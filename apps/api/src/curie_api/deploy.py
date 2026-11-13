@@ -24,7 +24,7 @@ from . import approver_tickets, bundles
 from .config import Settings, get_settings
 from .models import AgentVersion
 from .storage import ObjectStore
-from .tracker_result_declaration import ResultDeclaration, read_declaration
+from .tracker_result_declaration import DeclarationInvalid, ResultDeclaration, read_declaration
 
 
 class BundleInvalid(Exception):
@@ -79,7 +79,7 @@ class SealingKeyCustody(Exception):
     stored before it did can still be deployed, promoted or rolled back to,
     and at the cluster tier the deploy path would then resolve a plain name
     into the per-agent connector Secret. Raised by
-    ``check_stored_sealing_key_custody``; the message is the intake refusal's
+    ``check_stored_bundle_intake``; the message is the intake refusal's
     own custody reason, and ``code`` is the intake issue's code, so a git push
     rejection and a 422 detail say the same thing.
     """
@@ -95,7 +95,9 @@ class TrackerResultNotEnabled(Exception):
     such a version: a label on a half-built triage binding would queue work
     that cannot finish. Raised by ``validate_archive`` only after the bundle,
     declaration included, has validated, so a malformed declaration reports
-    its own ``tracker_result.*`` issue first. #5586 removes this refusal.
+    its own ``tracker_result.*`` issue first, and by
+    ``check_stored_bundle_intake`` for a stored object that carries one.
+    #5586 removes this refusal.
     ``code`` lets ``gitflow._rejected`` and the upload route build their
     envelopes from the exception alone.
     """
@@ -278,8 +280,15 @@ async def revalidate_stored_bundle(
         raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
 
 
-def _stored_custody_reasons(data: bytes, settings: Settings) -> list[str]:
-    """Blocking half of ``check_stored_sealing_key_custody``; run in a threadpool."""
+def _stored_intake_refusals(
+    data: bytes, settings: Settings
+) -> tuple[list[str], list[plugin_format.ValidationIssue], ResultDeclaration | None]:
+    """Blocking half of ``check_stored_bundle_intake``; run in a threadpool.
+
+    One extraction answers both stored-bundle intake checks: the sealing key
+    custody reasons, and the tracker result declaration's issues or, when it
+    is valid, the declaration itself.
+    """
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp)
@@ -290,20 +299,30 @@ def _stored_custody_reasons(data: bytes, settings: Settings) -> list[str]:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        issues = bundles.sealing_key_custody_issues(plugin_format.bundle_root(dest))
-        return [issue.message for issue in issues]
+        root = plugin_format.bundle_root(dest)
+        reasons = [issue.message for issue in bundles.sealing_key_custody_issues(root)]
+        try:
+            declaration = read_declaration(root)
+        except DeclarationInvalid as exc:
+            return reasons, list(exc.issues), None
+        return reasons, [], declaration
 
 
-async def check_stored_sealing_key_custody(
+async def check_stored_bundle_intake(
     store: ObjectStore, version: AgentVersion, settings: Settings | None = None
 ) -> None:
-    """Refuse a stored bundle that intake would now refuse for sealing key custody.
+    """Refuse a stored bundle that intake would now refuse.
 
     @spec ACTION-EXECUTOR-16: custody holds on every path that makes a version
-    the one that boots, not only on first upload. A no-op when the version
-    carries no bundle yet, like ``revalidate_stored_bundle``. Stored bytes the
-    current caps refuse report ``BundleTooLarge``, the settled answer for them
-    (ADR-0059 decision 3).
+    the one that boots, not only on first upload. So does the tracker result
+    refusal (ADR 0277, #5585): a version stored before intake refused
+    ``workflow/result.json``, or a git-flow sibling object, must not boot as a
+    tracker result deployment. A no-op when the version carries no bundle
+    yet, like ``revalidate_stored_bundle``. Raises, in this order:
+    ``BundleTooLarge`` for stored bytes the current caps refuse (ADR-0059
+    decision 3), ``SealingKeyCustody``, ``BundleInvalid`` carrying the
+    declaration's own ``tracker_result.*`` issues when it is malformed, and
+    ``TrackerResultNotEnabled`` when it is valid.
     """
 
     if version.bundle_ref is None:
@@ -311,11 +330,17 @@ async def check_stored_sealing_key_custody(
     settings = settings or get_settings()
     data = await store.get(version.bundle_ref)
     try:
-        reasons = await run_in_threadpool(_stored_custody_reasons, data, settings)
+        reasons, declaration_issues, declaration = await run_in_threadpool(
+            _stored_intake_refusals, data, settings
+        )
     except plugin_format.UnsupportedArchive as exc:
         raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
     if reasons:
         raise SealingKeyCustody("; ".join(reasons))
+    if declaration_issues:
+        raise BundleInvalid([issue.model_dump() for issue in declaration_issues])
+    if declaration is not None:
+        raise TrackerResultNotEnabled(declaration)
 
 
 def _declared_route_map(data: bytes, settings: Settings) -> dict[str, str] | None:

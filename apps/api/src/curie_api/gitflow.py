@@ -428,8 +428,9 @@ def _rejected(
     there first. The message is the exception's own, identical to the one the
     API returns as a 422 detail. `approver_ticket.bundle_gate_mismatch` (ADR
     0271 decision 2) rides on the same three route gates.
-    `tracker_result_not_enabled` (#5585) fires once, at the clone path's
-    `validate_archive`, before any version row exists.
+    `tracker_result_not_enabled` (#5585) fires at the clone path's
+    `validate_archive`, before any version row exists, and at the two stored
+    object checks (`check_stored_bundle_intake`).
     """
 
     return WebhookResult(
@@ -733,13 +734,17 @@ async def process_push(
                     store, sibling, agent.approval_routes, settings
                 )
                 # @spec ACTION-EXECUTOR-16: the sibling object is stored
-                # bytes too, so it gets the custody re-check intake would give.
-                await deploy.check_stored_sealing_key_custody(store, sibling, settings)
+                # bytes too, so it gets the custody re-check intake would give,
+                # and the tracker result refusal (#5585) with it.
+                await deploy.check_stored_bundle_intake(store, sibling, settings)
+            except deploy.BundleInvalid as exc:
+                return WebhookResult(status="rejected", agent_id=agent.id, errors=exc.errors)
             except (
                 deploy.BundleTooLarge,
                 deploy.ApprovalRoutesUnbound,
                 approver_tickets.BundleGateMismatch,
                 deploy.SealingKeyCustody,
+                deploy.TrackerResultNotEnabled,
             ) as exc:
                 # `bundle.too_large` is live here, not theoretical: the sibling
                 # object is a DIFFERENT object from the archive
@@ -795,9 +800,16 @@ async def process_push(
             await deploy.revalidate_stored_bundle(store, version, settings)
             # @spec ACTION-EXECUTOR-16: a reused bundle stored before intake
             # refused a non-SecretRef sealing key declaration is refused here,
-            # as `POST /deployments` refuses it.
-            await deploy.check_stored_sealing_key_custody(store, version, settings)
-        except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
+            # as `POST /deployments` refuses it. So is one that carries a
+            # tracker result declaration (#5585).
+            await deploy.check_stored_bundle_intake(store, version, settings)
+        except deploy.BundleInvalid as exc:
+            return WebhookResult(status="rejected", agent_id=agent.id, errors=exc.errors)
+        except (
+            deploy.BundleTooLarge,
+            deploy.SealingKeyCustody,
+            deploy.TrackerResultNotEnabled,
+        ) as exc:
             return _rejected(exc, agent.id)
 
     # The declared/bound approval-route join at the moment the version becomes

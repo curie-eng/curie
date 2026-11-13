@@ -15,6 +15,7 @@ from typing import Any
 
 from curie_api import bundles
 from curie_api.config import get_settings
+from curie_api.storage import BundleStore
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -291,6 +292,39 @@ def test_read_version_files_unknown_version_is_404(
 # --- tracker result declaration refusal (ADR 0277, #5585) -----------------
 
 
+def _store_directly(agent_id: str, version_id: str, data: bytes) -> None:
+    """Attach ``data`` to the version without passing intake.
+
+    Simulates a bundle stored before intake refused a tracker result
+    declaration: written straight to the object store under a fresh key (keys
+    are write-once) and pointed at by the version row, as
+    ``test_sealing_key_custody_paths.py`` does for custody.
+    """
+
+    async def run() -> None:
+        settings = get_settings()
+        key = f"bundles/{agent_id}/{version_id}-legacy-{uuid.uuid4().hex[:6]}.tar.gz"
+        await BundleStore(settings).put(key, data, "application/gzip")
+        engine = create_async_engine(settings.database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.agent_versions SET bundle_ref = :ref, "
+                        "bundle_sha256 = :sha WHERE id = :id"
+                    ),
+                    {
+                        "ref": key,
+                        "sha": hashlib.sha256(data).hexdigest(),
+                        "id": uuid.UUID(version_id),
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
 def _count_rows(table: str, agent_id: str) -> int:
     async def run() -> int:
         engine = create_async_engine(get_settings().database_url)
@@ -327,14 +361,36 @@ def test_upload_with_a_result_declaration_is_refused_and_leaves_nothing_behind(
 
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"]["code"] == "tracker_result_not_enabled"
-    # No version carries the bundle, no object was stored, and nothing was
-    # deployed or queued for the agent.
-    version = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()[0]
-    assert version["bundle_ref"] is None
-    assert version["bundle_sha256"] is None
+    # The version made for this upload is gone, no object was stored, and
+    # nothing was deployed or queued for the agent.
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
     assert client.get(url, headers=auth_headers).status_code == 404
     assert _count_rows("deployments", agent_id) == 0
     assert _count_rows("work_items", agent_id) == 0
+
+
+def test_a_refused_upload_onto_a_deployed_version_keeps_the_version(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The documented deploy-then-attach order: a deployment already references
+    # the bundleless version, so the refusal must not delete it.
+    agent_id, version_id = _create_version(client, auth_headers)
+    deployed = _deploy(client, auth_headers, agent_id, version_id)
+    assert deployed.status_code == 201, deployed.text
+    files = _valid_files()
+    files["workflow/result.json"] = RESULT_DECLARATION
+
+    resp = client.put(
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        files={"file": ("demo.tar.gz", _tar_gz(files))},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["code"] == "tracker_result_not_enabled"
+    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
+    assert [(v["id"], v["bundle_ref"]) for v in versions] == [(version_id, None)]
+    assert _count_rows("deployments", agent_id) == 1
 
 
 def test_the_same_bundle_without_the_result_declaration_uploads_and_deploys(
@@ -376,3 +432,49 @@ def test_upload_with_a_malformed_result_declaration_reports_validation_first(
     assert detail["detail"] == "bundle failed validation"
     assert [e["code"] for e in detail["errors"]] == ["tracker_result.schema_version"]
     assert "tracker_result_not_enabled" not in resp.text
+
+
+def test_deploying_a_stored_bundle_with_a_result_declaration_is_refused(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id, version_id = _create_version(client, auth_headers)
+    files = _valid_files()
+    files["workflow/result.json"] = RESULT_DECLARATION
+    _store_directly(agent_id, version_id, _tar_gz(files))
+
+    resp = _deploy(client, auth_headers, agent_id, version_id)
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["code"] == "tracker_result_not_enabled"
+    assert _count_rows("deployments", agent_id) == 0
+    assert _count_rows("work_items", agent_id) == 0
+
+
+def test_deploying_a_stored_bundle_with_a_malformed_result_declaration_reports_it(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id, version_id = _create_version(client, auth_headers)
+    files = _valid_files()
+    files["workflow/result.json"] = "[]"
+    _store_directly(agent_id, version_id, _tar_gz(files))
+
+    resp = _deploy(client, auth_headers, agent_id, version_id)
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["detail"] == "bundle failed validation"
+    assert [e["code"] for e in detail["errors"]] == ["tracker_result.not_object"]
+    assert _count_rows("deployments", agent_id) == 0
+
+
+def test_deploying_the_same_stored_bundle_without_the_declaration_succeeds(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The paired control: direct seeding itself deploys.
+    agent_id, version_id = _create_version(client, auth_headers)
+    _store_directly(agent_id, version_id, _tar_gz(_valid_files()))
+
+    resp = _deploy(client, auth_headers, agent_id, version_id)
+
+    assert resp.status_code == 201, resp.text
+    assert _count_rows("deployments", agent_id) == 1

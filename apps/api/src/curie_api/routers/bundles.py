@@ -8,6 +8,8 @@ bytes so a runner can pull a bundle by version.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
+from sqlalchemy import delete, exists
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from curie_api.crud import agents as crud_agents
@@ -19,7 +21,7 @@ from .. import approver_tickets, bundles, deploy
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
-from ..models import AgentVersion
+from ..models import AgentVersion, Deployment
 
 # Chunk size for the bounded read below; arbitrary, just small enough that a
 # rejected oversized upload never holds more than one chunk's worth of the
@@ -96,6 +98,31 @@ async def _read_bounded_upload(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
+async def _discard_upload_version(session: AsyncSession, version: AgentVersion) -> None:
+    """Delete the version a refused tracker result upload was made for (#5585).
+
+    Acceptance criterion 2 says a refused tracker result deployment leaves no
+    agent version behind. Every REST client (the CLI's ``prepare_deploy``, the
+    UI's create-agent modal and its deploy action) creates a fresh version with
+    ``POST /agents/{id}/versions`` and uploads into it at once, so a version
+    with no bundle that no deployment references exists only for this upload,
+    and nothing will ever upload into it again: a retry creates a new version.
+    A version a deployment already references (the documented
+    deploy-then-attach order) is kept. One guarded DELETE decides, so a
+    deployment created concurrently keeps its version. Only this refusal
+    discards: any other refused upload leaves the version as it always has.
+    """
+
+    await session.execute(
+        delete(AgentVersion).where(
+            AgentVersion.id == version.id,
+            AgentVersion.bundle_ref.is_(None),
+            ~exists().where(Deployment.version_id == AgentVersion.id),
+        )
+    )
+    await session.commit()
+
+
 @router.put("", response_model=BundleOut, status_code=status.HTTP_201_CREATED)
 async def upload_bundle(
     agent_id: uuid.UUID,
@@ -127,6 +154,7 @@ async def upload_bundle(
     except deploy.TrackerResultNotEnabled as exc:
         # Before the route join, `store.put` and `attach_bundle`, so a refused
         # bundle stores no object and leaves `bundle_ref` null (#5585).
+        await _discard_upload_version(session, version)
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
         ) from exc
