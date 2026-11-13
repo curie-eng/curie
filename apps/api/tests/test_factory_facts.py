@@ -315,6 +315,111 @@ def test_observation_reader_returns_live_row_and_expires_it(facts_world: Any) ->
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("expiry", ["current", "expired", "missing"])
+def test_selected_image_rows_distinguish_absent_outside_and_unobserved(
+    facts_world: Any,
+    expiry: str,
+) -> None:
+    from curie_api.models import FactoryFactObservation
+    from forge_fakes.github import REPO_ID
+    from test_factory_facts_intake import facts
+
+    world = facts_world
+
+    async def seed() -> None:
+        now = datetime.now(UTC)
+        async with world.sessions() as session:
+            if expiry != "missing":
+                for name, state in [("git", "present"), ("jq", "absent")]:
+                    session.add(
+                        FactoryFactObservation(
+                            kind="tool",
+                            agent_id=world.agent_id,
+                            scope=str(REPO_ID),
+                            item=name,
+                            subject_digest="sha256:" + "a" * 64,
+                            state=state,
+                            reason=None,
+                            observed_at=now - timedelta(seconds=901 if expiry == "expired" else 0),
+                            expires_at=now + timedelta(seconds=-1 if expiry == "expired" else 900),
+                        )
+                    )
+                session.add(
+                    FactoryFactObservation(
+                        kind="tool",
+                        agent_id=world.agent_id,
+                        scope=str(REPO_ID),
+                        item="service:docker",
+                        subject_digest="sha256:" + "a" * 64,
+                        state="configured",
+                        reason=None,
+                        observed_at=now,
+                        expires_at=now + timedelta(seconds=900),
+                    )
+                )
+            await session.commit()
+
+    asyncio.run(seed())
+    world.add(executables=["git", "jq", "acme-outside-catalog"], services=["docker", "postgres"])
+    world.cycle()
+    answer = facts(world)
+    expected = [("present", None), ("absent", None), ("unknown", "outside_catalog")]
+    if expiry != "current":
+        expected = [
+            ("unknown", "observation_expired" if expiry == "expired" else "observation_missing")
+        ] * 2
+        expected.append(("unknown", "observation_missing"))
+    assert [(entry.state, entry.reason) for entry in answer.executables] == expected
+    assert [entry.basis for entry in answer.executables] == (
+        ["selected_image_probe", "selected_image_probe", None]
+        if expiry == "current"
+        else [None, None, None]
+    )
+    assert answer.services[0].state == ("unknown" if expiry == "missing" else "configured")
+    assert answer.services[1].state == "unknown"
+
+
+def test_no_http_method_accepts_an_uploaded_tool_observation(facts_world: Any) -> None:
+    import httpx
+    import redis.asyncio as redis
+    from curie_api.main import create_app
+    from curie_api.models import FactoryFactObservation
+    from sqlalchemy import func, select
+
+    world = facts_world
+
+    async def check() -> None:
+        app = create_app()
+        app.state.sessionmaker = world.sessions
+        app.state.valkey = redis.Redis.from_url(world.settings.valkey_dsn())
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                for method in ("POST", "PUT", "PATCH", "DELETE"):
+                    response = await client.request(
+                        method,
+                        "/factory/facts",
+                        json={
+                            "kind": "tool",
+                            "item": "jq",
+                            "state": "present",
+                            "image_manifest": {"executables": ["jq"]},
+                        },
+                        headers={"X-API-Key": world.settings.api_key},
+                    )
+                    assert response.status_code in (404, 405, 422)
+            async with world.sessions() as session:
+                assert (
+                    await session.scalar(select(func.count()).select_from(FactoryFactObservation))
+                    == 0
+                )
+        finally:
+            await app.state.valkey.aclose()
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("state", ["clear", "killed", "paused", "unreadable", "personal"])
 def test_field_truth_from_current_state(facts_world: Any, state: str) -> None:
     import redis.asyncio as redis

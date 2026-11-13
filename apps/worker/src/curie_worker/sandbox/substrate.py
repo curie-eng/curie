@@ -57,6 +57,7 @@ from .docker import DockerSandboxClient
 from .k8s import KubernetesSandboxClient
 from .quota import admission_quota_headroom, resource_vector
 from .static import StaticPoolSandboxClient
+from .tool_probe import PROBE_PREFIX, ProbeResult, ProbeSelection
 from .types import (
     AGENT_LABEL,
     EXECUTOR_THREAD_KEY_PREFIX,
@@ -249,6 +250,7 @@ class SandboxSubstrate:
         self._config = config
         self._boot_credential_revoker: Callable[[str, str], bool] | None = None
         self._boot_credential_minter: Callable[[Mapping[str, str]], dict[str, str]] | None = None
+        self._pending_tool_probe: str | None = None
 
     def set_boot_credential_revoker(self, revoker: Callable[[str, str], bool]) -> None:
         """Report a released boot credential. The kernel wires the API call."""
@@ -1939,8 +1941,7 @@ class SandboxSubstrate:
             present = bool(probe(derived))
         except Exception:  # noqa: BLE001 - an unreadable pool must not fail the claim
             logger.warning(
-                "could not read SandboxWarmPool %s; the claim keeps the chart pool choice",
-                derived,
+                "could not read the agent SandboxWarmPool; the claim keeps the chart pool choice",
             )
             return None
         return derived if present else None
@@ -1979,7 +1980,7 @@ class SandboxSubstrate:
             except Exception as exc:
                 # Only the class: an API error body can carry object detail.
                 logger.warning(
-                    "could not read SandboxWarmPool %s (%s)", entry.pool, type(exc).__name__
+                    "could not read the repository SandboxWarmPool (%s)", type(exc).__name__
                 )
                 raise KubeTransientError(f"could not read SandboxWarmPool {entry.pool}") from exc
             if not present:
@@ -2124,8 +2125,9 @@ class SandboxSubstrate:
     ) -> None:
         if self._config.admission is None:
             return
-        runner = self._preflight_repo_runner(workspace_repo, env, agent_name)
-        pool = self._claim_pool(env=env, agent_name=agent_name, runner=runner)
+        runner, pool = self.select_runner(
+            workspace_repo=workspace_repo, env=env, agent_name=agent_name
+        )
         self._evaluate_admission(
             "",
             operation="inspect",
@@ -2134,6 +2136,73 @@ class SandboxSubstrate:
             agent_name=agent_name,
             executor_secret_names=None,
         )
+
+    def select_runner(
+        self,
+        *,
+        workspace_repo: str | None,
+        env: Mapping[str, str] | None = None,
+        agent_name: str | None = None,
+        repo_runner: RepoRunnerPool | None = None,
+    ) -> tuple[RepoRunnerPool | None, str]:
+        """Recompute a claim's runner without creating or changing a route."""
+        runner = (
+            repo_runner
+            if repo_runner is not None
+            else self._preflight_repo_runner(workspace_repo, env, agent_name)
+        )
+        return runner, self._claim_pool(env=env, agent_name=agent_name, runner=runner)
+
+    def inspect_tools(self, *, workspace_repo: str, agent_name: str) -> tuple[ProbeSelection, bool]:
+        if not isinstance(self._k8s, KubernetesSandboxClient):
+            raise ValueError("image observations require the Kubernetes substrate")
+        runner, pool = self.select_runner(workspace_repo=workspace_repo, agent_name=agent_name)
+        selection = self._k8s.inspect_tool_probe(pool, deadline=time.monotonic() + 10)
+        return selection, bool(runner is not None and runner.docker and runner.daemon is not None)
+
+    def probe_tools(self, selection: ProbeSelection, *, agent_name: str) -> ProbeResult:
+        if not isinstance(self._k8s, KubernetesSandboxClient):
+            raise ValueError("image observations require the Kubernetes substrate")
+        name = PROBE_PREFIX + uuid.uuid4().hex[:16]
+        deadline = time.monotonic() + 120
+        if self._pending_tool_probe is not None:
+            if not self._k8s.delete_tool_probe(self._pending_tool_probe, deadline=deadline - 90):
+                raise ClaimTimeoutError("previous observation release unconfirmed")
+            self._pending_tool_probe = None
+        reservation = self._evaluate_admission(
+            name,
+            operation="reserve",
+            pool=selection.pool,
+            runner_resources=None,
+            agent_name=agent_name,
+            executor_secret_names=frozenset(),
+        )
+        self._pending_tool_probe = name
+        try:
+            self._k8s.create_tool_probe(name, selection, deadline=deadline - 30)
+            reservation = self._advance_admission(name, reservation, "submitted")
+            while time.monotonic() < deadline - 30:
+                claim = self._k8s.get_claim(
+                    name,
+                    request_timeout_seconds=max(0.001, min(5, deadline - 30 - time.monotonic())),
+                )
+                if claim is not None and claim.quota_rejection is not None:
+                    raise CapacityExhaustedError(claim.quota_rejection)
+                if claim is not None and claim.sandbox_name is not None:
+                    result = self._k8s.read_tool_probe(claim.sandbox_name, deadline=deadline - 30)
+                    if result is not None:
+                        return result
+                time.sleep(min(0.2, max(0, deadline - 30 - time.monotonic())))
+            raise ClaimTimeoutError("tool observation timed out")
+        finally:
+            if not self._k8s.delete_tool_probe(name, deadline=deadline):
+                raise ClaimTimeoutError("observation release unconfirmed")
+            self._pending_tool_probe = None
+            admission = self._config.admission
+            if reservation is not None and admission is not None:
+                self._affinity.admission_update(
+                    self._config.namespace, admission.quota_name, name, reservation, None
+                )
 
     def _claim_fresh(
         self,
@@ -2184,12 +2253,10 @@ class SandboxSubstrate:
         # A repository bound to a runner pool (ADR 0216) claims that pool,
         # checked before any credential is minted so a refusal has no side
         # effects. A repository without one routes exactly as before.
-        runner = (
-            repo_runner
-            if repo_runner is not None
-            else self._preflight_repo_runner(workspace_repo, env, agent_name)
+        runner, pool = self.select_runner(
+            workspace_repo=workspace_repo, env=env, agent_name=agent_name,
+            repo_runner=repo_runner,
         )
-        pool = self._claim_pool(env=env, agent_name=agent_name, runner=runner)
         reservation = self._evaluate_admission(
             name,
             pool=pool,

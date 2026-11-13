@@ -1,0 +1,30 @@
+{{- if and .Values.worker.deploy .Values.worker.serviceAccount.create .Values.agentSandbox.deploy }}
+{{- $role := printf "%s-worker-tool-platform-%s" (include "curie.fullname" .) .Release.Namespace }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $role }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $role }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $role }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+{{- end }}
