@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from curie_api.factory_facts_schema import REQUEST_MARKER, InvalidFactsRequest, parse_request
+from forge_fakes.facts import facts_world as facts_world
 
 VECTORS = Path(__file__).resolve().parents[3] / "tests/vectors"
 REQUESTS = json.loads((VECTORS / "factory-facts-requests.json").read_text())

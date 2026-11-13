@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from curie_api.factory_facts_exchange import _answer_facts
 from curie_api.factory_facts_schema import FactoryFacts
+from forge_fakes.facts import facts_world as facts_world
 from forge_fakes.github import LABEL, REPO_ID
 
 
