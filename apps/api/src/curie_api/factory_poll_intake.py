@@ -512,7 +512,7 @@ async def _admit_mentions(
     repository."""
 
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
-    facts = FactsExchange(sessionmaker, settings, tracker)
+    facts = FactsExchange(sessionmaker, settings, tracker.facts)
     if serves:
         await facts.recover_owed()
     retried: set[int] = set()
@@ -559,7 +559,7 @@ async def _admit_mentions(
             and trailing_id(comment.get("issue_url")) not in owned_pulls
         ):
             try:
-                if await facts.observe(comment, serves=serves):
+                if await facts.observe(tracker.facts_comment(comment), serves=serves):
                     continue
             except (Unavailable, FeedbackUnavailable):
                 comment_id = comment.get("id")

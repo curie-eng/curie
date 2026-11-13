@@ -6,7 +6,6 @@ import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from ..auth import require_api_key
 from ..config import get_settings
@@ -14,8 +13,7 @@ from ..deps import SessionDep
 from ..factory_facts import FACTS_DEADLINE_SECONDS, read_facts
 from ..factory_facts_schema import FactoryFacts, FactsRequest
 from ..forges.errors import ForgeError
-from ..forges.github.tracker import read_repository
-from ..forges.hosts import factory_credentials, factory_tracker
+from ..forges.hosts import resolve_factory_repository
 from ..forges.registry import forges_registry
 from ..github_app import GitHubAppError, GitHubInstallationRefused
 from ..github_review_events import FeedbackIgnored, FeedbackUnavailable
@@ -65,15 +63,7 @@ async def _get_factory_facts(
         raise HTTPException(422, {"code": "invalid_facts_request"}) from None
     try:
         registry = forges_registry(settings)
-        _, token = await run_in_threadpool(
-            factory_credentials(registry).fresh_installation_token, repository, None
-        )
-        repo = await read_repository(
-            request.app.state.http_client,
-            api=factory_tracker(registry).config.api_url,
-            repo_full_name=repository,
-            token=token,
-        )
+        repo = await resolve_factory_repository(registry, request.app.state.http_client, repository)
     except (
         ForgeError,
         GitHubAppError,
@@ -82,14 +72,12 @@ async def _get_factory_facts(
         FeedbackUnavailable,
     ):
         raise HTTPException(503, {"code": "facts_unavailable"}) from None
-    if type(repo.get("id")) is not int or repo["id"] <= 0:
-        raise HTTPException(503, {"code": "repository_unavailable"})
     return await read_facts(
         session,
         settings,
         request.app.state.valkey,
         repository=repository,
-        repository_id=str(repo["id"]),
+        repository_id=repo.project_id,
         query=query,
         issue_number=None,
     )

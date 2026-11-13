@@ -25,10 +25,8 @@ from .factory_facts_schema import (
     parse_request,
 )
 from .forges.errors import NotFound, Unavailable
-from .forges.github.review_polling import label_actor, trailing_id
-from .forges.github.tracker import GitHubTracker
-from .forges.github.transport import parse_time
-from .forges.types import ReplyTarget
+from .forges.ports import TrackerFacts
+from .forges.types import ReplyTarget, TrackerComment, TrackerIssueRef
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
 from .models import FactoryFactsRequest
 
@@ -52,29 +50,28 @@ class FactsExchange:
     """Called only inside the poll pass's installation-wide advisory lock."""
 
     def __init__(
-        self, sessions: async_sessionmaker[AsyncSession], settings: Settings, tracker: GitHubTracker
+        self, sessions: async_sessionmaker[AsyncSession], settings: Settings, tracker: TrackerFacts
     ) -> None:
         self.sessions, self.settings, self.tracker = sessions, settings, tracker
         self._deferred: set[tuple[int, str, int]] = set()
 
     def _scope(self) -> tuple[Any, ...]:
         return (
-            FactoryFactsRequest.tracker_host == self.tracker.host,
-            FactoryFactsRequest.repository_id == str(self.tracker.repository_id),
+            FactoryFactsRequest.tracker_host == self.tracker.repository.host,
+            FactoryFactsRequest.repository_id == self.tracker.repository.project_id,
         )
 
-    async def _authorized(self, comment: dict[str, Any], number: int) -> tuple[int, str]:
-        if trailing_id(comment.get("issue_url")) != number:
+    def _issue(self, number: int) -> TrackerIssueRef:
+        repository = self.tracker.repository
+        return TrackerIssueRef(repository.kind, repository.host, repository.project_id, str(number))
+
+    async def _authorized(self, comment: TrackerComment, number: int) -> tuple[str, str]:
+        if comment.issue != self._issue(number):
             raise FeedbackIgnored("comment_target_mismatch")
-        actor_id, login = label_actor(
-            {
-                "actor": comment.get("user"),
-                "performed_via_github_app": comment.get("performed_via_github_app"),
-            },
-            app_id=self.tracker.app_id,
-        )
-        await self.tracker.verify_facts_writer(actor_id, login)
-        return actor_id, login
+        actor = await self.tracker.facts_writer(comment)
+        if actor is None:
+            raise FeedbackIgnored("actor_unverifiable")
+        return actor.id, actor.login
 
     async def _rate_limited(
         self, session: AsyncSession, actor_id: str, *, current: FactoryFactsRequest | None = None
@@ -97,7 +94,7 @@ class FactsExchange:
             )
         return len((await session.scalars(query.limit(6))).all()) == 6
 
-    async def observe(self, comment: dict[str, Any], *, serves: bool) -> bool:
+    async def observe(self, comment: TrackerComment | None, *, serves: bool) -> bool:
         try:
             async with asyncio.timeout(FACTS_DEADLINE_SECONDS):
                 return await self._observe(comment, serves=serves)
@@ -106,28 +103,23 @@ class FactsExchange:
         except Exception:  # noqa: BLE001 - no failed facts guard may reach another intake path
             raise FeedbackUnavailable("facts_unreadable") from None
 
-    async def _observe(self, comment: dict[str, Any], *, serves: bool) -> bool:
-        body, comment_id = comment.get("body"), comment.get("id")
-        number = trailing_id(comment.get("issue_url"))
-        if (
-            not isinstance(body, str)
-            or type(comment_id) is not int
-            or comment_id <= 0
-            or number is None
-        ):
+    async def _observe(self, comment: TrackerComment | None, *, serves: bool) -> bool:
+        if comment is None:
             return False
+        body, comment_id = comment.body, comment.id
+        number = int(comment.issue.issue_id)
         try:
             query = parse_request(body)
         except InvalidFactsRequest as exc:
             logger.info("factory facts request ignored reason=%s", exc.code)
             return False
-        if not await self.tracker.facts_issue_is_plain(number):
+        if not await self.tracker.facts_issue_is_plain(comment.issue):
             return False
         if not serves or not self.settings.factory_enabled:
             return True
         async with self.sessions() as session:
             _, binding = await facts_binding(
-                session, self.settings, self.tracker.repo_full_name, query.trigger_label
+                session, self.settings, self.tracker.repository.path, query.trigger_label
             )
             if binding is None:
                 return True
@@ -138,8 +130,8 @@ class FactsExchange:
             except FeedbackIgnored:
                 return True
             key = (
-                self.tracker.host,
-                str(self.tracker.repository_id),
+                self.tracker.repository.host,
+                self.tracker.repository.project_id,
                 number,
                 query.trigger_label,
                 comment_id,
@@ -151,8 +143,8 @@ class FactsExchange:
                 return True
             session.add(
                 FactoryFactsRequest(
-                    tracker_host=self.tracker.host,
-                    repository_id=str(self.tracker.repository_id),
+                    tracker_host=self.tracker.repository.host,
+                    repository_id=self.tracker.repository.project_id,
                     issue_number=number,
                     trigger_label=query.trigger_label,
                     request_comment_id=comment_id,
@@ -199,12 +191,12 @@ class FactsExchange:
 
     async def _recover(self, session: AsyncSession, row: FactoryFactsRequest) -> None:
         _, binding = await facts_binding(
-            session, self.settings, self.tracker.repo_full_name, row.trigger_label
+            session, self.settings, self.tracker.repository.path, row.trigger_label
         )
         if binding is None or await self._rate_limited(session, row.actor_id, current=row):
             return
         found = await self.tracker.marked_comments.find_facts(
-            ReplyTarget.on_issue(self.tracker.issue(row.issue_number)),
+            ReplyTarget.on_issue(self._issue(row.issue_number)),
             marker_prefix(row.trigger_label),
         )
         answer = _answer_facts(found.body) if found is not None else None
@@ -217,7 +209,7 @@ class FactsExchange:
             return
         assert found is not None
         written = await self.tracker.read_comment(int(found.id))
-        at = parse_time(written.get("updated_at"))
+        at = written.updated_at
         if at is None:
             raise Unavailable("comment")
         row.state, row.answer_comment_id, row.answered_at = "answered", found.id, at
@@ -247,7 +239,7 @@ class FactsExchange:
 
     async def _deliver(self, session: AsyncSession, row: FactoryFactsRequest) -> None:
         _, binding = await facts_binding(
-            session, self.settings, self.tracker.repo_full_name, row.trigger_label
+            session, self.settings, self.tracker.repository.path, row.trigger_label
         )
         if not self.settings.factory_enabled or binding is None:
             await session.delete(row)
@@ -271,7 +263,7 @@ class FactsExchange:
             return
         try:
             comment = await self.tracker.read_comment(row.request_comment_id)
-            body = comment.get("body")
+            body = comment.body
             if not isinstance(body, str):
                 raise InvalidFactsRequest("invalid_request")
             query = parse_request(body)
@@ -287,7 +279,7 @@ class FactsExchange:
         except (NotFound, FeedbackIgnored, InvalidFactsRequest):
             await session.delete(row)
             return
-        target = ReplyTarget(kind="issue", issue=self.tracker.issue(row.issue_number))
+        target = ReplyTarget(kind="issue", issue=self._issue(row.issue_number))
         comments = self.tracker.marked_comments
         prefix = marker_prefix(row.trigger_label)
         existing = await comments.find_facts(target, prefix)
@@ -312,7 +304,7 @@ class FactsExchange:
                 session,
                 self.settings,
                 valkey,
-                repository=self.tracker.repo_full_name,
+                repository=self.tracker.repository.path,
                 repository_id=row.repository_id,
                 query=query,
                 issue_number=row.issue_number,
@@ -320,9 +312,7 @@ class FactsExchange:
                 route=LabelRoute(
                     actor_kind="human",
                     actor_id=row.actor_id,
-                    route="github_user_via_app"
-                    if comment.get("performed_via_github_app") is not None
-                    else "github_user",
+                    route="github_user_via_app" if comment.via_app else "github_user",
                     state="eligible",
                     reason=None,
                 ),

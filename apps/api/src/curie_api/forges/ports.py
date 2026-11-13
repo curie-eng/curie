@@ -37,6 +37,7 @@ from curie_api.forges.types import (
     ReviewFeedback,
     StoredEvidence,
     TicketLabels,
+    TrackerComment,
     TrackerIssueRef,
     UpsertResult,
 )
@@ -76,6 +77,34 @@ class MarkedComments(Protocol):
         ...
 
 
+class FactsComments(MarkedComments, Protocol):
+    """Optional label-scoped comments whose request attributes change in place."""
+
+    async def find_facts(self, target: ReplyTarget, prefix: str) -> MarkedComment | None: ...
+
+    async def upsert_facts(
+        self, target: ReplyTarget, *, prefix: str, marker: str, body: str
+    ) -> UpsertResult: ...
+
+
+class TrackerFacts(Protocol):
+    """Optional tracker capability for the advisory facts exchange (ADR 0280)."""
+
+    @property
+    def repository(self) -> RepositoryRef: ...
+
+    @property
+    def marked_comments(self) -> FactsComments: ...
+
+    async def read_comment(self, comment_id: int) -> TrackerComment: ...
+
+    async def facts_issue_is_plain(self, issue: TrackerIssueRef) -> bool: ...
+
+    async def facts_writer(self, comment: TrackerComment) -> Actor | None:
+        """A current writer, or None; an unreadable permission raises Unavailable."""
+        ...
+
+
 class Tracker(Protocol):
     """Where work is marked and described (ADR 0197, "Two ports" item 1)."""
 
@@ -87,6 +116,11 @@ class Tracker(Protocol):
 
     @property
     def capabilities(self) -> Mapping[Operation, Support]: ...
+
+    @property
+    def facts(self) -> TrackerFacts | None:
+        """Optional facts exchange; absent where FACTS_EXCHANGE is unsupported."""
+        ...
 
     @property
     def marked_comments(self) -> MarkedComments:
