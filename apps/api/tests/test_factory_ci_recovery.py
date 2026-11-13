@@ -247,6 +247,7 @@ def test_superseded_runs_and_paginated_checks_can_prove_later_green(
     published = _failed(admitted, 9813)
     older = check_run("build", conclusion=conclusion, run_id=10, started_at="2026-01-01T00:00:00Z")
     newer = check_run("build", run_id=11, started_at="2026-01-01T00:01:00Z")
+    older["app"] = newer["app"] = {"id": 1, "slug": "acme-ci"}
     sink.ci_script = [ci_entry(older, *[check_run(f"check-{i}") for i in range(100)], newer)]
     _later()
     assert (HEAD_A, "check-runs", 2) in sink.ci_pages
@@ -254,14 +255,25 @@ def test_superseded_runs_and_paginated_checks_can_prove_later_green(
     assert _observation(published["id"])["status"] == "completed"
 
 
-def test_distinct_app_failure_is_not_superseded_by_another_apps_success(admitted: Any) -> None:
+@pytest.mark.parametrize(
+    "application_ids", [(1, 2), (None, None)], ids=["different_apps", "unknown_apps"]
+)
+def test_distinct_app_failure_is_not_superseded_by_another_apps_success(
+    admitted: Any,
+    application_ids: tuple[int | None, int | None],
+) -> None:
     _client, _github, sink = admitted
     published = _failed(admitted, 9814)
+    # GitHub check-run app is nullable in its published REST OpenAPI schema:
+    # https://docs.github.com/en/rest/checks/runs#get-a-check-run
     failed = {
         **check_run("build", conclusion="failure", started_at="2026-01-01T00:00:00Z"),
-        "app": {"id": 1},
+        "app": {"id": application_ids[0]} if application_ids[0] is not None else None,
     }
-    passing = {**check_run("build", started_at="2026-01-01T00:01:00Z"), "app": {"id": 2}}
+    passing = {
+        **check_run("build", started_at="2026-01-01T00:01:00Z"),
+        "app": {"id": application_ids[1]} if application_ids[1] is not None else None,
+    }
     sink.ci_script = [ci_entry(failed, passing)]
     _later()
     assert _observation(published["id"])["status"] == "observing"

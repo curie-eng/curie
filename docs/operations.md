@@ -1671,6 +1671,19 @@ refused (`github_forbidden_list_check_runs`, `github_forbidden_get_combined_stat
 reason names the operation and does not claim which App permission is missing:
 a 403 alone cannot say that (#5222).
 
+A latest request that ended `ci_timeout` or `ci_unverified` with an open recorded
+pull request keeps a separate, read-only CI observation for 24 hours from its
+creation. It polls every 20 seconds and survives API restarts without extending
+the window or the execution deadline. The work item exposes `ci_observation`;
+a later verified green on its authorized recorded head reports item-level
+observed completion while the original request stays failed. Observation
+creates no execution request, model turn, publication or workflow rerun and
+uses no repair allowance. The status comment retains the failure and adds the
+watch deadline. Observed completion adds the head and observation time and moves
+the state label from `curie-factory:needs-human` to `curie-factory:pr-open`.
+Expiry says the checks were not verified within 24 hours and keeps the human
+handoff label. Other terminal causes do not start this observation.
+
 Per-repository factory settings live under `factory.bindings[].repos[]`. A
 binding joins one tracker (`tracker`) to its repositories, and each `repos`
 entry names a `codeHost`, a `projectId`, a `path` (`owner/name`) and an `alias`.

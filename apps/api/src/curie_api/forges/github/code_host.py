@@ -243,6 +243,8 @@ def _latest_ci_entries(
             return (entry.get("context"),)
         app = entry.get("app")
         app_id = (app.get("id") or app.get("slug")) if isinstance(app, dict) else None
+        if app_id is None:
+            app_id = ("unidentified", id(entry))
         return app_id, entry.get("name"), entry.get("head_sha") or head_sha
 
     def later(candidate: dict[str, Any], earlier: dict[str, Any]) -> bool:
