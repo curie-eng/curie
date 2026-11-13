@@ -633,11 +633,11 @@ def test_intake_notice_migration_refuses_lossy_downgrade(isolated_migration_db: 
     from alembic import command
     from curie_api.schema_compat import SchemaServingUnavailable, assert_servable
 
-    isolated_migration_db.at("0160")
+    isolated_migration_db.at("0163")
     with pytest.raises(SchemaServingUnavailable):
         asyncio.run(assert_servable())
     config = alembic_config()
-    command.upgrade(config, "0164")
+    command.upgrade(config, "0167")
     _sql(
         "INSERT INTO curie.factory_intake_notices "
         "(tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, label_event_id, "
@@ -646,14 +646,14 @@ def test_intake_notice_migration_refuses_lossy_downgrade(isolated_migration_db: 
         "'https://github.com/acme-corp/acme-bot/issues/1', 'factory', 'actor_bot')"
     )
     with pytest.raises(RuntimeError, match="notices exist"):
-        command.downgrade(config, "0160")
+        command.downgrade(config, "0163")
     assert _rows("SELECT reason FROM curie.factory_intake_notices") == [{"reason": "actor_bot"}]
     _sql("DELETE FROM curie.factory_intake_notices")
-    command.downgrade(config, "0160")
+    command.downgrade(config, "0163")
     assert _rows("SELECT to_regclass('curie.factory_intake_notices') AS table_name") == [
         {"table_name": None}
     ]
-    command.upgrade(config, "0164")
+    command.upgrade(config, "0167")
 
 
 @pytest.mark.parametrize("case", ("signature", "disabled", "unserved", "outside", "pull_request"))

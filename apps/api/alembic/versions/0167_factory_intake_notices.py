@@ -1,7 +1,7 @@
 """Answer refused trigger-label additions through a leased outbox.
 
-Revision ID: 0164
-Revises: 0160
+Revision ID: 0167
+Revises: 0163
 """
 
 from collections.abc import Sequence
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0164"
-down_revision: str = "0160"
+revision: str = "0167"
+down_revision: str = "0163"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
