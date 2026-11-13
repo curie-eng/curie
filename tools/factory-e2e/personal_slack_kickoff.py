@@ -3520,9 +3520,11 @@ class LiveRun:
         )
         traces: list[dict[str, Any]] = []
         skeleton: dict[str, Any] = {}
+        transcripts: list[Mapping[str, bytes]] = []
         for pod in pods:
             with pod.lock:
                 files = pod.harvest.transcript_files()
+                transcripts.append(files)
                 findings.extend(
                     sks.capture_findings(
                         pod.trace,
@@ -3562,9 +3564,12 @@ class LiveRun:
             malformed=int(facts.malformed_lines) if facts is not None else 0,
         )
         self.ledger.record("budget", "settlement", settled)
-        # The launched set is the pod watcher and the runner's turn starts, not
-        # the harvest. A session that ran and left no transcript stays in it.
-        launched = sks.launched_sessions(self.reservations, self.launch_evidence())
+        # Runner launches are the pod watcher and the runner's turn starts.
+        # A subagent launch is an Agent or Task result in the main transcript.
+        # A harvested subagent file is not a launch.
+        launched = sks.launched_sessions(
+            self.reservations, self.launch_evidence(), transcripts=transcripts
+        )
         self.ledger.record("budget", "launched_sessions", launched)
         self.ledger.record(
             "budget",

@@ -883,12 +883,16 @@ breached, and the watchdog's recorded checks (`budget.guard_checks`) cover every
 response. An assistant record that carries usage is a response whether or not it
 has an id; an id-less one keeps a stable key and is never dropped. A check of an
 empty harvest does not count. The sessions the product started are recorded
-as `budget.launched_sessions`, from the runner pod watcher or a runner log
-turn start, and a guard row's `launched` flag is that record rather than a
-constant. A launched session with no harvested row fails. A session with any
-recorded turn, or one that record names, needs at least one response, every
-response checked, and a guard check after its first response. A completed
-run, one whose pull request exists, needs at least one launched implementer.
+as `budget.launched_sessions`. A runner session comes from the runner pod
+watcher or a runner log turn start. A subagent run recorded in the harvested
+main transcript, an Agent or Task tool use with its result, is an entry of
+that role whose source is the main transcript. A guard row's `launched` flag
+is that record rather than a constant. A launched runner session with no
+harvested row fails, and a launched subagent with no harvested row of its
+role fails with `subagent_unharvested`. A session with any recorded turn, or
+one that record names, needs at least one response, every response checked,
+and a guard check after its first response. A completed run, one whose pull
+request exists, needs at least one launched implementer.
 The item's earlier charge
 plus this attempt's stays at or under the recorded item cap. Whether usage is exact is
 reported as the `budget.usage_exact` observation with the capture rule's

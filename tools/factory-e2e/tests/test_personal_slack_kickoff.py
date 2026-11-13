@@ -3269,6 +3269,36 @@ def test_a_launched_session_missing_from_the_harvest_is_not_enforced(
         recorded.close()
 
 
+def test_a_reviewer_subagent_recorded_in_the_main_transcript_but_not_harvested_is_not_enforced(
+    tmp_path: Path,
+) -> None:
+    """Behavior: a reviewer subagent the main transcript records as run, with no harvested
+    reviewer row, fails the ceiling. The implementer the pod watcher launched stays covered."""
+
+    main = [
+        *_turns("msg_impl", IMPLEMENTER_MODEL, 2, 40, start=1),
+        _agent_call("toolu_plan", PLAN_KIND, 20),
+        _agent_result("toolu_plan", "plan01", 35),
+        _final("msg_impl_end", IMPLEMENTER_MODEL, 20, 40),
+    ]
+    files = _pod_files(main)
+    live = _budgeted(tmp_path)
+    run, ledger, pod = live.run, live.ledger, live.run.pods["uid-1"]
+    _feed_transcripts(pod, files)
+    live.clock.at = T0 + 50
+    run.tick()
+    run.settle()
+    assert ledger.observations("budget")["launched_sessions"] == [
+        {"role": sks.IMPLEMENTER, "seq": 1},
+        {"role": sks.PLAN_REVIEWER, "seq": 3, "source": "main_transcript"},
+    ]
+    assert [row["role"] for row in ledger.observations("budget")["guard_checks"]["sessions"]] == [
+        sks.IMPLEMENTER
+    ]
+    assert sks.ceiling_enforcement_failures(ledger) == ["subagent_unharvested"]
+    ledger.close()
+
+
 def test_a_missing_launched_set_is_not_enforced(tmp_path: Path) -> None:
     """Behavior: a budget ledger with no launched-set observation fails the ceiling,
     even when every harvested row is otherwise covered."""

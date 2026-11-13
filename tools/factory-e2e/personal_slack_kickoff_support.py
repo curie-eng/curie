@@ -3044,18 +3044,90 @@ def _judge_budget(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     }
 
 
+def _reviewer_role(subagent_type: Any) -> str | None:
+    """The reserved reviewer role a subagent type names, or None.
+
+    The native CLI records ``dark-factory:plan-reviewer`` and
+    ``dark-factory:diff-reviewer``. The role is the tail after the last colon.
+    """
+
+    if not isinstance(subagent_type, str):
+        return None
+    tail = subagent_type.rsplit(":", 1)[-1].strip()
+    return tail if tail in (PLAN_REVIEWER, DIFF_REVIEWER) else None
+
+
+def _main_transcript_records(files: Mapping[str, bytes]) -> list[dict[str, Any]]:
+    """Records of harvested main transcripts, sidechains left out. Pure."""
+
+    records: list[dict[str, Any]] = []
+    for name, data in files.items():
+        parts = PurePosixPath(name).parts
+        if "projects" not in parts or "subagents" in parts or not name.endswith(".jsonl"):
+            continue
+        parsed, _whole = _transcript_records(data)
+        records.extend(record for record in parsed if not record.get("isSidechain"))
+    return records
+
+
+def _recorded_reviewer_roles(records: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Reviewer roles of Agent or Task tool uses that a result says ran.
+
+    A result with ``is_error`` true did not run. The role comes from the tool
+    use's ``input.subagent_type``. One tool use is one run, in result order.
+    """
+
+    roles: dict[str, str] = {}
+    for record in records:
+        for item in _items(record):
+            if item.get("type") != "tool_use" or item.get("name") not in _AGENT_TOOLS:
+                continue
+            tool_input = item.get("input")
+            role = _reviewer_role(
+                tool_input.get("subagent_type") if isinstance(tool_input, dict) else None
+            )
+            use_id = item.get("id")
+            if role is not None and isinstance(use_id, str) and use_id:
+                roles[use_id] = role
+    started: list[str] = []
+    seen: set[str] = set()
+    for record in records:
+        for item in _items(record):
+            use_id = item.get("tool_use_id")
+            if (
+                item.get("type") != "tool_result"
+                or item.get("is_error") is True
+                or not isinstance(use_id, str)
+                or use_id not in roles
+                or use_id in seen
+            ):
+                continue
+            seen.add(use_id)
+            started.append(roles[use_id])
+    return started
+
+
 def launched_sessions(
     reservations: Sequence[Reservation],
     pods: Sequence[Mapping[str, Any]],
+    *,
+    transcripts: Sequence[Mapping[str, bytes]] = (),
 ) -> list[dict[str, Any]]:
-    """The runner sessions the product started. The harvest is not an input. Pure.
+    """The sessions the product started. Pure.
 
-    ``pods`` is the followed runners, in follow order. ``turn_starts`` is
-    ``(session id, timestamp)`` pairs from that pod's runner log, in log order.
-    Distinct session ids, in the order each id first appears, are sessions that
-    started. A pod whose native process ran (``ran``) and that logged no turn
-    start still started one runner session. Each start takes the next implementer
-    reservation. A start with none left is recorded with no seq.
+    Runner sessions come from ``pods``, in follow order, and never from a
+    harvested session. ``turn_starts`` is ``(session id, timestamp)`` pairs
+    from that pod's runner log, in log order. Distinct session ids, in the
+    order each id first appears, are sessions that started. A pod whose native
+    process ran (``ran``) and that logged no turn start still started one
+    runner session. Each start takes the next implementer reservation. A start
+    with none left is recorded with no seq.
+
+    ``transcripts`` is each followed pod's harvested files, in that same order.
+    A subagent run recorded in a main transcript, an Agent or Task tool use
+    answered by a result that is not an error, is an entry of that reviewer
+    role. Its ``source`` is ``main_transcript``. Each one takes the next
+    reservation of its role. A subagent file is not a launch.
     """
 
     pending = [item for item in reservations if item.role == IMPLEMENTER]
@@ -3075,6 +3147,19 @@ def launched_sessions(
             if pending:
                 row["seq"] = pending.pop(0).seq
             rows.append(row)
+    pending_reviewers = {
+        role: [item for item in reservations if item.role == role]
+        for role in (PLAN_REVIEWER, DIFF_REVIEWER)
+    }
+    for files in transcripts:
+        if not isinstance(files, Mapping):
+            continue
+        for role in _recorded_reviewer_roles(_main_transcript_records(files)):
+            queue = pending_reviewers[role]
+            if queue:
+                rows.append({"role": role, "seq": queue.pop(0).seq, "source": "main_transcript"})
+            else:
+                rows.append({"role": role, "source": "main_transcript"})
     return rows
 
 
@@ -3207,7 +3292,9 @@ def _guard_record_failures(guard: Any) -> list[str]:
 
 
 def _launch_record_ok(item: Any) -> bool:
-    if not isinstance(item, dict) or set(item) - {"seq", "role"}:
+    if not isinstance(item, dict) or set(item) - {"seq", "role", "source"}:
+        return False
+    if "source" in item and item.get("source") != "main_transcript":
         return False
     if item.get("role") not in ROLES:
         return False
@@ -3218,6 +3305,8 @@ def _launched_row(rows: Sequence[Any], entry: Mapping[str, Any], used: set[int])
     for index, row in enumerate(rows):
         if index in used or not isinstance(row, dict) or row.get("role") != entry.get("role"):
             continue
+        if entry.get("source") == "main_transcript":
+            return index
         if "seq" in entry:
             if row.get("seq") == entry.get("seq"):
                 return index
@@ -3226,13 +3315,20 @@ def _launched_row(rows: Sequence[Any], entry: Mapping[str, Any], used: set[int])
     return None
 
 
+def _subagent_launch(entry: Mapping[str, Any]) -> bool:
+    return entry.get("source") == "main_transcript"
+
+
 def _launched_set_failures(ledger: Ledger) -> list[str]:
     """Why ``budget.launched_sessions`` does not show every start harvested.
 
     The set is its own observation. A missing or malformed one fails closed, and
-    that is not the same as an empty set. Each entry needs a harvested guard row
-    whose ``launched`` flag was taken from this record. A product path that
-    opened a pull request needs a launched implementer.
+    that is not the same as an empty set. Each runner entry needs a harvested
+    guard row whose ``launched`` flag was taken from this record. A subagent
+    entry, one whose source is the main transcript, needs a harvested guard row
+    of its role under that same rule, and a missing row is
+    ``subagent_unharvested``. A product path that opened a pull request needs a
+    launched implementer.
     """
 
     budget = ledger.observations("budget")
@@ -3245,14 +3341,18 @@ def _launched_set_failures(ledger: Ledger) -> list[str]:
     guard = budget.get("guard_checks")
     rows = guard.get("sessions") if isinstance(guard, dict) else None
     if not isinstance(rows, list):
-        if launched:
+        if any(not _subagent_launch(item) for item in launched):
             failures.append("launched_unharvested")
+        if any(_subagent_launch(item) for item in launched):
+            failures.append("subagent_unharvested")
     else:
         used: set[int] = set()
         for entry in launched:
             index = _launched_row(rows, entry, used)
             if index is None:
-                failures.append("launched_unharvested")
+                failures.append(
+                    "subagent_unharvested" if _subagent_launch(entry) else "launched_unharvested"
+                )
                 continue
             used.add(index)
             if rows[index].get("launched") is not True:
@@ -3274,11 +3374,14 @@ def ceiling_enforcement_failures(ledger: Ledger) -> list[str]:
     Every session's charge, observed or its full reservation share when unknown, stays
     inside its bounds and the attempt's; no bound was breached; every assistant record
     that carries usage is a response, id or not. The launched set is its own
-    observation, taken from the pod watcher or a runner log turn start, and a guard
-    row's ``launched`` flag is that record. Every launched session has a harvested
-    row with at least one response, every response checked, and a guard check after
-    its first response. A session with a recorded turn has the same coverage. A
-    product path that opened a pull request has at least one launched implementer.
+    observation. A runner session comes from the pod watcher or a runner log turn
+    start. A subagent run recorded in the main transcript is an entry of that role
+    whose source is the main transcript. A guard row's ``launched`` flag is that
+    record. Every launched session has a harvested row of its role with at least one
+    response, every response checked, and a guard check after its first response. A
+    launched subagent with no such row fails with ``subagent_unharvested``. A session
+    with a recorded turn has the same coverage. A product path that opened a pull
+    request has at least one launched implementer.
     A check of an empty harvest does not count. The item's earlier charge plus this
     attempt's stays at or under the recorded item cap.
     """
