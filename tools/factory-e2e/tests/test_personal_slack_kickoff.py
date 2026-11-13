@@ -4577,7 +4577,9 @@ def test_ceiling_is_the_exact_approval_and_the_gate_holds_parallel_starts(tmp_pa
 
     gate = _private(tmp_path / "hooks")
     (gate / sks.RESERVATION_GATE_FILE).write_text(sks.RESERVATION_GATE_PROGRAM)
-    shutil.copy(psk.REPO_ROOT / psk.BUNDLE_SOURCE / "hooks" / "review_gate.py", gate)
+    # review_gate loads decisions_section.py from its own directory at import.
+    for name in ("review_gate.py", "decisions_section.py"):
+        shutil.copy(psk.REPO_ROOT / psk.BUNDLE_SOURCE / "hooks" / name, gate)
     slots = tmp_path / "reservations"
     environment = {"PATH": "/usr/bin:/bin", "PSK_RESERVATION_DIR": str(slots)}
 
