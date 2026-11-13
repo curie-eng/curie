@@ -1483,6 +1483,19 @@ pub(crate) enum AgentSkillsAction {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // Clap owns the existing wide quickstart arguments; the small skills verb shares this command group.
 pub(crate) enum FactoryAction {
+    /// Read the factory pull requests that record why a GitHub issue changed.
+    ///
+    /// ISSUE is owner/repo#number or a github.com issue URL. Login is GH_TOKEN,
+    /// then GITHUB_TOKEN, then `gh auth token`. This command never reads the
+    /// Curie platform key.
+    Explain {
+        /// GitHub issue, as owner/repo#number or a github.com issue URL.
+        reference: String,
+        /// GitHub API root. Any host other than api.github.com is passed to
+        /// `gh auth token --hostname`.
+        #[arg(long, default_value = "https://api.github.com")]
+        api_url: String,
+    },
     /// Install the local Software Factory preparation, review, and admin skills.
     Skills {
         #[command(subcommand)]

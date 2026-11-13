@@ -196,6 +196,12 @@
       "version": "2.0"
     },
     {
+      "result": "FactoryExplainOutput",
+      "kind": "CliOutput",
+      "schema": "factory-explain.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "FactoryIntakeOutput",
       "kind": "CliOutput",
       "schema": "factory.schema.json",

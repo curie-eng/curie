@@ -1,0 +1,254 @@
+{
+  "cases": [
+    {
+      "id": "one-entry",
+      "valid": true,
+      "body": "Notes before the heading stay outside it.\n## Decisions\n1. Keep the forge read on the caller token. Rejected: Read the platform key, because that key belongs to the cluster. (plan) Evidence: the command sends only the caller token.\n",
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the forge read on the caller token",
+          "rejected": "Read the platform key",
+          "reason": "that key belongs to the cluster",
+          "source": "plan",
+          "evidence": "the command sends only the caller token"
+        }
+      ]
+    },
+    {
+      "id": "three-sources",
+      "valid": true,
+      "body": "## Decisions\n1. Print every match. Rejected: Print only the newest, because an older record can still be the one that landed. (plan) Evidence: several pull requests can carry the marker.\n2. Clip the review text. Rejected: Print the whole body, because the reviews heading already bounds it. (plan review) Evidence: the clip stops at two thousand characters.\n3. Count each check name once. Rejected: Count every run, because a rerun replaces the earlier result. (diff review) Evidence: the latest conclusion wins.\n",
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Print every match",
+          "rejected": "Print only the newest",
+          "reason": "an older record can still be the one that landed",
+          "source": "plan",
+          "evidence": "several pull requests can carry the marker"
+        },
+        {
+          "n": 2,
+          "choice": "Clip the review text",
+          "rejected": "Print the whole body",
+          "reason": "the reviews heading already bounds it",
+          "source": "plan review",
+          "evidence": "the clip stops at two thousand characters"
+        },
+        {
+          "n": 3,
+          "choice": "Count each check name once",
+          "rejected": "Count every run",
+          "reason": "a rerun replaces the earlier result",
+          "source": "diff review",
+          "evidence": "the latest conclusion wins"
+        }
+      ]
+    },
+    {
+      "id": "none-line",
+      "valid": true,
+      "body": "## Decisions\nNone: the change follows directly from the acceptance criteria.\n",
+      "entries": []
+    },
+    {
+      "id": "none-with-blank-lines",
+      "valid": true,
+      "body": "Intro.\n\n## Decisions\n\nNone: the change follows directly from the acceptance criteria.\n\n## Later\nignored\n",
+      "entries": []
+    },
+    {
+      "id": "seven-entries",
+      "valid": true,
+      "body": "## Decisions\n1. One. Rejected: Skip one, because one was a real choice. (plan) Evidence: row one.\n2. Two. Rejected: Skip two, because two was a real choice. (plan) Evidence: row two.\n3. Three. Rejected: Skip three, because three was a real choice. (plan) Evidence: row three.\n4. Four. Rejected: Skip four, because four was a real choice. (plan) Evidence: row four.\n5. Five. Rejected: Skip five, because five was a real choice. (plan review) Evidence: row five.\n6. Six. Rejected: Skip six, because six was a real choice. (plan review) Evidence: row six.\n7. Seven. Rejected: Skip seven, because seven was a real choice. (diff review) Evidence: row seven.\n",
+      "entries": [
+        {"n": 1, "choice": "One", "rejected": "Skip one", "reason": "one was a real choice", "source": "plan", "evidence": "row one"},
+        {"n": 2, "choice": "Two", "rejected": "Skip two", "reason": "two was a real choice", "source": "plan", "evidence": "row two"},
+        {"n": 3, "choice": "Three", "rejected": "Skip three", "reason": "three was a real choice", "source": "plan", "evidence": "row three"},
+        {"n": 4, "choice": "Four", "rejected": "Skip four", "reason": "four was a real choice", "source": "plan", "evidence": "row four"},
+        {"n": 5, "choice": "Five", "rejected": "Skip five", "reason": "five was a real choice", "source": "plan review", "evidence": "row five"},
+        {"n": 6, "choice": "Six", "rejected": "Skip six", "reason": "six was a real choice", "source": "plan review", "evidence": "row six"},
+        {"n": 7, "choice": "Seven", "rejected": "Skip seven", "reason": "seven was a real choice", "source": "diff review", "evidence": "row seven"}
+      ]
+    },
+    {
+      "id": "blank-lines-between-entries",
+      "valid": true,
+      "body": "## Decisions\n\n1. Keep blanks out of the entry list. Rejected: Treat a blank as an entry, because a blank carries no choice. (plan) Evidence: blank lines are skipped.\n\n2. Stop at the next heading. Rejected: Read to the end of the body, because a later heading is a different section. (diff review) Evidence: the section ends at the next heading.\n\n## Reviews\nnot part of the decisions\n",
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep blanks out of the entry list",
+          "rejected": "Treat a blank as an entry",
+          "reason": "a blank carries no choice",
+          "source": "plan",
+          "evidence": "blank lines are skipped"
+        },
+        {
+          "n": 2,
+          "choice": "Stop at the next heading",
+          "rejected": "Read to the end of the body",
+          "reason": "a later heading is a different section",
+          "source": "diff review",
+          "evidence": "the section ends at the next heading"
+        }
+      ]
+    },
+    {
+      "id": "crlf",
+      "valid": true,
+      "body": "## Decisions\r\n1. Accept CRLF. Rejected: Require LF only, because GitHub bodies can use either. (plan) Evidence: the carriage return is stripped.\r\n",
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Accept CRLF",
+          "rejected": "Require LF only",
+          "reason": "GitHub bodies can use either",
+          "source": "plan",
+          "evidence": "the carriage return is stripped"
+        }
+      ]
+    },
+    {
+      "id": "eight-entries",
+      "valid": false,
+      "body": "## Decisions\n1. One. Rejected: Skip one, because one was a real choice. (plan) Evidence: row one.\n2. Two. Rejected: Skip two, because two was a real choice. (plan) Evidence: row two.\n3. Three. Rejected: Skip three, because three was a real choice. (plan) Evidence: row three.\n4. Four. Rejected: Skip four, because four was a real choice. (plan) Evidence: row four.\n5. Five. Rejected: Skip five, because five was a real choice. (plan) Evidence: row five.\n6. Six. Rejected: Skip six, because six was a real choice. (plan) Evidence: row six.\n7. Seven. Rejected: Skip seven, because seven was a real choice. (plan) Evidence: row seven.\n8. Eight. Rejected: Skip eight, because eight exceeds the cap. (plan) Evidence: row eight.\n"
+    },
+    {
+      "id": "bad-source",
+      "valid": false,
+      "body": "## Decisions\n1. Keep the source list closed. Rejected: Accept any word, because the grammar names three sources. (author) Evidence: author is not a source.\n"
+    },
+    {
+      "id": "gap",
+      "valid": false,
+      "body": "## Decisions\n1. First. Rejected: Skip first, because the numbers must be contiguous. (plan) Evidence: row one.\n3. Third. Rejected: Skip third, because two is missing. (plan) Evidence: row three.\n"
+    },
+    {
+      "id": "starts-at-two",
+      "valid": false,
+      "body": "## Decisions\n2. Second. Rejected: Start at two, because the first number is one. (plan) Evidence: the list starts at two.\n"
+    },
+    {
+      "id": "starts-at-zero",
+      "valid": false,
+      "body": "## Decisions\n0. Zero. Rejected: Start at zero, because the first number is one. (plan) Evidence: a leading zero is not a number here.\n"
+    },
+    {
+      "id": "duplicate-heading",
+      "valid": false,
+      "body": "## Decisions\n1. Keep one heading. Rejected: Allow a second heading, because two headings make the section ambiguous. (plan) Evidence: the first section is well formed.\n## Decisions\n1. Second copy. Rejected: Keep it, because a second heading is invalid. (plan) Evidence: the whole body is unparsed.\n"
+    },
+    {
+      "id": "missing-heading",
+      "valid": false,
+      "body": "1. This line is not under the heading. Rejected: Guess a heading, because the heading must be exact. (plan) Evidence: there is no heading.\n"
+    },
+    {
+      "id": "empty-body",
+      "valid": false,
+      "body": ""
+    },
+    {
+      "id": "malformed-line",
+      "valid": false,
+      "body": "## Decisions\nthis line is not an entry\n"
+    },
+    {
+      "id": "trailing-space",
+      "valid": false,
+      "body": "## Decisions\n1. Trim is not applied. Rejected: Strip the trailing space, because the line must match exactly. (plan) Evidence: a trailing space remains. \n"
+    },
+    {
+      "id": "none-mixed-with-entry",
+      "valid": false,
+      "body": "## Decisions\nNone: the change follows directly from the acceptance criteria.\n1. Also an entry. Rejected: Mix them, because none stands alone. (plan) Evidence: both lines are present.\n"
+    },
+    {
+      "id": "heading-case",
+      "valid": false,
+      "body": "## decisions\n1. Case must match. Rejected: Fold case, because the heading is exact. (plan) Evidence: the heading is lowercase.\n"
+    },
+    {
+      "id": "hash-checks-does-not-end-section",
+      "valid": false,
+      "body": "## Decisions\n1. Stop only at a real heading. Rejected: Stop at any hashes, because the terminator is a heading line. (plan) Evidence: the next line is not a heading.\n##Checks\n"
+    },
+    {
+      "id": "empty-section",
+      "valid": false,
+      "body": "## Decisions\n\n## Reviews\nstill empty\n"
+    },
+    {
+      "id": "heading-at-end",
+      "valid": false,
+      "body": "## Decisions"
+    },
+    {
+      "id": "leading-space",
+      "valid": false,
+      "body": "## Decisions\n 1. Leading space. Rejected: Trim it, because the line must match exactly. (plan) Evidence: a leading space remains.\n"
+    },
+    {
+      "id": "wrong-none-text",
+      "valid": false,
+      "body": "## Decisions\nNone: there was no choice.\n"
+    },
+    {
+      "id": "duplicate-none",
+      "valid": false,
+      "body": "## Decisions\nNone: the change follows directly from the acceptance criteria.\nNone: the change follows directly from the acceptance criteria.\n"
+    },
+    {
+      "id": "third-level-heading",
+      "valid": false,
+      "body": "### Decisions\n1. A deeper heading is not the section. Rejected: Accept it, because the heading level is exact. (plan) Evidence: three hashes.\n"
+    },
+    {
+      "id": "heading-trailing-space",
+      "valid": false,
+      "body": "## Decisions \n1. The heading has a trailing space. Rejected: Trim the heading, because only the exact line counts. (plan) Evidence: the space is still there.\n"
+    },
+    {
+      "id": "source-case",
+      "valid": false,
+      "body": "## Decisions\n1. Sources are lowercase. Rejected: Accept Plan, because the source tokens are exact. (Plan) Evidence: the capital does not match.\n"
+    },
+    {
+      "id": "null-body",
+      "valid": false,
+      "body": null
+    },
+    {
+      "id": "number-body",
+      "valid": false,
+      "body": 7
+    },
+    {
+      "id": "object-body",
+      "valid": false,
+      "body": {"text": "## Decisions"}
+    },
+    {
+      "id": "list-body",
+      "valid": false,
+      "body": ["## Decisions"]
+    },
+    {
+      "id": "reason-contains-source-delimiter",
+      "valid": true,
+      "body": "## Decisions\n1. Keep the last source delimiter. Rejected: Split on the first period, because a reason may say . (See the benchmark.) before the source. (plan) Evidence: the source token is still plan.\n",
+      "entries": [
+        {
+          "n": 1,
+          "choice": "Keep the last source delimiter",
+          "rejected": "Split on the first period",
+          "reason": "a reason may say . (See the benchmark.) before the source",
+          "source": "plan",
+          "evidence": "the source token is still plan"
+        }
+      ]
+    }
+  ]
+}

@@ -16,6 +16,10 @@ name = "integration"
 path = "tests/integration.rs"
 
 [[test]]
+name = "factory_explain"
+path = "tests/factory_explain.rs"
+
+[[test]]
 name = "dev_test_env"
 path = "tests/dev_test_env.rs"
 
