@@ -3372,6 +3372,7 @@ def _install_approval_telemetry(monkeypatch: pytest.MonkeyPatch) -> _ApprovalTel
     return probe
 
 
+@pytest.mark.usefixtures("fresh_agent_metric_labels")
 @pytest.mark.parametrize("agent_name", [None, "acme-metrics", "unbound"])
 def test_pending_age_resolved_and_expired_approval_metrics_are_bounded(
     approvals_client: TestClient,

@@ -312,6 +312,7 @@ class _MetricBinding:
         return BehaviorPacks()
 
 
+@pytest.mark.usefixtures("fresh_agent_metric_labels")
 @pytest.mark.parametrize(
     ("agent_name", "expected"),
     [("acme-bot", "acme-bot"), ("other", "other"), ("unbound", "other"),
@@ -826,6 +827,7 @@ class _Approvals:
         return CreatedApproval(id=f"appr-example-{len(self.requests)}", status="pending")
 
 
+@pytest.mark.usefixtures("fresh_agent_metric_labels")
 @pytest.mark.parametrize("agent_name", [None, "acme-bot", "unbound"])
 def test_approval_suspend_and_resume_have_bounded_lifecycle_outcomes(
     make_harness,

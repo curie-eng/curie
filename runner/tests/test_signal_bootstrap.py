@@ -277,6 +277,7 @@ def test_runner_turn_records_declared_metrics_through_configured_provider() -> N
         provider.shutdown()
 
 
+@pytest.mark.usefixtures("fresh_agent_metric_labels")
 @pytest.mark.parametrize(("agent_name", "expected"), [
     ("acme-bot", "acme-bot"), ("unbound", "other"), ("not a slug", "other"),
 ])
