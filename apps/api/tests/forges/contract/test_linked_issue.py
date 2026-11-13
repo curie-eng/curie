@@ -232,3 +232,74 @@ async def test_a_source_outside_the_tracker_is_not_found(harness: AdapterHarness
 
     assert linked.write_count() == writes
     assert linked.sent_issue_bodies() == []
+
+
+@pytest.mark.anyio
+async def test_a_retry_naming_the_recorded_issue_returns_it_without_creating(
+    harness: AdapterHarness,
+) -> None:
+    linked = _linked(harness)
+    source = linked.seed_issue("Source", "Triage this.")
+    recorded = await _create(linked, source)
+    writes, count = linked.write_count(), linked.issue_count()
+
+    again = await linked.tracker.create_linked_issue(
+        source,
+        output_identity=OUTPUT,
+        title=TITLE,
+        body=BODY,
+        labels=LABELS,
+        expected=recorded.issue,
+    )
+
+    assert again.issue == recorded.issue and again.created is False
+    assert again.body_sha256 == again.sent_body_sha256 == recorded.sent_body_sha256
+    assert linked.write_count() == writes and linked.issue_count() == count
+    assert len(linked.sent_issue_bodies()) == 1
+
+
+@pytest.mark.anyio
+async def test_a_retry_naming_an_issue_whose_marker_was_removed_never_creates(
+    harness: AdapterHarness,
+) -> None:
+    linked = _linked(harness)
+    source = linked.seed_issue("Source", "Triage this.")
+    recorded = await _create(linked, source)
+    linked.edit_issue_body(recorded.issue, "Someone rewrote this issue.")
+    writes, count = linked.write_count(), linked.issue_count()
+
+    with pytest.raises(NotFound, match="linked_issue"):
+        await linked.tracker.create_linked_issue(
+            source,
+            output_identity=OUTPUT,
+            title=TITLE,
+            body=BODY,
+            labels=LABELS,
+            expected=recorded.issue,
+        )
+
+    assert linked.write_count() == writes and linked.issue_count() == count
+    assert len(linked.sent_issue_bodies()) == 1
+    assert linked.marked_issue_count(OUTPUT) == 0
+
+
+@pytest.mark.anyio
+async def test_a_retry_naming_another_issue_than_the_one_match_is_not_found(
+    harness: AdapterHarness,
+) -> None:
+    linked = _linked(harness)
+    source = linked.seed_issue("Source", "Triage this.")
+    await _create(linked, source)
+    writes, count = linked.write_count(), linked.issue_count()
+
+    with pytest.raises(NotFound, match="linked_issue"):
+        await linked.tracker.create_linked_issue(
+            source,
+            output_identity=OUTPUT,
+            title=TITLE,
+            body=BODY,
+            labels=LABELS,
+            expected=source,
+        )
+
+    assert linked.write_count() == writes and linked.issue_count() == count

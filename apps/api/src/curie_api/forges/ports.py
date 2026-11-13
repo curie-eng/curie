@@ -167,6 +167,7 @@ class Tracker(Protocol):
         title: str,
         body: str,
         labels: Collection[str],
+        expected: TrackerIssueRef | None = None,
     ) -> LinkedIssue:
         """Optional: one new issue in ``source``'s own scope, linked to it (ADR 0277).
 
@@ -188,6 +189,14 @@ class Tracker(Protocol):
         adapter declares `Operation.CREATE_LINKED_ISSUE` unsupported (GitLab
         and Jira Cloud). Callers compare the returned `LinkedIssue.body_sha256`
         with `LinkedIssue.sent_body_sha256` before recording delivery.
+
+        ``expected`` is for a retry after the caller has recorded the output
+        issue: the adapter then never creates. It runs the same lookup; exactly
+        one match equal to ``expected`` is returned with a fresh read-back
+        (``created`` False); no match, or a match that is not ``expected``,
+        raises ``NotFound("linked_issue")``, so an issue whose marker was
+        removed is never replaced by a second one. Two matches still raise
+        `Ambiguous`. None keeps the create-or-reconcile behaviour above.
         """
         ...
 

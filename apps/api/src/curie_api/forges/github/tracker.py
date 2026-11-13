@@ -801,6 +801,7 @@ class GitHubTracker:
         title: str,
         body: str,
         labels: Collection[str],
+        expected: TrackerIssueRef | None = None,
     ) -> LinkedIssue:
         """One issue in this repository linked to ``source`` (ADR 0277).
 
@@ -810,7 +811,9 @@ class GitHubTracker:
         lookup (`_linked_matches`) runs before the create and again after an
         uncertain create; one match reconciles, none after an uncertain
         create is `Unavailable("linked_issue_unconfirmed")`, two or more are
-        `Ambiguous`. The issue is then read back
+        `Ambiguous`. With ``expected`` nothing is created: one match equal to
+        it is read back, anything else is ``NotFound("linked_issue")``. The
+        issue is then read back
         (https://docs.github.com/en/rest/issues/issues#get-an-issue) for its
         body digest, labels and ``html_url``.
         """
@@ -821,6 +824,11 @@ class GitHubTracker:
         text = linked_issue_body(body, related=f"Related to #{source_number}.", embedded=embedded)
         own = await self._own_login()
         number = await self._single(own, embedded)
+        if expected is not None:
+            # A recorded output is only ever reconciled, never recreated.
+            if number is None or self.issue(number) != expected:
+                raise NotFound("linked_issue")
+            return await self._linked_issue(number, text, created=False)
         created = False
         if number is None:
             number = await self._create_issue(title, text, labels)

@@ -632,12 +632,14 @@ class InMemoryTracker(_Declared):
         title: str,
         body: str,
         labels: Collection[str],
+        expected: TrackerIssueRef | None = None,
     ) -> LinkedIssue:
         """The port operation over dict state; honours ``write_faults`` for
         `Operation.CREATE_LINKED_ISSUE`. The related-source line is
         ``Related to <issue_url(source)>.``; the marker is
         `embed_linked_marker`. A create counts one ledger write and appends
-        the composed body to ``sent_issue_bodies``."""
+        the composed body to ``sent_issue_bodies``. With ``expected`` it
+        never creates (see the port)."""
 
         self._gate(Operation.CREATE_LINKED_ISSUE)
         valid_output_identity(output_identity)
@@ -650,6 +652,9 @@ class InMemoryTracker(_Declared):
         matches = self._own_marked(embedded)
         if len(matches) > 1:
             raise Ambiguous("linked_issue")
+        if expected is not None and (not matches or matches[0].ref != expected):
+            # A recorded output is only ever reconciled, never recreated.
+            raise NotFound("linked_issue")
         created = not matches
         if matches:
             found = matches[0]

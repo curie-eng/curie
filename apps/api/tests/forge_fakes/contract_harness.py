@@ -171,6 +171,12 @@ class LinkedIssueHarness(AdapterHarness, Protocol):
     def embed_linked_marker(self, output_identity: str) -> str:
         """The marker line exactly as the adapter embeds it."""
 
+    def edit_issue_body(self, issue: TrackerIssueRef, body: str) -> None:
+        """A person replaces the issue's body from outside the port."""
+
+    def issue_count(self) -> int:
+        """Issues in the tracker's scope, pull requests excluded."""
+
 
 async def open_pull(harness: AdapterHarness, branch: str) -> PullRequest:
     """Push ``branch`` and open a pull request from it through the port."""
@@ -336,6 +342,12 @@ class InMemoryHarness:
 
     def embed_linked_marker(self, output_identity: str) -> str:
         return InMemoryTracker.embed_linked_marker(output_identity)
+
+    def edit_issue_body(self, issue: TrackerIssueRef, body: str) -> None:
+        self._tracker.edit_issue_body(issue, body)
+
+    def issue_count(self) -> int:
+        return len(self._tracker.issues())
 
 
 class _ObservedEvidenceCodeHost(InMemoryCodeHost):
@@ -580,6 +592,12 @@ class GitHubHarness:
 
     def embed_linked_marker(self, output_identity: str) -> str:
         return GitHubTracker.embed_linked_marker(output_identity)
+
+    def edit_issue_body(self, issue: TrackerIssueRef, body: str) -> None:
+        self.fake.issues[int(issue.issue_id)]["body"] = body
+
+    def issue_count(self) -> int:
+        return sum("pull_request" not in issue for issue in self.fake.issues.values())
 
 
 class JiraGitHubHarness:
