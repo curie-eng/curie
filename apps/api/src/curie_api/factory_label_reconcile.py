@@ -29,12 +29,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
-from . import github_factory
+from . import factory_intake_notices, github_factory
 from .config import Settings
 from .forges.errors import Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND
 from .forges.github.comments import static_token
-from .forges.github.review_polling import label_actor
 from .forges.github.tracker import GitHubTracker, last_label_event, read_repository
 from .forges.hosts import factory_credentials, factory_tracker
 from .forges.identity import reconcile_delivery_id
@@ -201,15 +200,9 @@ async def _reconcile_label(
     ]
     if not numbers:
         return 0
-    async with sessionmaker() as session:
-        missing = [
-            number
-            for number in numbers
-            if await github_factory.work_item_for(session, tracker.issue(number)) is None
-        ]
     grace = timedelta(seconds=settings.factory_reconcile_grace_s)
     admitted = 0
-    for number in missing:
+    for number in numbers:
         try:
             events = await tracker.issue_events(number)
         except Unavailable:
@@ -222,11 +215,6 @@ async def _reconcile_label(
         if labeled_at is None or labeled_at > now - grace:
             # A delivery may still be in flight; let it land first.
             continue
-        try:
-            sender_id, sender_login = label_actor(event, app_id=tracker.app_id)
-        except FeedbackIgnored as exc:
-            logger.info("factory label actor refused %s#%d: %s", repo, number, exc.code)
-            continue
         notice = FactoryNotice(
             reconcile_delivery_id(tracker.issue(number), str(event["id"])),
             "issues",
@@ -236,12 +224,13 @@ async def _reconcile_label(
             repository_id,
             repo,
             number,
-            sender_id,
-            sender_login,
+            0,
+            "",
             label_event_at=labeled_at,
             label=label,
             label_event_id=event["id"],
         )
+        notice = factory_intake_notices.observe_label(notice, event, app_id=tracker.app_id)
         if await _admit(sessionmaker, settings, client, notice, tracker, repository):
             admitted += 1
     return admitted
@@ -259,10 +248,6 @@ async def _admit(
         try:
             issue = github_factory.notice_issue(notice, forges_registry(settings))
             await github_factory.lock_issue(session, issue)
-            # A delivery may have admitted it since the listing; the lock orders us.
-            if await github_factory.work_item_for(session, issue) is not None:
-                await session.rollback()
-                return False
             verified = await github_factory.verify_polled(
                 notice,
                 settings=settings,
@@ -271,7 +256,7 @@ async def _admit(
                 repository=repository,
             )
             outcome = await github_factory.admit_notice(
-                session, notice, settings, verified, client=client
+                session, notice, settings, verified, client=client, reconcile_only=True
             )
         except (FeedbackUnavailable, FeedbackIgnored) as exc:
             await session.rollback()
@@ -283,6 +268,12 @@ async def _admit(
             )
             return False
         await session.commit()
+    await factory_intake_notices.sync_intake_notices(
+        sessionmaker,
+        settings,
+        owner="label-reconcile",
+        client=client,
+    )
     if outcome.status != "factory_admitted":
         return False
     logger.warning(

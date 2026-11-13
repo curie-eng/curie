@@ -86,7 +86,7 @@ from curie_api.forges.types import (
     valid_output_identity,
 )
 from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_login
-from curie_api.github_review_events import FeedbackIgnored
+from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable
 from curie_api.github_review_truth import verify_sender_write_permission
 from curie_api.repo_full_name import repo_url_path
 
@@ -1181,19 +1181,29 @@ class GitHubTracker:
                 if issue.get("state") != "open":
                     raise FactoryRefused("issue_not_open")
                 await self._verify_mention(notice, token)
-        await verify_sender_write_permission(
-            self._client,
-            api=self._api,
-            token=token,
-            repo_path=self._repo_path,
-            sender_id=notice.sender_id,
-            sender_login=notice.sender_login,
-        )
+        if notice.disposition != "admit":
+            await verify_sender_write_permission(
+                self._client, api=self._api, token=token, repo_path=self._repo_path,
+                sender_id=notice.sender_id, sender_login=notice.sender_login,
+            )
         default_branch = repository.get("default_branch")
         return IssueFacts(
             labels=names,
             default_branch=default_branch if isinstance(default_branch, str) else None,
         )
+
+    async def label_permission(self, notice: FactoryNotice) -> str | None:
+        """Authorize a canonical actor after duplicate and delegated-output checks."""
+        try:
+            await verify_sender_write_permission(
+                self._client, api=self._api, token=await self._token(), repo_path=self._repo_path,
+                sender_id=notice.sender_id, sender_login=notice.sender_login,
+            )
+        except FeedbackIgnored as exc:
+            if exc.code == "sender_permission_refused":
+                return "actor_no_permission"
+            raise FeedbackUnavailable("sender_permission_unavailable") from None
+        return None
 
     async def _verify_mention(self, notice: FactoryNotice, token: str) -> None:
         comment = await get_github_json(
