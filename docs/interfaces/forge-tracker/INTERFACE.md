@@ -79,10 +79,14 @@ marked and described:
     adapter lists the scope's issues its own identity created (never a search
     API) and reconciles to the one whose last non-empty line is the marker. A
     marker in an issue anyone else created counts for nothing, and two matches
-    raise `Ambiguous` without writing. A retry after the platform recorded
-    the output issue passes it as `expected`: the adapter then never creates,
-    returns the one match only when it is that issue, and otherwise raises
-    `NotFound("linked_issue")`, so removing the marker from a recorded issue
+    raise `Ambiguous` without writing. The creator-filtered listing can lag a
+    create by seconds (observed on GitHub), so a caller that has recorded the
+    output issue passes it as `expected`, and a caller retrying a create it
+    could not confirm waits past that lag first. With `expected` the adapter
+    never lists and never creates: it reads that issue directly and returns it
+    only when it is an issue, not a pull request, its own identity created it,
+    and its last non-empty line is the marker; anything else raises
+    `NotFound("linked_issue")`, so a recorded issue whose marker was removed
     never yields a second one. The GitHub and in-memory adapters
     implement it; GitLab and Jira Cloud declare it unsupported and raise
     `Unsupported`.

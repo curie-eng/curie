@@ -177,6 +177,9 @@ class LinkedIssueHarness(AdapterHarness, Protocol):
     def issue_count(self) -> int:
         """Issues in the tracker's scope, pull requests excluded."""
 
+    def listing_count(self) -> int:
+        """How many own-issue listing reads the adapter has made; compared only for change."""
+
 
 async def open_pull(harness: AdapterHarness, branch: str) -> PullRequest:
     """Push ``branch`` and open a pull request from it through the port."""
@@ -348,6 +351,9 @@ class InMemoryHarness:
 
     def issue_count(self) -> int:
         return len(self._tracker.issues())
+
+    def listing_count(self) -> int:
+        return self._tracker.linked_listings
 
 
 class _ObservedEvidenceCodeHost(InMemoryCodeHost):
@@ -598,6 +604,12 @@ class GitHubHarness:
 
     def issue_count(self) -> int:
         return sum("pull_request" not in issue for issue in self.fake.issues.values())
+
+    def listing_count(self) -> int:
+        """Pages of the repository issue listing requested, not lookups."""
+
+        path = f"/repos/{REPO}/issues"
+        return sum(r.method == "GET" and r.url.path == path for r in self.fake.http_requests)
 
 
 class JiraGitHubHarness:

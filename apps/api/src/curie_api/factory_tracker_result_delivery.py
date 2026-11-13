@@ -81,6 +81,18 @@ every later attempt passes it as ``expected`` to `Tracker.create_linked_issue`,
 which then never creates: an issue whose marker is gone is ``output_missing``
 (owed until the deadline), never replaced by a second issue.
 
+Listing lag. Before an output is recorded, a retry finds an earlier create
+only through the tracker's creator-filtered issue listing, which can lag a
+create by seconds. So when the linked issue call raises `Unavailable` and no
+output is recorded (the create may have been written but was not confirmed),
+the attempt records ``tracker_unavailable`` with ``next_attempt_at`` at least
+`LISTING_SETTLE_SECONDS` out (the larger of that and the normal backoff), and
+`due_deliveries` does not return the row before then. A process that dies
+after an unconfirmed create is covered the same way by the attempt lease:
+the next attempt cannot claim for `ATTEMPT_LEASE_SECONDS` (120), which exceeds
+`LISTING_SETTLE_SECONDS`. Once an output is recorded, ``expected`` reads it
+directly and no listing is involved.
+
 Rechecks. Immediately before each tracker write (the linked issue call and the
 comment upsert) an attempt rechecks the deadline and fences 1 to 5 against the
 locked delivery row; a failure settles failed with that code and the write is
@@ -145,6 +157,9 @@ logger = logging.getLogger("curie_api.factory_tracker_results")
 
 RESULT_MARKER_PREFIX = "curie-tracker-result:"
 ATTEMPT_LEASE_SECONDS = 120
+# How long a tracker's own-identity issue listing may lag a create it answered
+# uncertainly (seen against GitHub: seconds). See "Listing lag" above.
+LISTING_SETTLE_SECONDS = 60
 
 
 def output_identity_for(execution_request_id: uuid.UUID) -> str:
@@ -793,12 +808,21 @@ async def _record_error(
     claim: _Claim,
     code: AttemptError,
     settings: Settings,
+    *,
+    at_least_seconds: int = 0,
 ) -> DeliveryOutcome:
-    """Record ``code``, back off, release the lease; the delivery stays owed."""
+    """Record ``code``, back off, release the lease; the delivery stays owed.
 
-    backoff = min(
-        settings.work_item_backoff_base_seconds * 2 ** max(claim.attempts - 1, 0),
-        settings.work_item_backoff_max_seconds,
+    ``next_attempt_at`` moves out by the WorkItem backoff, or by
+    ``at_least_seconds`` when that is longer.
+    """
+
+    backoff = max(
+        min(
+            settings.work_item_backoff_base_seconds * 2 ** max(claim.attempts - 1, 0),
+            settings.work_item_backoff_max_seconds,
+        ),
+        at_least_seconds,
     )
     async with sessionmaker() as session:
         await session.execute(
@@ -1051,6 +1075,17 @@ async def deliver(
                     raise
                 return await _record_error(
                     sessionmaker, claim, AttemptError.OUTPUT_MISSING, settings
+                )
+            except Unavailable:
+                if claim.recorded is not None:
+                    raise
+                # The create may be written but not yet listed; let the listing settle.
+                return await _record_error(
+                    sessionmaker,
+                    claim,
+                    AttemptError.TRACKER_UNAVAILABLE,
+                    settings,
+                    at_least_seconds=LISTING_SETTLE_SECONDS,
                 )
             if linked.body_sha256 != linked.sent_body_sha256:
                 return await _record_error(

@@ -811,9 +811,9 @@ class GitHubTracker:
         lookup (`_linked_matches`) runs before the create and again after an
         uncertain create; one match reconciles, none after an uncertain
         create is `Unavailable("linked_issue_unconfirmed")`, two or more are
-        `Ambiguous`. With ``expected`` nothing is created: one match equal to
-        it is read back, anything else is ``NotFound("linked_issue")``. The
-        issue is then read back
+        `Ambiguous`. The listing can lag a create by seconds, so with
+        ``expected`` nothing is listed or created: `_recorded_issue` reads that
+        issue directly. The issue is then read back
         (https://docs.github.com/en/rest/issues/issues#get-an-issue) for its
         body digest, labels and ``html_url``.
         """
@@ -823,12 +823,9 @@ class GitHubTracker:
         embedded = self.embed_linked_marker(output_identity)
         text = linked_issue_body(body, related=f"Related to #{source_number}.", embedded=embedded)
         own = await self._own_login()
-        number = await self._single(own, embedded)
         if expected is not None:
-            # A recorded output is only ever reconciled, never recreated.
-            if number is None or self.issue(number) != expected:
-                raise NotFound("linked_issue")
-            return await self._linked_issue(number, text, created=False)
+            return await self._recorded_issue(expected, own, embedded, text)
+        number = await self._single(own, embedded)
         created = False
         if number is None:
             number = await self._create_issue(title, text, labels)
@@ -839,10 +836,39 @@ class GitHubTracker:
                     raise Unavailable("linked_issue_unconfirmed")
         return await self._linked_issue(number, text, created=created)
 
+    async def _recorded_issue(
+        self, expected: TrackerIssueRef, own: str, embedded: str, sent: str
+    ) -> LinkedIssue:
+        """The recorded output issue read directly, with no listing
+        (https://docs.github.com/en/rest/issues/issues#get-an-issue).
+
+        ``NotFound("linked_issue")`` unless it is in this repository, is not a
+        pull request, `created_by` ``own``, and its last non-empty line is
+        ``embedded``.
+        """
+
+        try:
+            number = self._number(expected)
+        except NotFound:
+            raise NotFound("linked_issue") from None
+        found = await self._issue(number)
+        if (
+            found is None
+            or not created_by(found, own)
+            or not ends_with_marker(_text(found.get("body")), embedded)
+        ):
+            raise NotFound("linked_issue")
+        return self._linked_result(number, found, sent, created=False)
+
     async def _linked_issue(self, number: int, sent: str, *, created: bool) -> LinkedIssue:
         found = await self._issue(number)
         if found is None:
             raise Unavailable("linked_issue")
+        return self._linked_result(number, found, sent, created=created)
+
+    def _linked_result(
+        self, number: int, found: dict[str, Any], sent: str, *, created: bool
+    ) -> LinkedIssue:
         # An empty body reads back as null; anything else that is not text
         # cannot be digested and is `Unavailable`.
         body = _text(found.get("body"))

@@ -31,12 +31,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import Settings, get_settings
 from curie_api.factory_tracker_result_delivery import (
+    LISTING_SETTLE_SECONDS,
     DeliveryOutcome,
     DeliveryState,
     RefusalReason,
     TrackerResultRefused,
     TrackerResultStorageError,
     deliver,
+    due_deliveries,
     expire_overdue,
     output_identity_for,
     result_marker,
@@ -539,6 +541,43 @@ def test_a_lost_create_response_reconciles_to_the_one_issue(admitted: Any) -> No
     assert _count("factory_tracker_result_receipts", delivery_id) == 0
     outcome = _deliver(src, delivery_id)
     assert outcome.state is DeliveryState.DELIVERED
+    _assert_delivered_once(src, delivery_id, "ticket")
+
+
+def test_an_unconfirmed_create_waits_for_the_listing_to_settle(admitted: Any) -> None:
+    src = _source(admitted, 9305)
+    delivery_id = _submit(src, _ticket())
+
+    def due() -> list[uuid.UUID]:
+        async def work(maker: async_sessionmaker[AsyncSession]) -> list[uuid.UUID]:
+            async with maker() as session:
+                return await due_deliveries(session)
+
+        return _run(work)
+
+    assert due() == [delivery_id]
+    # The create is written but its response is lost and nothing confirms it.
+    src.tracker.write_faults.lose_next_response(Operation.CREATE_LINKED_ISSUE)
+    lost = _deliver(src, delivery_id)
+    assert (lost.state, lost.last_error_code) == (DeliveryState.OWED, "tracker_unavailable")
+    assert len(_own_issues(src)) == 1
+    assert _delivery(delivery_id)["output_issue_id"] is None
+    assert LISTING_SETTLE_SECONDS == 60
+    (row,) = _rows(
+        "SELECT next_attempt_at - updated_at >= interval '60 seconds' AS from_attempt, "
+        "next_attempt_at > clock_timestamp() + interval '50 seconds' AS still_out "
+        "FROM curie.factory_tracker_result_deliveries WHERE id = :id",
+        {"id": delivery_id},
+    )
+    assert row == {"from_attempt": True, "still_out": True}
+    assert due() == []
+    _exec(
+        "UPDATE curie.factory_tracker_result_deliveries "
+        "SET next_attempt_at = clock_timestamp() - interval '1 second' WHERE id = :id",
+        {"id": delivery_id},
+    )
+    assert due() == [delivery_id]
+    assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
     _assert_delivered_once(src, delivery_id, "ticket")
 
 

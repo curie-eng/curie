@@ -190,13 +190,20 @@ class Tracker(Protocol):
         and Jira Cloud). Callers compare the returned `LinkedIssue.body_sha256`
         with `LinkedIssue.sent_body_sha256` before recording delivery.
 
-        ``expected`` is for a retry after the caller has recorded the output
-        issue: the adapter then never creates. It runs the same lookup; exactly
-        one match equal to ``expected`` is returned with a fresh read-back
-        (``created`` False); no match, or a match that is not ``expected``,
-        raises ``NotFound("linked_issue")``, so an issue whose marker was
-        removed is never replaced by a second one. Two matches still raise
-        `Ambiguous`. None keeps the create-or-reconcile behaviour above.
+        The creator-filtered listing can lag a create by seconds (observed on
+        GitHub, as its search index does), so the lookup cannot prove a very
+        recent create absent. A caller that has recorded the output issue
+        therefore passes it as ``expected``, and a caller retrying a create it
+        could not confirm waits past that lag first.
+
+        With ``expected`` the adapter never creates and never lists: it reads
+        that one issue directly and returns it with that read-back (``created``
+        False) only when it is in this scope, is not a pull request, was
+        created by the adapter's own identity, and its last non-empty line is
+        the marker. Anything else (missing, a pull request, another author, the
+        marker gone) raises ``NotFound("linked_issue")``, so a recorded issue
+        is never replaced by a second one. `Ambiguous` is not raised on this
+        path. None keeps the create-or-reconcile behaviour above.
         """
         ...
 

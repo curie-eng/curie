@@ -336,6 +336,8 @@ class InMemoryTracker(_Declared):
         self.write_faults = write_faults or WriteFaults()
         # Each composed body a `create_linked_issue` create wrote, in order.
         self.sent_issue_bodies: list[str] = []
+        # How many own-issue listings `create_linked_issue` has run.
+        self.linked_listings = 0
         self._page_size = page_size
         self._issues: dict[TrackerIssueRef, _Issue] = {}
         self._timeline: list[_TimelineEvent] = []
@@ -609,6 +611,7 @@ class InMemoryTracker(_Declared):
         """Issues in this scope our own identity created whose last line is
         ``embedded``, read page by page as a creator-filtered listing is."""
 
+        self.linked_listings += 1
         own = [
             found
             for found in self._issues.values()
@@ -638,8 +641,8 @@ class InMemoryTracker(_Declared):
         `Operation.CREATE_LINKED_ISSUE`. The related-source line is
         ``Related to <issue_url(source)>.``; the marker is
         `embed_linked_marker`. A create counts one ledger write and appends
-        the composed body to ``sent_issue_bodies``. With ``expected`` it
-        never creates (see the port)."""
+        the composed body to ``sent_issue_bodies``. With ``expected`` it reads
+        that issue directly and never lists or creates (see the port)."""
 
         self._gate(Operation.CREATE_LINKED_ISSUE)
         valid_output_identity(output_identity)
@@ -649,12 +652,21 @@ class InMemoryTracker(_Declared):
         text = linked_issue_body(
             body, related=f"Related to {self.issue_url(source)}.", embedded=embedded
         )
+        if expected is not None:
+            # A recorded output is read directly, never listed or recreated.
+            recorded = self._issues.get(expected)
+            if (
+                recorded is None
+                or recorded.ref.scope_id != self.scope_id
+                or recorded.author != self.identity
+                or not ends_with_marker(recorded.body, embedded)
+            ):
+                raise NotFound("linked_issue")
+            self.write_faults.after(Operation.CREATE_LINKED_ISSUE)
+            return self._linked(recorded, text, created=False)
         matches = self._own_marked(embedded)
         if len(matches) > 1:
             raise Ambiguous("linked_issue")
-        if expected is not None and (not matches or matches[0].ref != expected):
-            # A recorded output is only ever reconciled, never recreated.
-            raise NotFound("linked_issue")
         created = not matches
         if matches:
             found = matches[0]
@@ -665,12 +677,15 @@ class InMemoryTracker(_Declared):
             self.sent_issue_bodies.append(text)
             self.ledger.record()
         self.write_faults.after(Operation.CREATE_LINKED_ISSUE)
+        return self._linked(found, text, created=created)
+
+    def _linked(self, found: _Issue, sent: str, *, created: bool) -> LinkedIssue:
         return LinkedIssue(
             issue=found.ref,
             url=self.issue_url(found.ref),
             labels=frozenset(found.labels),
             body_sha256=body_sha256(found.body),
-            sent_body_sha256=body_sha256(text),
+            sent_body_sha256=body_sha256(sent),
             created=created,
         )
 
