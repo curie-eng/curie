@@ -11,6 +11,7 @@ the env-gated cluster e2e tests.
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import json
 import logging
@@ -969,13 +970,15 @@ class KubernetesSandboxClient:
         # request. Leaving the ``with`` block joins every thread, so nothing
         # outlives the call. Results are read in a fixed order and the first
         # failure in that order is raised as-is; there is no partial inventory
-        # and no retry.
+        # and no retry. Each LIST runs in its own copy of the caller's context,
+        # as ``asyncio.to_thread`` would, so context variables set by the
+        # caller (the delivery lease, the active span) stay visible to it.
         with ThreadPoolExecutor(
             max_workers=3, thread_name_prefix="capacity-inventory"
         ) as pool:
-            claims_listed = pool.submit(list_claims)
-            sandboxes_listed = pool.submit(list_sandboxes)
-            pods_listed = pool.submit(list_pods)
+            claims_listed = pool.submit(contextvars.copy_context().run, list_claims)
+            sandboxes_listed = pool.submit(contextvars.copy_context().run, list_sandboxes)
+            pods_listed = pool.submit(contextvars.copy_context().run, list_pods)
         claims = claims_listed.result()
         sandboxes = sandboxes_listed.result()
         pods = pods_listed.result()

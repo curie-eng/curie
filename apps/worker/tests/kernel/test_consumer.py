@@ -1407,9 +1407,11 @@ async def _assert_pod_list_admission_wait(
         assert record.first_wait_ms == original.first_wait_ms
         assert record.deadline_ms == original.deadline_ms
     assert len(api.pod_list_calls) == deferrals
-    assert [plural for plural, _selector in api.lists] == [
-        "sandboxclaims", "sandboxes"
-    ] * deferrals
+    # The inventory LISTs run concurrently (#5630), so only their count per
+    # attempt is fixed, not their order: each is issued once, never retried.
+    assert sorted(plural for plural, _selector in api.lists) == sorted(
+        ["sandboxclaims", "sandboxes"] * deferrals
+    )
     assert api.quota_error is api.runtime_error is None
     assert api.failures == {}
     assert api.created == api.patches == []
