@@ -514,7 +514,7 @@ def test_malformed_cached_observation_is_unknown_without_disclosing_it(
     assert "private-credential-sentinel" not in json.dumps(world.answers()) + caplog.text
 
 
-@pytest.mark.parametrize("failure", ["crash", "deadline", "unparseable"])
+@pytest.mark.parametrize("failure", ["crash", "deadline", "unparseable", "provider_refusal"])
 def test_operator_guard_denies_failure_with_a_fixed_error(
     facts_world: Any, monkeypatch: Any, failure: str, caplog: Any
 ) -> None:
@@ -533,6 +533,12 @@ def test_operator_guard_denies_failure_with_a_fixed_error(
             raise RuntimeError("private-operator-crash-sentinel")
         if failure == "deadline":
             await asyncio.Event().wait()
+        if failure == "provider_refusal":
+            return httpx.Response(
+                503,
+                json={"message": "private-provider-body-sentinel"},
+                headers={"X-GitHub-Request-Id": "private-provider-header-sentinel"},
+            )
         return httpx.Response(200, content=b"{broken-json")
 
     app = create_app()
@@ -556,6 +562,8 @@ def test_operator_guard_denies_failure_with_a_fixed_error(
                 assert response.status_code == 503
                 assert response.json() == {"detail": {"code": "facts_unavailable"}}
                 assert "private-operator-crash-sentinel" not in response.text + caplog.text
+                assert "private-provider-body-sentinel" not in response.text + caplog.text
+                assert "private-provider-header-sentinel" not in response.text + caplog.text
         finally:
             await app.state.http_client.aclose()
             await app.state.valkey.aclose()
