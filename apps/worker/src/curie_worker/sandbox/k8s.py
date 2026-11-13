@@ -761,15 +761,6 @@ class KubernetesSandboxClient:
             user_id = spec.security_context.run_as_user
         if type(user_id) is not int:
             raise ValueError("sandbox user identity unavailable")
-        if not isinstance(spec.node_name, str):
-            raise ValueError("sandbox node identity unavailable")
-        node = self._core_api.read_node(spec.node_name, _request_timeout=_claim_timeout(deadline))
-        if node.status is None or node.status.node_info is None:
-            raise ValueError("sandbox platform unavailable")
-        info = node.status.node_info
-        platform = f"{info.operating_system}/{info.architecture}"
-        if info.operating_system != "linux" or info.architecture not in ("amd64", "arm64"):
-            raise ValueError("sandbox platform unavailable")
         output = self._core_api.read_namespaced_pod_log(
             sandbox,
             self._namespace,
@@ -779,9 +770,8 @@ class KubernetesSandboxClient:
         )
         if not isinstance(container.image_id, str):
             raise ValueError("runner image identity unavailable")
-        return ProbeResult(
-            parse_probe(output), reported_digest(container.image_id), platform, user_id
-        )
+        present, platform = parse_probe(output)
+        return ProbeResult(present, reported_digest(container.image_id), platform, user_id)
 
     def delete_tool_probe(self, name: str, *, deadline: float) -> bool:
         if not name.startswith(PROBE_PREFIX):

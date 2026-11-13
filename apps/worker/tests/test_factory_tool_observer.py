@@ -20,6 +20,7 @@ from curie_worker.sandbox.tool_probe import (
     PROBE_PREFIX,
     ProbeSelection,
     digest,
+    parse_probe,
     probe_script,
 )
 
@@ -109,7 +110,7 @@ class ClusterAPI:
 
 
 class ProbeCoreAPI:
-    # Kubernetes v1.31 Pod, ContainerStatus and NodeSystemInfo response fields:
+    # Kubernetes v1.31 Pod and ContainerStatus response fields:
     # https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/
     def __init__(self) -> None:
         self.runner_status = NS(name="runner", image_id=IMAGE, state=NS(terminated=NS(exit_code=0)))
@@ -127,16 +128,15 @@ class ProbeCoreAPI:
                 node_name="acme-node",
             ),
         )
-        self.platform = NS(operating_system="linux", architecture="amd64")
-        self.node = NS(status=NS(node_info=self.platform))
-        self.output = "".join(f"{name}={int(name in {'sh', 'git'})}\n" for name in CATALOG)
+        self.output = "platform_os=Linux\nplatform_arch=x86_64\n" + "".join(
+            f"{name}={int(name in {'sh', 'git'})}\n" for name in CATALOG
+        )
 
     def read_namespaced_pod(self, name: str, namespace: str, **kwargs: Any) -> Any:
         return self.pod
 
     def read_node(self, name: str, **kwargs: Any) -> Any:
-        assert name == "acme-node"
-        return self.node
+        raise AssertionError("the observer must not read nodes")
 
     def read_namespaced_pod_log(
         self, name: str, namespace: str, *, container: str, **kwargs: Any
@@ -145,7 +145,9 @@ class ProbeCoreAPI:
         return self.output
 
 
-@pytest.mark.parametrize("variant", ["container_user", "pod_user", "arm64", "containerd"])
+@pytest.mark.parametrize(
+    "variant", ["container_user", "pod_user", "arm64", "containerd", "unscheduled"]
+)
 def test_real_client_reads_the_runner_container_result(variant: str) -> None:
     client, _ = cluster_client()
     core = ProbeCoreAPI()
@@ -153,9 +155,11 @@ def test_real_client_reads_the_runner_container_result(variant: str) -> None:
     if variant == "pod_user":
         core.runner.security_context = None
     elif variant == "arm64":
-        core.platform.architecture = "arm64"
+        core.output = core.output.replace("x86_64", "aarch64")
     elif variant == "containerd":
         core.runner_status.image_id = "containerd://sha256:" + "a" * 64
+    elif variant == "unscheduled":
+        core.pod.spec.node_name = None
     result = client.read_tool_probe("acme-probe", deadline=time.monotonic() + 5)
     assert result is not None
     assert result.present == frozenset({"sh", "git"})
@@ -165,7 +169,7 @@ def test_real_client_reads_the_runner_container_result(variant: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "invalid", ["exit", "user", "node", "platform", "os", "architecture", "image", "log"]
+    "invalid", ["exit", "user", "platform", "os", "architecture", "image", "log"]
 )
 def test_real_client_rejects_unreadable_runner_results(invalid: str) -> None:
     client, _ = cluster_client()
@@ -176,14 +180,12 @@ def test_real_client_rejects_unreadable_runner_results(invalid: str) -> None:
     elif invalid == "user":
         core.runner.security_context = None
         core.pod.spec.security_context = None
-    elif invalid == "node":
-        core.pod.spec.node_name = None
     elif invalid == "platform":
-        core.node.status.node_info = None
+        core.output = "\n".join(core.output.splitlines()[2:]) + "\n"
     elif invalid == "os":
-        core.platform.operating_system = "windows"
+        core.output = core.output.replace("Linux", "Windows")
     elif invalid == "architecture":
-        core.platform.architecture = "unknown"
+        core.output = core.output.replace("x86_64", "riscv64")
     elif invalid == "image":
         core.runner_status.image_id = "registry.example.com/acme-runner:latest"
     else:
@@ -242,6 +244,11 @@ def test_probe_only_looks_up_catalog_and_does_not_execute_its_binaries(tmp_path:
         binary = tmp_path / name
         binary.write_text(f"#!/bin/sh\nprintf executed > '{marker}'\n")
         binary.chmod(0o755)
+    uname = tmp_path / "uname"
+    uname.write_text(
+        "#!/bin/sh\ncase $1 in -s) printf 'Linux\\n';; -m) printf 'x86_64\\n';; *) exit 1;; esac\n"
+    )
+    uname.chmod(0o755)
     result = subprocess.run(
         ["/bin/sh", "-c", probe_script()],
         env={"PATH": str(tmp_path)},
@@ -249,7 +256,11 @@ def test_probe_only_looks_up_catalog_and_does_not_execute_its_binaries(tmp_path:
         capture_output=True,
         check=True,
     )
-    assert result.stdout.splitlines() == [f"{name}=1" for name in CATALOG]
+    assert result.stdout.splitlines() == [
+        "platform_os=Linux",
+        "platform_arch=x86_64",
+        *[f"{name}=1" for name in CATALOG],
+    ]
     assert not marker.exists()
     (tmp_path / "jq").unlink()
     result = subprocess.run(
@@ -261,6 +272,41 @@ def test_probe_only_looks_up_catalog_and_does_not_execute_its_binaries(tmp_path:
     )
     assert "jq=0" in result.stdout.splitlines()
     assert not marker.exists()
+    uname.unlink()
+    result = subprocess.run(
+        ["/bin/sh", "-c", probe_script()],
+        env={"PATH": str(tmp_path)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("machine", "platform"), [("x86_64", "linux/amd64"), ("aarch64", "linux/arm64")]
+)
+def test_probe_parses_the_process_uname_platform(machine: str, platform: str) -> None:
+    tools = "".join(f"{name}={int(name in {'sh', 'git'})}\n" for name in CATALOG)
+    output = f"platform_os=Linux\nplatform_arch={machine}\n" + tools
+    assert parse_probe(output) == (frozenset({"sh", "git"}), platform)
+
+
+@pytest.mark.parametrize(
+    "platform_lines",
+    [
+        "",
+        "platform_os=Linux\n",
+        "platform_os=\nplatform_arch=x86_64\n",
+        "platform_os=Linux\nplatform_arch=\n",
+        "platform_os=Darwin\nplatform_arch=x86_64\n",
+        "platform_os=Linux\nplatform_arch=riscv64\n",
+    ],
+)
+def test_probe_rejects_missing_or_unsupported_uname_platform(platform_lines: str) -> None:
+    output = platform_lines + "".join(f"{name}=0\n" for name in CATALOG)
+    with pytest.raises(ValueError):
+        parse_probe(output)
 
 
 @pytest.mark.parametrize("output", ["", "jq=1\n", "\udcff", SENTINEL])
@@ -733,6 +779,35 @@ def test_runtime_digest_must_match_the_deployments_declared_digest(
         core.runner_status.image_id = IMAGE
         await loop.tick()
         assert {row["state"] for row in await observation_rows(world)} == {"present", "absent"}
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("invalid", ["missing", "os", "architecture"])
+def test_unreadable_process_platform_writes_only_unknown_rows(
+    observation_world: Any, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    world = observation_world
+    client = ProbeClient()
+    core = ProbeCoreAPI()
+    if invalid == "missing":
+        core.output = "\n".join(core.output.splitlines()[2:]) + "\n"
+    elif invalid == "os":
+        core.output = core.output.replace("Linux", "Darwin")
+    else:
+        core.output = core.output.replace("x86_64", "riscv64")
+    client._core_api = core  # type: ignore[assignment]
+    client._namespace = "acme"
+    monkeypatch.setattr(
+        client, "read_tool_probe", KubernetesSandboxClient.read_tool_probe.__get__(client)
+    )
+
+    async def check() -> None:
+        await observer(world, client).tick()
+        rows = await observation_rows(world)
+        assert len(rows) == len(CATALOG)
+        assert all(row["state"] == "unknown" and row["reason"] == "unreadable" for row in rows)
+        assert len(client.created) == 1 and client.created == client.released
 
     asyncio.run(check())
 

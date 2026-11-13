@@ -153,7 +153,7 @@ def bound_worker_roles(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def assert_worker_cluster_reads(
-    docs: list[dict[str, Any]], *, observer: bool = True, runtime_class: str | None = None
+    docs: list[dict[str, Any]], *, runtime_class: str | None = None
 ) -> None:
     worker = next(
         doc
@@ -183,8 +183,6 @@ def assert_worker_cluster_reads(
         assert len(referenced) == 1, "worker cluster binding must resolve to one role"
         roles.append(referenced[0]["rules"])
     expected = []
-    if observer:
-        expected.append([{"apiGroups": [""], "resources": ["nodes"], "verbs": ["get"]}])
     if runtime_class is not None:
         expected.append(
             [
@@ -198,7 +196,7 @@ def assert_worker_cluster_reads(
         )
     assert sorted(json.dumps(rules, sort_keys=True) for rules in roles) == sorted(
         json.dumps(rules, sort_keys=True) for rules in expected
-    ), "worker cluster reads must match the exact observer and RuntimeClass grants"
+    ), "worker cluster reads must match only the selected RuntimeClass grant"
 
 
 @pytest.mark.parametrize(
@@ -423,9 +421,7 @@ def test_disabled_admission_omits_inventory_grants(
     ]:
         assert permissions[("", "pods")] == {"get"}
         assert permissions[("agents.x-k8s.io", "sandboxes")] == {"get", "patch"}
-    assert_worker_cluster_reads(
-        docs, observer=overrides.get("agentSandbox", {}).get("deploy", True)
-    )
+    assert_worker_cluster_reads(docs)
 
 
 def test_worker_reads_only_the_selected_runtime_class(tmp_path: Path) -> None:

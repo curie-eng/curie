@@ -4185,6 +4185,11 @@ as the sandbox user with the image's default environment, without executing
 catalog programs. It releases its claim and confirms removal within its
 120-second budget. Capacity refusal defers the subject until another tick.
 
+The same probe records `uname -s` and `uname -m` for its process platform.
+Linux on `x86_64` or `aarch64` becomes `linux/amd64` or `linux/arm64` in the
+observation digest. Missing or unsupported platform answers produce `unknown`
+with reason `unreadable`. The observer needs no cluster-scoped permission.
+
 Catalog version 1 contains `bash`, `sh`, `git`, `curl`, `wget`, `jq`, `make`,
 `gcc`, `cc`, `python3`, `pip`, `uv`, `pytest`, `ruff`, `node`, `npm`, `npx`,
 `pnpm`, `yarn`, `tsc`, `cargo`, `rustc`, `rustfmt`, `go`, `java`, `mvn`,

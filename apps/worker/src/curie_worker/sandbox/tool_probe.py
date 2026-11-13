@@ -86,6 +86,8 @@ class ProbeResult:
 def probe_script() -> str:
     # POSIX command and printf are shell builtins. The lookup output is discarded.
     return (
+        "probe_system=$(uname -s) && probe_machine=$(uname -m) || exit 1; "
+        'printf "platform_os=%s\\nplatform_arch=%s\\n" "$probe_system" "$probe_machine"; '
         "for name in " + " ".join(CATALOG) + "; do "
         'if command -v "$name" >/dev/null 2>&1; then value=1; else value=0; fi; '
         'printf "%s=%s\\n" "$name" "$value"; done'
@@ -126,17 +128,23 @@ def probe_template(selection: ProbeSelection, claim: str) -> dict[str, Any]:
     return spec
 
 
-def parse_probe(output: str) -> frozenset[str]:
+def parse_probe(output: str) -> tuple[frozenset[str], str]:
     lines = output.splitlines()
-    if len(lines) != len(CATALOG):
+    if len(lines) != len(CATALOG) + 2:
         raise ValueError("incomplete tool observation")
+    architecture = {
+        "platform_arch=x86_64": "amd64",
+        "platform_arch=aarch64": "arm64",
+    }.get(lines[1])
+    if lines[0] != "platform_os=Linux" or architecture is None:
+        raise ValueError("sandbox platform unavailable")
     present = set()
-    for expected, line in zip(CATALOG, lines, strict=True):
+    for expected, line in zip(CATALOG, lines[2:], strict=True):
         if line not in (f"{expected}=0", f"{expected}=1"):
             raise ValueError("invalid tool observation")
         if line.endswith("=1"):
             present.add(expected)
-    return frozenset(present)
+    return frozenset(present), f"linux/{architecture}"
 
 
 def reported_digest(image_id: str) -> str:
