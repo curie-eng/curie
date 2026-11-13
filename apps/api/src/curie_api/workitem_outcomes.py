@@ -13,7 +13,8 @@ Output is an allowlist: every view is built from explicit fields below, never
 from an ORM row, so a runtime-owner token, a reply transport address, a patch,
 a publication body/error or an approval summary cannot reach an operator even
 when a new column is added later. CI is observed live on the detail route
-only and never persisted; any failure to observe is ``unavailable`` with a
+only; bounded recovery stores separate item-level proof. Any failed live read is
+``unavailable`` with a
 fixed reason code that never carries a response body, header, URL or token.
 """
 
@@ -24,6 +25,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
+from typing import Literal, cast
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +35,7 @@ from curie_api.forges.hosts import issue_url as tracker_issue_url
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.types import RepositoryRef, RollupState
 from curie_api.schemas.workitems import (
+    WorkItemCiObservationOut,
     WorkItemCiOut,
     WorkItemCiState,
     WorkItemCorrectnessOut,
@@ -54,6 +57,7 @@ from .models import (
     Approval,
     ExecutionRequest,
     ExecutionRequestPhaseReport,
+    FactoryCiObservation,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -264,6 +268,7 @@ def derive_outcome(
     now: datetime,
     *,
     issue_url: str,
+    observation: FactoryCiObservation | None = None,
 ) -> WorkItemOutcomeOut:
     """Derive one operator view. Pure: no I/O. ``ci`` is left null."""
 
@@ -313,6 +318,20 @@ def derive_outcome(
     else:
         state = "completed_unpublished"
 
+    observed_completion = (
+        observation is not None
+        and observation.status == "completed"
+        and req is not None
+        and observation.request_id == req.id
+        and item.cancelled_at is None
+        and lineage is not None
+        and lineage.status == "open"
+        and observation.lineage_id == lineage.id
+        and observation.head_sha == lineage.head_sha
+    )
+    if observed_completion:
+        state = "published"
+
     snapshot = next(
         (
             r
@@ -351,7 +370,11 @@ def derive_outcome(
         created_at=item.created_at,
         updated_at=item.updated_at,
         state=state,
-        actionable_cause=_cause(state, req, lineage, publication, approval, now),
+        actionable_cause=(
+            "ci_observed_after_run"
+            if observed_completion
+            else _cause(state, req, lineage, publication, approval, now)
+        ),
         objective=objective[:OBJECTIVE_LIMIT] if objective is not None else None,
         objective_truncated=truncated,
         requester=snapshot.requester if snapshot is not None else None,
@@ -367,6 +390,20 @@ def derive_outcome(
         ),
         correctness=WorkItemCorrectnessOut(),
         ci=None,
+        ci_observation=(
+            WorkItemCiObservationOut(
+                status=cast(
+                    Literal["observing", "completed", "expired", "invalidated"], observation.status
+                ),
+                head_sha=observation.head_sha,
+                reason=observation.reason,
+                created_at=observation.created_at,
+                expires_at=observation.expires_at,
+                observed_at=observation.observed_at,
+            )
+            if observation is not None
+            else None
+        ),
         requests=[_request_view(r) for r in ordered],
         tenant_id=item.tenant_id,
         model_auth_mode=mode_of(item.model_auth_mode),
@@ -561,6 +598,14 @@ async def _views(
         ).all():
             reports[report.execution_request_id].append(report)
 
+    observations = {
+        row.request_id: row
+        for row in (
+            await session.scalars(
+                select(FactoryCiObservation).where(FactoryCiObservation.work_item_id.in_(ids))
+            )
+        ).all()
+    }
     views = []
     for item in items:
         item_requests = requests.get(item.id, [])
@@ -589,6 +634,7 @@ async def _views(
             pending_turn,
             now,
             issue_url=tracker_issue_url(settings, item.tracker_issue, item.repository),
+            observation=observations.get(current_request.id) if current_request else None,
         )
         view.title = _title(comments[item.id], sequences)
         comment_row = latest_comment.get(item.id)

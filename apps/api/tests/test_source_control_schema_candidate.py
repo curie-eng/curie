@@ -51,8 +51,9 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # and the factory Slack progress loop reads the 0157 tables. GitHub host
     # namespaces require 0158. Execution owner reads require 0159, personal
     # custody reads and enrollment fences require 0160, and agent version reads
-    # select the 0162 result policy columns.
-    assert window == {"schema_min": "0162", "schema_head": "0162"}
+    # select the 0162 result policy columns. Factory CI observations require
+    # the 0163 table.
+    assert window == {"schema_min": "0163", "schema_head": "0163"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -83,7 +84,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-43:] == [
+    assert data["revisions"][-44:] == [
         "0095",
         "0096",
         "0097",
@@ -127,6 +128,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0159",
         "0160",
         "0162",
+        "0163",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -166,6 +168,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0159"] == "expand"
     assert kinds["0160"] == "expand"
     assert kinds["0162"] == "expand"
+    assert kinds["0163"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -264,7 +267,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0162"
+    assert current_revision() == "0163"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]

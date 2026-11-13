@@ -63,7 +63,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # writes the github_host kind 0158 allows. Owner tuple reads require 0159,
     # personal custody reads and enrollment fences require 0160, and agent
     # version reads select the 0162 result policy columns.
-    candidate = {"schema_min": "0162", "schema_head": "0162"}
+    candidate = {"schema_min": "0163", "schema_head": "0163"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -71,7 +71,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-43:] == [
+    assert catalog["revisions"][-44:] == [
         "0095",
         "0096",
         "0097",
@@ -115,6 +115,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0159",
         "0160",
         "0162",
+        "0163",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

@@ -1748,6 +1748,31 @@ def test_ci_verdict_wins_over_the_execution_deadline(
     assert summary in _body(sink, published["id"])
 
 
+@pytest.mark.parametrize("converges", [False, True], ids=["deadline", "stable-next-read"])
+def test_a_check_created_between_pages_keeps_the_live_request_pending(
+    admitted: Any, converges: bool
+) -> None:
+    client, github, sink = admitted
+    number = 9722
+    sink.ci_script = [ci_entry(*[check_run(f"check-{index}") for index in range(101)])]
+    sink.ci_page_totals[(HEAD_A, "check-runs", 2)] = 102
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert (HEAD_A, "check-runs", 2) in sink.ci_pages
+    assert _terminal(number) == ("running", None)
+    assert _ci_turns(published["id"]) == []
+    if converges:
+        sink.ci_page_totals.clear()
+        _reconcile_later(60)
+        assert _terminal(number) == ("completed", "completed")
+    else:
+        _reconcile_later(3700)
+        assert _terminal(number) == ("failed", "ci_timeout")
+        assert "listing_incomplete" in _body(sink, published["id"])
+
+
 def test_transient_errors_until_the_deadline_end_as_ci_timeout(admitted: Any) -> None:
     client, github, sink = admitted
     number = 9722

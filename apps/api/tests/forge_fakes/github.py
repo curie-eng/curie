@@ -2,6 +2,9 @@
 
 Payload shapes follow GitHub's webhook catalog:
 https://docs.github.com/en/webhooks/webhook-events-and-payloads
+
+Combined status responses follow GitHub's REST documentation:
+https://docs.github.com/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
 """
 
 from __future__ import annotations
@@ -1186,7 +1189,8 @@ class GitHubRepositoryFake:
             if matched[2] == "status":
                 statuses = list(self.statuses.get(matched[1], {}).values())
                 return httpx.Response(
-                    200, json={"state": "pending", "statuses": statuses, "total_count": 0}
+                    200,
+                    json={"state": "pending", "statuses": statuses, "total_count": len(statuses)},
                 )
             runs = [self._visible(run) for run in self.check_runs.get(matched[1], {}).values()]
             return httpx.Response(200, json={"total_count": len(runs), "check_runs": runs})

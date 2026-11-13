@@ -72,8 +72,8 @@ CONTRACT = "0041"
 # progress loop reads the 0157 thread tables. GitHub host namespaces require
 # 0158; owner tuple reads require 0159; personal custody reads and the
 # enrollment_fenced cause require 0160; agent version reads select the 0162
-# result policy columns.
-APP_SCHEMA_MIN = "0162"
+# result policy columns; factory CI observations require the 0163 table.
+APP_SCHEMA_MIN = "0163"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -191,6 +191,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0159",
             "0160",
             "0162",
+            "0163",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -238,8 +239,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0159",
             "0160",
             "0162",
+            "0163",
         }
-    assert current_revision() == "0162"
+    assert current_revision() == "0163"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -345,8 +347,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # progress reads the 0157 tables. GitHub host namespaces require 0158,
     # execution owner reads require 0159, personal custody reads and
     # enrollment fences require 0160, and agent version reads select the 0162
-    # result policy columns.
-    for revision in sorted(known - {"0162"}):
+    # result policy columns. Factory CI observations require the 0163 table.
+    for revision in sorted(known - {"0163"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -366,7 +368,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0158", window, known) is False
     assert can_serve("0159", window, known) is False
     assert can_serve("0160", window, known) is False
-    assert can_serve("0162", window, known) is True
+    assert can_serve("0162", window, known) is False
+    assert can_serve("0163", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

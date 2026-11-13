@@ -35,6 +35,7 @@ from curie_api.workitems import lifecycle
 
 from . import (
     factory_ci,
+    factory_ci_recovery,
     factory_label_reconcile,
     factory_notices,
     factory_poll_intake,
@@ -484,6 +485,14 @@ class WorkItemReconciler:
                 )
                 if result != "waiting":
                     self._ci_observed.pop(settlement.request_id, None)
+            if client is None:
+                client = httpx.AsyncClient(
+                    timeout=self._settings.github_app_timeout_seconds,
+                    verify=code_host_verify(self._settings),
+                )
+            await factory_ci_recovery.reconcile(
+                self._sessionmaker, self._valkey, self._settings, client
+            )
         finally:
             if client is not None:
                 await client.aclose()
