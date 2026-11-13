@@ -96,13 +96,23 @@
         ]
       },
       "cardinality_bound": 340,
-      "description": "Terminal turns for one agent. Each process admits at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
+      "description": "Terminal turns for one agent. Agent-labeled metrics in each process share at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
       "monotonic": true,
       "type": "counter",
       "unit": "{turn}"
     },
     "curie.approval.lifecycle": {
       "attributes": {
+        "agent": {
+          "ceiling": 32,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+          "reserved": [
+            "other",
+            "unbound"
+          ]
+        },
         "operation": [
           "request",
           "resolve",
@@ -127,7 +137,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 112,
+      "cardinality_bound": 3808,
       "description": "Approval lifecycle outcomes.",
       "monotonic": true,
       "type": "counter",
@@ -135,6 +145,16 @@
     },
     "curie.approval.pending": {
       "attributes": {
+        "agent": {
+          "ceiling": 32,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+          "reserved": [
+            "other",
+            "unbound"
+          ]
+        },
         "operation": [
           "observe"
         ],
@@ -145,7 +165,7 @@
           "curie-api"
         ]
       },
-      "cardinality_bound": 1,
+      "cardinality_bound": 34,
       "description": "Pending approvals.",
       "monotonic": false,
       "type": "gauge",
@@ -153,6 +173,16 @@
     },
     "curie.approval.pending.age": {
       "attributes": {
+        "agent": {
+          "ceiling": 32,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+          "reserved": [
+            "other",
+            "unbound"
+          ]
+        },
         "operation": [
           "observe"
         ],
@@ -163,7 +193,7 @@
           "curie-api"
         ]
       },
-      "cardinality_bound": 1,
+      "cardinality_bound": 34,
       "description": "Age of the oldest pending approval.",
       "monotonic": false,
       "type": "gauge",
@@ -2292,6 +2322,16 @@
     },
     "curie.turn.duration": {
       "attributes": {
+        "agent": {
+          "ceiling": 32,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+          "reserved": [
+            "other",
+            "unbound"
+          ]
+        },
         "outcome": [
           "done",
           "awaiting_approval",
@@ -2319,7 +2359,7 @@
           "eval"
         ]
       },
-      "cardinality_bound": 240,
+      "cardinality_bound": 8160,
       "description": "End to end turn duration.",
       "monotonic": false,
       "type": "histogram",

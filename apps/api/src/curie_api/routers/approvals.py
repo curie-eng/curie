@@ -23,6 +23,7 @@ from typing import Annotated
 
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
+    agent_metric_label,
     canonicalize_traceparent,
     operation_span,
     record_metric,
@@ -634,6 +635,11 @@ async def resolve_approval(
     ):
         raise _approval_not_found()
     stored_parent = approval_trace_context(approval)
+    agent = (
+        await crud_agents.get_agent(session, approval.agent_id)
+        if approval.agent_id is not None else None
+    )
+    metric_agent = agent_metric_label(agent.name if agent is not None else None)
     # @spec HTTP-APPROVAL-CONTINUITY-7/10: a selected row never reaches legacy
     # admission, team lookup or CAS. Its deadline expiry goes through the sealing
     # owner, and an authenticated Slack answer through the approval commit owner;
@@ -691,7 +697,7 @@ async def resolve_approval(
         record_metric(
             "curie.approval.lifecycle",
             attributes={"service.name": "curie-api", "operation": "resolve",
-                        "outcome": "resolved"},
+                        "outcome": "resolved", "agent": metric_agent},
         )
         # @spec HTTP-APPROVAL-CONTINUITY-11: only after the acknowledged commit.
         out = ApprovalOut.model_validate(resolved)
@@ -838,6 +844,7 @@ async def resolve_approval(
                 attributes={
                     "service.name": "curie-api",
                     "operation": "expire",
+                    "agent": metric_agent,
                     "outcome": "expired",
                 },
             )
@@ -972,6 +979,7 @@ async def resolve_approval(
         attributes={
             "service.name": "curie-api",
             "operation": "resolve",
+            "agent": metric_agent,
             "outcome": "resolved",
         },
     )

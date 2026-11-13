@@ -263,57 +263,67 @@ def test_turn_process_span_exports_bounded_terminal_failures_as_error(
     asyncio.run(go())
 
 
-def test_a_resolved_agent_labels_only_the_agent_turn_counter(
+class _MetricResolved:
+    def __init__(self, agent_name: str = "acme-bot") -> None:
+        self.agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        self.agent_name = agent_name
+        self.endpoint = None
+        self.adapter = None
+
+
+class _MetricBinding:
+    def __init__(self, agent_name: str = "acme-bot") -> None:
+        self.agent_name = agent_name
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = _MetricResolved().agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+    async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _MetricResolved:
+        return _MetricResolved(self.agent_name)
+
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return self.agent_name
+
+    def boot_env(
+        self,
+        _resolved: object,
+        thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+        **_: object,
+    ) -> dict[str, str]:
+        del kind, address
+        return {
+            "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
+            "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
+        }
+
+    def packs_for(self, _resolved: object) -> BehaviorPacks:
+        return BehaviorPacks()
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "expected"),
+    [("acme-bot", "acme-bot"), ("other", "other"), ("unbound", "other"),
+     ("not a slug", "other"), ("x" * 64, "other")],
+)
+def test_turn_duration_uses_the_agent_turn_counter_label(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
+    agent_name: str,
+    expected: str,
 ) -> None:
-    """#2952: the fleet counter stays unlabeled; the agent series names the bot.
-
-    No binding leaves ``unbound``. A binding's agent name is the label. The
-    fleet ``curie.turn.completed`` point never gains an agent attribute.
-    """
-
-    class _Resolved:
-        def __init__(self) -> None:
-            self.agent_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
-            self.agent_name = "acme-bot"
-            self.endpoint = None
-            self.adapter = None
-
-    class _Binding:
-
-        async def identity_binding(
-            self, kind: str, adapter: str | None, address: str,
-        ) -> HttpIdentityBinding | None:
-            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
-            agent_id = _Resolved().agent_id
-            return HttpIdentityBinding(
-                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
-                agent_id=agent_id,
-                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
-                binding_generation=1, http_identity_required=False,
-            )
-
-        async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _Resolved:
-            return _Resolved()
-
-        def boot_env(
-            self,
-            _resolved: object,
-            thread_key: str,
-            *,
-            kind: str | None = None,
-            address: str | None = None,
-        **_: object,
-        ) -> dict[str, str]:
-            del kind, address
-            return {
-                "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
-                "CURIE_RUNNER_TOKEN": f"token-{thread_key}",
-            }
-
-        def packs_for(self, _resolved: object) -> BehaviorPacks:
-            return BehaviorPacks()
+    """Duration and the agent counter share the normalized agent label."""
 
     async def go() -> None:
         probe = _install(monkeypatch)
@@ -325,14 +335,22 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
             agent_points = _metrics(probe, "curie.agent.turn.completed")
             assert agent_points[-1].attributes["agent"] == "unbound"
             assert agent_points[-1].attributes["outcome"] == "done"
+            duration = _metrics(probe, "curie.turn.duration")[-1]
+            assert duration.attributes == agent_points[-1].attributes
+            assert duration.value >= 0
 
         probe.metrics.clear()
-        async with make_harness(binding=_Binding()) as named:
+        async with make_harness(binding=_MetricBinding(agent_name)) as named:
             await named.kernel.process_event(_qevent("named", thread="thread-named-agent"))
             fleet = _metrics(probe, "curie.turn.completed")
             assert fleet and "agent" not in fleet[-1].attributes
             named_points = _metrics(probe, "curie.agent.turn.completed")
-            assert named_points[-1].attributes["agent"] == "acme-bot"
+            assert named_points[-1].attributes["agent"] == expected
+            duration = _metrics(probe, "curie.turn.duration")[-1]
+            assert duration.attributes == named_points[-1].attributes
+            validate_record_metric(
+                "curie.turn.duration", duration.value, attributes=duration.attributes
+            )
             assert named_points[-1].attributes["service.name"] == "curie-worker"
             # The probe stores attributes. The real recorder must accept them.
             validate_record_metric(
@@ -808,14 +826,17 @@ class _Approvals:
         return CreatedApproval(id=f"appr-example-{len(self.requests)}", status="pending")
 
 
+@pytest.mark.parametrize("agent_name", [None, "acme-bot", "unbound"])
 def test_approval_suspend_and_resume_have_bounded_lifecycle_outcomes(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
+    agent_name: str | None,
 ) -> None:
     async def go() -> None:
         probe = _install(monkeypatch)
         approvals = _Approvals()
-        async with make_harness(approvals=approvals) as h:
+        binding = None if agent_name is None else _MetricBinding(agent_name)
+        async with make_harness(approvals=approvals, binding=binding) as h:
             h.runner.default_script = [
                 TextDelta(text="Requesting sign-off"),
                 Final(
@@ -841,7 +862,13 @@ def test_approval_suspend_and_resume_have_bounded_lifecycle_outcomes(
             outcomes = {
                 point.attributes["outcome"] for point in _metrics(probe, "curie.approval.lifecycle")
             }
-            assert outcomes >= {"suspended", "resumed"}
+            assert outcomes >= {"requested", "suspended", "resumed"}
+            raised = [
+                point for point in _metrics(probe, "curie.approval.lifecycle")
+                if point.attributes["operation"] == "request"
+                and point.attributes["outcome"] == "requested"
+            ]
+            assert len(raised) == 1
             assert {
                 "curie.approval.suspend",
                 "curie.approval.resume",
@@ -852,6 +879,11 @@ def test_approval_suspend_and_resume_have_bounded_lifecycle_outcomes(
             assert process_spans[1].attributes["outcome"] == "done"
             assert process_spans[1].status is StatusCode.OK
             for point in _metrics(probe, "curie.approval.lifecycle"):
+                expected = "unbound" if agent_name is None else (
+                    "other" if agent_name == "unbound" else agent_name
+                )
+                assert point.attributes["agent"] == expected
+                validate_record_metric(point.name, point.value, attributes=point.attributes)
                 assert set(point.attributes) <= _BOUNDED_KEYS
                 assert "thread-approval" not in point.attributes.values()
 

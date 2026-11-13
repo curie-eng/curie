@@ -265,16 +265,17 @@ def test_sandbox_inventory_uses_one_aggregate_series_per_instrument() -> None:
         assert manifest[name]["cardinality_bound"] == 1
 
 
-def test_approval_pending_inventory_has_one_series_per_emitting_service() -> None:
+def test_approval_pending_inventory_has_bounded_agent_series() -> None:
     manifest = _read(_MANIFEST)["metrics"]
     expected_attributes = {
         "service.name": ["curie-api"],
         "operation": ["observe"],
         "outcome": ["pending"],
     }
+    agent_domain = manifest["curie.agent.turn.completed"]["attributes"]["agent"]
     for name in ("curie.approval.pending", "curie.approval.pending.age"):
-        assert manifest[name]["attributes"] == expected_attributes
-        assert manifest[name]["cardinality_bound"] == 1
+        assert manifest[name]["attributes"] == {**expected_attributes, "agent": agent_domain}
+        assert manifest[name]["cardinality_bound"] == 34
 
 
 def test_completion_outbox_inventory_is_bounded_and_has_no_identity_labels() -> None:
@@ -723,7 +724,7 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
         "outcome": "deadline_halted",
     }
     record_metric("curie.turn.completed", attributes=attributes)
-    record_metric("curie.turn.duration", 1.5, attributes=attributes)
+    record_metric("curie.turn.duration", 1.5, attributes={**attributes, "agent": "unbound"})
     manifest = _read(_MANIFEST)["metrics"]
     for name in ("curie.turn.completed", "curie.turn.duration"):
         outcomes = manifest[name]["attributes"]["outcome"]
@@ -732,7 +733,8 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
             assert sibling in outcomes
         assert "capacity_wait_expired" in outcomes
         assert "fenced_out" not in outcomes
-        assert manifest[name]["cardinality_bound"] == 240
+        expected_bound = 240 * (34 if name == "curie.turn.duration" else 1)
+        assert manifest[name]["cardinality_bound"] == expected_bound
 
 
 def test_deploy_notice_suppressed_is_two_closed_series() -> None:
@@ -1007,6 +1009,62 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
     manifest = declared_metric_manifest()["metrics"]["curie.agent.turn.completed"]
     assert manifest["attributes"]["agent"]["ceiling"] == 32
     assert manifest["cardinality_bound"] == 10 * (32 + 2)
+
+
+
+@pytest.mark.parametrize("first_metric", [
+    "curie.agent.turn.completed",
+    "curie.turn.duration",
+    "curie.approval.lifecycle",
+    "curie.approval.pending",
+    "curie.approval.pending.age",
+])
+def test_agent_labels_share_admission_across_turn_and_approval_metrics(
+    metrics: tuple[MeterProvider, InMemoryMetricReader], first_metric: str,
+) -> None:
+    previous_provider, _ = metrics
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
+    configure_meter_provider(provider)
+    reset_bounded_labels()
+    attributes = {
+        "curie.agent.turn.completed": {
+            "service.name": "curie-worker", "source": "worker", "outcome": "done",
+        },
+        "curie.turn.duration": {
+            "service.name": "curie-worker", "source": "worker", "outcome": "done",
+        },
+        "curie.approval.lifecycle": {
+            "service.name": "curie-api", "operation": "resolve", "outcome": "resolved",
+        },
+        "curie.approval.pending": {
+            "service.name": "curie-api", "operation": "observe", "outcome": "pending",
+        },
+        "curie.approval.pending.age": {
+            "service.name": "curie-api", "operation": "observe", "outcome": "pending",
+        },
+    }
+    names = list(attributes)
+    names.remove(first_metric)
+    names.insert(0, first_metric)
+    try:
+        for index in range(32):
+            name = names[index % len(names)]
+            record_metric(name, attributes={**attributes[name], "agent": f"acme-{index}"})
+        for name in names:
+            for agent in ("acme-overflow", "not a slug", "x" * 64, "acme-0", "unbound"):
+                record_metric(name, attributes={**attributes[name], "agent": agent})
+        assert provider.force_flush(timeout_millis=5000)
+        for name, series in _exported_series(reader).items():
+            assert name in attributes
+            labels = {dict(point)["agent"] for point in series}
+            assert {"other", "acme-0", "unbound"} <= labels
+            assert not labels.intersection({"acme-overflow", "not a slug", "x" * 64})
+            assert all(set(dict(point)) == {*attributes[name], "agent"} for point in series)
+    finally:
+        reset_bounded_labels()
+        configure_meter_provider(previous_provider)
+        provider.shutdown()
 
 
 def test_record_metric_still_rejects_unknown_turn_outcome(

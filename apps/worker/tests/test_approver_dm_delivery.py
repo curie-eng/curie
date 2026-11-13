@@ -546,6 +546,11 @@ def test_failed_or_uncertain_dm_post_is_recorded_and_never_falls_back(
                 "approver DM delivery failed" in record.getMessage()
                 for record in caplog.records
             )
+            failures = [attrs for name, attrs in metrics
+                        if name == "curie.approval.lifecycle"
+                        and attrs.get("operation") == "dm_delivery"]
+            assert len(failures) == 1
+            assert failures[0]["agent"] == dm_binding().resolved.agent_name
             assert (
                 "curie.approval.lifecycle",
                 {"service.name": "curie-worker", "operation": "dm_delivery",
