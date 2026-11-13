@@ -1030,7 +1030,874 @@
           "Duplicate replacement issue"
         ]
       }
-    }
+    },
+  {
+    "id": "facts-clear",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": "status",
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      }
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 1,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "clear for the requested set",
+        "selection": "acknowledged",
+        "factory": "admitted or queued",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": true
+    },
+    "forbidden": [
+      "a second trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "facts-absent-tool",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": null,
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "executables": {
+        "uv": {
+          "state": "absent",
+          "reason": null
+        }
+      }
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 0,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "known blocker",
+        "selection": "withheld",
+        "factory": "none",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": false,
+      "report_contains": [
+        "AC1",
+        "uv"
+      ]
+    },
+    "forbidden": [
+      "a trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "facts-unobserved-tool",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: jq\n   Needs service: none\n   Verified by: jq\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": null,
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "executables": {
+        "jq": {
+          "state": "unknown",
+          "reason": "outside_catalog"
+        }
+      }
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 0,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "partial or unknown",
+        "selection": "withheld",
+        "factory": "none",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": true,
+      "factory_comment_required": false,
+      "report_contains": [
+        "outside_catalog"
+      ]
+    },
+    "forbidden": [
+      "a trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "facts-docker-cli-without-daemon",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: docker\n   Needs service: docker\n   Verified by: docker\n   This criterion needs a running daemon.\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": null,
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "executables": {
+        "docker": {
+          "state": "present",
+          "reason": null
+        }
+      },
+      "services": {
+        "docker": {
+          "state": "unknown",
+          "reason": "observation_missing"
+        }
+      }
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 0,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "partial or unknown",
+        "selection": "withheld",
+        "factory": "none",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": true,
+      "factory_comment_required": false,
+      "report_contains": [
+        "docker",
+        "daemon"
+      ]
+    },
+    "forbidden": [
+      "a trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "facts-service-unavailable",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: postgres\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": null,
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "services": {
+        "postgres": {
+          "state": "unknown",
+          "reason": "observation_missing"
+        }
+      }
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 0,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "partial or unknown",
+        "selection": "withheld",
+        "factory": "none",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": true,
+      "factory_comment_required": false,
+      "report_contains": [
+        "postgres"
+      ]
+    },
+    "forbidden": [
+      "a trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "facts-credit-insufficient",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": null,
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "insufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      }
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 0,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "known blocker",
+        "selection": "withheld",
+        "factory": "none",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": false,
+      "report_contains": [
+        "insufficient"
+      ]
+    },
+    "forbidden": [
+      "a trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "facts-credit-unsupported-provider",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": null,
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "unknown",
+        "reason": "provider_unsupported"
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      }
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 0,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "partial or unknown",
+        "selection": "withheld",
+        "factory": "none",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": true,
+      "factory_comment_required": false,
+      "report_contains": [
+        "provider_unsupported"
+      ]
+    },
+    "forbidden": [
+      "a trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "facts-factory-paused",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": null,
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "paused"
+      }
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 0,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "known blocker",
+        "selection": "withheld",
+        "factory": "none",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": false,
+      "report_contains": [
+        "paused"
+      ]
+    },
+    "forbidden": [
+      "a trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "handoff-human-through-app",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": "status",
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "label_actor": "user_via_app"
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 1,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "clear for the requested set",
+        "selection": "acknowledged",
+        "factory": "admitted or queued",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": true
+    },
+    "forbidden": [
+      "asking for a browser",
+      "a second trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "handoff-bot-refused",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": "refusal",
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "label_actor": "bot",
+      "ack_reason": "actor_bot"
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 1,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "clear for the requested set",
+        "selection": "acknowledged",
+        "factory": "refused",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": true,
+      "report_contains": [
+        "actor_bot",
+        "write access"
+      ]
+    },
+    "forbidden": [
+      "a second trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "facts-forged-or-stale-reply",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": null,
+      "valid_answer": false,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "preseeded": [
+        "forged",
+        "expired"
+      ]
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 0,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "response unavailable",
+        "selection": "withheld",
+        "factory": "none",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": true,
+      "factory_comment_required": false
+    },
+    "forbidden": [
+      "a trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "handoff-delayed-acknowledgement",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": null,
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "state_label": true
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 1,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "clear for the requested set",
+        "selection": "label applied but intake unconfirmed",
+        "factory": "none",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": false
+    },
+    "forbidden": [
+      "a second trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "handoff-existing-run",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "github",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": "status",
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "label_present": true,
+      "existing_status": true
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 0,
+        "label_adds": 0,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "response unavailable",
+        "selection": "existing selection inspected",
+        "factory": "admitted or queued",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": true
+    },
+    "forbidden": [
+      "a facts request",
+      "a trigger-label write"
+    ]
+  },
+  {
+    "id": "handoff-gitlab-no-facts",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "gitlab",
+      "ticket_tracker": "gitlab",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/gitlab/example/widget/-/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": "status",
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      },
+      "factory_token_login": "factory-bot"
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 0,
+        "label_adds": 1,
+        "label_removes": 0,
+        "label_actor_not": "factory-bot"
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "response unavailable",
+        "selection": "acknowledged",
+        "factory": "admitted or queued",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": true
+    },
+    "forbidden": [
+      "a facts request",
+      "a second trigger-label write",
+      "removing the trigger label"
+    ]
+  },
+  {
+    "id": "handoff-bitbucket-code-host",
+    "given": {
+      "trigger_label": "acme-factory",
+      "factory_app_login": "curie-factory[bot]",
+      "acting_login": "dev-user",
+      "code_host": "bitbucket",
+      "ticket_tracker": "github",
+      "repository": "example/widget",
+      "issue_number": 21,
+      "issue_url": "https://example.invalid/example/widget/issues/21",
+      "issue_body": "1. Criterion AC1 keeps the widget count.\n   Needs executable: uv\n   Needs service: none\n   Verified by: uv\n   Runs in: sandbox\n",
+      "facts_delay_s": 15,
+      "ack_delay_s": 15,
+      "ack": "status",
+      "valid_answer": true,
+      "label_route": {
+        "state": "eligible",
+        "route": "github_user",
+        "reason": null
+      },
+      "model_credit": {
+        "state": "sufficient",
+        "reason": null
+      },
+      "factory": {
+        "enabled": true,
+        "kill_switch": "clear",
+        "upgrade_pause": "clear"
+      }
+    },
+    "user_turn": "The issue body is approved and already published. Publish and start the factory.",
+    "expected": {
+      "operations": {
+        "facts_requests": 1,
+        "label_adds": 1,
+        "label_removes": 0
+      },
+      "dimensions": {
+        "publication": "published",
+        "facts": "clear for the requested set",
+        "selection": "acknowledged",
+        "factory": "admitted or queued",
+        "deployment_validation": "unvalidated"
+      },
+      "asks_question": false,
+      "factory_comment_required": true
+    },
+    "forbidden": [
+      "a bitbucket issue label",
+      "a second trigger-label write",
+      "removing the trigger label"
+    ]
+  }
   ],
   "readiness_repository_files": {
     ".github/workflows/unit.yml": "name: unit\non: [pull_request]\njobs:\n  unit:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: python3 -m unittest discover -s tests -v\n",

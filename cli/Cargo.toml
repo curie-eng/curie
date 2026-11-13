@@ -30,6 +30,18 @@ path = "tests/subscription.rs"
 name = "requester_coding_instructions"
 path = "tests/requester_coding_instructions.rs"
 
+# autotests is false, so a filename is not a target. These two files stay
+# modules of integration and are also named targets, because the preparation
+# embed check runs `cargo test --test factory_preparation_install` and
+# `cargo test --test curie_skills_install`.
+[[test]]
+name = "factory_preparation_install"
+path = "tests/factory_preparation_install.rs"
+
+[[test]]
+name = "curie_skills_install"
+path = "tests/curie_skills_install.rs"
+
 [dependencies]
 curie-aci-protocol = { path = "../packages/aci-protocol/generated/rust" }
 anstream = "1"

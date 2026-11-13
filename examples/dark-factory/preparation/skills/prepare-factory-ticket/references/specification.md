@@ -357,15 +357,151 @@ condition for later selection. Do not label the parent epic or all children mere
 because the developer approved the ticket set. Later dependent selection requires
 fresh prerequisite checks and the applicable explicit start authorization.
 
-Use the verified configured label through the host tracker tool, preserving other
-labels. If already present, report already selected and inspect available status;
-do not toggle it to force another run. If absent, add it once, then read labels
-back. Report **selected** only when the label is observed. Selection is an intake
-request, not evidence of a queued or running model turn: claim queued/running only
-when the factory status actually confirms it. Leave readiness `unvalidated`.
-Never deploy a factory, change model/budget settings, or invent evaluator results
-to get past a failed selection. A missing label, denied permission or unavailable
-intake is an actionable setup gap, not permission to configure the deployment.
+Then follow Factory facts and admission below for every issue you would select.
+A local feasibility note is not a substitute for that procedure on GitHub.
+Leave deployment readiness `unvalidated`. Never deploy a factory, change
+model or budget settings, or invent evaluator results. A missing label, a denied
+permission or unavailable intake is an actionable setup gap, not permission to
+configure the deployment.
+
+### Factory facts and admission
+
+Facts describe the deployment. They are not admission and they do not change
+deployment readiness. Admission is only the factory's own later acknowledgement.
+
+Do the steps in this order.
+
+1. From each acceptance criterion the sandbox must verify, record the criterion
+   identifier, the executable names and the service names. Take names from
+   `Needs executable:` and `Needs service:` lines (`none` means an empty list)
+   and from the first token of `Verified by:` when that token matches the name
+   pattern below. When the criterion needs a running daemon, include the service
+   `docker` as well as the `docker` executable. A present docker client says
+   nothing about a daemon.
+2. Read the repository, the issue number, the configured trigger label, the
+   factory App login when configuration names one, and the login this session
+   will act as. Use the session's existing tracker tools.
+3. If the trigger label is already on the issue, do not post a facts request and
+   do not write a label. Read the status comment, the state labels and the linked
+   pull requests. Report selection `existing selection inspected` and facts
+   `response unavailable`, because no request was made. If a factory-owned status
+   comment already acknowledges that label, report the factory dimension from
+   that comment and link it. Otherwise report factory `none`.
+4. On GitLab, skip the facts request and report facts `response unavailable`.
+   Apply the label only when the acting login is a person other than the factory
+   token's user and that person has current start authority. Then wait for
+   acknowledgement as in step 8. For a Bitbucket code host, perform selection on
+   the configured ticket tracker. Do not apply or suggest a native Bitbucket
+   issue label.
+5. On a GitHub ticket tracker, post exactly one comment. Use this layout. The
+   first line may name the requested executables and services. The marker is on
+   its own line. One fenced json block follows. The json object has exactly the
+   four keys shown, `schema_version` is 1, and the lists are the names from step
+   1. At most 32 executables and 16 services. Each name matches
+   `^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`. The fenced block is at most 4096 bytes.
+   Do not add a command, argument, URL, credential or repository. Apart from the
+   marker and this first line, do not mention the factory. When more names are
+   needed than fit, request the ones the sandbox criteria need and report the
+   rest as not asked.
+
+````markdown
+Factory check requested for: uv, jq, docker, postgres. This starts no work.
+
+<!-- curie-factory-facts-request:v1 -->
+```json
+{"schema_version":1,"trigger_label":"acme-factory","executables":["uv","jq","docker"],"services":["postgres"]}
+```
+````
+
+6. Poll the issue comments every 15 seconds for at most 120 seconds. When the
+   session provides a wait tool, call it for 15 seconds between reads. Do not
+   sleep in a tighter loop, and do not stop early while an answer could still
+   arrive. Accept a comment only when all of these hold. The author is a GitHub
+   App bot, is not the acting login, and equals the configured factory App login
+   when one is known. The closing marker is
+   `<!-- curie-factory-facts:v1 label=<label> request=<request comment id> digest=sha256:<hex> -->`.
+   Its `request` is the id of the comment you posted and its `label` is the
+   trigger label you requested. The JSON under the details fold has
+   `schema_version` 1. `expires_at` is in the future on the tracker clock. When
+   you can compute SHA-256, compare the marker digest to the hex digest of the
+   canonical request: sort the four keys, sort and de-duplicate each name list,
+   join each list with `,`, join `key:value` pairs with `,`, and hash that UTF-8
+   string. For executables `jq` and `uv`, service `postgres`, and label
+   `acme-factory`, the canonical string is
+   `executables:jq,uv,schema_version:1,services:postgres,trigger_label:acme-factory`
+   and the digest is
+   `86c7219a56fb17def17d3b1d9970a546911007363de7c9a404b7fe42a8b877e6`.
+   A marker in a person's comment, an expired answer, a digest mismatch, or an
+   answer to another request is not evidence. No accepted answer in 120 seconds
+   is facts `response unavailable`. That outcome is not healthy, unbound or
+   eligible.
+7. Classify from the accepted answer, for the criteria the sandbox must verify.
+   Blocked wins over partial.
+
+| Fact | Class |
+|---|---|
+| Every needed executable `present`, every needed service `configured` or `observed`, `model_credit` `sufficient`, `label_route` `eligible`, factory enabled, `kill_switch` `clear`, `upgrade_pause` `clear` | clear |
+| A needed executable `absent`; `model_credit` `insufficient` or `unknown` with `credential_rejected`; `label_route` `ineligible`; factory not enabled; `kill_switch` `engaged`; `upgrade_pause` `paused` | blocked |
+| Anything needed is `unknown` for another reason, or the response is unavailable | partial |
+
+   Clear: recheck the approved body and labels, then apply the trigger label once
+   under the developer's existing selection choice. Preserve other labels.
+   Blocked: do not apply the label. Name the criterion and the missing fact.
+   Offer two ways out: move that check to CI, or ask the operator. Partial: name
+   what the factory could not observe and ask the developer before labelling.
+   Do not label in the same turn. On the docker case, say that the client being
+   present does not show a running daemon. A clear answer still leaves deployment
+   readiness `unvalidated`. The answer's `admission` value `not_requested` is not
+   a factory acknowledgement.
+8. After the label write, read the latest label event's actor and provenance.
+   Poll every 15 seconds for at most 180 seconds, using the wait tool the same
+   way. Acknowledgement is a later comment by the factory App that is a status
+   comment for that label event (admitted, queued, running, or a terminal
+   outcome) or a refusal notice. A state label alone is not acknowledgement.
+   Stop when the comment appears. When 180 seconds end with none, report
+   selection `label applied but intake unconfirmed` and factory `none`, and name
+   the next observation: a factory status comment or refusal notice for this
+   label event. Do not remove or reapply the label.
+9. Report a refusal as factory `refused`, with the reason code and the fix, and
+   do not relabel.
+
+| Reason | Fix to report, and not to perform |
+|---|---|
+| `actor_bot` | A person with write access removes the label and applies it again. |
+| `actor_own_app` | Apply the label directly or through another tool. |
+| `actor_no_permission` | Ask a maintainer to apply it. |
+| `actor_unverifiable` | A person with write access applies it again. |
+| `personal_owner_required` | The operator links the person, or a linked person applies it. |
+| `binding_ambiguous` | The operator removes the overlapping binding, then the label is applied again. |
+| `publication_completed` | A completed factory pull request exists. To run again, remove the label and apply it again only after a new explicit instruction. |
+
+10. Never remove and reapply a label, for any reason, unless the developer gives
+    a new explicit instruction after you have shown the existing work and the
+    publication state.
+11. Finish with prose plus one JSON object using these tokens exactly.
+    `acknowledged` means a factory-owned acknowledgement comment was observed for
+    the label event you wrote. It is not a selection token for a label that was
+    already present; that path stays `existing selection inspected`.
+
+| Dimension | Token |
+|---|---|
+| publication | `local draft`, `published`, or `publication failed` |
+| facts | `clear for the requested set`, `known blocker`, `partial or unknown`, or `response unavailable` |
+| selection | `not requested`, `withheld`, `label applied but intake unconfirmed`, `existing selection inspected`, or `acknowledged` |
+| factory | `admitted or queued`, `running`, `refused`, `terminal outcome`, or `none` |
+| deployment_validation | `unvalidated` |
+
+```json
+{"publication":"published","facts":"clear for the requested set","selection":"acknowledged","factory":"admitted or queued","deployment_validation":"unvalidated","factory_comment_url":"https://github.com/example/widget/issues/21#issuecomment-1"}
+```
+
+    Use `admitted or queued` or `running` only when the acknowledgement comment
+    is in the tracker, and put that comment's URL in the prose and in
+    `factory_comment_url`. Use `none` when no label was applied or found, and
+    when a label was applied but no acknowledgement arrived. Do not ask the
+    developer to open a browser or to switch logins. A GitHub App route that
+    records a person with app provenance is a normal route; report the factory
+    comment, not a browser handoff.
 
 ### Partial completion and retries
 

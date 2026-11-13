@@ -838,7 +838,10 @@ pub fn install_curie_skills(
         (
             "preparation",
             "prepare-factory-ticket",
-            &["b4c5b268d73dad0a010ccc51c04e9049fdb1b0516af1634f60d0834c962b3d85"][..],
+            &[
+                "b4c5b268d73dad0a010ccc51c04e9049fdb1b0516af1634f60d0834c962b3d85",
+                "123752a5668200fae36335d9488412fe96a29824121e539ae44935a40a86f800",
+            ][..],
         ),
         (
             "review",

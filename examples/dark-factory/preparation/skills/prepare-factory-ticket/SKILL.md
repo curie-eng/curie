@@ -188,7 +188,8 @@ update when the approved content is unchanged. Existing explicit authorization
 for that exact handoff remains valid; do not ask again just because this skill
 reached another stage. Name the repository, create/update actions
 and exact issues to select, and explain that adding the configured factory label
-can start implementation. Offer publish-and-start when the agreed implementation
+asks the factory to start implementation. A label that is only visible is not
+admission. Offer publish-and-start when the agreed implementation
 has feasible automated tests, including tests to add;
 flagged and approved external qualification does not block it. For core verification
 gaps, explain the blocking criteria and offer
@@ -204,6 +205,47 @@ publication and selection outcomes. Keep the evidence report local. Stop with
 specific actionable gaps when access, unresolved intent or a conflict prevents
 the next step; local draft creation alone is not completion of an approved publish.
 
+## Factory facts and admission
+
+Follow [Factory facts and admission](references/specification.md#factory-facts-and-admission)
+before any trigger label write, and use it again when you report the result.
+It overrides any earlier wording that treats a visible label, a label readback,
+or a state label as proof that the factory admitted the issue.
+
+1. Extract sandbox criteria locally. For each criterion the sandbox must verify,
+   record its identifier, the executable names and the service names. Send names
+   only. Never send ticket prose, scripts, commands, arguments, URLs, credentials
+   or the repository to the deployment.
+2. Identify the repository, the issue and the configured trigger label from the
+   host's tracker tools. Read the issue labels before any comment or label write.
+   Use whatever authorized route this session already has, including a GitHub
+   App connector. Do not infer identity or admission from the tool's brand or
+   from a claimed login.
+3. If the trigger label is already on the issue, post no facts request and write
+   no label. Report selection `existing selection inspected` and facts
+   `response unavailable`, because no request was made. If a factory-owned status
+   comment already acknowledges that label, report the factory dimension from
+   that comment and link it. Otherwise report factory `none`.
+4. On a GitHub ticket tracker, when the label is absent, post one facts request
+   in the reference layout. On GitLab, post no facts request. A Bitbucket code
+   host is not a ticket tracker: select through the configured ticket tracker
+   and never suggest a native Bitbucket issue label.
+5. Authenticate one factory answer. Poll every 15 seconds for at most 120
+   seconds. When the session provides a wait tool, advance 15 seconds with that
+   tool instead of sleeping. No accepted answer is `response unavailable`.
+6. Classify locally with the reference table. Clear: apply the trigger label
+   once. Blocked: do not apply it, name the criterion and the missing fact, and
+   offer the two ways out. Partial, including `response unavailable` on GitHub:
+   name the unknown fact and ask the developer before labelling. GitLab still
+   labels under its own person rule after reporting facts `response unavailable`.
+7. After the one label write, read the latest label event. Poll every 15 seconds
+   for at most 180 seconds for a factory-owned status comment or refusal notice.
+   A state label alone is corroboration, never proof. Do not write the label
+   twice. Do not remove it and apply it again.
+8. Close with the five dimensions in the reference. Report `admitted or queued`
+   or `running` only when the tracker holds the factory's acknowledgement, and
+   include a link to that comment. Deployment validation stays `unvalidated`.
+
 ## Readiness boundary
 
 Every output of this release has deployment readiness **unvalidated**, including
@@ -212,11 +254,11 @@ review separately as pending or confirmed. Manual format review and local test
 results do not mean a deterministic parser or deployment evaluator ran, and do
 not prove required checks, granted capabilities or deployment availability.
 
-Connected validation is future work in #4488; this skill supplies no validation
-command or API to invoke. Keep validation results absent and explain that
-deployment validation is pending. Approved publication and selection use the
-existing tracker and configured label intake, not a validated handoff API. Do not
-emit `validated-ready` or claim a reservation. Later connected validation must use
+Connected validation is future work in #4488. A facts answer is not that
+validation and is not admission. Keep deployment validation `unvalidated` and
+explain that it is pending. Approved publication and selection use the existing
+tracker, the facts request on GitHub, and configured label intake. Do not emit
+`validated-ready` or claim a reservation. Later connected validation must use
 the factory-owned evaluator for the exact final input and selected deployment;
 editing an input invalidates any earlier report for that input.
 
