@@ -205,6 +205,13 @@ pub(crate) enum ClusterAction {
         #[command(subcommand)]
         action: ClusterSubscriptionAction,
     },
+    /// Manage your own coding instructions using a Console principal session.
+    /// The content reaches the model provider and must not contain credentials.
+    /// Application to factory runs is unavailable.
+    CodingInstructions {
+        #[command(subcommand)]
+        action: ClusterCodingInstructionsAction,
+    },
     /// Report value paths that differ between a release and pending Helm files.
     /// A nonempty report is advisory and exits successfully.
     LintValues {

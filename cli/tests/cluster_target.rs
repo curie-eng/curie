@@ -6,6 +6,7 @@
 //! Neither path needs a cluster or backing service.
 
 use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -200,6 +201,42 @@ fn cluster_cases() -> Vec<ClusterCase> {
             ],
         },
         ClusterCase {
+            name: "coding-instructions",
+            args: &[
+                "coding-instructions",
+                "get",
+                "--session-file",
+                "session",
+                "--dry-run",
+            ],
+        },
+        ClusterCase {
+            name: "coding-instructions",
+            args: &[
+                "coding-instructions",
+                "set",
+                "--session-file",
+                "session",
+                "--file",
+                "instructions",
+                "--expected-revision",
+                "0",
+                "--dry-run",
+            ],
+        },
+        ClusterCase {
+            name: "coding-instructions",
+            args: &[
+                "coding-instructions",
+                "clear",
+                "--session-file",
+                "session",
+                "--expected-revision",
+                "0",
+                "--dry-run",
+            ],
+        },
+        ClusterCase {
             name: "approvals",
             args: &["approvals", "acme-bot", "--dry-run"],
         },
@@ -357,7 +394,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 41);
+    assert_eq!(covered_names.len(), 42);
 }
 
 #[test]
@@ -615,6 +652,36 @@ fn nested_observability_uses_the_file_target() {
     write_installation(dir.path(), FILE_NAMESPACE, FILE_RELEASE);
     let output = run(dir.path(), &["cluster", "observability", "--dry-run"], &[]);
     assert_success_target(&output, FILE_NAMESPACE, FILE_RELEASE);
+}
+
+#[test]
+fn coding_instructions_leaves_use_the_file_target() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_installation(dir.path(), FILE_NAMESPACE, FILE_RELEASE);
+    let session = dir.path().join("session");
+    std::fs::write(&session, "example-session-cookie").expect("write session");
+    std::fs::set_permissions(&session, std::fs::Permissions::from_mode(0o600))
+        .expect("make session private");
+    std::fs::write(dir.path().join("instructions"), "").expect("write instructions");
+
+    for case in cluster_cases()
+        .into_iter()
+        .filter(|case| case.name == "coding-instructions")
+    {
+        let mut args = vec!["cluster"];
+        args.extend_from_slice(case.args);
+        let output = run(dir.path(), &args, &[]);
+        assert_success_target(&output, FILE_NAMESPACE, FILE_RELEASE);
+        assert_eq!(
+            target_diagnostics(&output),
+            vec![target_note(
+                FILE_NAMESPACE,
+                "curie.yaml",
+                FILE_RELEASE,
+                "curie.yaml"
+            )]
+        );
+    }
 }
 
 #[test]

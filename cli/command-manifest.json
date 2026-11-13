@@ -4986,6 +4986,214 @@
           ]
         },
         {
+          "about": "Manage your own coding instructions using a Console principal session. The content reaches the model provider and must not contain credentials. Application to factory runs is unavailable",
+          "hidden": false,
+          "name": "coding-instructions",
+          "subcommands": [
+            {
+              "about": "Read your coding instructions and current revision. Application to factory runs is unavailable",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session",
+                  "id": "session_file",
+                  "long": "session-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback. A direct URL must use HTTPS unless it is loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Validate the files and print the request plan without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "get"
+            },
+            {
+              "about": "Replace your coding instructions from a UTF-8 file, preserving its whitespace. An empty file clears the document. The content reaches the model provider and must not contain credentials. Application to factory runs is unavailable",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session",
+                  "id": "session_file",
+                  "long": "session-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback. A direct URL must use HTTPS unless it is loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Validate the files and print the request plan without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "UTF-8 instruction file. Its bytes are sent unchanged to the API",
+                  "id": "file",
+                  "long": "file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Revision returned by get. Use 0 when no document has been created",
+                  "id": "expected_revision",
+                  "long": "expected-revision",
+                  "positional": false,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "set"
+            },
+            {
+              "about": "Clear your document while preserving its revision history",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session",
+                  "id": "session_file",
+                  "long": "session-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to reach the release API over loopback. A direct URL must use HTTPS unless it is loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Validate the files and print the request plan without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Revision returned by get. Use 0 when no document has been created",
+                  "id": "expected_revision",
+                  "long": "expected-revision",
+                  "positional": false,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "clear"
+            }
+          ]
+        },
+        {
           "about": "Report value paths that differ between a release and pending Helm files. A nonempty report is advisory and exits successfully",
           "args": [
             {

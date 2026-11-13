@@ -14,11 +14,13 @@ use curie::message;
 use curie::ui::ColorFlag;
 
 mod cluster;
+mod coding_instructions;
 mod dev;
 mod local;
 mod skill;
 
 pub(crate) use cluster::*;
+pub(crate) use coding_instructions::*;
 pub(crate) use dev::*;
 pub(crate) use local::*;
 pub(crate) use skill::*;

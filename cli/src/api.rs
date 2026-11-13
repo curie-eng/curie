@@ -6148,6 +6148,140 @@ pub struct PersonalEnrollmentStatus {
     pub teardown: PersonalEnrollmentTeardown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodingInstructionsApplication {
+    Unavailable,
+}
+
+/// Every owner coding instructions route's answer (`CodingInstructionsOut`).
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CodingInstructionsStatus {
+    pub revision: i64,
+    pub sha256: Option<String>,
+    pub format_version: i64,
+    pub byte_length: i64,
+    pub text: Option<String>,
+    pub updated_at: Option<String>,
+    pub tenant_enabled: bool,
+    pub application: CodingInstructionsApplication,
+}
+
+impl std::fmt::Debug for CodingInstructionsStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodingInstructionsStatus")
+            .field("revision", &self.revision)
+            .field("text", &"<redacted>")
+            .field("application", &self.application)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Serialize)]
+pub struct CodingInstructionsWrite {
+    pub text: String,
+    pub expected_revision: i64,
+}
+
+impl std::fmt::Debug for CodingInstructionsWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodingInstructionsWrite")
+            .field("text", &"<redacted>")
+            .field("expected_revision", &self.expected_revision)
+            .finish()
+    }
+}
+
+fn coding_instructions_refusal(
+    operation: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    use crate::exit::ExitClass::{Failure, Transient, Usage};
+
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let detail = value.as_ref().and_then(|value| value.get("detail"));
+    let code = detail
+        .and_then(|detail| detail.get("code"))
+        .and_then(serde_json::Value::as_str);
+    let current_revision = detail
+        .and_then(|detail| detail.get("current_revision"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|revision| *revision >= 0);
+    let (class, problem, fix) = match (status.as_u16(), code) {
+        (401, _) => (
+            Failure,
+            "the platform refused the Console principal session (HTTP 401)".to_string(),
+            ENROLLMENT_SESSION_FIX.to_string(),
+        ),
+        (403, _) => (
+            Failure,
+            "the platform refused the session or request origin (HTTP 403)".to_string(),
+            ENROLLMENT_ORIGIN_FIX.to_string(),
+        ),
+        (409, Some("stale_revision")) => (
+            Failure,
+            current_revision.map_or_else(
+                || "the document changed (stale_revision)".to_string(),
+                |revision| {
+                    format!("the document changed (stale_revision, current revision {revision})")
+                },
+            ),
+            "run `curie cluster coding-instructions get`, review the document, then retry with \
+             --expected-revision set to its revision"
+                .to_string(),
+        ),
+        (409, Some("revision_exhausted")) => (
+            Failure,
+            "the document reached its maximum revision (revision_exhausted)".to_string(),
+            "the document cannot be changed further; contact the platform administrator"
+                .to_string(),
+        ),
+        (413, _) => (
+            Usage,
+            "the coding instructions request exceeds the maximum size (HTTP 413)".to_string(),
+            "reduce the instruction file, then retry".to_string(),
+        ),
+        (422, Some("too_large")) => (
+            Usage,
+            "the instruction document exceeds 16384 normalized UTF-8 bytes (too_large)".to_string(),
+            "reduce the file to at most 16384 bytes after line-ending normalization, then retry"
+                .to_string(),
+        ),
+        (422, _) => (
+            Usage,
+            "the platform refused the coding instructions request (invalid_text)".to_string(),
+            "use UTF-8 text without NUL and a nonnegative --expected-revision".to_string(),
+        ),
+        (502..=504, _) => (
+            Transient,
+            format!("the platform API is temporarily unavailable (HTTP {status})"),
+            "retry once the platform API is available".to_string(),
+        ),
+        _ if status.is_redirection() => (
+            Failure,
+            format!("the endpoint answered {status} with a redirect, which this CLI never follows"),
+            "point --api-url at the platform API's own address".to_string(),
+        ),
+        (404, _) if is_unrouted(status, body) => (
+            Failure,
+            "this platform release does not serve /coding-instructions".to_string(),
+            "upgrade the release, or use a CLI matching it".to_string(),
+        ),
+        _ => (
+            Failure,
+            format!("the platform answered HTTP {status}"),
+            "check the platform API and Console session, then retry".to_string(),
+        ),
+    };
+    crate::exit::CliError {
+        message: format!("{operation} failed: {problem}; {fix}"),
+        fix: Some(fix),
+        class,
+    }
+    .into()
+}
+
 /// The `detail.code` of an owner enrollment refusal, when it is one the
 /// contract defines. Any other body is dropped, never echoed.
 fn allowlisted_enrollment_code(body: &str) -> Option<&'static str> {
@@ -6283,7 +6417,7 @@ fn enrollment_refusal(operation: &str, status: reqwest::StatusCode, body: &str) 
     })
 }
 
-/// The owner enrollment client. It holds the caller's Console session cookie
+/// The owner API client. It holds the caller's Console session cookie
 /// and no platform key, sends the cookie on every request and `Origin` on every
 /// unsafe one, and never follows a redirect.
 pub struct OwnerApiClient {
@@ -6324,8 +6458,13 @@ impl OwnerApiClient {
             .http
             .get(format!("{}/personal-claude/enrollment", self.base_url))
             .header(reqwest::header::COOKIE, self.cookie.header_value()?);
-        self.exchange(request, "GET /personal-claude/enrollment")
-            .await
+        self.exchange(
+            request,
+            "GET /personal-claude/enrollment",
+            "a personal enrollment",
+            enrollment_refusal,
+        )
+        .await
     }
 
     /// `PUT /personal-claude/enrollment`: enroll, replace or reconnect.
@@ -6339,8 +6478,13 @@ impl OwnerApiClient {
             .header(reqwest::header::COOKIE, self.cookie.header_value()?)
             .header(reqwest::header::ORIGIN, self.origin.clone())
             .json::<PersonalEnrollmentWrite>(body);
-        self.exchange(request, "PUT /personal-claude/enrollment")
-            .await
+        self.exchange(
+            request,
+            "PUT /personal-claude/enrollment",
+            "a personal enrollment",
+            enrollment_refusal,
+        )
+        .await
     }
 
     /// `DELETE /personal-claude/enrollment?expected_version=N`: disconnect.
@@ -6354,15 +6498,74 @@ impl OwnerApiClient {
             .query(&[("expected_version", expected_version)])
             .header(reqwest::header::COOKIE, self.cookie.header_value()?)
             .header(reqwest::header::ORIGIN, self.origin.clone());
-        self.exchange(request, "DELETE /personal-claude/enrollment")
-            .await
+        self.exchange(
+            request,
+            "DELETE /personal-claude/enrollment",
+            "a personal enrollment",
+            enrollment_refusal,
+        )
+        .await
     }
 
-    async fn exchange(
+    pub async fn get_coding_instructions(&self) -> Result<CodingInstructionsStatus> {
+        let request = self
+            .http
+            .get(format!("{}/coding-instructions", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?);
+        self.exchange(
+            request,
+            "GET /coding-instructions",
+            "a coding instructions document",
+            coding_instructions_refusal,
+        )
+        .await
+    }
+
+    pub async fn put_coding_instructions(
+        &self,
+        body: &CodingInstructionsWrite,
+    ) -> Result<CodingInstructionsStatus> {
+        let request = self
+            .http
+            .put(format!("{}/coding-instructions", self.base_url))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<CodingInstructionsWrite>(body);
+        self.exchange(
+            request,
+            "PUT /coding-instructions",
+            "a coding instructions document",
+            coding_instructions_refusal,
+        )
+        .await
+    }
+
+    pub async fn delete_coding_instructions(
+        &self,
+        expected_revision: i64,
+    ) -> Result<CodingInstructionsStatus> {
+        let request = self
+            .http
+            .delete(format!("{}/coding-instructions", self.base_url))
+            .query(&[("expected_revision", expected_revision)])
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone());
+        self.exchange(
+            request,
+            "DELETE /coding-instructions",
+            "a coding instructions document",
+            coding_instructions_refusal,
+        )
+        .await
+    }
+
+    async fn exchange<T: serde::de::DeserializeOwned>(
         &self,
         request: reqwest::RequestBuilder,
         operation: &'static str,
-    ) -> Result<PersonalEnrollmentStatus> {
+        resource: &'static str,
+        refusal: fn(&str, reqwest::StatusCode, &str) -> anyhow::Error,
+    ) -> Result<T> {
         let response = match request.timeout(OWNER_REQUEST_TIMEOUT).send().await {
             Ok(response) => response,
             Err(err) => {
@@ -6394,11 +6597,11 @@ impl OwnerApiClient {
                 .bytes()
                 .await
                 .with_context(|| format!("{operation}: reading the response"))?;
-            return serde_json::from_slice::<PersonalEnrollmentStatus>(&body).map_err(|_| {
+            return serde_json::from_slice::<T>(&body).map_err(|_| {
                 anyhow::Error::from(
                     crate::exit::CliError::failure(format!(
-                        "{operation} answered {status} with a body that is not a personal \
-                         enrollment; the platform release may not match this CLI"
+                        "{operation} answered {status} with a body that is not {resource}; \
+                         the platform release may not match this CLI"
                     ))
                     .with_fix("use a CLI matching the release"),
                 )
@@ -6409,7 +6612,7 @@ impl OwnerApiClient {
         } else {
             response.text().await.unwrap_or_default()
         };
-        Err(enrollment_refusal(operation, status, &body))
+        Err(refusal(operation, status, &body))
     }
 }
 

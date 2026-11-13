@@ -12,11 +12,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from .. import identity_audit
+from .. import identity_audit, requester_coding_profiles
 from ..auth import require_platform_key
 from ..deps import SessionDep
 from ..identity.service import find_or_create_namespace
 from ..models import IdentityLink, IdentityNamespace, Principal
+from ..schemas.coding_instructions import CodingInstructionsPolicyOut, CodingInstructionsPolicyWrite
 from ..schemas.identity import CodeHostLinkIn, CodeHostLinkOut, IdentityLinkRevokedOut
 
 GITHUB_HOST = "github_host"
@@ -27,6 +28,33 @@ router = APIRouter(
     tags=["identity-admin"],
     dependencies=[Depends(require_platform_key)],
 )
+
+
+@router.get("/{tenant_id}/coding-instructions-policy", response_model=CodingInstructionsPolicyOut)
+async def coding_instructions_policy(
+    tenant_id: uuid.UUID, session: SessionDep
+) -> CodingInstructionsPolicyOut:
+    try:
+        await requester_coding_profiles.require_tenant(session, tenant_id)
+    except requester_coding_profiles.ProfileRefusal:
+        raise HTTPException(404, {"code": "tenant_not_found"}) from None
+    return CodingInstructionsPolicyOut(
+        enabled=await requester_coding_profiles.tenant_enabled(session, tenant_id)
+    )
+
+
+@router.put("/{tenant_id}/coding-instructions-policy", response_model=CodingInstructionsPolicyOut)
+async def set_coding_instructions_policy(
+    tenant_id: uuid.UUID, body: CodingInstructionsPolicyWrite, session: SessionDep
+) -> CodingInstructionsPolicyOut:
+    try:
+        await requester_coding_profiles.write_policy(
+            session, tenant_id=tenant_id, enabled=body.enabled
+        )
+    except requester_coding_profiles.ProfileRefusal:
+        raise HTTPException(404, {"code": "tenant_not_found"}) from None
+    await session.commit()
+    return CodingInstructionsPolicyOut(enabled=body.enabled)
 
 
 @router.get("/{tenant_id}/{resource}")
