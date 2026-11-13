@@ -2076,6 +2076,17 @@ def _refuse(reason: str) -> int:
 
 
 def main() -> int:
+    """Exit 2 on every failure that is not a deliberate exit, since any other
+    nonzero exit lets the tool call through."""
+    try:
+        return _decide()
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - any failure denies the call
+        return _refuse(f"the hook failed ({type(exc).__name__})")
+
+
+def _decide() -> int:
     try:
         data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     except (UnicodeDecodeError, ValueError):

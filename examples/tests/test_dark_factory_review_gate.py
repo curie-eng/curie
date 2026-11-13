@@ -802,6 +802,15 @@ def test_publish_hook_denies_unreadable_input(
     assert "refusing" in capsys.readouterr().err
 
 
+def test_hook_denies_deeply_nested_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_nested_input")
+    raw = b'{"a": ' + b"[" * 12000 + b"]" * 12000 + b"}"
+    assert _publish_main(hook, monkeypatch, raw) == 2
+    assert "refusing" in capsys.readouterr().err
+
+
 def test_publish_hook_denies_on_its_own_exception(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
