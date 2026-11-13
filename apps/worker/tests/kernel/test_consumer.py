@@ -61,6 +61,7 @@ from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.sandbox import k8s as k8s_module
 from curie_worker.sandbox.k8s import KubernetesSandboxClient
+from curie_worker.sandbox.types import KubeTransientError
 from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
@@ -1406,9 +1407,11 @@ async def _assert_pod_list_admission_wait(
         assert record.first_wait_ms == original.first_wait_ms
         assert record.deadline_ms == original.deadline_ms
     assert len(api.pod_list_calls) == deferrals
-    assert [plural for plural, _selector in api.lists] == [
-        "sandboxclaims", "sandboxes"
-    ] * deferrals
+    # The inventory LISTs run concurrently (#5630), so only their count per
+    # attempt is fixed, not their order: each is issued once, never retried.
+    assert sorted(plural for plural, _selector in api.lists) == sorted(
+        ["sandboxclaims", "sandboxes"] * deferrals
+    )
     assert api.quota_error is api.runtime_error is None
     assert api.failures == {}
     assert api.created == api.patches == []
@@ -3751,6 +3754,179 @@ def test_a_failing_progress_sweep_does_not_stop_the_maintenance_tick(
             assert any("progress outbox sweep failed" in r.getMessage() for r in caplog.records)
 
     asyncio.run(go())
+
+
+class _ExpiryRecorder:
+    """A retention ledger (workspace or attachment) that records each expiry pass.
+
+    Nothing has expired, so only ``enumerate_expired`` is reached.
+    """
+
+    def __init__(self, events: list[tuple[int, str]], tick: list[int], name: str) -> None:
+        self._events = events
+        self._tick = tick
+        self._name = name
+
+    def enumerate_expired(self) -> list[str]:
+        self._events.append((self._tick[0], self._name))
+        return []
+
+
+def test_maintenance_inventory_503_does_not_skip_independent_steps(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5630: a Pod LIST 503 fails the orphan reap's admission inventory on two
+    consecutive ticks. Each failing tick logs that failure once, against its
+    step, and still runs every independent maintenance step exactly once; the
+    third tick, after the API recovers, logs nothing at ERROR."""
+
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=2
+    )
+    # Advanced by the last observer, so every step is tagged with its tick.
+    tick = [0]
+    events: list[tuple[int, str]] = []
+    real_inventory = client.capacity_inventory
+
+    def counting_inventory(**kwargs: Any) -> Any:
+        events.append((tick[0], "capacity_inventory"))
+        return real_inventory(**kwargs)
+
+    monkeypatch.setattr(client, "capacity_inventory", counting_inventory)
+
+    def counting(name: str, step: Any) -> Any:
+        async def run() -> None:
+            events.append((tick[0], name))
+            await step()
+
+        return run
+
+    async def go() -> list[int]:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            reclaim_interval_s=1e-6,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            # The fake claim LIST reads this group's pending rows.
+            await consumer.ensure_group()
+            h.kernel._workspace = _ExpiryRecorder(events, tick, "workspace_expiry")
+            h.kernel._attachments = _ExpiryRecorder(events, tick, "attachment_expiry")
+            h.kernel.sweep_pending_completions = counting(  # type: ignore[method-assign]
+                "sweep_pending_completions", h.kernel.sweep_pending_completions
+            )
+            consumer._sweep_pending_progress = counting(  # type: ignore[method-assign]
+                "progress_sweep", consumer._sweep_pending_progress
+            )
+            consumer._drain_pending_progress_inboxes = counting(  # type: ignore[method-assign]
+                "progress_inbox_drain", consumer._drain_pending_progress_inboxes
+            )
+            consumer._drain_thread_reset_requests = counting(  # type: ignore[method-assign]
+                "thread_reset_drain", consumer._drain_thread_reset_requests
+            )
+            boundaries: list[int] = []
+            real_observe = consumer._observe_capacity_waits
+
+            async def last_observer() -> None:
+                await real_observe()
+                boundaries.append(len(caplog.records))
+                tick[0] += 1
+                if tick[0] == 3:
+                    consumer.request_stop()
+
+            consumer._observe_capacity_waits = last_observer  # type: ignore[method-assign]
+            await consumer._maintenance_loop()
+            return boundaries
+
+    with caplog.at_level(logging.ERROR):
+        boundaries = asyncio.run(go())
+
+    assert len(boundaries) == 3
+    assert api.failures_left == 0
+    every_step = [
+        "capacity_inventory",
+        "workspace_expiry",
+        "attachment_expiry",
+        "sweep_pending_completions",
+        "progress_sweep",
+        "progress_inbox_drain",
+        "thread_reset_drain",
+    ]
+    start = 0
+    for index, end in enumerate(boundaries):
+        # Every step once, in order; the inventory once, so no retry.
+        assert [name for at, name in events if at == index] == every_step, index
+        errors = caplog.records[start:end]
+        start = end
+        if index == 2:
+            assert [(r.name, r.getMessage()) for r in errors] == [], index
+            continue
+        assert [(r.levelno, r.getMessage()) for r in errors] == [
+            (logging.ERROR, "maintenance tick failed")
+        ], index
+        record = errors[0]
+        assert getattr(record, "maintenance_step", None) == "reap_orphans", index
+        assert record.exc_info is not None
+        assert isinstance(record.exc_info[1], KubeTransientError), record.exc_info
+        assert str(record.exc_info[1]) == "kube API 503 listing pods"
+
+
+def test_maintenance_inventory_503_with_failing_expiry_logs_the_substrate_error(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5630 Decision 5.3: when the substrate reap and the expiry reap both
+    fail, the substrate error is the logged exception and the expiry failure
+    rides on it as a note, so one traceback carries both."""
+
+    client, _api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=1
+    )
+
+    class _FailingWorkspace:
+        def enumerate_expired(self) -> list[str]:
+            raise RuntimeError("workspace ledger unreadable")
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            reclaim_interval_s=1e-6,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            h.kernel._workspace = _FailingWorkspace()
+            real_observe = consumer._observe_capacity_waits
+
+            async def last_observer() -> None:
+                await real_observe()
+                consumer.request_stop()
+
+            consumer._observe_capacity_waits = last_observer  # type: ignore[method-assign]
+            await consumer._maintenance_loop()
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(go())
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["maintenance tick failed"]
+    record = errors[0]
+    assert getattr(record, "maintenance_step", None) == "reap_orphans"
+    assert record.exc_info is not None
+    assert record.exc_info[0] is KubeTransientError
+    assert str(record.exc_info[1]) == "kube API 503 listing pods"
+    notes = getattr(record.exc_info[1], "__notes__", [])
+    assert len(notes) == 1
+    assert "expiry reap also failed" in notes[0]
+    assert "workspace ledger unreadable" in notes[0]
+    assert "workspace ledger unreadable" in logging.Formatter().format(record)
 
 
 def test_maintenance_tick_settles_pending_progress_without_a_deliverer(make_harness) -> None:

@@ -1204,25 +1204,31 @@ class Consumer(StreamConsumer):
 
     async def _maintenance_loop(self) -> None:
         while not self._should_stop():
-            try:
-                # A reclaim is a NEW claim: it moves a peer's pending entry into
-                # this consumer and dispatches it. During an upgrade drain
-                # (#2010) that is exactly the theft the gate exists to stop --
-                # a replacement pod coming up mid-roll would otherwise take the
-                # delivery a still-draining replica is settling, see the
-                # side-effect marker, and escalate work that was about to
-                # complete. The rest of the tick is unaffected: reaping orphans
-                # and sweeping owed completions create no claims and stay
-                # useful while a drain is in progress.
-                if not await self._claims_paused():
-                    await self._reclaim_once()
-                await self._kernel.reap_orphans()
-                await self._kernel.sweep_pending_completions()
-                await self._sweep_pending_progress()
-                await self._drain_pending_progress_inboxes()
-                await self._drain_thread_reset_requests()
-            except Exception:
-                logger.exception("maintenance tick failed")
+            # Each step runs in its own try (#5630): the steps are independent,
+            # so a Kubernetes outage that fails the orphan reap must not stall
+            # owed completion recovery or the thread-reset drain behind it.
+            #
+            # A reclaim is a NEW claim: it moves a peer's pending entry into
+            # this consumer and dispatches it. During an upgrade drain
+            # (#2010) that is exactly the theft the gate exists to stop --
+            # a replacement pod coming up mid-roll would otherwise take the
+            # delivery a still-draining replica is settling, see the
+            # side-effect marker, and escalate work that was about to
+            # complete. The rest of the tick is unaffected: reaping orphans
+            # and sweeping owed completions create no claims and stay
+            # useful while a drain is in progress.
+            await self._maintenance_step("reclaim", self._reclaim_unless_paused)
+            await self._maintenance_step("reap_orphans", self._kernel.reap_orphans)
+            await self._maintenance_step(
+                "sweep_pending_completions", self._kernel.sweep_pending_completions
+            )
+            await self._maintenance_step("progress_sweep", self._sweep_pending_progress)
+            await self._maintenance_step(
+                "progress_inbox_drain", self._drain_pending_progress_inboxes
+            )
+            await self._maintenance_step(
+                "thread_reset_drain", self._drain_thread_reset_requests
+            )
             # Queue inventory is operational sampling, not message settlement.
             # Keep its three Valkey reads on the bounded maintenance cadence so
             # a slow telemetry read cannot retain a per-message concurrency slot
@@ -1233,6 +1239,18 @@ class Consumer(StreamConsumer):
             await self._observe_completion_outbox()
             await self._observe_capacity_waits()
             await self._sleep_or_stop(self._config.reclaim_interval_s)
+
+    async def _reclaim_unless_paused(self) -> None:
+        if not await self._claims_paused():
+            await self._reclaim_once()
+
+    @staticmethod
+    async def _maintenance_step(name: str, step: Callable[[], Awaitable[object]]) -> None:
+        """Run one maintenance step, logging its failure without skipping the rest."""
+        try:
+            await step()
+        except Exception:
+            logger.exception("maintenance tick failed", extra={"maintenance_step": name})
 
     async def _sweep_pending_progress(self) -> None:
         """Sweep the progress outbox (ADR 0130) with no deliverer.

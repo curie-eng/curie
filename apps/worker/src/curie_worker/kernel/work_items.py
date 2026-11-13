@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -464,7 +465,37 @@ async def reap_orphans(self: Kernel) -> list[str]:
                 await self._markers.forget_watched_turn(claim_name, expected)
         except Exception:  # noqa: BLE001 - one unavailable claim must not starve maintenance
             logger.warning("could not reap watched runner claim %s", claim_name, exc_info=True)
-    reaped.extend(await asyncio.to_thread(self._substrate.reap_orphans))
+    # The substrate reap reads live Kubernetes capacity, so an API outage
+    # fails it. The expiry reaps below are independent of that read and must
+    # not stall behind it (#5630): they still run, then the substrate error
+    # is re-raised so the maintenance tick logs it once.
+    substrate_error: Exception | None = None
+    try:
+        reaped.extend(await asyncio.to_thread(self._substrate.reap_orphans))
+    except Exception as exc:  # noqa: BLE001 - re-raised after the expiry reaps
+        substrate_error = exc
+    expiry_error: Exception | None = None
+    try:
+        await _reap_expired(self)
+    except Exception as exc:
+        if substrate_error is None:
+            raise
+        expiry_error = exc
+    if substrate_error is not None:
+        # The substrate error stays the propagated exception (#5630 Decision
+        # 5.3). An expiry failure rides on it as a note, so the one logged
+        # traceback carries both and no new log line is added.
+        if expiry_error is not None:
+            substrate_error.add_note(
+                "expiry reap also failed:\n"
+                + "".join(traceback.format_exception(expiry_error))
+            )
+        raise substrate_error
+    return reaped
+
+
+async def _reap_expired(self: Kernel) -> None:
+    """Reap expired workspace and attachment ledgers behind the thread lock."""
     if self._workspace is not None:
         expired_threads = await asyncio.to_thread(self._workspace.enumerate_expired)
         for thread_key in expired_threads:
@@ -508,7 +539,6 @@ async def reap_orphans(self: Kernel) -> list[str]:
                         self._attachments.finish_expired_reap,
                         parked,
                     )
-    return reaped
 
 
 async def _preflight_reclaimed_delivery(

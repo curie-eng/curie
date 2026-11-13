@@ -11,6 +11,7 @@ the env-gated cluster e2e tests.
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import json
 import logging
@@ -19,6 +20,7 @@ import socket
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -619,6 +621,19 @@ def _daemon_view(kind: DaemonObjectKind, obj: Any) -> DaemonObjectView:
 # threads behind repeated pings (each one fails closed instead).
 _PORT_FORWARDS = threading.BoundedSemaphore(8)
 
+# The capacity inventory's three LISTs run here (#5630): three for each of up to
+# 16 inventories in flight at once, the default per-worker turn concurrency
+# (CURIE_WORKER_MAX_CONCURRENCY). One bounded pool for the process, not one per
+# call: threads start lazily and are reused, so ticks do not grow them. A LIST
+# still queued when its call ends is cancelled and never issues a request. A
+# LIST already reading cannot be interrupted; it finishes in the background on
+# its pool thread within the SDK's own timeouts, its result or error is
+# discarded, and nothing retries it.
+_INVENTORY_LIST_THREADS = 48
+_INVENTORY_POOL = ThreadPoolExecutor(
+    max_workers=_INVENTORY_LIST_THREADS, thread_name_prefix="capacity-inventory"
+)
+
 
 def _owner_ref(api_version: str, kind: str, name: str, uid: str) -> dict[str, str]:
     """An ownerReference with no ``controller`` or ``blockOwnerDeletion``."""
@@ -932,28 +947,81 @@ class KubernetesSandboxClient:
                 raise TimeoutError("sandbox capacity inventory deadline expired")
             return remaining
 
-        claims = cast(
-            dict[str, Any],
-            self._api.list_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
-                _request_timeout=budget(),
-            ),
-        )["items"]
-        sandboxes = cast(
-            dict[str, Any],
-            self._api.list_namespaced_custom_object(
-                CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
-                _request_timeout=budget(),
-            ),
-        )["items"]
+        def list_claims() -> list[dict[str, Any]]:
+            return cast(
+                dict[str, list[dict[str, Any]]],
+                self._api.list_namespaced_custom_object(
+                    EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
+                    _request_timeout=budget(),
+                ),
+            )["items"]
+
+        def list_sandboxes() -> list[dict[str, Any]]:
+            return cast(
+                dict[str, list[dict[str, Any]]],
+                self._api.list_namespaced_custom_object(
+                    CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
+                    _request_timeout=budget(),
+                ),
+            )["items"]
+
+        def list_pods() -> list[k8s_client.V1Pod]:
+            try:
+                return self._core_api.list_namespaced_pod(
+                    self._namespace, _request_timeout=budget()
+                ).items
+            except k8s_client.ApiException as exc:
+                if exc.status in _TRANSIENT_STATUSES:
+                    raise KubeTransientError(f"kube API {exc.status} listing pods") from exc
+                raise
+
+        # The three LISTs run concurrently (#5630): issued one after another,
+        # three healthy reads were summed against the one total budget, so
+        # ordinary API latency failed admission and maintenance. The bound is
+        # unchanged (#5296 Decision 3): each LIST still gets the budget
+        # remaining when it is issued, and an expired budget raises before any
+        # request. The call returns or raises at the first deciding outcome or
+        # the deadline, whichever comes first, never later than the sequential
+        # code would for the same fault. Results are taken in the fixed order
+        # claims, sandboxes, Pods: the first failure whose earlier siblings all
+        # succeeded is raised as-is, and a later LIST's failure never preempts
+        # an earlier one still in flight. Past the deadline the call raises the
+        # same TimeoutError an exhausted budget always has. There is no partial
+        # inventory and no retry. On the way out every LIST is cancelled, so
+        # one still queued never issues a request; one already reading cannot
+        # be interrupted, finishes in the background on its pool thread within
+        # the SDK's own timeouts, and its result or error is discarded. Each
+        # LIST runs in its own copy of the caller's context, as
+        # ``asyncio.to_thread`` would, so context variables set by the caller
+        # (the delivery lease, the active span) stay visible to it.
+        claims_listed = _INVENTORY_POOL.submit(contextvars.copy_context().run, list_claims)
+        sandboxes_listed = _INVENTORY_POOL.submit(
+            contextvars.copy_context().run, list_sandboxes
+        )
+        pods_listed = _INVENTORY_POOL.submit(contextvars.copy_context().run, list_pods)
+        listed: tuple[Future[Any], ...] = (claims_listed, sandboxes_listed, pods_listed)
         try:
-            pods = self._core_api.list_namespaced_pod(
-                self._namespace, _request_timeout=budget()
-            ).items
-        except k8s_client.ApiException as exc:
-            if exc.status in _TRANSIENT_STATUSES:
-                raise KubeTransientError(f"kube API {exc.status} listing pods") from exc
-            raise
+            while True:
+                for future in listed:
+                    if not future.done():
+                        break
+                    future.result()
+                else:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("sandbox capacity inventory deadline expired")
+                wait(
+                    [future for future in listed if not future.done()],
+                    timeout=remaining,
+                    return_when=FIRST_COMPLETED,
+                )
+        finally:
+            for future in listed:
+                future.cancel()
+        claims = claims_listed.result()
+        sandboxes = sandboxes_listed.result()
+        pods = pods_listed.result()
         footprints: dict[str, dict[str, str]] = {}
         claim_names: set[str] = set()
         runtime_class_overheads: dict[str, dict[str, str]] = {}
