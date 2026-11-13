@@ -462,7 +462,7 @@ def test_stale_metadata_cannot_recover_until_fresh_checks_exist(
 
 @pytest.fixture
 def migration_admitted(isolated_migration_db: Any, request: pytest.FixtureRequest) -> Any:
-    isolated_migration_db.at("0163")
+    isolated_migration_db.at("head")
     return request.getfixturevalue("admitted")
 
 
@@ -481,7 +481,7 @@ def test_additive_migration_preserves_existing_failed_execution(migration_admitt
     )
     command.downgrade(config, "0162")
     assert _snapshot(published["id"]) == before
-    command.upgrade(config, "0163")
+    command.upgrade(config, "head")
     assert _snapshot(published["id"]) == before
     assert _rows("SELECT request_id FROM curie.factory_ci_observations") == []
 
