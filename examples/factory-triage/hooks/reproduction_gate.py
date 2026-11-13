@@ -11,6 +11,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ DEADLINE_SECONDS = 8
 MAX_INPUT = 2 * 1024 * 1024
 MAX_OUTPUT = 32 * 1024
 MAX_RUNS = 128
+MAX_STATE = 8 * 1024 * 1024
 RESULT_TOOL = "mcp__curie__submit_tracker_result"
 STATE_DIRECTORY = ".curie/factory-triage"
 READ_TOOLS = {"Read", "Glob", "Grep", "Skill", "TodoWrite"}
@@ -41,7 +43,12 @@ def decode(raw: bytes) -> dict[str, Any]:
             value[key] = item
         return value
 
-    value = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=pairs)
+    def constant(_name: str) -> None:
+        raise Refusal("Nonfinite JSON values are refused.")
+
+    value = json.loads(
+        raw.decode("utf-8", "strict"), object_pairs_hook=pairs, parse_constant=constant
+    )
     if not isinstance(value, dict):
         raise Refusal("The hook input must be an object.")
     json.dumps(value, ensure_ascii=False).encode("utf-8", "strict")
@@ -118,7 +125,7 @@ def mutation_guard(tool: str, inputs: dict[str, Any], cwd: Path) -> None:
     if tool == "Bash":
         command = required_text(inputs.get("command"), "shell command")
         if protected(command, cwd):
-            raise Refusal("Shell commands cannot access the hook or its evidence state.")
+            raise Refusal("This command names the hook or its evidence state; use a local probe.")
         if inputs.get("run_in_background"):
             raise Refusal("Reproduction commands must finish in the foreground.")
         if re.search(r"\b(?:git\s+(?:push|remote)|gh|curl|wget|ssh|eval|exec)\b", command):
@@ -132,10 +139,37 @@ def mutation_guard(tool: str, inputs: dict[str, Any], cwd: Path) -> None:
     )
 
 
+def digest(value: dict[str, Any]) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def validate_entry(entry: Any) -> None:
+    fields = {"command", "exit_status", "revision", "clean", "output", "output_digest"}
+    if not isinstance(entry, dict) or set(entry) != fields | {"entry_digest"}:
+        raise Refusal("A reproduction entry is missing its integrity fields.")
+    if (
+        not isinstance(entry["command"], str)
+        or not entry["command"].strip()
+        or type(entry["exit_status"]) is not int
+        or not 0 <= entry["exit_status"] <= 255
+        or not isinstance(entry["revision"], str)
+        or not re.fullmatch(r"[0-9a-f]{40}", entry["revision"])
+        or type(entry["clean"]) is not bool
+        or not isinstance(entry["output"], str)
+        or len(entry["output"]) > MAX_OUTPUT
+    ):
+        raise Refusal("A reproduction entry has corrupt integrity fields.")
+    if entry["output_digest"] != hashlib.sha256(
+        entry["output"].encode("utf-8")
+    ).hexdigest() or entry["entry_digest"] != digest({key: entry[key] for key in fields}):
+        raise Refusal("A reproduction entry no longer matches its digest.")
+
+
 def load(path: Path, session: str, cwd: Path, *, create: bool) -> dict[str, Any]:
     if not path.exists() and create:
         return {"session": session, "workspace": str(cwd), "runs": [], "pending": {}}
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_INPUT:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_STATE:
         raise Refusal(
             "Reproduction state is missing or unreadable; run a fresh probe or submit findings."
         )
@@ -147,14 +181,24 @@ def load(path: Path, session: str, cwd: Path, *, create: bool) -> dict[str, Any]
         or not isinstance(state.get("pending"), dict)
     ):
         raise Refusal("Reproduction state does not belong to this session and checkout.")
+    if len(state["runs"]) > MAX_RUNS or len(state["pending"]) > MAX_RUNS:
+        raise Refusal("Reproduction state exceeds its entry limit.")
+    for entry in state["runs"]:
+        validate_entry(entry)
     return state
 
 
 def save(path: Path, state: dict[str, Any]) -> None:
-    pending = path.with_suffix(".pending")
-    with pending.open("x", encoding="utf-8") as handle:
-        json.dump(state, handle, ensure_ascii=False)
-    os.replace(pending, path)
+    fd, name = tempfile.mkstemp(prefix=path.stem + ".", suffix=".pending", dir=path.parent)
+    pending = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(pending, path)
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def output(response: Any, *, failed: bool) -> tuple[int, str]:
@@ -197,15 +241,16 @@ def record(state: dict[str, Any], event: str, data: dict[str, Any], cwd: Path) -
     after = snapshot(cwd)
     failed = event == "PostToolUseFailure"
     status, text = output(data.get("error") if failed else data.get("tool_response"), failed=failed)
-    state["runs"].append(
-        {
-            "command": command,
-            "revision": before["revision"],
-            "clean": before["clean"] and after["clean"] and before["revision"] == after["revision"],
-            "exit_status": status,
-            "output": text,
-        }
-    )
+    entry = {
+        "command": command,
+        "revision": before["revision"],
+        "clean": before["clean"] and after["clean"] and before["revision"] == after["revision"],
+        "exit_status": status,
+        "output": text,
+        "output_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
+    entry["entry_digest"] = digest(entry)
+    state["runs"].append(entry)
     state["runs"] = state["runs"][-MAX_RUNS:]
 
 

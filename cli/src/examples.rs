@@ -1032,6 +1032,14 @@ pub const FACTORY_TRIAGE_BUNDLE_FILES: &[(&str, &[u8])] = &[
         "skills/investigate-report/SKILL.md",
         include_bytes!("../../examples/factory-triage/skills/investigate-report/SKILL.md"),
     ),
+    (
+        "evals/triage-cases.json",
+        include_bytes!("../../examples/factory-triage/evals/triage-cases.json"),
+    ),
+    (
+        "evals/reply-format.md",
+        include_bytes!("../../examples/factory-triage/evals/reply-format.md"),
+    ),
 ];
 
 pub struct FactoryTriageRenderOutput {

@@ -1,16 +1,40 @@
 {
   "hooks": {
-    "PreToolUse": [{
-      "matcher": ".*",
-      "hooks": [{"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/reproduction_gate.py", "timeout": 10}]
-    }],
-    "PostToolUse": [{
-      "matcher": "Bash",
-      "hooks": [{"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/reproduction_gate.py", "timeout": 10}]
-    }],
-    "PostToolUseFailure": [{
-      "matcher": "Bash",
-      "hooks": [{"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/reproduction_gate.py", "timeout": 10}]
-    }]
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/reproduction_gate.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/reproduction_gate.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/reproduction_gate.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
   }
 }

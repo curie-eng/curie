@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -44,8 +45,8 @@ class Session:
             hook_event_name=event,
             tool_name=tool,
             tool_input=inputs,
-            **extra,
         )
+        payload.update(extra)
         result = {}
         for group in self.config.get(event, []):
             if not re.fullmatch(group.get("matcher", ".*"), tool):
@@ -260,3 +261,75 @@ def test_lock_is_held_through_check_and_save(session: Session) -> None:
         assert denied(refusal)
     session.run("echo after")
     assert not denied(session.submit(session.ticket("echo after", "after")))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "command",
+        "exit_status",
+        "revision",
+        "clean",
+        "output",
+        "output_digest",
+        "entry_digest",
+    ],
+)
+def test_accidental_entry_corruption_refuses_ticket_and_preserves_findings(
+    session: Session,
+    field: str,
+) -> None:
+    session.run("echo probe")
+    path = next((session.cwd / ".curie/factory-triage").glob("*.json"))
+    state = json.loads(path.read_text())
+    state["runs"][0][field] = "hand edited"
+    path.write_text(json.dumps(state))
+    assert denied(session.submit(session.ticket("echo probe", "probe")))
+    assert not denied(
+        session.submit(
+            dict(kind="findings", reason="not_reproduced", tried="probe", missing="valid evidence")
+        )
+    )
+
+
+def test_documented_limit_deliberate_shell_state_forgery_is_not_detected(session: Session) -> None:
+    """Document the accepted limit, not proof of protection against deliberate forgery."""
+    code = (
+        "from pathlib import Path; import hashlib,json; "
+        "p=next(Path('.').glob('.*/*/*.json')); s=json.loads(p.read_text()); "
+        "e=dict(command='echo fabricated',exit_status=0,"
+        "revision=s['pending']['call-1']['revision'],clean=True,output='fabricated'); "
+        "e['output_digest']=hashlib.sha256(e['output'].encode()).hexdigest(); "
+        "e['entry_digest']=hashlib.sha256(json.dumps(e,sort_keys=True,"
+        "separators=(',',':'),ensure_ascii=False).encode()).hexdigest(); "
+        "s['runs']=[e]; p.write_text(json.dumps(s))"
+    )
+    session.run("python3 -c " + shlex.quote(code))
+    assert not denied(session.submit(session.ticket("echo fabricated", "fabricated")))
+
+
+def test_undecodable_state_refuses_ticket_but_findings_needs_no_checkout(session: Session) -> None:
+    session.run("echo probe")
+    path = next((session.cwd / ".curie/factory-triage").glob("*.json"))
+    path.write_bytes(b"\xff")
+    assert denied(session.submit(session.ticket("echo probe", "probe")))
+    assert not denied(session.event("PreToolUse", SUBMIT, dict(kind="findings"), cwd="unused"))
+
+
+def test_input_read_deadline_returns_deny_before_runner_timeout() -> None:
+    process = subprocess.Popen(
+        [sys.executable, str(BUNDLE / "hooks/reproduction_gate.py")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert process.wait(timeout=12) == 0
+        assert process.stdout is not None
+        response = json.loads(process.stdout.read())
+        assert denied(response)
+        assert "deadline" in response["hookSpecificOutput"]["permissionDecisionReason"]
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate()

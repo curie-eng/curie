@@ -45,11 +45,17 @@ checkout at submission. Its observed result must quote at least one recorded
 nonempty output line verbatim. Untracked probe files are allowed; tracked source
 patches must be reverted before the baseline probe and before submission.
 
-The hook refuses unsupported tickets, protected-path edits, direct publication,
+The hook refuses unsupported tickets, explicit protected-path edits, direct publication,
 background reproduction and unknown mutation tools. Its file lock covers both
 checking and saving evidence. Invalid input, unreadable state, internal exceptions
 and an eight-second deadline produce a deny decision with successful hook exit,
 because the runner treats hook errors and timeouts as nonblocking.
+
+State writes use a temporary file and atomic rename while holding the session
+lock. Each recorded entry includes its command, exit status, revision, output
+digest and a digest of the complete entry. The gate refuses malformed entries
+and mismatched digests. These checks catch accidents such as truncation and
+hand edits that leave a stale digest, not deliberate forgery.
 
 Findings remain available when reproduction state is missing or corrupt. The
 submitted reasons are `not_reproduced`, `already_fixed`,
@@ -63,6 +69,20 @@ agent judgments, exercised by graded evals. Publication of a ticket is not a
 platform certification that it is viable. Review the ticket before selecting it
 for a separate implementation run.
 
+## Known limits
+
+The gate guards against a model that skipped or misreported its reproduction,
+not one that deliberately forges recorder state through an allowed shell
+command. The shell and hook share write authority in the session workspace.
+A model can rewrite the entries and recompute their unkeyed digests. Explicit
+path filtering is only an accidental-edit guard and does not isolate that state.
+Publication of a ticket is not a platform certification that it is viable.
+
+Stronger options for maintainer follow-up are having the gate re-execute the
+reproduction itself at submission time against a clean checkout, or providing
+a hook-owned store that the tool sandbox cannot write. The latter requires a
+platform change; neither stronger option is implemented in this bundle.
+
 ## Verification
 
 ```bash
@@ -72,5 +92,10 @@ uv run pytest examples/tests/test_factory_triage_bundle.py examples/tests/test_f
 Eval inputs include issue, repository and diff evidence inline, so they can run
 without a checkout or issue tool. Candidate and evidence-removal control replies
 are recorded with prompt hashes; fixed counterexamples test grader sensitivity.
+The policy replay cases are in `evals/triage-cases.json`; `evals/reply-format.md`
+defines structured evidence fields for those replays. These are consumed by the
+Python replay harness, not the CLI's text-only `skill eval` graders. Live result
+text uses ordinary prose. The replay fact sheets make a different reported bug,
+unsupported fix claim or silently chosen default observable to the grader.
 Offline hook tests drive the shipped configuration against a real temporary git
 checkout. Live provider and factory publication proof are separate requirements.

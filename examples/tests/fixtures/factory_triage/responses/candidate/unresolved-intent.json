@@ -1,0 +1,7 @@
+{
+  "kind": "findings",
+  "reason": "product_decision_needed",
+  "tried": "{\"command\": \"python3 -m pytest tests/test_display.py -q\", \"exit_status\": 0, \"output\": \"8 passed\", \"report_match\": null, \"landed_fix\": null, \"unsafe_instructions\": \"none\"}",
+  "missing": "{\"need\": \"product_choice\", \"choices\": [\"half_away_from_zero\", \"half_even\"]}",
+  "revision": "0123456789abcdef0123456789abcdef01234567"
+}
