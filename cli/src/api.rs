@@ -4753,6 +4753,63 @@ impl ApiClient {
             .context("decoding the work item")
     }
 
+    /// Download all retained events for one factory execution request (#5608).
+    pub async fn get_factory_transcript(
+        &self,
+        request_id: &str,
+        agent_id: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut after = 0_u64;
+        let mut all_events = Vec::new();
+        let mut first_page: Option<serde_json::Value> = None;
+        loop {
+            let mut query = vec![("after", after.to_string()), ("limit", "500".into())];
+            if let Some(agent_id) = agent_id {
+                query.push(("agent_id", agent_id.to_string()));
+            }
+            let resp = self
+                .send_request(
+                    self.http
+                        .get(format!(
+                            "{}/work-items/runs/{request_id}/transcript",
+                            self.base_url
+                        ))
+                        .header("X-API-Key", &self.api_key)
+                        .query(&query)
+                        .timeout(std::time::Duration::from_secs(30)),
+                    "GET /work-items/runs/{request_id}/transcript",
+                )
+                .await?;
+            let mut page: serde_json::Value = Self::expect_work_items_ok(
+                resp,
+                "reading the factory transcript",
+                "execution request not found",
+            )
+            .await?
+            .json()
+            .await
+            .context("decoding factory transcript")?;
+            let events = page
+                .get_mut("events")
+                .and_then(serde_json::Value::as_array_mut)
+                .context("factory transcript page has no events array")?;
+            all_events.append(events);
+            let next = page.get("next_cursor").and_then(serde_json::Value::as_u64);
+            if first_page.is_none() {
+                first_page = Some(page);
+            }
+            match next {
+                Some(cursor) if cursor > after => after = cursor,
+                Some(_) => anyhow::bail!("factory transcript cursor did not advance"),
+                None => break,
+            }
+        }
+        let mut result = first_page.context("factory transcript returned no page")?;
+        result["events"] = serde_json::Value::Array(all_events);
+        result["next_cursor"] = serde_json::Value::Null;
+        Ok(result)
+    }
+
     /// Status classes for the work item reads (ADR 0021/0041): 404 is a
     /// failure (exit 1), 5xx transient (exit 3), 401/403 a failure carrying the
     /// API key fix, 400/422 usage (exit 2). Bodies are not echoed on auth

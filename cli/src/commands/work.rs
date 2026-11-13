@@ -402,6 +402,7 @@ pub struct WorkItemsOpts {
     pub api_url: String,
     pub api_key: String,
     pub id: Option<String>,
+    pub transcript: Option<String>,
     pub agent: Option<String>,
     pub dry_run: bool,
     /// "local" or "cluster", for the transient-error remediation hint.
@@ -417,6 +418,9 @@ pub enum WorkItemsOutput {
     },
     Detail {
         item: Box<crate::api::WorkItemOutcome>,
+    },
+    Transcript {
+        transcript: serde_json::Value,
     },
     DryRun(crate::ui::DryRunPlan),
 }
@@ -442,6 +446,7 @@ impl crate::ui::CliOutput for WorkItemsOutput {
         match self {
             WorkItemsOutput::List { list } => serde_json::to_value(list).unwrap_or_default(),
             WorkItemsOutput::Detail { item } => serde_json::json!({ "item": item }),
+            WorkItemsOutput::Transcript { transcript } => transcript.clone(),
             WorkItemsOutput::DryRun(plan) => plan.to_json(),
         }
     }
@@ -549,6 +554,9 @@ impl crate::ui::CliOutput for WorkItemsOutput {
                     );
                 }
             }
+            WorkItemsOutput::Transcript { transcript } => {
+                ui.payload_plain(&serde_json::to_string_pretty(transcript).unwrap_or_default());
+            }
         }
     }
 }
@@ -559,13 +567,20 @@ impl crate::ui::CliOutput for WorkItemsOutput {
 /// unfiltered list.
 pub async fn work_items(opts: WorkItemsOpts) -> Result<WorkItemsOutput> {
     if opts.dry_run {
-        let path = match &opts.id {
-            Some(id) => format!("GET {}/work-items/{id}", opts.api_url),
-            None => format!(
-                "GET {}/work-items?limit={}",
-                opts.api_url,
-                ApiClient::WORK_ITEMS_LIST_LIMIT
-            ),
+        let path = if let Some(request_id) = &opts.transcript {
+            format!(
+                "GET {}/work-items/runs/{request_id}/transcript",
+                opts.api_url
+            )
+        } else {
+            match &opts.id {
+                Some(id) => format!("GET {}/work-items/{id}", opts.api_url),
+                None => format!(
+                    "GET {}/work-items?limit={}",
+                    opts.api_url,
+                    ApiClient::WORK_ITEMS_LIST_LIMIT
+                ),
+            }
         };
         let mut lines = vec![path];
         if let Some(agent) = &opts.agent {
@@ -587,6 +602,13 @@ pub async fn work_items(opts: WorkItemsOpts) -> Result<WorkItemsOutput> {
         ),
         None => None,
     };
+    if let Some(request_id) = opts.transcript {
+        return Ok(WorkItemsOutput::Transcript {
+            transcript: client
+                .get_factory_transcript(&request_id, agent_id.as_deref())
+                .await?,
+        });
+    }
     match opts.id {
         Some(id) => Ok(WorkItemsOutput::Detail {
             item: Box::new(client.get_work_item(&id, agent_id.as_deref()).await?),

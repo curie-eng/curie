@@ -1144,6 +1144,17 @@ async def _process_event(
                     scope="work_item.progress",
                     exp=int(clock.time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
                 )
+                # A separate request-bound credential records runner-visible
+                # messages before replay history can compact or discard them.
+                boot_env["CURIE_FACTORY_TRANSCRIPT_URL"] = (
+                    f"{base}/v1/work-item-transcripts/{owned_work_item_id}/events"
+                )
+                boot_env["CURIE_FACTORY_TRANSCRIPT_TOKEN"] = sandbox_token.mint(
+                    self._config.api_key,
+                    agent=str(owned_work_item_id),
+                    scope="work_item.transcript.write",
+                    exp=int(clock.time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
+                )
             # The bundle reads its issue through the platform (ADR 0187):
             # the API mints a capability naming this execution and its
             # WorkItem's issue, and the runner mounts get_issue only when

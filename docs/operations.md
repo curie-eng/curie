@@ -2454,6 +2454,13 @@ NAME_OR_ID] [--json]` and `curie local work-items`. Exit codes are 0 on
 success, 1 for not found or refused, 2 for invalid input and 3 when the API
 is unreachable. The skill tier has no work items and exits 4.
 
+For a factory execution request, `curie --json cluster work-items --transcript
+REQUEST_ID` follows every page of the private transcript API and prints the
+retained event stream. `--agent NAME_OR_ID` scopes the read. `status` reports
+`complete`, `incomplete`, `unavailable`, or `expired`; it is not inferred from
+the work item's terminal state alone. The transcript is retained for 30 days
+from request creation, independently of replay history and Langfuse traces.
+
 ### Personal Claude enrollment
 
 A personal WorkItem runs on its owner's own Claude subscription. The owner

@@ -89,6 +89,20 @@ claim. Restore the old binding if checks fail. See
 curie cluster work-items --agent dark-factory
 ```
 
+To inspect a specific execution after its sandbox exits, find its request ID
+in the work item detail, then download its retained runner transcript:
+
+```bash
+curie --json cluster work-items --transcript <request-id> > factory-transcript.json
+```
+
+The result includes ordered prompts, SDK messages, tool calls and results,
+control frames, and a `status` of `complete`, `incomplete`, `unavailable`, or
+`expired`. Large events appear as ordered `chunk` records whose
+`json_fragment` fields reconstruct the original event content. The archive
+expires 30 days after the request was created. Requests predating this feature
+return `unavailable` because their messages were not captured.
+
 ```text
 Review factory failures for <factory> over the last 30 days and
 propose repairs.

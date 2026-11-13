@@ -540,6 +540,7 @@ _HTTP_OPERATIONS = [
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
     "/v1/work-item-progress/{request_id}/verification",
+    "/v1/work-item-transcripts/{request_id}/events",
     # Deliberate progress from a running turn (ADR 0130).
     "/v1/turn-progress/{progress_id}",
     "/v1/factory/cards/{token}.svg",
@@ -554,6 +555,7 @@ _HTTP_OPERATIONS = [
     "/work-items/issue-read",
     "/work-items/{work_item_id}",
     "/work-items/{work_item_id}/usage",
+    "/work-items/runs/{request_id}/transcript",
     "/work-items/{work_item_id}/recovery",
     "/work-items/{work_item_id}/recovery/{checkpoint_id}",
     "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",

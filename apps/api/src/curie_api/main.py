@@ -92,6 +92,7 @@ from .routers import (
     evals,
     factory_slack,
     factory_status,
+    factory_transcripts,
     forge_credential_health,
     gitflow_routing,
     github,
@@ -759,6 +760,7 @@ def create_app(
     app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
     app.include_router(factory_status.router)
+    app.include_router(factory_transcripts.router)
     app.include_router(forge_credential_health.router)
     app.include_router(turn_progress.router)
     app.include_router(work_item_outcomes.router)

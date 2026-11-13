@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import json
 import logging
 import math
 import os
@@ -67,6 +68,7 @@ from .adapter import (
 from .approval import ApprovalGate, is_mcp_tool, platform_tool_names
 from .attachment_access import LAZY_ATTACHMENT_NOTICE, AttachmentAccessTurn
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
+from .factory_transcript import FactoryTranscriptRecorder, visible_message
 from .final_answer import (
     FINAL_ANSWER_CLASSIFICATION,
     FINAL_ANSWER_DIAGNOSTIC,
@@ -418,6 +420,7 @@ class SessionRunner:
         model: str | None = None,
         memory_store: MemoryStore | None = None,
         history_store: TranscriptStore | None = None,
+        factory_transcript: FactoryTranscriptRecorder | None = None,
         approval_gate: ApprovalGate | None = None,
         approval_resumed_kind: str | None = None,
         approval_decision: str | None = None,
@@ -509,6 +512,7 @@ class SessionRunner:
         # write side, appended once per terminal turn so a restarted sandbox
         # rehydrates the thread. NullTranscriptStore when no CURIE_HISTORY_REF.
         self._history: TranscriptStore = history_store or NullTranscriptStore()
+        self._factory_transcript = factory_transcript
         # Boot compaction was refused by the transcript cap (#2820). The thread
         # cannot record another turn, so every turn is refused with the append
         # path's capacity pair before the model is queried.
@@ -1293,6 +1297,10 @@ class SessionRunner:
         # Same redaction as a turn start: the user text is the recorded size,
         # and an echo of the framed query does not reach the trace.
         self._tracer.remember_turn_prompt(text, framed)
+        if self._factory_transcript is not None:
+            await self._factory_transcript.record(
+                "prompt", {"text": text, "framed": framed, "steer": True}
+            )
         await session.query(framed)
         if self._active_state is not None:
             self._active_state.assistant_group = None
@@ -1432,11 +1440,19 @@ class SessionRunner:
                             map_error_classification(frame.classification),
                             output_ceiling=self._ceiling,
                         )
+                if self._factory_transcript is not None:
+                    await self._factory_transcript.record(
+                        "control", {"aci_frame": json.loads(line)}
+                    )
                 for scrubbed in redactor.push(line):
                     yield scrubbed
             pending = redactor.finish()
             if pending is not None:
                 yield pending
+            if self._factory_transcript is not None:
+                await self._factory_transcript.record(
+                    "capture_complete", {"status": self._status.value}
+                )
 
     async def _run_turn(
         self,
@@ -1996,11 +2012,31 @@ class SessionRunner:
         if prompt != event.text:
             gen.remember_echo(prompt)
         state.prompt_text = prompt
+        if self._factory_transcript is not None:
+            await self._factory_transcript.record(
+                "prompt", {"user": event.user, "text": event.text, "framed": prompt}
+            )
         await self._session.query(prompt)
         live_background: set[str] = set()
         while True:
             held_for_background = False
             async for message in self._session.receive_turn():
+                if self._factory_transcript is not None:
+                    captured = visible_message(message)
+                    if captured is not None:
+                        await self._factory_transcript.record(*captured)
+                    elif isinstance(message, StreamedToolUseBoundary):
+                        await self._factory_transcript.record(
+                            "control",
+                            {
+                                "tool_use_started": message.tool_name,
+                                "call_id": message.call_id,
+                            },
+                        )
+                    elif not isinstance(message, PartialMessageBoundary):
+                        await self._factory_transcript.record(
+                            "capture_gap", {"unsupported_type": type(message).__name__}
+                        )
                 _track_live_background_tasks(live_background, message)
                 # A result while a background task is still live is the CLI
                 # pausing, not the end of the factory turn (#4902). Accounting

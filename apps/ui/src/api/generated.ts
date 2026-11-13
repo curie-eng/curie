@@ -4512,6 +4512,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/work-item-transcripts/{request_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Write Transcript Event */
+        post: operations["write_transcript_event_v1_work_item_transcripts__request_id__events_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items": {
         parameters: {
             query?: never;
@@ -4540,6 +4557,23 @@ export interface paths {
         put?: never;
         /** Read Work Item Issue */
         post: operations["read_work_item_issue_work_items_issue_read_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/runs/{request_id}/transcript": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Transcript */
+        get: operations["read_transcript_work_items_runs__request_id__transcript_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -11659,6 +11693,35 @@ export interface components {
             kind: string;
             /** Scope Id */
             scope_id: string;
+        };
+        /** TranscriptEventIn */
+        TranscriptEventIn: {
+            /**
+             * Boot Id
+             * Format: uuid
+             */
+            boot_id: string;
+            /** Content */
+            content: {
+                [key: string]: unknown;
+            };
+            /**
+             * Event Id
+             * Format: uuid
+             */
+            event_id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "prompt" | "message" | "result" | "control" | "capture_complete" | "capture_gap" | "chunk";
+            /**
+             * Occurred At
+             * Format: date-time
+             */
+            occurred_at: string;
+            /** Sequence */
+            sequence: number;
         };
         /** Transfer */
         Transfer: {
@@ -22037,6 +22100,45 @@ export interface operations {
             };
         };
     };
+    write_transcript_event_v1_work_item_transcripts__request_id__events_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TranscriptEventIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_work_items_work_items_get: {
         parameters: {
             query?: {
@@ -22089,6 +22191,45 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["IssueReadResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_transcript_work_items_runs__request_id__transcript_get: {
+        parameters: {
+            query?: {
+                agent_id?: string | null;
+                after?: number;
+                limit?: number;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description Validation Error */

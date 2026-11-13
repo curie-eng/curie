@@ -324,6 +324,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                 api_url,
                 api_key,
                 id,
+                transcript: None,
                 agent,
                 dry_run,
                 tier: "local",
