@@ -881,7 +881,7 @@ def test_duplicate_effective_label_is_refused_at_admission(paused_factory: Admit
     ticket = run.seed("github", run.agents[0], label="factory")
     result = run.label_webhook(ticket, "factory")
     assert result["status"] == "factory_ignored"
-    assert result["errors"] == [{"code": "binding_missing"}]
+    assert result["errors"] == [{"code": "binding_ambiguous"}]
     run.worker_replicas(1)
     progress_neighbor(run)
     assert run.request(ticket) is None
