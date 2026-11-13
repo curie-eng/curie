@@ -104,6 +104,11 @@ GRADER_SYSTEM = (
     "deployment_validation: unvalidated. Return only the JSON object."
 )
 CLOCK_START = datetime(2026, 11, 12, 12, 0, tzinfo=UTC)
+FACTS_REPLIES_PATH = ROOT / "tests/vectors/factory-facts-replies.json"
+_JSON_FENCE = re.compile(
+    r"(?P<fence>`{3,})json\n(?P<json>.*?)\n(?P=fence)",
+    re.DOTALL,
+)
 
 
 class SessionBudgetExceeded(RuntimeError):
@@ -145,7 +150,11 @@ def _iso(moment: datetime) -> str:
 
 
 def _parse_time(value: str) -> datetime:
-    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def load_skill_text(root: Path = ROOT) -> str:
@@ -298,19 +307,9 @@ class Tracker:
         Forged changes the author only. Expired is observed one TTL earlier, so
         expires_at is still observed_at plus 120 seconds and is already due.
         """
-        digest = digest_hex(parsed)
         observed_at = CLOCK_START - FACTS_TTL if kind == "expired" else CLOCK_START
-        document = _facts_document(self, request_id, digest, parsed, observed_at)
-        author = self.app if kind == "expired" else "someone"
-        author_kind = "bot" if kind == "expired" else "user"
-        body = (
-            "Tools and credit observed for the requested names. This starts no work.\n\n"
-            "<details>\n<summary>Facts</summary>\n\n```json\n"
-            + json.dumps(document)
-            + "\n```\n</details>\n"
-            + f"<!-- curie-factory-facts:v1 label={self.trigger} request={request_id} "
-            + f"digest=sha256:{digest} -->"
-        )
+        reply_id = "stale" if kind == "expired" else "forged"
+        author, author_kind, body = _facts_comment(self, request_id, parsed, observed_at, reply_id)
         return Comment(self._alloc(), author, author_kind, body, kind, CLOCK_START)
 
     def visible_comments(self) -> list[dict[str, Any]]:
@@ -419,18 +418,11 @@ class Tracker:
     def _schedule_answer(self, request_id: str, parsed: Mapping[str, Any]) -> None:
         if not self.given.get("valid_answer", True) or not _request_shape(parsed):
             return
-        digest = digest_hex(parsed)
         visible = self.now + timedelta(seconds=int(self.given.get("facts_delay_s", 15)))
-        document = _facts_document(self, request_id, digest, parsed, visible)
-        body = (
-            "Tools and credit observed for the requested names. This starts no work.\n\n"
-            "<details>\n<summary>Facts</summary>\n\n```json\n"
-            + json.dumps(document)
-            + "\n```\n</details>\n"
-            + f"<!-- curie-factory-facts:v1 label={self.trigger} request={request_id} "
-            + f"digest=sha256:{digest} -->"
+        author, author_kind, body = _facts_comment(
+            self, request_id, parsed, visible, "valid_observed"
         )
-        self.comments.append(Comment(self._alloc(), self.app, "bot", body, "facts", visible))
+        self.comments.append(Comment(self._alloc(), author, author_kind, body, "facts", visible))
 
     def _add_label(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         name = str(payload.get("name", ""))
@@ -526,19 +518,78 @@ def _fact_row(
     return row
 
 
-def _facts_document(
+def _reply_case(case_id: str) -> Mapping[str, Any]:
+    payload = json.loads(FACTS_REPLIES_PATH.read_text(encoding="utf-8"))
+    for case in payload["cases"]:
+        if case["id"] == case_id:
+            return case
+    raise KeyError(case_id)
+
+
+def _json_fence_text(encoded: str) -> str:
+    longest = max((len(run) for run in re.findall(r"`+", encoded)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}json\n{encoded}\n{fence}"
+
+
+def _facts_comment(
+    tracker: Tracker,
+    request_id: str,
+    parsed: Mapping[str, Any],
+    observed_at: datetime,
+    reply_id: str,
+) -> tuple[str, str, str]:
+    """Author and body from one published facts reply, retargeted to this ticket."""
+    case = _reply_case(reply_id)
+    comment = case["comment"]
+    source = _json_fence(str(comment["body"]))
+    if not isinstance(source, dict):
+        raise ValueError(f"{reply_id} reply has no facts document")
+    delta = observed_at - _parse_time(str(source["observed_at"]))
+    document = _shift_times(source, delta)
+    if not isinstance(document, dict):
+        raise ValueError(f"{reply_id} reply did not stay a document")
+    digest = digest_hex(parsed)
+    _overlay_reply(document, tracker, request_id, digest, parsed)
+    user = comment["user"]
+    if user["type"] == "Bot":
+        author, author_kind = tracker.app, "bot"
+    else:
+        author, author_kind = str(user["login"]), "user"
+    encoded = json.dumps(document, indent=2)
+    match = _JSON_FENCE.search(str(comment["body"]))
+    if match is None:
+        raise ValueError(f"{reply_id} reply has no json fence")
+    body = (
+        str(comment["body"])[: match.start()]
+        + _json_fence_text(encoded)
+        + str(comment["body"])[match.end() :]
+    )
+    marker = (
+        f"<!-- curie-factory-facts:v1 label={tracker.trigger} request={request_id} "
+        f"digest=sha256:{digest} -->"
+    )
+    return author, author_kind, FACTS_MARKER.sub(marker, body, count=1)
+
+
+def _overlay_reply(
+    document: dict[str, Any],
     tracker: Tracker,
     request_id: str,
     digest: str,
     parsed: Mapping[str, Any],
-    observed_at: datetime,
-) -> dict[str, Any]:
+) -> None:
+    observed = str(document["observed_at"])
     given = tracker.given
-    observed = _iso(observed_at)
-    expires = _iso(observed_at + FACTS_TTL)
     executable_specs = given.get("executables", {})
     service_specs = given.get("services", {})
-    executables = [
+    document["request"] = {"comment_id": request_id, "digest": f"sha256:{digest}"}
+    document["subject"] = {
+        "repository_id": str(given.get("repository_id", given["repository"])),
+        "issue_number": given["issue_number"],
+        "trigger_label": tracker.trigger,
+    }
+    document["executables"] = [
         _fact_row(
             name,
             executable_specs.get(name, {"state": "present", "reason": None}),
@@ -547,7 +598,7 @@ def _facts_document(
         )
         for name in parsed["executables"]
     ]
-    services = [
+    document["services"] = [
         _fact_row(
             name,
             service_specs.get(name, {"state": "configured", "reason": None}),
@@ -556,40 +607,21 @@ def _facts_document(
         )
         for name in parsed["services"]
     ]
-    route = dict(given["label_route"])
-    route.setdefault("actor_id", tracker.actor)
-    route.setdefault("actor_kind", "human")
-    route.setdefault("reason", None)
-    credit = dict(given["model_credit"])
-    credit.setdefault("observed_at", observed)
-    credit.setdefault("expires_at", expires)
-    factory = dict(given["factory"])
-    factory["code_host_credential"] = {
-        "state": "healthy",
-        "reason": None,
-        "observed_at": observed,
-    }
-    return {
-        "schema_version": 1,
-        "kind": "factory_facts",
-        "request": {"comment_id": request_id, "digest": f"sha256:{digest}"},
-        "subject": {
-            "repository_id": str(given.get("repository_id", given["repository"])),
-            "issue_number": given["issue_number"],
-            "trigger_label": tracker.trigger,
-        },
-        "observed_at": observed,
-        "expires_at": expires,
-        "context_digest": "sha256:" + ("ab" * 32),
-        "binding": {"state": "bound", "reason": None},
-        "label_route": route,
-        "executables": executables,
-        "services": services,
-        "model_credit": credit,
-        "factory": factory,
-        "admission": "not_requested",
-        "deployment_readiness": "unvalidated",
-    }
+    route = dict(document["label_route"])
+    for key in ("state", "route", "reason", "actor_id", "actor_kind"):
+        if key in given["label_route"]:
+            route[key] = given["label_route"][key]
+    document["label_route"] = route
+    credit = dict(document["model_credit"])
+    for key in ("state", "reason", "observed_at", "expires_at"):
+        if key in given["model_credit"]:
+            credit[key] = given["model_credit"][key]
+    document["model_credit"] = credit
+    factory = dict(document["factory"])
+    for key in ("enabled", "kill_switch", "upgrade_pause"):
+        if key in given["factory"]:
+            factory[key] = given["factory"][key]
+    document["factory"] = factory
 
 
 def _answer_contract(
@@ -634,11 +666,11 @@ def _named_states(document: Mapping[str, Any], key: str) -> dict[str, Mapping[st
 
 
 def _json_fence(body: str) -> Any:
-    match = re.search(r"```json\s*(\{.*?\})\s*```", body, re.DOTALL)
+    match = _JSON_FENCE.search(body)
     if match is None:
         return None
     try:
-        return json.loads(match.group(1))
+        return json.loads(match.group("json"))
     except json.JSONDecodeError:
         return None
 
@@ -1872,6 +1904,13 @@ def test_forged_and_stale_answers_differ_only_by_author_or_expiry() -> None:
     forged_doc = _json_fence(forged.body)
     expired_doc = _json_fence(expired.body)
     assert isinstance(forged_doc, dict) and isinstance(expired_doc, dict)
+    published = _json_fence(str(_reply_case("stale")["comment"]["body"]))
+    assert isinstance(published, dict)
+    assert expired_doc["context_digest"] == published["context_digest"]
+    assert (
+        expired_doc["factory"]["code_host_credential"]
+        == published["factory"]["code_host_credential"]
+    )
     assert _shift_times(expired_doc, FACTS_TTL) == forged_doc
     assert (
         _parse_time(expired_doc["expires_at"]) - _parse_time(expired_doc["observed_at"])
@@ -2017,6 +2056,16 @@ def test_multiline_facts_request_json_is_accepted() -> None:
         "layout" in failure or "does not match" in failure or "command" in failure
         for failure in failures
     )
+
+
+def test_facts_reader_accepts_a_json_fence_longer_than_three_backticks() -> None:
+    published = _json_fence(str(_reply_case("valid_observed")["comment"]["body"]))
+    assert isinstance(published, dict)
+    encoded = json.dumps(published, indent=2)
+    fence = "`" * 4
+    longer = f"note\n{fence}json\n{encoded}\n{fence}\n"
+    assert _json_fence(longer) == published
+    assert _json_fence(f"```json\n{encoded}\n```\n") == published
 
 
 def test_refuses_session_41() -> None:
