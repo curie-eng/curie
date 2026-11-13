@@ -531,8 +531,9 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/internal/work-items/issue-read/context",
-    # Factory Slack run steering (#5414).
+    # Factory Slack run steering (#5414) and kickoff (#5380).
     "/v1/internal/factory-slack/steer",
+    "/v1/internal/factory-slack/kickoff",
     "/v1/internal/channel-read/context",
     # The thread attachment ledger (ADR 0205).
     "/v1/internal/thread-attachments/query",

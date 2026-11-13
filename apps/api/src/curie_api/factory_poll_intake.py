@@ -415,18 +415,22 @@ async def _cancel_stale(
                 )
             )
         )
+        kickoff = await github_factory.kickoff_work_items(session, [item.id for item in items])
         # Each WorkItem against the label that admitted it (#4361 decision 10).
-        admitting: dict[int, str] = {}
+        # A Slack kickoff's WorkItem has none (#5380): it is watched for its
+        # issue closing alone, so no label removal, earlier or later, cancels it.
+        watched: dict[int, str | None] = {}
         for item in items:
-            label = github_factory.admitting_label(registry, item)
-            if label is not None:
-                admitting[int(item.tracker_issue_id)] = label
-    keys = {f"issue:{number}:{label}" for number, label in admitting.items()}
+            label = github_factory.admitting_label(registry, item, kickoff_items=kickoff)
+            if label is not None or item.id in kickoff:
+                watched[int(item.tracker_issue_id)] = label
+    keys = {_etag_key(number, label) for number, label in watched.items()}
     for key in list(cursor.etags):
         if key.startswith("issue:") and key not in keys:
             del cursor.etags[key]
-    for number, label in sorted(admitting.items()):
-        key = f"issue:{number}:{label}"
+    for number in sorted(watched):
+        label = watched[number]
+        key = _etag_key(number, label)
         try:
             issue, etag = await tracker.conditional_issue(number, cursor.etags.get(key))
             if issue is None or "pull_request" in issue:
@@ -436,7 +440,7 @@ async def _cancel_stale(
                 raise Unavailable(f"issue {number}")
             if issue.get("state") == "closed":
                 action, kind = "closed", "closed"
-            elif label not in names:
+            elif label is not None and label not in names:
                 action, kind = "unlabeled", "unlabeled"
             else:
                 if etag:
@@ -470,6 +474,12 @@ async def _cancel_stale(
             await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             logger.info("factory stale issue poll for %s issue %s deferred", repo, number)
+
+
+def _etag_key(number: int, label: str | None) -> str:
+    """The ETag key of one watched issue; a kickoff's carries no label (#5380)."""
+
+    return f"issue:{number}" if label is None else f"issue:{number}:{label}"
 
 
 def _in_scope(tracker: GitHubTracker) -> tuple[ColumnElement[bool], ...]:

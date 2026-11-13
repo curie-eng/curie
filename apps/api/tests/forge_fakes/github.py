@@ -16,6 +16,7 @@ import itertools
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -266,6 +267,69 @@ def fake_installation_tokens(monkeypatch: Any, credentials: Any = None) -> None:
     monkeypatch.setattr(GitHubCredentials, "app_slug", lambda _self: APP_SLUG)
 
 
+# The repository-wide listings a poll pass reads, answered empty when
+# ``GitHubAPI.answer_listings`` is set.
+_POLL_LISTINGS = frozenset(
+    {f"/repos/{REPO}/issues", f"/repos/{REPO}/issues/comments", f"/repos/{REPO}/pulls/comments"}
+)
+
+
+@dataclass
+class PlantedIssue:
+    """One issue's own answers (#5380), in place of the shared ``issue_state``
+    and ``labels``.
+
+    GET an issue (https://docs.github.com/en/rest/issues/issues#get-an-issue)
+    answers ``number``, ``state`` and ``labels``; every pull request is also an
+    issue, and its issue payload carries a ``pull_request`` key. An issue the
+    installation cannot see answers 404 with GitHub's ``message``. ``events``,
+    when set, is the issue's event list
+    (https://docs.github.com/en/rest/issues/events#list-issue-events).
+    """
+
+    state: str = "open"
+    labels: tuple[str, ...] = ()
+    pull_request: bool = False
+    missing: bool = False
+    events: list[dict[str, Any]] | None = None
+
+
+def issue_event(event: str, *, event_id: int, label: str | None = None) -> dict[str, Any]:
+    """One human event on an issue, in the list-issue-events shape
+    (https://docs.github.com/en/rest/issues/events#list-issue-events)."""
+
+    found: dict[str, Any] = {
+        "id": event_id,
+        "event": event,
+        "actor": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+        "created_at": "2026-09-01T00:00:00Z",
+    }
+    if label is not None:
+        found["label"] = {"name": label}
+    return found
+
+
+def listed_publication(number: int, *, pull: int, state: str = "open") -> dict[str, Any]:
+    """A factory publication of issue ``number`` as the repository's pull request
+    listing returns it (https://docs.github.com/en/rest/pulls/pulls#list-pull-requests):
+    opened by the App's bot user from a publication branch of the repository
+    itself, closing the issue."""
+
+    repo = {"id": REPO_ID, "full_name": REPO}
+    return {
+        "number": pull,
+        "state": state,
+        "html_url": f"https://github.com/{REPO}/pull/{pull}",
+        "node_id": f"PR_acme_{pull}",
+        "user": dict(APP_BOT_USER),
+        "body": f"Closes #{number}",
+        "merged_at": None,
+        "closed_at": None if state == "open" else "2026-09-02T00:00:00Z",
+        "head": {"sha": BASE_SHA, "ref": f"curie/publication-{pull:032x}", "repo": dict(repo)},
+        "base": {"ref": "main", "repo": dict(repo)},
+    }
+
+
 class GitHubAPI:
     """In-process stand-in for the GitHub REST reads the intake verifier makes."""
 
@@ -291,6 +355,21 @@ class GitHubAPI:
         # Issue number -> its comments, for the marked label refusal comment.
         self.issue_comments: dict[int, list[dict[str, Any]]] = {}
         self._comment_ids = itertools.count(9000)
+        # Additive answers (#5380); each default leaves the answers above as
+        # they were. Issues with their own answers, by number.
+        self.planted_issues: dict[int, PlantedIssue] = {}
+        # Branches GET a reference answers 404 for
+        # (https://docs.github.com/en/rest/git/refs#get-a-reference).
+        self.missing_branches: set[str] = set()
+        # What the repository's pull request listing returns.
+        self.listed_pulls: list[dict[str, Any]] = []
+        # Answer the repository-wide listings a poll pass reads (open issues
+        # by label, issue comments and review comments since a time) with one
+        # empty page:
+        # https://docs.github.com/en/rest/issues/issues#list-repository-issues,
+        # https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository,
+        # https://docs.github.com/en/rest/pulls/comments#list-review-comments-in-a-repository.
+        self.answer_listings = False
 
     def advance_label_event(self, number: int) -> None:
         """Record a newer labeled timeline event. A relabel webhook reads it."""
@@ -307,17 +386,32 @@ class GitHubAPI:
                 200,
                 json={"id": self.repository_id, "full_name": REPO, "default_branch": "main"},
             )
+        if self.answer_listings and request.method == "GET" and path in _POLL_LISTINGS:
+            return httpx.Response(200, json=[])
         if path == f"/repos/{REPO}/pulls" and request.method == "GET":
             # The repository-wide listing rediscovery reads (#4629): no factory
-            # publication exists in this stand-in.
-            return httpx.Response(200, json=[])
+            # publication exists in this stand-in unless one is listed.
+            return httpx.Response(200, json=list(self.listed_pulls))
         if path.startswith(f"/repos/{REPO}/git/ref/heads/"):
             # Admission resolves the base and reads its commit through the
             # code host (#3095).
             # https://docs.github.com/en/rest/git/refs#get-a-reference
             name = path.removeprefix(f"/repos/{REPO}/git/ref/heads/")
+            if name in self.missing_branches:
+                return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(
                 200, json={"ref": f"refs/heads/{name}", "object": {"sha": BASE_SHA}}
+            )
+        if path.startswith(f"/repos/{REPO}/git/matching-refs/heads/"):
+            # The code host reads this listing after a 404 on the reference;
+            # GitHub answers 200 with an empty array when no branch matches
+            # (https://docs.github.com/en/rest/git/refs#list-matching-references).
+            name = path.removeprefix(f"/repos/{REPO}/git/matching-refs/heads/")
+            if name in self.missing_branches:
+                return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json=[{"ref": f"refs/heads/{name}", "object": {"sha": BASE_SHA, "type": "commit"}}],
             )
         if path.startswith(f"/repos/{REPO}/issues/comments/"):
             comment_id = int(path.rsplit("/", 1)[1])
@@ -350,6 +444,9 @@ class GitHubAPI:
             return httpx.Response(200, json=listed)
         if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/events"):
             number = int(path.split("/")[-2])
+            planted = self.planted_issues.get(number)
+            if planted is not None and planted.events is not None:
+                return httpx.Response(200, json=list(planted.events))
             event_id = self.label_event_ids.get(number, self.label_event_base + number)
             return httpx.Response(
                 200,
@@ -366,6 +463,9 @@ class GitHubAPI:
             )
         if path.startswith(f"/repos/{REPO}/issues/"):
             number = int(path.rsplit("/", 1)[1])
+            planted = self.planted_issues.get(number)
+            if planted is not None:
+                return self._planted_issue(number, planted)
             return httpx.Response(
                 200,
                 json={
@@ -385,6 +485,19 @@ class GitHubAPI:
                 },
             )
         return httpx.Response(404, json={"message": "missing fixture"})
+
+    def _planted_issue(self, number: int, planted: PlantedIssue) -> httpx.Response:
+        # https://docs.github.com/en/rest/issues/issues#get-an-issue
+        if planted.missing:
+            return httpx.Response(404, json={"message": "Not Found"})
+        issue: dict[str, Any] = {
+            "number": number,
+            "state": planted.state,
+            "labels": [{"name": name} for name in planted.labels],
+        }
+        if planted.pull_request:
+            issue["pull_request"] = {"url": f"https://api.github.com/repos/{REPO}/pulls/{number}"}
+        return httpx.Response(200, json=issue)
 
 
 class _Credentials:

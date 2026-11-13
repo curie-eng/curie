@@ -72,8 +72,11 @@ CONTRACT = "0041"
 # progress loop reads the 0157 thread tables. GitHub host namespaces require
 # 0158; owner tuple reads require 0159; personal custody reads and the
 # enrollment_fenced cause require 0160; agent version reads select the 0162
-# result policy columns. Owner coding profiles and policies require 0165.
-APP_SCHEMA_MIN = "0165"
+# result policy columns, factory CI observations require the 0163 table,
+# cached facts and request delivery require the 0164 tables, and Slack
+# kickoff thread origin reads require 0166.
+# Owner coding profiles and tenant policies require 0165, which stays below this floor.
+APP_SCHEMA_MIN = "0166"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -105,8 +108,8 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
-    assert window.schema_head == "0165"
-    assert HEAD == "0165"
+    assert window.schema_head == HEAD
+    assert HEAD == "0166"
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
     # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
@@ -115,8 +118,10 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0070"] == KIND_CONTRACT
     assert kinds[REVIEW_SCHEMA_MIN] == KIND_CONTRACT
     assert kinds["0162"] == KIND_EXPAND
+    assert kinds["0163"] == KIND_EXPAND
     assert kinds["0164"] == KIND_EXPAND
     assert kinds["0165"] == KIND_EXPAND
+    assert kinds["0166"] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
@@ -196,6 +201,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0163",
             "0164",
             "0165",
+            "0166",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -246,8 +252,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0163",
             "0164",
             "0165",
+            "0166",
         }
-    assert current_revision() == "0165"
+    assert current_revision() == "0166"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -352,9 +359,12 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # dynamic approval answers require the 0156 answer gate. Factory Slack
     # progress reads the 0157 tables. GitHub host namespaces require 0158,
     # execution owner reads require 0159, personal custody reads and
-    # enrollment fences require 0160, and agent version reads select the 0162
-    # result policy columns. Owner coding profiles and policies require 0165.
-    for revision in sorted(known - {"0165"}):
+    # enrollment fences require 0160, agent version reads select the 0162
+    # result policy columns, factory CI observations require the 0163 table,
+    # cached facts and request delivery require the 0164 tables, and Slack
+    # kickoff thread origin reads require 0166.
+    # Owner coding profiles and tenant policies require 0165, which stays below this floor.
+    for revision in sorted(known - {"0166"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -377,7 +387,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0162", window, known) is False
     assert can_serve("0163", window, known) is False
     assert can_serve("0164", window, known) is False
-    assert can_serve("0165", window, known) is True
+    assert can_serve("0165", window, known) is False
+    assert can_serve("0166", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

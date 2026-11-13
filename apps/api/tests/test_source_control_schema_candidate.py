@@ -50,10 +50,13 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # raise the floor. Dynamic approval answers require the 0156 answer gate,
     # and the factory Slack progress loop reads the 0157 tables. GitHub host
     # namespaces require 0158. Execution owner reads require 0159, personal
-    # custody reads and enrollment fences require 0160, and agent version reads
-    # select the 0162 result policy columns. Owner coding profiles and tenant
-    # policies require 0165.
-    assert window == {"schema_min": "0165", "schema_head": "0165"}
+    # custody reads and enrollment fences require 0160, agent
+    # version reads select the 0162 result policy columns, factory CI
+    # observations require the 0163 table, cached facts and request
+    # delivery require the 0164 tables, and Slack kickoff thread origin
+    # reads require 0166.
+    # Owner coding profiles and tenant policies require 0165, which stays below this floor.
+    assert window == {"schema_min": "0166", "schema_head": "0166"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -84,7 +87,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-46:] == [
+    assert data["revisions"][-47:] == [
         "0095",
         "0096",
         "0097",
@@ -131,6 +134,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0163",
         "0164",
         "0165",
+        "0166",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -170,7 +174,10 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0159"] == "expand"
     assert kinds["0160"] == "expand"
     assert kinds["0162"] == "expand"
+    assert kinds["0163"] == "expand"
+    assert kinds["0164"] == "expand"
     assert kinds["0165"] == "expand"
+    assert kinds["0166"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -228,7 +235,7 @@ def test_released_0076_startup_refuses_without_migrating_then_candidate_starts(
                 pass
         assert current_revision() == "0100"
         command.upgrade(alembic_config(), load_window().schema_head)
-        assert current_revision() == "0165"
+        assert current_revision() == "0166"
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200
@@ -269,7 +276,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0165"
+    assert current_revision() == "0166"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
@@ -307,6 +314,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
         ("execution_requests", "owner_principal_id"),
         ("personal_claude_enrollments", "generation"),
         ("personal_claude_custody", "secret_uid"),
+        ("factory_slack_threads", "origin"),
         ("agent_versions", "result_policy_digest"),
         ("factory_tracker_result_grants", "output_identity"),
         ("factory_tracker_result_deliveries", "proposal_sha256"),

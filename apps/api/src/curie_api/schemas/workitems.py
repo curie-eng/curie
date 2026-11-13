@@ -303,3 +303,67 @@ class FactorySlackSteerOut(BaseModel):
     replayed: bool = False
     pull_request_url: str | None = None
     reason: str | None = None
+
+
+# Every answer the factory Slack kickoff route gives (#5380). ``not_factory``
+# sends the mention down the ordinary chat path; every other refusal is final
+# for its delivery and is replied in its thread. Only an unavailable code host
+# or store answers 503.
+FactorySlackKickoffOutcome = Literal[
+    "admitted",
+    "not_factory",
+    "receipt_mismatch",
+    "test_driver_refused",
+    "binding_missing",
+    "binding_ambiguous",
+    "link_missing",
+    "link_multiple",
+    "link_malformed",
+    "link_host_unsupported",
+    "link_pull_request",
+    "sender_unverified",
+    "enrollment_inactive",
+    "issue_inaccessible",
+    "issue_closed",
+    "publication_exists",
+    "base_refused",
+    "thread_conflict",
+    "authority_changed",
+    "admission_refused",
+]
+
+
+class FactorySlackKickoffIn(BaseModel):
+    """One Slack mention linking an issue, at a channel root or in a thread no
+    factory run owns, as the worker consumed it.
+
+    ``receipt`` is the dispatcher's verified mention receipt
+    (``curie_internal.slack_mention_receipt.SlackMentionReceipt``, version 1
+    for a person, 2 for a declared test driver), validated by the route so a
+    malformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or
+    the message's own at root. ``author`` is the turn's Slack user id; the
+    receipt must name the same delivery, route and sender.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    delivery_id: str = Field(min_length=1, max_length=256)
+    channel_identity: str = Field(min_length=1, max_length=256)
+    channel: str = Field(min_length=1, max_length=64)
+    root_ts: str = Field(min_length=1, max_length=64)
+    author: str = Field(min_length=1, max_length=64)
+    receipt: dict[str, Any]
+
+
+class FactorySlackKickoffOut(BaseModel):
+    """The kickoff decision. ``reason`` is the resolver's reason for
+    ``sender_unverified``, the base refusal code for ``base_refused`` and the
+    admission refusal code for ``admission_refused``."""
+
+    outcome: FactorySlackKickoffOutcome
+    request_id: str | None = None
+    request_status: str | None = None
+    work_item_id: str | None = None
+    issue_url: str | None = None
+    replayed: bool = False
+    reason: str | None = None

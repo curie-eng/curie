@@ -4998,3 +4998,80 @@ def test_a_persistence_failure_at_admission_answers_503_and_never_logs_the_slack
 def _detail_code(answer: Any) -> str | None:
     detail = answer.get("detail") if isinstance(answer, dict) else None
     return detail.get("code") if isinstance(detail, dict) else None
+
+
+# --- #5380: steering reads only a person's thread reply receipt ------------------------
+
+
+def test_steering_refuses_a_root_receipt_and_a_driver_receipt(steering: SteeringStack) -> None:
+    """Kickoff reads root and declared driver receipts (#5380); steering never does.
+
+    Through the steer route, a version 1 receipt whose message is the root
+    itself, and a version 2 driver receipt for a reply in the run's root, are
+    each ``receipt_mismatch`` and admit nothing, although both name a sender
+    with write access. A person's version 1 reply receipt there still admits
+    (liveness). Fails with the route's two cross-consumer refusals reverted:
+    both receipts would admit. The worker's own refusal of a version 2 receipt
+    is ``apps/worker/tests/test_factory_steering.py``'s.
+    """
+
+    from curie_channel_gateway.slack.identities import delivery_key
+    from curie_channel_gateway.slack.identity import driver_evidence, slack_evidence
+    from curie_internal.slack_mention_receipt import SlackMentionReceipt
+
+    stack = steering
+    writer = stack.person()
+    run = stack.open_steered_run()
+    known = {row["id"] for row in stack.requests()}
+
+    def steer_with(*, message_ts: str, driver: bool = False) -> dict[str, Any]:
+        event_id = f"Ev0{stack.tag.upper()}{uuid.uuid4().hex[:8].upper()}"
+        event = {
+            "type": "app_mention",
+            "channel": CHANNEL,
+            "text": f"<@{FACTORY_BOT_USER}> Please also update the changelog.",
+            "ts": message_ts,
+            "thread_ts": run.root_ts,
+            "team": TEAM,
+            "user": writer.slack_user,
+            "user_team": TEAM,
+        }
+        body = {"type": "event_callback", "event_id": event_id, "team_id": TEAM, "event": event}
+        evidence = driver_evidence(body, writer.slack_user) if driver else slack_evidence(body)
+        assert evidence is not None
+        delivery_id = delivery_key(event_id, stack.identity)
+        receipt = SlackMentionReceipt(
+            version=2 if driver else 1,
+            delivery_id=delivery_id,
+            channel_identity=stack.identity,
+            channel=CHANNEL,
+            root_ts=run.root_ts,
+            message_ts=message_ts,
+            user_id=writer.slack_user,
+            body=str(event["text"]),
+            evidence=evidence,
+            driver_bot_id="B0EXAMPLE5" if driver else None,
+        )
+        response = stack.client.post(
+            STEER_PATH,
+            headers=stack.internal,
+            json={
+                "delivery_id": delivery_id,
+                "channel_identity": stack.identity,
+                "channel": CHANNEL,
+                "root_ts": run.root_ts,
+                "author": writer.slack_user,
+                "receipt": receipt.model_dump(mode="json"),
+            },
+        )
+        assert response.status_code == 200, response.text
+        answer: dict[str, Any] = response.json()
+        return answer
+
+    assert steer_with(message_ts=run.root_ts)["outcome"] == "receipt_mismatch"
+    assert steer_with(message_ts="1800000900.000001", driver=True)["outcome"] == "receipt_mismatch"
+    assert [row for row in stack.requests() if row["id"] not in known] == []
+
+    live = steer_with(message_ts="1800000900.000002")
+    assert live["outcome"] == "admitted", live
+    assert len([row for row in stack.requests() if row["id"] not in known]) == 1

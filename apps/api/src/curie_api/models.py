@@ -1980,18 +1980,29 @@ class ExecutionRequestPhaseReport(Base):
     )
 
 
+FACTORY_SLACK_THREAD_ORIGINS = ("configured", "kickoff")
+
+
 class FactorySlackThread(Base):
     """The one Slack root a WorkItem's factory progress posts into (#5414).
 
     Bound for the WorkItem's whole life, across revisions. ``root_ts`` is NULL
     until the root post is delivered. ``first_sequence`` is the first request
-    posted, set once at discovery and never advanced.
+    posted, set once at discovery and never advanced. ``origin`` is
+    ``configured`` for a root the agent's factory destination created and
+    ``kickoff`` for a root a person started by mentioning the agent with an
+    issue link (#5380); a kickoff thread owes progress into its own thread
+    whether or not the agent has a destination.
     """
 
     __tablename__ = "factory_slack_threads"
     __table_args__ = (
         UniqueConstraint(
             "channel_identity", "channel", "root_ts", name="factory_slack_threads_root_key"
+        ),
+        CheckConstraint(
+            f"origin IN ({', '.join(repr(origin) for origin in FACTORY_SLACK_THREAD_ORIGINS)})",
+            name="factory_slack_threads_origin_ck",
         ),
     )
 
@@ -2005,6 +2016,7 @@ class FactorySlackThread(Base):
     channel: Mapped[str] = mapped_column(Text)
     root_ts: Mapped[str | None] = mapped_column(Text, default=None)
     first_sequence: Mapped[int] = mapped_column()
+    origin: Mapped[str] = mapped_column(Text, default="configured", server_default="configured")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
