@@ -166,12 +166,25 @@ def validate_entry(entry: Any) -> None:
         raise Refusal("A reproduction entry no longer matches its digest.")
 
 
-def load(path: Path, session: str, cwd: Path, *, create: bool) -> dict[str, Any]:
+def load_base_revision(path: Path, cwd: Path, *, create: bool) -> str:
+    if not path.exists() and create:
+        save(path, {"base_revision": snapshot(cwd)["revision"]})
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_STATE:
+        raise Refusal("The investigated base revision is missing or unreadable.")
+    revision = decode(path.read_bytes()).get("base_revision")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise Refusal("The investigated base revision is corrupt.")
+    return revision
+
+
+def load(
+    path: Path, session: str, cwd: Path, *, create: bool, base_revision: str
+) -> dict[str, Any]:
     if not path.exists() and create:
         return {
             "session": session,
             "workspace": str(cwd),
-            "base_revision": snapshot(cwd)["revision"],
+            "base_revision": base_revision,
             "runs": [],
             "pending": {},
         }
@@ -191,6 +204,8 @@ def load(path: Path, session: str, cwd: Path, *, create: bool) -> dict[str, Any]
         r"[0-9a-f]{40}", state["base_revision"]
     ):
         raise Refusal("Reproduction state has a missing or corrupt base revision.")
+    if state["base_revision"] != base_revision:
+        raise Refusal("Reproduction state differs from the investigated base revision.")
     if len(state["runs"]) > MAX_RUNS or len(state["pending"]) > MAX_RUNS:
         raise Refusal("Reproduction state exceeds its entry limit.")
     for entry in state["runs"]:
@@ -319,7 +334,13 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "r+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        state = load(path, session, cwd, create=tool == "Bash" and event == "PreToolUse")
+        create = tool == "Bash" and event == "PreToolUse"
+        anchor_directory = Path(git(cwd, "rev-parse", "--absolute-git-dir")) / "factory-triage"
+        anchor_directory.mkdir(mode=0o700, exist_ok=True)
+        base_revision = load_base_revision(
+            anchor_directory / f"{key}.json", cwd, create=create and not path.exists()
+        )
+        state = load(path, session, cwd, create=create, base_revision=base_revision)
         if tool == "Bash":
             record(state, event, data, cwd)
             save(path, state)

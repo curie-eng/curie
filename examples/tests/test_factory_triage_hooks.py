@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -155,6 +156,60 @@ def test_revision_moves_cannot_supply_ticket_evidence(session: Session, move: st
     assert not denied(session.submit(dict(kind="findings", reason="not_reproduced")))
     session.git("checkout", "-q", session.revision)
     assert not denied(session.submit(session.ticket(command, "5")))
+
+
+def test_checkout_and_clean_cannot_reset_investigated_base(session: Session) -> None:
+    older = session.revision
+    (session.cwd / "calc.py").write_text("def add(a, b): return a + b\n")
+    session.git("commit", "-am", "Fix addition", "-q")
+    session.revision = session.git("rev-parse", "HEAD").strip()
+    command = "python3 -B -c 'from calc import add; print(add(2, 3))'"
+    session.run(command)
+    assert not denied(session.submit(session.ticket(command, "5")))
+
+    session.run("git checkout -q " + older)
+    session.run("git clean -fdx")
+    session.run(command)
+    proposal = session.ticket(command, "-1")
+    proposal["reproduction"]["revision"] = older
+    assert denied(session.submit(proposal))
+    assert not denied(session.submit(dict(kind="findings", reason="not_reproduced")))
+
+    session.run("git checkout -q " + session.revision)
+    session.run(command)
+    assert not denied(session.submit(session.ticket(command, "5")))
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["missing", "unreadable", "corrupt", "undecodable", "invalid", "symlink", "different_revision"],
+)
+def test_unavailable_base_anchor_refuses_ticket_but_allows_findings(
+    session: Session, fault: str
+) -> None:
+    session.run("echo probe")
+    assert not denied(session.submit(session.ticket("echo probe", "probe")))
+    git_dir = Path(session.git("rev-parse", "--absolute-git-dir").strip())
+    directory = git_dir / "factory-triage"
+    directory.mkdir(exist_ok=True)
+    anchor = directory / (hashlib.sha256(b"triage-session").hexdigest() + ".json")
+    if fault in {"missing", "unreadable"}:
+        anchor.unlink(missing_ok=True)
+        if fault == "unreadable":
+            anchor.mkdir()
+    elif fault == "symlink":
+        anchor.unlink(missing_ok=True)
+        anchor.symlink_to(session.cwd / "calc.py")
+    elif fault == "corrupt":
+        anchor.write_text("{")
+    elif fault == "undecodable":
+        anchor.write_bytes(b"\xff")
+    elif fault == "different_revision":
+        anchor.write_text(json.dumps(dict(base_revision="0" * 40)))
+    else:
+        anchor.write_text(json.dumps(dict(base_revision="unknown")))
+    assert denied(session.submit(session.ticket("echo probe", "probe")))
+    assert not denied(session.submit(dict(kind="findings", reason="not_reproduced")))
 
 
 @pytest.mark.parametrize(
@@ -357,7 +412,8 @@ def test_documented_limit_deliberate_shell_state_forgery_is_not_detected(session
     """Document the accepted limit, not proof of protection against deliberate forgery."""
     code = (
         "from pathlib import Path; import hashlib,json; "
-        "p=next(Path('.').glob('.*/*/*.json')); s=json.loads(p.read_text()); "
+        "p=next(p for p in Path('.').glob('.*/*/*.json') "
+        "if 'runs' in json.loads(p.read_text())); s=json.loads(p.read_text()); "
         "e=dict(command='echo fabricated',exit_status=0,"
         "revision=s['pending']['call-1']['revision'],clean=True,output='fabricated'); "
         "e['output_digest']=hashlib.sha256(e['output'].encode()).hexdigest(); "
