@@ -191,6 +191,7 @@ class GithubStub:
                 "CREATE TABLE objects(kind TEXT, id INTEGER, body TEXT NOT NULL,"
                 " PRIMARY KEY(kind,id)); CREATE TABLE unsupported(request TEXT);"
                 "CREATE TABLE tokens(token TEXT PRIMARY KEY, permissions TEXT);"
+                "CREATE TABLE request_log(method TEXT NOT NULL, path TEXT NOT NULL);"
             )
         self._repository.parent.mkdir(parents=True, exist_ok=True)
         self._run("git", "init", "--bare", "--initial-branch=main", str(self._repository))
@@ -468,9 +469,45 @@ class GithubStub:
         handler.end_headers()
         handler.wfile.write(payload)
 
+    def add_issue_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        author: dict[str, Any],
+        app: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Seed an authenticated-read comment with independent author and App provenance."""
+        identifier = max((row["id"] for row in self._rows("comment")), default=0) + 1
+        comment = {
+            "id": identifier,
+            "body": body,
+            "issue_number": number,
+            "user": author,
+            "performed_via_github_app": app,
+            "created_at": _utc(),
+            "updated_at": _utc(),
+            "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
+            "html_url": f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}",
+        }
+        self._put("comment", identifier, comment)
+        return comment
+
+    @property
+    def request_log(self) -> list[dict[str, str]]:
+        with sqlite3.connect(self._database) as connection:
+            return [
+                {"method": method, "path": path}
+                for method, path in connection.execute(
+                    "SELECT method,path FROM request_log ORDER BY rowid"
+                )
+            ]
+
     def _request(self, handler: BaseHTTPRequestHandler) -> None:
         parsed = urlsplit(handler.path)
         path = unquote(parsed.path)
+        with sqlite3.connect(self._database) as connection:
+            connection.execute("INSERT INTO request_log VALUES(?,?)", (handler.command, path))
         if path.startswith("/api/v3/"):
             path = path.removeprefix("/api/v3")
         body = handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
@@ -576,8 +613,18 @@ class GithubStub:
                 "permissions": PERMISSIONS,
                 "account": {"login": "acme-corp"},
             }
-        if method == "GET" and tail == "collaborators/octocat/permission":
-            return 200, {"permission": "write", "user": HUMAN}
+        if method == "GET" and tail.startswith("collaborators/") and tail.endswith("/permission"):
+            login = tail.split("/")[1]
+            actors = {
+                HUMAN["login"]: HUMAN,
+                "reader": {"id": 6602, "login": "reader", "type": "User"},
+            }
+            if login not in actors:
+                return 404, {"message": "Not Found"}
+            return 200, {
+                "permission": "read" if login == "reader" else "write",
+                "user": actors[login],
+            }
         if method == "GET" and tail.startswith("rules/branches/"):
             # No ruleset on this fixture. HTTP 404 contributes no required names.
             # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch

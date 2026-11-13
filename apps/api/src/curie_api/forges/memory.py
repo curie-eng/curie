@@ -73,6 +73,7 @@ from curie_api.forges.types import (
     ReviewFeedback,
     StoredEvidence,
     TicketLabels,
+    TrackerComment,
     TrackerIssueRef,
     UpsertResult,
     body_sha256,
@@ -225,6 +226,7 @@ class _Comment:
     id: str
     author: Actor
     body: str
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class InMemoryMarkedComments(_Declared):
@@ -287,6 +289,35 @@ class InMemoryMarkedComments(_Declared):
                 if comment.author == self.identity and embedded in comment.body:
                     return MarkedComment(comment.id, target, comment.body)
         return None
+
+    async def find_facts(self, target: ReplyTarget, prefix: str) -> MarkedComment | None:
+        self._gate(Operation.FIND_MARKED)
+        thread = self._accept(target)
+        for start in range(0, max(len(thread), 1), self._page_size):
+            self._faults.read_page("comments")
+            for comment in thread[start : start + self._page_size]:
+                if comment.author == self.identity and prefix in comment.body:
+                    return MarkedComment(comment.id, target, comment.body)
+        return None
+
+    async def upsert_facts(
+        self, target: ReplyTarget, *, prefix: str, marker: str, body: str
+    ) -> UpsertResult:
+        self._gate(Operation.UPSERT_MARKED)
+        self.write_faults.before(Operation.UPSERT_MARKED)
+        encoded = self.embed(marker, body)
+        found = await self.find_facts(target, prefix)
+        if found is None:
+            comment_id = self.seed_comment(target, self.identity, encoded)
+        else:
+            comment_id = found.id
+            if found.body == encoded:
+                return UpsertResult(found, written=False)
+            stored = next(comment for comment in self._accept(target) if comment.id == comment_id)
+            stored.body, stored.updated_at = encoded, datetime.now(UTC)
+        self._ledger.record()
+        self.write_faults.after(Operation.UPSERT_MARKED)
+        return UpsertResult(MarkedComment(comment_id, target, encoded), written=True)
 
     async def upsert_marked(self, target: ReplyTarget, marker: str, body: str) -> UpsertResult:
         """Honours ``write_faults`` for `Operation.UPSERT_MARKED`."""
@@ -395,6 +426,15 @@ class InMemoryTracker(_Declared):
             page_size=page_size,
             capabilities=comment_capabilities,
             write_faults=self.write_faults,
+        )
+        self._facts = InMemoryTrackerFacts(self)
+
+    @property
+    def facts(self) -> InMemoryTrackerFacts | None:
+        return (
+            self._facts
+            if self.capabilities[Operation.FACTS_EXCHANGE] is Support.SUPPORTED
+            else None
         )
 
     @property
@@ -800,6 +840,62 @@ class _PullRequest:
 class _Feedback:
     position: int
     feedback: ReviewFeedback
+
+
+class InMemoryTrackerFacts:
+    """Facts capability over the memory tracker's public seeding and grant state."""
+
+    def __init__(self, tracker: InMemoryTracker) -> None:
+        self._tracker = tracker
+        self._via_app: set[int] = set()
+
+    @property
+    def repository(self) -> RepositoryRef:
+        tracker = self._tracker
+        return RepositoryRef(tracker.kind, tracker.host, tracker.scope_id, tracker.scope_id)
+
+    @property
+    def marked_comments(self) -> InMemoryMarkedComments:
+        return self._tracker.marked_comments
+
+    def seed_comment(
+        self, issue: TrackerIssueRef, actor: Actor, body: str, *, via_app: bool = False
+    ) -> int:
+        self._tracker._issue(issue)
+        identifier = int(
+            self.marked_comments.seed_comment(ReplyTarget.on_issue(issue), actor, body)
+        )
+        if via_app:
+            self._via_app.add(identifier)
+        return identifier
+
+    async def read_comment(self, comment_id: int) -> TrackerComment:
+        self._tracker._gate(Operation.FACTS_EXCHANGE)
+        for target, comments in self.marked_comments._threads.items():
+            for comment in comments:
+                if comment.id == str(comment_id) and target.issue is not None:
+                    return TrackerComment(
+                        comment_id,
+                        target.issue,
+                        comment.body,
+                        None if comment.author == self._tracker.identity else comment.author,
+                        comment_id in self._via_app,
+                        comment.updated_at,
+                    )
+        raise NotFound("comment")
+
+    async def facts_issue_is_plain(self, issue: TrackerIssueRef) -> bool:
+        self._tracker._gate(Operation.FACTS_EXCHANGE)
+        self._tracker._issue(issue)
+        return True
+
+    async def facts_writer(self, comment: TrackerComment) -> Actor | None:
+        self._tracker._gate(Operation.FACTS_EXCHANGE)
+        self._tracker._issue(comment.issue)
+        actor = comment.actor
+        if actor is None or actor == self._tracker.identity:
+            return None
+        return actor if actor.id in self._tracker._authorized else None
 
 
 class InMemoryCodeHost(_Declared):

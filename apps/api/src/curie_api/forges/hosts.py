@@ -75,6 +75,14 @@ def factory_credentials(registry: ForgeRegistry) -> GitHubCredentials:
     return factory_code_host_entry(registry).credentials.credentials
 
 
+async def resolve_factory_repository(
+    registry: ForgeRegistry, client: httpx.AsyncClient, path: str
+) -> RepositoryRef:
+    """Resolve a factory repository through its code host's configured credentials."""
+    code_host: CodeHost = factory_code_host(registry, client)
+    return await code_host.resolve_repository(f"{PATH_ID_PREFIX}{path}")
+
+
 def factory_tracker(registry: ForgeRegistry) -> GitHubTrackerConnection:
     """The factory's GitHub tracker entry. Refused ``unavailable`` when none."""
 

@@ -105,6 +105,18 @@ class Actor:
         _require_text("Actor", id=self.id, login=self.login)
 
 
+@dataclass(frozen=True)
+class TrackerComment:
+    """Comment content and provenance read by a tracker, before facts authorization."""
+
+    id: int
+    issue: TrackerIssueRef
+    body: str
+    actor: Actor | None
+    via_app: bool
+    updated_at: datetime | None
+
+
 class PullRequestState(enum.StrEnum):
     OPEN = "open"
     MERGED = "merged"

@@ -53,7 +53,7 @@ from curie_api.forges.errors import (
 )
 from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
 from curie_api.forges.github.marked_comments import REFUSED_STATUSES, github_request
-from curie_api.forges.github.review_polling import human_actor
+from curie_api.forges.github.review_polling import human_actor, label_actor, trailing_id
 from curie_api.forges.github.transport import (
     PollUnavailable,
     get_all,
@@ -64,6 +64,7 @@ from curie_api.forges.github.transport import (
     repository_identity_matches,
 )
 from curie_api.forges.github.transport import Unavailable as TransportUnavailable
+from curie_api.forges.ports import TrackerFacts
 from curie_api.forges.types import (
     GITHUB,
     Actor,
@@ -74,6 +75,7 @@ from curie_api.forges.types import (
     PullRequest,
     RepositoryRef,
     TicketLabels,
+    TrackerComment,
     TrackerIssueRef,
     body_sha256,
     ends_with_marker,
@@ -83,6 +85,7 @@ from curie_api.forges.types import (
     valid_output_identity,
 )
 from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_login
+from curie_api.github_review_events import FeedbackIgnored
 from curie_api.github_review_truth import verify_sender_write_permission
 from curie_api.repo_full_name import repo_url_path
 
@@ -197,7 +200,7 @@ async def read_repository(
 def _status_error(status: int, what: str) -> Exception:
     if status == 401:
         return Unauthorized(what)
-    if status == 404:
+    if status in {404, 410}:
         return NotFound(what)
     return Unavailable(what)
 
@@ -311,6 +314,89 @@ class GitHubTracker:
     @property
     def marked_comments(self) -> GitHubMarkedComments:
         return self._comments
+
+    @property
+    def facts(self) -> TrackerFacts:
+        return self
+
+    @property
+    def repository(self) -> RepositoryRef:
+        return RepositoryRef(self.kind, self.host, str(self.repository_id), self.repo_full_name)
+
+    def facts_comment(self, value: Mapping[str, Any]) -> TrackerComment | None:
+        number = trailing_id(value.get("issue_url"))
+        comment_id, body = value.get("id"), value.get("body")
+        if (
+            number is None
+            or type(comment_id) is not int
+            or comment_id <= 0
+            or not isinstance(body, str)
+        ):
+            return None
+        try:
+            actor_id, login = label_actor(
+                {
+                    "actor": value.get("user"),
+                    "performed_via_github_app": value.get("performed_via_github_app"),
+                },
+                app_id=self.app_id,
+            )
+            actor = Actor(str(actor_id), login)
+        except FeedbackIgnored:
+            actor = None
+        return TrackerComment(
+            comment_id,
+            self.issue(number),
+            body,
+            actor,
+            value.get("performed_via_github_app") is not None,
+            parse_time(value.get("updated_at")),
+        )
+
+    async def read_comment(self, comment_id: int) -> TrackerComment:
+        """Re-read request content and provenance through the installation credential."""
+        value = await self._get(f"{self._repo_path}/issues/comments/{comment_id}")
+        if not isinstance(value, dict) or value.get("id") != comment_id:
+            raise Unavailable("comment")
+        comment = self.facts_comment(value)
+        if comment is None:
+            raise Unavailable("comment")
+        return comment
+
+    async def facts_issue_is_plain(self, ref: TrackerIssueRef) -> bool:
+        number = self._number(ref)
+        try:
+            issue = await self._get(f"{self._repo_path}/issues/{number}")
+        except (NotFound, Unauthorized):
+            raise Unavailable("issue") from None
+        if (
+            not isinstance(issue, dict)
+            or type(issue.get("number")) is not int
+            or issue["number"] != number
+        ):
+            raise Unavailable("issue")
+        return "pull_request" not in issue
+
+    async def facts_writer(self, comment: TrackerComment) -> Actor | None:
+        """Reuse admission's immutable-user effective write permission check."""
+        actor = comment.actor
+        if actor is None:
+            return None
+        self._number(comment.issue)
+        try:
+            await verify_sender_write_permission(
+                self._client,
+                api=self._api,
+                token=await self._token(),
+                repo_path=self._repo_path,
+                sender_id=int(actor.id),
+                sender_login=actor.login,
+            )
+        except FeedbackIgnored as exc:
+            if exc.code == "sender_permission_unavailable":
+                raise Unavailable("actor_unreadable") from None
+            return None
+        return actor
 
     def issue(self, number: int) -> TrackerIssueRef:
         return TrackerIssueRef(GITHUB, self.host, str(self.repository_id), str(number))

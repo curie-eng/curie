@@ -2430,6 +2430,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/factory/facts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Factory Facts */
+        get: operations["get_factory_facts_factory_facts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/forges/credentials/health": {
         parameters: {
             query?: never;
@@ -6396,6 +6413,16 @@ export interface components {
             schema_version: 1;
             scope: components["schemas"]["TurnAuthorityScopeV1"];
         };
+        /** BindingFact */
+        BindingFact: {
+            /** Reason */
+            reason: ("unbound" | "label_not_served" | "ambiguous") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "bound" | "unbound" | "label_not_served" | "ambiguous";
+        };
         /** Body_confirm_connection_identity_connect__token__confirm_post */
         Body_confirm_connection_identity_connect__token__confirm_post: {
             /** Csrf */
@@ -7134,6 +7161,18 @@ export interface components {
             /** Total Usd */
             total_usd: number;
         };
+        /** CredentialFact */
+        CredentialFact: {
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "healthy" | "unhealthy" | "unknown";
+        };
         /**
          * CredentialHeader
          * @description The header form git accepts on a forge. GitLab refuses a Bearer header.
@@ -7149,6 +7188,20 @@ export interface components {
             generation: number;
             /** Id */
             id: string;
+        };
+        /** CreditFact */
+        CreditFact: {
+            /** Expires At */
+            expires_at: string | null;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "sufficient" | "insufficient" | "unknown";
         };
         /** Declaration */
         Declaration: {
@@ -7787,6 +7840,22 @@ export interface components {
              */
             version_id: string;
         };
+        /** ExecutableFact */
+        ExecutableFact: {
+            /** Basis */
+            basis: "selected_image_probe" | null;
+            /** Name */
+            name: string;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "present" | "absent" | "unknown";
+        };
         /**
          * ExecutionArguments
          * @description A claimed forward execution's bound call, read by its holder only.
@@ -7980,6 +8049,67 @@ export interface components {
              */
             tenant_id: string;
         };
+        /** FactoryFact */
+        FactoryFact: {
+            code_host_credential: components["schemas"]["CredentialFact"];
+            /** Enabled */
+            enabled: boolean;
+            /**
+             * Kill Switch
+             * @enum {string}
+             */
+            kill_switch: "clear" | "engaged" | "unknown";
+            /**
+             * Upgrade Pause
+             * @enum {string}
+             */
+            upgrade_pause: "clear" | "paused" | "unknown";
+        };
+        /** FactoryFacts */
+        FactoryFacts: {
+            /**
+             * Admission
+             * @constant
+             */
+            admission: "not_requested";
+            binding: components["schemas"]["BindingFact"];
+            /** Context Digest */
+            context_digest: string;
+            /**
+             * Deployment Readiness
+             * @constant
+             */
+            deployment_readiness: "unvalidated";
+            /** Executables */
+            executables: components["schemas"]["ExecutableFact"][];
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            factory: components["schemas"]["FactoryFact"];
+            /**
+             * Kind
+             * @constant
+             */
+            kind: "factory_facts";
+            label_route: components["schemas"]["LabelRoute"] | null;
+            model_credit: components["schemas"]["CreditFact"];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            request: components["schemas"]["RequestIdentity"] | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /** Services */
+            services: components["schemas"]["ServiceFact"][];
+            subject: components["schemas"]["FactsSubject"];
+        };
         /**
          * FactorySlackKickoffIn
          * @description One Slack mention linking an issue, at a channel root or in a thread no
@@ -8093,6 +8223,15 @@ export interface components {
             conversation_id: string;
             /** Kind */
             kind: string;
+        };
+        /** FactsSubject */
+        FactsSubject: {
+            /** Issue Number */
+            issue_number: number | null;
+            /** Repository Id */
+            repository_id: string;
+            /** Trigger Label */
+            trigger_label: string;
         };
         /** FileDescriptor */
         FileDescriptor: {
@@ -8686,6 +8825,28 @@ export interface components {
         KillState: {
             /** Killed */
             killed: boolean;
+        };
+        /** LabelRoute */
+        LabelRoute: {
+            /** Actor Id */
+            actor_id: string;
+            /**
+             * Actor Kind
+             * @constant
+             */
+            actor_kind: "human";
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * Route
+             * @enum {string}
+             */
+            route: "github_user" | "github_user_via_app";
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "eligible" | "ineligible" | "unknown";
         };
         /**
          * ListedTargets
@@ -10837,6 +10998,13 @@ export interface components {
             /** Project Id */
             project_id: string;
         };
+        /** RequestIdentity */
+        RequestIdentity: {
+            /** Comment Id */
+            comment_id: string;
+            /** Digest */
+            digest: string;
+        };
         /**
          * ResolveTargetRequest
          * @description A bundle's ``deploy.yaml`` text plus the target to resolve (ADR-0089).
@@ -11258,6 +11426,20 @@ export interface components {
              * Format: uuid
              */
             id: string;
+        };
+        /** ServiceFact */
+        ServiceFact: {
+            /** Name */
+            name: string;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "configured" | "observed" | "unknown";
         };
         /**
          * SettingConfig
@@ -17781,6 +17963,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EvalTriggerResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_factory_facts_factory_facts_get: {
+        parameters: {
+            query: {
+                repository: string;
+                trigger_label: string;
+                executables?: string;
+                services?: string;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactoryFacts"];
                 };
             };
             /** @description Validation Error */

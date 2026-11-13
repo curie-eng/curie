@@ -243,12 +243,14 @@ class JiraTracker:
     """The factory's tracker on one Jira Cloud site scope, for one binding."""
 
     kind = JIRA_CLOUD
+    facts = None
     capabilities: Mapping[Operation, Support] = {
         **dict.fromkeys(TRACKER_OPERATIONS, Support.SUPPORTED),
         # No core caller reads dependencies yet (ADR 0165 is a Draft, decision 19).
         Operation.DEPENDENCIES: Support.NOOP,
         # Linked output issues are GitHub only (ADR 0277); no fallback path.
         Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
+        Operation.FACTS_EXCHANGE: Support.UNSUPPORTED,
     }
 
     def __init__(

@@ -90,6 +90,7 @@ from .routers import (
     deployments,
     directory,
     evals,
+    factory_facts,
     factory_slack,
     factory_status,
     forge_credential_health,
@@ -758,6 +759,7 @@ def create_app(
     app.include_router(channel_read.router)
     app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
+    app.include_router(factory_facts.router)
     app.include_router(factory_status.router)
     app.include_router(forge_credential_health.router)
     app.include_router(turn_progress.router)

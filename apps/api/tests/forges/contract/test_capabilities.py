@@ -37,7 +37,15 @@ async def _optional_calls(harness: AdapterHarness) -> dict[Operation, Call]:
     harness.report_checks(pull.head_sha, {"unit": CheckState.FAILURE})
     tracker, code_host, repository = harness.tracker, harness.code_host, harness.repository
     jobs = failed_native_jobs((await code_host.observe_ci(repository, pull.head_sha)).checks)
+
+    async def facts_exchange() -> bool:
+        facts = tracker.facts
+        if facts is None:
+            raise Unsupported(Operation.FACTS_EXCHANGE)
+        return await facts.facts_issue_is_plain(issue)
+
     return {
+        Operation.FACTS_EXCHANGE: facts_exchange,
         Operation.LINK_PULL_REQUEST: lambda: tracker.link_pull_request(issue, pull),
         Operation.DEPENDENCIES: lambda: tracker.dependencies(issue),
         Operation.GROUP_MEMBERSHIP: lambda: tracker.in_group(harness.writer, "starters"),

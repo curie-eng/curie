@@ -4401,6 +4401,43 @@
         "title": "BindingClassificationResponseV1",
         "type": "object"
       },
+      "BindingFact": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "unbound",
+                  "label_not_served",
+                  "ambiguous"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "bound",
+              "unbound",
+              "label_not_served",
+              "ambiguous"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "reason"
+        ],
+        "title": "BindingFact",
+        "type": "object"
+      },
       "Body_confirm_connection_identity_connect__token__confirm_post": {
         "properties": {
           "csrf": {
@@ -6153,6 +6190,61 @@
         "title": "CostReport",
         "type": "object"
       },
+      "CredentialFact": {
+        "additionalProperties": false,
+        "properties": {
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "observation_missing",
+                  "observation_expired",
+                  "outside_catalog",
+                  "runner_unavailable",
+                  "provider_unsupported",
+                  "credential_rejected",
+                  "not_probed",
+                  "unreadable",
+                  "personal_owner_required"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "healthy",
+              "unhealthy",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "reason",
+          "observed_at"
+        ],
+        "title": "CredentialFact",
+        "type": "object"
+      },
       "CredentialHeader": {
         "description": "The header form git accepts on a forge. GitLab refuses a Bearer header.",
         "enum": [
@@ -6182,6 +6274,74 @@
           "generation"
         ],
         "title": "CredentialReferenceV1",
+        "type": "object"
+      },
+      "CreditFact": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "observation_missing",
+                  "observation_expired",
+                  "outside_catalog",
+                  "runner_unavailable",
+                  "provider_unsupported",
+                  "credential_rejected",
+                  "not_probed",
+                  "unreadable",
+                  "personal_owner_required"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "sufficient",
+              "insufficient",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "reason",
+          "observed_at",
+          "expires_at"
+        ],
+        "title": "CreditFact",
         "type": "object"
       },
       "Declaration": {
@@ -7599,6 +7759,80 @@
         "title": "EvalTriggerResult",
         "type": "object"
       },
+      "ExecutableFact": {
+        "additionalProperties": false,
+        "properties": {
+          "basis": {
+            "anyOf": [
+              {
+                "const": "selected_image_probe",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Basis"
+          },
+          "name": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$",
+            "title": "Name",
+            "type": "string"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "observation_missing",
+                  "observation_expired",
+                  "outside_catalog",
+                  "runner_unavailable",
+                  "provider_unsupported",
+                  "credential_rejected",
+                  "not_probed",
+                  "unreadable",
+                  "personal_owner_required"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "present",
+              "absent",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "state",
+          "basis",
+          "reason",
+          "observed_at"
+        ],
+        "title": "ExecutableFact",
+        "type": "object"
+      },
       "ExecutionArguments": {
         "description": "A claimed forward execution's bound call, read by its holder only.\n\n@spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19: the worker recomputes\n``arguments_sha256`` over the text it sends, so it reads the tool and the\narguments the authority bound under its fence before dispatch. Answered\nonly by ``POST /action-executions/{id}/arguments`` (internal worker token);\n``ExecutionOut`` keeps carrying no argument.",
         "properties": {
@@ -8035,6 +8269,149 @@
         "title": "FactoryContext",
         "type": "object"
       },
+      "FactoryFact": {
+        "additionalProperties": false,
+        "properties": {
+          "code_host_credential": {
+            "$ref": "#/components/schemas/CredentialFact"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "kill_switch": {
+            "enum": [
+              "clear",
+              "engaged",
+              "unknown"
+            ],
+            "title": "Kill Switch",
+            "type": "string"
+          },
+          "upgrade_pause": {
+            "enum": [
+              "clear",
+              "paused",
+              "unknown"
+            ],
+            "title": "Upgrade Pause",
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "kill_switch",
+          "upgrade_pause",
+          "code_host_credential"
+        ],
+        "title": "FactoryFact",
+        "type": "object"
+      },
+      "FactoryFacts": {
+        "additionalProperties": false,
+        "properties": {
+          "admission": {
+            "const": "not_requested",
+            "title": "Admission",
+            "type": "string"
+          },
+          "binding": {
+            "$ref": "#/components/schemas/BindingFact"
+          },
+          "context_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Context Digest",
+            "type": "string"
+          },
+          "deployment_readiness": {
+            "const": "unvalidated",
+            "title": "Deployment Readiness",
+            "type": "string"
+          },
+          "executables": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutableFact"
+            },
+            "title": "Executables",
+            "type": "array"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "factory": {
+            "$ref": "#/components/schemas/FactoryFact"
+          },
+          "kind": {
+            "const": "factory_facts",
+            "title": "Kind",
+            "type": "string"
+          },
+          "label_route": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LabelRoute"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model_credit": {
+            "$ref": "#/components/schemas/CreditFact"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "request": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RequestIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceFact"
+            },
+            "title": "Services",
+            "type": "array"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/FactsSubject"
+          }
+        },
+        "required": [
+          "schema_version",
+          "kind",
+          "request",
+          "subject",
+          "observed_at",
+          "expires_at",
+          "context_digest",
+          "binding",
+          "label_route",
+          "executables",
+          "services",
+          "model_credit",
+          "factory",
+          "admission",
+          "deployment_readiness"
+        ],
+        "title": "FactoryFacts",
+        "type": "object"
+      },
       "FactorySlackKickoffIn": {
         "additionalProperties": false,
         "description": "One Slack mention linking an issue, at a channel root or in a thread no\nfactory run owns, as the worker consumed it.\n\n``receipt`` is the dispatcher's verified mention receipt\n(``curie_internal.slack_mention_receipt.SlackMentionReceipt``, version 1\nfor a person, 2 for a declared test driver), validated by the route so a\nmalformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or\nthe message's own at root. ``author`` is the turn's Slack user id; the\nreceipt must name the same delivery, route and sender.",
@@ -8349,6 +8726,37 @@
           "conversation_id"
         ],
         "title": "FactoryWake",
+        "type": "object"
+      },
+      "FactsSubject": {
+        "additionalProperties": false,
+        "properties": {
+          "issue_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue Number"
+          },
+          "repository_id": {
+            "title": "Repository Id",
+            "type": "string"
+          },
+          "trigger_label": {
+            "title": "Trigger Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository_id",
+          "issue_number",
+          "trigger_label"
+        ],
+        "title": "FactsSubject",
         "type": "object"
       },
       "FileDescriptor": {
@@ -9608,6 +10016,68 @@
           "killed"
         ],
         "title": "KillState",
+        "type": "object"
+      },
+      "LabelRoute": {
+        "additionalProperties": false,
+        "properties": {
+          "actor_id": {
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "actor_kind": {
+            "const": "human",
+            "title": "Actor Kind",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "observation_missing",
+                  "observation_expired",
+                  "outside_catalog",
+                  "runner_unavailable",
+                  "provider_unsupported",
+                  "credential_rejected",
+                  "not_probed",
+                  "unreadable",
+                  "personal_owner_required"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "route": {
+            "enum": [
+              "github_user",
+              "github_user_via_app"
+            ],
+            "title": "Route",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "eligible",
+              "ineligible",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "actor_id",
+          "actor_kind",
+          "route",
+          "state",
+          "reason"
+        ],
+        "title": "LabelRoute",
         "type": "object"
       },
       "ListedTargets": {
@@ -14489,6 +14959,26 @@
         "title": "RepositoryIn",
         "type": "object"
       },
+      "RequestIdentity": {
+        "additionalProperties": false,
+        "properties": {
+          "comment_id": {
+            "title": "Comment Id",
+            "type": "string"
+          },
+          "digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "comment_id",
+          "digest"
+        ],
+        "title": "RequestIdentity",
+        "type": "object"
+      },
       "ResolveTargetRequest": {
         "description": "A bundle's ``deploy.yaml`` text plus the target to resolve (ADR-0089).\n\nThe CLI sends the file CONTENT rather than parsing it, so there is exactly\none parser for this format. Two would be a drift hazard on a file whose\nwhole job is to be unambiguous about where a deploy lands -- and the Rust\nYAML ecosystem has no maintained successor to serde_yaml to pick from.",
         "properties": {
@@ -15450,6 +15940,67 @@
           "id"
         ],
         "title": "Selection",
+        "type": "object"
+      },
+      "ServiceFact": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$",
+            "title": "Name",
+            "type": "string"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "observation_missing",
+                  "observation_expired",
+                  "outside_catalog",
+                  "runner_unavailable",
+                  "provider_unsupported",
+                  "credential_rejected",
+                  "not_probed",
+                  "unreadable",
+                  "personal_owner_required"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "configured",
+              "observed",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "state",
+          "reason",
+          "observed_at"
+        ],
+        "title": "ServiceFact",
         "type": "object"
       },
       "SettingConfig": {
@@ -28814,6 +29365,93 @@
         "summary": "Trigger Eval",
         "tags": [
           "evals"
+        ]
+      }
+    },
+    "/factory/facts": {
+      "get": {
+        "operationId": "get_factory_facts_factory_facts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "repository",
+            "required": true,
+            "schema": {
+              "title": "Repository",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "trigger_label",
+            "required": true,
+            "schema": {
+              "title": "Trigger Label",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "executables",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Executables",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "services",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Services",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactoryFacts"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Factory Facts",
+        "tags": [
+          "factory-facts"
         ]
       }
     },

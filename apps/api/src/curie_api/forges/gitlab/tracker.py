@@ -58,6 +58,7 @@ TRACKER_CAPABILITIES: Mapping[Operation, Support] = {
     Operation.GROUP_MEMBERSHIP: Support.UNSUPPORTED,
     # Linked output issues are GitHub only (ADR 0277); no fallback path.
     Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
+    Operation.FACTS_EXCHANGE: Support.UNSUPPORTED,
 }
 # The overlap between poll windows (decision 8): it absorbs clock skew and
 # issues committed late.
@@ -175,6 +176,7 @@ class GitLabTracker:
     """The factory's tracker on one GitLab project, for one binding."""
 
     kind = types.GITLAB
+    facts = None
     capabilities: Mapping[Operation, Support] = TRACKER_CAPABILITIES
 
     def __init__(

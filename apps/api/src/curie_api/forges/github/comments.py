@@ -41,7 +41,7 @@ def static_token(token: str) -> TokenSource:
 def _refusal(status: int | None, what: str) -> Exception:
     if status == 401 or status == 403:
         return Unauthorized(what)
-    if status == 404:
+    if status in {404, 410}:
         return NotFound(what)
     return Unavailable(what)
 
@@ -128,3 +128,49 @@ class GitHubMarkedComments:
             raise _refusal(written.status, "comment")
         comment = MarkedComment(str(written.comment_id), target, written.body)
         return UpsertResult(comment, written=written.outcome == "written")
+
+    async def find_facts(self, target: ReplyTarget, prefix: str) -> MarkedComment | None:
+        """Find our label-scoped facts marker, whose request attributes may change."""
+        number, thread = self._address(target)
+        found = await find_own_marker(
+            self._client,
+            api=self._api,
+            repo_path=self._repo_path,
+            headers=github_headers(await self._token()),
+            number=number,
+            thread_id=thread,
+            marker=prefix,
+            app_id=self._app_id,
+        )
+        if isinstance(found, MarkerWrite):
+            raise _refusal(found.status, "comments")
+        if found.comment_id is None or found.body is None:
+            return None
+        return MarkedComment(str(found.comment_id), target, found.body)
+
+    async def upsert_facts(
+        self,
+        target: ReplyTarget,
+        *,
+        prefix: str,
+        marker: str,
+        body: str,
+    ) -> UpsertResult:
+        number, thread = self._address(target)
+        written = await upsert_marker(
+            self._client,
+            api=self._api,
+            repo_path=self._repo_path,
+            headers=github_headers(await self._token()),
+            number=number,
+            thread_id=thread,
+            marker=prefix,
+            body=self.embed(marker, body),
+            app_id=self._app_id,
+        )
+        if written.outcome == "unavailable" or written.comment_id is None:
+            raise _refusal(written.status, "comment")
+        return UpsertResult(
+            MarkedComment(str(written.comment_id), target, written.body),
+            written=written.outcome == "written",
+        )

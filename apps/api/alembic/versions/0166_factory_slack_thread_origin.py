@@ -19,8 +19,8 @@ an exclusive lock on the table first, under a bounded wait, so a kickoff row
 cannot be inserted between the check and the drop, and it refuses before any
 DDL.
 
-Revision ID: 0167
-Revises: 0163
+Revision ID: 0166
+Revises: 0164
 """
 
 from collections.abc import Sequence
@@ -28,8 +28,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0167"
-down_revision: str = "0163"
+revision: str = "0166"
+down_revision: str = "0164"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 S = "curie"

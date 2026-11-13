@@ -1,0 +1,78 @@
+[
+  {
+    "schema_version": 1,
+    "kind": "factory_facts",
+    "request": {
+      "comment_id": "101",
+      "digest": "sha256:6ca35c65ea442d22806eaa7dbc3e1d021f7aff696be7b47c27ece92bbfac69e4"
+    },
+    "subject": {
+      "repository_id": "4401",
+      "issue_number": 42,
+      "trigger_label": "acme-factory"
+    },
+    "observed_at": "2026-11-12T09:58:00Z",
+    "expires_at": "2026-11-12T10:00:00Z",
+    "context_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "binding": {
+      "state": "bound",
+      "reason": null
+    },
+    "label_route": {
+      "actor_id": "77",
+      "actor_kind": "human",
+      "route": "github_user",
+      "state": "eligible",
+      "reason": null
+    },
+    "executables": [
+      {
+        "name": "uv",
+        "state": "unknown",
+        "reason": "observation_missing",
+        "observed_at": null,
+        "basis": null
+      },
+      {
+        "name": "jq",
+        "state": "unknown",
+        "reason": "observation_missing",
+        "observed_at": null,
+        "basis": null
+      },
+      {
+        "name": "docker",
+        "state": "unknown",
+        "reason": "observation_missing",
+        "observed_at": null,
+        "basis": null
+      }
+    ],
+    "services": [
+      {
+        "name": "postgres",
+        "state": "unknown",
+        "reason": "observation_missing",
+        "observed_at": null
+      }
+    ],
+    "model_credit": {
+      "state": "unknown",
+      "reason": "observation_missing",
+      "observed_at": null,
+      "expires_at": null
+    },
+    "factory": {
+      "enabled": true,
+      "kill_switch": "clear",
+      "upgrade_pause": "clear",
+      "code_host_credential": {
+        "state": "unknown",
+        "reason": "not_probed",
+        "observed_at": null
+      }
+    },
+    "admission": "not_requested",
+    "deployment_readiness": "unvalidated"
+  }
+]

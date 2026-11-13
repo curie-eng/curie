@@ -31,6 +31,7 @@ https://docs.github.com/en/rest/using-the-rest-api/getting-started-with-the-rest
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, replace
@@ -52,7 +53,10 @@ from curie_api.factory_label_reconcile import (
 
 from . import github_factory
 from .config import Settings
-from .forges.errors import Unavailable
+from .factory_facts import FACTS_DEADLINE_SECONDS
+from .factory_facts_exchange import FactsExchange
+from .factory_facts_schema import REQUEST_MARKER
+from .forges.errors import NotFound, Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND
 from .forges.github.comments import static_token
 from .forges.github.review_polling import (
@@ -518,10 +522,34 @@ async def _admit_mentions(
     repository."""
 
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
+    facts = FactsExchange(sessionmaker, settings, tracker.facts)
+    if serves:
+        await facts.recover_owed()
+    retried: set[int] = set()
+    for key in list(cursor.etags):
+        if not key.startswith("facts-retry:"):
+            continue
+        retry_id = trailing_id(key.replace(":", "/"))
+        if retry_id is None:
+            cursor.etags.pop(key, None)
+            continue
+        retried.add(retry_id)
+        try:
+            async with asyncio.timeout(FACTS_DEADLINE_SECONDS):
+                comment = await tracker.read_comment(retry_id)
+                if not await facts.observe(comment, serves=serves):
+                    retried.discard(retry_id)
+        except NotFound:
+            cursor.etags.pop(key, None)
+        except Exception:  # noqa: BLE001 - retry one facts comment without replaying feedback
+            logger.info("factory facts observation deferred reason=unreadable")
+        else:
+            cursor.etags.pop(key, None)
     listed, etag = await tracker.issue_comments_since(
         since_param(cursor.comments_since, now), cursor.etags.get("issue-comments")
     )
     if listed is None:
+        await facts.deliver_owed()
         return
     factory_issues = await _issue_numbers(sessionmaker, tracker) if serves else set()
     owned_pulls = set(
@@ -532,6 +560,23 @@ async def _admit_mentions(
     for comment in listed:
         if not isinstance(comment, dict):
             continue
+        body = comment.get("body")
+        if comment.get("id") in retried:
+            continue
+        if (
+            isinstance(body, str)
+            and REQUEST_MARKER in body
+            and trailing_id(comment.get("issue_url")) not in owned_pulls
+        ):
+            try:
+                if await facts.observe(tracker.facts_comment(comment), serves=serves):
+                    continue
+            except (Unavailable, FeedbackUnavailable):
+                comment_id = comment.get("id")
+                if type(comment_id) is int and comment_id > 0:
+                    cursor.etags[f"facts-retry:{comment_id}"] = "pending"
+                logger.info("factory facts observation deferred reason=unreadable")
+                continue
         if comment.get("performed_via_github_app") is not None:
             continue
         sender = human_actor({"user": comment.get("user")})
@@ -588,6 +633,7 @@ async def _admit_mentions(
             comment_body=body,
         )
         await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
+    await facts.deliver_owed()
     cursor.comments_since = advance(cursor.comments_since, listed, "created_at", "updated_at")
     if etag:
         cursor.etags["issue-comments"] = etag

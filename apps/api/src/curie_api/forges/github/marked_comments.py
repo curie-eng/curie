@@ -316,7 +316,7 @@ async def find_marker(
             )
         except httpx.HTTPError:
             return _MarkerScan(unavailable=True)
-        if listed.status_code in REFUSED_STATUSES:
+        if listed.status_code in REFUSED_STATUSES | {410}:
             return _MarkerScan(refusal=f"http_{listed.status_code}")
         if listed.status_code != 200:
             return _MarkerScan(unavailable=True)

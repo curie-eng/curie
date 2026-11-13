@@ -19,6 +19,7 @@ from curie_api.schemas.deployments import WebhookResult
 
 from ..config import get_settings
 from ..deps import EvalQueueDep, SessionDep, StoreDep
+from ..factory_facts_schema import InvalidFactsRequest, parse_request
 from ..gitflow import log_push_outcome, process_push, verify_signature
 from ..github_factory import handle_factory_delivery
 from ..github_factory_events import is_plain_issue
@@ -95,6 +96,16 @@ async def github_webhook(
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "webhook body is not valid JSON") from exc
+
+    if x_github_event == "issue_comment" and is_plain_issue(payload):
+        comment = payload.get("comment")
+        if isinstance(comment, dict) and isinstance(comment.get("body"), str):
+            try:
+                parse_request(comment["body"])
+            except InvalidFactsRequest:
+                pass
+            else:
+                return WebhookResult(status="ignored")
 
     if x_github_event == "issues" or (
         factory_enabled and x_github_event == "issue_comment" and is_plain_issue(payload)
