@@ -195,7 +195,7 @@ def _approve_diff(s: Any) -> _Admitted:
 
 
 def _publish(s: Any) -> dict[str, Any]:
-    decision: dict[str, Any] = s.pre(PUBLISH, {"title": "t", "body": "b"})
+    decision: dict[str, Any] = s.pre(PUBLISH, {"title": "t", "body": gate.VALID_PR_BODY})
     return decision
 
 
