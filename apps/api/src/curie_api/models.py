@@ -1387,6 +1387,9 @@ class ExecutionRequest(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    transcript_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -1622,6 +1625,36 @@ class ExecutionRequestPhaseReport(Base):
     reported_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.clock_timestamp()
     )
+
+
+class FactoryTranscriptEvent(Base):
+    """One immutable runner-visible event in a factory execution (#5608)."""
+
+    __tablename__ = "factory_transcript_events"
+    __table_args__ = (
+        UniqueConstraint("execution_request_id", "event_id", name="uq_factory_transcript_event_id"),
+        UniqueConstraint(
+            "execution_request_id", "boot_id", "sequence", name="uq_factory_transcript_sequence"
+        ),
+        Index("ix_factory_transcript_request_cursor", "execution_request_id", "id"),
+        Index("ix_factory_transcript_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    boot_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    sequence: Mapped[int] = mapped_column(Integer)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    kind: Mapped[str] = mapped_column(Text)
+    content: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    redacted: Mapped[bool] = mapped_column(default=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class FactorySlackThread(Base):

@@ -1345,6 +1345,9 @@ pub(crate) enum ClusterAction {
         /// Work item id to read. Omit to list.
         #[arg(value_name = "ID")]
         id: Option<String>,
+        /// Read a completed or running execution's retained transcript by request id.
+        #[arg(long, value_name = "REQUEST_ID", conflicts_with = "id")]
+        transcript: Option<String>,
         /// Scope to one agent (name or id).
         #[arg(long, value_name = "NAME_OR_ID")]
         agent: Option<String>,

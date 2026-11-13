@@ -25,6 +25,8 @@ from test_work_item_workspace import (  # noqa: E402
 
 PROGRESS_URL_ENV = "CURIE_PROGRESS_URL"
 PROGRESS_TOKEN_ENV = "CURIE_PROGRESS_TOKEN"
+TRANSCRIPT_URL_ENV = "CURIE_FACTORY_TRANSCRIPT_URL"
+TRANSCRIPT_TOKEN_ENV = "CURIE_FACTORY_TRANSCRIPT_TOKEN"
 
 
 def _claim_envs(h: object) -> list[dict[str, str]]:
@@ -48,6 +50,15 @@ def test_a_work_item_execution_claim_carries_a_request_bound_progress_token(
             env = envs[0]
             base = h.config.runner_facing_api_base_url.rstrip("/")
             assert env[PROGRESS_URL_ENV] == f"{base}/v1/work-item-progress/{request_id}"
+            assert env[TRANSCRIPT_URL_ENV] == (
+                f"{base}/v1/work-item-transcripts/{request_id}/events"
+            )
+            assert sandbox_token.verify(
+                env[TRANSCRIPT_TOKEN_ENV],
+                h.config.api_key,
+                agent=str(request_id),
+                scope="work_item.transcript.write",
+            )
             token = env[PROGRESS_TOKEN_ENV]
             assert sandbox_token.verify(
                 token, h.config.api_key, agent=str(request_id), scope="work_item.progress"
@@ -79,6 +90,8 @@ def test_an_ordinary_turn_carries_no_progress_env(make_harness) -> None:
             for env in _claim_envs(h):
                 assert PROGRESS_URL_ENV not in env
                 assert PROGRESS_TOKEN_ENV not in env
+                assert TRANSCRIPT_URL_ENV not in env
+                assert TRANSCRIPT_TOKEN_ENV not in env
 
     asyncio.run(exercise())
 

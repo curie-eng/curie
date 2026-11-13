@@ -173,6 +173,38 @@ fn route(path: &str) -> &str {
     path.split('?').next().unwrap()
 }
 
+#[test]
+fn cluster_transcript_downloads_every_page_by_request_id() {
+    let server = serve(move |request| {
+        if route(&request.path) != format!("/work-items/runs/{ITEM_ID}/transcript") {
+            return Response::json(500, "{}");
+        }
+        assert_eq!(request.header("x-api-key"), Some(TEST_API_KEY));
+        let page = if request.path.contains("after=0") {
+            json!({"status":"complete","events":[{"cursor":1,"content":{"text":"first"}}],"next_cursor":1,"gaps":[],"redacted":false,"expires_at":"2030-01-01T00:00:00Z"})
+        } else {
+            json!({"status":"complete","events":[{"cursor":2,"content":{"text":"second"}}],"next_cursor":null,"gaps":[],"redacted":false,"expires_at":"2030-01-01T00:00:00Z"})
+        };
+        Response::json(200, &page.to_string())
+    });
+    let output = run(&[
+        "cluster",
+        "work-items",
+        "--transcript",
+        ITEM_ID,
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        TEST_API_KEY,
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let body = one_object(&output);
+    assert_eq!(body["status"], "complete");
+    assert_eq!(body["events"].as_array().unwrap().len(), 2);
+    assert_eq!(body["events"][1]["content"]["text"], "second");
+}
+
 fn list_server(items: Vec<Value>) -> MockServer {
     let body = list_body(items, 200, false);
     serve(move |req| match route(&req.path) {

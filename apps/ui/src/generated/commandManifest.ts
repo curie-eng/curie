@@ -8099,6 +8099,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Read a completed or running execution's retained transcript by request id",
+              "id": "transcript",
+              "long": "transcript",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Scope to one agent (name or id)",
               "id": "agent",
               "long": "agent",

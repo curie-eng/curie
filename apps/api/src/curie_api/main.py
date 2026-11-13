@@ -46,6 +46,7 @@ from .db import (
     create_source_gate_engine,
 )
 from .evalqueue import EvalQueue
+from .factory_transcripts import run_retention_sweeper
 from .forges.registry import forges_registry
 from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
@@ -92,6 +93,7 @@ from .routers import (
     evals,
     factory_slack,
     factory_status,
+    factory_transcripts,
     forge_credential_health,
     gitflow_routing,
     github,
@@ -283,6 +285,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.custody_store = custody_store.build_custody_secret_store(settings)
     app.state.personal_custody_reconciler_task = start_personal_custody_reconciler(
         app.state.sessionmaker, settings, app.state.custody_store
+    )
+    transcript_sweeper_stop = asyncio.Event()
+    app.state.transcript_sweeper_task = asyncio.create_task(
+        run_retention_sweeper(app.state.sessionmaker, transcript_sweeper_stop)
     )
     app.state.rollout_hold = rollout_hold.build_rollout_hold(settings)
     rollout_hold.install(app.state.rollout_hold)
@@ -476,6 +482,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await asyncio.wait_for(app.state.sweeper_task, 5.0)
                 except (TimeoutError, asyncio.CancelledError):
                     pass
+            transcript_sweeper_stop.set()
+            try:
+                await asyncio.wait_for(app.state.transcript_sweeper_task, 5.0)
+            except (TimeoutError, asyncio.CancelledError):
+                pass
             # Read-only, so simply cancel it before closing valkey.
             watcher_task = getattr(app.state, "graveyard_watcher_task", None)
             if watcher_task is not None:
@@ -759,6 +770,7 @@ def create_app(
     app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
     app.include_router(factory_status.router)
+    app.include_router(factory_transcripts.router)
     app.include_router(forge_credential_health.router)
     app.include_router(turn_progress.router)
     app.include_router(work_item_outcomes.router)

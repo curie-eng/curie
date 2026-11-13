@@ -1523,6 +1523,10 @@ api:
   # Applied once per publication revision using a 30-day Valkey success marker.
   # Best effort: forge or Valkey errors preserve the publication.
   factoryPublicationLabels: {}
+  # Factory execution transcripts are retained from request creation for this
+  # many days. The API fixes each request's expiry at its first captured event;
+  # changing this value does not rewrite existing archives.
+  factoryTranscriptRetentionDays: 30
   # BYO secret (issue #1759, the same idiom githubAppExistingSecret below
   # uses). Wins over githubToken when set. A plain `curie cluster up`
   # preserves the reference and key; an explicit inline replacement or

@@ -79,6 +79,11 @@ from .connectors import (
     upload_endpoints,
 )
 from .executor import EXECUTOR_MODE, RUNNER_MODE_ENV
+from .factory_transcript import (
+    TRANSCRIPT_TOKEN_ENV,
+    TRANSCRIPT_URL_ENV,
+    FactoryTranscriptRecorder,
+)
 from .fake import FakeModelSession
 from .harness.claude.approval import (
     build_approval_hook,
@@ -798,6 +803,19 @@ def build_runner(
     ``DEFAULT_GUIDANCE``), both loaded at boot (#1461).
     """
 
+    transcript_url = os.environ.pop(TRANSCRIPT_URL_ENV, None)
+    transcript_token = os.environ.pop(TRANSCRIPT_TOKEN_ENV, None)
+    if sdk_env is not None:
+        sdk_env.pop(TRANSCRIPT_URL_ENV, None)
+        sdk_env.pop(TRANSCRIPT_TOKEN_ENV, None)
+    factory_transcript = (
+        FactoryTranscriptRecorder(transcript_url, transcript_token)
+        if transcript_url is not None and transcript_token is not None
+        else None
+    )
+    if (transcript_url is None) != (transcript_token is None):
+        raise ValueError("factory transcript URL and token must be provided together")
+
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
     # single source for the read-only tool classification and how a bundle
     # compiles into session inputs, replacing the direct module imports these
@@ -1131,6 +1149,9 @@ def build_runner(
         connector_names=declared_secret_names(config.session.plugin_dir),
         server_groups=(bundle_servers, derived_mcp_servers),
     )
+    if transcript_token is not None:
+        held_secrets = held_secrets | frozenset((transcript_token,))
+        register_held_secrets((transcript_token,))
     # Before any header is materialized: the hosted-header channel (#5378)
     # relays exactly the values only this process will hold.
     derived_headers = derived_header_placeholders(derived_mcp_servers)
@@ -1554,6 +1575,7 @@ def build_runner(
             model=config.model,
             memory_store=memory_store,
             history_store=history_store,
+            factory_transcript=factory_transcript,
             approval_gate=approval_gate,
             approval_resumed_kind=config.approval_resumed_kind,
             approval_decision=config.approval_decision,
