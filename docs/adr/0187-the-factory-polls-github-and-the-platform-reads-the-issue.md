@@ -29,6 +29,11 @@ carrying "the configured label". It lists once per effective trigger label
 bound on the repository, under the ETag key `issues:<label>`. Everything else
 in this ADR stands.
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Adds the delegated-selection provenance path alongside tracker observations;
+scoped reads and credential custody are preserved.
+
 Accepted with explicit maintainer approval on 2026-10-01 (Brian Conn),
 alongside implementation under ADR 0102.
 

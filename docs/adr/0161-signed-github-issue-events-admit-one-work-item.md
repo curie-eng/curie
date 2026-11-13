@@ -17,6 +17,11 @@ trigger label, or serves the tracker's configured label when it has none, and
 a removed label cancels a WorkItem only when it is the label stored as having
 admitted it. Everything else in this ADR stands.
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Adds the single internal delegated-selection exception to the human-event
+admission authority, while retaining bot/App event rejection.
+
 Partially amends
 [ADR 0145](0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md).
 The tracker remains the backlog. Curie still does not copy issue bodies.

@@ -297,5 +297,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0274 | [A declared webhook wake skips overlap until the next poll](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md) | Accepted |
 | 0275 | [A channel gateway owns provider authentication and I/O](0275-channel-gateway-provider-boundary.md) | Accepted |
 | 0276 | [Static shells share capacity and receive agent inputs per claim](0276-static-shells-share-capacity-and-receive-agent-inputs-per-claim.md) | Accepted |
+| 0277 | [Factory triage publishes tickets before implementation admission](0277-factory-triage-publishes-tickets-before-implementation-admission.md) | Accepted |
 | 0278 | [Requester coding instructions are pinned preferences below repository rules](0278-requester-coding-instructions.md) | Draft |
 <!-- END GENERATED: adr-index -->
