@@ -51,9 +51,9 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # and the factory Slack progress loop reads the 0157 tables. GitHub host
     # namespaces require 0158. Execution owner reads require 0159, personal
     # custody reads and enrollment fences require 0160, and agent version reads
-    # select the 0162 result policy columns. Factory CI observations require
-    # the 0163 table.
-    assert window == {"schema_min": "0163", "schema_head": "0163"}
+    # select the 0162 result policy columns. Cached facts and request delivery
+    # require the 0166 tables.
+    assert window == {"schema_min": "0166", "schema_head": "0166"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -129,6 +129,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0160",
         "0162",
         "0163",
+        "0166",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -168,7 +169,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0159"] == "expand"
     assert kinds["0160"] == "expand"
     assert kinds["0162"] == "expand"
-    assert kinds["0163"] == "expand"
+    assert kinds["0166"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -197,7 +198,7 @@ def _release_key(version: str) -> tuple[int, int, int, int, int]:
     return int(major), int(minor), int(patch), int(rc is None), int(rc or 0)
 
 
-def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
+def test_released_0076_startup_refuses_without_migrating_then_candidate_starts(
     isolated_migration_db: IsolatedMigrationDb, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
@@ -226,7 +227,7 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
                 pass
         assert current_revision() == "0100"
         command.upgrade(alembic_config(), load_window().schema_head)
-        assert current_revision() == load_window().schema_head
+        assert current_revision() == "0166"
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200
@@ -267,7 +268,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0163"
+    assert current_revision() == "0166"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]

@@ -83,6 +83,7 @@ from curie_api.forges.types import (
     valid_output_identity,
 )
 from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_login
+from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable
 from curie_api.github_review_truth import verify_sender_write_permission
 from curie_api.repo_full_name import repo_url_path
 
@@ -301,6 +302,42 @@ class GitHubTracker:
     @property
     def marked_comments(self) -> GitHubMarkedComments:
         return self._comments
+
+    async def read_comment(self, comment_id: int) -> dict[str, Any]:
+        """Re-read request content and provenance through the installation credential."""
+        value = await self._get(f"{self._repo_path}/issues/comments/{comment_id}")
+        if not isinstance(value, dict) or value.get("id") != comment_id:
+            raise Unavailable("comment")
+        return value
+
+    async def facts_issue_is_plain(self, number: int) -> bool:
+        try:
+            issue = await self._get(f"{self._repo_path}/issues/{number}")
+        except (NotFound, Unauthorized):
+            raise Unavailable("issue") from None
+        if (
+            not isinstance(issue, dict)
+            or type(issue.get("number")) is not int
+            or issue["number"] != number
+        ):
+            raise Unavailable("issue")
+        return "pull_request" not in issue
+
+    async def verify_facts_writer(self, actor_id: int, login: str) -> None:
+        """Reuse admission's immutable-user effective write permission check."""
+        try:
+            await verify_sender_write_permission(
+                self._client,
+                api=self._api,
+                token=await self._token(),
+                repo_path=self._repo_path,
+                sender_id=actor_id,
+                sender_login=login,
+            )
+        except FeedbackIgnored as exc:
+            if exc.code == "sender_permission_unavailable":
+                raise FeedbackUnavailable(exc.code) from None
+            raise
 
     def issue(self, number: int) -> TrackerIssueRef:
         return TrackerIssueRef(GITHUB, self.host, str(self.repository_id), str(number))

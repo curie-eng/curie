@@ -52,6 +52,8 @@ from curie_api.factory_label_reconcile import (
 
 from . import github_factory
 from .config import Settings
+from .factory_facts_exchange import FactsExchange
+from .factory_facts_schema import REQUEST_MARKER
 from .forges.errors import Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND
 from .forges.github.comments import static_token
@@ -508,10 +510,14 @@ async def _admit_mentions(
     repository."""
 
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
+    facts = FactsExchange(sessionmaker, settings, tracker)
+    if serves:
+        await facts.recover_owed()
     listed, etag = await tracker.issue_comments_since(
         since_param(cursor.comments_since, now), cursor.etags.get("issue-comments")
     )
     if listed is None:
+        await facts.deliver_owed()
         return
     factory_issues = await _issue_numbers(sessionmaker, tracker) if serves else set()
     owned_pulls = set(
@@ -519,8 +525,18 @@ async def _admit_mentions(
             sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
         )
     )
+    facts_deferred = False
     for comment in listed:
         if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        if isinstance(body, str) and REQUEST_MARKER in body:
+            if trailing_id(comment.get("issue_url")) not in owned_pulls:
+                try:
+                    await facts.observe(comment, serves=serves)
+                except (Unavailable, FeedbackUnavailable):
+                    facts_deferred = True
+                    logger.info("factory facts observation deferred reason=unreadable")
             continue
         if comment.get("performed_via_github_app") is not None:
             continue
@@ -578,6 +594,10 @@ async def _admit_mentions(
             comment_body=body,
         )
         await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
+    await facts.deliver_owed()
+    if facts_deferred:
+        cursor.etags.pop("issue-comments", None)
+        return
     cursor.comments_since = advance(cursor.comments_since, listed, "created_at", "updated_at")
     if etag:
         cursor.etags["issue-comments"] = etag

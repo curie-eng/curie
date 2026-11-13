@@ -52,6 +52,7 @@ from _migration_support import (  # noqa: E402
     alembic_config,
     render_url,
 )
+from forge_fakes.facts import facts_world  # noqa: E402, F401
 from identity_fence_support import (  # noqa: E402
     fence_key_for_worker,
     installed_fence_key,

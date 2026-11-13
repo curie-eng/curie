@@ -300,4 +300,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0277 | [Factory triage publishes tickets before implementation admission](0277-factory-triage-publishes-tickets-before-implementation-admission.md) | Accepted |
 | 0278 | [Requester coding instructions are pinned preferences below repository rules](0278-requester-coding-instructions.md) | Draft |
 | 0279 | [A person acting through a GitHub App can select factory work, and refused trigger labels are answered on the issue](0279-a-person-acting-through-a-github-app-can-select-factory-work.md) | Accepted |
+| 0280 | [A repository writer can ask the factory for facts on the ticket, and facts are never admission](0280-a-repository-writer-can-ask-the-factory-for-facts-on-the-ticket.md) | Accepted |
 <!-- END GENERATED: adr-index -->

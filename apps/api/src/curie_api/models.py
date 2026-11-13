@@ -5122,3 +5122,54 @@ class WorkspaceRecoveryReader(Base):
     checkpoint_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
     holder_id: Mapped[str] = mapped_column(String(256))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class FactoryFactObservation(Base):
+    __tablename__ = "factory_fact_observations"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('tool', 'model_credit')", name="factory_fact_observation_kind_ck"
+        ),
+        CheckConstraint(
+            "subject_digest ~ '^sha256:[0-9a-f]{64}$'", name="factory_fact_observation_digest_ck"
+        ),
+        {"schema": SCHEMA},
+    )
+
+    kind: Mapped[str] = mapped_column(Text, primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), primary_key=True
+    )
+    scope: Mapped[str] = mapped_column(Text, primary_key=True)
+    item: Mapped[str] = mapped_column(Text, primary_key=True)
+    subject_digest: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str | None] = mapped_column(Text)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class FactoryFactsRequest(Base):
+    __tablename__ = "factory_facts_requests"
+    __table_args__ = (
+        CheckConstraint("state IN ('owed', 'answered')", name="factory_facts_request_state_ck"),
+        Index(
+            "ix_factory_facts_actor_window",
+            "tracker_host",
+            "repository_id",
+            "actor_id",
+            "answered_at",
+        ),
+        {"schema": SCHEMA},
+    )
+
+    tracker_host: Mapped[str] = mapped_column(Text, primary_key=True)
+    repository_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    issue_number: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    trigger_label: Mapped[str] = mapped_column(Text, primary_key=True)
+    request_comment_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    digest: Mapped[str] = mapped_column(Text)
+    actor_id: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, default="owed")
+    answer_comment_id: Mapped[str | None] = mapped_column(Text, default=None)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

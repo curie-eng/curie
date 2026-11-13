@@ -6668,6 +6668,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "scripted",
         help="kind-rung factory scenario with the GitHub stub and a scripted model",
     )
+    scripted.add_argument("--scenario", choices=("publication", "facts"), default="publication")
     scripted.add_argument(
         "--transcript",
         type=Path,

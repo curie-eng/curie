@@ -58,6 +58,86 @@ def test_missing_replay_transcript_refuses_before_resource_mutation(
     assert "transcript" in capsys.readouterr().err.lower()
 
 
+def test_facts_configuration_needs_no_model_transcript(tmp_path: Path) -> None:
+    args = fe.parse_args(
+        ["scripted", "--scenario", "facts", "--transcript", str(tmp_path / "missing.json")]
+    )
+    sk.validate_configuration(args)
+    assert sk.ScriptedRun(args).model is None
+
+
+def test_facts_recording_refuses_before_resource_mutation(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    args = fe.parse_args(["scripted", "--scenario", "facts", "--record"])
+    assert sk.main(args) == fe.EXIT_CONFIG
+    assert "never records" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("violation", [None, "admission", "request", "tool", "route"])
+def test_facts_scenario_executes_assertions_and_refuses_violations(
+    tmp_path: Path, violation: str | None
+) -> None:
+    import copy
+    import types
+
+    sample = json.loads((REPO_ROOT / "tests/vectors/factory-facts-v1.examples.json").read_text())[0]
+    sample["label_route"]["route"] = "github_user_via_app"
+    sample["request"]["comment_id"] = "4"
+    if violation == "admission":
+        sample["admission"] = "requested"
+    if violation == "request":
+        sample["request"]["comment_id"] = "3"
+    if violation == "tool":
+        sample["executables"][0]["state"] = "present"
+    if violation == "route":
+        sample["label_route"]["route"] = "github_user"
+    args = fe.parse_args(["scripted", "--scenario", "facts"])
+    driver = sk.ScriptedRun(args)
+    calls: list[Any] = []
+
+    class Stub:
+        request_log: list[Any] = []
+
+        def __init__(self) -> None:
+            self.rows: list[dict[str, Any]] = []
+
+        def add_issue_comment(
+            self, number: int, body: str, *, author: Any, app: Any = None
+        ) -> dict[str, Any]:
+            row = {"id": len(self.rows) + 1}
+            self.rows.append(row)
+            return row
+
+    def kubectl(*args: Any, **kwargs: Any) -> str:
+        calls.append(args)
+        return '{"items":[]}'
+
+    def api(method: str, path: str, body: Any = None) -> Any:
+        calls.append((method, path))
+        return {"items": []}
+
+    def wait(request: str) -> dict[str, Any]:
+        calls.append(("wait", request))
+        return copy.deepcopy(sample)
+
+    driver.stub = Stub()
+    driver.kubectl = kubectl
+    driver.facts_api = api
+    driver.wait_facts = wait
+    driver.sql = lambda query: {"work_items": 0, "execution_requests": 0, "deliveries": 2}
+    github = types.SimpleNamespace(HUMAN={"type": "User"}, BOT={"type": "Bot"})
+    if violation is None:
+        driver.run_facts(github)
+        assert driver.evidence["model_requests"] == []
+        assert driver.evidence["api_work_items"] == driver.evidence["api_execution_requests"] == 0
+        assert any("restart" in call for call in calls)
+    else:
+        with pytest.raises(sk.ScriptedScenarioError):
+            driver.run_facts(github)
+
+
 def test_record_without_upstream_key_refuses_before_resource_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
