@@ -93,6 +93,17 @@ spec:
                   name: {{ include "curie.secretName" $ }}
                   key: {{ printf "channelGateway%sToken" (title $caller) }}
             {{- end }}
+            {{- with $gateway.identityLookup.existingSecret }}
+            # Optional identity caller: an external HTTP identity provider that
+            # may only ask which email belongs to a Slack user.
+            - name: CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ required "channelGateway.identityLookup.tokenKey must name the Secret key that holds the identity caller credential" $gateway.identityLookup.tokenKey | quote }}
+            - name: CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S
+              value: {{ $gateway.identityLookup.timeoutSeconds | quote }}
+            {{- end }}
             {{- if $tlsSecret }}
             - name: CURIE_CHANNEL_GATEWAY_TLS_CERT
               value: /var/run/gateway-tls/tls.crt

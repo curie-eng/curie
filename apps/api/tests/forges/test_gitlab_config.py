@@ -94,6 +94,7 @@ def test_the_declared_capabilities_follow_decisions_14_and_19() -> None:
         Operation.LINK_PULL_REQUEST: Support.NOOP,
         Operation.DEPENDENCIES: Support.NOOP,
         Operation.GROUP_MEMBERSHIP: Support.UNSUPPORTED,
+        Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
     }
     assert dict(code_host.capabilities) == {
         **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),

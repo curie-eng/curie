@@ -10276,6 +10276,32 @@ export const commandManifest = {
       "name": "factory",
       "subcommands": [
         {
+          "about": "Read the factory pull requests that record why a GitHub issue changed",
+          "args": [
+            {
+              "global": false,
+              "help": "GitHub issue, as owner/repo#number or a github.com issue URL",
+              "id": "reference",
+              "positional": true,
+              "required": true
+            },
+            {
+              "default_values": [
+                "https://api.github.com"
+              ],
+              "global": false,
+              "help": "GitHub API root. Any host other than api.github.com is passed to `gh auth token --hostname`",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read the factory pull requests that record why a GitHub issue changed.\n\nISSUE is owner/repo#number or a github.com issue URL. Login is GH_TOKEN, then GITHUB_TOKEN, then `gh auth token`. This command never reads the Curie platform key.",
+          "name": "explain"
+        },
+        {
           "about": "Install the local Software Factory preparation, review, and admin skills",
           "hidden": false,
           "name": "skills",

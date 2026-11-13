@@ -56,6 +56,7 @@ from curie_api.e2e_connector import (
     pin_server_command,
     prepare_connectors,
 )
+from curie_api.tracker_result_declaration import declaration_issues
 
 # Re-exported so existing catchers (gitflow.py, routers/bundles.py, tests) keep
 # resolving ``bundles.UnsupportedArchive`` after the extraction logic moved to
@@ -135,10 +136,14 @@ def extract_and_validate(
     # runner meeting a new bundle is "will not start", never "starts unfenced".
     root = bundle_root(dest)
     result = validate_bundle(root, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
-    custody = sealing_key_custody_issues(root)
-    if custody:
+    # API-only issues on top of the frozen package: sealing key custody, then
+    # the tracker result declaration (ADR 0277, #5585). A malformed
+    # `workflow/result.json` is a validation error here, so it reports its own
+    # codes before `deploy.validate_archive` refuses a valid one.
+    extra = [*sealing_key_custody_issues(root), *declaration_issues(root)]
+    if extra:
         result = ValidationResult(
-            valid=False, errors=[*result.errors, *custody], warnings=result.warnings
+            valid=False, errors=[*result.errors, *extra], warnings=result.warnings
         )
     return extension, content_type, result
 

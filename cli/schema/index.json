@@ -181,7 +181,7 @@
       "result": "EvalOutput",
       "kind": "CliOutput",
       "schema": "eval.schema.json",
-      "version": "1.3"
+      "version": "1.4"
     },
     {
       "result": "FactoryAppRegistrationOutput",
@@ -194,6 +194,12 @@
       "kind": "CliOutput",
       "schema": "factory.schema.json",
       "version": "2.0"
+    },
+    {
+      "result": "FactoryExplainOutput",
+      "kind": "CliOutput",
+      "schema": "factory-explain.schema.json",
+      "version": "1.0"
     },
     {
       "result": "FactoryIntakeOutput",
@@ -505,7 +511,7 @@
       "result": "eval_json",
       "kind": "builder",
       "schema": "eval.schema.json",
-      "version": "1.3"
+      "version": "1.4"
     },
     {
       "result": "message_awaiting_approval_json",

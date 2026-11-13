@@ -258,6 +258,12 @@ class Settings(BaseSettings):
     langfuse_host: str = "http://localhost:23000"
     langfuse_public_key: str = "pk-lf-curie-dev"
     langfuse_secret_key: str = "sk-lf-curie-dev"
+    # Which Langfuse read API generation to call. "v3" uses the legacy traces /
+    # observations / metrics endpoints (the compose and chart pin, and every
+    # self-hosted v3). "v4" uses Observations API v2 and Metrics API v2, the
+    # only read path on Langfuse Cloud from 2026-11-16, when Langfuse removes the
+    # legacy read APIs there.
+    langfuse_api_version: Literal["v3", "v4"] = "v3"
 
     # RustFS / S3 for immutable plugin bundles (compose stack RustFS on 29000).
     # The credentials default to EMPTY on purpose (#1559): an empty credential
@@ -671,6 +677,15 @@ class Settings(BaseSettings):
             "CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS",
             "WORK_ITEM_BACKOFF_MAX_SECONDS",
         ),
+    )
+    # How long a sealed tracker result stays owed after submission before it is
+    # recorded failed (ADR 0277, #5585). Read only by
+    # `factory_tracker_result_delivery.submit_result`; an int, so finite.
+    factory_tracker_result_delivery_deadline_seconds: int = Field(
+        default=900,
+        gt=0,
+        le=86400,
+        validation_alias=AliasChoices("CURIE_FACTORY_TRACKER_RESULT_DELIVERY_DEADLINE_SECONDS"),
     )
     work_item_start_deferral_limit: int = Field(
         default=5,

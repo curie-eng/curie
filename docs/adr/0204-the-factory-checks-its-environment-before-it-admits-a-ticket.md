@@ -4,6 +4,11 @@ Date: 2026-10-06
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Its pre-allocation requirements are explicitly deferred for this launch surface
+until the named shared checks ship.
+
 Accepted 2026-10-06 with explicit maintainer approval from Brian Conn
 (TheConnMan), given after the Draft merged in
 [#4106](https://github.com/curie-eng/curie/pull/4106).

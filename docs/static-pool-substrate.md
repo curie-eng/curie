@@ -281,8 +281,14 @@ credential must be common to every agent served by that shell. The supervisor
 runs as root and the runner child runs as an
 unprivileged uid, so the child cannot read the supervisor's environment,
 certificate key or other claims' directories. The runner bearer is per claim
-and must differ from the control credential. Each claim gets a new directory,
-`HOME` and `TMPDIR`. Bundle code and its immutable plugin templates are delivered
+and must differ from the control credential. Each claim gets a freshly created
+directory, `HOME` and `TMPDIR`. Every claim uses the same path for them
+(`<state root>/claims/active`), so a call approved before an approval pause
+names the same file when it runs after the cold resume. A shell holds one claim
+at a time and admits the next only after it removed the previous tree and
+stopped every process the child left, and the directory is created exclusively,
+so a leftover tree refuses the stage and quarantines the shell instead of being
+reused. Bundle code and its immutable plugin templates are delivered
 per claim, remain root-owned and read only, and retain executable permissions
 where needed. The runner cannot write them or chmod them. Mutable runtime
 configuration and credentials use a separate runner-owned `0400` bootstrap
@@ -402,7 +408,7 @@ Valkey and real supervisors. `apps/worker/tests/sandbox/test_static_qualificatio
 runs real supervisors with the real runner on the fake model through the
 substrate and the runner client: a first turn, a follow-up on the retained
 route, an approval pause and cold resume on a recycled shell with the same
-history, refusal of the paused claim's route and bearer, a worker restart in
+history, an approved `Write` that runs exactly once after that resume, refusal of the paused claim's route and bearer, a worker restart in
 the middle of a turn, pool exhaustion and cleanup. It also builds a claim's
 environment with the worker's static connector binding and proves the
 connector endpoints, caller token, agent name and the shell's connector CA

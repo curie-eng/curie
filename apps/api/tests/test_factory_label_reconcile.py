@@ -27,7 +27,13 @@ from curie_api.factory_label_reconcile import reconcile_missed_labels
 from curie_api.github_app import GitHubInstallationRefused
 from curie_api.main import create_app
 from fastapi.testclient import TestClient
-from forge_fakes.github import factory_env, fake_installation_tokens
+from forge_fakes.github import (
+    LABEL_ACTOR_PERMISSIONS,
+    LABEL_ACTOR_REFUSAL_IDS,
+    LABEL_ACTOR_REFUSALS,
+    factory_env,
+    fake_installation_tokens,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -46,6 +52,11 @@ class GitHubAPI:
     def __init__(self) -> None:
         self.open_issues: dict[int, datetime] = {}
         self.permission = "write"
+        self.label_actor: Any = {"id": SENDER_ID, "login": SENDER, "type": "User"}
+        self.label_app: Any = None
+        self.permission_status = 200
+        self.role_name = "write"
+        self.permission_user_id = SENDER_ID
         # Older events that precede the labeled event, and a newer relabel.
         self.padding_events = 0
         self.relabel_by_bot = False
@@ -101,8 +112,8 @@ class GitHubAPI:
                     "label": {"name": LABEL},
                     "actor": {"id": 42, "login": "some-bot[bot]", "type": "Bot"}
                     if self.relabel_by_bot
-                    else human,
-                    "performed_via_github_app": None,
+                    else self.label_actor,
+                    "performed_via_github_app": self.label_app,
                     "created_at": labeled_at,
                 }
             )
@@ -124,8 +135,12 @@ class GitHubAPI:
             return httpx.Response(200, json=[])
         if path == f"/repos/{REPO}/collaborators/{SENDER}/permission":
             return httpx.Response(
-                200,
-                json={"permission": self.permission, "user": {"id": SENDER_ID, "login": SENDER}},
+                self.permission_status,
+                json={
+                    "permission": self.permission,
+                    "role_name": self.role_name,
+                    "user": {"id": self.permission_user_id, "login": SENDER},
+                },
             )
         return httpx.Response(404, json={"message": "missing fixture"})
 
@@ -306,3 +321,79 @@ def test_a_newer_bot_relabel_on_a_later_event_page_is_not_admitted(
     assert _reconcile(github) == 0
 
     assert _requests(number) == []
+
+
+# GitHub User-with-App attribution replays the same recorded shape and provider
+# references as test_github_factory_ingress.py (#5510 and #4485).
+@pytest.mark.parametrize("app", [None, {"id": 52}])
+def test_label_actor_admission(
+    factory: tuple[TestClient, GitHubAPI], app: dict[str, Any] | None
+) -> None:
+    _client, github = factory
+    github.label_app = app
+    number = next(_ISSUES)
+    github.label(number, age=timedelta(minutes=30))
+    assert _reconcile(github) == 1
+    assert _reconcile(github) == 0
+    assert [r["requester"] for r in _requests(number)] == [f"github:{SENDER_ID}:{SENDER}"]
+
+
+@pytest.mark.parametrize("permission", LABEL_ACTOR_PERMISSIONS)
+def test_label_actor_permission(factory: tuple[TestClient, GitHubAPI], permission: str) -> None:
+    _client, github = factory
+    github.label_app = {"id": 52}
+    github.permission = "write" if permission == "maintain" else permission
+    github.role_name = permission
+    number = next(_ISSUES)
+    github.label(number, age=timedelta(minutes=30))
+    admits = int(permission in {"write", "maintain", "admin"})
+    assert _reconcile(github) == admits
+    assert len(_requests(number)) == admits
+
+
+def test_label_actor_permission_retry(factory: tuple[TestClient, GitHubAPI]) -> None:
+    _client, github = factory
+    github.label_app, github.permission_status = {"id": 52}, 500
+    number = next(_ISSUES)
+    github.label(number, age=timedelta(minutes=30))
+    assert _reconcile(github) == 0
+    assert _requests(number) == []
+    github.permission_status = 200
+    assert _reconcile(github) == 1
+    assert len(_requests(number)) == 1
+
+
+@pytest.mark.parametrize("actor,app,reason", LABEL_ACTOR_REFUSALS, ids=LABEL_ACTOR_REFUSAL_IDS)
+def test_label_actor_own_app_bot_or_unverifiable(
+    factory: tuple[TestClient, GitHubAPI],
+    actor: Any,
+    app: Any,
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="curie_api.factory_label_reconcile")
+    _client, github = factory
+    github.label_actor, github.label_app = actor, app
+    number = next(_ISSUES)
+    github.label(number, age=timedelta(minutes=30))
+    assert _reconcile(github) == 0
+    assert _requests(number) == []
+    assert (REPO, number, reason) in [
+        record.args
+        for record in caplog.records
+        if record.name == "curie_api.factory_label_reconcile"
+    ]
+    github.label_actor = {"id": SENDER_ID, "login": SENDER, "type": "User"}
+    github.label_app = {"id": 52}
+    assert _reconcile(github) == 1
+    assert len(_requests(number)) == 1
+
+
+def test_label_actor_permission_identity_mismatch(factory: tuple[TestClient, GitHubAPI]) -> None:
+    _client, github = factory
+    github.label_app, github.permission_user_id = {"id": 52}, SENDER_ID + 1
+    number = next(_ISSUES)
+    github.label(number, age=timedelta(minutes=30))
+    assert _reconcile(github) == 0
+    github.permission_user_id = SENDER_ID
+    assert _reconcile(github) == 1

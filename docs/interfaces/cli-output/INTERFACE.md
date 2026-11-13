@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 81 outputs behind one trait
+impls: 82 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 81 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 82 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -66,7 +66,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-81 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+82 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 `MigrationOutput` in `cli/src/process_migrate.rs` reports the completed offline
 protected-process migration as one JSON object or a human confirmation.
@@ -96,6 +96,7 @@ protected-process migration as one JSON object or a human confirmation.
   it emits one object even when the bundle declares nothing to build, because
   under `--json` an agent cannot tell "nothing to build" from "the command
   produced nothing" — the #485 failure this seam exists to prevent.
+  `FactoryExplainOutput` (`cli/src/commands/factory_explain.rs`) is the `curie factory explain` receipt: the issue and each matching factory pull request.
   `TestEnvOutput` (`cli/src/commands/dev.rs`) is the `curie dev test-env`
   receipt: the profile and private project, resolved `ports` and `networks`,
   `child_exit_code` (or `null` when no child started), and `cleanup_verified`.
@@ -151,10 +152,10 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   result. This syntactic inventory does not prove that every verb returns a
   `CliOutput` or honors the one-object JSON contract.
 2. **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 81 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 82 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 85 tests in `cli/tests/json_contract.rs`.
+  against real `to_json()` output across 86 tests in `cli/tests/json_contract.rs`.
   The dark factory render receipt uses schema version 2. Its `runner_image`
   and `runner_note` fields are required and accept a string or `null`; the
   binary render tests validate the actual receipt against the committed schema.

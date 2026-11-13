@@ -818,7 +818,7 @@ def test_in_progress_pytest_shards_keep_waiting_for_the_aggregate() -> None:
     )
 
     assert verdict.kind == "pending"
-    assert verdict.reason == "required_python_ci_missing"
+    assert verdict.reason == "required_python_aggregate_waiting_on_shards"
     assert "Conversion batch 1/3)" in _names(verdict.pending)
     assert verdict.kind != "unverified"
 
@@ -833,7 +833,7 @@ def test_a_later_round_still_waits_while_pytest_shards_are_in_progress() -> None
     )
 
     assert verdict.kind == "pending"
-    assert verdict.reason == "required_python_ci_missing"
+    assert verdict.reason == "required_python_aggregate_waiting_on_shards"
 
 
 def test_a_pending_status_keeps_the_missing_python_aggregate_waiting() -> None:
@@ -911,8 +911,8 @@ def test_a_missing_python_aggregate_is_unverified_at_the_ci_deadline() -> None:
         python_ci=conversion_python_ci(),
     )
 
-    assert verdict.kind == "unverified"
-    assert verdict.reason == "required_python_ci_unrelated"
+    assert verdict.kind == "timed_out"
+    assert verdict.reason == "required_python_aggregate_waiting_on_shards"
     assert "Conversion batch 1/3)" in _names(verdict.pending)
 
 
@@ -926,8 +926,121 @@ def test_the_execution_deadline_ends_a_missing_python_aggregate() -> None:
         execution_deadline=early,
     )
 
+    assert verdict.kind == "timed_out"
+    assert verdict.reason == "required_python_aggregate_waiting_on_shards"
+    assert "Conversion batch 1/3)" in _names(verdict.pending)
+
+
+def _running_shard(status: str) -> dict[str, Any]:
+    return _actions_run("Conversion batch 1/3)", status=status, conclusion=None, run_id=1)
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress"])
+@pytest.mark.parametrize(
+    "changed_paths",
+    [[_PYTHON_PATH], ["README.md"]],
+    ids=["python-path", "other-path"],
+)
+def test_required_python_aggregate_waits_for_running_shards(
+    status: str, changed_paths: list[str]
+) -> None:
+    """#5276: a required aggregate still waiting on a shard times out, it does not
+    claim the aggregate never started. A non-Python change is the same case."""
+
+    detail = _detail(_running_shard(status), _actions_run("Conversion secret scan", run_id=2))
+    paths = {
+        "changed_paths": changed_paths,
+        "python_ci": conversion_python_ci(),
+        "host_required_checks": (_PYTHON_AGGREGATE,),
+    }
+    before_ci = _decide(detail, 1199, **paths)
+    at_ci = _decide(detail, 1200, **paths)
+    early = PUBLISHED + timedelta(seconds=200)
+    before_execution = _decide(detail, 199, execution_deadline=early, **paths)
+    at_execution = _decide(detail, 200, execution_deadline=early, **paths)
+
+    for verdict in (before_ci, before_execution):
+        assert verdict.kind == "pending"
+        assert verdict.reason == "required_python_aggregate_waiting_on_shards"
+        assert verdict.note is None
+    for verdict in (at_ci, at_execution):
+        assert verdict.kind == "timed_out"
+        assert verdict.reason == "required_python_aggregate_waiting_on_shards"
+        assert verdict.note is None
+    for verdict in (before_ci, at_ci, before_execution, at_execution):
+        assert "for example a label" not in (verdict.note or "")
+        assert "never started" not in (verdict.note or "")
+        named = [
+            item
+            for item in verdict.pending
+            if item.get("name") == "Conversion batch 1/3)" and item.get("status") == status
+        ]
+        assert named
+
+
+def test_required_checks_missing_python_aggregate_with_another_check_stays_absent() -> None:
+    verdict = _decide(
+        _detail(*_pytest_shards()),
+        1200,
+        changed_paths=[_PYTHON_PATH],
+        python_ci=conversion_python_ci(),
+        host_required_checks=(_PYTHON_AGGREGATE, "label-gate"),
+    )
+
     assert verdict.kind == "unverified"
-    assert verdict.reason == "required_python_ci_unrelated"
+    assert verdict.reason == "required_check_absent"
+    assert verdict.note is not None
+    assert "label-gate" in verdict.note
+    assert "for example a label" in verdict.note
+
+
+@pytest.mark.parametrize("changed_paths", [[_PYTHON_PATH], ["README.md"]])
+def test_required_checks_missing_python_aggregate_after_shards_finish_stays_absent(
+    changed_paths: list[str],
+) -> None:
+    verdict = _decide(
+        _detail(*_pytest_shards(status="completed")),
+        1200,
+        changed_paths=changed_paths,
+        python_ci=conversion_python_ci(),
+        host_required_checks=(_PYTHON_AGGREGATE,),
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_check_absent"
+    assert verdict.note is not None
+    assert "for example a label" in verdict.note
+
+
+def test_a_failing_check_still_fails_while_shards_run_on_other_paths() -> None:
+    verdict = _decide(
+        _detail(
+            _running_shard("in_progress"),
+            _actions_run("lint", conclusion="failure", run_id=9),
+        ),
+        1200,
+        changed_paths=["README.md"],
+        python_ci=conversion_python_ci(),
+        host_required_checks=(_PYTHON_AGGREGATE,),
+    )
+
+    assert verdict.kind == "failing"
+    assert verdict.reason != "required_python_aggregate_waiting_on_shards"
+
+
+def test_a_required_aggregate_with_no_running_shard_stays_absent_on_other_paths() -> None:
+    verdict = _decide(
+        _detail(_actions_run("lint", run_id=2)),
+        1200,
+        changed_paths=["README.md"],
+        python_ci=conversion_python_ci(),
+        host_required_checks=(_PYTHON_AGGREGATE,),
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_check_absent"
+    assert verdict.note is not None
+    assert "for example a label" in verdict.note
 
 
 def test_python_changes_with_no_checks_follow_the_grace_window() -> None:

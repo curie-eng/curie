@@ -8,6 +8,10 @@ tlsSecret: ''
 apiToken: null
 workerToken: null
 groupCacheTtlSeconds: 60
+identityLookup:
+  existingSecret: ''
+  tokenKey: token
+  timeoutSeconds: 5
 readinessProbe:
   initialDelaySeconds: 1
   periodSeconds: 5

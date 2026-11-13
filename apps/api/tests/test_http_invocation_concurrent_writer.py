@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -206,33 +207,6 @@ def holder(scope: dict[str, Any], seconds: float) -> tuple[threading.Thread, thr
     return threading.Thread(target=run, args=(hold,), name="synthetic-lock-holder"), held
 
 
-def test_slow_lookups_with_stale_captures_exhaust_one_budget(
-    clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: retries share one deadline and fail closed after it."""
-    provider = synthetic_provider
-    monkeypatch.setattr(http_invocation, "_COMPOSITION_BUDGET_SECONDS", BUDGET)
-    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
-        token = membership._credential(invocation.client, invocation.scope)
-        before = turn_authority.delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        write, committed = writers(invocation.scope, times=2)
-        provider.during_lookup = slow(write)
-        spans = timed(monkeypatch)
-        refused = membership._post(
-            invocation.client, token, *membership._submission(invocation.scope),
-        )
-        assert refused.status_code == 503, refused.text
-        assert refused.json() == {"detail": "identity_authority_unavailable"}
-        assert committed == [1, 1]
-        [(outcome, elapsed)] = spans
-        assert outcome == "failed"
-        assert elapsed < BUDGET + SLACK
-        assert turn_authority.delivery_state(
-            valkey, runs_stream, invocation.scope["binding"],
-        ) == before
-
-
 @pytest.mark.parametrize("phase", ["capture", "revalidation"])
 def test_identity_lock_wait_past_the_budget_fails_closed(
     phase: str, clean_db: None, valkey: redis.Redis, runs_stream: str,
@@ -294,6 +268,39 @@ def test_uncontended_slow_lookup_within_the_budget_queues_once(
         assert outcome == "yielded"
         assert SLOW <= elapsed < BUDGET
         assert len(provider.requests) == 2
+        assert len(valkey.xrange(runs_stream)) == 2
+
+
+def test_a_composition_reaching_revalidation_late_in_its_budget_still_queues(
+    clean_db: None, valkey: redis.Redis, runs_stream: str,
+    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-4: shared fixture facts outlive the composition budget.
+
+    The API revalidates provider facts against the wall clock after the writer
+    phase. A loaded runner can reach that point seconds after the provider's
+    observation while still inside the composition budget, so the synthetic
+    source must stay fresh for the whole budget or an in-time turn reads as
+    identity_authority_unavailable. The clock is advanced, not slept.
+    """
+    provider = synthetic_provider
+    late = timedelta(seconds=http_invocation._COMPOSITION_BUDGET_SECONDS)
+
+    class LateClock(datetime):
+        """@spec HTTP-INVOCATION-EXECUTION-4: revalidation at the end of the budget."""
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            """@spec HTTP-INVOCATION-EXECUTION-4."""
+            return datetime.now(tz) + late
+
+    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
+        token = membership._credential(invocation.client, invocation.scope)
+        monkeypatch.setattr(http_invocation, "datetime", LateClock)
+        accepted = membership._post(
+            invocation.client, token, *membership._submission(invocation.scope),
+        )
+        assert accepted.status_code == 200, accepted.text
         assert len(valkey.xrange(runs_stream)) == 2
 
 

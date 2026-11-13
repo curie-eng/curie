@@ -48,6 +48,7 @@ def anyio_backend() -> str:
 def _expected_tracker_capabilities() -> dict[Operation, Support]:
     declared = dict.fromkeys(TRACKER_OPERATIONS, Support.SUPPORTED)
     declared[Operation.DEPENDENCIES] = Support.NOOP
+    declared[Operation.CREATE_LINKED_ISSUE] = Support.UNSUPPORTED
     return declared
 
 

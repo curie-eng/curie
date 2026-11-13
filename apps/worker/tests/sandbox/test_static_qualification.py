@@ -384,6 +384,69 @@ def test_turns_follow_up_and_approval_resume_cold_on_a_recycled_shell(
     assert list((shell.state_root / "claims").iterdir()) == []
 
 
+def test_an_approved_write_runs_once_after_a_cold_resume(
+    valkey: redis.Redis,
+    prefix: str,
+    state: _StateApi,
+    shells: ShellFactory,
+    worker_factory: Callable[[list[SupervisorProcess]], _Worker],
+) -> None:
+    """#5571: the resumed claim works in the directory the approver saw.
+
+    The approval pause wipes the claim and resume leases a new one. The
+    one-shot grant admits only the approved arguments, which carry the
+    absolute path in the paused claim's working directory, so the resumed
+    claim must stage into the same path for the approved write to run.
+    """
+
+    shell = shells("w0")
+    worker = worker_factory([shell])
+    thread = f"t-{uuid.uuid4().hex[:8]}"
+    gated = {**_boot_env(state, thread), "CURIE_APPROVAL_REQUIRED_TOOLS": "Write"}
+    directive = "[fake:write-file approval-check.txt approved-content]"
+
+    first = _claim(worker, thread, gated)
+    paused = worker.turn(first, f"write it {directive}")
+    assert paused.status == SessionStatus.AWAITING_APPROVAL
+    assert paused.approval_granted_tool == "Write"
+    arguments = paused.approval_granted_arguments
+    assert arguments is not None
+    approved_path = Path(arguments["file_path"])
+    assert approved_path.is_relative_to(shell.state_root / "claims")
+    assert not approved_path.exists()
+    worker.substrate.suspend(thread, history_ref=state.key_url(thread))
+    assert list((shell.state_root / "claims").iterdir()) == []
+
+    # Another thread uses the recycled shell meanwhile, and gives it back.
+    other = f"t-{uuid.uuid4().hex[:8]}"
+    borrowed = _claim(worker, other, _boot_env(state, other))
+    assert worker.turn(borrowed, "unrelated").status == SessionStatus.DONE
+    assert worker.substrate.release(other)
+
+    # Cold resume under a new claim; the worker's resume overlay carries the
+    # grant bound to the approved arguments.
+    resume_env = {
+        **_boot_env(state, thread, token=False),
+        "CURIE_APPROVAL_REQUIRED_TOOLS": "Write",
+        "CURIE_APPROVAL_GRANT_TOOL": "Write",
+        "CURIE_APPROVAL_GRANT_ARGUMENTS": json.dumps(arguments),
+    }
+    resumed = worker.substrate.resume(thread, env=resume_env)
+    wait_until(lambda: worker.status(resumed).get("turn_active") is False, 30, "resumed idle")
+    assert resumed.claim_name != first.claim_name
+    assert worker.turn(resumed, f"approved, carry on {directive}").status == SessionStatus.DONE
+    assert approved_path.read_text(encoding="utf-8") == "approved-content"
+
+    # The grant was spent: the same call is held for a new approval and the
+    # file is not written a second time.
+    approved_path.unlink()
+    again = worker.turn(resumed, f"once more {directive}")
+    assert again.status == SessionStatus.AWAITING_APPROVAL
+    assert not approved_path.exists()
+    assert worker.substrate.release(thread)
+    assert list((shell.state_root / "claims").iterdir()) == []
+
+
 def test_a_worker_restart_mid_turn_keeps_the_shell_and_the_turn(
     valkey: redis.Redis,
     prefix: str,

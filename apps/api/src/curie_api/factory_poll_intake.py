@@ -62,6 +62,7 @@ from .forges.github.review_polling import (
     admit_reviews,
     advance,
     human_actor,
+    label_actor,
     open_pulls,
     read_pull,
     repository_payload,
@@ -358,10 +359,11 @@ async def _admit_labeled(
             event = last_label_event(events, label)
             if event is None or type(event.get("id")) is not int:
                 continue
-            sender = human_actor(event)
-            if sender is None:
+            try:
+                sender_id, sender_login = label_actor(event, app_id=tracker.app_id)
+            except FeedbackIgnored as exc:
+                logger.info("factory label actor refused %s#%d: %s", repo, number, exc.code)
                 continue
-            sender_id, sender_login = sender
             notice = FactoryNotice(
                 uuid.uuid4(),
                 "issues",

@@ -23,6 +23,7 @@ extend the platform's own code.
     - [Artifact resolution](#artifact-resolution)
   - [Managing secrets](#managing-secrets)
   - [Installing Software Factory skills](#installing-software-factory-skills)
+  - [Read a factory pull request](#read-a-factory-pull-request)
 - [For contributors](#for-contributors)
   - [`curie install`](#curie-install)
   - [`curie dev`](#curie-dev)
@@ -74,6 +75,21 @@ local tests, approved factory feedback and merging. The
 [repository environment guide](../docs/guides/factory-environments.md) covers
 the two admin skills. No second installation command is needed. Installation
 grants no tracker or factory authority.
+
+## Read a factory pull request
+
+`curie factory explain` reads the pull requests a factory published for one GitHub issue. Pass `owner/repo#number` or a github.com issue URL.
+
+```bash
+curie factory explain curie-eng/curie#120
+curie factory explain https://github.com/curie-eng/curie/issues/120 --json
+```
+
+The command uses your forge login in this order: `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. It does not read the Curie platform key and it does not call the Curie API. `--api-url` selects the GitHub API root. The default is `https://api.github.com`. Any other host is passed to `gh auth token --hostname`.
+
+Human output and the `--json` object name the issue, then each matching pull request, newest first. Each record includes the pull request summary, the parsed `## Decisions` entries, the verification checkbox counts, the `## Reviews` text, the latest forge review state for each reviewer, and the check totals for the head commit. Zero matches print `no factory pull request` and exit 0. A pull request with no `## Decisions` heading reports `not recorded`. The exact line `None: the change follows directly from the acceptance criteria.` reports `none`. A heading whose lines are not entries reports `unparsed` and reprints those lines.
+
+Exit 2 means the reference is not a GitHub issue, including a pull request URL or another tracker. Exit 1 means the token is missing, the forge refused it, or the issue does not exist. Exit 3 means the forge could not be reached, returned a server error, or rate limited the call.
 
 ## Interactive mode
 
@@ -366,6 +382,21 @@ miss is labeled as one draw rather than unexplained tier drift. Raise N with
 Each sample starts a fresh conversation. A `--model` sweep on local/cluster
 refuses `--samples > 1` because the frozen EvalJob cannot carry N; set
 `CURIE_EVAL_SAMPLES` on the worker for the production eval path.
+
+Each case in `--json` also carries `trials`, the raw record of every sample
+the CLI drove: `index`, its own `outcome` and `passed`, `seconds`, the `reply`
+it judged, `tool_calls`, and the terminal `status`. The skill tier reads tool
+calls from the runner's tool frames (names only; arguments do not cross the
+runner wire). Local and cluster see only the delivered reply, so their
+`tool_calls` is null, meaning not observable rather than none. A trajectory
+eval on local/cluster runs on the platform eval plane and omits `trials`. The
+bundle under test is `bundle_digest` at the skill tier and `bundle_revision`
+(the agent bound to the exact Slack route the turns are sent on, its in-force
+deployment, version, commit, bundle sha256) on the in-CLI local/cluster path. `bundle_revision` is read once before the first sample and
+once after the last, and reported only when both agree: it is the revision in
+force at the start and at the end, unchanged, not proof that every sample ran
+on it. It is null when the reads disagree, when a lookup fails or exceeds its
+10 second budget, and on a local/cluster trajectory eval.
 
 The skill tier scores the runner tool frames directly. The local and cluster
 tiers trigger the deployed bundle through the platform eval plane, then poll

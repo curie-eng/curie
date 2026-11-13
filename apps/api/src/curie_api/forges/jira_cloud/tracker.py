@@ -39,7 +39,7 @@ from zoneinfo import ZoneInfo
 
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
 from curie_api.forges.config import AccountAllowlist, GroupAuthority, StartAuthority
-from curie_api.forges.errors import NotFound, Unavailable
+from curie_api.forges.errors import NotFound, Unavailable, Unsupported
 from curie_api.forges.jira_cloud import adf
 from curie_api.forges.jira_cloud.comments import JiraMarkedComments
 from curie_api.forges.jira_cloud.identity import IdentityCache, verify_identity
@@ -48,6 +48,7 @@ from curie_api.forges.types import (
     JIRA_CLOUD,
     Actor,
     Disposition,
+    LinkedIssue,
     MarkedNotice,
     NoticePage,
     PullRequest,
@@ -246,6 +247,8 @@ class JiraTracker:
         **dict.fromkeys(TRACKER_OPERATIONS, Support.SUPPORTED),
         # No core caller reads dependencies yet (ADR 0165 is a Draft, decision 19).
         Operation.DEPENDENCIES: Support.NOOP,
+        # Linked output issues are GitHub only (ADR 0277); no fallback path.
+        Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
     }
 
     def __init__(
@@ -828,3 +831,18 @@ class JiraTracker:
 
     async def dependencies(self, issue: TrackerIssueRef) -> tuple[TrackerIssueRef, ...]:
         return ()
+
+    async def create_linked_issue(
+        self,
+        source: TrackerIssueRef,
+        *,
+        output_identity: str,
+        title: str,
+        body: str,
+        labels: Collection[str],
+        expected: TrackerIssueRef | None = None,
+        reconcile_only: bool = False,
+    ) -> LinkedIssue:
+        """Declared unsupported: linked output issues are GitHub only (ADR 0277)."""
+
+        raise Unsupported(Operation.CREATE_LINKED_ISSUE)

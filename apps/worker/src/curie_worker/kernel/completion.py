@@ -175,7 +175,7 @@ async def _complete(
                         cause=cause,
                         detail=(
                             None
-                            if ci_fix or turn is None
+                            if turn is None or (ci_fix and cause != "ci_fix_unpublished")
                             else failures._finish_detail(turn.assistant_text)
                         ),
                         ci_fix_round=ci_fix_round,

@@ -107,6 +107,7 @@ mod eval_falsifiability;
 mod eval_portforward_cleanup;
 mod eval_sampling;
 mod eval_thread_reset;
+mod eval_trial_records;
 mod example_builtin_coding_tools;
 mod example_dark_factory_render;
 mod example_sre_bot_install;
@@ -234,7 +235,14 @@ fn every_test_file_is_declared_in_the_integration_crate() {
     }
     let root_source =
         fs::read_to_string(tests_dir.join("integration.rs")).expect("read tests/integration.rs");
-    let missing = undeclared_test_files(&names, &root_source);
+    let cargo_toml = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .expect("read cli/Cargo.toml");
+    // A file with its own [[test]] target compiles on its own. Declaring it
+    // again in this crate ran the same tests a second time, or skipped them.
+    let missing: Vec<String> = undeclared_test_files(&names, &root_source)
+        .into_iter()
+        .filter(|name| !cargo_toml.contains(&format!("path = \"tests/{name}\"")))
+        .collect();
     assert!(
         missing.is_empty(),
         "these test files are not declared, so they never compile: {}. \

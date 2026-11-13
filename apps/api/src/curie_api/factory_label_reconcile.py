@@ -34,6 +34,7 @@ from .config import Settings
 from .forges.errors import Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND
 from .forges.github.comments import static_token
+from .forges.github.review_polling import label_actor
 from .forges.github.tracker import GitHubTracker, last_label_event, read_repository
 from .forges.hosts import factory_credentials, factory_tracker
 from .forges.identity import reconcile_delivery_id
@@ -42,7 +43,7 @@ from .forges.surfaces import bound_labels
 from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice
-from .github_review_events import FeedbackIgnored, FeedbackUnavailable, human_sender
+from .github_review_events import FeedbackIgnored, FeedbackUnavailable
 from .models import AgentChannel, WorkItem
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name
 from .workspace_policy import repository_is_allowed
@@ -221,14 +222,10 @@ async def _reconcile_label(
         if labeled_at is None or labeled_at > now - grace:
             # A delivery may still be in flight; let it land first.
             continue
-        if event.get("performed_via_github_app") is not None:
-            continue
-        actor = event.get("actor")
-        if not isinstance(actor, dict) or actor.get("type") == "Bot":
-            continue
         try:
-            sender_id, sender_login = human_sender(actor)
-        except FeedbackIgnored:
+            sender_id, sender_login = label_actor(event, app_id=tracker.app_id)
+        except FeedbackIgnored as exc:
+            logger.info("factory label actor refused %s#%d: %s", repo, number, exc.code)
             continue
         notice = FactoryNotice(
             reconcile_delivery_id(tracker.issue(number), str(event["id"])),
@@ -243,6 +240,7 @@ async def _reconcile_label(
             sender_login,
             label_event_at=labeled_at,
             label=label,
+            label_event_id=event["id"],
         )
         if await _admit(sessionmaker, settings, client, notice, tracker, repository):
             admitted += 1

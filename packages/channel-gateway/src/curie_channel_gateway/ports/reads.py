@@ -30,6 +30,17 @@ class SenderIdentities(Protocol):
         ...
 
 
+class UserEmailSource(Protocol):
+    async def email_of(self, *, identity: str, user_id: str, workspace: str) -> str:
+        """The user's email, read fresh with the named identity's credential.
+
+        Raises ``UserEmailUnknown`` when the provider has no usable email for
+        that user in that workspace and ``UserEmailLookupError`` on any other
+        failure; never returns an empty or default value.
+        """
+        ...
+
+
 class AddressIdentityLookup(Protocol):
     async def identity_for_address(self, kind: str, address: str) -> str | None: ...
 

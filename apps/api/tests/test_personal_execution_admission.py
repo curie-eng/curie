@@ -48,7 +48,6 @@ from forge_fakes.github import (
     LABEL,
     REPO,
     REPO_ID,
-    SENDER,
     GitHubAPI,
     _Credentials,
     _issue_event,
@@ -993,21 +992,17 @@ def _seed_default_tenant_owner() -> UUID:
 
 
 class _OwnerTextGitHub(GitHubAPI):
-    """The GitHub fixture, also answering the permission read for a sender whose
-    login is ``sender_login`` (an owner principal's UUID in these tests)."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.sender_login = SENDER
+    """Answer permission reads for the canonical label actor's login."""
 
     def handle(self, request: httpx.Request) -> httpx.Response:
-        if request.url.path == f"/repos/{REPO}/collaborators/{self.sender_login}/permission":
+        login = self.label_actor["login"]
+        if request.url.path == f"/repos/{REPO}/collaborators/{login}/permission":
             self.permission_requests.append(request)
             return httpx.Response(
                 200,
                 json={
                     "permission": self.permission,
-                    "user": {"id": self.permission_user_id, "login": self.sender_login},
+                    "user": {"id": self.permission_user_id, "login": login},
                 },
             )
         return super().handle(request)
@@ -1093,7 +1088,7 @@ def test_github_label_in_personal_mode_refuses_without_an_owner_even_when_text_n
 ) -> None:
     owner = _seed_default_tenant_owner()
     client, api = github_factory("personal")
-    api.sender_login = str(owner)
+    api.label_actor["login"] = str(owner)
     number = next(_GITHUB_ISSUES)
 
     response = _post(client, "issues", _owner_text_event(number, owner))
@@ -1114,7 +1109,7 @@ def test_github_label_with_the_service_setting_admits_a_service_work_item(
 ) -> None:
     owner = _seed_default_tenant_owner()
     client, api = github_factory(mode)
-    api.sender_login = str(owner)
+    api.label_actor["login"] = str(owner)
     number = next(_GITHUB_ISSUES)
 
     response = _post(client, "issues", _owner_text_event(number, owner))
