@@ -83,13 +83,25 @@ _IMAGE_ROOT = Path("/app")
 _SESSION_WORKSPACE = Path("/workspace")
 
 
+def _image_root() -> Path:
+    """Read-only image root. A test names a stand-in; the runner leaves this unset."""
+    return _env_path("FACTORY_SELECTOR_IMAGE_ROOT") or _IMAGE_ROOT
+
+
+def _session_workspace() -> Path:
+    """Managed checkout. A test names a stand-in; the runner leaves this unset."""
+    return _env_path("FACTORY_SELECTOR_WORKSPACE") or _SESSION_WORKSPACE
+
+
 def _under_image_root(path: Path) -> bool:
+    root = _image_root()
     try:
         candidate = path.resolve()
+        root = root.resolve()
     except OSError:
         candidate = path
     try:
-        candidate.relative_to(_IMAGE_ROOT)
+        candidate.relative_to(root)
     except ValueError:
         return False
     return True
@@ -125,8 +137,9 @@ def state_directory(data: dict[str, Any]) -> Path:
     payload = Path(str(data.get("cwd") or ""))
     if _writable_directory(payload):
         return payload / ".factory-selector"
-    if _writable_directory(_SESSION_WORKSPACE):
-        return _SESSION_WORKSPACE / ".factory-selector"
+    workspace = _session_workspace()
+    if _writable_directory(workspace):
+        return workspace / ".factory-selector"
     return Path(tempfile.gettempdir()) / ".factory-selector"
 
 
