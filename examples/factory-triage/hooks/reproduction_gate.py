@@ -22,7 +22,7 @@ MAX_RUNS = 128
 MAX_STATE = 8 * 1024 * 1024
 RESULT_TOOL = "mcp__curie__submit_tracker_result"
 STATE_DIRECTORY = ".curie/factory-triage"
-READ_TOOLS = {"Read", "Glob", "Grep", "Skill", "TodoWrite"}
+READ_TOOLS = {"Read", "Glob", "Grep", "Skill", "TodoWrite", "ToolSearch", "WaitForMcpServers"}
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
 
@@ -168,7 +168,13 @@ def validate_entry(entry: Any) -> None:
 
 def load(path: Path, session: str, cwd: Path, *, create: bool) -> dict[str, Any]:
     if not path.exists() and create:
-        return {"session": session, "workspace": str(cwd), "runs": [], "pending": {}}
+        return {
+            "session": session,
+            "workspace": str(cwd),
+            "base_revision": snapshot(cwd)["revision"],
+            "runs": [],
+            "pending": {},
+        }
     if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_STATE:
         raise Refusal(
             "Reproduction state is missing or unreadable; run a fresh probe or submit findings."
@@ -181,6 +187,10 @@ def load(path: Path, session: str, cwd: Path, *, create: bool) -> dict[str, Any]
         or not isinstance(state.get("pending"), dict)
     ):
         raise Refusal("Reproduction state does not belong to this session and checkout.")
+    if not isinstance(state.get("base_revision"), str) or not re.fullmatch(
+        r"[0-9a-f]{40}", state["base_revision"]
+    ):
+        raise Refusal("Reproduction state has a missing or corrupt base revision.")
     if len(state["runs"]) > MAX_RUNS or len(state["pending"]) > MAX_RUNS:
         raise Refusal("Reproduction state exceeds its entry limit.")
     for entry in state["runs"]:
@@ -260,8 +270,10 @@ def check_ticket(state: dict[str, Any], proposal: dict[str, Any], cwd: Path) -> 
     observed = required_text(reproduction.get("observed"), "reproduction.observed")
     revision = required_text(reproduction.get("revision"), "reproduction.revision")
     current = snapshot(cwd)
-    if revision != current["revision"]:
-        raise Refusal("The submitted revision differs from the checkout revision.")
+    if revision != state["base_revision"]:
+        raise Refusal("The submitted revision differs from the investigated base revision.")
+    if current["revision"] != state["base_revision"]:
+        raise Refusal("The checkout revision differs from the investigated base revision.")
     if not current["clean"]:
         raise Refusal("Tracked files are modified at submission; revert candidate patches first.")
     runs = [run for run in state["runs"] if run.get("command") == command]
@@ -319,13 +331,16 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, DEADLINE_SECONDS)
     try:
-        raw = sys.stdin.buffer.read(MAX_INPUT + 1)
-        if len(raw) > MAX_INPUT:
-            raise Refusal("The hook input exceeds its size limit.")
-        result = handle(decode(raw))
+        try:
+            signal.signal(signal.SIGALRM, expired)
+            signal.setitimer(signal.ITIMER_REAL, DEADLINE_SECONDS)
+            raw = sys.stdin.buffer.read(MAX_INPUT + 1)
+            if len(raw) > MAX_INPUT:
+                raise Refusal("The hook input exceeds its size limit.")
+            result = handle(decode(raw))
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
     except BaseException as exc:  # noqa: BLE001
         reason = (
             str(exc)
@@ -341,7 +356,6 @@ def main() -> None:
                 "permissionDecisionReason": reason,
             }
         }
-    signal.setitimer(signal.ITIMER_REAL, 0)
     print(json.dumps(result, ensure_ascii=True))
 
 

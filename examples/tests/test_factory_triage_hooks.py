@@ -118,6 +118,45 @@ def test_clean_recorded_probe_allows_ticket_and_untracked_test(session: Session)
     assert not denied(session.submit(session.ticket(command, "Observed output:\n-1")))
 
 
+@pytest.mark.parametrize("tool", ["ToolSearch", "WaitForMcpServers"])
+def test_result_tool_discovery_is_allowed(session: Session, tool: str) -> None:
+    assert not denied(session.event("PreToolUse", tool, {"query": SUBMIT}))
+
+
+@pytest.mark.parametrize("move", ["commit", "checkout"])
+def test_revision_moves_cannot_supply_ticket_evidence(session: Session, move: str) -> None:
+    older = session.revision
+    (session.cwd / "calc.py").write_text("def add(a, b): return a + b\n")
+    session.git("commit", "-am", "Fix addition", "-q")
+    session.revision = session.git("rev-parse", "HEAD").strip()
+    command = "python3 -B -c 'from calc import add; print(add(2, 3))'"
+    session.run(command)
+    assert not denied(session.submit(session.ticket(command, "5")))
+
+    if move == "commit":
+        session.run(
+            "printf 'def add(a, b): return a - b\\n' > calc.py; "
+            "git add calc.py; git commit -qm 'Introduce subtraction'"
+        )
+    else:
+        session.run("git checkout -q " + older)
+    moved_revision = session.git("rev-parse", "HEAD").strip()
+    assert moved_revision != session.revision
+    session.run(command)
+    proposal = session.ticket(command, "-1")
+    proposal["reproduction"]["revision"] = moved_revision
+    refusal = session.submit(proposal)
+    assert denied(refusal)
+    assert "base revision" in refusal["hookSpecificOutput"]["permissionDecisionReason"]
+
+    refusal = session.submit(session.ticket(command, "5"))
+    assert denied(refusal)
+    assert "base revision" in refusal["hookSpecificOutput"]["permissionDecisionReason"]
+    assert not denied(session.submit(dict(kind="findings", reason="not_reproduced")))
+    session.git("checkout", "-q", session.revision)
+    assert not denied(session.submit(session.ticket(command, "5")))
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -298,6 +337,22 @@ def test_accidental_entry_corruption_refuses_ticket_and_preserves_findings(
     )
 
 
+@pytest.mark.parametrize("revision", [None, "invalid"])
+def test_missing_or_corrupt_base_refuses_ticket_but_allows_findings(
+    session: Session, revision: str | None
+) -> None:
+    session.run("echo probe")
+    path = next((session.cwd / ".curie/factory-triage").glob("*.json"))
+    state = json.loads(path.read_text())
+    if revision is None:
+        state.pop("base_revision", None)
+    else:
+        state["base_revision"] = revision
+    path.write_text(json.dumps(state))
+    assert denied(session.submit(session.ticket("echo probe", "probe")))
+    assert not denied(session.submit(dict(kind="findings", reason="not_reproduced")))
+
+
 def test_documented_limit_deliberate_shell_state_forgery_is_not_detected(session: Session) -> None:
     """Document the accepted limit, not proof of protection against deliberate forgery."""
     code = (
@@ -339,3 +394,47 @@ def test_input_read_deadline_returns_deny_before_runner_timeout() -> None:
         if process.poll() is None:
             process.kill()
         process.communicate()
+
+
+@pytest.mark.parametrize("ending", ["completion", "refusal"])
+def test_deadline_during_completion_or_refusal_cannot_fail_open(
+    session: Session, ending: str
+) -> None:
+    code = """
+import runpy, signal, sys
+ending, hook = sys.argv[1:]
+visited = False
+def trace(frame, event, arg):
+    global visited
+    if not visited and event == 'line' and frame.f_code.co_name == 'main':
+        ready = 'result' in frame.f_locals if ending == 'completion' else 'exc' in frame.f_locals
+        if ready:
+            visited = True
+            sys.stderr.write('deadline checkpoint reached\\n')
+            if signal.getitimer(signal.ITIMER_REAL)[0] > 0:
+                signal.raise_signal(signal.SIGALRM)
+    return trace
+sys.settrace(trace)
+runpy.run_path(hook, run_name='__main__')
+assert visited
+"""
+    payload = (
+        dict(
+            hook_event_name="PreToolUse",
+            tool_name="Read",
+            tool_input=dict(file_path="calc.py"),
+            cwd=str(session.cwd),
+        )
+        if ending == "completion"
+        else {}
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code, ending, str(BUNDLE / "hooks/reproduction_gate.py")],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        timeout=12,
+    )
+    assert "deadline checkpoint reached" in done.stderr
+    assert done.returncode == 0, done.stderr
+    assert denied(json.loads(done.stdout))
