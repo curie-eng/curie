@@ -98,6 +98,11 @@ fn discover_suites() -> Vec<(String, EvalSuite)> {
         suites.len(),
         suites.iter().map(|(n, _)| n).collect::<Vec<_>>()
     );
+    assert!(
+        suites.iter().any(|(name, _)| name == "factory-selector"),
+        "factory-selector suite was not discovered: {:?}",
+        suites.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
     suites
 }
 
