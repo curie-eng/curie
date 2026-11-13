@@ -124,6 +124,12 @@ async def upload_bundle(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             {"detail": "bundle failed validation", "errors": exc.errors},
         ) from exc
+    except deploy.TrackerResultNotEnabled as exc:
+        # Before the route join, `store.put` and `attach_bundle`, so a refused
+        # bundle stores no object and leaves `bundle_ref` null (#5585).
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
+        ) from exc
 
     # The declared/bound approval-route join, CONDITIONAL on this version already
     # being live (#2436). `DeploymentCreate` carries no bundle and

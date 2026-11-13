@@ -411,6 +411,7 @@ def _rejected(
         deploy.ApprovalRoutesUnbound
         | deploy.BundleTooLarge
         | deploy.SealingKeyCustody
+        | deploy.TrackerResultNotEnabled
         | approver_tickets.BundleGateMismatch
     ),
     agent_id: uuid.UUID | None = None,
@@ -427,6 +428,8 @@ def _rejected(
     there first. The message is the exception's own, identical to the one the
     API returns as a 422 detail. `approver_ticket.bundle_gate_mismatch` (ADR
     0271 decision 2) rides on the same three route gates.
+    `tracker_result_not_enabled` (#5585) fires once, at the clone path's
+    `validate_archive`, before any version row exists.
     """
 
     return WebhookResult(
@@ -636,6 +639,8 @@ async def process_push(
         return _rejected(exc)
     except deploy.BundleInvalid as exc:
         return WebhookResult(status="rejected", errors=exc.errors)
+    except deploy.TrackerResultNotEnabled as exc:
+        return _rejected(exc)
 
     named = target_agent_name(targets, environment)
     named_elsewhere = (

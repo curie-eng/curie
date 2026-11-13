@@ -24,6 +24,7 @@ from . import approver_tickets, bundles
 from .config import Settings, get_settings
 from .models import AgentVersion
 from .storage import ObjectStore
+from .tracker_result_declaration import ResultDeclaration, read_declaration
 
 
 class BundleInvalid(Exception):
@@ -84,6 +85,31 @@ class SealingKeyCustody(Exception):
     """
 
     code = bundles.SEALING_KEY_CODE
+
+
+class TrackerResultNotEnabled(Exception):
+    """A valid bundle declares a tracker result contract (ADR 0277, #5585).
+
+    This release builds the declaration and the delivery foundation but no
+    path that can run a tracker-result execution, so ingestion refuses to store
+    such a version: a label on a half-built triage binding would queue work
+    that cannot finish. Raised by ``validate_archive`` only after the bundle,
+    declaration included, has validated, so a malformed declaration reports
+    its own ``tracker_result.*`` issue first. #5586 removes this refusal.
+    ``code`` lets ``gitflow._rejected`` and the upload route build their
+    envelopes from the exception alone.
+    """
+
+    code = "tracker_result_not_enabled"
+
+    def __init__(self, declaration: ResultDeclaration) -> None:
+        self.schema_version = declaration.schema_version
+        self.digest = declaration.digest
+        super().__init__(
+            "the bundle declares a tracker result contract (workflow/result.json, "
+            f"digest {declaration.digest}); tracker result deployments are not "
+            "enabled in this release, so this version cannot be stored"
+        )
 
 
 class ApprovalRoutesUnbound(Exception):
@@ -194,9 +220,13 @@ def validate_archive(
     ``BundleInvalid`` if the plugin bundle fails validation, and (via
     ``safe_extract``) ``bundles.UnsupportedArchive`` again if the archive
     exceeds the configured uncompressed-size or compression-ratio cap.
+    Raises ``TrackerResultNotEnabled`` when a bundle that is otherwise valid
+    declares a tracker result contract (``workflow/result.json``); a
+    malformed declaration is a ``BundleInvalid`` instead, checked first.
     """
 
     settings = settings or get_settings()
+    declaration: ResultDeclaration | None = None
     with tempfile.TemporaryDirectory() as tmp:
         extension, content_type, result = bundles.extract_and_validate(
             data,
@@ -205,8 +235,14 @@ def validate_archive(
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
+        if result.valid:
+            # Cannot raise: `extract_and_validate` already reported any issue
+            # this declaration has, and the result is valid.
+            declaration = read_declaration(bundles.bundle_root(Path(tmp)))
     if not result.valid:
         raise BundleInvalid([e.model_dump() for e in result.errors])
+    if declaration is not None:
+        raise TrackerResultNotEnabled(declaration)
     return extension, content_type
 
 

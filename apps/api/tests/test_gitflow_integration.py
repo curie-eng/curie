@@ -1427,6 +1427,72 @@ def test_malformed_bundle_push_is_rejected(
     assert deployments == []
 
 
+def test_dev_push_of_a_bundle_with_a_result_declaration_is_rejected_until_removed(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A valid tracker result declaration refuses the push (ADR 0277, #5585).
+
+    The refusal fires at the clone path's `validate_archive`, before any
+    version row, so the agent keeps no version, deployment or WorkItem. A
+    second commit on the same branch that only deletes `workflow/result.json`
+    then deploys, which proves the refusal is the declaration and nothing else.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    files = {
+        **VALID_FILES,
+        "workflow/result.json": (
+            '{"schema_version": 1, "contract": "tracker_result", "results": ["findings"]}'
+        ),
+    }
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, files)
+
+    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "rejected", body
+    assert [error["code"] for error in body["errors"]] == ["tracker_result_not_enabled"]
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+    assert (
+        client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json()
+        == []
+    )
+
+    async def _work_items() -> int:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                value = await conn.scalar(
+                    text("SELECT count(*) FROM curie.work_items WHERE agent_id = :agent_id"),
+                    {"agent_id": uuid.UUID(agent_id)},
+                )
+        finally:
+            await engine.dispose()
+        return int(value or 0)
+
+    assert asyncio.run(_work_items()) == 0
+
+    work = trusted_clone_base / "_work" / REPO
+    _git("rm", "-q", "workflow/result.json", cwd=work)
+    _git("commit", "-q", "-m", "drop the result declaration", cwd=work)
+    without = _git("rev-parse", "HEAD", cwd=work)
+    bare = trusted_clone_base / f"{REPO}.git"
+    _git("push", "--quiet", str(bare), "HEAD:refs/heads/dev", cwd=work)
+
+    resp = _post(client, "push", _push_payload("refs/heads/dev", without, clone_url))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "deployed", resp.json()
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 1
+
+
 def test_signed_push_with_a_foreign_clone_url_is_rejected(
     client: Any,
     auth_headers: dict[str, str],

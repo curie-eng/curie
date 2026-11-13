@@ -1,0 +1,144 @@
+{
+  "comment": "The bundle tracker result declaration, workflow/result.json at the bundle root (ADR 0277 decision 1, #5585). Each case is the raw file text. A valid case gives the expected result-policy digest, the SHA-256 of the canonical JSON of the parsed object, and the parsed fields; an invalid case gives the exact list of validation issue codes, in the order the parser reports them (unknown fields, missing fields, then schema_version, contract, results, implementation_label). Read by apps/api/tests/test_tracker_result_declaration.py; later readers (#5586, #5587) run their own parser against the same inputs. Readers reject unknown top-level keys.",
+  "path": "workflow/result.json",
+  "canonical": "keys sorted, UTF-8, separators , and :, no insignificant whitespace",
+  "valid": [
+    {
+      "name": "findings_only",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"findings\"]}",
+      "digest": "dc7892d9d4e505f9daff8556f42f984d18e88d9f5e984dac756a4b8c89114537",
+      "schema_version": 1,
+      "results": ["findings"],
+      "implementation_label": null
+    },
+    {
+      "name": "ticket_and_findings",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"ticket\", \"findings\"], \"implementation_label\": \"curie-factory\"}",
+      "digest": "2e886257cda862bc80c7ea42fb53129656e24ca662a0543995e0c37eec1507c6",
+      "schema_version": 1,
+      "results": ["ticket", "findings"],
+      "implementation_label": "curie-factory"
+    },
+    {
+      "name": "ticket_and_findings_keys_reordered",
+      "text": "{\n  \"implementation_label\" : \"curie-factory\",\n  \"results\": [ \"ticket\", \"findings\" ],\n\t\"contract\":\"tracker_result\",\"schema_version\":1\n}\n",
+      "digest": "2e886257cda862bc80c7ea42fb53129656e24ca662a0543995e0c37eec1507c6",
+      "schema_version": 1,
+      "results": ["ticket", "findings"],
+      "implementation_label": "curie-factory"
+    },
+    {
+      "name": "label_of_fifty_characters",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"ticket\", \"findings\"], \"implementation_label\": \"abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij\"}",
+      "digest": "486056aec801d104ad1cc5f66fc979b1959847ed7f4612a77f0c4cad5ded8b11",
+      "schema_version": 1,
+      "results": ["ticket", "findings"],
+      "implementation_label": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+    },
+    {
+      "name": "non_ascii_label_findings_first",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"findings\", \"ticket\"], \"implementation_label\": \"implementación\"}",
+      "digest": "9a736e7b228a47089dad284217b7105fca7920e6e14d38aa85144e144169a0bb",
+      "schema_version": 1,
+      "results": ["findings", "ticket"],
+      "implementation_label": "implementación"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "missing_schema_version",
+      "text": "{\"contract\": \"tracker_result\", \"results\": [\"findings\"]}",
+      "codes": ["tracker_result.missing_field"]
+    },
+    {
+      "name": "wrong_contract",
+      "text": "{\"schema_version\": 1, \"contract\": \"implementation\", \"results\": [\"findings\"]}",
+      "codes": ["tracker_result.contract"]
+    },
+    {
+      "name": "empty_results",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": []}",
+      "codes": ["tracker_result.results"]
+    },
+    {
+      "name": "results_without_findings",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"ticket\"], \"implementation_label\": \"curie-factory\"}",
+      "codes": ["tracker_result.results"]
+    },
+    {
+      "name": "ticket_without_implementation_label",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"ticket\", \"findings\"]}",
+      "codes": ["tracker_result.implementation_label"]
+    },
+    {
+      "name": "unknown_field",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"findings\"], \"destination\": \"octo/elsewhere\"}",
+      "codes": ["tracker_result.unknown_field"]
+    },
+    {
+      "name": "non_object_file",
+      "text": "[]",
+      "codes": ["tracker_result.not_object"]
+    },
+    {
+      "name": "label_without_ticket",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"findings\"], \"implementation_label\": \"curie-factory\"}",
+      "codes": ["tracker_result.implementation_label"]
+    },
+    {
+      "name": "label_of_fifty_one_characters",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"ticket\", \"findings\"], \"implementation_label\": \"abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijk\"}",
+      "codes": ["tracker_result.implementation_label"]
+    },
+    {
+      "name": "empty_label",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"ticket\", \"findings\"], \"implementation_label\": \"\"}",
+      "codes": ["tracker_result.implementation_label"]
+    },
+    {
+      "name": "label_not_a_string",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"ticket\", \"findings\"], \"implementation_label\": 7}",
+      "codes": ["tracker_result.implementation_label"]
+    },
+    {
+      "name": "schema_version_true",
+      "text": "{\"schema_version\": true, \"contract\": \"tracker_result\", \"results\": [\"findings\"]}",
+      "codes": ["tracker_result.schema_version"]
+    },
+    {
+      "name": "schema_version_float",
+      "text": "{\"schema_version\": 1.0, \"contract\": \"tracker_result\", \"results\": [\"findings\"]}",
+      "codes": ["tracker_result.schema_version"]
+    },
+    {
+      "name": "schema_version_2",
+      "text": "{\"schema_version\": 2, \"contract\": \"tracker_result\", \"results\": [\"findings\"]}",
+      "codes": ["tracker_result.schema_version"]
+    },
+    {
+      "name": "duplicate_result_kind",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"findings\", \"findings\"]}",
+      "codes": ["tracker_result.results"]
+    },
+    {
+      "name": "unknown_result_kind",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"findings\", \"pull_request\"]}",
+      "codes": ["tracker_result.results"]
+    },
+    {
+      "name": "duplicate_json_key",
+      "text": "{\"schema_version\": 1, \"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"findings\"]}",
+      "codes": ["tracker_result.invalid_json"]
+    },
+    {
+      "name": "nan_value",
+      "text": "{\"schema_version\": NaN, \"contract\": \"tracker_result\", \"results\": [\"findings\"]}",
+      "codes": ["tracker_result.invalid_json"]
+    },
+    {
+      "name": "not_json",
+      "text": "schema_version: 1\ncontract: tracker_result\nresults: [findings]\n",
+      "codes": ["tracker_result.invalid_json"]
+    }
+  ]
+}
