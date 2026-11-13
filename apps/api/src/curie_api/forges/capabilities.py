@@ -39,6 +39,7 @@ class Operation(enum.StrEnum):
     GROUP_MEMBERSHIP = "tracker.group_membership"
     TICKET_LABELS = "tracker.ticket_labels"
     PUBLICATION_REFERENCES = "tracker.publication_references"
+    CREATE_LINKED_ISSUE = "tracker.create_linked_issue"
     # CodeHost
     RESOLVE_REPOSITORY = "code_host.resolve_repository"
     CREDENTIAL = "code_host.credential"
@@ -86,6 +87,9 @@ OPTIONAL_OPERATIONS: frozenset[Operation] = frozenset(
         Operation.LINK_PULL_REQUEST,
         Operation.DEPENDENCIES,
         Operation.GROUP_MEMBERSHIP,
+        # A write, so it is never no-op eligible: doing nothing is not a
+        # correct answer (ADR 0277).
+        Operation.CREATE_LINKED_ISSUE,
         Operation.CI_DIAGNOSTICS,
         Operation.RERUN_FAILED,
         Operation.USER_CAN_WRITE,

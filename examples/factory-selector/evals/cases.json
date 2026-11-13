@@ -1,0 +1,23 @@
+{
+  "name": "factory-selector",
+  "cases": [
+    {
+      "id": "reports-labelled-and-skipped",
+      "input": "Select factory work from the policy and report the outcome of this run.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?s)\\ALabelled:\\n(?:#[0-9]+ [^\\n]+\\n)+Skipped:\\n(?:#[0-9]+ [^\\n]+\\n)+",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "reports-nothing-matched",
+      "input": "Select factory work from the policy and report the outcome when the search returns no issues.",
+      "grader": {
+        "kind": "contains",
+        "expected": "Nothing matched.",
+        "case_sensitive": true
+      }
+    }
+  ]
+}

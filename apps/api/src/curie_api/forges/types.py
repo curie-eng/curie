@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import base64
 import enum
+import hashlib
+import re
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -658,3 +660,92 @@ class MarkedComment:
 class UpsertResult:
     comment: MarkedComment
     written: bool
+
+
+# Linked output issues (ADR 0277, `Tracker.create_linked_issue`).
+#
+# The platform derives one output identity per source execution request and
+# hands it in; the core owns the marker text built from it, and each adapter
+# decides how to embed that marker in an issue body. Every adapter composes
+# the body with `linked_issue_body` and matches with `ends_with_marker`, so the
+# rule below holds on every tracker.
+
+OUTPUT_IDENTITY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+LINKED_ISSUE_MARKER_PREFIX = "curie-linked-issue:"
+
+
+def valid_output_identity(value: str) -> str:
+    """Return ``value``; ValueError unless it fullmatches OUTPUT_IDENTITY_PATTERN.
+
+    The pattern admits no whitespace and no angle bracket, so the marker it
+    builds cannot close an HTML comment early or span two lines.
+    """
+
+    if not isinstance(value, str) or OUTPUT_IDENTITY_PATTERN.fullmatch(value) is None:
+        raise ValueError("an output identity is 1 to 128 of [A-Za-z0-9._:-], starting alphanumeric")
+    return value
+
+
+def linked_issue_marker(output_identity: str) -> str:
+    """The core-owned marker an output issue carries: ``curie-linked-issue:<id>``.
+
+    ValueError for an invalid ``output_identity`` (`valid_output_identity`).
+    """
+
+    return f"{LINKED_ISSUE_MARKER_PREFIX}{valid_output_identity(output_identity)}"
+
+
+def linked_issue_body(body: str, *, related: str, embedded: str) -> str:
+    """The exact body an adapter sends for a linked output issue.
+
+    ``body`` with CRLF folded to LF and trailing newlines dropped, a blank
+    line, the related-source line ``related``, a blank line, then the
+    adapter's embedded marker ``embedded`` as the last line, ending in one
+    newline. The related-source line references the source and never closes
+    it.
+    """
+
+    text = body.replace("\r\n", "\n").rstrip("\n")
+    return f"{text}\n\n{related}\n\n{embedded}\n"
+
+
+def ends_with_marker(body: str | None, embedded: str) -> bool:
+    """True when the last non-empty line of ``body`` is exactly ``embedded``.
+
+    Surrounding whitespace on that line is ignored (a tracker may store CRLF).
+    A marker planted anywhere earlier, for example by model text inside the
+    body, never matches, so one output cannot claim another's issue.
+    """
+
+    if not body:
+        return False
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    return bool(lines) and lines[-1] == embedded
+
+
+def body_sha256(body: str) -> str:
+    """The lowercase hex SHA-256 of ``body`` encoded as UTF-8."""
+
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class LinkedIssue:
+    """What `Tracker.create_linked_issue` created or reconciled to.
+
+    ``issue`` is the output issue in the source's own scope and ``url`` its
+    web link. ``labels`` are its label names as read back now.
+    ``body_sha256`` is the SHA-256 of its body as read back from the tracker
+    now; ``sent_body_sha256`` is the SHA-256 of the exact body this adapter
+    composes for these inputs (`linked_issue_body`). A caller records delivery
+    only when the two are equal. ``created`` is True only when this call's
+    create request was answered as written; a reconciled issue, including
+    one an unanswered create of this same call may have written, is False.
+    """
+
+    issue: TrackerIssueRef
+    url: str
+    labels: frozenset[str]
+    body_sha256: str
+    sent_body_sha256: str
+    created: bool

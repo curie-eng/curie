@@ -39,6 +39,7 @@ from .forges.errors import ForgeError, Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND, resolve_binding
 from .forges.github.comments import static_token
 from .forges.github.identity import delivery_uuid
+from .forges.github.review_polling import label_actor
 from .forges.github.tracker import GitHubTracker, IssueFacts, last_label_event
 from .forges.github.transport import parse_time
 from .forges.hosts import (
@@ -533,7 +534,7 @@ async def _with_label_event(
     settings: Settings,
     client: httpx.AsyncClient,
 ) -> FactoryNotice:
-    """Attach the newest human labeled event id. The delivery id stays put.
+    """Attach the newest label event and its actor. The delivery id stays put.
 
     The events list is the same read the missed-label backstop uses. When
     GitHub cannot answer, the route retries instead of admitting under the
@@ -549,13 +550,11 @@ async def _with_label_event(
     event = last_label_event(events, label)
     if event is None or type(event.get("id")) is not int:
         raise FeedbackUnavailable("label_events_unavailable")
-    if event.get("performed_via_github_app") is not None:
-        raise FactoryRefused("app_authored")
-    actor = event.get("actor")
-    if not isinstance(actor, dict) or actor.get("type") == "Bot":
-        raise FactoryRefused("app_authored")
+    sender_id, sender_login = label_actor(event, app_id=tracker.app_id)
     return replace(
         notice,
+        sender_id=sender_id,
+        sender_login=sender_login,
         label_event_id=event["id"],
         label_event_at=parse_time(event.get("created_at")),
     )
@@ -615,9 +614,9 @@ async def handle_factory_delivery(
             mention=intake.mention,
         )
         await lock_issue(session, notice_issue(notice, registry))
-        verified = await verify_current(notice, settings=settings, client=client)
         if notice.disposition == "admit":
             notice = await _with_label_event(notice, settings=settings, client=client)
+        verified = await verify_current(notice, settings=settings, client=client)
         if notice.disposition == "cancel":
             outcome = await cancel_notice(session, notice, settings)
         elif notice.disposition == "base_label":

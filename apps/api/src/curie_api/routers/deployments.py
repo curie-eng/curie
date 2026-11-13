@@ -47,10 +47,22 @@ async def create_deployment(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     # @spec ACTION-EXECUTOR-16: a bundle stored before intake refused a
     # non-SecretRef sealing key declaration is refused here too, before any row.
+    # So is a stored tracker result declaration (#5585), with the upload
+    # route's envelopes: a malformed one as a validation failure, a valid one
+    # as `tracker_result_not_enabled`.
     try:
-        await deploy.check_stored_sealing_key_custody(store, version)
+        await deploy.check_stored_bundle_intake(store, version)
     except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except deploy.BundleInvalid as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {"detail": "bundle failed validation", "errors": exc.errors},
+        ) from exc
+    except deploy.TrackerResultNotEnabled as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
+        ) from exc
     # The declared/bound approval-route join (#2436): this is the first moment
     # both halves are known for a specific agent, and the moment the version
     # becomes the thing that boots. AFTER the bounds check above, so an over-cap

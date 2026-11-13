@@ -4,6 +4,10 @@ Date: 2026-10-06
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Tracker-result investigations are excluded from automatic owner-loss successors.
+
 **Partially amended by [ADR 0269](0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md)**
 (back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 the Decision and point 4 now spend a shared two-successor allowance per WorkItem

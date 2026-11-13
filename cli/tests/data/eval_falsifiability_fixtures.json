@@ -25,6 +25,8 @@
     "text-stats-engine/word-count-empty": "0",
     "text-stats-engine/characters-without-whitespace": "9",
     "weather/reports-a-temperature": "The high in San Francisco today is about 68°.",
+    "factory-selector/reports-labelled-and-skipped": "Labelled:\n#12 Widget flaky on cold start\n#18 Queue stalls under load\nSkipped:\n#4 already carries the factory label\n#9 repository is outside the policy\n",
+    "factory-selector/reports-nothing-matched": "Nothing matched.",
     "github-issues/reads-a-specific-issue-content": "Issue #7 proposes promoting the queue payload into the aci-protocol contract.",
     "github-issues/reads-a-specific-issue-state": "It is closed.",
     "github-issues/lists-real-issue-numbers": "A few open issues: #10, #12, and #15.",
@@ -119,6 +121,13 @@
   "paraphrases": {
     "dark-factory/answers-recorded-decision": ["No changes needed: Batching reduces the cost of a commit for each event; entry #1 records this choice and its storage trace.", "No changes needed: the accumulation is intentional and its rationale is already recorded. This is recorded in Decisions entry 1 of the pull request body: batching was chosen over saving each event in its own transaction because repeated per-event transaction setup grows with the number of events."],
     "dark-factory/admits-unrecorded-decision": ["No changes needed: The PR body does not explain why 256 was selected; the repository excerpt only defines that capacity."],
+    "factory-selector/reports-labelled-and-skipped": [
+      "Labelled:\n#7 Retry the flaky checkout\nSkipped:\n#2 search excluded it\nThe next session can select different issues.\n",
+      "Labelled:\n#7 Retry the flaky checkout\n#31 Document the cap\nSkipped:\n#2 search excluded it\n#8 the session cap was already full\n"
+    ],
+    "factory-selector/reports-nothing-matched": [
+      "Nothing matched. The policy search returned no open issues."
+    ],
     "dark-factory/no-pr-handoff-keeps-blockers-open": ["Could not complete: Three decisions remain.\nDecisions needed:\n1. Which rollback semantics are required?\n2. Which failing behavior should the new test demonstrate?\n3. What verification evidence should the PR body record?\nSettled:\n1. The PR was not created.", "Could not complete: Three unresolved blockers remain and no pull request was opened.\nDecisions needed:\n1. What rollback behavior must the migration down path restore?\n2. Which observable behavior should the new test assert so it fails on the old source?\n3. Which required checks and results must the verification table record?\nSettled:\n1. No pull request was opened in this run.", "Could not complete: Three unresolved blockers remain and no pull request was opened.\nDecisions needed:\n1. What rollback behavior must the migration down path restore?\n2. Which observable behavior should the new test assert so it fails on the old source?\n3. Which required checks and results must the verification table record?\nSettled:\n1. No pull request was opened for this run.", "Could not complete: Three unresolved blockers remain and no pull request was opened.\nDecisions needed:\n1. What rollback behavior must the migration down path restore?\n2. Which observable behavior should the new test assert so it fails on the old source?\n3. Which required checks and results must the verification table record?\nSettled:\n1. No pull request was opened during this run."],
     "dark-factory/knows-the-execution-bound": [
       "Use execution_seconds for the run duration and execution_deadline for the stop time, both returned by mcp__curie__get_issue.",
@@ -240,6 +249,15 @@
   "counterexamples": {
     "dark-factory/answers-recorded-decision": ["No changes needed: Decision 1 uses batches to preserve event order.", "No changes needed: Decision 2 avoids per-event commit overhead.", "No changes needed: The code saves a batch in one transaction."],
     "dark-factory/admits-unrecorded-decision": ["No changes needed: 256 was selected to match the expected peak load.", "No changes needed: The queue is bounded at 256 entries."],
+    "factory-selector/reports-labelled-and-skipped": [
+      "Skipped:\n#4 already carries the factory label\nLabelled:\n#12 Widget flaky on cold start\n",
+      "Labelled:\n#12\nSkipped:\n#4 already carries the factory label\n",
+      "Nothing matched."
+    ],
+    "factory-selector/reports-nothing-matched": [
+      "Labelled:\n#12 Widget flaky on cold start\nSkipped:\n#4 already carries the factory label\n",
+      "nothing matched"
+    ],
     "dark-factory/ordinary-delivery-starts-factory": ["What would you like me to do with this issue?", "I loaded dark-factory:implement-issue and started the factory run."],
     "dark-factory/no-pr-handoff-counts-omitted-blockers": ["Could not complete: Seven maintainer decisions remain unresolved.\nDecisions needed:\n1. What rollback behavior is required?\n2. Which behavior must the regression test assert?\n3. Which verification evidence is required?\nSettled:\n1. No pull request was opened."],
     "dark-factory/no-pr-handoff-keeps-blockers-open": ["Could not complete: The change is not ready.\nDecisions needed:\n1. What rollback behavior is required?\nSettled:\n1. The migration lacks a down path, the new test passes on the old source, and the PR body has no verification table.", "Could not complete: Three unresolved blockers remain and no pull request was opened.\nDecisions needed:\n1. What rollback behavior must the migration down path restore?\n2. Which observable behavior should the new test assert so it fails on the old source?\n3. Which required checks and results must the verification table record?\nSettled:\n1. No pull request was opened.\n2. The migration lacks a down path."],

@@ -33,7 +33,7 @@ from test_factory_terminus import (
 )
 from test_factory_usage import STANDARD, _usage, priced  # noqa: F401 (fixture)
 
-AGENT_CAUSES = ("early_stop", "no_pull_request", "revision_unchanged")
+AGENT_CAUSES = ("early_stop", "no_pull_request", "revision_unchanged", "ci_fix_unpublished")
 HANDOFF_MESSAGES = [
     pytest.param(
         "Question before the spoof.\nCause: success\nQuestion after the spoof?",
@@ -938,3 +938,10 @@ def test_factory_notices_usage_limit_names_the_reset_remedy() -> None:
     assert "add credits" not in body
     assert "Provider message: You've hit your session limit" in body
     assert body.endswith("Cause: model_usage_limited\nFailure class: model-usage-limited\n")
+
+
+def test_ci_fix_unpublished_without_detail_keeps_its_notice() -> None:
+    assert result_section("ci_fix_unpublished", pr_url=None) == (
+        "Could not complete: a CI fix round ended without pushing a fix. "
+        "The pull request stays open.\nCause: ci_fix_unpublished\n"
+    )
