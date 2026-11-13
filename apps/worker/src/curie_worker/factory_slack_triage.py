@@ -19,49 +19,6 @@ from typing import Any, Final
 from curie_internal.factory_triage import HandoffOutcome, TriageResult, slack_line
 
 TRIAGE_KIND: Final = "triage"
-_TRACKER_RESULT: Final = "tracker_result"
-
-
-def terminal_post_owed(requests_alias: str, deliveries: str) -> str:
-    """A SQL condition: the generic terminal post of ``requests_alias`` is owed.
-
-    True for every implementation request; for a tracker-result request only
-    while it has no owed or delivered result.
-    """
-
-    return f"""
-        ({requests_alias}.completion_contract <> '{_TRACKER_RESULT}'
-         OR NOT EXISTS (
-             SELECT 1
-               FROM {deliveries} d
-              WHERE d.execution_request_id = {requests_alias}.id
-                AND d.state IN ('owed', 'delivered')
-         ))
-    """
-
-
-def triage_posts_sql(*, posts: str, requests: str, receipts: str, live_threads: str) -> str:
-    """The insert of one ``triage`` post per delivered result of an eligible request."""
-
-    return f"""
-        INSERT INTO {posts} AS p
-               (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
-        SELECT t.work_item_id, 'triage:' || q.id, '{TRIAGE_KIND}', q.sequence, 3, 0,
-               jsonb_build_object(
-                   'result_kind', r.result_kind,
-                   'reason', r.reason,
-                   'revision', r.revision,
-                   'ticket_url', r.output_url,
-                   'result_comment_url', r.result_comment_url
-               )
-          FROM ({live_threads}) t
-          JOIN {requests} q
-            ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
-          JOIN {receipts} r
-            ON r.execution_request_id = q.id
-         WHERE q.completion_contract = '{_TRACKER_RESULT}'
-        ON CONFLICT (work_item_id, post_key) DO NOTHING
-    """
 
 
 def _text(payload: dict[str, Any], key: str) -> str | None:
@@ -107,4 +64,4 @@ def _handoff(payload: dict[str, Any]) -> HandoffOutcome | None:
     )
 
 
-__all__ = ["TRIAGE_KIND", "render_triage", "terminal_post_owed", "triage_posts_sql"]
+__all__ = ["TRIAGE_KIND", "render_triage"]

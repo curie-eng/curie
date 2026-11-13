@@ -76,12 +76,7 @@ from curie_channel_gateway.reply_errors import InvalidReplyTargetError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from .factory_slack_triage import (
-    TRIAGE_KIND,
-    render_triage,
-    terminal_post_owed,
-    triage_posts_sql,
-)
+from .factory_slack_triage import TRIAGE_KIND, render_triage
 from .reply_sink import ReplySink, TargetRoute
 
 logger = logging.getLogger(__name__)
@@ -311,17 +306,39 @@ class PostgresFactorySlackStore:
               JOIN {self._requests} q
                 ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
              WHERE q.terminal_at IS NOT NULL
-               AND {terminal_post_owed("q", self._deliveries)}
+               AND (
+                   q.completion_contract <> 'tracker_result'
+                   OR NOT EXISTS (
+                       SELECT 1
+                         FROM {self._deliveries} d
+                        WHERE d.execution_request_id = q.id
+                          AND d.state IN ('owed', 'delivered')
+                   )
+               )
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
+        # One triage post per delivered result. The kind literal matches TRIAGE_KIND.
         triages = text(
-            triage_posts_sql(
-                posts=self._posts,
-                requests=self._requests,
-                receipts=self._receipts,
-                live_threads=live_threads,
-            )
+            f"""
+            INSERT INTO {self._posts} AS p
+                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
+            SELECT t.work_item_id, 'triage:' || q.id, 'triage', q.sequence, 3, 0,
+                   jsonb_build_object(
+                       'result_kind', r.result_kind,
+                       'reason', r.reason,
+                       'revision', r.revision,
+                       'ticket_url', r.output_url,
+                       'result_comment_url', r.result_comment_url
+                   )
+              FROM ({live_threads}) t
+              JOIN {self._requests} q
+                ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
+              JOIN {self._receipts} r
+                ON r.execution_request_id = q.id
+             WHERE q.completion_contract = 'tracker_result'
+            ON CONFLICT (work_item_id, post_key) DO NOTHING
+            """
         )
         async with self._engine.begin() as connection:
             await connection.execute(discover)
