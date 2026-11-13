@@ -593,7 +593,11 @@ jobs:
           CURIE_E2E_LIVE: "1"
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
-        run: bash cli/scripts/e2e-ladder.sh
+        # The ladder never guesses a kube context; hand it the one kind-action
+        # selected, as ci.yaml's cluster rung does.
+        run: |
+          export CURIE_E2E_KUBE_CONTEXT="$(kubectl config current-context)"
+          bash cli/scripts/e2e-ladder.sh
       - name: Record a test failure
         if: ${{ failure() && steps.ladder.outcome == 'failure' }}
         run: echo test-failed >> "$GITHUB_STEP_SUMMARY"

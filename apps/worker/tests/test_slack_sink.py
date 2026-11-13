@@ -667,7 +667,7 @@ def test_post_renders_the_approval_card_from_a_confirm_intent() -> None:
             sink,
             channel="C1",
             message=_approval_message("appr-1", "Give ACME a 20% discount"),
-            requested_by="U_AE",
+            requested_by="U0EXAMPLE1",
             # A ts Slack could actually mint. It used to read "th-card", which no
             # real thread is named; the adapter now refuses a conversation id that
             # is not a timestamp, because a hook mints one that is not.
@@ -683,7 +683,7 @@ def test_post_renders_the_approval_card_from_a_confirm_intent() -> None:
     assert isinstance(blocks, list)
     assert blocks[0]["type"] == "header"  # type: ignore[index]
     assert "Give ACME a 20% discount" in blocks[1]["text"]["text"]  # type: ignore[index]
-    assert "<@U_AE>" in blocks[2]["elements"][0]["text"]  # type: ignore[index]
+    assert "<@U0EXAMPLE1>" in blocks[2]["elements"][0]["text"]  # type: ignore[index]
     actions = blocks[-1]  # type: ignore[index]
     assert actions["type"] == "actions"
     approve, reject = actions["elements"]
@@ -893,13 +893,13 @@ def test_an_expired_card_is_headed_expired_and_names_its_requester() -> None:
 
     captured = _settle(
         OutboundMessage(version=MESSAGE_VERSION, text="Discount ACME"),
-        SettledOutcome(requested_by="U9"),
+        SettledOutcome(requested_by="U0EXAMPLE9"),
     )
 
     blocks = captured["blocks"]
     assert isinstance(blocks, list)
     assert blocks[0]["text"]["text"] == "Expired"  # type: ignore[index]
-    assert "Requested by <@U9>" in str(blocks)
+    assert "Requested by <@U0EXAMPLE9>" in str(blocks)
     assert all(b.get("type") != "actions" for b in blocks)  # type: ignore[union-attr]
 
 

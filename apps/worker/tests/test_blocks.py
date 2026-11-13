@@ -430,12 +430,12 @@ def test_approval_card_shape_and_click_contract() -> None:
     fallback, card = approval_card(
         approval_id="appr-1",
         summary="Give ACME a 20% discount",
-        requested_by="U_AE",
+        requested_by="U0EXAMPLE1",
     )
     assert "Give ACME a 20% discount" in fallback
     assert card[0]["type"] == "header"
     assert "Give ACME a 20% discount" in card[1]["text"]["text"]
-    assert "<@U_AE>" in card[2]["elements"][0]["text"]
+    assert "<@U0EXAMPLE1>" in card[2]["elements"][0]["text"]
 
     actions = card[-1]
     assert actions["type"] == "actions"
@@ -700,13 +700,122 @@ def test_an_expired_card_still_names_its_requester() -> None:
 
     from curie_channel_gateway.slack.blocks import expired_approval_card
 
-    _fallback, card = expired_approval_card(summary="Refund order 42", requested_by="U_AE")
+    _fallback, card = expired_approval_card(
+        summary="Refund order 42", requested_by="U0EXAMPLE1"
+    )
 
     assert {
         "type": "context",
-        "elements": [{"type": "mrkdwn", "text": "Requested by <@U_AE>"}],
+        "elements": [{"type": "mrkdwn", "text": "Requested by <@U0EXAMPLE1>"}],
     } in card
     assert "expired" in str(card[-1]).lower()
+
+
+def _assert_requester_identity_across_approval_states(requested_by: str) -> None:
+    """Assert one requester value on the pending, resolved and expired cards.
+
+    A mention is only for a Slack user id. Every other nonempty requester is
+    literal plain_text, and an empty requester omits the line. All three card
+    states render it one way (ADR-0179), so all three real builders are asserted.
+    """
+
+    from curie_channel_gateway.slack.blocks import (
+        approval_card,
+        expired_approval_card,
+        resolved_approval_card,
+    )
+
+    cards = {
+        "pending": approval_card(
+            approval_id="appr-1", summary="Refund order 42", requested_by=requested_by,
+        )[1],
+        "resolved": resolved_approval_card(
+            summary="Refund order 42",
+            requested_by=requested_by,
+            decision="approved",
+            resolver="U0MANAGER1",
+            note=None,
+        )[1],
+        "expired": expired_approval_card(
+            summary="Refund order 42", requested_by=requested_by,
+        )[1],
+    }
+
+    for state, blocks in cards.items():
+        requester_blocks = [
+            block
+            for block in blocks
+            if block.get("type") == "context"
+            and any("Requested by" in str(element) for element in block["elements"])
+        ]
+        if not requested_by:
+            # Omitted, never rendered empty: "Requested by <@>" reads as a bug.
+            assert requester_blocks == [], (state, blocks)
+            continue
+        assert len(requester_blocks) == 1, (state, blocks)
+        element = requester_blocks[0]["elements"][0]
+        if requested_by in ("U0EXAMPLE1", "W0EXAMPLE1"):
+            assert element == {
+                "type": "mrkdwn",
+                "text": f"Requested by <@{requested_by}>",
+            }, (state, element)
+        else:
+            assert element == {
+                "type": "plain_text",
+                "text": f"Requested by {requested_by}",
+                "emoji": False,
+            }, (state, element)
+            # Untrusted requester text cannot introduce a mention: no element
+            # on any card state wraps it in Slack's mention syntax. Both the
+            # raw form and its JSON-escaped spelling are checked, so control
+            # characters (the trailing-newline param) cannot slip the guard.
+            rendered = json.dumps(blocks)
+            assert f"<@{requested_by}>" not in rendered, (state, blocks)
+            assert f'<@{json.dumps(requested_by)[1:-1]}>' not in rendered, (state, blocks)
+
+
+@pytest.mark.parametrize(
+    "requested_by",
+    [
+        "requester@example.com",
+        "Ada Lovelace",
+        "<@U0EXAMPLE1>",
+        "U0EXAMPLE1\n",
+    ],
+)
+def test_requester_identity_renders_safely_across_approval_states(
+    requested_by: str,
+) -> None:
+    """#5515: non-id requester text renders as literal text, never a mention.
+
+    The requester field is untrusted display input. A live card once rendered
+    ``Requested by <@requester@example.com>`` -- a mention attempt wrapping the
+    address. Email, a display name, mention-shaped text and a trailing-newline
+    id are not Slack user ids, so each renders as literal plain_text. These are
+    the inputs whose expected output changes with that fix.
+    """
+
+    _assert_requester_identity_across_approval_states(requested_by)
+
+
+@pytest.mark.parametrize(
+    "requested_by",
+    [
+        "U0EXAMPLE1",
+        "W0EXAMPLE1",
+        "",
+    ],
+)
+def test_requester_identity_keeps_id_mentions_and_omits_empty(
+    requested_by: str,
+) -> None:
+    """Valid Slack user ids stay mentions, and an empty requester stays omitted.
+
+    Those outputs match the previous renderer, so they are not part of the fix
+    pin. The same three builders still cover pending, resolved and expired.
+    """
+
+    _assert_requester_identity_across_approval_states(requested_by)
 
 
 def test_expired_approval_card_clamps_oversized_summary() -> None:
