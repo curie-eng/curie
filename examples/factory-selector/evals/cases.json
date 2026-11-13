@@ -6,7 +6,7 @@
       "input": "Select factory work from the policy and report the outcome of this run.",
       "grader": {
         "kind": "regex",
-        "expected": "(?s)\\ALabelled:\\n(?:#[0-9]+ [^ \\t\\n][^\\n]*\\n)+Skipped:\\n(?:(?:#[0-9]+ [^ \\t\\n][^\\n]*\\n)+(?:[^\\n#][^\\n]*\\n)*(?:[^\\n#][^\\n]*)?|(?:#[0-9]+ [^ \\t\\n][^\\n]*\\n)*#[0-9]+ [^ \\t\\n][^\\n]*)\\z",
+        "expected": "(?s)\\ALabelled:\\n(?:#[0-9]+ [^ \\t\\n][^\\n]*\\n)+Skipped:\\n(?:(?:#[0-9]+ [^ \\t\\n][^\\n]*\\n)+(?:[^\\n#][^\\n]*\\n)*(?:[^\\n#][^\\n]*)?|(?:#[0-9]+ [^ \\t\\n][^\\n]*\\n)*#[0-9]+ [^ \\t\\n][^\\n]*)$",
         "case_sensitive": true
       }
     },
