@@ -8035,6 +8035,236 @@
         "title": "FactoryContext",
         "type": "object"
       },
+      "FactoryRunAnalysisOut": {
+        "properties": {
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/FactoryRunEvidenceOut"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "immediate_cause": {
+            "title": "Immediate Cause",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "immediate_cause",
+          "summary",
+          "evidence"
+        ],
+        "title": "FactoryRunAnalysisOut",
+        "type": "object"
+      },
+      "FactoryRunEventOut": {
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "phase",
+              "publication",
+              "state",
+              "terminal"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phase"
+          },
+          "reference_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Url"
+          },
+          "round": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "at",
+          "kind",
+          "text"
+        ],
+        "title": "FactoryRunEventOut",
+        "type": "object"
+      },
+      "FactoryRunEvidenceOut": {
+        "properties": {
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "statement": {
+            "title": "Statement",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "statement"
+        ],
+        "title": "FactoryRunEvidenceOut",
+        "type": "object"
+      },
+      "FactoryRunReportOut": {
+        "properties": {
+          "analysis": {
+            "$ref": "#/components/schemas/FactoryRunAnalysisOut"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/FactoryRunEventOut"
+            },
+            "title": "Events",
+            "type": "array"
+          },
+          "execution_request_id": {
+            "format": "uuid",
+            "title": "Execution Request Id",
+            "type": "string"
+          },
+          "sources": {
+            "$ref": "#/components/schemas/FactoryRunSourcesOut"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "terminal_at": {
+            "format": "date-time",
+            "title": "Terminal At",
+            "type": "string"
+          },
+          "terminal_cause": {
+            "title": "Terminal Cause",
+            "type": "string"
+          },
+          "trace_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Trace Ids",
+            "type": "array"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "execution_request_id",
+          "status",
+          "terminal_cause",
+          "terminal_at",
+          "sources",
+          "trace_ids",
+          "events",
+          "analysis"
+        ],
+        "title": "FactoryRunReportOut",
+        "type": "object"
+      },
+      "FactoryRunSourcesOut": {
+        "properties": {
+          "artifacts": {
+            "enum": [
+              "complete",
+              "unavailable",
+              "truncated"
+            ],
+            "title": "Artifacts",
+            "type": "string"
+          },
+          "phase_reports": {
+            "enum": [
+              "complete",
+              "missing",
+              "truncated"
+            ],
+            "title": "Phase Reports",
+            "type": "string"
+          },
+          "publications": {
+            "enum": [
+              "complete",
+              "missing",
+              "truncated"
+            ],
+            "title": "Publications",
+            "type": "string"
+          },
+          "state_changes": {
+            "enum": [
+              "partial",
+              "truncated"
+            ],
+            "title": "State Changes",
+            "type": "string"
+          },
+          "traces": {
+            "enum": [
+              "time_matched",
+              "missing",
+              "truncated",
+              "unavailable"
+            ],
+            "title": "Traces",
+            "type": "string"
+          }
+        },
+        "required": [
+          "phase_reports",
+          "state_changes",
+          "publications",
+          "traces",
+          "artifacts"
+        ],
+        "title": "FactoryRunSourcesOut",
+        "type": "object"
+      },
       "FactorySlackSteerIn": {
         "additionalProperties": false,
         "description": "One threaded Slack mention in a factory run's root, as the worker consumed it.\n\n``receipt`` is the dispatcher's verified mention receipt\n(``curie_internal.slack_mention_receipt.SlackMentionReceipt``), validated by\nthe route so a malformed one is a refusal, not a retry. ``author`` is the\nturn's Slack user id; the receipt must name the same delivery, route and\nsender.",
@@ -17634,6 +17864,11 @@
             ],
             "title": "Execution Deadline"
           },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
           "last_deferral_reason": {
             "anyOf": [
               {
@@ -17757,6 +17992,7 @@
           }
         },
         "required": [
+          "id",
           "sequence",
           "status",
           "created_at",
@@ -36513,6 +36749,83 @@
         ]
       }
     },
+    "/work-items/runs/{request_id}/report": {
+      "get": {
+        "description": "Inspect a run directly when its request ID is all the operator has.",
+        "operationId": "get_run_report_by_id_work_items_runs__request_id__report_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactoryRunReportOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Run Report By Id",
+        "tags": [
+          "work-items"
+        ]
+      }
+    },
     "/work-items/{work_item_id}": {
       "get": {
         "operationId": "get_work_item_work_items__work_item_id__get",
@@ -36798,6 +37111,93 @@
         "summary": "Object Download",
         "tags": [
           "workspace-recovery"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/runs/{request_id}/report": {
+      "get": {
+        "description": "Read one terminal execution's retained diagnostic record (#5601).",
+        "operationId": "get_run_report_work_items__work_item_id__runs__request_id__report_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FactoryRunReportOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Run Report",
+        "tags": [
+          "work-items"
         ]
       }
     },

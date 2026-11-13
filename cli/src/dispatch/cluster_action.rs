@@ -1502,6 +1502,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         }
         ClusterAction::WorkItems {
             id,
+            report,
             agent,
             conn,
             dry_run,
@@ -1509,6 +1510,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             // Validate before any network access, through the centralized
             // structured error path (cli/CLAUDE.md error contract).
             let id = commands::validated_work_item_id(id)?;
+            let report = commands::validated_work_item_id(report)?;
             // `_cluster_api_pf` is the port-forward guard; it must live for
             // the whole call.
             let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
@@ -1524,6 +1526,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     api_url,
                     api_key,
                     id,
+                    report,
                     agent,
                     dry_run,
                     tier: "cluster",

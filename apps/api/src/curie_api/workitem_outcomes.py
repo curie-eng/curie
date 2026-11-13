@@ -387,6 +387,7 @@ def _safe_termination(observation: str | None) -> str | None:
 
 def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
     return WorkItemRequestOut(
+        id=req.id,
         sequence=req.sequence,
         status=req.status,
         created_at=req.created_at,

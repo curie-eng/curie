@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/work-items/v2.1.json",
+  "$id": "https://schemas.curietech.ai/cli/work-items/v2.2.json",
   "title": "curie <tier> work-items --json",
   "description": "The agent-facing payload of `curie <tier> work-items [ID]`: the dry-run plan, the factory work item list (`items`, `limit`, `truncated`), or one work item under `item` with live CI. `state` and `actionable_cause` are the platform API's strings, never derived by the CLI.",
   "$defs": {
@@ -27,6 +27,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "id",
         "sequence",
         "status",
         "created_at",
@@ -40,6 +41,9 @@
         "last_deferral_reason"
       ],
       "properties": {
+        "id": {
+          "type": "string"
+        },
         "sequence": {
           "type": "integer"
         },
@@ -447,6 +451,27 @@
         }
       }
     },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["report"],
+      "properties": {
+        "report": {
+          "type": "object",
+          "required": ["work_item_id", "execution_request_id", "status", "terminal_cause", "terminal_at", "sources", "events", "analysis"],
+          "properties": {
+            "work_item_id": { "type": "string" },
+            "execution_request_id": { "type": "string" },
+            "status": { "type": "string" },
+            "terminal_cause": { "type": "string" },
+            "terminal_at": { "type": "string" },
+            "sources": { "type": "object" },
+            "events": { "type": "array", "items": { "type": "object" } },
+            "analysis": { "type": "object" }
+          }
+        }
+      }
+    },
     "detail": {
       "type": "object",
       "additionalProperties": false,
@@ -466,6 +491,9 @@
     },
     {
       "$ref": "#/$defs/detail"
+    },
+    {
+      "$ref": "#/$defs/report"
     },
     {
       "$ref": "#/$defs/dryRun"
