@@ -209,7 +209,7 @@ def test_budget_exhausted_is_platform_only() -> None:
         ("command", "reproduction.command"),
     ],
 )
-def test_a_lone_surrogate_is_a_text_issue_not_an_encode_error(field: str, path: str) -> None:
+def test_a_lone_surrogate_is_a_proposal_issue_not_an_encode_error(field: str, path: str) -> None:
     # A JSON "\ud800" escape decodes to a lone surrogate, which UTF-8 cannot
     # encode, so the proposal digest would raise UnicodeEncodeError (review).
     ticket: dict[str, Any] = {
@@ -231,7 +231,8 @@ def test_a_lone_surrogate_is_a_text_issue_not_an_encode_error(field: str, path: 
         raw[field] = "x \ud800"
     with pytest.raises(ProposalInvalid) as refused:
         parse_proposal(raw)
-    assert [(issue.field, issue.code) for issue in refused.value.issues] == [(path, "text")]
+    # Pydantic's strict string check refuses it before any digest is taken.
+    assert [(issue.field, issue.code) for issue in refused.value.issues] == [(path, "type")]
     # Liveness: the same proposal without the surrogate parses and digests.
     if field == "command":
         raw["reproduction"]["command"] = "run \u00e9"
