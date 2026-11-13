@@ -14,7 +14,11 @@ two independently enrolled owners need:
 4. per-owner state (``Owner``), a fence that scales the worker to zero, deletes
    the run agent's claims and runner pods and disconnects every active owner,
    and a per-owner fence;
-5. the unpaid rehearsal's admission, disconnect and restart controls.
+5. the unpaid drill in both modes (cards delivered and answered before a live
+   run's first reservation), and the rehearsal's admission, adoption,
+   disconnect and restart controls;
+6. the finalize capture audit (logs, events, API and publication captures and
+   traces, scanned in memory) and the approval-card residue record.
 
 Every input comes from the private ``--inputs-file`` descriptor
 (``personal_two_owner_support.load_inputs_file``). No held value (grant,
@@ -23,9 +27,9 @@ password) is printed, logged, recorded or placed in a child's argv; the CLI
 reads session and token files the driver writes 0600 into the private work
 directory, and the finalizer removes them.
 
-The paid phases (``PAID_PHASES``) follow the live timeline: a grant probe per
-owner, A1 and B1 parked on their cards with A1's pod deleted at the park, the
-wrong-owner controls, A1's rejection and its fresh successor A2, both
+After the drill, the paid phases (``PAID_PHASES``) follow the live timeline: a
+grant probe per owner, A1 and B1 parked on their cards with A1's pod deleted at
+the park, the wrong-owner controls, A1's rejection and its fresh successor A2, both
 approvals, a worker stop that lets B's real failing check queue the
 production repair, A's follow-up A3, the worker restart, B-r1 held at its
 prompt while A3 runs one tool, A's disconnect, the process interruption that
@@ -80,10 +84,11 @@ StepFailed = pp.StepFailed
 # Phases
 # --------------------------------------------------------------------------
 
-#: Unpaid phases every run takes, in order.
-UNPAID_PHASES = ("refusals", "namespace", "images", "install", "setup", "forge")
-#: The rehearsal-only unpaid phases after setup and forge.
-REHEARSAL_ONLY_PHASES = ("drill", "rehearsal-controls")
+#: Unpaid phases every run takes, in order. The drill proves card delivery
+#: through the channel gateway before a live run's first reservation.
+UNPAID_PHASES = ("refusals", "namespace", "images", "install", "setup", "forge", "drill")
+#: The rehearsal-only unpaid phases after the drill.
+REHEARSAL_ONLY_PHASES = ("rehearsal-controls",)
 #: The last phase a rehearsal runs; the fence and the finalizer follow it.
 REHEARSAL_CUT = "rehearsal-controls"
 #: The paid phases, in the live timeline's order.
@@ -1148,7 +1153,13 @@ class TwoOwnerRun(pp.LiveRun):
         self.custody_seen: set[str] = set()
         self.claims_seen: set[str] = set()
         self.worker_observations: list[dict[str, Any]] = []
-        self.cards: list[str] = []
+        # Every approval card the run created, drill cards included: card name
+        # (``drill_reject``, ``card1``...) -> its publication's digest.
+        self.cards: dict[str, str] = {}
+        # The same cards' publication ids, held in memory for the capture audit.
+        self.card_publications: dict[str, str] = {}
+        # The rendered helm values, once install computed them (the trace backend).
+        self.install_values: dict[str, Any] | None = None
         self.owner_dir = inputs.work_dir / "owners"
         # -- paid-phase state ------------------------------------------------
         self.gate_factory = gate_factory
@@ -1220,13 +1231,10 @@ class TwoOwnerRun(pp.LiveRun):
             ("install", self.phase_install),
             ("setup", self.phase_setup),
             ("forge", self.phase_forge),
+            ("drill", self.phase_drill),
         ]
         if self.scenario_rehearsal:
-            return [
-                *unpaid,
-                ("drill", self.phase_drill),
-                ("rehearsal-controls", self.phase_rehearsal_controls),
-            ]
+            return [*unpaid, ("rehearsal-controls", self.phase_rehearsal_controls)]
         return [*unpaid, *self.paid_phases()]
 
     def paid_phases(self) -> list[tuple[str, Callable[[], None]]]:
@@ -2469,9 +2477,9 @@ class TwoOwnerRun(pp.LiveRun):
             ),
             "",
         )
-        self.cards.append(pps.ref_digest(run.approval_id))
         if not run.publication_id:
             self.fail_paid(f"card {run.card} has no publication")
+        self.cards[f"card{run.card}"] = pps.ref_digest(run.publication_id)
         self.record_publication_branch(run)
         run.branch_known = True
         self.no_push[run.card] = self.unpushed(run)
@@ -3026,7 +3034,7 @@ class TwoOwnerRun(pp.LiveRun):
         self.require({"lineage": lineage, "marker": marker}, "attempt B1")
 
     def phase_wrong_owner(self) -> None:
-        """B names itself on A's issue, replays A1's request and reads A's context."""
+        """B names itself on A's issue, replays A1's request, reads A's context and adopts it."""
 
         self.require_live("wrong-owner")
         a, b = self.owners["a"], self.owners["b"]
@@ -3061,6 +3069,10 @@ class TwoOwnerRun(pp.LiveRun):
             "admission_request_count_unchanged": controls["request_count_unchanged"],
             "replay_owner_b_refused": controls["replay_owner_b_refused"],
             "personal_context_b_hidden": controls["personal_context_b_hidden"],
+            "adoption_b_refused": controls["adoption_b_refused"],
+            "adoption_a_binding_unchanged": controls["adoption_a_binding_unchanged"],
+            "adoption_no_request": controls["adoption_no_request"],
+            "adoption_owner_control": controls["adoption_owner_control"],
             "a_marker_unchanged": before is not None
             and before == after
             and self.markers.get("a", "") in (after or []),
@@ -3917,33 +3929,11 @@ class TwoOwnerRun(pp.LiveRun):
     def revalidate(self, owner: Owner, run: PodRun) -> bool:
         """Revalidating the WorkItem at the versions read now answers enrollment_inactive."""
 
-        query = urllib.parse.urlencode(
-            {
-                "tenant_id": owner.tenant_id,
-                "agent_id": self.agent_id,
-                "owner_principal_id": owner.principal_id,
-            }
-        )
-        status, context = self.internal(
-            "GET", f"/v1/internal/work-items/{run.work_item_id}/personal-context?{query}"
-        )
-        request = context.get("request") if isinstance(context, dict) else None
-        enrollment = context.get("enrollment") if isinstance(context, dict) else None
-        if status != 200 or not isinstance(request, dict) or not isinstance(enrollment, dict):
+        status, context = self.personal_context(owner, run.work_item_id)
+        versions = pto.context_versions(context) if status == 200 else None
+        if versions is None:
             return False
-        code, body = self.internal(
-            "POST",
-            f"/v1/internal/work-items/{run.work_item_id}/personal-context/revalidate",
-            {
-                "tenant_id": owner.tenant_id,
-                "agent_id": self.agent_id,
-                "owner_principal_id": owner.principal_id,
-                "request_id": str(request.get("id")),
-                "expected_work_item_version": context.get("work_item_version"),
-                "expected_request_version": request.get("version"),
-                "expected_enrollment_version": enrollment.get("version"),
-            },
-        )
+        code, body = self.revalidate_as(owner, run.work_item_id, versions)
         return code == 409 and self.code_of(body) == "enrollment_inactive"
 
     # -- the native-process interruption and grant delivery ---------------------------
@@ -4432,6 +4422,7 @@ class TwoOwnerRun(pp.LiveRun):
             client_id=pto.OIDC_CLIENT_ID,
             client_secret_ref=(OIDC_SECRET, OIDC_SECRET_KEY),
         )
+        self.install_values = values
         values_file = work / "values.json"
         self.finalizer.register("delete-values-file", lambda: values_file.unlink(missing_ok=True))
         pp.write_private(values_file, json.dumps(values, indent=2).encode())
@@ -5130,25 +5121,107 @@ class TwoOwnerRun(pp.LiveRun):
                 return False
         return True
 
-    # -- phase 6b: the drill (rehearsal only) ---------------------------------------------
+    # -- phase 6b: the drill (unpaid, before the first paid phase) ------------------------
+
+    def await_card(self, publication_id: str, key: str) -> None:
+        """Register the card before waiting for it, so the card residue names it either way."""
+
+        self.card_publications[key] = publication_id
+        self.cards[key] = pps.ref_digest(publication_id)
+        super().await_card(publication_id, key)
 
     def phase_drill(self) -> None:
-        try:
-            super().phase_drill()
-        finally:
-            if self.rehearsal:
-                self.record_drill_keys()
+        """Unpaid in both modes: routed cards are delivered and answered before any paid phase.
 
-    def drill_publication(self, label: str) -> str:
-        approval_id = super().drill_publication(label)
-        self.cards.append(pps.ref_digest(approval_id))
-        return approval_id
+        The single-profile drill (``pp.LiveRun.phase_drill``, rehearsal only
+        there): two publications in a factory publication's shape on the run's
+        agent, each card delivered by the channel gateway before anyone
+        answers, the unlisted operator refused by the explicit list, the
+        allowed operator rejecting the first and approving the second. The
+        two-owner live run takes it after forge and before ``probe-a``, so an
+        unusable bot credential or resolution channel fails before any
+        reservation or native start. Neither publication starts a native
+        session: a publication approval owes no model wake (apps/api
+        routers/approvals.py, purpose ``publication``), and the approved one's
+        push Job, not a runner, fails fetching its all-zero base commit before
+        any push (apps/worker publication_k8s.py). Its keys go to
+        ``rehearsal`` in a rehearsal and to ``approval`` in a live run.
+        """
+
+        try:
+            self.run_drill("rehearsal" if self.rehearsal else "approval")
+        finally:
+            self.record_drill_keys()
+
+    def run_drill(self, section: str) -> None:
+        if self.allowed_token is None or self.unlisted_token is None:
+            raise StepFailed("an operator principal was not minted")
+        first = self.drill_publication("reject")
+        second = self.drill_publication("approve")
+        refused = self.resolve(first, self.unlisted_token)
+        unlisted = self.record_resolution(
+            "drill_unlisted", refused, self.audit(first), self.unlisted_subject
+        )
+        pending = self.approval(first).get("status") == "pending"
+        checks = {
+            "drill_unlisted_refused_by_list": unlisted["http_status"] == 403
+            and unlisted["audit_authorizer"] == pps.EXPLICIT_USERS_AUTHORIZER
+            and pending,
+            "drill_reject_resolved": self.drill_resolve(first, "rejected"),
+            "drill_approve_resolved": self.drill_resolve(second, "approved"),
+            "drill_started_nothing": self.drill_started_nothing(),
+            "drill_pushed_nothing": self.drill_pushed_nothing(),
+        }
+        for key, value in checks.items():
+            self.ledger.record(section, key, value)
+        failed = sorted(key for key, value in checks.items() if not value)
+        if failed:
+            raise StepFailed("publication drill failed: " + ", ".join(failed))
+
+    def drill_resolve(self, approval_id: str, decision: Literal["approved", "rejected"]) -> bool:
+        """The allowed operator answers one drill card; the audit names it as operator."""
+
+        extra = ("--reject", "--note", "drill rejection") if decision == "rejected" else ()
+        result = self.resolve(approval_id, self.allowed_token, *extra)
+        audit = self.audit(approval_id)
+        step = "drill_reject" if decision == "rejected" else "drill_approve"
+        self.record_resolution(step, result, audit, self.allowed_subject)
+        return (
+            result.returncode == 0
+            and self.approval(approval_id).get("status") == decision
+            and pps.audit_row(
+                audit,
+                action="resolved",
+                subject=self.allowed_subject,
+                authorized=True,
+                decision=decision,
+            )
+        )
+
+    def drill_started_nothing(self) -> bool:
+        """No runner claim of the run's agent and no reserved session after the drill."""
+
+        return not self.agent_claims() and not self.owner_ledger.session_rows()
+
+    def drill_pushed_nothing(self) -> bool:
+        """The approved drill publication's API-reported branch has no head and no pull request.
+
+        The branch is owned by the run from here, so the absence inventory
+        checks it again after teardown.
+        """
+
+        record = self.publication(self.card_publications.get("drill_approve", ""))
+        branch = str(record.get("branch") or "")
+        if not pps.publication_branch_valid(branch):
+            return False
+        if branch not in self.publication_branches:
+            self.publication_branches.append(branch)
+        return self.branch_head(branch) is None and not self.branch_pulls(branch)
 
     def record_drill_keys(self) -> None:
-        """The drill's evidence under ``pto.REHEARSAL_EXPECTED`` names."""
+        """The drill's summary: ``pto.REHEARSAL_EXPECTED`` names, or approval ones live."""
 
         approval = self.ledger.observations("approval")
-        rehearsal = self.ledger.observations("rehearsal")
         delivered = all(
             isinstance(approval.get(f"drill_{label}_card"), dict)
             and approval[f"drill_{label}_card"].get("delivered") is True
@@ -5156,10 +5229,14 @@ class TwoOwnerRun(pp.LiveRun):
         )
         unlisted = approval.get("cli_drill_unlisted")
         status = unlisted.get("http_status") if isinstance(unlisted, dict) else None
+        status = status if type(status) is int else None
+        if not self.rehearsal:
+            self.ledger.record("approval", "drill_cards_delivered", delivered)
+            self.ledger.record("approval", "drill_unlisted_status", status)
+            return
+        rehearsal = self.ledger.observations("rehearsal")
         self.ledger.record("rehearsal", "card_delivered", delivered)
-        self.ledger.record(
-            "rehearsal", "card_unlisted_status", status if type(status) is int else None
-        )
+        self.ledger.record("rehearsal", "card_unlisted_status", status)
         self.ledger.record(
             "rehearsal", "card_rejected_by_operator", rehearsal.get("drill_reject_resolved") is True
         )
@@ -5172,7 +5249,7 @@ class TwoOwnerRun(pp.LiveRun):
     # -- the rehearsal controls --------------------------------------------------------------
 
     def phase_rehearsal_controls(self) -> None:
-        """Unpaid: wrong-owner admission controls with the worker stopped, then disconnect.
+        """Unpaid: wrong-owner admission and adoption controls, worker stopped, then disconnect.
 
         A, then a worker restart: A's new admission is refused and no A claim
         appears, while B stays active. Nothing here starts a native session:
@@ -5207,6 +5284,10 @@ class TwoOwnerRun(pp.LiveRun):
                 "replay_owner_b_refused",
                 "personal_context_b_hidden",
                 "personal_context_a_readable",
+                "adoption_b_refused",
+                "adoption_a_binding_unchanged",
+                "adoption_no_request",
+                "adoption_owner_control",
                 "no_request_started",
             )
         )
@@ -5329,49 +5410,126 @@ class TwoOwnerRun(pp.LiveRun):
     def wrong_owner_controls(
         self, owner: Owner, other: Owner, work_item_id: str, request_id: str
     ) -> dict[str, bool]:
-        """``other`` names itself on ``owner``'s issue, replays its request and reads its context.
+        """``other`` names itself on ``owner``'s issue, replays, reads and adopts its WorkItem.
 
         Expected answers (apps/api/src/curie_api/personal_execution.py
-        ``existing_work_item_refusal`` then ``compare_owner``; routers/
-        work_items.py): 409 ``{"detail": {"code": "owner_mismatch"}}`` for a new
-        admission and for a replay, and 404 ``{"detail": {"code": "not_found"}}``
-        for the owner-scoped personal-context read.
+        ``existing_work_item_refusal`` then ``compare_owner``, ``read_context``
+        and ``revalidate``; routers/work_items.py): 409 ``{"detail": {"code":
+        "owner_mismatch"}}`` for a new admission and for a replay, 404
+        ``{"detail": {"code": "not_found"}}`` for the owner-scoped
+        personal-context read, and 409 ``owner_mismatch`` for the adoption:
+        ``other`` revalidating ``owner``'s WorkItem onto its own enrollment
+        with its tenant, agent and principal at the WorkItem and request
+        versions ``owner`` reads now and ``other``'s current enrollment
+        version. The authorized control is ``owner``'s own revalidation at the
+        same versions: it passes the owner check and answers 409
+        ``generation_current`` (the WorkItem is bound to the active
+        generation) or ``runtime_live`` (A1's runtime has no termination
+        receipt yet), so it rebinds nothing and the planned scenario keeps
+        A's binding. ``owner``'s binding and versions are compared before and
+        after every control, and no request may be created or started.
         """
 
-        before = len(self.work_item_of(work_item_id).get("requests") or [])
+        def rows() -> list[dict[str, Any]]:
+            requests = self.work_item_of(work_item_id).get("requests") or []
+            return [row for row in requests if isinstance(row, dict)]
+
+        def started(found: list[dict[str, Any]]) -> set[str]:
+            return {str(row.get("id")) for row in found if row.get("started_at")}
+
+        first_rows = rows()
         status, body = self.admit_owner(other, issue_owner=owner)
         foreign = status == 409 and self.code_of(body) == "owner_mismatch"
-        after_item = self.work_item_of(work_item_id)
-        after = len(after_item.get("requests") or [])
+        after_rows = rows()
         replay_status, replay = self.admit_owner(other, issue_owner=owner, request_id=request_id)
         replayed = replay_status == 409 and self.code_of(replay) == "owner_mismatch"
-
-        def context(reader: Owner) -> tuple[int, Any]:
-            query = urllib.parse.urlencode(
-                {
-                    "tenant_id": reader.tenant_id,
-                    "agent_id": self.agent_id,
-                    "owner_principal_id": reader.principal_id,
-                }
+        hidden_status, hidden = self.personal_context(other, work_item_id)
+        own_status, own = self.personal_context(owner, work_item_id)
+        binding = pto.context_binding(own) if own_status == 200 else None
+        versions = pto.context_versions(own) if own_status == 200 else None
+        adopted = self.adoption(other, work_item_id, versions)
+        between_status, between = self.personal_context(owner, work_item_id)
+        reached = False
+        if versions is not None:
+            own_code, own_answer = self.revalidate_as(owner, work_item_id, versions)
+            reached = own_code == 409 and self.code_of(own_answer) in pto.OWNER_REVALIDATION_CODES
+        final_status, final = self.personal_context(owner, work_item_id)
+        final_rows = rows()
+        bound = (
+            binding is not None
+            and binding["owner_principal_id"] == owner.principal_id
+            and binding["tenant_id"] == owner.tenant_id
+            and binding["enrollment_generation"] == pps.OWNER_GENERATION
+            and all(
+                code == 200 and pto.context_binding(answer) == binding
+                for code, answer in ((between_status, between), (final_status, final))
             )
-            return self.internal(
-                "GET", f"/v1/internal/work-items/{work_item_id}/personal-context?{query}"
-            )
-
-        hidden_status, hidden = context(other)
-        own_status, own = context(owner)
-        requests = [row for row in after_item.get("requests") or [] if isinstance(row, dict)]
+        )
         return {
             "b_on_a_issue_refused": foreign,
-            "request_count_unchanged": before == after,
+            "request_count_unchanged": len(first_rows) == len(after_rows),
             "replay_owner_b_refused": replayed,
             "personal_context_b_hidden": hidden_status == 404
             and self.code_of(hidden) == "not_found",
             "personal_context_a_readable": own_status == 200 and isinstance(own, dict),
-            "no_request_started": bool(requests)
-            and all(not row.get("started_at") for row in requests),
-            "owner_unchanged": pps.owner_matches(pps.owner_of(after_item), owner.tuple()),
+            "adoption_b_refused": adopted,
+            "adoption_a_binding_unchanged": bound,
+            "adoption_no_request": bool(first_rows)
+            and len(final_rows) == len(first_rows)
+            and started(final_rows) == started(first_rows),
+            "adoption_owner_control": reached and bound,
+            "no_request_started": bool(final_rows)
+            and all(not row.get("started_at") for row in final_rows),
+            "owner_unchanged": pps.owner_matches(
+                pps.owner_of(self.work_item_of(work_item_id)), owner.tuple()
+            ),
         }
+
+    def personal_context(self, reader: Owner, work_item_id: str) -> tuple[int, Any]:
+        """``GET .../personal-context`` scoped to ``reader``'s tenant and principal."""
+
+        query = urllib.parse.urlencode(
+            {
+                "tenant_id": reader.tenant_id,
+                "agent_id": self.agent_id,
+                "owner_principal_id": reader.principal_id,
+            }
+        )
+        return self.internal(
+            "GET", f"/v1/internal/work-items/{work_item_id}/personal-context?{query}"
+        )
+
+    def revalidate_as(
+        self, caller: Owner, work_item_id: str, versions: Mapping[str, Any]
+    ) -> tuple[int, Any]:
+        """``POST .../personal-context/revalidate`` as ``caller`` at ``versions``."""
+
+        return self.internal(
+            "POST",
+            f"/v1/internal/work-items/{work_item_id}/personal-context/revalidate",
+            {
+                "tenant_id": caller.tenant_id,
+                "agent_id": self.agent_id,
+                "owner_principal_id": caller.principal_id,
+                **versions,
+            },
+        )
+
+    def adoption(self, other: Owner, work_item_id: str, versions: Mapping[str, Any] | None) -> bool:
+        """``other`` binds the WorkItem to its own enrollment: 409 ``owner_mismatch``.
+
+        The WorkItem and request versions are the ones the owner read now, the
+        enrollment version ``other``'s own current one from its status.
+        """
+
+        code, status = self.subscription(other, "status")
+        enrollment = status.get("version") if code == 0 else None
+        if versions is None or type(enrollment) is not int or status.get("state") != "active":
+            return False
+        answer_code, answer = self.revalidate_as(
+            other, work_item_id, {**versions, "expected_enrollment_version": enrollment}
+        )
+        return answer_code == 409 and self.code_of(answer) == "owner_mismatch"
 
     def cancel_work_item(self, work_item_id: str) -> None:
         """``POST /v1/internal/work-items/{id}/cancel`` at the current version (#5378's route)."""
@@ -5805,9 +5963,10 @@ class TwoOwnerRun(pp.LiveRun):
         stop before anything waits for the worker's graceful exit. The
         watchdog is stopped around it. Only then are open sessions charged at
         their share, the summary keys gathered and the gate streams closed.
-        Every remaining teardown step runs even past CLEANUP_SECONDS; a
-        cleanup longer than that is recorded as a breach the cleanup judge
-        fails (``cleanup_within_window``).
+        The capture audit (``capture_audit``) follows, before any teardown
+        removes what it reads. Every remaining teardown step runs even past
+        CLEANUP_SECONDS; a cleanup longer than that is recorded as a breach
+        the cleanup judge fails (``cleanup_within_window``).
         """
 
         started = self.clock.monotonic()
@@ -5823,6 +5982,8 @@ class TwoOwnerRun(pp.LiveRun):
             if run.gate is not None and not run.closed:
                 self.safe(run.gate.close, None)
                 run.closed = True
+        if self.mutated:
+            self.capture_audit()
         ok = super().finalize()
         if self.mutated:
             self.record_cleanup_keys()
@@ -5844,16 +6005,14 @@ class TwoOwnerRun(pp.LiveRun):
         kinds = {owner.token_kind for owner in self.owners.values()}
         self.ledger.record("cleanup", "token_scan_both_grants", held)
         self.ledger.record("cleanup", "token_scan_subject", sorted(kinds))
-        self.ledger.record(
-            "cleanup",
-            "card_residue",
-            {
-                "cards": len(self.cards),
-                "channel": pps.ref_digest(self.inputs.resolution_channel),
-                "removed": False,
-            },
+        approval = self.ledger.observations("approval")
+        residue = pto.card_residue(
+            self.cards, approval, channel=pps.ref_digest(self.inputs.resolution_channel)
         )
-        self.ledger.record("cleanup", "card_residue_recorded", True)
+        self.ledger.record("cleanup", "card_residue", residue)
+        self.ledger.record(
+            "cleanup", "card_residue_recorded", pto.card_residue_recorded(residue, approval)
+        )
         statuses = {row["kind"]: row["status"] for row in self.ledger.cleanup_rows()}
         guarded = [
             statuses.get(f"step:{name}", "ok")
@@ -5862,6 +6021,169 @@ class TwoOwnerRun(pp.LiveRun):
         self.ledger.record(
             "cleanup", "forge_removal_guarded", all(item == "ok" for item in guarded)
         )
+
+    # -- the credential capture audit (AC 9) ----------------------------------------------
+
+    def capture_audit(self) -> None:
+        """After the fence, before teardown: collect and scan in memory what AC 9 audits.
+
+        The logs of every container instance (current and previous) of every
+        pod in the release and grant namespaces, both namespaces' events, the
+        API's final records of the run (each owner's WorkItems with their
+        requests, each card's approval and audit), its publications and pull
+        requests, and the install's traces (``pto.trace_backend``: Langfuse's
+        ClickHouse tables when the chart deploys them, an explicit ``absent``
+        when telemetry is disabled). Each read is scanned on its channel and
+        dropped: nothing is written to disk, logged or printed. A read that
+        fails counts as a failure of its channel, never as a pass; the cleanup
+        judge requires a source and a scanned byte on every channel and no
+        failure (``pto.scan_checks``). Worker and runner pods the fence or the
+        scenario already deleted are gone; their transcripts were harvested.
+        """
+
+        receipts = {name: {"sources": 0, "failures": 0} for name in pto.CAPTURE_CHANNELS}
+        values = self.install_values
+        backend = pto.trace_backend(values) if values is not None else None
+        try:
+            for namespace in (self.inputs.namespace, self.grant_namespace):
+                self.capture_namespace(self.kube_in(namespace), receipts)
+            self.capture_api(receipts)
+            self.capture_traces(backend, receipts)
+        except Exception:  # noqa: BLE001 - an audit that cannot finish fails its channels
+            for entry in receipts.values():
+                entry["failures"] += 1
+        finally:
+            self.ledger.record("cleanup", "traces_backend", backend)
+            self.ledger.record("cleanup", "capture_audit", receipts)
+
+    def capture(
+        self, channel: str, receipts: dict[str, dict[str, int]], read: Callable[[], bytes | None]
+    ) -> None:
+        """One capture: scanned on ``channel`` and dropped; an exception or None is a failure."""
+
+        try:
+            data = read()
+        except Exception:  # noqa: BLE001 - a failed read is counted, never raised
+            data = None
+        if data is None:
+            receipts[channel]["failures"] += 1
+            return
+        receipts[channel]["sources"] += 1
+        self.scan.scan(channel, data)
+
+    def captured_output(self, kube: pp.Kube, *args: str) -> bytes | None:
+        """A kubectl read kept out of the command log and the children channel; None on failure."""
+
+        result = kube.ctl(*args, check=False, sensitive_output=True, record_output=False)
+        if result.returncode != 0:
+            self.scan.scan("children", result.stderr)
+            return None
+        return result.stdout + result.stderr
+
+    def capture_namespace(self, kube: pp.Kube, receipts: dict[str, dict[str, int]]) -> None:
+        """Every container instance's log and the events of one namespace."""
+
+        pods = self.safe(functools.partial(kube.json, "get", "pods"), None)
+        if not isinstance(pods, dict):
+            # An unread pod list is an unread log, never an empty namespace.
+            receipts[pto.POD_LOGS_CHANNEL]["failures"] += 1
+        for pod, container, previous in pto.container_log_reads(pods):
+            flags = ("--previous",) if previous else ()
+            self.capture(
+                pto.POD_LOGS_CHANNEL,
+                receipts,
+                functools.partial(self.captured_output, kube, "logs", pod, "-c", container, *flags),
+            )
+        self.capture(
+            pto.EVENTS_CHANNEL,
+            receipts,
+            functools.partial(self.captured_output, kube, "get", "events", "-o", "json"),
+        )
+
+    def capture_json(
+        self, channel: str, receipts: dict[str, dict[str, int]], read: Callable[[], Any]
+    ) -> Any:
+        """One API or forge read, scanned as canonical JSON; its value, or None on failure."""
+
+        found: list[Any] = []
+
+        def serialized() -> bytes:
+            value = read()
+            found.append(value)
+            return json.dumps(value, sort_keys=True).encode()
+
+        self.capture(channel, receipts, serialized)
+        return found[0] if found else None
+
+    def capture_api(self, receipts: dict[str, dict[str, int]]) -> None:
+        """The run's WorkItems, cards' approvals and audits, publications and pull requests."""
+
+        api = self.api
+        if api is None:
+            receipts[pto.API_CAPTURES_CHANNEL]["failures"] += 1
+            receipts[pto.PUBLICATION_CAPTURES_CHANNEL]["failures"] += 1
+            return
+        work_items = {item for owner in self.owners.values() for item in owner.work_item_ids}
+        for work_item_id in sorted(work_items):
+            self.capture_json(
+                pto.API_CAPTURES_CHANNEL,
+                receipts,
+                functools.partial(api.get, f"/work-items/{work_item_id}"),
+            )
+        self.capture_json(pto.PUBLICATION_CAPTURES_CHANNEL, receipts, self.publications)
+        for publication_id in sorted(set(self.card_publications.values())):
+            record = self.capture_json(
+                pto.PUBLICATION_CAPTURES_CHANNEL,
+                receipts,
+                functools.partial(self.publication, publication_id),
+            )
+            approval_id = str(record.get("approval_id") or "") if isinstance(record, dict) else ""
+            if not approval_id:
+                receipts[pto.API_CAPTURES_CHANNEL]["failures"] += 1
+                continue
+            for suffix in ("", "/audit"):
+                self.capture_json(
+                    pto.API_CAPTURES_CHANNEL,
+                    receipts,
+                    functools.partial(api.get, f"/approvals/{approval_id}{suffix}"),
+                )
+        if self.forge is None:
+            receipts[pto.PUBLICATION_CAPTURES_CHANNEL]["failures"] += 1
+        else:
+            self.capture_json(pto.PUBLICATION_CAPTURES_CHANNEL, receipts, self.run_pulls)
+
+    def capture_traces(self, backend: str | None, receipts: dict[str, dict[str, int]]) -> None:
+        """Every Langfuse trace table in the release's ClickHouse, or the recorded reason not to.
+
+        ``absent`` reads nothing (the judge accepts that recorded fact); an
+        external or unknown backend cannot be audited and fails the channel.
+        """
+
+        if backend == "absent":
+            return
+        if backend != "in_cluster":
+            receipts[pto.TRACES_CHANNEL]["failures"] += 1
+            return
+        pod = f"{self.fullname}-clickhouse-0"
+        for table in pto.TRACE_TABLES:
+            self.capture(
+                pto.TRACES_CHANNEL,
+                receipts,
+                functools.partial(
+                    self.captured_output,
+                    self.kube,
+                    "exec",
+                    pod,
+                    "-c",
+                    "clickhouse",
+                    "--",
+                    "sh",
+                    "-c",
+                    pto.CLICKHOUSE_EXEC,
+                    "sh",
+                    pto.trace_query(table),
+                ),
+            )
 
     def query_inventory(self) -> dict[str, str]:
         results = super().query_inventory()

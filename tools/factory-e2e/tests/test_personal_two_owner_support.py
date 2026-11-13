@@ -2433,6 +2433,10 @@ def _passing(criterion: str, key: str) -> Any:
     return True if rule is None else rule[1]
 
 
+#: Every card a complete run delivers: the two drill cards and the four scenario cards.
+CARDS = ("drill_reject", "drill_approve", "card1", "card2", "card3", "card4")
+
+
 def _record_complete(ledger: pto.TwoOwnerLedger) -> None:
     for criterion, keys in pto.EXPECTED.items():
         for key in keys:
@@ -2441,8 +2445,26 @@ def _record_complete(ledger: pto.TwoOwnerLedger) -> None:
     ledger.record(
         "cleanup",
         "token_scan",
-        {name: {"scanned_bytes": 10, "token_bytes_found": False} for name in pto.SCAN_CHANNELS},
+        {
+            name: {"scanned_bytes": 10, "token_bytes_found": False}
+            for name in pto.LIVE_SCAN_CHANNELS
+        },
     )
+    ledger.record(
+        "cleanup",
+        "capture_audit",
+        {name: {"sources": 2, "failures": 0} for name in pto.CAPTURE_CHANNELS},
+    )
+    ledger.record("cleanup", "traces_backend", "in_cluster")
+    for card in CARDS:
+        state = {"delivered": True, "attempts": 1, "error": False}
+        ledger.record("approval", f"{card}_card", state)
+    residue = pto.card_residue(
+        {card: f"ref-{card}" for card in CARDS},
+        ledger.observations("approval"),
+        channel="ref-channel",
+    )
+    ledger.record("cleanup", "card_residue", residue)
     for step in ("fence", "inventory", "forge", "namespace"):
         ledger.record_cleanup(f"step:{step}", step, "ok")
     for kind in pto.INVENTORY_KINDS:
@@ -2764,14 +2786,74 @@ CLEANUP_BREAKS: list[tuple[str, Callable[[pto.TwoOwnerLedger], None], str]] = [
         lambda led: led.record(
             "cleanup",
             "token_scan",
-            {name: {"token_bytes_found": name == "harvest"} for name in pto.SCAN_CHANNELS},
+            {
+                name: {"scanned_bytes": 10, "token_bytes_found": name == "harvest"}
+                for name in pto.LIVE_SCAN_CHANNELS
+            },
         ),
         "token_bytes_absent",
     ),
     (
         "channel not scanned",
-        lambda led: led.record("cleanup", "token_scan", {"stdout": {"token_bytes_found": False}}),
+        lambda led: led.record(
+            "cleanup", "token_scan", {"stdout": {"scanned_bytes": 10, "token_bytes_found": False}}
+        ),
         "token_scan_complete",
+    ),
+    (
+        "capture channel scanned zero bytes",
+        lambda led: _set_scan(led, "pod_logs", {"scanned_bytes": 0, "token_bytes_found": False}),
+        "token_scan_complete",
+    ),
+    (
+        "events never scanned",
+        lambda led: _set_scan(led, "events", None),
+        "token_scan_complete",
+    ),
+    (
+        "capture read failed",
+        lambda led: _set_capture(led, "pod_logs", {"sources": 9, "failures": 1}),
+        "capture_audit_complete",
+    ),
+    (
+        "capture read nothing",
+        lambda led: _set_capture(led, "publication_captures", {"sources": 0, "failures": 0}),
+        "capture_audit_complete",
+    ),
+    (
+        "capture receipt missing",
+        lambda led: _set_capture(led, "api_captures", None),
+        "capture_audit_complete",
+    ),
+    (
+        "traces sent to an unreadable backend",
+        lambda led: led.record("cleanup", "traces_backend", "external"),
+        "traces_audited",
+    ),
+    (
+        "trace backend unrecorded",
+        lambda led: led.record("cleanup", "traces_backend", None),
+        "traces_audited",
+    ),
+    (
+        "card claimed removed",
+        lambda led: _set_residue(led, removed=True),
+        "card_residue_recorded",
+    ),
+    (
+        "delivered card unnamed",
+        lambda led: _set_residue(led, drop="drill_approve"),
+        "card_residue_recorded",
+    ),
+    (
+        "card residue status unexplained",
+        lambda led: _set_residue(led, status=("card2", "deleted")),
+        "card_residue_recorded",
+    ),
+    (
+        "delivered card recorded as undelivered",
+        lambda led: _set_residue(led, status=("card4", "not_delivered")),
+        "card_residue_recorded",
     ),
     (
         "cleanup past its window",
@@ -2779,6 +2861,40 @@ CLEANUP_BREAKS: list[tuple[str, Callable[[pto.TwoOwnerLedger], None], str]] = [
         "cleanup_within_window",
     ),
 ]
+
+
+def _set_scan(ledger: pto.TwoOwnerLedger, channel: str, entry: Any) -> None:
+    scans = dict(ledger.observations("cleanup")["token_scan"])
+    if entry is None:
+        scans.pop(channel)
+    else:
+        scans[channel] = entry
+    ledger.record("cleanup", "token_scan", scans)
+
+
+def _set_capture(ledger: pto.TwoOwnerLedger, channel: str, entry: Any) -> None:
+    receipts = dict(ledger.observations("cleanup")["capture_audit"])
+    if entry is None:
+        receipts.pop(channel)
+    else:
+        receipts[channel] = entry
+    ledger.record("cleanup", "capture_audit", receipts)
+
+
+def _set_residue(
+    ledger: pto.TwoOwnerLedger,
+    *,
+    removed: bool = False,
+    drop: str = "",
+    status: tuple[str, str] | None = None,
+) -> None:
+    residue = json.loads(json.dumps(ledger.observations("cleanup")["card_residue"]))
+    residue["removed"] = removed
+    residue["cards"].pop(drop, None)
+    if status is not None:
+        card, value = status
+        residue["cards"][card]["residue"] = value
+    ledger.record("cleanup", "card_residue", residue)
 
 
 @pytest.mark.parametrize(
@@ -2791,6 +2907,209 @@ def test_cleanup_judge_reads_the_inventory(
     corrupt(ledger)
     result = pto.judge(ledger, "cleanup")
     assert result["verdict"] == "fail" and result["checks"][check] is False
+
+
+def test_trace_backend_follows_the_rendered_values() -> None:
+    # The scenario's install keeps the chart's Langfuse, ClickHouse and collector.
+    assert pto.trace_backend(_values()) == "in_cluster"
+    assert pto.trace_backend({}) == "in_cluster"
+    assert pto.trace_backend({"otelCollector": {"telemetryDisabled": True}}) == "absent"
+    for values in (
+        {"langfuse": {"deploy": False}},
+        {"clickhouse": {"deploy": False}},
+        {"otelCollector": {"deploy": False}},
+        {"otelCollector": {"deploy": False, "endpoint": "https://otel.example.com:4318"}},
+    ):
+        assert pto.trace_backend(values) == "external", values
+
+
+def test_trace_queries_name_only_the_trace_tables() -> None:
+    assert [pto.trace_query(table) for table in pto.TRACE_TABLES] == [
+        "SELECT * FROM traces FORMAT JSON",
+        "SELECT * FROM observations FORMAT JSON",
+        "SELECT * FROM scores FORMAT JSON",
+    ]
+    with pytest.raises(ValueError):
+        pto.trace_query("system.users")
+    # The ClickHouse login comes from the container's own environment, never argv.
+    assert "$CLICKHOUSE_PASSWORD" in pto.CLICKHOUSE_EXEC and '"$1"' in pto.CLICKHOUSE_EXEC
+
+
+def test_container_log_reads_cover_every_instance_that_ran() -> None:
+    def status(name: str, state: dict[str, Any], **extra: Any) -> dict[str, Any]:
+        return {"name": name, "state": state, "lastState": {}, "restartCount": 0, **extra}
+
+    pods = {
+        "items": [
+            {
+                "metadata": {"name": "api-1"},
+                "status": {
+                    "initContainerStatuses": [status("migrate", {"terminated": {"exitCode": 0}})],
+                    "containerStatuses": [
+                        status(
+                            "api",
+                            {"running": {"startedAt": "2027-01-15T08:00:00Z"}},
+                            lastState={"terminated": {"exitCode": 1}},
+                            restartCount=1,
+                        ),
+                        status(
+                            "sidecar",
+                            {"waiting": {"reason": "CrashLoopBackOff"}},
+                            restartCount=3,
+                        ),
+                    ],
+                },
+            },
+            {
+                "metadata": {"name": "pending-1"},
+                "status": {"containerStatuses": [status("web", {"waiting": {}})]},
+            },
+            {"metadata": {"name": "unscheduled-1"}, "status": {"phase": "Pending"}},
+        ]
+    }
+    assert pto.container_log_reads(pods) == [
+        ("api-1", "migrate", False),
+        ("api-1", "api", False),
+        ("api-1", "api", True),
+        ("api-1", "sidecar", True),
+    ]
+    assert pto.container_log_reads(None) == []
+    assert pto.container_log_reads({"items": "unreadable"}) == []
+
+
+def _scan_entry(size: int = 10, found: bool = False) -> dict[str, Any]:
+    return {"scanned_bytes": size, "token_bytes_found": found}
+
+
+def test_scan_checks_require_bytes_receipts_and_traces_on_every_channel() -> None:
+    scans = {name: _scan_entry() for name in pto.LIVE_SCAN_CHANNELS}
+    receipts = {name: {"sources": 1, "failures": 0} for name in pto.CAPTURE_CHANNELS}
+    passing = pto.scan_checks(scans, receipts, rehearsal=False, traces_backend="in_cluster")
+    assert passing == {
+        "token_scan_complete": True,
+        "capture_audit_complete": True,
+        "traces_audited": True,
+        "token_bytes_absent": True,
+    }
+    # A channel initialized and never fed is not a scan.
+    empty = {**scans, "events": _scan_entry(0)}
+    verdict = pto.scan_checks(empty, receipts, rehearsal=False, traces_backend="in_cluster")
+    assert verdict["token_scan_complete"] is False
+    boolean = {**scans, "events": {"scanned_bytes": True, "token_bytes_found": False}}
+    verdict = pto.scan_checks(boolean, receipts, rehearsal=False, traces_backend="in_cluster")
+    assert verdict["token_scan_complete"] is False
+    failed = {**receipts, "traces": {"sources": 3, "failures": 1}}
+    verdict = pto.scan_checks(scans, failed, rehearsal=False, traces_backend="in_cluster")
+    assert verdict["capture_audit_complete"] is False and verdict["traces_audited"] is False
+    # Without traces, only an explicit absence passes.
+    bare = {name: entry for name, entry in scans.items() if name != "traces"}
+    unread = {name: entry for name, entry in receipts.items() if name != "traces"}
+    absent = pto.scan_checks(bare, unread, rehearsal=False, traces_backend="absent")
+    assert all(absent.values()), absent
+    for backend in ("external", None, "in_cluster"):
+        verdict = pto.scan_checks(bare, unread, rehearsal=False, traces_backend=backend)
+        assert verdict["traces_audited"] is False, backend
+    # A rehearsal has no harvest and no forge file; a live run must have both.
+    rehearsal = {name: scans[name] for name in pto.REHEARSAL_SCAN_CHANNELS}
+    assert pto.scan_checks(rehearsal, receipts, rehearsal=True, traces_backend="in_cluster")[
+        "token_scan_complete"
+    ]
+    assert not pto.scan_checks(rehearsal, receipts, rehearsal=False, traces_backend="in_cluster")[
+        "token_scan_complete"
+    ]
+    assert "harvest" not in pto.REHEARSAL_SCAN_CHANNELS
+    assert set(pps.SCAN_CHANNELS) < set(pto.LIVE_SCAN_CHANNELS)
+
+
+def test_card_residue_records_each_card_and_its_status() -> None:
+    approval = {
+        "drill_reject_card": {"delivered": True},
+        "card1_card": {"delivered": False},
+        "card1_delivered": True,
+        "drill_reject_card_on_route_channel": True,
+    }
+    residue = pto.card_residue(
+        {"drill_reject": "ref-1", "card1": "ref-2"}, approval, channel="ref-channel"
+    )
+    assert residue == {
+        "channel": "ref-channel",
+        "removed": False,
+        "cards": {
+            "card1": {"publication": "ref-2", "delivered": False, "residue": "not_delivered"},
+            "drill_reject": {
+                "publication": "ref-1",
+                "delivered": True,
+                "residue": "left_in_channel",
+            },
+        },
+    }
+    assert pto.delivered_cards(approval) == {"drill_reject"}
+    assert pto.card_residue_recorded(residue, approval) is True
+    # A delivered card the residue does not name, a claimed removal, a bare count.
+    assert not pto.card_residue_recorded(residue, {**approval, "card2_card": {"delivered": True}})
+    assert not pto.card_residue_recorded({**residue, "removed": True}, approval)
+    assert not pto.card_residue_recorded(
+        {"cards": 2, "channel": "ref-channel", "removed": False}, approval
+    )
+    assert not pto.card_residue_recorded({**residue, "channel": ""}, approval)
+
+
+def test_context_versions_read_the_personal_context_shape() -> None:
+    body = {
+        "work_item_id": "w",
+        "tenant_id": "t",
+        "owner_principal_id": "p",
+        "model_auth_mode": "personal",
+        "enrollment_generation": 1,
+        "work_item_version": 3,
+        "request": {
+            "id": "r",
+            "sequence": 1,
+            "status": "queued",
+            "version": 5,
+            "enrollment_generation": 1,
+        },
+        "enrollment": {"generation": 1, "active": True, "version": 2},
+    }
+    assert pto.context_versions(body) == {
+        "request_id": "r",
+        "expected_work_item_version": 3,
+        "expected_request_version": 5,
+        "expected_enrollment_version": 2,
+    }
+    binding = pto.context_binding(body)
+    assert binding is not None and binding["owner_principal_id"] == "p"
+    assert binding["enrollment_generation"] == 1 and binding["request_generation"] == 1
+    for broken in (
+        {**body, "request": None},
+        {**body, "enrollment": None},
+        {**body, "work_item_version": True},
+        {**body, "request": {**body["request"], "id": ""}},
+        [],
+    ):
+        assert pto.context_versions(broken) is None
+        assert pto.context_binding(broken) is None
+
+
+def test_a_disabled_trace_export_passes_on_its_recorded_absence(tmp_path: Path) -> None:
+    ledger = _complete(tmp_path)
+    ledger.record("cleanup", "traces_backend", "absent")
+    _set_scan(ledger, "traces", None)
+    _set_capture(ledger, "traces", None)
+    result = pto.judge(ledger, "cleanup")
+    assert result["verdict"] == "pass", result["checks"]
+    assert result["checks"]["traces_audited"] is True
+
+
+def test_a_rehearsal_needs_no_harvest_or_forge_scan_and_a_live_run_does(tmp_path: Path) -> None:
+    for channel in ("harvest", "forge"):
+        rehearsal = _ledger(tmp_path / f"rehearsal-{channel}", rehearsal=True)
+        _record_complete(rehearsal)
+        _set_scan(rehearsal, channel, None)
+        assert pto.judge(rehearsal, "cleanup")["verdict"] == "pass"
+        live = _complete(tmp_path / f"live-{channel}")
+        _set_scan(live, channel, None)
+        assert pto.judge(live, "cleanup")["checks"]["token_scan_complete"] is False
 
 
 def test_rehearsal_ledger_passes_no_live_criterion(tmp_path: Path) -> None:

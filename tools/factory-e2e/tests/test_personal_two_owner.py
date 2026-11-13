@@ -41,6 +41,7 @@ from two_owner_shared import (
     AGENT_ID,
     API_PORT,
     CANDIDATE,
+    CHANNEL,
     CONTEXT,
     DEX_DIGEST,
     DEX_PORT,
@@ -55,6 +56,7 @@ from two_owner_shared import (
     REFUSED_CLASS,
     REGISTRY,
     RELEASE,
+    REPO,
     REPO_ROOT,
     RUN_ID,
     SESSION_MARKER,
@@ -398,10 +400,14 @@ def _bind(call: Callable[[str], None], name: str) -> Callable[[], None]:
     return lambda: call(name)
 
 
-def test_live_run_takes_the_paid_phases_after_forge(tmp_path: Path) -> None:
+def test_live_run_takes_the_drill_after_forge_then_the_paid_phases(tmp_path: Path) -> None:
     h = _harness(tmp_path, rehearsal=False)
     names = [name for name, _phase in h.run.phases()]
     assert names == [*pt.UNPAID_PHASES, *pt.PAID_PHASES]
+    # The gateway drill is unpaid and runs before the first reservation.
+    assert names.index("forge") + 1 == names.index("drill") == names.index("probe-a") - 1
+    drill = dict(h.run.phases())["drill"]
+    assert getattr(drill, "__func__", None) is pt.TwoOwnerRun.phase_drill
     assert h.run.stop_after is None and not h.run.rehearsal and h.run.command == "run"
     assert not h.ledger.is_rehearsal()
     paid = dict(h.run.phases()[len(pt.UNPAID_PHASES) :])
@@ -1098,16 +1104,79 @@ def test_fence_owner_selects_that_owners_claims_on_the_run_agent_only(tmp_path: 
 # --------------------------------------------------------------------------
 
 
-def _controls_cluster(h: _Harness, *, replay_refused: bool = True) -> dict[str, Any]:
+def _context(state: Mapping[str, Any], request: Mapping[str, Any]) -> dict[str, Any]:
+    """``PersonalContextOut`` (apps/api routers/work_items.py) for A's WorkItem."""
+
+    return {
+        "work_item_id": WORK_ITEM,
+        "agent_id": AGENT_ID,
+        "tenant_id": TENANT,
+        "model_auth_mode": "personal",
+        "owner_principal_id": PRINCIPAL_A,
+        "enrollment_generation": 1,
+        "work_item_version": state["work_item_version"],
+        "request": {
+            "id": request["id"],
+            "sequence": request["sequence"],
+            "status": request["status"],
+            "version": state["request_version"],
+            "enrollment_generation": 1,
+        },
+        "enrollment": {"generation": 1, "active": True, "version": 1},
+    }
+
+
+def _revalidation_route(
+    api: _FakeApi, state: dict[str, Any], *, adoption_refused: bool, own_code: str
+) -> None:
+    """``POST .../personal-context/revalidate`` (personal_execution.revalidate).
+
+    The owner check comes first: another principal is 409 ``owner_mismatch``.
+    With ``adoption_refused`` false the route behaves as a regression that
+    skips it and rebinds, bumping both versions (``RevalidationOut``). A's own
+    call answers 409 ``own_code``.
+    """
+
+    @api.route("POST", f"/v1/internal/work-items/{WORK_ITEM}/personal-context/revalidate")
+    def revalidate(_path: str, headers: Mapping[str, str], body: Any) -> tuple[int, Any]:
+        assert headers == {"X-Curie-Worker-Token": "worker-token-marker-0001"}
+        state["revalidations"].append(dict(body))
+        if body["owner_principal_id"] == PRINCIPAL_A:
+            return 409, {"detail": {"code": own_code}}
+        if adoption_refused:
+            return 409, {"detail": {"code": "owner_mismatch"}}
+        state["work_item_version"] += 1
+        state["request_version"] += 1
+        return 200, {
+            "work_item_id": WORK_ITEM,
+            "request_id": body["request_id"],
+            "previous_generation": 1,
+            "enrollment_generation": 2,
+            "work_item_version": state["work_item_version"],
+            "request_version": state["request_version"],
+            "enrollment_version": body["expected_enrollment_version"],
+        }
+
+
+def _controls_cluster(
+    h: _Harness, *, replay_refused: bool = True, adoption_refused: bool = True
+) -> dict[str, Any]:
     """The worker, Postgres, custody listing and API answers the controls read.
 
     API shapes: apps/api/src/curie_api/routers/work_items.py (admission
     ``{"work_item", "request", "replayed"}``, 409 ``{"detail": {"code"}}``,
-    cancel, personal-context 404) and schemas/workitems.py
-    ``WorkItemOutcomeOut.requests``.
+    cancel, personal-context 404 and ``PersonalContextOut``, revalidation) and
+    schemas/workitems.py ``WorkItemOutcomeOut.requests``.
     """
 
-    state: dict[str, Any] = {"replicas": 1, "uid": "uid-worker-1", "disconnected": False}
+    state: dict[str, Any] = {
+        "replicas": 1,
+        "uid": "uid-worker-1",
+        "disconnected": False,
+        "work_item_version": 1,
+        "request_version": 1,
+        "revalidations": [],
+    }
     request: dict[str, Any] = {
         "sequence": 1,
         "status": "queued",
@@ -1156,7 +1225,8 @@ def _controls_cluster(h: _Harness, *, replay_refused: bool = True) -> dict[str, 
             return 0, _enrollment("inactive", 2, 2, pending_custody_cleanup=1)
         if owner == "a" and state["disconnected"]:
             return 0, _enrollment("inactive", 2, 2)
-        return 0, _enrollment("active", 1, 1)
+        # B's enrollment row has its own version, distinct from A's.
+        return 0, _enrollment("active", 1, 4 if owner == "b" else 1)
 
     _subscription_answers(shell, answers)
 
@@ -1173,7 +1243,7 @@ def _controls_cluster(h: _Harness, *, replay_refused: bool = True) -> dict[str, 
                 return 200, {"work_item": {"id": WORK_ITEM}, "request": request, "replayed": True}
             return 409, {"detail": {"code": "owner_mismatch"}}
         assert state["replicas"] == 0
-        state["request_id"] = body["request_id"]
+        state["request_id"] = request["id"] = body["request_id"]
         work_item = {
             "id": WORK_ITEM,
             "conversation_id": "github:acme-corp/acme-fixture:issue-11",
@@ -1200,8 +1270,12 @@ def _controls_cluster(h: _Harness, *, replay_refused: bool = True) -> dict[str, 
     def context(path: str, _headers: Mapping[str, str], _body: Any) -> tuple[int, Any]:
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
         if query["owner_principal_id"] == [PRINCIPAL_A]:
-            return 200, {"work_item_id": WORK_ITEM, "enrollment_generation": 1}
+            return 200, _context(state, request)
         return 404, {"detail": {"code": "not_found"}}
+
+    _revalidation_route(
+        api, state, adoption_refused=adoption_refused, own_code="generation_current"
+    )
 
     @api.route("POST", f"/v1/internal/work-items/{WORK_ITEM}/cancel")
     def cancel(_path: str, _headers: Mapping[str, str], body: Any) -> tuple[int, Any]:
@@ -1216,7 +1290,7 @@ def _controls_cluster(h: _Harness, *, replay_refused: bool = True) -> dict[str, 
 def test_rehearsal_controls_record_the_expected_keys(tmp_path: Path) -> None:
     h = _harness(tmp_path)
     _connect(h)
-    _controls_cluster(h)
+    state = _controls_cluster(h)
     h.run.phase_rehearsal_controls()
     observed = h.ledger.observations("rehearsal")
     for key in (
@@ -1231,6 +1305,10 @@ def test_rehearsal_controls_record_the_expected_keys(tmp_path: Path) -> None:
         "replay_owner_b_refused",
         "personal_context_b_hidden",
         "personal_context_a_readable",
+        "adoption_b_refused",
+        "adoption_a_binding_unchanged",
+        "adoption_no_request",
+        "adoption_owner_control",
         "no_request_started",
         "owner_unchanged",
         "inactive",
@@ -1253,6 +1331,42 @@ def test_rehearsal_controls_record_the_expected_keys(tmp_path: Path) -> None:
     # No B disconnect and no paid start: the fence and finalizer do the rest.
     assert "disconnect-b" not in h.events
     assert h.run.owners["a"].state == "inactive" and h.run.owners["a"].generation == 2
+    # B's adoption names B's tenant, agent and principal at A's current WorkItem and
+    # request versions and B's own enrollment version; A's control reuses A's.
+    adoption, control = state["revalidations"]
+    versions = {
+        "request_id": state["request_id"],
+        "expected_work_item_version": 1,
+        "expected_request_version": 1,
+    }
+    assert adoption == {
+        "tenant_id": TENANT,
+        "agent_id": AGENT_ID,
+        "owner_principal_id": PRINCIPAL_B,
+        **versions,
+        "expected_enrollment_version": 4,
+    }
+    assert control == {
+        "tenant_id": TENANT,
+        "agent_id": AGENT_ID,
+        "owner_principal_id": PRINCIPAL_A,
+        **versions,
+        "expected_enrollment_version": 1,
+    }
+
+
+def test_rehearsal_controls_fail_when_b_adopts_a_work_item(tmp_path: Path) -> None:
+    h = _harness(tmp_path)
+    _connect(h)
+    _controls_cluster(h, adoption_refused=False)
+    with pytest.raises(pp.StepFailed, match="admission_controls_refused"):
+        h.run.phase_rehearsal_controls()
+    observed = h.ledger.observations("rehearsal")
+    assert observed["admission_controls_refused"] is False
+    assert observed["control_adoption_b_refused"] is False
+    assert observed["control_adoption_a_binding_unchanged"] is False
+    # The other wrong-owner controls still held.
+    assert observed["control_replay_owner_b_refused"] is True
 
 
 def test_rehearsal_controls_fail_when_a_wrong_owner_replay_is_accepted(tmp_path: Path) -> None:
@@ -1433,6 +1547,11 @@ class _Live(pt.TwoOwnerRun):
     def start_watchdog(self) -> None:
         # Tests drive the watchdog's pass (watchdog_tick) on the fake clock.
         self.trace.append("watchdog-start")
+
+    def capture_audit(self) -> None:
+        # The real audit, against the fakes; its reads are tested below.
+        self.trace.append("capture")
+        super().capture_audit()
 
 
 def _live(tmp_path: Path, *, begin: bool = True) -> _Harness:
@@ -3506,8 +3625,9 @@ def test_finalize_fences_before_it_charges_or_observes(
     h.run.fence_paid_starts = fence  # type: ignore[method-assign]
     _teardown(h, monkeypatch, 5.0)
     assert h.run.finalize() is True
-    # Runner execution and grant delivery stop before any charge or observation.
-    assert _trace(h) == ["fence", "summary", "teardown"]
+    # Runner execution and grant delivery stop before any charge or observation;
+    # the capture audit reads what the teardown would remove.
+    assert _trace(h) == ["fence", "summary", "capture", "teardown"]
     assert fenced == [{"reserved"}]
     assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
     assert _gate(run).closed and run.closed and h.run.watch_stop.is_set()
@@ -3532,9 +3652,502 @@ def test_cleanup_past_its_window_is_recorded_and_the_teardown_still_runs(
     _teardown(h, monkeypatch, 5.0)
     assert h.run.finalize() is True
     # The cleanup clock starts before the fence; every later step still runs.
-    assert _trace(h) == ["fence", "summary", "teardown"]
+    assert _trace(h) == ["fence", "summary", "capture", "teardown"]
     elapsed = h.ledger.observations("budget")["cleanup_elapsed"]
     assert elapsed == pto.CLEANUP_SECONDS + (0 if within else 1)
     cleanup = h.ledger.observations("cleanup")
     assert cleanup["cleanup_within_window"] is within
     assert cleanup["card_residue_recorded"] is True
+
+
+# -- the unpaid drill in a live run (gateway delivery before paid admission) ---------
+
+DEPLOYMENT = "5d0c7f3e-0000-4000-8000-0000000de901"
+DRILL_PUBLICATION = {
+    "reject": "5d0c7f3e-0000-4000-8000-0000000f0001",
+    "approve": "5d0c7f3e-0000-4000-8000-0000000f0002",
+}
+DRILL_APPROVAL = {
+    "reject": "5d0c7f3e-0000-4000-8000-0000000e0001",
+    "approve": "5d0c7f3e-0000-4000-8000-0000000e0002",
+}
+DRILL_BRANCH = "curie/publication-" + "d" * 32
+#: cli/src/main.rs under --json: the 403 refusal of an operator the list does not name.
+UNLISTED_STDOUT = json.dumps(
+    {
+        "error": "resolving approval failed with 403 Forbidden: "
+        + json.dumps({"detail": "not an approver for this route"}),
+        "fix": None,
+    }
+).encode()
+
+
+def _forge(h: _Harness) -> _FakeApi:
+    """A real ``pp.Forge`` over a replaying HTTP fake, its installation token already minted."""
+
+    http = _FakeApi()
+    forge = pp.Forge(
+        h.shell,
+        http,  # type: ignore[arg-type]
+        h.run.inputs.app_dir or Path(),
+        h.run.inputs.app,
+        h.runtime.scrubber,
+        h.clock,
+    )
+    forge.token = h.runtime.scrubber.hold(pps.HeldSecret("forge-token-marker-0001"))
+    forge.expires_at = T0 + 10**6
+    h.run.forge = forge
+    return http
+
+
+def _drill_setup(h: _Harness, *, delivered: bool = True) -> dict[str, Any]:
+    """The drill's API, approvals CLI, card outbox and forge answers in their recorded shapes.
+
+    API: schemas/deployments.py rows, the workspace selection, ``PublicationCreate``'s
+    201 ``{"id", "approval_id"}``, ``ApprovalOut`` and ``ApprovalAuditOut`` rows and
+    ``GET /publications/{id}``'s ``branch``. The card outbox is ``pp.LiveRun.card_state``'s
+    psql row; GitHub answers 404 for an absent ref and ``[]`` for no pull request.
+    """
+
+    run = h.run
+    run.allowed_token = h.runtime.scrubber.hold(pps.HeldSecret("allowed-operator-marker"))
+    run.unlisted_token = h.runtime.scrubber.hold(pps.HeldSecret("unlisted-operator-marker"))
+    state: dict[str, Any] = {
+        "status": dict.fromkeys(DRILL_APPROVAL.values(), "pending"),
+        "audit": {approval: [] for approval in DRILL_APPROVAL.values()},
+        "resolves": 0,
+    }
+    api = h.api
+    api.route("GET", "/deployments")(
+        lambda _p, _h, _b: (200, [{"id": DEPLOYMENT, "environment": "prod"}])
+    )
+    api.route("POST", f"/v1/internal/workspaces/{DEPLOYMENT}/selection")(
+        lambda _p, _h, body: (200, {"conversation_id": body["conversation_id"]})
+    )
+
+    @api.route("POST", "/v1/internal/publications")
+    def create(_path: str, _headers: Mapping[str, str], body: Any) -> tuple[int, Any]:
+        label = "reject" if body["dedupe_key"].endswith("-reject") else "approve"
+        assert body["base_sha"] == "0" * 40 and body["card_channel"] == CHANNEL
+        return 201, {"id": DRILL_PUBLICATION[label], "approval_id": DRILL_APPROVAL[label]}
+
+    for label, approval in DRILL_APPROVAL.items():
+        api.route("GET", f"/approvals/{approval}/audit")(
+            lambda _p, _h, _b, approval=approval: (200, list(state["audit"][approval]))
+        )
+        api.route("GET", f"/approvals/{approval}")(
+            lambda _p, _h, _b, approval=approval: (
+                200,
+                {"id": approval, "card_channel": CHANNEL, "status": state["status"][approval]},
+            )
+        )
+        api.route("GET", f"/publications/{DRILL_PUBLICATION[label]}")(
+            lambda _p, _h, _b, approval=approval: (
+                200,
+                {"approval_id": approval, "branch": DRILL_BRANCH, "status": "approved"},
+            )
+        )
+    h.shell.on("psql", "-At", "-c")(lambda _a, _s: b"t|1|f\n" if delivered else b"f|5|t\n")
+
+    @h.shell.on("cluster", "approvals", "--resolve")
+    def resolve(argv: list[str], _stdin: bytes | None) -> pp.Completed:
+        approval = argv[argv.index("--resolve") + 1]
+        state["resolves"] += 1
+        if state["resolves"] == 1:
+            state["audit"][approval].append(
+                {
+                    "action": "denied",
+                    "actor": run.unlisted_subject,
+                    "authorized": False,
+                    "authorizer": pps.EXPLICIT_USERS_AUTHORIZER,
+                    "reason": "not an approver for this route",
+                    "created_at": "2027-01-15T08:00:00",
+                }
+            )
+            return pp.Completed(1, UNLISTED_STDOUT, b"")
+        decision = "rejected" if "--reject" in argv else "approved"
+        state["status"][approval] = decision
+        state["audit"][approval].append(
+            {
+                "action": "resolved",
+                "actor": run.allowed_subject,
+                "authorized": True,
+                "principal_kind": "operator",
+                "decision": decision,
+            }
+        )
+        return pp.Completed(0, b"{}", b"")
+
+    forge = _forge(h)
+    forge.route("GET", f"/repos/{REPO}/git/ref/heads/{DRILL_BRANCH}")(
+        lambda _p, _h, _b: (404, {"message": "Not Found"})
+    )
+    forge.route("GET", f"/repos/{REPO}/pulls")(lambda _p, _h, _b: (200, []))
+    return state
+
+
+def test_a_live_drill_proves_card_delivery_before_any_paid_phase(tmp_path: Path) -> None:
+    h = _live(tmp_path, begin=False)
+    state = _drill_setup(h)
+    h.run.phase_drill()
+    approval = h.ledger.observations("approval")
+    for key in (
+        "drill_cards_delivered",
+        "drill_unlisted_refused_by_list",
+        "drill_reject_resolved",
+        "drill_approve_resolved",
+        "drill_started_nothing",
+        "drill_pushed_nothing",
+    ):
+        assert approval[key] is True, key
+    assert approval["drill_unlisted_status"] == 403
+    assert state["status"] == {
+        DRILL_APPROVAL["reject"]: "rejected",
+        DRILL_APPROVAL["approve"]: "approved",
+    }
+    # Both drill cards are in the run's card list, and the approved one's branch is
+    # owned by the run for the absence inventory.
+    assert h.run.cards == {
+        "drill_reject": pps.ref_digest(DRILL_PUBLICATION["reject"]),
+        "drill_approve": pps.ref_digest(DRILL_PUBLICATION["approve"]),
+    }
+    assert DRILL_BRANCH in h.run.publication_branches
+    # Unpaid: no reservation, no live window.
+    assert h.ledger.session_rows() == []
+    assert h.ledger.run_row()["live_started_at"] is None
+
+
+def test_an_undelivered_drill_card_fails_the_live_run_before_any_reservation(
+    tmp_path: Path,
+) -> None:
+    h = _live(tmp_path, begin=False)
+    _drill_setup(h, delivered=False)
+    with pytest.raises(pp.StepFailed, match="drill_reject card was not delivered"):
+        h.run.phase_drill()
+    approval = h.ledger.observations("approval")
+    assert approval["drill_cards_delivered"] is False
+    assert approval["drill_reject_card"]["delivered"] is False
+    # The undelivered card is still registered, so its residue is recorded.
+    assert set(h.run.cards) == {"drill_reject"}
+    assert h.ledger.session_rows() == []
+    assert h.ledger.run_row()["live_started_at"] is None
+
+
+# -- the live wrong-owner adoption control ---------------------------------------------
+
+
+def _wrong_owner_setup(
+    h: _Harness, *, adoption_refused: bool = True, own_code: str = "runtime_live"
+) -> dict[str, Any]:
+    """A1 parked on card 1: A's WorkItem with A1 started, and the API's wrong-owner answers.
+
+    A1's runtime has no termination receipt yet, so A's own revalidation is
+    409 ``runtime_live`` (personal_execution.revalidate).
+    """
+
+    first = _pod_run(h, "a1", card=1, reserve=False)
+    first.work_item_id, first.request_id, first.admission_key = WORK_ITEM, REQUEST_A1, REQUEST_A1
+    first.claim_labels = {pt.THREAD_HASH_LABEL: "thread-hash-a"}
+    h.run.threads["a"], h.run.markers["a"] = "thread-a", "marker-a"
+    h.run.thread_records = lambda: {"thread-a": ["record-1", "marker-a"]}  # type: ignore[method-assign]
+    h.run.request_rows = lambda _w: [  # type: ignore[method-assign]
+        {"id": REQUEST_A1, "owner_principal_id": PRINCIPAL_A}
+    ]
+    state: dict[str, Any] = {"work_item_version": 3, "request_version": 5, "revalidations": []}
+    request = {
+        "id": REQUEST_A1,
+        "sequence": 1,
+        "status": "running",
+        "started_at": "2027-01-15T08:00:00Z",
+        "tenant_id": TENANT,
+        "model_auth_mode": "personal",
+        "owner_principal_id": PRINCIPAL_A,
+        "enrollment_generation": 1,
+    }
+    api = h.api
+    api.route("POST", "/v1/internal/work-items/admissions")(
+        lambda _p, _h, _b: (409, {"detail": {"code": "owner_mismatch"}})
+    )
+    api.route("GET", f"/work-items/{WORK_ITEM}")(
+        lambda _p, _h, _b: (
+            200,
+            {
+                "id": WORK_ITEM,
+                "tenant_id": TENANT,
+                "model_auth_mode": "personal",
+                "owner_principal_id": PRINCIPAL_A,
+                "enrollment_generation": 1,
+                "requests": [dict(request)],
+            },
+        )
+    )
+
+    @api.route("GET", f"/v1/internal/work-items/{WORK_ITEM}/personal-context")
+    def context(path: str, _headers: Mapping[str, str], _body: Any) -> tuple[int, Any]:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+        if query["owner_principal_id"] == [PRINCIPAL_A]:
+            return 200, _context(state, request)
+        return 404, {"detail": {"code": "not_found"}}
+
+    _revalidation_route(api, state, adoption_refused=adoption_refused, own_code=own_code)
+    _subscription_answers(
+        h.shell, lambda _verb, owner: (0, _enrollment("active", 1, 4 if owner == "b" else 1))
+    )
+    return state
+
+
+def test_live_wrong_owner_controls_include_the_adoption_control(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    state = _wrong_owner_setup(h)
+    h.run.phase_wrong_owner()
+    observed = h.ledger.observations("wrong-owner")
+    for key in (
+        "admission_b_on_a_issue_refused",
+        "replay_owner_b_refused",
+        "personal_context_b_hidden",
+        "adoption_b_refused",
+        "adoption_a_binding_unchanged",
+        "adoption_no_request",
+        "adoption_owner_control",
+        "a_marker_unchanged",
+        "no_b_claim_on_a_thread",
+    ):
+        assert observed[key] is True, key
+    adoption, control = state["revalidations"]
+    assert adoption["owner_principal_id"] == PRINCIPAL_B and adoption["tenant_id"] == TENANT
+    assert adoption["agent_id"] == AGENT_ID and adoption["request_id"] == REQUEST_A1
+    assert (adoption["expected_work_item_version"], adoption["expected_request_version"]) == (3, 5)
+    assert adoption["expected_enrollment_version"] == 4
+    assert control == {
+        **adoption,
+        "owner_principal_id": PRINCIPAL_A,
+        "expected_enrollment_version": 1,
+    }
+    # The controls read and refuse; nothing is fenced.
+    assert "fence" not in _trace(h)
+
+
+@pytest.mark.parametrize(
+    ("adoption_refused", "own_code", "failed"),
+    [
+        (False, "runtime_live", "adoption_b_refused"),
+        (True, "owner_mismatch", "adoption_owner_control"),
+    ],
+    ids=["b-adopts-a", "owner-control-refused"],
+)
+def test_live_wrong_owner_fails_fenced_when_the_adoption_control_breaks(
+    tmp_path: Path, adoption_refused: bool, own_code: str, failed: str
+) -> None:
+    h = _live(tmp_path)
+    _wrong_owner_setup(h, adoption_refused=adoption_refused, own_code=own_code)
+    with pytest.raises(pp.StepFailed, match=failed):
+        h.run.phase_wrong_owner()
+    assert h.ledger.observations("wrong-owner")[failed] is False
+    assert "fence" in _trace(h)
+
+
+# -- the finalize capture audit --------------------------------------------------------
+
+API_POD = f"{FULLNAME}-api-6d4f8b7c9-x2x9q"
+JOB_POD = f"{FULLNAME}-publication-0001-abcde"
+PENDING_POD = f"{FULLNAME}-langfuse-web-7c9d8-k2l3m"
+PUBLICATION_1 = "5d0c7f3e-0000-4000-8000-0000000f0101"
+APPROVAL_1 = "5d0c7f3e-0000-4000-8000-0000000e0101"
+
+
+def _status(name: str, *, state: str, restarts: int = 0, last: bool = False) -> dict[str, Any]:
+    """One ``containerStatuses`` entry (core/v1 ContainerStatus)."""
+
+    details = {
+        "running": {"startedAt": "2027-01-15T08:00:00Z"},
+        "terminated": {"exitCode": 0, "reason": "Completed"},
+        "waiting": {"reason": "ContainerCreating"},
+    }
+    return {
+        "name": name,
+        "state": {state: details[state]},
+        "lastState": {"terminated": {"exitCode": 1, "reason": "Error"}} if last else {},
+        "restartCount": restarts,
+    }
+
+
+def _capture_cluster(h: _Harness, *, failing_log: str = "") -> list[str]:
+    """Pods, logs, events, ClickHouse and API answers of the capture audit; the logs read.
+
+    A's grant marker is in the API container's previous instance only.
+    """
+
+    run = h.run
+    pods = {
+        "items": [
+            {
+                "metadata": {"name": API_POD},
+                "status": {
+                    "containerStatuses": [_status("api", state="running", restarts=1, last=True)]
+                },
+            },
+            {
+                "metadata": {"name": JOB_POD},
+                "status": {
+                    "initContainerStatuses": [_status("clone", state="terminated")],
+                    "containerStatuses": [_status("push", state="terminated")],
+                },
+            },
+            {
+                "metadata": {"name": PENDING_POD},
+                "status": {"containerStatuses": [_status("web", state="waiting")]},
+            },
+        ]
+    }
+
+    def namespace(argv: list[str]) -> str:
+        return argv[argv.index("--namespace") + 1]
+
+    h.shell.on("get", "pods", "-o", "json")(
+        lambda argv, _s: pods if namespace(argv) == NAMESPACE else {"items": []}
+    )
+    read: list[str] = []
+
+    @h.shell.on("logs")
+    def logs(argv: list[str], _stdin: bytes | None) -> pp.Completed:
+        pod, container = argv[argv.index("logs") + 1], argv[argv.index("-c") + 1]
+        key = f"{pod}/{container}" + ("/previous" if "--previous" in argv else "")
+        read.append(key)
+        if key == failing_log:
+            return pp.Completed(1, b"", b"Error from server (BadRequest): container not found")
+        if key == f"{API_POD}/api/previous":
+            return pp.Completed(0, f"startup with token {MARKER_A}\n".encode(), b"")
+        return pp.Completed(0, f"{key} log line\n".encode(), b"")
+
+    h.shell.on("get", "events", "-o", "json")(
+        lambda _a, _s: {"items": [{"reason": "Killing", "message": "Stopping container worker"}]}
+    )
+    h.shell.on("exec", f"{FULLNAME}-clickhouse-0")(
+        lambda _a, _s: b'{"meta": [], "data": [], "rows": 0}\n'
+    )
+    run.owners["a"].work_item_ids = [WORK_ITEM]
+    run.card_publications = {"card1": PUBLICATION_1}
+    api = h.api
+    api.route("GET", f"/work-items/{WORK_ITEM}")(lambda _p, _h, _b: (200, {"id": WORK_ITEM}))
+    api.route("GET", "/publications?limit=200")(
+        lambda _p, _h, _b: (200, [{"id": PUBLICATION_1, "approval_id": APPROVAL_1}])
+    )
+    api.route("GET", f"/publications/{PUBLICATION_1}")(
+        lambda _p, _h, _b: (200, {"id": PUBLICATION_1, "approval_id": APPROVAL_1})
+    )
+    api.route("GET", f"/approvals/{APPROVAL_1}/audit")(lambda _p, _h, _b: (200, []))
+    api.route("GET", f"/approvals/{APPROVAL_1}")(
+        lambda _p, _h, _b: (200, {"id": APPROVAL_1, "status": "approved"})
+    )
+    forge = _forge(h)
+    forge.route("GET", f"/repos/{REPO}/pulls")(lambda _p, _h, _b: (200, []))
+    return read
+
+
+def test_the_capture_audit_scans_every_capture_in_memory(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    log = tmp_path / "commands.jsonl"
+    h.shell.log = log
+    h.run.install_values = {}
+    read = _capture_cluster(h)
+    pt.TwoOwnerRun.capture_audit(h.run)
+    # Every container instance that ran, the previous one of a restarted container
+    # included; the never-started container has no log.
+    assert read == [
+        f"{API_POD}/api",
+        f"{API_POD}/api/previous",
+        f"{JOB_POD}/clone",
+        f"{JOB_POD}/push",
+    ]
+    cleanup = h.ledger.observations("cleanup")
+    assert cleanup["traces_backend"] == "in_cluster"
+    assert cleanup["capture_audit"] == {
+        "pod_logs": {"sources": 4, "failures": 0},
+        "events": {"sources": 2, "failures": 0},
+        "api_captures": {"sources": 3, "failures": 0},
+        "publication_captures": {"sources": 3, "failures": 0},
+        "traces": {"sources": 3, "failures": 0},
+    }
+    scans = h.runtime.scan.as_json()
+    # A grant written only to a previous container instance is found.
+    assert scans["pod_logs"]["token_bytes_found"] is True
+    for channel in ("events", "api_captures", "publication_captures", "traces"):
+        assert scans[channel]["scanned_bytes"] > 0 and not scans[channel]["token_bytes_found"]
+    # Logs and trace reads never reach the command log or the children channel.
+    captures = [
+        call
+        for call in h.shell.calls
+        if call.argv[0] == "kubectl" and ("logs" in call.argv or "exec" in call.argv)
+    ]
+    assert captures and all(call.sensitive_output for call in captures)
+    logged = log.read_text()
+    assert MARKER_A not in logged and '"logs"' not in logged and '"exec"' not in logged
+    queries = [call.argv[-1] for call in captures if "exec" in call.argv]
+    assert queries == [pto.trace_query(table) for table in pto.TRACE_TABLES]
+    exec_argv = next(call.argv for call in captures if "exec" in call.argv)
+    assert exec_argv[:2] == ["kubectl", "--context"] and "-c" in exec_argv
+    assert exec_argv[exec_argv.index("sh") : exec_argv.index("sh") + 3] == [
+        "sh",
+        "-c",
+        pto.CLICKHOUSE_EXEC,
+    ]
+    verdict = pto.scan_checks(
+        scans, cleanup["capture_audit"], rehearsal=False, traces_backend="in_cluster"
+    )
+    assert verdict["capture_audit_complete"] is True and verdict["traces_audited"] is True
+    assert verdict["token_bytes_absent"] is False
+
+
+def test_a_failed_capture_fails_its_channel_never_passes(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    # Traces sent to a backend the driver cannot read are a failed capture.
+    h.run.install_values = {"langfuse": {"deploy": False}}
+    _capture_cluster(h, failing_log=f"{JOB_POD}/push")
+    h.run.api = None
+    pt.TwoOwnerRun.capture_audit(h.run)
+    cleanup = h.ledger.observations("cleanup")
+    assert cleanup["traces_backend"] == "external"
+    receipts = cleanup["capture_audit"]
+    assert receipts["pod_logs"] == {"sources": 3, "failures": 1}
+    assert receipts["traces"] == {"sources": 0, "failures": 1}
+    assert receipts["api_captures"]["failures"] == 1
+    assert receipts["publication_captures"]["failures"] == 1
+    verdict = pto.scan_checks(
+        h.runtime.scan.as_json(), receipts, rehearsal=False, traces_backend="external"
+    )
+    assert verdict["capture_audit_complete"] is False and verdict["traces_audited"] is False
+
+
+# -- approval-card residue ---------------------------------------------------------------
+
+
+def test_card_residue_names_every_delivered_card_or_is_not_recorded(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    h.run.cards = {"drill_reject": "ref-dr", "drill_approve": "ref-da", "card1": "ref-c1"}
+    for card, delivered in (("drill_reject", True), ("drill_approve", True), ("card1", False)):
+        state = {"delivered": delivered, "attempts": 1 if delivered else 5, "error": not delivered}
+        h.ledger.record("approval", f"{card}_card", state)
+    h.run.record_cleanup_keys()
+    cleanup = h.ledger.observations("cleanup")
+    assert cleanup["card_residue"] == {
+        "channel": pps.ref_digest(CHANNEL),
+        "removed": False,
+        "cards": {
+            "card1": {"publication": "ref-c1", "delivered": False, "residue": "not_delivered"},
+            "drill_approve": {
+                "publication": "ref-da",
+                "delivered": True,
+                "residue": "left_in_channel",
+            },
+            "drill_reject": {
+                "publication": "ref-dr",
+                "delivered": True,
+                "residue": "left_in_channel",
+            },
+        },
+    }
+    assert cleanup["card_residue_recorded"] is True
+    # A card recorded as delivered that the run's card list never named.
+    h.ledger.record("approval", "card3_card", {"delivered": True, "attempts": 1, "error": False})
+    h.run.record_cleanup_keys()
+    assert h.ledger.observations("cleanup")["card_residue_recorded"] is False

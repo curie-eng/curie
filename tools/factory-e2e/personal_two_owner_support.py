@@ -16,7 +16,8 @@ can be tested without a cluster:
 6. Dex, OIDC and chart values for a two-owner install, and a scan for any
    installation-wide grant;
 7. the OIDC login flow with an injected opener;
-8. issue fixtures, and the evidence contract and judges;
+8. issue fixtures, and the evidence contract and judges, with the credential
+   capture audit's channels and the approval-card residue record;
 9. the native-process interruption program and the per-claim grant-delivery
    readers (digests and names only);
 10. the recovery evidence each interruption is judged on: the read-only
@@ -2557,6 +2558,20 @@ EXPECTED: dict[str, dict[str, str]] = {
         "allowed operator",
         "principals_distinct": "the allowed operator, the unlisted operator and both owners "
         "are four distinct principals",
+        "drill_cards_delivered": "both unpaid drill cards were delivered through the channel "
+        "gateway after forge and before the first paid phase",
+        "drill_unlisted_status": "the unlisted operator's resolve of the first drill card "
+        "answered 403",
+        "drill_unlisted_refused_by_list": "the first drill card stayed pending and its audit "
+        "names the explicit users authorizer for that refusal",
+        "drill_reject_resolved": "the allowed operator rejected the first drill card and the "
+        "audit names it as operator",
+        "drill_approve_resolved": "the allowed operator approved the second drill card and the "
+        "audit names it as operator",
+        "drill_started_nothing": "after the drill no runner claim of the run's agent and no "
+        "reserved session existed",
+        "drill_pushed_nothing": "the approved drill publication's API-reported branch and any "
+        "pull request for it were absent on the forge",
         "card1_delivered": "A1's card (card 1) was delivered through the channel gateway",
         "card1_unlisted_status": "the unlisted operator's resolve of card 1 answered 403",
         "card1_pending_after_unlisted": "card 1 stayed pending after the unlisted attempt",
@@ -2638,6 +2653,14 @@ EXPECTED: dict[str, dict[str, str]] = {
         "owner_mismatch",
         "personal_context_b_hidden": "the owner-scoped personal-context read of A's WorkItem "
         "with B's principal answered 404",
+        "adoption_b_refused": "B's revalidation binding A's WorkItem to B's enrollment, with "
+        "B's tenant, agent and principal at the current WorkItem, request and enrollment "
+        "versions, answered 409 owner_mismatch",
+        "adoption_a_binding_unchanged": "after every control A's WorkItem kept A's owner, "
+        "generation 1 and its WorkItem and request versions",
+        "adoption_no_request": "the controls created no request and started none on A's WorkItem",
+        "adoption_owner_control": "A's own revalidation at the same versions passed the owner "
+        "check (409 generation_current or runtime_live) and rebound nothing",
         "a_marker_unchanged": "A's durable transcript marker is unchanged by the controls",
         "no_b_claim_on_a_thread": "no claim or pod for B appeared on A's thread",
         "no_foreign_runnable_request": "no runnable request with B's tuple exists on A's WorkItem",
@@ -2697,7 +2720,8 @@ EXPECTED: dict[str, dict[str, str]] = {
     "cleanup": {
         "foreign_preserved": "every foreign resource seen before the run kept its uid",
         "token_scan_both_grants": "the token scan held both owner grants and both session cookies",
-        "card_residue_recorded": "external approval-card residue was recorded, not claimed removed",
+        "card_residue_recorded": "card_residue names every delivered card of the run, drill "
+        "cards included, as left in its channel; none is claimed removed",
         "forge_removal_guarded": "every forge object removed was confirmed created and still "
         "at this run's recorded head",
         "cleanup_within_window": "every cleanup step, from the fence that opens finalize to the "
@@ -2707,7 +2731,11 @@ EXPECTED: dict[str, dict[str, str]] = {
 #: Numeric observations: (operator, bound). Every other key must be exactly True.
 COMPARISONS: dict[str, dict[str, tuple[str, int]]] = {
     "owners": {"custody_secret_count": ("==", 2)},
-    "approval": {"card1_unlisted_status": ("==", 403), "card4_unlisted_status": ("==", 403)},
+    "approval": {
+        "drill_unlisted_status": ("==", 403),
+        "card1_unlisted_status": ("==", 403),
+        "card4_unlisted_status": ("==", 403),
+    },
     "disconnect": {
         "teardown_pending_runtimes": ("==", 0),
         "teardown_pending_custody_cleanup": ("==", 0),
@@ -2733,8 +2761,9 @@ REHEARSAL_EXPECTED: dict[str, str] = {
     "card_unlisted_status": "the unlisted operator's resolve answered 403",
     "card_rejected_by_operator": "the allowed operator rejected a drill card",
     "card_approved_by_operator": "the allowed operator approved a drill card",
-    "admission_controls_refused": "with the worker stopped, wrong-owner and unenrolled "
-    "admissions were refused before any request ran",
+    "admission_controls_refused": "with the worker stopped, B's admission, replay, context "
+    "read and adoption of A's WorkItem were refused before any request ran, while A's own "
+    "read and revalidation passed the owner check",
     "disconnect_refused_after_restart": "after a worker restart, an unenrolled owner's "
     "disconnect and admission were refused",
     "no_grant_loaded": "the rehearsal loaded no grant",
@@ -2748,8 +2777,304 @@ INVENTORY_KINDS = (
     "claim_tokens",
     "dex",
 )
-SCAN_CHANNELS = pps.SCAN_CHANNELS
 _DONE_SOURCES = frozenset({"native", "not_started", "probe"})
+
+# -- the credential capture audit (AC 9) ---------------------------------------
+#
+# The single-profile channels (pps.SCAN_CHANNELS) are scanned as bytes pass
+# through the driver. Finalize adds, after the fence and before teardown, the
+# captures AC 9 names that the driver does not otherwise read in full: the logs
+# of every container instance in the release and grant namespaces, both
+# namespaces' events, the API's final records of the run, its publications and
+# pull requests, and the install's traces. Each is scanned in memory on its own
+# channel and never written to disk or printed.
+
+POD_LOGS_CHANNEL = "pod_logs"
+EVENTS_CHANNEL = "events"
+API_CAPTURES_CHANNEL = "api_captures"
+PUBLICATION_CAPTURES_CHANNEL = "publication_captures"
+TRACES_CHANNEL = "traces"
+#: The channels the finalize capture audit fills; each one carries a receipt.
+CAPTURE_CHANNELS = (
+    POD_LOGS_CHANNEL,
+    EVENTS_CHANNEL,
+    API_CAPTURES_CHANNEL,
+    PUBLICATION_CAPTURES_CHANNEL,
+    TRACES_CHANNEL,
+)
+#: Forge file contents read at published heads (``TwoOwnerRun.forge_file``).
+FORGE_CHANNEL = "forge"
+#: Every channel a live ledger must show scanned, with at least one byte and no token.
+LIVE_SCAN_CHANNELS = (*pps.SCAN_CHANNELS, FORGE_CHANNEL, *CAPTURE_CHANNELS)
+#: A rehearsal starts no runner pod and reads no published head, so it has no
+#: transcript harvest and no forge file to scan.
+REHEARSAL_SCAN_CHANNELS = tuple(
+    name for name in LIVE_SCAN_CHANNELS if name not in {"harvest", FORGE_CHANNEL}
+)
+#: Where an install's traces land, from its rendered values (``trace_backend``).
+TRACE_BACKENDS = ("in_cluster", "absent", "external")
+#: Langfuse's ClickHouse tables (its default database) that hold trace content.
+TRACE_TABLES = ("traces", "observations", "scores")
+#: ``sh -c`` in the release's ClickHouse container: clickhouse-client logs in
+#: with that container's own CLICKHOUSE_USER and CLICKHOUSE_PASSWORD
+#: (charts/curie/templates/clickhouse.yaml), so the driver's argv carries the
+#: query only; ``$1`` is the query.
+CLICKHOUSE_EXEC = (
+    'exec clickhouse-client --user "$CLICKHOUSE_USER" '
+    '--password "$CLICKHOUSE_PASSWORD" --query "$1"'
+)
+
+
+def _deployed(values: Mapping[str, Any], name: str) -> bool:
+    section = values.get(name)
+    return not (isinstance(section, Mapping) and section.get("deploy") is False)
+
+
+def trace_backend(values: Mapping[str, Any]) -> str:
+    """Where the install's traces land: ``in_cluster``, ``absent`` or ``external``.
+
+    The chart's defaults (charts/curie/values.yaml) deploy Langfuse, its
+    ClickHouse and the OTel collector, which then exports to that Langfuse:
+    ``in_cluster``, read from ClickHouse. ``otelCollector.telemetryDisabled``
+    true exports no traces at all: ``absent``, the explicit fact the cleanup
+    judge accepts in place of a trace capture. Any other shape sends traces
+    somewhere the driver cannot read: ``external``, which fails the audit.
+    """
+
+    otel = values.get("otelCollector")
+    otel = otel if isinstance(otel, Mapping) else {}
+    if otel.get("telemetryDisabled") is True:
+        return "absent"
+    if _deployed(values, "otelCollector") and all(
+        _deployed(values, name) for name in ("langfuse", "clickhouse")
+    ):
+        return "in_cluster"
+    return "external"
+
+
+def trace_query(table: str) -> str:
+    """One ClickHouse read of a whole trace table; JSON output, so an empty table still answers."""
+
+    if table not in TRACE_TABLES:
+        raise ValueError("not a trace table")
+    return f"SELECT * FROM {table} FORMAT JSON"
+
+
+def required_scan_channels(*, rehearsal: bool, traces_backend: Any) -> tuple[str, ...]:
+    """The channels a ledger must show scanned; traces only where the install exports them."""
+
+    channels = REHEARSAL_SCAN_CHANNELS if rehearsal else LIVE_SCAN_CHANNELS
+    if traces_backend == "absent":
+        return tuple(name for name in channels if name != TRACES_CHANNEL)
+    return channels
+
+
+def container_log_reads(pods: Any) -> list[tuple[str, str, bool]]:
+    """``(pod, container, previous)`` for every container instance whose log exists.
+
+    A ``kubectl get pods -o json`` listing: every init, regular and ephemeral
+    container whose current instance has run (a running or terminated state)
+    has a current log; one with a restart count or a terminated last state
+    also has a previous instance (``kubectl logs --previous``). A container
+    that never started has no log and is not a read.
+    """
+
+    reads: list[tuple[str, str, bool]] = []
+    items = pods.get("items") if isinstance(pods, Mapping) else None
+    for pod in items if isinstance(items, list) else []:
+        if not isinstance(pod, Mapping):
+            continue
+        name = str((pod.get("metadata") or {}).get("name") or "")
+        status = pod.get("status") or {}
+        if not name or not isinstance(status, Mapping):
+            continue
+        for key in ("initContainerStatuses", "containerStatuses", "ephemeralContainerStatuses"):
+            for item in status.get(key) or []:
+                if not isinstance(item, Mapping) or not item.get("name"):
+                    continue
+                container = str(item["name"])
+                state = item.get("state")
+                last = item.get("lastState")
+                restarts = item.get("restartCount")
+                if isinstance(state, Mapping) and ("running" in state or "terminated" in state):
+                    reads.append((name, container, False))
+                if (isinstance(last, Mapping) and "terminated" in last) or (
+                    type(restarts) is int and restarts > 0
+                ):
+                    reads.append((name, container, True))
+    return reads
+
+
+def _scanned(entry: Any) -> bool:
+    if not isinstance(entry, Mapping):
+        return False
+    size = entry.get("scanned_bytes")
+    return type(size) is int and size > 0 and entry.get("token_bytes_found") is False
+
+
+def _captured(entry: Any) -> bool:
+    if not isinstance(entry, Mapping):
+        return False
+    sources, failures = entry.get("sources"), entry.get("failures")
+    return type(sources) is int and sources > 0 and type(failures) is int and failures == 0
+
+
+def scan_checks(
+    scans: Any, captures: Any, *, rehearsal: bool, traces_backend: Any
+) -> dict[str, bool]:
+    """The cleanup judge's scan verdicts from the recorded token scan and capture receipts.
+
+    Every required channel must be present with a nonzero scanned byte count
+    and no token bytes; every capture channel among them must have read at
+    least one source with no failed read; and the trace backend must be
+    recorded, with traces either captured from the install or explicitly
+    absent from it.
+    """
+
+    scans = scans if isinstance(scans, Mapping) else {}
+    captures = captures if isinstance(captures, Mapping) else {}
+    required = required_scan_channels(rehearsal=rehearsal, traces_backend=traces_backend)
+    return {
+        "token_scan_complete": all(_scanned(scans.get(name)) for name in required),
+        "capture_audit_complete": all(
+            _captured(captures.get(name)) for name in CAPTURE_CHANNELS if name in required
+        ),
+        "traces_audited": traces_backend == "absent"
+        or (
+            traces_backend == "in_cluster"
+            and _scanned(scans.get(TRACES_CHANNEL))
+            and _captured(captures.get(TRACES_CHANNEL))
+        ),
+        "token_bytes_absent": bool(scans)
+        and all(
+            isinstance(entry, Mapping) and entry.get("token_bytes_found") is False
+            for entry in scans.values()
+        ),
+    }
+
+
+# -- approval-card residue (AC 9) ----------------------------------------------
+
+#: An approval observation ``<card>_card`` (``pp.LiveRun.await_card``): the drill's two
+#: cards and the four scenario cards.
+_CARD_STATE_KEY = re.compile(r"(drill_reject|drill_approve|card[1-4])_card")
+#: Residue status of one card, and whether it says the card was delivered. The
+#: driver never deletes a channel message, so a delivered card is left there.
+CARD_RESIDUE_STATUSES: dict[str, bool] = {"left_in_channel": True, "not_delivered": False}
+
+
+def delivered_cards(approval: Mapping[str, Any]) -> set[str]:
+    """The cards whose recorded delivery state says delivered."""
+
+    found: set[str] = set()
+    for key, value in approval.items():
+        match = _CARD_STATE_KEY.fullmatch(key)
+        if match and isinstance(value, Mapping) and value.get("delivered") is True:
+            found.add(match[1])
+    return found
+
+
+def card_residue(
+    cards: Mapping[str, str], approval: Mapping[str, Any], *, channel: str
+) -> dict[str, Any]:
+    """The cleanup record of every card the run created: its reference and residue status.
+
+    ``cards`` maps a card (``drill_reject``, ``card1``...) to the digest of its
+    publication; ``approval`` holds each card's recorded delivery state.
+    """
+
+    delivered = delivered_cards(approval)
+    return {
+        "channel": channel,
+        "removed": False,
+        "cards": {
+            key: {
+                "publication": ref,
+                "delivered": key in delivered,
+                "residue": "left_in_channel" if key in delivered else "not_delivered",
+            }
+            for key, ref in sorted(cards.items())
+        },
+    }
+
+
+def card_residue_recorded(residue: Any, approval: Mapping[str, Any]) -> bool:
+    """True only when ``residue`` names every delivered card with an explicit residue status.
+
+    Each entry needs a publication reference and a status from
+    ``CARD_RESIDUE_STATUSES`` that agrees with its delivered flag, nothing may
+    be claimed removed, and every card ``approval`` records as delivered must
+    be there as delivered.
+    """
+
+    if not isinstance(residue, Mapping) or residue.get("removed") is not False:
+        return False
+    channel, cards = residue.get("channel"), residue.get("cards")
+    if not isinstance(channel, str) or not channel or not isinstance(cards, Mapping):
+        return False
+    for entry in cards.values():
+        if not isinstance(entry, Mapping):
+            return False
+        status, ref = entry.get("residue"), entry.get("publication")
+        if status not in CARD_RESIDUE_STATUSES or not isinstance(ref, str) or not ref:
+            return False
+        if entry.get("delivered") is not CARD_RESIDUE_STATUSES[status]:
+            return False
+    return all(
+        isinstance(cards.get(key), Mapping) and cards[key].get("delivered") is True
+        for key in delivered_cards(approval)
+    )
+
+
+# -- the personal-context read the adoption control compares -------------------
+
+#: Codes A's own revalidation may answer at the scenario's controls: the owner
+#: check passed and nothing was rebound (personal_execution.revalidate checks
+#: the owner before the live runtime and the generation).
+OWNER_REVALIDATION_CODES = frozenset({"generation_current", "runtime_live"})
+
+
+def context_versions(body: Any) -> dict[str, Any] | None:
+    """The revalidation versions from a ``PersonalContextOut`` body, or None.
+
+    apps/api/src/curie_api/routers/work_items.py: ``work_item_version``, the
+    latest ``request`` (``id``, ``version``) and the owner's ``enrollment``
+    (``version``).
+    """
+
+    if not isinstance(body, Mapping):
+        return None
+    request, enrollment = body.get("request"), body.get("enrollment")
+    if not isinstance(request, Mapping) or not isinstance(enrollment, Mapping):
+        return None
+    versions = {
+        "request_id": request.get("id"),
+        "expected_work_item_version": body.get("work_item_version"),
+        "expected_request_version": request.get("version"),
+        "expected_enrollment_version": enrollment.get("version"),
+    }
+    if not isinstance(versions["request_id"], str) or not versions["request_id"]:
+        return None
+    if any(type(versions[key]) is not int for key in versions if key != "request_id"):
+        return None
+    return versions
+
+
+def context_binding(body: Any) -> dict[str, Any] | None:
+    """The owner, bound generation and versions of a ``PersonalContextOut`` body, or None."""
+
+    versions = context_versions(body)
+    if versions is None or not isinstance(body, Mapping):
+        return None
+    request = body.get("request") or {}
+    return {
+        **versions,
+        "tenant_id": body.get("tenant_id"),
+        "owner_principal_id": body.get("owner_principal_id"),
+        "model_auth_mode": body.get("model_auth_mode"),
+        "enrollment_generation": body.get("enrollment_generation"),
+        "request_generation": request.get("enrollment_generation"),
+    }
 
 
 def check_value(value: Any, rule: tuple[str, int] | None) -> bool:
@@ -2870,13 +3195,18 @@ def _judge_cleanup(ledger: TwoOwnerLedger) -> tuple[dict[str, bool], dict[str, i
         "steps_ok": bool(steps) and all(row["status"] == "ok" for row in steps),
         "inventory_complete": set(INVENTORY_KINDS) <= kinds,
         "inventory_absent": bool(inventory) and all(row["status"] == "absent" for row in inventory),
-        "token_scan_complete": set(SCAN_CHANNELS) <= set(scans),
-        "token_bytes_absent": bool(scans)
-        and all(
-            isinstance(entry, dict) and entry.get("token_bytes_found") is False
-            for entry in scans.values()
+        **scan_checks(
+            scans,
+            observed.get("capture_audit"),
+            rehearsal=ledger.is_rehearsal(),
+            traces_backend=observed.get("traces_backend"),
         ),
     }
+    # The flag alone is not evidence: the recorded residue must name every card
+    # the approval criterion recorded as delivered.
+    checks["card_residue_recorded"] = checks["card_residue_recorded"] and card_residue_recorded(
+        observed.get("card_residue"), ledger.observations("approval")
+    )
     counts = {
         "steps": len(steps),
         "failed_steps": sum(row["status"] != "ok" for row in steps),

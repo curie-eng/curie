@@ -373,10 +373,14 @@ private inputs file instead.
    reviewer, real tools and a bundle hook on their own grant only. WorkItem,
    every request, custody and delivery identity, session and CLI reads agree on
    tenant, immutable owner and generation, and no installation-wide grant exists.
-2. `approval` and `publication`: a listed operator rejects A's first
-   publication and approves its fresh successor and B's publications, an
-   unlisted operator gets 403, nothing is pushed before approval, and approved
-   trees equal the reviewed workspace on the branch the API reports.
+2. `approval` and `publication`: before the first paid phase an unpaid drill
+   proves the channel gateway delivers routed cards (two drill cards, the
+   unlisted operator refused, one rejected and one approved, nothing started or
+   pushed), so a broken gateway fails before any reservation. Then a listed
+   operator rejects A's first publication and approves its fresh successor and
+   B's publications, an unlisted operator gets 403, nothing is pushed before
+   approval, and approved trees equal the reviewed workspace on the branch the
+   API reports.
 3. `ci-repair`: a real failing check on B's published head reaches production
    CI ingestion; the production repair keeps B's owner and grant, pushes a
    repaired head and its latest and required checks pass.
@@ -392,14 +396,23 @@ private inputs file instead.
    the interrupted one's where a runner existed, must hold the branch head and
    every committed blob's SHA-256 as the owned forge serves them (B1's
    published head for the worker stop, which has no runner).
-5. `wrong-owner`: B cannot adopt or read A's work before A's authorized
-   continuation, which then runs with its original tuple.
+5. `wrong-owner`: before A's authorized continuation, B's admission on A's
+   issue, B's replay of A1's request, B's personal-context read and B's
+   adoption of A's WorkItem (`POST .../personal-context/revalidate` with B's
+   tenant, agent and principal at the current WorkItem, request and enrollment
+   versions) are refused; A's binding and versions are unchanged, no request
+   is created or started, and A's own revalidation at the same versions passes
+   the owner check without rebinding. A's continuation then runs with its
+   original tuple.
 6. `disconnect`: A's disconnect during active work fences and tears A down; B
    makes a new tool call after A's confirmed stop and publishes a passing head;
    after a worker restart A cannot launch, reuse or resume.
 7. `budget` and `cleanup`: every start was reserved and settled from native
    usage inside the ceiling, and every owned resource is absent with no grant
-   bytes in any scanned channel. `rehearsal` judges the unpaid rehearsal ledger.
+   bytes in any scanned channel. Every required channel must show scanned bytes
+   and every capture a read source with no failed read; the card residue must
+   name every delivered card, drill cards included, as left in its channel.
+   `rehearsal` judges the unpaid rehearsal ledger.
 
 ### Inputs file
 
@@ -462,7 +475,8 @@ p judge --criterion all
    rehearsal run ID.
 2. `rehearse` is unpaid and takes no grant and no `--approve-live`: namespace,
    install, Dex logins per owner, forge issues, delivered-card controls
-   (unlisted 403, authorized reject and approve), wrong-owner admission
+   (unlisted 403, authorized reject and approve, the same drill a live run
+   takes before its first reservation), wrong-owner admission and adoption
    controls with the worker stopped, post-restart refusals, the fence and
    cleanup. It cannot pass a live criterion.
 3. `forge-probe` is the single-profile write probe plus read-only CI reads.
@@ -519,10 +533,11 @@ most 32,768 minus prior spend, and every production transition mapped.
 ### Live phase order
 
 1. Unpaid: `refusals`, `namespace`, `images`, `install`, `setup` (Dex login and
-   enrollment per owner), `forge`. Then `probe-a`, `attempt-a1` (parks on
-   card 1), `probe-b`, `attempt-b1` (parks on card 3). Every attempt's pod is
-   deleted at its park after terminal capture, so each later start is a fresh
-   native process.
+   enrollment per owner), `forge`, `drill` (an undelivered card fails here,
+   before any reservation or native start). Then `probe-a`, `attempt-a1`
+   (parks on card 1), `probe-b`, `attempt-b1` (parks on card 3). Every
+   attempt's pod is deleted at its park after terminal capture, so each later
+   start is a fresh native process.
 2. `wrong-owner`, then `reject-a1` (unlisted operator refused, listed operator
    rejects), `attempt-a2` (fresh successor in a new pod), `approve-a2`.
 3. `approve-b1` once A is quiescent: B-r1 is reserved before B1's card is
@@ -540,8 +555,12 @@ most 32,768 minus prior spend, and every production transition mapped.
 6. The fence (worker to zero, runner pods deleted without grace, their claims
    deleted, active owners disconnected), cleanup and inventory. On success,
    failure and signal the fence is the first action of finalize, before any
-   charge, observation or wait for the worker's graceful exit. One cleanup
-   clock starts before it and covers every step; a cleanup past 600 s is
+   charge, observation or wait for the worker's graceful exit. Before teardown
+   the capture audit reads, in memory, every container instance's log
+   (previous instances included) in the release and grant namespaces, both
+   namespaces' events, the run's WorkItems, approvals, audits, publications
+   and pull requests, and Langfuse's ClickHouse trace tables. One cleanup
+   clock starts before the fence and covers every step; a cleanup past 600 s is
    recorded (`cleanup_within_window` false) and fails the cleanup judge while
    the remaining teardown still runs.
 
@@ -597,7 +616,12 @@ the failure, the single rerun (or its forbidden refusal) and the production
 The private SQLite ledger (`ledger.sqlite3` in `$STATE_DIR`, mode 0600) holds
 reservations per owner and group, sanitized per-session facts and native error
 classes, every observation each criterion judges, cleanup steps, inventories and
-the token scan over stdout, stderr, children, http, harvest, ledger and evidence.
+the token scan over stdout, stderr, children, http, harvest, ledger, evidence,
+forge, pod_logs, events, api_captures, publication_captures and traces, with a
+capture receipt (sources read, failed reads) per capture channel and the trace
+backend the install values imply. A rehearsal has no harvest or forge channel.
+`traces_backend` `absent` (telemetry disabled) is the only way to pass without a
+trace capture; an external backend fails the audit.
 Public output is verdicts, booleans, counts and refusal codes: no identifier, no
 transcript, no grant, session or client value. Grants travel only by file; the
 CLI reads session files the driver writes 0600 and the finalizer removes.
@@ -628,6 +652,13 @@ CLI reads session files the driver writes 0600 and the finalizer removes.
    the same clock.
 7. The watchdog acts at its deadline (300 s, 4,800 s), as the ceiling decision
    says; settled usage exactly at a ceiling still passes the budget judge.
+8. The drill runs in the live run too. A publication approval owes no model
+   wake and the approved drill publication's push Job fails fetching its
+   all-zero base, so the drill starts no native session and pushes nothing;
+   the driver also checks both after the drill.
+9. The capture audit runs after the fence, so the worker and runner pods the
+   fence (or the scenario's restarts) deleted are not in it; runner
+   transcripts reach the token scan through the harvest instead.
 
 ### Not met
 
