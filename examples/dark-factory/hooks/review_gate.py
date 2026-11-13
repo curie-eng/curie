@@ -237,6 +237,10 @@ One script handles every hook event the bundle registers:
     After those checks, the body must contain one valid ``## Decisions``
     section. A malformed or missing section refuses publication without
     stopping the run or changing its review approval or round counters.
+    The runner allows a call whose hook times out or exits with anything but
+    0 or 2, so the publish decision exits 2 (deny) on its own exception, on
+    hook input that is not UTF-8 JSON, and when it has not finished within
+    ``PUBLISH_DEADLINE_SECONDS``.
 
 ``PreToolUse`` on ``report_progress``
     Never decided. Writes a ``curie_reported`` line with the reported phase,
@@ -318,6 +322,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeGuard
@@ -2053,8 +2058,52 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
     return out
 
 
+# The runner lets a tool call through when its hook times out (60 seconds) or
+# exits with anything but 0 or 2, so a publication decision that cannot finish
+# denies itself first. Kept below the 10 second hook timeout in hooks.json.
+PUBLISH_DEADLINE_SECONDS = 9.0
+
+
+def _is_publish(data: dict[str, Any]) -> bool:
+    return data.get("hook_event_name") == "PreToolUse" and str(
+        data.get("tool_name") or ""
+    ).endswith("publish_changes")
+
+
+def _refuse(reason: str) -> int:
+    print(f"dark factory review gate: {reason}; refusing", file=sys.stderr)
+    return 2
+
+
 def main() -> int:
-    out = handle(json.load(sys.stdin))
+    try:
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return _refuse("the hook input is not UTF-8 JSON")
+    if not isinstance(data, dict):
+        return _refuse("the hook input is not a JSON object")
+    if not _is_publish(data):
+        out = handle(data)
+        if out is not None:
+            print(json.dumps(out))
+        return 0
+    result: dict[str, Any] = {}
+
+    def decide() -> None:
+        try:
+            result["out"] = handle(data)
+        except BaseException as exc:  # noqa: BLE001 - any failure denies publication
+            result["error"] = exc
+
+    worker = threading.Thread(target=decide, daemon=True)
+    worker.start()
+    worker.join(PUBLISH_DEADLINE_SECONDS)
+    if worker.is_alive():
+        return _refuse(f"the publication check did not finish in {PUBLISH_DEADLINE_SECONDS}s")
+    if "error" in result:
+        error = result["error"]
+        return _refuse(f"the publication check failed ({type(error).__name__})")
+    out = result.get("out")
     if out is not None:
         print(json.dumps(out))
     return 0

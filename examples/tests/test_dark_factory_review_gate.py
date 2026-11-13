@@ -9,6 +9,7 @@ cap, a failed reviewer call, and the publication gate.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import re
@@ -773,6 +774,77 @@ def test_publish_decisions_adversarial_sections_are_denied_quickly(
         assert time.monotonic() - started < 20.0
         assert refused["permissionDecision"] == "deny"
         assert "## Decisions" in refused["permissionDecisionReason"]
+
+
+def _publish_main(hook: Any, monkeypatch: pytest.MonkeyPatch, raw: bytes) -> int:
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8"))
+    code: int = hook.main()
+    return code
+
+
+def _publish_event(tmp_path: Path) -> bytes:
+    event = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "sess-publish",
+        "cwd": str(tmp_path),
+        "tool_name": PUBLISH,
+        "tool_input": {"title": "t", "body": VALID_PR_BODY},
+    }
+    return json.dumps(event).encode()
+
+
+@pytest.mark.parametrize("raw", [b"{not json", b"\xff\xfe\x00", b"[]", b""])
+def test_publish_hook_denies_unreadable_input(
+    raw: bytes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_unreadable_input")
+    assert _publish_main(hook, monkeypatch, raw) == 2
+    assert "refusing" in capsys.readouterr().err
+
+
+def test_publish_hook_denies_on_its_own_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_publish_exception")
+
+    def broken(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(hook, "pre_publish", broken)
+    assert _publish_main(hook, monkeypatch, _publish_event(tmp_path)) == 2
+    assert "RuntimeError" in capsys.readouterr().err
+
+
+def test_publish_hook_denies_at_its_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_publish_deadline")
+    release = threading.Event()
+
+    def stuck(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
+        # Bounded so a hook that waits for its check fails here instead of hanging.
+        release.wait(timeout=5)
+        return dict(hook._allow("late"))
+
+    # The shipped deadline is below the runner's 60 second hook timeout.
+    assert hook.PUBLISH_DEADLINE_SECONDS < 60
+    monkeypatch.setattr(hook, "pre_publish", stuck)
+    monkeypatch.setattr(hook, "PUBLISH_DEADLINE_SECONDS", 0.05)
+    try:
+        assert _publish_main(hook, monkeypatch, _publish_event(tmp_path)) == 2
+    finally:
+        release.set()
+    assert "did not finish" in capsys.readouterr().err
+
+
+def test_publish_hook_still_allows_a_decision_that_finishes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_publish_liveness")
+    monkeypatch.setattr(hook, "pre_publish", lambda state, tool_input: hook._allow("ok"))
+    assert _publish_main(hook, monkeypatch, _publish_event(tmp_path)) == 0
+    decision = json.loads(capsys.readouterr().out)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "allow"
 
 
 @pytest.mark.parametrize("case_id", ["answers-recorded-decision", "admits-unrecorded-decision"])
