@@ -17,6 +17,11 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    op.add_column(
+        "execution_requests",
+        sa.Column("transcript_expires_at", sa.DateTime(timezone=True), nullable=True),
+        schema="curie",
+    )
     op.create_table(
         "factory_transcript_events",
         sa.Column("id", sa.BigInteger(), sa.Identity(), primary_key=True),
@@ -68,3 +73,4 @@ def downgrade() -> None:
         "ix_factory_transcript_request_cursor", table_name="factory_transcript_events", schema="curie"
     )
     op.drop_table("factory_transcript_events", schema="curie")
+    op.drop_column("execution_requests", "transcript_expires_at", schema="curie")

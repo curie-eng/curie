@@ -385,6 +385,12 @@
             "items": {"type": "string", "minLength": 1, "maxLength": 50}
           }
         },
+        "factoryTranscriptRetentionDays": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3650,
+          "description": "Retention for newly captured factory execution transcripts, in days. Existing request expiries remain fixed."
+        },
         "githubRepoAllowlist": {
           "type": "array",
           "uniqueItems": true,

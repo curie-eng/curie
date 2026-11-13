@@ -2459,7 +2459,9 @@ REQUEST_ID` follows every page of the private transcript API and prints the
 retained event stream. `--agent NAME_OR_ID` scopes the read. `status` reports
 `complete`, `incomplete`, `unavailable`, or `expired`; it is not inferred from
 the work item's terminal state alone. The transcript is retained for 30 days
-from request creation, independently of replay history and Langfuse traces.
+from request creation by default. `api.factoryTranscriptRetentionDays` changes
+the period for newly captured requests; existing request expiries are fixed.
+Transcript retention is independent of replay history and Langfuse traces.
 
 ### Personal Claude enrollment
 

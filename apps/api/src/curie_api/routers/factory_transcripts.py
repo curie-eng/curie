@@ -36,11 +36,18 @@ async def require_transcript_writer(
 async def write_transcript_event(
     request_id: uuid.UUID, body: TranscriptEventIn, session: SessionDep
 ) -> dict[str, Any]:
-    result = await record_event(session, request_id, body)
+    result = await record_event(
+        session,
+        request_id,
+        body,
+        retention_days=get_settings().factory_transcript_retention_days,
+    )
     if result == "request_not_found":
         raise HTTPException(status.HTTP_404_NOT_FOUND, {"code": result})
     if result == "event_conflict":
         raise HTTPException(status.HTTP_409_CONFLICT, {"code": result})
+    if result == "expired":
+        raise HTTPException(status.HTTP_410_GONE, {"code": result})
     if result == "too_large":
         raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, {"code": result})
     return {"recorded": result == "recorded", "duplicate": result == "duplicate"}

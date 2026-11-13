@@ -542,6 +542,11 @@ class Settings(BaseSettings):
     # resumes their stranded sessions. Values <= 0 disable the sweeper (the
     # operator kill lever and the fully-inert-app escape hatch for tests).
     approval_sweep_interval_s: float = 30.0
+    # Fixed for each factory execution at its first transcript event. Changing
+    # this value later applies only to newly captured requests.
+    factory_transcript_retention_days: int = Field(
+        default=30, ge=1, le=3650, validation_alias="CURIE_FACTORY_TRANSCRIPT_RETENTION_DAYS"
+    )
     approval_reminders_enabled: bool = Field(
         default=False, validation_alias="CURIE_APPROVAL_REMINDERS_ENABLED"
     )

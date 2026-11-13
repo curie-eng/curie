@@ -15,6 +15,16 @@ import pytest
 from curie_api.config import Settings, get_settings
 from pydantic import ValidationError
 
+
+def test_factory_transcript_retention_days_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CURIE_FACTORY_TRANSCRIPT_RETENTION_DAYS", "7")
+    assert Settings().factory_transcript_retention_days == 7
+    monkeypatch.setenv("CURIE_FACTORY_TRANSCRIPT_RETENTION_DAYS", "0")
+    with pytest.raises(ValidationError):
+        Settings()
+
 _PUBLICATION_LABEL_VECTORS = json.loads(
     (
         Path(__file__).resolve().parents[3] / "tests/vectors/factory-publication-labels.json"

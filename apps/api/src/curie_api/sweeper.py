@@ -59,7 +59,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import publications as crud_publications
 
-from . import factory_transcripts
 from .config import get_settings
 from .identity.http_approval import approval_is_selected
 from .identity.http_invocation import HttpInvocationRuntime
@@ -426,7 +425,6 @@ async def run_expiry_sweeper(
                         - timedelta(seconds=publication_patch_retention_seconds),
                         limit=100,
                     )
-                    await factory_transcripts.expire_events(session)
                     if remediation_admissions is not None:
                         await remediation_admissions(session)
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained

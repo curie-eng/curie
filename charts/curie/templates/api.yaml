@@ -509,6 +509,8 @@ spec:
             # instead of disabling. <= 0 disables the sweeper.
             - name: APPROVAL_SWEEP_INTERVAL_S
               value: {{ .Values.api.approvalSweepIntervalSeconds | quote }}
+            - name: CURIE_FACTORY_TRANSCRIPT_RETENTION_DAYS
+              value: {{ .Values.api.factoryTranscriptRetentionDays | quote }}
             - name: CURIE_APPROVAL_RECOVERY_ENABLED
               value: {{ .Values.api.approvalRecovery.enabled | quote }}
             # How long a fetched user-group member set is reused (#420). Rendered

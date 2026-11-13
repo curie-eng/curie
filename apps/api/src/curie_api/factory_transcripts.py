@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -11,13 +13,13 @@ from curie_telemetry.redact import redact_text
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .models import ExecutionRequest, FactoryTranscriptEvent
 
-RETENTION = timedelta(days=30)
 MAX_EVENT_BYTES = 4 * 1024 * 1024
 WRITE_SCOPE = "work_item.transcript.write"
+logger = logging.getLogger(__name__)
 EventKind = Literal[
     "prompt",
     "message",
@@ -26,6 +28,9 @@ EventKind = Literal[
     "capture_complete",
     "capture_gap",
     "chunk",
+]
+RecordResult = Literal[
+    "recorded", "duplicate", "request_not_found", "expired", "event_conflict", "too_large"
 ]
 
 
@@ -60,13 +65,18 @@ def _redact(value: Any) -> tuple[Any, bool]:
 
 
 async def record_event(
-    session: AsyncSession, request_id: uuid.UUID, event: TranscriptEventIn
-) -> Literal["recorded", "duplicate", "request_not_found", "event_conflict", "too_large"]:
+    session: AsyncSession, request_id: uuid.UUID, event: TranscriptEventIn, *, retention_days: int
+) -> RecordResult:
     """Insert once per event ID; reject a retry that changes its content."""
 
-    request = await session.get(ExecutionRequest, request_id)
+    request = await session.get(ExecutionRequest, request_id, with_for_update=True)
     if request is None:
         return "request_not_found"
+    if request.transcript_expires_at is None:
+        request.transcript_expires_at = request.created_at + timedelta(days=retention_days)
+    expires_at = request.transcript_expires_at
+    if expires_at <= datetime.now(UTC):
+        return "expired"
     safe, redacted = _redact(event.content)
     if len(json.dumps(safe, separators=(",", ":"), ensure_ascii=False).encode()) > MAX_EVENT_BYTES:
         return "too_large"
@@ -96,7 +106,7 @@ async def record_event(
             kind=event.kind,
             content=safe,
             redacted=redacted,
-            expires_at=request.created_at + RETENTION,
+            expires_at=expires_at,
         )
         .on_conflict_do_nothing()
         .returning(FactoryTranscriptEvent.id)
@@ -130,6 +140,16 @@ async def page_events(
     """Return a stable cursor page and run-level capture status."""
 
     request_id = request.id
+    expires_at = request.transcript_expires_at
+    if expires_at is not None and expires_at <= datetime.now(UTC):
+        return {
+            "status": "expired",
+            "gaps": [],
+            "redacted": False,
+            "expires_at": expires_at.isoformat(),
+            "events": [],
+            "next_cursor": None,
+        }
     rows = list(
         await session.scalars(
             select(FactoryTranscriptEvent)
@@ -170,9 +190,7 @@ async def page_events(
         and not gaps
     )
     status = (
-        "expired"
-        if request.created_at + RETENTION <= datetime.now(UTC)
-        else "unavailable"
+        "unavailable"
         if not all_markers
         else "complete"
         if complete
@@ -182,7 +200,7 @@ async def page_events(
         "status": status,
         "gaps": gaps,
         "redacted": any(event.redacted for event in all_markers),
-        "expires_at": (request.created_at + RETENTION).isoformat(),
+        "expires_at": expires_at.isoformat() if expires_at is not None else None,
         "events": [
             {
                 "cursor": row.id,
@@ -218,3 +236,22 @@ async def expire_events(session: AsyncSession, *, limit: int = 1000) -> int:
     count = len(rows.all())
     await session.commit()
     return count
+
+
+async def run_retention_sweeper(
+    sessionmaker: async_sessionmaker[AsyncSession], stop: asyncio.Event, *, interval_s: float = 30
+) -> None:
+    """Reap expired transcript rows independently of the approval sweeper."""
+
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_s)
+        except TimeoutError:
+            pass
+        if stop.is_set():
+            break
+        try:
+            async with sessionmaker() as session:
+                await expire_events(session)
+        except Exception:
+            logger.exception("factory transcript retention sweep failed")

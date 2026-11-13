@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from curie_api.config import get_settings
 from curie_api.factory_transcripts import expire_events
-from curie_api.models import FactoryTranscriptEvent
+from curie_api.models import ExecutionRequest, FactoryTranscriptEvent
 from curie_internal import sandbox_token
 from forge_fakes.github_comments import admitted, comments  # noqa: F401 - fixtures
 from sqlalchemy import update
@@ -124,3 +124,47 @@ def test_transcript_write_is_request_bound_ordered_and_idempotent(admitted: Any)
     assert swept.status_code == 200
     assert swept.json()["status"] == "unavailable"
     assert swept.json()["events"] == []
+
+    async def expire_request() -> None:
+        async with client.app.state.sessionmaker() as session:
+            await session.execute(
+                update(ExecutionRequest)
+                .where(ExecutionRequest.id == request_id)
+                .values(transcript_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+            )
+            await session.commit()
+
+    client.portal.call(expire_request)
+    assert client.post(path, headers=headers, json=_event(boot_id, 5)).status_code == 410
+    expired = client.get(
+        f"/work-items/runs/{request_id}/transcript",
+        headers={"X-API-Key": get_settings().api_key},
+    )
+    assert expired.json()["status"] == "expired"
+    assert expired.json()["events"] == []
+
+
+def test_retention_is_fixed_at_first_event(admitted: Any, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    client, github, _comments = admitted
+    _label(client, github, 5609)
+    request_id = _request(5609)["id"]
+    _start_running(client, request_id)
+    settings = get_settings()
+    monkeypatch.setattr(settings, "factory_transcript_retention_days", 7)
+    boot_id = uuid.uuid4()
+    path = f"/v1/work-item-transcripts/{request_id}/events"
+    headers = {"X-API-Key": _write_token(request_id)}
+    assert client.post(path, headers=headers, json=_event(boot_id, 1)).status_code == 201
+    first = client.get(
+        f"/work-items/runs/{request_id}/transcript",
+        headers={"X-API-Key": settings.api_key},
+    ).json()["expires_at"]
+    assert timedelta(days=6) < datetime.fromisoformat(first) - datetime.now(UTC) < timedelta(days=8)
+
+    monkeypatch.setattr(settings, "factory_transcript_retention_days", 14)
+    assert client.post(path, headers=headers, json=_event(boot_id, 2)).status_code == 201
+    second = client.get(
+        f"/work-items/runs/{request_id}/transcript",
+        headers={"X-API-Key": settings.api_key},
+    ).json()["expires_at"]
+    assert second == first
