@@ -262,6 +262,8 @@ A factory agent can name one Slack channel for run progress. Set it with `PATCH 
 
 A person steers by explicitly mentioning the app in that run thread, which asks for a revision of the same pull request on its existing branch. Plain thread replies do not steer. The API resolves the Slack sender in the receiving app's workspace, requires one active operator-managed GitHub account link for that person on the pull request's host, reads the account's current login and the pull request (open, on the run's branch), applies the existing pull request write authority, and admits the revision through the existing revision queue; a running request queues it behind. The full reply is kept as JSON in the revision objective, and no approval is added. A personal WorkItem, which runs on its owner's own Claude subscription, is steered only by its owner while their enrollment is active at the WorkItem's generation, and its revision runs as that owner; on an installation in personal mode a service WorkItem cannot be steered. Every other case is refused and the refusal code is posted in the thread. Nothing in a mapped root starts ordinary chat. GitHub is the only code host with account links today, so other hosts refuse. Worker settings are in the [operations reference](operations.md#factory-slack-progress), and account links in [factory Slack steering](operations.md#factory-slack-steering).
 
+Developers enroll and start a personal run from the [personal subscription guide](guides/personal-subscription.md).
+
 ## Operate and evaluate
 
 Use [measuring factory outcomes](guides/measuring-factory-outcomes.md) to

@@ -19,6 +19,8 @@ they are not substitutes for a supported quickstart.
   it for your organization's repository and tune it.
 - [Software Factory user guide](guides/factory-user-guide.md): use an installed
   factory to prepare an issue and verify the resulting GitHub PR.
+- [Personal Claude subscription](guides/personal-subscription.md): use your own
+  Claude Pro or Max plan for factory runs on a Kubernetes installation.
 - [Software Factory overview](software-factory.md): workflow, review and CI limits.
 - [Bring your agent](bring-your-agent.md): compatibility and reuse of supported
   skills and tools.
