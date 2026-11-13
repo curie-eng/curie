@@ -1791,6 +1791,11 @@ class FactoryTrackerResultDelivery(Base):
     )
     last_error_code: Mapped[str | None] = mapped_column(Text, default=None)
     failure_code: Mapped[str | None] = mapped_column(Text, default=None)
+    # Set, committed, before a create request is sent and kept while its
+    # outcome is uncertain; then retries only reconcile, never create again.
+    create_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     output_tracker_kind: Mapped[str | None] = mapped_column(Text, default=None)
     output_tracker_host: Mapped[str | None] = mapped_column(Text, default=None)
     output_scope_id: Mapped[str | None] = mapped_column(Text, default=None)

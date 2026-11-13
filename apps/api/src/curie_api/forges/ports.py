@@ -168,42 +168,61 @@ class Tracker(Protocol):
         body: str,
         labels: Collection[str],
         expected: TrackerIssueRef | None = None,
+        reconcile_only: bool = False,
     ) -> LinkedIssue:
         """Optional: one new issue in ``source``'s own scope, linked to it (ADR 0277).
 
         The body is ``body``, then a related-source line naming ``source``, then the
         hidden marker ``linked_issue_marker(output_identity)`` as the last line
         (`curie_api.forges.types.linked_issue_body`). It carries no closing
-        keyword and creates no blocked-by relation. Before creating, and again
-        after any uncertain create response, the adapter lists the scope's
-        issues created by its own identity (never a search API) and reconciles
-        to the one whose last non-empty line is that marker
-        (`curie_api.forges.types.ends_with_marker`); a marker in an issue
-        another identity created counts for nothing. More than one match raises
-        `Ambiguous` and writes nothing. A listing that cannot be read to its end
-        raises `Unavailable` and writes nothing, as does an uncertain create the
-        second listing cannot confirm. ``labels`` are applied at creation and
-        never edited on a reconciled issue. ValueError for an invalid
-        ``output_identity`` (`curie_api.forges.types.valid_output_identity`);
-        `NotFound` for a source outside this tracker; `Unsupported` where the
-        adapter declares `Operation.CREATE_LINKED_ISSUE` unsupported (GitLab
-        and Jira Cloud). Callers compare the returned `LinkedIssue.body_sha256`
-        with `LinkedIssue.sent_body_sha256` before recording delivery.
+        keyword and creates no blocked-by relation. ``labels`` are applied at
+        creation and never edited on a reconciled issue. Callers compare the
+        returned `LinkedIssue.body_sha256` with `LinkedIssue.sent_body_sha256`
+        before recording delivery.
 
-        The creator-filtered listing can lag a create by seconds (observed on
-        GitHub, as its search index does), so the lookup cannot prove a very
-        recent create absent. A caller that has recorded the output issue
-        therefore passes it as ``expected``, and a caller retrying a create it
-        could not confirm waits past that lag first.
+        The lookup lists the scope's issues created by the adapter's own
+        identity (never a search API) and matches the one whose last non-empty
+        line is the marker (`curie_api.forges.types.ends_with_marker`); a
+        marker in an issue another identity created counts for nothing. More
+        than one match raises `Ambiguous` and writes nothing. That
+        creator-filtered listing can lag a create by seconds (observed on
+        GitHub, as its search index does), so neither a listing nor elapsed
+        time proves a create absent.
 
-        With ``expected`` the adapter never creates and never lists: it reads
-        that one issue directly and returns it with that read-back (``created``
-        False) only when it is in this scope, is not a pull request, was
-        created by the adapter's own identity, and its last non-empty line is
-        the marker. Anything else (missing, a pull request, another author, the
-        marker gone) raises ``NotFound("linked_issue")``, so a recorded issue
-        is never replaced by a second one. `Ambiguous` is not raised on this
-        path. None keeps the create-or-reconcile behaviour above.
+        Three modes, chosen by the keywords:
+
+        1. Default (create or reconcile). The lookup runs first; one match is
+           returned with a read-back (``created`` False). With none the
+           adapter sends one create request. A definite refusal of it keeps
+           its type and proves nothing was created: `Unauthorized` (401, 403),
+           `NotFound` (404), ``Unavailable("unprocessable")`` (422). Any
+           failure after the request may have reached the tracker (a
+           transport error, a 5xx, an unreadable success, a success whose
+           read-back fails, or a relist after an uncertain answer that finds
+           nothing or cannot be read) raises `LinkedIssueUnconfirmed`; a
+           caller that gets it must never create again for this output
+           identity and reconciles with ``reconcile_only=True`` instead. An
+           uncertain answer the in-call relist does confirm returns that issue
+           (``created`` False). ``created`` is True only when the create was
+           answered and read back.
+        2. ``reconcile_only=True``. Never creates: the same lookup; one match is
+           returned with a read-back (``created`` False), none raises
+           ``NotFound("linked_issue")``, two raise `Ambiguous`.
+        3. ``expected=<recorded issue>``, for a caller that has recorded the
+           output. Never creates and never lists: it reads that one issue
+           directly and returns it with that read-back (``created`` False) only
+           when it is in this scope, is not a pull request, was created by the
+           adapter's own identity, and its last non-empty line is the marker.
+           Anything else (missing, a pull request, another author, the marker
+           gone) raises ``NotFound("linked_issue")``. `Ambiguous` is not raised.
+
+        Errors raised before any create request is sent keep their types and
+        write nothing: ValueError for an invalid ``output_identity``
+        (`curie_api.forges.types.valid_output_identity`) or for ``expected``
+        together with ``reconcile_only``; `NotFound` for a source outside this
+        tracker; `Unavailable` for a lookup listing that cannot be read to its
+        end; `Unsupported` where the adapter declares
+        `Operation.CREATE_LINKED_ISSUE` unsupported (GitLab and Jira Cloud).
         """
         ...
 

@@ -74,21 +74,29 @@ marked and described:
     `create_linked_issue` opens one issue in the source issue's own scope whose
     body ends with a related-source line and a hidden marker carrying the
     caller's output identity, with no closing keyword and no blocked-by
-    relation, and returns a `LinkedIssue` with the read-back body digest. It
-    is idempotent: before creating, and again after an uncertain create, the
-    adapter lists the scope's issues its own identity created (never a search
-    API) and reconciles to the one whose last non-empty line is the marker. A
-    marker in an issue anyone else created counts for nothing, and two matches
-    raise `Ambiguous` without writing. The creator-filtered listing can lag a
-    create by seconds (observed on GitHub), so a caller that has recorded the
-    output issue passes it as `expected`, and a caller retrying a create it
-    could not confirm waits past that lag first. With `expected` the adapter
-    never lists and never creates: it reads that issue directly and returns it
-    only when it is an issue, not a pull request, its own identity created it,
-    and its last non-empty line is the marker; anything else raises
-    `NotFound("linked_issue")`, so a recorded issue whose marker was removed
-    never yields a second one. The GitHub and in-memory adapters
-    implement it; GitLab and Jira Cloud declare it unsupported and raise
+    relation, and returns a `LinkedIssue` with the read-back body digest. Its
+    lookup lists the scope's issues its own identity created (never a search
+    API) and matches the one whose last non-empty line is the marker. A marker
+    in an issue anyone else created counts for nothing, and two matches raise
+    `Ambiguous` without writing. The creator-filtered listing can lag a create
+    by seconds (observed on GitHub), so neither a listing nor elapsed time
+    proves a create absent. By default the call reconciles to a match or
+    creates once. A definite refusal of the create keeps its type and created
+    nothing (`Unauthorized`, `NotFound`, `Unavailable("unprocessable")`). Any
+    failure after the create request may have reached the tracker (transport
+    error, 5xx, unreadable success, failed read-back, or a relist after an
+    uncertain answer that finds nothing or cannot be read) raises
+    `LinkedIssueUnconfirmed`, after which the caller never creates again for
+    that output identity. `reconcile_only=True` never creates: one match is
+    returned, none raises `NotFound("linked_issue")`, two raise `Ambiguous`.
+    A caller that has recorded the output issue passes it as `expected`: the
+    adapter then never lists and never creates, reads that issue directly, and
+    returns it only when it is an issue, not a pull request, its own identity
+    created it, and its last non-empty line is the marker; anything else
+    raises `NotFound("linked_issue")`, so a recorded issue whose marker was
+    removed never yields a second one. `expected` and `reconcile_only`
+    together are a ValueError. The GitHub and in-memory adapters implement
+    it; GitLab and Jira Cloud declare it unsupported and raise
     `Unsupported`.
 
 ### CodeHost

@@ -305,6 +305,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
         ("agent_versions", "result_policy_digest"),
         ("factory_tracker_result_grants", "output_identity"),
         ("factory_tracker_result_deliveries", "proposal_sha256"),
+        ("factory_tracker_result_deliveries", "create_attempted_at"),
         ("factory_tracker_result_receipts", "result_comment_id"),
         ("factory_tracker_result_artifacts", "content"),
     } <= columns

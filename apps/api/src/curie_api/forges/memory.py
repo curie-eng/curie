@@ -29,7 +29,14 @@ from curie_api.forges.capabilities import (
     Support,
     validate_declaration,
 )
-from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
+from curie_api.forges.errors import (
+    Ambiguous,
+    ForgeError,
+    LinkedIssueUnconfirmed,
+    NotFound,
+    Unavailable,
+    Unsupported,
+)
 from curie_api.forges.ports import CodeHost, MarkedComments, Tracker
 from curie_api.forges.retarget import require_retargetable
 from curie_api.forges.types import (
@@ -126,12 +133,41 @@ class WriteFaults:
     def __init__(self) -> None:
         self._lost: set[Operation] = set()
         self._aborts: dict[Operation, BaseException] = {}
+        self._refusals: dict[Operation, ForgeError] = {}
 
     def lose_next_response(self, operation: Operation) -> None:
-        """The next call of ``operation`` does its work, writes included, then
-        raises `Unavailable` instead of answering: a lost response."""
+        """A lost response.
+
+        For `Operation.UPSERT_MARKED` the next call does its work, writes
+        included, then raises `Unavailable` instead of answering. For
+        `Operation.CREATE_LINKED_ISSUE` it applies to the next create write:
+        the issue is written, then the answer is lost, so the adapter relists
+        within the call as a real adapter does. It returns the issue when the
+        relist sees it (``created`` False) and raises `LinkedIssueUnconfirmed`
+        when it does not (`InMemoryTracker.hide_new_from_listing`)."""
 
         self._lost.add(operation)
+
+    def refuse_next_write(self, operation: Operation, error: ForgeError) -> None:
+        """The next create write of `Operation.CREATE_LINKED_ISSUE` is refused
+        definitely with ``error`` and writes nothing, as a 401 or 422 is."""
+
+        self._refusals[operation] = error
+
+    def refusal(self, operation: Operation) -> None:
+        """Called by an adapter just before the write a refusal answers."""
+
+        error = self._refusals.pop(operation, None)
+        if error is not None:
+            raise error
+
+    def lost(self, operation: Operation) -> bool:
+        """Consume an armed lost response for ``operation``; True when one was."""
+
+        if operation in self._lost:
+            self._lost.discard(operation)
+            return True
+        return False
 
     def abort_before_next(self, operation: Operation, error: BaseException) -> None:
         """The next call of ``operation`` that passes its argument checks
@@ -150,8 +186,7 @@ class WriteFaults:
     def after(self, operation: Operation) -> None:
         """Called by an adapter once ``operation`` has done its work."""
 
-        if operation in self._lost:
-            self._lost.discard(operation)
+        if self.lost(operation):
             raise Unavailable(f"{operation.value} response lost")
 
 
@@ -338,6 +373,12 @@ class InMemoryTracker(_Declared):
         self.sent_issue_bodies: list[str] = []
         # How many own-issue listings `create_linked_issue` has run.
         self.linked_listings = 0
+        # Listing lag: issues absent from the creator listing yet readable
+        # directly, as a fresh GitHub issue is for a few seconds. While
+        # ``hide_new_from_listing`` is set every issue the port creates starts
+        # hidden.
+        self.hide_new_from_listing = False
+        self._hidden: set[TrackerIssueRef] = set()
         self._page_size = page_size
         self._issues: dict[TrackerIssueRef, _Issue] = {}
         self._timeline: list[_TimelineEvent] = []
@@ -401,6 +442,22 @@ class InMemoryTracker(_Declared):
         """A person edits the issue's body. Not a port write: no ledger entry."""
 
         self._issue(issue).body = body
+
+    def hide_from_listing(self, issue: TrackerIssueRef) -> None:
+        """Listing lag: ``issue`` is absent from the creator listing
+        `create_linked_issue` reads, yet still readable directly, so an
+        ``expected`` read still finds it."""
+
+        self._issue(issue)
+        self._hidden.add(issue)
+
+    def show_in_listing(self, issue: TrackerIssueRef | None = None) -> None:
+        """The lag ends for ``issue``, or for every hidden issue when None."""
+
+        if issue is None:
+            self._hidden.clear()
+        else:
+            self._hidden.discard(issue)
 
     def issues(self, *, author: Actor | None = None) -> list[TrackerIssueRef]:
         """Every issue in creation order, only those ``author`` created when given."""
@@ -615,7 +672,9 @@ class InMemoryTracker(_Declared):
         own = [
             found
             for found in self._issues.values()
-            if found.ref.scope_id == self.scope_id and found.author == self.identity
+            if found.ref.scope_id == self.scope_id
+            and found.author == self.identity
+            and found.ref not in self._hidden
         ]
         matches: list[_Issue] = []
         for start in range(0, max(len(own), 1), self._page_size):
@@ -636,15 +695,20 @@ class InMemoryTracker(_Declared):
         body: str,
         labels: Collection[str],
         expected: TrackerIssueRef | None = None,
+        reconcile_only: bool = False,
     ) -> LinkedIssue:
         """The port operation over dict state; honours ``write_faults`` for
         `Operation.CREATE_LINKED_ISSUE`. The related-source line is
         ``Related to <issue_url(source)>.``; the marker is
         `embed_linked_marker`. A create counts one ledger write and appends
-        the composed body to ``sent_issue_bodies``. With ``expected`` it reads
-        that issue directly and never lists or creates (see the port)."""
+        the composed body to ``sent_issue_bodies``; an issue it creates while
+        ``hide_new_from_listing`` is set is hidden from the listing. With
+        ``expected`` it reads that issue directly and never lists or creates;
+        with ``reconcile_only`` it lists and never creates (see the port)."""
 
         self._gate(Operation.CREATE_LINKED_ISSUE)
+        if expected is not None and reconcile_only:
+            raise ValueError("expected and reconcile_only are exclusive")
         valid_output_identity(output_identity)
         self._issue(source)
         self.write_faults.before(Operation.CREATE_LINKED_ISSUE)
@@ -662,22 +726,31 @@ class InMemoryTracker(_Declared):
                 or not ends_with_marker(recorded.body, embedded)
             ):
                 raise NotFound("linked_issue")
-            self.write_faults.after(Operation.CREATE_LINKED_ISSUE)
             return self._linked(recorded, text, created=False)
         matches = self._own_marked(embedded)
         if len(matches) > 1:
             raise Ambiguous("linked_issue")
-        created = not matches
         if matches:
-            found = matches[0]
-        else:
-            ref = TrackerIssueRef(self.kind, self.host, self.scope_id, self._next_issue_id())
-            found = _Issue(ref, title, text, labels=set(labels), author=self.identity)
-            self._issues[ref] = found
-            self.sent_issue_bodies.append(text)
-            self.ledger.record()
-        self.write_faults.after(Operation.CREATE_LINKED_ISSUE)
-        return self._linked(found, text, created=created)
+            return self._linked(matches[0], text, created=False)
+        if reconcile_only:
+            raise NotFound("linked_issue")
+        self.write_faults.refusal(Operation.CREATE_LINKED_ISSUE)
+        ref = TrackerIssueRef(self.kind, self.host, self.scope_id, self._next_issue_id())
+        found = _Issue(ref, title, text, labels=set(labels), author=self.identity)
+        self._issues[ref] = found
+        if self.hide_new_from_listing:
+            self._hidden.add(ref)
+        self.sent_issue_bodies.append(text)
+        self.ledger.record()
+        if not self.write_faults.lost(Operation.CREATE_LINKED_ISSUE):
+            return self._linked(found, text, created=True)
+        # The answer was lost: relist within the call, as a real adapter does.
+        confirmed = self._own_marked(embedded)
+        if len(confirmed) > 1:
+            raise Ambiguous("linked_issue")
+        if not confirmed:
+            raise LinkedIssueUnconfirmed("linked_issue_unconfirmed")
+        return self._linked(confirmed[0], text, created=False)
 
     def _linked(self, found: _Issue, sent: str, *, created: bool) -> LinkedIssue:
         return LinkedIssue(

@@ -26,6 +26,7 @@ from curie_api.forges.capabilities import (
     Operation,
     Support,
 )
+from curie_api.forges.errors import ForgeError, Unauthorized, Unavailable
 from curie_api.forges.github import code_host as github_code_host
 from curie_api.forges.github.code_host import GitHubCodeHost
 from curie_api.forges.github.comments import GitHubMarkedComments, static_token
@@ -179,6 +180,17 @@ class LinkedIssueHarness(AdapterHarness, Protocol):
 
     def listing_count(self) -> int:
         """How many own-issue listing reads the adapter has made; compared only for change."""
+
+    def lag_listing(self) -> None:
+        """Listing lag starts: every issue the adapter creates from now on is
+        absent from its creator listing, yet readable directly."""
+
+    def end_listing_lag(self) -> None:
+        """Listing lag ends: every hidden issue is listed again."""
+
+    def refuse_next_create(self, status: int) -> None:
+        """The next issue create is refused definitely, writing nothing, as
+        GitHub answers ``status`` (401 or 422)."""
 
 
 async def open_pull(harness: AdapterHarness, branch: str) -> PullRequest:
@@ -354,6 +366,22 @@ class InMemoryHarness:
 
     def listing_count(self) -> int:
         return self._tracker.linked_listings
+
+    def lag_listing(self) -> None:
+        self._tracker.hide_new_from_listing = True
+
+    def end_listing_lag(self) -> None:
+        self._tracker.hide_new_from_listing = False
+        self._tracker.show_in_listing()
+
+    def refuse_next_create(self, status: int) -> None:
+        refusals: dict[int, ForgeError] = {
+            401: Unauthorized("linked_issue"),
+            422: Unavailable("unprocessable"),
+        }
+        self._tracker.write_faults.refuse_next_write(
+            Operation.CREATE_LINKED_ISSUE, refusals[status]
+        )
 
 
 class _ObservedEvidenceCodeHost(InMemoryCodeHost):
@@ -610,6 +638,16 @@ class GitHubHarness:
 
         path = f"/repos/{REPO}/issues"
         return sum(r.method == "GET" and r.url.path == path for r in self.fake.http_requests)
+
+    def lag_listing(self) -> None:
+        self.fake.hide_new_from_listing = True
+
+    def end_listing_lag(self) -> None:
+        self.fake.hide_new_from_listing = False
+        self.fake.hidden_from_listing.clear()
+
+    def refuse_next_create(self, status: int) -> None:
+        self.fake.fail_writes(rf"^POST /repos/{REPO}/issues$", status)
 
 
 class JiraGitHubHarness:

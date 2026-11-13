@@ -640,6 +640,14 @@ class GitHubRepositoryFake:
         # False models a listing that ignores ``creator``, so an adapter's own
         # owner check is all that keeps another account's issue out.
         self.honour_creator = True
+        # Listing lag: issue numbers absent from the repository issue listing,
+        # yet readable directly, as a fresh issue is for a few seconds on
+        # GitHub. While ``hide_new_from_listing`` is set every issue the
+        # adapter creates starts hidden.
+        self.hidden_from_listing: set[int] = set()
+        self.hide_new_from_listing = False
+        # Reads that answer an injected status: [pattern, status, count].
+        self._read_faults: list[list[Any]] = []
         self.label_requests: list[httpx.Request] = []
         self._event_ids = itertools.count(70001)
         self._comment_ids = itertools.count(80001)
@@ -831,6 +839,12 @@ class GitHubRepositoryFake:
 
         self._lost_writes.append([re.compile(pattern), status, count])
 
+    def fail_reads(self, pattern: str, status: int, count: int = 1) -> None:
+        """The next ``count`` GET requests whose ``"GET <path>"`` matches
+        ``pattern`` answer ``status`` (``{"message": "injected"}``)."""
+
+        self._read_faults.append([re.compile(pattern), status, count])
+
     def _lost_answer(self, request: httpx.Request, path: str) -> httpx.Response | None:
         subject = f"{request.method} {path}"
         for fault in self._lost_writes:
@@ -985,12 +999,26 @@ class GitHubRepositoryFake:
         path = request.url.path
         if request.url.host == "github.com":
             return self._raw(request, path)
-        if self._listing_fails(path):
+        # Creating an issue shares the issue listing's path but is no listing.
+        creates_issue = request.method == "POST" and path == f"/repos/{REPO}/issues"
+        if not creates_issue and self._listing_fails(path):
             return httpx.Response(502, json={"message": "injected"})
         if request.method != "GET":
             answer = self._write(request, path)
             return self._lost_answer(request, path) or answer
+        injected = self._injected_read(request, path)
+        if injected is not None:
+            return injected
         return self._read(request, path) or self._read_code(request, path)
+
+    def _injected_read(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        subject = f"GET {path}"
+        for fault in self._read_faults:
+            pattern, status, remaining = fault
+            if remaining > 0 and pattern.search(subject):
+                fault[2] = remaining - 1
+                return httpx.Response(status, json={"message": "injected"})
+        return None
 
     def _issue_listing(self, request: httpx.Request) -> httpx.Response:
         """List repository issues, pull requests included, oldest or newest first.
@@ -1007,6 +1035,7 @@ class GitHubRepositoryFake:
             issue
             for _, issue in sorted(self.issues.items(), reverse=params.get("direction") != "asc")
             if (state == "all" or issue.get("state") == state)
+            and issue["number"] not in self.hidden_from_listing
             and (
                 creator is None
                 or not self.honour_creator
@@ -1221,6 +1250,8 @@ class GitHubRepositoryFake:
             "performed_via_github_app": {"id": CONTRACT_APP_ID},
         }
         self.issues[number] = issue
+        if self.hide_new_from_listing:
+            self.hidden_from_listing.add(number)
         return httpx.Response(201, json=issue)
 
     def _write_code(

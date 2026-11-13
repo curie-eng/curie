@@ -55,6 +55,7 @@ from curie_api.factory_tracker_results import (
     proposal_sha256,
 )
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
+from curie_api.forges.errors import Unauthorized, Unavailable
 from curie_api.forges.memory import InMemoryTracker, all_supported
 from curie_api.forges.types import ReplyTarget, TrackerIssueRef
 from curie_api.models import (
@@ -410,7 +411,7 @@ def _deliver(src: _Source, delivery_id: uuid.UUID, *, owner: str = "deliverer") 
 def _delivery(delivery_id: uuid.UUID) -> dict[str, Any]:
     (row,) = _rows(
         "SELECT state, attempts, last_error_code, failure_code, output_issue_id, "
-        "attempt_owner, submitted_at, deadline_at "
+        "attempt_owner, submitted_at, deadline_at, create_attempted_at "
         "FROM curie.factory_tracker_result_deliveries WHERE id = :id",
         {"id": delivery_id},
     )
@@ -567,68 +568,39 @@ def test_a_restart_between_the_issue_write_and_the_comment_write_delivers_once(
 def test_a_lost_create_response_reconciles_to_the_one_issue(admitted: Any) -> None:
     src = _source(admitted, 9303)
     delivery_id = _submit(src, _ticket())
+    # The answer is lost and the adapter's in-call relist confirms the issue.
     src.tracker.write_faults.lose_next_response(Operation.CREATE_LINKED_ISSUE)
-    lost = _deliver(src, delivery_id)
-    assert (lost.state, lost.last_error_code) == (DeliveryState.OWED, "tracker_unavailable")
-    assert len(_own_issues(src)) == 1
-    assert _comments(src) == []
-    assert _delivery(delivery_id)["output_issue_id"] is None
-    assert _count("factory_tracker_result_receipts", delivery_id) == 0
-    _make_due(delivery_id)
-    outcome = _deliver(src, delivery_id)
-    assert outcome.state is DeliveryState.DELIVERED
-    _assert_delivered_once(src, delivery_id, "ticket")
-
-
-def test_an_immediate_retry_inside_the_listing_lag_is_refused_by_the_claim(
-    admitted: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    src = _source(admitted, 9306)
-    delivery_id = _submit(src, _ticket())
-    # The creator listing lags: a fresh create is not listed yet.
-    lagging = [True]
-    real_listing = src.tracker._own_marked
-
-    def listing(embedded: str) -> Any:
-        return [] if lagging[0] else real_listing(embedded)
-
-    monkeypatch.setattr(src.tracker, "_own_marked", listing)
-    src.tracker.write_faults.lose_next_response(Operation.CREATE_LINKED_ISSUE)
-    lost = _deliver(src, delivery_id)
-    assert (lost.state, lost.last_error_code) == (DeliveryState.OWED, "tracker_unavailable")
-    assert len(_own_issues(src)) == 1
-    writes = src.tracker.ledger.writes
-    # Still lagging, an immediate attempt would create a second issue; the claim refuses it.
-    early = _deliver(src, delivery_id)
-    assert (early.state, early.attempted) == (DeliveryState.OWED, False)
-    assert len(_own_issues(src)) == 1
-    assert src.tracker.ledger.writes == writes
-    assert _delivery(delivery_id)["attempts"] == 1
-    # The backoff passes and the listing catches up: the retry reconciles.
-    _make_due(delivery_id)
-    lagging[0] = False
     assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
     _assert_delivered_once(src, delivery_id, "ticket")
+    assert _delivery(delivery_id)["attempts"] == 1
+
+
+def _due() -> list[uuid.UUID]:
+    async def work(maker: async_sessionmaker[AsyncSession]) -> list[uuid.UUID]:
+        async with maker() as session:
+            return await due_deliveries(session)
+
+    return _run(work)
+
+
+def _unconfirmed_create(src: _Source, delivery_id: uuid.UUID) -> TrackerIssueRef:
+    """A create whose answer is lost while the listing lags: written, unconfirmed."""
+
+    src.tracker.hide_new_from_listing = True
+    src.tracker.write_faults.lose_next_response(Operation.CREATE_LINKED_ISSUE)
+    lost = _deliver(src, delivery_id)
+    assert (lost.state, lost.last_error_code) == (DeliveryState.OWED, "output_unconfirmed")
+    (issue,) = _own_issues(src)
+    row = _delivery(delivery_id)
+    assert row["output_issue_id"] is None and row["create_attempted_at"] is not None
+    return issue
 
 
 def test_an_unconfirmed_create_waits_for_the_listing_to_settle(admitted: Any) -> None:
     src = _source(admitted, 9305)
     delivery_id = _submit(src, _ticket())
-
-    def due() -> list[uuid.UUID]:
-        async def work(maker: async_sessionmaker[AsyncSession]) -> list[uuid.UUID]:
-            async with maker() as session:
-                return await due_deliveries(session)
-
-        return _run(work)
-
-    assert due() == [delivery_id]
-    # The create is written but its response is lost and nothing confirms it.
-    src.tracker.write_faults.lose_next_response(Operation.CREATE_LINKED_ISSUE)
-    lost = _deliver(src, delivery_id)
-    assert (lost.state, lost.last_error_code) == (DeliveryState.OWED, "tracker_unavailable")
-    assert len(_own_issues(src)) == 1
-    assert _delivery(delivery_id)["output_issue_id"] is None
+    assert _due() == [delivery_id]
+    issue = _unconfirmed_create(src, delivery_id)
     assert LISTING_SETTLE_SECONDS == 60
     (row,) = _rows(
         "SELECT next_attempt_at - updated_at >= interval '60 seconds' AS from_attempt, "
@@ -637,11 +609,94 @@ def test_an_unconfirmed_create_waits_for_the_listing_to_settle(admitted: Any) ->
         {"id": delivery_id},
     )
     assert row == {"from_attempt": True, "still_out": True}
-    assert due() == []
+    assert _due() == []
     # The claim refuses the row inside the settle window too.
-    assert _deliver(src, delivery_id).attempted is False
+    writes = src.tracker.ledger.writes
+    early = _deliver(src, delivery_id)
+    assert (early.state, early.attempted) == (DeliveryState.OWED, False)
+    assert src.tracker.ledger.writes == writes and _delivery(delivery_id)["attempts"] == 1
     _make_due(delivery_id)
-    assert due() == [delivery_id]
+    assert _due() == [delivery_id]
+    src.tracker.show_in_listing(issue)
+    assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
+    _assert_delivered_once(src, delivery_id, "ticket")
+
+
+@pytest.mark.parametrize("appears", [False, True])
+def test_an_unconfirmed_create_is_never_sent_again(admitted: Any, appears: bool) -> None:
+    src = _source(admitted, 9306)
+    delivery_id = _submit(src, _ticket())
+    issue = _unconfirmed_create(src, delivery_id)
+    writes = src.tracker.ledger.writes
+    # Past every settle window the listing still omits it; retries only reconcile.
+    for _ in range(3):
+        _make_due(delivery_id)
+        retry = _deliver(src, delivery_id)
+        assert (retry.state, retry.last_error_code) == (DeliveryState.OWED, "output_unconfirmed")
+        assert _own_issues(src) == [issue] and len(src.tracker.sent_issue_bodies) == 1
+        assert src.tracker.ledger.writes == writes and _comments(src) == []
+        assert _delivery(delivery_id)["create_attempted_at"] is not None
+    if appears:
+        src.tracker.show_in_listing(issue)
+        _make_due(delivery_id)
+        assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
+        _assert_delivered_once(src, delivery_id, "ticket")
+        return
+    _age_deadline(delivery_id)
+    failed = _deliver(src, delivery_id)
+    assert (failed.state, failed.failure_code) == (
+        DeliveryState.FAILED,
+        "delivery_deadline_exceeded",
+    )
+    assert _own_issues(src) == [issue]
+    assert _count("factory_tracker_result_receipts", delivery_id) == 0
+
+
+def test_a_process_death_after_the_create_request_never_creates_again(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _source(admitted, 9307)
+    delivery_id = _submit(src, _ticket())
+    src.tracker.hide_new_from_listing = True
+    real_create = src.tracker.create_linked_issue
+
+    async def dies_after_the_write(*args: Any, **kwargs: Any) -> Any:
+        await real_create(*args, **kwargs)
+        raise _Restart
+
+    monkeypatch.setattr(src.tracker, "create_linked_issue", dies_after_the_write)
+    with pytest.raises(_Restart):
+        _deliver(src, delivery_id, owner="dead-process")
+    monkeypatch.setattr(src.tracker, "create_linked_issue", real_create)
+    (issue,) = _own_issues(src)
+    row = _delivery(delivery_id)
+    assert row["create_attempted_at"] is not None and row["output_issue_id"] is None
+    _age_lease(delivery_id)
+    retry = _deliver(src, delivery_id)
+    assert (retry.state, retry.last_error_code) == (DeliveryState.OWED, "output_unconfirmed")
+    assert _own_issues(src) == [issue] and len(src.tracker.sent_issue_bodies) == 1
+    src.tracker.show_in_listing(issue)
+    _make_due(delivery_id)
+    assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
+    _assert_delivered_once(src, delivery_id, "ticket")
+
+
+@pytest.mark.parametrize("refusal", ["unauthorized", "unprocessable"])
+def test_a_definite_refusal_clears_the_mark_and_a_retry_creates_once(
+    admitted: Any, refusal: str
+) -> None:
+    src = _source(admitted, 9308)
+    delivery_id = _submit(src, _ticket())
+    error: Unauthorized | Unavailable = (
+        Unauthorized("credential refused") if refusal == "unauthorized" else Unavailable(refusal)
+    )
+    src.tracker.write_faults.refuse_next_write(Operation.CREATE_LINKED_ISSUE, error)
+    refused = _deliver(src, delivery_id)
+    expected_code = "tracker_unauthorized" if refusal == "unauthorized" else "tracker_unavailable"
+    assert (refused.state, refused.last_error_code) == (DeliveryState.OWED, expected_code)
+    assert _own_issues(src) == [] and src.tracker.ledger.writes == 0
+    assert _delivery(delivery_id)["create_attempted_at"] is None
+    _make_due(delivery_id)
     assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
     _assert_delivered_once(src, delivery_id, "ticket")
 

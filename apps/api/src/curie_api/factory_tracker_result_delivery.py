@@ -62,7 +62,7 @@ any fence reason that fails at attempt time (fences do not heal). Nothing
 leaves ``delivered`` or ``failed``. An attempt that hits a transient error
 (`AttemptError`: ``tracker_unavailable``, ``tracker_unauthorized``,
 ``tracker_not_found``, ``readback_mismatch``, ``output_mismatch``,
-``output_missing``) records it
+``output_missing``, ``output_unconfirmed``) records it
 as ``last_error_code``, backs off ``next_attempt_at`` with the WorkItem
 backoff settings and stays owed until the deadline,
 ``Settings.factory_tracker_result_delivery_deadline_seconds`` (default 900)
@@ -76,27 +76,37 @@ call.
 Exactly once. An attempt holds a lease (``attempt_owner`` plus
 ``attempt_lease_expires_at``, `ATTEMPT_LEASE_SECONDS`), and every state write
 is a compare-and-set on that owner and the attempt count. Retries reuse the
-sealed proposal and reconcile the same output: `Tracker.create_linked_issue`
-finds the issue its marker names, and `MarkedComments.upsert_marked` edits the
-comment `result_marker` names. A process that dies mid-attempt leaves the
-lease held; the next attempt claims once it lapses. The output issue is
-recorded on the delivery as soon as it is created, before the comment, and
-every later attempt passes it as ``expected`` to `Tracker.create_linked_issue`,
-which then never creates: an issue whose marker is gone is ``output_missing``
-(owed until the deadline), never replaced by a second issue.
+sealed proposal and reconcile the same output rather than create another
+issue (ADR 0277), and `MarkedComments.upsert_marked` edits the one comment
+`result_marker` names. A process that dies mid-attempt leaves the lease held;
+the next attempt claims once it lapses. Elapsed time never proves that an
+unconfirmed create was not written, so the linked issue call follows one rule:
 
-Listing lag. Before an output is recorded, a retry finds an earlier create
-only through the tracker's creator-filtered issue listing, which can lag a
-create by seconds. So when the linked issue call raises `Unavailable` and no
-output is recorded (the create may have been written but was not confirmed),
-the attempt records ``tracker_unavailable`` with ``next_attempt_at`` at least
+1. An output is recorded on the delivery: the call passes it as ``expected``
+   and never creates; an issue whose marker is gone is ``output_missing``.
+2. No output is recorded and ``create_attempted_at`` is set: an earlier
+   create may have been written, so the call passes ``reconcile_only`` and
+   never creates. One match is recorded as the output and the attempt goes on
+   to the comment; none is ``output_unconfirmed``; a transient read failure
+   is ``tracker_unavailable`` and keeps the mark. Such a row stays owed until
+   the deadline and then fails ``delivery_deadline_exceeded``, never
+   delivered.
+3. No output and no mark: ``create_attempted_at`` is committed under the lease
+   (with the fence recheck) before the create is sent. Success records the
+   output. `LinkedIssueUnconfirmed` (the request may have been written) keeps
+   the mark and records ``output_unconfirmed``. A definite refusal or a failure
+   before the request (``tracker_unauthorized``, ``tracker_not_found``, plain
+   ``tracker_unavailable``) clears the mark in the same write, since nothing
+   was created. A process that dies after the mark leaves it set.
+
+Listing lag. A tracker's creator-filtered issue listing can lag a create by
+seconds, so every ``output_unconfirmed`` sets ``next_attempt_at`` at least
 `LISTING_SETTLE_SECONDS` out (the larger of that and the normal backoff), and
-neither the attempt claim nor `due_deliveries` takes the row before then. A
-process that dies
-after an unconfirmed create is covered the same way by the attempt lease:
-the next attempt cannot claim for `ATTEMPT_LEASE_SECONDS` (120), which exceeds
-`LISTING_SETTLE_SECONDS`. Once an output is recorded, ``expected`` reads it
-directly and no listing is involved.
+neither the attempt claim nor `due_deliveries` takes the row before then; a
+process death is held off the same way by the attempt lease
+(`ATTEMPT_LEASE_SECONDS`, 120). The wait only gives a written issue time to
+appear for reconciliation. An empty listing after it proves nothing, so the
+mark still forbids a create.
 
 Rechecks. Immediately before each tracker write (the linked issue call and the
 comment upsert) an attempt rechecks the deadline and fences 1 to 5 against the
@@ -145,7 +155,14 @@ from curie_api.factory_tracker_results import (
     proposal_sha256,
 )
 from curie_api.forges.capabilities import Operation, supports
-from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized, Unavailable, Unsupported
+from curie_api.forges.errors import (
+    Ambiguous,
+    LinkedIssueUnconfirmed,
+    NotFound,
+    Unauthorized,
+    Unavailable,
+    Unsupported,
+)
 from curie_api.forges.ports import Tracker
 from curie_api.forges.types import LinkedIssue, ReplyTarget, TrackerIssueRef
 from curie_api.models import (
@@ -162,8 +179,9 @@ logger = logging.getLogger("curie_api.factory_tracker_results")
 
 RESULT_MARKER_PREFIX = "curie-tracker-result:"
 ATTEMPT_LEASE_SECONDS = 120
-# How long a tracker's own-identity issue listing may lag a create it answered
-# uncertainly (seen against GitHub: seconds). See "Listing lag" above.
+# How long a tracker's own-identity issue listing may lag a create (seen against
+# GitHub: seconds). A wait before reconciling, never proof of absence; see
+# "Listing lag" above.
 LISTING_SETTLE_SECONDS = 60
 
 
@@ -240,6 +258,7 @@ class AttemptError(enum.StrEnum):
     READBACK_MISMATCH = "readback_mismatch"
     OUTPUT_MISMATCH = "output_mismatch"
     OUTPUT_MISSING = "output_missing"
+    OUTPUT_UNCONFIRMED = "output_unconfirmed"
 
 
 class FailureCode(enum.StrEnum):
@@ -597,6 +616,8 @@ class _Claim:
     deadline_passed: bool
     # The output issue an earlier attempt recorded, or None.
     recorded: TrackerIssueRef | None
+    # An earlier attempt sent (or may have sent) a create whose outcome is uncertain.
+    create_attempted: bool
 
 
 def _held(claim: _Claim) -> tuple[ColumnElement[bool], ...]:
@@ -673,6 +694,7 @@ async def _claim(
                     delivery.output_tracker_host,
                     delivery.output_scope_id,
                     delivery.output_issue_id,
+                    delivery.create_attempted_at.is_not(None).label("create_attempted"),
                 )
                 .execution_options(synchronize_session=False)
             )
@@ -703,6 +725,7 @@ async def _claim(
         owner=owner,
         deadline_passed=bool(row.deadline_passed),
         recorded=recorded,
+        create_attempted=bool(row.create_attempted),
     )
 
 
@@ -798,18 +821,33 @@ async def _settle_failed(
 
 
 async def _gate(
-    sessionmaker: async_sessionmaker[AsyncSession], claim: _Claim, tracker: Tracker
+    sessionmaker: async_sessionmaker[AsyncSession],
+    claim: _Claim,
+    tracker: Tracker,
+    *,
+    mark_create: bool = False,
 ) -> DeliveryOutcome | None:
     """Recheck the deadline and every fence immediately before a tracker write.
 
     None lets the write go ahead. Otherwise the attempt has ended: failed with
     the code, or nothing recorded when the row is no longer this attempt's.
+    ``mark_create`` also sets ``create_attempted_at`` in the same committed
+    transaction, before any create request is sent.
     """
 
     async with sessionmaker() as session:
         verdict = await _verdict(session, claim, tracker)
         if verdict is None:
-            await session.rollback()
+            if mark_create:
+                await session.execute(
+                    update(FactoryTrackerResultDelivery)
+                    .where(*_held(claim))
+                    .values(create_attempted_at=func.clock_timestamp())
+                    .execution_options(synchronize_session=False)
+                )
+                await session.commit()
+            else:
+                await session.rollback()
             return None
         return await _close(session, claim, verdict)
 
@@ -821,11 +859,14 @@ async def _record_error(
     settings: Settings,
     *,
     at_least_seconds: int = 0,
+    clear_create_attempt: bool = False,
 ) -> DeliveryOutcome:
     """Record ``code``, back off, release the lease; the delivery stays owed.
 
     ``next_attempt_at`` moves out by the WorkItem backoff, or by
-    ``at_least_seconds`` when that is longer.
+    ``at_least_seconds`` when that is longer. ``clear_create_attempt`` clears
+    ``create_attempted_at`` in the same write: the create was definitely not
+    written.
     """
 
     backoff = max(
@@ -844,6 +885,7 @@ async def _record_error(
                 next_attempt_at=func.clock_timestamp() + timedelta(seconds=backoff),
                 attempt_owner=None,
                 attempt_lease_expires_at=None,
+                **({"create_attempted_at": None} if clear_create_attempt else {}),
             )
             .execution_options(synchronize_session=False)
         )
@@ -1037,6 +1079,69 @@ async def _load_sealed(
     return _Sealed(proposal=proposal, source=source, output_identity=output_identity)
 
 
+async def _linked_issue(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    claim: _Claim,
+    tracker: Tracker,
+    sealed: _Sealed,
+    proposal: TicketProposal,
+    settings: Settings,
+) -> LinkedIssue | DeliveryOutcome:
+    """The output issue, by the one rule that never creates twice (see "Exactly once").
+
+    1. An output is recorded: ``expected`` reads it; gone is ``output_missing``.
+    2. A create was attempted and its outcome is uncertain: ``reconcile_only``
+       never creates; none found is ``output_unconfirmed``.
+    3. Otherwise ``create_attempted_at`` is committed first, then the create is
+       sent. An unconfirmed create keeps the mark (``output_unconfirmed``); a
+       definite refusal clears it in the same write that records the error.
+
+    Ambiguous and Unsupported propagate to `deliver`, which settles failed.
+    """
+
+    reconcile_only = claim.recorded is None and claim.create_attempted
+    first_create = claim.recorded is None and not claim.create_attempted
+    stopped = await _gate(sessionmaker, claim, tracker, mark_create=first_create)
+    if stopped is not None:
+        return stopped
+    error: AttemptError
+    settle = 0
+    clear = False
+    try:
+        return await tracker.create_linked_issue(
+            sealed.source,
+            output_identity=sealed.output_identity,
+            title=_publishable(proposal.title),
+            body=_publishable(proposal.body),
+            # The implementation label is the handoff's to apply (#5588).
+            labels=(),
+            expected=claim.recorded,
+            reconcile_only=reconcile_only,
+        )
+    except LinkedIssueUnconfirmed:
+        # The create may be written; it is never sent again.
+        error, settle = AttemptError.OUTPUT_UNCONFIRMED, LISTING_SETTLE_SECONDS
+    except NotFound:
+        if claim.recorded is not None:
+            error = AttemptError.OUTPUT_MISSING
+        elif reconcile_only:
+            error, settle = AttemptError.OUTPUT_UNCONFIRMED, LISTING_SETTLE_SECONDS
+        else:
+            error, clear = AttemptError.TRACKER_NOT_FOUND, True
+    except Unavailable:
+        error, clear = AttemptError.TRACKER_UNAVAILABLE, first_create
+    except Unauthorized:
+        error, clear = AttemptError.TRACKER_UNAUTHORIZED, first_create
+    return await _record_error(
+        sessionmaker,
+        claim,
+        error,
+        settings,
+        at_least_seconds=settle,
+        clear_create_attempt=clear,
+    )
+
+
 async def deliver(
     sessionmaker: async_sessionmaker[AsyncSession],
     delivery_id: uuid.UUID,
@@ -1069,37 +1174,10 @@ async def deliver(
     linked: LinkedIssue | None = None
     try:
         if isinstance(proposal, TicketProposal):
-            stopped = await _gate(sessionmaker, claim, tracker)
-            if stopped is not None:
-                return stopped
-            try:
-                linked = await tracker.create_linked_issue(
-                    sealed.source,
-                    output_identity=sealed.output_identity,
-                    title=_publishable(proposal.title),
-                    body=_publishable(proposal.body),
-                    # The implementation label is the handoff's to apply (#5588).
-                    labels=(),
-                    # A recorded output is reconciled, never created again.
-                    expected=claim.recorded,
-                )
-            except NotFound:
-                if claim.recorded is None:
-                    raise
-                return await _record_error(
-                    sessionmaker, claim, AttemptError.OUTPUT_MISSING, settings
-                )
-            except Unavailable:
-                if claim.recorded is not None:
-                    raise
-                # The create may be written but not yet listed; let the listing settle.
-                return await _record_error(
-                    sessionmaker,
-                    claim,
-                    AttemptError.TRACKER_UNAVAILABLE,
-                    settings,
-                    at_least_seconds=LISTING_SETTLE_SECONDS,
-                )
+            got = await _linked_issue(sessionmaker, claim, tracker, sealed, proposal, settings)
+            if isinstance(got, DeliveryOutcome):
+                return got
+            linked = got
             if linked.body_sha256 != linked.sent_body_sha256:
                 return await _record_error(
                     sessionmaker, claim, AttemptError.READBACK_MISMATCH, settings

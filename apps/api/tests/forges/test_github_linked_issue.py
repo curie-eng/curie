@@ -19,7 +19,7 @@ import httpx
 import pytest
 from curie_api.forges import trackers, types
 from curie_api.forges.config import ForgesConfig
-from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
+from curie_api.forges.errors import LinkedIssueUnconfirmed, NotFound, Unauthorized, Unavailable
 from curie_api.forges.github import tracker as github_tracker
 from curie_api.forges.registry import build_registry
 from curie_api.forges.types import LinkedIssue, RepositoryRef, TrackerIssueRef
@@ -205,7 +205,7 @@ async def test_an_uncertain_create_relists_and_reconciles_to_the_one_it_wrote(
 
 
 @pytest.mark.anyio
-async def test_an_uncertain_create_the_second_listing_cannot_confirm_is_unavailable(
+async def test_an_uncertain_create_the_second_listing_cannot_confirm_is_unconfirmed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness = GitHubHarness(monkeypatch)
@@ -213,11 +213,44 @@ async def test_an_uncertain_create_the_second_listing_cannot_confirm_is_unavaila
     # A 502 that wrote nothing.
     harness.fake.fail_writes(CREATE, 502)
 
-    with pytest.raises(Unavailable, match="linked_issue_unconfirmed"):
+    with pytest.raises(LinkedIssueUnconfirmed, match="linked_issue_unconfirmed"):
         await _create(harness, source)
 
     assert len(_listings(harness.fake.http_requests)) == 2
     assert harness.marked_issue_count(OUTPUT) == 0
+
+
+@pytest.mark.anyio
+async def test_a_created_issue_whose_read_back_fails_is_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = GitHubHarness(monkeypatch)
+    source = harness.seed_issue("Source", "Triage this.")
+    # The create's read-back is the first single-issue read of the call.
+    harness.fake.fail_reads(rf"^GET /repos/{REPO}/issues/\d+$", 502)
+
+    with pytest.raises(LinkedIssueUnconfirmed):
+        await _create(harness, source)
+
+    assert len(_posts(harness.fake.http_requests)) == 1
+    assert harness.marked_issue_count(OUTPUT) == 1
+
+
+@pytest.mark.anyio
+async def test_a_relist_that_cannot_be_read_after_an_uncertain_create_is_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = GitHubHarness(monkeypatch)
+    source = harness.seed_issue("Source", "Triage this.")
+    harness.fake.lose_write_responses(CREATE)
+    # The lookup reads one page; the relist's first page then fails.
+    harness.fake.fail_next_page(after=1)
+
+    with pytest.raises(LinkedIssueUnconfirmed):
+        await _create(harness, source)
+
+    assert len(_posts(harness.fake.http_requests)) == 1
+    assert harness.marked_issue_count(OUTPUT) == 1
 
 
 @pytest.mark.anyio
@@ -232,9 +265,10 @@ async def test_a_definite_refusal_raises_without_relisting(
     source = harness.seed_issue("Source", "Triage this.")
     harness.fake.fail_writes(CREATE, status)
 
-    with pytest.raises(error):
+    with pytest.raises(error) as refused:
         await _create(harness, source)
 
+    assert not isinstance(refused.value, LinkedIssueUnconfirmed)
     assert len(_listings(harness.fake.http_requests)) == 1
     assert harness.marked_issue_count(OUTPUT) == 0
 

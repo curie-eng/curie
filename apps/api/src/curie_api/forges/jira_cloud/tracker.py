@@ -841,6 +841,7 @@ class JiraTracker:
         body: str,
         labels: Collection[str],
         expected: TrackerIssueRef | None = None,
+        reconcile_only: bool = False,
     ) -> LinkedIssue:
         """Declared unsupported: linked output issues are GitHub only (ADR 0277)."""
 

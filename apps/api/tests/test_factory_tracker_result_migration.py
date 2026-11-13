@@ -73,6 +73,7 @@ COLUMNS = {
         "next_attempt_at",
         "last_error_code",
         "failure_code",
+        "create_attempted_at",
         *OUTPUTS,
         "submitted_at",
         "deadline_at",

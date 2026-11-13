@@ -42,7 +42,15 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
-from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized, Unavailable, Unsupported
+from curie_api.forges.errors import (
+    Ambiguous,
+    ForgeError,
+    LinkedIssueUnconfirmed,
+    NotFound,
+    Unauthorized,
+    Unavailable,
+    Unsupported,
+)
 from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
 from curie_api.forges.github.marked_comments import REFUSED_STATUSES, github_request
 from curie_api.forges.github.review_polling import human_actor
@@ -751,36 +759,39 @@ class GitHubTracker:
         """POST the issue; its number, or None when the answer is uncertain.
 
         https://docs.github.com/en/rest/issues/issues#create-an-issue
-        A transport error, a 5xx or an unreadable 201 may have created it, so
-        it is None and the caller lists again. A definite refusal raises:
-        401 or 403 `Unauthorized`, 404 `NotFound`, 422 and anything else
-        `Unavailable`.
+        The token is read before anything is sent, so its failure keeps its
+        type. A transport error, a 5xx, a 2xx other than 201 or an unreadable
+        201 may have created it, so it is None and the caller relists. A
+        definite refusal, which created nothing, raises: 401 or 403
+        `Unauthorized`, 404 `NotFound`, 422 ``Unavailable("unprocessable")``,
+        and any other 3xx or 4xx ``Unavailable("linked_issue")``.
         """
 
         template = "/repos/{owner}/{repo}/issues"
+        headers = github_headers(await self._token())
         try:
             response = await github_request(
                 self._client,
                 "POST",
                 f"{self._api}{self._repo_path}/issues",
                 path_template=template,
-                headers=github_headers(await self._token()),
+                headers=headers,
                 json={"title": title, "body": body, "labels": sorted(set(labels))},
                 follow_redirects=False,
             )
         except httpx.HTTPError:
             return None
         status = response.status_code
-        if status >= 500:
-            return None
         if status in {401, 403}:
             raise Unauthorized("linked_issue")
         if status == 404:
             raise NotFound("linked_issue")
         if status == 422:
             raise Unavailable("unprocessable")
-        if status != 201:
+        if 300 <= status < 500:
             raise Unavailable("linked_issue")
+        if status != 201:
+            return None
         try:
             payload = response.json()
         except ValueError:
@@ -802,22 +813,26 @@ class GitHubTracker:
         body: str,
         labels: Collection[str],
         expected: TrackerIssueRef | None = None,
+        reconcile_only: bool = False,
     ) -> LinkedIssue:
         """One issue in this repository linked to ``source`` (ADR 0277).
 
         The body ends with ``Related to #<source>.``, a bare same-repository
         reference that makes GitHub's cross-reference and neither closes the
         source nor records a dependency, then `embed_linked_marker`. The
-        lookup (`_linked_matches`) runs before the create and again after an
-        uncertain create; one match reconciles, none after an uncertain
-        create is `Unavailable("linked_issue_unconfirmed")`, two or more are
-        `Ambiguous`. The listing can lag a create by seconds, so with
-        ``expected`` nothing is listed or created: `_recorded_issue` reads that
-        issue directly. The issue is then read back
-        (https://docs.github.com/en/rest/issues/issues#get-an-issue) for its
-        body digest, labels and ``html_url``.
+        modes and the error contract are the port's. The lookup is
+        `_linked_matches`; the create is `_create_issue`; every result is read
+        back (https://docs.github.com/en/rest/issues/issues#get-an-issue) for
+        its body digest, labels and ``html_url``. With ``expected`` nothing is
+        listed or created: `_recorded_issue` reads that issue directly.
+
+        Everything before `_create_issue` sends its request keeps its error
+        type. Once the request may have reached GitHub, every failure except
+        `Ambiguous` (a relist that found two) is `LinkedIssueUnconfirmed`.
         """
 
+        if expected is not None and reconcile_only:
+            raise ValueError("expected and reconcile_only are exclusive")
         valid_output_identity(output_identity)
         source_number = self._number(source)
         embedded = self.embed_linked_marker(output_identity)
@@ -826,15 +841,23 @@ class GitHubTracker:
         if expected is not None:
             return await self._recorded_issue(expected, own, embedded, text)
         number = await self._single(own, embedded)
-        created = False
-        if number is None:
-            number = await self._create_issue(title, text, labels)
-            created = number is not None
-            if number is None:
-                number = await self._single(own, embedded)
-                if number is None:
-                    raise Unavailable("linked_issue_unconfirmed")
-        return await self._linked_issue(number, text, created=created)
+        if number is not None:
+            return await self._linked_issue(number, text, created=False)
+        if reconcile_only:
+            raise NotFound("linked_issue")
+        written = await self._create_issue(title, text, labels)
+        # From here the create may have been written: nothing proves it absent.
+        try:
+            if written is not None:
+                return await self._linked_issue(written, text, created=True)
+            confirmed = await self._single(own, embedded)
+            if confirmed is None:
+                raise LinkedIssueUnconfirmed("linked_issue_unconfirmed")
+            return await self._linked_issue(confirmed, text, created=False)
+        except (Ambiguous, LinkedIssueUnconfirmed):
+            raise
+        except (ForgeError, httpx.HTTPError, ValueError):
+            raise LinkedIssueUnconfirmed("linked_issue_unconfirmed") from None
 
     async def _recorded_issue(
         self, expected: TrackerIssueRef, own: str, embedded: str, sent: str

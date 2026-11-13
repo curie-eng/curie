@@ -159,6 +159,7 @@ def upgrade() -> None:
         _now("next_attempt_at"),
         sa.Column("last_error_code", sa.Text(), nullable=True),
         sa.Column("failure_code", sa.Text(), nullable=True),
+        sa.Column("create_attempted_at", sa.DateTime(timezone=True), nullable=True),
         *_output_columns(),
         _now("submitted_at"),
         sa.Column("deadline_at", sa.DateTime(timezone=True), nullable=False),
