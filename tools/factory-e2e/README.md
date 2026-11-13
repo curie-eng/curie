@@ -882,9 +882,14 @@ full reservation share when unknown) stays inside its bounds, no bound was
 breached, and the watchdog's recorded checks (`budget.guard_checks`) cover every
 response. An assistant record that carries usage is a response whether or not it
 has an id; an id-less one keeps a stable key and is never dropped. A check of an
-empty harvest does not count. A session with any recorded turn, or one whose
-slot was reserved and launched, needs at least one response, every response
-checked, and a guard check after its first response. The item's earlier charge
+empty harvest does not count. The sessions the product started are recorded
+as `budget.launched_sessions`, from the runner pod watcher or a runner log
+turn start, and a guard row's `launched` flag is that record rather than a
+constant. A launched session with no harvested row fails. A session with any
+recorded turn, or one that record names, needs at least one response, every
+response checked, and a guard check after its first response. A completed
+run, one whose pull request exists, needs at least one launched implementer.
+The item's earlier charge
 plus this attempt's stays at or under the recorded item cap. Whether usage is exact is
 reported as the `budget.usage_exact` observation with the capture rule's
 failure codes, never as a pass condition (coordinator ruling of 2026-11-13).

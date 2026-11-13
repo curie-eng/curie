@@ -3129,7 +3129,7 @@ def test_a_session_whose_responses_are_all_idless_passes_only_when_guarded(
 
 
 def test_a_launched_session_with_no_response_is_not_enforced(tmp_path: Path) -> None:
-    """Behavior: a reserved slot whose transcript launched and holds no response fails
+    """Behavior: a slot the launched set names, whose harvest holds no response, fails
     the ceiling, including when a check was recorded against that empty harvest."""
 
     state = _private(tmp_path / "state")
@@ -3150,10 +3150,11 @@ def test_a_launched_session_with_no_response_is_not_enforced(tmp_path: Path) -> 
             )
             for row in ledger.sessions()
         ]
+        launched = ledger.observations("budget")["launched_sessions"]
         ledger.record(
             "budget",
             "guard_checks",
-            sks.guard_coverage(reservations, facts.sessions, (), checks=1),
+            sks.guard_coverage(reservations, facts.sessions, (), checks=1, launched=launched),
         )
         result = sks.judge(ledger, "budget")
         assert result["checks"]["budget.ceiling_enforced"] is False
@@ -3163,8 +3164,8 @@ def test_a_launched_session_with_no_response_is_not_enforced(tmp_path: Path) -> 
 
 
 def test_a_guard_check_on_an_empty_harvest_does_not_count(tmp_path: Path) -> None:
-    """Behavior: watchdog ticks before any response do not count as checks, and a launched
-    session that still has no response fails the ceiling."""
+    """Behavior: watchdog ticks before any response do not count as checks. The pod
+    watcher records the launch, and that session still having no response fails."""
 
     files = _pod_files([_user(0)])
     live = _budgeted(tmp_path)
@@ -3177,9 +3178,118 @@ def test_a_guard_check_on_an_empty_harvest_does_not_count(tmp_path: Path) -> Non
     run.settle()
     guard = ledger.observations("budget")["guard_checks"]
     assert guard["checks"] == 0 and guard["responses"] == 0
+    assert ledger.observations("budget")["launched_sessions"] == [
+        {"role": sks.IMPLEMENTER, "seq": 1}
+    ]
     assert guard["sessions"][0]["launched"] is True and guard["sessions"][0]["responses"] == 0
     assert sks.ceiling_enforcement_failures(ledger) == ["responses_absent"]
     ledger.close()
+
+
+def test_turn_starts_name_distinct_runner_sessions() -> None:
+    """Behavior: each distinct turn-start session takes the next implementer slot, a
+    repeated id does not, and a process that ran with no turn start takes one slot."""
+
+    roles = [
+        sks.Reservation(1, sks.IMPLEMENTER, 1, 1, 1),
+        sks.Reservation(2, sks.IMPLEMENTER, 1, 1, 1),
+        sks.Reservation(3, sks.PLAN_REVIEWER, 1, 1, 1),
+    ]
+    starts = [("agent-a", 1.0), ("agent-a", 2.0), ("agent-b", 3.0)]
+    assert sks.launched_sessions(roles, [{"ran": True, "turn_starts": starts}]) == [
+        {"role": sks.IMPLEMENTER, "seq": 1},
+        {"role": sks.IMPLEMENTER, "seq": 2},
+    ]
+    assert sks.launched_sessions(roles, [{"ran": True, "turn_starts": ()}]) == [
+        {"role": sks.IMPLEMENTER, "seq": 1}
+    ]
+    assert sks.launched_sessions(roles[:1], [{"ran": False, "turn_starts": starts}]) == [
+        {"role": sks.IMPLEMENTER, "seq": 1},
+        {"role": sks.IMPLEMENTER},
+    ]
+
+
+def _empty_guard() -> dict[str, Any]:
+    return {"checks": 0, "responses": 0, "responses_checked": 0, "sessions": []}
+
+
+def test_an_empty_harvest_on_a_completed_run_is_not_enforced(tmp_path: Path) -> None:
+    """Behavior: a completed run whose harvest is empty and whose launched set names no
+    implementer fails the ceiling. The empty guard record alone does not."""
+
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        assert ledger.observations("progress")["pull_request_exists"] is True
+        ledger.record("budget", "launched_sessions", [])
+        ledger.record("budget", "guard_checks", _empty_guard())
+        result = sks.judge(ledger, "budget")
+        assert result["checks"]["budget.ceiling_enforced"] is False
+        assert result["observations"]["budget.ceiling_enforcement_failures"] == [
+            "launched_set_empty"
+        ]
+    finally:
+        ledger.close()
+
+
+def test_a_launched_session_missing_from_the_harvest_is_not_enforced(
+    tmp_path: Path,
+) -> None:
+    """Behavior: a runner turn start with no harvested row fails the ceiling, and the
+    launch is recorded from that log rather than from the harvest."""
+
+    live = _budgeted(tmp_path / "driver")
+    run, ledger, pod = live.run, live.ledger, live.run.pods["uid-1"]
+    pod.trace.feed_log(_runner_log("start", T0 + 1))
+    run.settle()
+    assert ledger.observations("budget")["launched_sessions"] == [
+        {"role": sks.IMPLEMENTER, "seq": 1}
+    ]
+    assert ledger.observations("budget")["guard_checks"]["sessions"] == []
+    assert sks.ceiling_enforcement_failures(ledger) == ["launched_unharvested"]
+    ledger.close()
+
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    recorded = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        launched = recorded.observations("budget")["launched_sessions"]
+        recorded.record(
+            "budget",
+            "launched_sessions",
+            [*launched, {"seq": 99, "role": sks.IMPLEMENTER}],
+        )
+        result = sks.judge(recorded, "budget")
+        assert result["checks"]["budget.ceiling_enforced"] is False
+        assert result["observations"]["budget.ceiling_enforcement_failures"] == [
+            "launched_unharvested"
+        ]
+    finally:
+        recorded.close()
+
+
+def test_a_missing_launched_set_is_not_enforced(tmp_path: Path) -> None:
+    """Behavior: a budget ledger with no launched-set observation fails the ceiling,
+    even when every harvested row is otherwise covered."""
+
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        with ledger.transaction() as db:
+            db.execute(
+                "DELETE FROM observations WHERE run_id=? AND criterion='budget' "
+                "AND key='launched_sessions'",
+                (RUN_ID,),
+            )
+        result = sks.judge(ledger, "budget")
+        assert result["checks"]["budget.ceiling_enforced"] is False
+        assert result["observations"]["budget.ceiling_enforcement_failures"] == [
+            "launched_set_missing"
+        ]
+    finally:
+        ledger.close()
 
 
 def test_ceiling_is_enforced_when_the_watchdog_saw_every_recorded_response(
@@ -3206,10 +3316,11 @@ def test_ceiling_is_enforced_when_the_watchdog_saw_every_recorded_response(
         expected,
         expected,
     )
-    assert all(
-        row["launched"] and row["responses"] >= 1 and row["guard_after_first"]
-        for row in guard["sessions"]
-    )
+    assert ledger.observations("budget")["launched_sessions"] == [
+        {"role": sks.IMPLEMENTER, "seq": 1}
+    ]
+    assert [row["launched"] for row in guard["sessions"]] == [True, False, False]
+    assert all(row["responses"] >= 1 and row["guard_after_first"] for row in guard["sessions"])
     result = sks.judge(ledger, "budget")
     assert result["verdict"] == "pass", result["checks"]
     assert result["checks"]["budget.ceiling_enforced"] is True
@@ -3476,10 +3587,12 @@ def _passing_ledger(state: Path, *, rehearsal: bool = False) -> None:
         reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=time.time() + 1)
         facts = sks.attempt_facts([_attempt_files()], not_before=T0 - 30)
         seen = [key for session in facts.sessions for key in session.message_ids]
+        launched = sks.launched_sessions(reservations, [{"ran": True, "turn_starts": ()}])
+        ledger.record("budget", "launched_sessions", launched)
         ledger.record(
             "budget",
             "guard_checks",
-            sks.guard_coverage(reservations, facts.sessions, seen, checks=1),
+            sks.guard_coverage(reservations, facts.sessions, seen, checks=1, launched=launched),
         )
         sks.settle_attempt(ledger, reservations, facts.sessions, complete=True)
         request_id = str(sks.kickoff_request_id(sks.DEFAULT_IDENTITY, DELIVERY))
@@ -3671,6 +3784,7 @@ READS: dict[str, tuple[tuple[str, str], ...]] = {
         ("budget", "approved_ceiling"),
         ("budget", "ceiling"),
         ("budget", "allowance_breach"),
+        ("budget", "launched_sessions"),
         *(("grant_probe", key) for key in ("started", "result", "output_cap", "turn_cap", "model")),
     ),
     "cleanup": (("cleanup", "token_scan"), ("cleanup", "registry_tags_absent")),

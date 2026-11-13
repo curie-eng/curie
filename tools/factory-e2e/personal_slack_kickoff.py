@@ -3493,6 +3493,19 @@ class LiveRun:
         remaining = window - (self.clock.now() - self.attempt_started)
         self.wait_until(self.quiescent, seconds=max(remaining, POLL_SECONDS), what="the attempt")
 
+    def launch_evidence(self) -> list[dict[str, Any]]:
+        """Pod-watcher and runner-log starts, in follow order.
+
+        ``ran`` is whether the native process ran. ``turn_starts`` is each runner
+        turn start as (session id, container time). Neither value is a transcript.
+        """
+
+        evidence: list[dict[str, Any]] = []
+        for pod in self.followed():
+            with pod.lock:
+                evidence.append({"ran": pod.watch.ran, "turn_starts": tuple(pod.trace.started)})
+        return evidence
+
     def settle(self) -> None:
         if not self.reservations:
             return
@@ -3549,11 +3562,19 @@ class LiveRun:
             malformed=int(facts.malformed_lines) if facts is not None else 0,
         )
         self.ledger.record("budget", "settlement", settled)
+        # The launched set is the pod watcher and the runner's turn starts, not
+        # the harvest. A session that ran and left no transcript stays in it.
+        launched = sks.launched_sessions(self.reservations, self.launch_evidence())
+        self.ledger.record("budget", "launched_sessions", launched)
         self.ledger.record(
             "budget",
             "guard_checks",
             sks.guard_coverage(
-                self.reservations, sessions, self.guard_responses, checks=self.guard_checks
+                self.reservations,
+                sessions,
+                self.guard_responses,
+                checks=self.guard_checks,
+                launched=launched,
             ),
         )
         if facts is None:

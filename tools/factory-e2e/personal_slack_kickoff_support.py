@@ -1326,6 +1326,7 @@ _UNATTRIBUTED_AGENT = "<unattributed>"
 # The runner's own turn records (curie_runner.session): "turn start session=..."
 # and "turn end session=... status=... duration_ms=...".
 _TURN_KINDS = (("turn start ", "start"), ("turn end ", "end"))
+_TURN_START_SESSION = re.compile(r"^turn start session=(\S+)")
 
 
 def _json_object(line: bytes) -> dict[str, Any] | None:
@@ -1342,12 +1343,15 @@ class CaptureTrace:
 
     ``reports`` holds each harvester size report as (taken at, sizes by path) in
     stream order, ``turns`` each runner turn start or end as (kind, logged at) in
-    log order, and ``harvester_ended`` whether the harvester stopped on its own
-    deadline. Both times come from the runner container's clock.
+    log order, ``started`` each turn start as (session id, logged at), and
+    ``harvester_ended`` whether the harvester stopped on its own deadline. The
+    times come from the runner container's clock. ``sanitized`` leaves the
+    session id out; the launched set reads ``started`` and keeps only a seq.
     """
 
     reports: list[tuple[float, dict[str, int]]] = dataclasses.field(default_factory=list)
     turns: list[tuple[str, float]] = dataclasses.field(default_factory=list)
+    started: list[tuple[str, float]] = dataclasses.field(default_factory=list)
     harvester_ended: bool = False
 
     def feed_harvest(self, line: bytes) -> None:
@@ -1381,8 +1385,14 @@ class CaptureTrace:
             moment = dt.datetime.fromisoformat(stamp)
         except ValueError:
             return
-        if moment.tzinfo is not None:
-            self.turns.append((kind, moment.timestamp()))
+        if moment.tzinfo is None:
+            return
+        logged_at = moment.timestamp()
+        if kind == "start":
+            matched = _TURN_START_SESSION.match(message)
+            if matched is not None:
+                self.started.append((matched.group(1), logged_at))
+        self.turns.append((kind, logged_at))
 
     def sanitized(self) -> dict[str, Any]:
         """Times and sizes only: each path becomes its digest, and identical consecutive
@@ -3034,22 +3044,70 @@ def _judge_budget(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     }
 
 
+def launched_sessions(
+    reservations: Sequence[Reservation],
+    pods: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """The runner sessions the product started. The harvest is not an input. Pure.
+
+    ``pods`` is the followed runners, in follow order. ``turn_starts`` is
+    ``(session id, timestamp)`` pairs from that pod's runner log, in log order.
+    Distinct session ids, in the order each id first appears, are sessions that
+    started. A pod whose native process ran (``ran``) and that logged no turn
+    start still started one runner session. Each start takes the next implementer
+    reservation. A start with none left is recorded with no seq.
+    """
+
+    pending = [item for item in reservations if item.role == IMPLEMENTER]
+    rows: list[dict[str, Any]] = []
+    for pod in pods:
+        seen: list[str] = []
+        for item in pod.get("turn_starts") or ():
+            if not isinstance(item, (tuple, list)) or not item:
+                continue
+            session = item[0]
+            if not isinstance(session, str) or not session or session in seen:
+                continue
+            seen.append(session)
+        count = len(seen) if seen else (1 if pod.get("ran") is True else 0)
+        for _index in range(count):
+            row: dict[str, Any] = {"role": IMPLEMENTER}
+            if pending:
+                row["seq"] = pending.pop(0).seq
+            rows.append(row)
+    return rows
+
+
 def guard_coverage(
     reservations: Sequence[Reservation],
     sessions: Sequence[Any] | None,
     seen: Iterable[str],
     *,
     checks: int,
+    launched: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """The recorded per-response guard: one row per launched session. Pure.
+    """The recorded per-response guard: one row per harvested session. Pure.
 
-    A session in the harvest was launched. A reservation it did not match was
-    not started and is omitted, so an unused slot is not a missing response.
-    ``guard_after_first`` is true only when that session has a response, every
-    one of its response keys was seen, and at least one check ran.
+    ``launched`` is the recorded launched set, never inferred from the harvest.
+    A row's ``launched`` is true only when that set names its reservation, or,
+    for a session no reservation matched, a seq-less entry of its role. A
+    reservation the harvest did not match is omitted, so an unused slot is not
+    a missing response. ``guard_after_first`` is true only when that session has
+    a response, every one of its response keys was seen, and at least one check
+    ran.
     """
 
     covered_ids = frozenset(seen)
+    by_seq = {
+        int(item["seq"]): item
+        for item in launched
+        if isinstance(item, Mapping) and type(item.get("seq")) is int
+    }
+    unsequenced = [
+        item
+        for item in launched
+        if isinstance(item, Mapping) and "seq" not in item and item.get("role") in ROLES
+    ]
     pending = {role: [item for item in reservations if item.role == role] for role in ROLES}
     rows: list[dict[str, Any]] = []
     ordered = sorted(sessions or (), key=lambda item: (item.first is None, item.first or 0.0))
@@ -3059,10 +3117,20 @@ def guard_coverage(
         keys = frozenset(session.message_ids)
         responses = len(keys)
         checked = len(keys & covered_ids)
+        is_launched = False
+        if slot is not None:
+            record = by_seq.get(slot.seq)
+            is_launched = isinstance(record, Mapping) and record.get("role") == session.role
+        else:
+            for index, item in enumerate(unsequenced):
+                if item.get("role") == session.role:
+                    is_launched = True
+                    del unsequenced[index]
+                    break
         row: dict[str, Any] = {
             "role": session.role,
             "turns": int(session.assistant_turns),
-            "launched": True,
+            "launched": is_launched,
             "responses": responses,
             "responses_checked": checked,
             "guard_after_first": responses >= 1 and checked == responses and checks >= 1,
@@ -3138,16 +3206,81 @@ def _guard_record_failures(guard: Any) -> list[str]:
     return list(dict.fromkeys(failures))
 
 
+def _launch_record_ok(item: Any) -> bool:
+    if not isinstance(item, dict) or set(item) - {"seq", "role"}:
+        return False
+    if item.get("role") not in ROLES:
+        return False
+    return "seq" not in item or type(item.get("seq")) is int
+
+
+def _launched_row(rows: Sequence[Any], entry: Mapping[str, Any], used: set[int]) -> int | None:
+    for index, row in enumerate(rows):
+        if index in used or not isinstance(row, dict) or row.get("role") != entry.get("role"):
+            continue
+        if "seq" in entry:
+            if row.get("seq") == entry.get("seq"):
+                return index
+        elif "seq" not in row:
+            return index
+    return None
+
+
+def _launched_set_failures(ledger: Ledger) -> list[str]:
+    """Why ``budget.launched_sessions`` does not show every start harvested.
+
+    The set is its own observation. A missing or malformed one fails closed, and
+    that is not the same as an empty set. Each entry needs a harvested guard row
+    whose ``launched`` flag was taken from this record. A product path that
+    opened a pull request needs a launched implementer.
+    """
+
+    budget = ledger.observations("budget")
+    if "launched_sessions" not in budget:
+        return ["launched_set_missing"]
+    launched = budget.get("launched_sessions")
+    if not isinstance(launched, list) or any(not _launch_record_ok(item) for item in launched):
+        return ["launched_set_missing"]
+    failures: list[str] = []
+    guard = budget.get("guard_checks")
+    rows = guard.get("sessions") if isinstance(guard, dict) else None
+    if not isinstance(rows, list):
+        if launched:
+            failures.append("launched_unharvested")
+    else:
+        used: set[int] = set()
+        for entry in launched:
+            index = _launched_row(rows, entry, used)
+            if index is None:
+                failures.append("launched_unharvested")
+                continue
+            used.add(index)
+            if rows[index].get("launched") is not True:
+                failures.append("guard_sessions")
+        for index, row in enumerate(rows):
+            if isinstance(row, dict) and row.get("launched") is True and index not in used:
+                failures.append("guard_sessions")
+    if ledger.observations("progress").get("pull_request_exists") is True and not any(
+        isinstance(item, dict) and item.get("role") == IMPLEMENTER for item in launched
+    ):
+        failures.append("launched_set_empty")
+    return list(dict.fromkeys(failures))
+
+
 def ceiling_enforcement_failures(ledger: Ledger) -> list[str]:
     """Why the recorded ledger does not show the approved ceiling enforced; empty when it
     does. Reads only recorded observations and session rows.
 
     Every session's charge, observed or its full reservation share when unknown, stays
     inside its bounds and the attempt's; no bound was breached; every assistant record
-    that carries usage is a response, id or not, and a launched session or one with a
-    recorded turn has at least one response, every response checked, and a guard check
-    after its first response. A check of an empty harvest does not count. The item's
-    earlier charge plus this attempt's stays at or under the recorded item cap.
+    that carries usage is a response, id or not. The launched set is its own
+    observation, taken from the pod watcher or a runner log turn start, and a guard
+    row's ``launched`` flag is that record. Every launched session has a harvested
+    row with at least one response, every response checked, and a guard check after
+    its first response. A session with a recorded turn has the same coverage. A
+    product path that opened a pull request has at least one launched implementer.
+    A check of an empty harvest does not count. The item's earlier charge plus this
+    attempt's stays at or under the recorded item cap.
     """
 
     observed = ledger.observations("budget")
@@ -3161,6 +3294,7 @@ def ceiling_enforcement_failures(ledger: Ledger) -> list[str]:
     if observed.get("allowance_breach") != []:
         failures.append("bound_breached")
     failures.extend(_guard_record_failures(observed.get("guard_checks")))
+    failures.extend(_launched_set_failures(ledger))
     item = observed.get("item_ledger")
     cap = item.get("cap") if isinstance(item, dict) else None
     before = item.get("charged_before") if isinstance(item, dict) else None
