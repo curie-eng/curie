@@ -481,7 +481,11 @@ async def admit_notice(
             return ignored("label_event_answered")
         admitted = await session.get(ExecutionRequest, notice.request_id)
         if admitted is not None or notice.previously_admitted:
-            await record_base_label_notice(session, notice, verified, settings, client=client)
+            if (
+                notice.actor_refusal is None
+                and await verified.tracker.label_permission(notice) is None
+            ):
+                await record_base_label_notice(session, notice, verified, settings, client=client)
             return WebhookResult(status="factory_duplicate")
         grouped = await bound_labels(session, registry, GITHUB_CHANNEL_KIND, notice.repo_full_name)
         matches = grouped.get(notice.label or "", [])
@@ -785,10 +789,14 @@ async def handle_factory_delivery(
     else:
         settle_review_delivery(audit, "accepted")
     await session.commit()
-    await factory_intake_notices.sync_intake_notices(
-        async_sessionmaker(session.bind, expire_on_commit=False),
-        settings,
-        owner="webhook-intake",
-        client=client,
-    )
+    try:
+        await factory_intake_notices.sync_intake_notices(
+            async_sessionmaker(session.bind, expire_on_commit=False),
+            settings,
+            owner="webhook-intake",
+            client=client,
+            limit=1,
+        )
+    except Exception:
+        logger.exception("factory intake notice delivery deferred")
     return outcome

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import os
 import subprocess
 import sys
 import uuid
@@ -43,13 +44,15 @@ from forge_fakes.github import (
     _issue_event,
     _post,
     factory_env,
+    github_repository_binding,
 )
+from markdown_it import MarkdownIt
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from test_factory_poll_intake import PollGitHub, _client_type, _iso
+from test_factory_poll_intake import PollGitHub, _acquire, _client_type, _iso
 from test_github_factory_ingress import _rows
 
 REASONS = (
@@ -68,6 +71,7 @@ PATHS = ("webhook", "poll", "reconcile")
 class NoticeGitHub(PollGitHub):
     installation = INSTALLATION_ID
     comment_failure = False
+    unexpected_comment_failure = False
     lose_write = False
     missing_event = False
     unknown_event_time = False
@@ -144,6 +148,8 @@ class NoticeGitHub(PollGitHub):
                 ],
             )
         if path.endswith("/comments") and request.method == "POST":
+            if self.unexpected_comment_failure:
+                raise RuntimeError("fixture_delivery_failure")
             if self.comment_failure:
                 return httpx.Response(
                     403, json={"message": "Resource not accessible by integration"}
@@ -341,7 +347,7 @@ def test_each_reason(factory: Any, monkeypatch: pytest.MonkeyPatch, path: str, r
         "actor_no_permission": (SENDER, REPO),
         "actor_unverifiable": (REPO,),
         "personal_owner_required": (SENDER,),
-        "binding_ambiguous": (f"label {LABEL}", REPO),
+        "binding_ambiguous": (LABEL, REPO),
         "publication_completed": (f"https://github.com/{REPO}/pull/76",),
         "installation_changed": ("GitHub App",),
     }
@@ -684,3 +690,145 @@ def test_silent_untrusted_or_unserved(
         assert _post(client, "issues", payload).status_code == 200
     assert _notices(number) == _work(number) == _requests(number) == []
     assert _comments(github, number) == []
+
+
+@pytest.mark.parametrize("actor", ("bot", "no_write", "writer"))
+def test_duplicate_silent_base_label_requires_writer(
+    factory: Any, monkeypatch: pytest.MonkeyPatch, actor: str
+) -> None:
+    client, github, _agent = factory
+    document = json.loads(os.environ["CURIE_FORGES"])
+    document["bindings"] = [
+        github_repository_binding(bases=["main", "next"], default_base="main")
+    ]
+    monkeypatch.setenv("CURIE_FORGES", json.dumps(document))
+    get_settings.cache_clear()
+    number = github.plant_issue(age=timedelta(minutes=5))
+    _observe(factory, "webhook", number)
+    request_id = _requests(number)[0]["id"]
+    acquired = _acquire(client, request_id)
+    assert acquired.status_code == 200, acquired.text
+    started = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/start",
+        headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+        json={
+            "owner": "factory-intake-owner",
+            "generation": acquired.json()["generation"],
+            "claim_name": "claim-intake-notice",
+            "sandbox_name": "sandbox-intake-notice",
+            "context": acquired.json()["context"],
+        },
+    )
+    assert started.status_code == 200, started.text
+    if actor == "bot":
+        github.label_actor = {"id": 99, "login": "acme[bot]", "type": "Bot"}
+    elif actor == "no_write":
+        github.permission = "read"
+    github.issues[number].event_id += 1
+    github.issues[number].labeled_at = _requests(number)[0]["created_at"] - timedelta(seconds=1)
+    github.issues[number].base_labels = ("base:next",)
+    before_work, before_requests = _work(number), _requests(number)
+
+    _pass(github, "poll")
+
+    transitions = _rows(
+        "SELECT target_base_ref FROM curie.factory_base_transitions WHERE work_item_id = :id",
+        {"id": before_work[0]["id"]},
+    )
+    assert _notices(number) == []
+    if actor == "writer":
+        assert _work(number)[0]["base_requested_branch"] == "next"
+        assert _requests(number)[0]["status"] == "cancellation_requested"
+    else:
+        assert transitions == []
+        assert _work(number) == before_work
+        assert _requests(number) == before_requests
+
+
+@pytest.mark.parametrize("reason", ("binding_ambiguous", "actor_no_permission"))
+def test_notice_untrusted_values_are_inline_code(
+    factory: Any, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    client, github, _agent = factory
+    number = github.plant_issue()
+    _configure(factory, reason, number, monkeypatch)
+    label = "@acme-user https://example.com/ `x`\nnext"
+    github.comment_failure = True
+    response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert response.status_code == 200, response.text
+    assert _notices(number)[0]["posted_at"] is None
+    if reason == "binding_ambiguous":
+        _sql("UPDATE curie.factory_intake_notices SET label = :label", {"label": label})
+    github.comment_failure = False
+    _sql("UPDATE curie.factory_intake_notices SET not_before = NULL")
+    _pass(github, "delivery")
+    body = _comments(github, number)[0]["body"]
+    # GitHub code spans use CommonMark rules: https://github.github.com/gfm/#code-spans
+    tokens = [child for block in MarkdownIt().parse(body) for child in block.children or []]
+    values = [token.content for token in tokens if token.type == "code_inline"]
+    assert REPO in values
+    if reason == "binding_ambiguous":
+        assert " ".join(label.splitlines()) in values
+        assert not any(
+            token.type != "code_inline"
+            and ("@acme-user" in token.content or "https://example.com/" in token.content)
+            for token in tokens
+        )
+        assert not any(token.type in {"link_open", "softbreak", "hardbreak"} for token in tokens)
+    else:
+        assert SENDER in values
+    assert _notices(number)[0]["reason"] == reason
+    assert _work(number) == [] and _requests(number) == []
+
+
+def test_webhook_delivery_unexpected_exception_stays_owed(
+    factory: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, github, _agent = factory
+    number = github.plant_issue()
+    github.label_actor = {"id": 99, "login": "acme[bot]", "type": "Bot"}
+    github.unexpected_comment_failure = True
+
+    response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_ignored"
+    assert _notices(number)[0]["posted_at"] is None
+    assert _work(number) == [] and _requests(number) == []
+    assert any(
+        record.name == "curie_api.github_factory"
+        and record.exc_info is not None and record.exc_info[0] is RuntimeError
+        for record in caplog.records
+    )
+    github.unexpected_comment_failure = False
+    _sql(
+        "UPDATE curie.factory_intake_notices SET lease_expires_at = clock_timestamp() "
+        "- interval '1 second'"
+    )
+    _pass(github, "delivery")
+    assert _notices(number)[0]["posted_at"] is not None
+    assert len(_comments(github, number)) == 1
+
+
+def test_webhook_delivery_attempts_one_and_periodic_pass_drains_the_rest(factory: Any) -> None:
+    _client, github, _agent = factory
+    github.label_actor = {"id": 99, "login": "acme[bot]", "type": "Bot"}
+    github.comment_failure = True
+    for _ in range(2):
+        _observe(factory, "webhook", github.plant_issue())
+    github.comment_failure = False
+    github.calls.clear()
+    _sql("UPDATE curie.factory_intake_notices SET not_before = NULL")
+
+    _observe(factory, "webhook", github.plant_issue())
+
+    posted = _rows("SELECT id FROM curie.factory_intake_notices WHERE posted_at IS NOT NULL")
+    owed = _rows("SELECT id FROM curie.factory_intake_notices WHERE posted_at IS NULL")
+    assert len(posted) == 1 and len(owed) == 2
+    assert len([
+        call for call in github.calls
+        if call.method == "POST" and call.url.path.endswith("/comments")
+    ]) == 1
+    _pass(github, "delivery")
+    rows = _rows("SELECT id FROM curie.factory_intake_notices WHERE posted_at IS NOT NULL")
+    assert len(rows) == 3

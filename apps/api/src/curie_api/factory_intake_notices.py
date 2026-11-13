@@ -17,7 +17,7 @@ from starlette.concurrency import run_in_threadpool
 from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_comment_text import redact_factory_comment
-from .factory_notices import body_digest, escape_markdown, lease_available
+from .factory_notices import body_digest, code_span, lease_available
 from .forges.errors import ForgeError
 from .forges.github.comments import static_token
 from .forges.github.review_polling import label_actor
@@ -120,9 +120,9 @@ def marker_for(row: FactoryIntakeNotice) -> str:
 
 
 def notice_body(row: FactoryIntakeNotice) -> str:
-    repo = escape_markdown(row.repository_path)
-    login = escape_markdown(row.actor_login or "This person")
-    label = escape_markdown(row.label)
+    repo = code_span(" ".join(row.repository_path.splitlines()))
+    login = code_span(" ".join((row.actor_login or "This person").splitlines()))
+    label = code_span(" ".join(row.label.splitlines()))
     sentences = {
         "actor_bot": (
             "This label was applied by a bot account, and Curie only starts work "
