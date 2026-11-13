@@ -328,7 +328,6 @@ def approval_card(
         APPROVE_NOTE_ACTION_ID,
         REJECT_ACTION_ID,
         REJECT_NOTE_ACTION_ID,
-        requester_context_block,
     )
 
     approve_action = APPROVE_NOTE_ACTION_ID if allow_free_text else APPROVE_ACTION_ID
@@ -336,10 +335,6 @@ def approval_card(
 
     clamped = _truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX)
     fallback = _truncate(f"Approval required: {summary}", _SLACK_TEXT_MAX)
-    # The one requester-line renderer, shared with the settled card (#5515):
-    # a mention only for a Slack user id, literal text for anything else, and
-    # None (line omitted) for an empty requester.
-    requester_block = requester_context_block(requested_by)
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
@@ -350,7 +345,7 @@ def approval_card(
             },
         },
         {"type": "section", "text": {"type": "mrkdwn", "text": clamped}},
-        *([requester_block] if requester_block is not None else []),
+        *([_context_block(f"Requested by <@{requested_by}>")] if requested_by else []),
         {
             "type": "actions",
             "elements": [

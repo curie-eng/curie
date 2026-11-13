@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -385,52 +384,6 @@ class ApprovalResolveClient:
         return None
 
 
-# A requester is a Slack user id only when it matches the documented id shape:
-# a ``U`` (workspace member) or ``W`` (organisation member) followed by at
-# least eight uppercase alphanumerics. Anything else a requester supplies --
-# an email address, a plain display name, text already wrapped in mention
-# syntax -- is display text, never an id.
-_REQUESTER_ID_SHAPE = re.compile(r"^[UW][A-Z0-9]{8,}$")
-
-
-def requester_context_block(requested_by: str) -> dict[str, Any] | None:
-    """The "Requested by" context line shared by every approval card (#5515).
-
-    The requester field is untrusted display input: the same card carries a
-    Slack user id, an email address or a plain display name depending on who
-    triggered the turn, and a live card once rendered
-    ``Requested by <@requester@example.com>`` -- a mention attempt wrapping the
-    address, which Slack shows as raw text naming an address that is not a
-    user. Only an id-shaped requester renders as a mention; every other
-    nonempty requester renders as literal text in a ``plain_text`` context
-    element, which Slack never parses for mention syntax, so requester text
-    cannot introduce a mention. An empty requester returns None so callers
-    omit the line rather than render it empty.
-
-    Lives here, next to ``settled_approval_card``, because the dependency runs
-    one way: ``curie_channel_gateway.slack.blocks`` imports this module for the
-    action ids, and the live card, the resolved rebuild and the expired
-    rebuild must not drift on what a requester line is.
-    """
-
-    if not requested_by:
-        return None
-    # fullmatch, not match: a "$" anchor tolerates a trailing newline, which
-    # would let "U0EXAMPLE1\n" through as a mention of a user who does not
-    # exist. Slack user ids are single tokens; anything else is display text.
-    if _REQUESTER_ID_SHAPE.fullmatch(requested_by):
-        return {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"Requested by <@{requested_by}>"}],
-        }
-    return {
-        "type": "context",
-        "elements": [
-            {"type": "plain_text", "text": f"Requested by {requested_by}", "emoji": False}
-        ],
-    }
-
-
 def settled_approval_card(
     *, summary: str, requested_by: str, verdict: str, header: str
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -468,13 +421,14 @@ def settled_approval_card(
         {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
     ]
     # Omitted rather than rendered empty when unknown: a card remembered before
-    # #1084 carries no requester, and "Requested by <@" of nothing reads as a
-    # bug. The requester line itself is rendered by ``requester_context_block``
-    # so the live, resolved and expired cards cannot drift on what a requester
-    # line is (#5515).
-    requester_block = requester_context_block(requested_by)
-    if requester_block is not None:
-        blocks.append(requester_block)
+    # #1084 carries no requester, and "Requested by <@>" reads as a bug.
+    if requested_by:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"Requested by <@{requested_by}>"}],
+            }
+        )
     blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": verdict}]})
     fallback = f"{verdict}\n{summary}".strip()
     if len(fallback) > _FALLBACK_TEXT_MAX:
@@ -976,36 +930,8 @@ def _fetch_card_message(
     return {}
 
 
-# #5515: the conditional guidance appended to 401/403 refusal feedback. Those
-# are the refusals a copied or forwarded card's buttons produce -- the proof and
-# permission checks reject the copy, and the clicker otherwise learns only that
-# the click failed, not that the card works for the selected approver alone.
-# The sentence stays conditional because the API does not classify the refusal
-# and this surface must not: an unauthorized clicker inside the right channel
-# gets the same reason, and the sentence must stay true for them too. It names
-# no person, echoes no API code, and adds no lookup.
-_ORIGINAL_DM_GUIDANCE = (
-    " If this card was copied or forwarded, the selected approver must answer "
-    "the original card in their DM."
-)
-
-
 def _refusal_text(outcome: ResolveOutcome) -> str:
-    """The one wording for a non-200 resolution, shared by both surfaces.
-
-    401 and 403 additionally carry the copied-card guidance (#5515), appended to
-    the existing reason so the refusal classes stay as distinguishable as
-    before.
-    """
-
-    text = _refusal_reason(outcome)
-    if outcome.status_code in (401, 403):
-        text += _ORIGINAL_DM_GUIDANCE
-    return text
-
-
-def _refusal_reason(outcome: ResolveOutcome) -> str:
-    """The reason half of a refusal, by status class."""
+    """The one wording for a non-200 resolution, shared by both surfaces."""
 
     if outcome.status_code == 403:
         # The API already words each refusal class distinctly (non-membership,
