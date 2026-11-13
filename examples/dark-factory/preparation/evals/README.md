@@ -10,8 +10,8 @@ final report. The report has five dimensions.
 2. Facts are `clear for the requested set`, `known blocker`, `partial or unknown`,
    or `response unavailable`.
 3. Selection is `not requested`, `withheld`, `label applied but intake unconfirmed`,
-   `existing selection inspected`, or `acknowledged` after a factory comment on a
-   label this session wrote.
+   or `existing selection inspected`. A factory acknowledgement for a label this
+   session wrote is a factory outcome. Selection in that report is `not requested`.
 4. Factory is `admitted or queued`, `running`, `refused`, `terminal outcome`, or
    `none`. `admitted or queued` and `running` require the factory's acknowledgement
    comment and a link to it.

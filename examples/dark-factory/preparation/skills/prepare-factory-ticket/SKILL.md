@@ -242,9 +242,13 @@ or a state label as proof that the factory admitted the issue.
    for at most 180 seconds for a factory-owned status comment or refusal notice.
    A state label alone is corroboration, never proof. Do not write the label
    twice. Do not remove it and apply it again.
-8. Close with the five dimensions in the reference. Report `admitted or queued`
-   or `running` only when the tracker holds the factory's acknowledgement, and
-   include a link to that comment. Deployment validation stays `unvalidated`.
+8. Close with the five dimensions in the reference. Selection is only
+   `not requested`, `withheld`, `label applied but intake unconfirmed`, or
+   `existing selection inspected`. When you applied the label and the factory
+   acknowledgement is present, selection is `not requested` and the factory
+   dimension carries that acknowledgement. Report `admitted or queued` or
+   `running` only when the tracker holds the acknowledgement, and include a
+   link to that comment. Deployment validation stays `unvalidated`.
 
 ## Readiness boundary
 

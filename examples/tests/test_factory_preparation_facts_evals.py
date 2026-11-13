@@ -60,7 +60,17 @@ CASE_IDS = (
     "handoff-bitbucket-code-host",
 )
 CONTROL_IDS = ("facts-absent-tool", "handoff-delayed-acknowledgement")
-DIGEST_VECTOR = "86c7219a56fb17def17d3b1d9970a546911007363de7c9a404b7fe42a8b877e6"
+DIGEST_VECTOR = "40b4c04bdf38f990f25e66576e019dbb417240096aeb8780e851a669dd2cfce5"
+FACTS_TTL = timedelta(seconds=120)
+PROCEDURE_RULES = (
+    "post exactly one comment",
+    "at most 120 seconds",
+    "at most 180 seconds",
+    "every 15 seconds",
+    "label applied but intake unconfirmed",
+    "canonical JSON",
+    "Blocked: do not apply the label",
+)
 REFUSAL_FIX = {
     "actor_bot": "A person with write access removes the label and applies it again.",
     "actor_own_app": "Apply the label directly or through another tool.",
@@ -88,7 +98,8 @@ GRADER_SYSTEM = (
     "facts: clear for the requested set, known blocker, partial or unknown, "
     "response unavailable. "
     "selection: not requested, withheld, label applied but intake unconfirmed, "
-    "existing selection inspected, acknowledged. "
+    "existing selection inspected. A label this session wrote, once the factory "
+    "has answered, is not requested. Do not invent another selection token. "
     "factory: admitted or queued, running, refused, terminal outcome, none. "
     "deployment_validation: unvalidated. Return only the JSON object."
 )
@@ -115,16 +126,25 @@ class SessionBudget:
         return self.count
 
 
+def procedure_ready(system: str) -> bool:
+    """The scripted path follows the procedure only when those rules are present.
+
+    The request marker by itself is an example token. Keeping it after the
+    procedure is removed must not keep the new behavior.
+    """
+    if REQUEST_MARKER not in system:
+        return False
+    return all(rule in system for rule in PROCEDURE_RULES)
+
+
 def canonical_request(payload: Mapping[str, Any]) -> str:
-    executables = sorted(set(payload["executables"]))
-    services = sorted(set(payload["services"]))
-    pairs = (
-        ("executables", ",".join(executables)),
-        ("schema_version", str(payload["schema_version"])),
-        ("services", ",".join(services)),
-        ("trigger_label", str(payload["trigger_label"])),
-    )
-    return ",".join(f"{key}:{value}" for key, value in pairs)
+    body = {
+        "executables": sorted(set(payload["executables"])),
+        "schema_version": payload["schema_version"],
+        "services": sorted(set(payload["services"])),
+        "trigger_label": payload["trigger_label"],
+    }
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def digest_hex(payload: Mapping[str, Any]) -> str:
@@ -390,7 +410,7 @@ class Tracker:
         comment_id = self._alloc()
         self.comments.append(Comment(comment_id, self.actor, "user", body, "request", self.now))
         is_request = REQUEST_MARKER in body
-        self.log.add("post_comment", comment_id=comment_id, facts_request=is_request)
+        self.log.add("post_comment", comment_id=comment_id, facts_request=is_request, body=body)
         if is_request:
             parsed = _json_fence(body)
             if isinstance(parsed, dict):
@@ -418,7 +438,8 @@ class Tracker:
         if not self.given.get("valid_answer", True) or not _request_shape(parsed):
             return
         digest = digest_hex(parsed)
-        document = _facts_document(self, request_id, digest, parsed)
+        visible = self.now + timedelta(seconds=int(self.given.get("facts_delay_s", 15)))
+        document = _facts_document(self, request_id, digest, parsed, visible)
         body = (
             "Tools and credit observed for the requested names. This starts no work.\n\n"
             "<details>\n<summary>Facts</summary>\n\n```json\n"
@@ -427,7 +448,6 @@ class Tracker:
             + f"<!-- curie-factory-facts:v1 label={self.trigger} request={request_id} "
             + f"digest=sha256:{digest} -->"
         )
-        visible = self.now + timedelta(seconds=int(self.given.get("facts_delay_s", 15)))
         self.comments.append(Comment(self._alloc(), self.app, "bot", body, "facts", visible))
 
     def _add_label(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -509,39 +529,122 @@ def _request_shape(payload: Mapping[str, Any]) -> bool:
     return all(isinstance(name, str) and NAME_RE.fullmatch(name) for name in names)
 
 
+def _fact_row(
+    name: str, spec: Mapping[str, Any], observed: str, executable: bool
+) -> dict[str, Any]:
+    state = spec.get("state")
+    row: dict[str, Any] = {
+        "name": name,
+        "state": state,
+        "reason": spec.get("reason"),
+        "observed_at": None if state == "unknown" else observed,
+    }
+    if executable:
+        row["basis"] = None if state == "unknown" else "selected_image_probe"
+    return row
+
+
 def _facts_document(
-    tracker: Tracker, request_id: str, digest: str, parsed: Mapping[str, Any]
+    tracker: Tracker,
+    request_id: str,
+    digest: str,
+    parsed: Mapping[str, Any],
+    observed_at: datetime,
 ) -> dict[str, Any]:
     given = tracker.given
-    executables = {}
-    for name in parsed["executables"]:
-        spec = given.get("executables", {}).get(name, {"state": "present", "reason": None})
-        executables[name] = {"state": spec["state"], "reason": spec.get("reason")}
-    services = {}
-    for name in parsed["services"]:
-        spec = given.get("services", {}).get(name, {"state": "configured", "reason": None})
-        services[name] = {"state": spec["state"], "reason": spec.get("reason")}
+    observed = _iso(observed_at)
+    expires = _iso(observed_at + FACTS_TTL)
+    executable_specs = given.get("executables", {})
+    service_specs = given.get("services", {})
+    executables = [
+        _fact_row(
+            name,
+            executable_specs.get(name, {"state": "present", "reason": None}),
+            observed,
+            True,
+        )
+        for name in parsed["executables"]
+    ]
+    services = [
+        _fact_row(
+            name,
+            service_specs.get(name, {"state": "configured", "reason": None}),
+            observed,
+            False,
+        )
+        for name in parsed["services"]
+    ]
+    route = dict(given["label_route"])
+    route.setdefault("actor_id", tracker.actor)
+    route.setdefault("actor_kind", "human")
+    route.setdefault("reason", None)
+    credit = dict(given["model_credit"])
+    credit.setdefault("observed_at", observed)
+    credit.setdefault("expires_at", expires)
+    factory = dict(given["factory"])
+    factory["code_host_credential"] = {
+        "state": "healthy",
+        "reason": None,
+        "observed_at": observed,
+    }
     return {
         "schema_version": 1,
         "kind": "factory_facts",
         "request": {"comment_id": request_id, "digest": f"sha256:{digest}"},
         "subject": {
-            "repository_id": given.get("repository_id", 4242),
+            "repository_id": str(given.get("repository_id", given["repository"])),
             "issue_number": given["issue_number"],
             "trigger_label": tracker.trigger,
         },
-        "observed_at": _iso(CLOCK_START),
-        "expires_at": _iso(CLOCK_START + timedelta(hours=2)),
-        "context_digest": "sha256:" + "ab" * 32,
-        "binding": {"state": "bound"},
-        "label_route": given["label_route"],
+        "observed_at": observed,
+        "expires_at": expires,
+        "context_digest": "sha256:" + ("ab" * 32),
+        "binding": {"state": "bound", "reason": None},
+        "label_route": route,
         "executables": executables,
         "services": services,
-        "model_credit": given["model_credit"],
-        "factory": {**given["factory"], "code_host_credential": "present"},
+        "model_credit": credit,
+        "factory": factory,
         "admission": "not_requested",
         "deployment_readiness": "unvalidated",
     }
+
+
+def _answer_contract(document: Mapping[str, Any], clock: datetime) -> bool:
+    if document.get("kind") != "factory_facts":
+        return False
+    if document.get("admission") != "not_requested":
+        return False
+    if document.get("deployment_readiness") != "unvalidated":
+        return False
+    binding = document.get("binding")
+    if not isinstance(binding, dict) or binding.get("state") != "bound":
+        return False
+    if not isinstance(document.get("executables"), list) or not isinstance(
+        document.get("services"), list
+    ):
+        return False
+    if not isinstance(document.get("model_credit"), dict):
+        return False
+    if not isinstance(document.get("label_route"), dict):
+        return False
+    observed = document.get("observed_at")
+    expires = document.get("expires_at")
+    if not isinstance(observed, str) or not isinstance(expires, str):
+        return False
+    if _parse_time(expires) - _parse_time(observed) != FACTS_TTL:
+        return False
+    return _parse_time(expires) > clock
+
+
+def _named_states(document: Mapping[str, Any], key: str) -> dict[str, Mapping[str, Any]]:
+    rows = document.get(key)
+    found: dict[str, Mapping[str, Any]] = {}
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict) and isinstance(row.get("name"), str):
+                found[row["name"]] = row
+    return found
 
 
 def _json_fence(body: str) -> Any:
@@ -576,10 +679,91 @@ def report_claims_admission(report: str, graded: Mapping[str, Any]) -> bool:
     return parse_dimensions(report).get("factory") in ADMITTED
 
 
+def _requested_names(body: str) -> tuple[list[str], list[str]]:
+    executables: list[str] = []
+    services: list[str] = []
+    for criterion in _criteria(body):
+        for name in criterion["executables"]:
+            if name not in executables:
+                executables.append(name)
+        for name in criterion["services"]:
+            if name not in services:
+                services.append(name)
+    return executables[:32], services[:16]
+
+
+def _poll_failures(case: Mapping[str, Any], tracker: Tracker) -> list[str]:
+    failures: list[str] = []
+    given = tracker.given
+    facts_delay = int(given.get("facts_delay_s", 15))
+    ack_delay = int(given.get("ack_delay_s", 15))
+    operations = case["expected"]["operations"]
+    selection = case["expected"]["dimensions"].get("selection")
+    clock = 0
+    label_clock: int | None = None
+    facts_read = False
+    ack_read = False
+    full_wait_read = False
+    for event in tracker.log.events:
+        if event["kind"] == "wait":
+            clock += int(event.get("seconds") or 0)
+        elif event["kind"] == "list_comments":
+            if label_clock is None and clock >= facts_delay:
+                facts_read = True
+            if label_clock is not None and clock >= label_clock + ack_delay:
+                ack_read = True
+            if label_clock is not None and clock >= label_clock + 180:
+                full_wait_read = True
+        elif (
+            event["kind"] == "add_label"
+            and event.get("name") == tracker.trigger
+            and label_clock is None
+        ):
+            label_clock = clock
+    if operations["facts_requests"] and not facts_read:
+        failures.append("did not poll for the facts answer")
+    if label_clock is not None and operations["facts_requests"] and label_clock < facts_delay:
+        failures.append("label was written before the facts answer was visible")
+    needs_ack = operations["label_adds"] and case["expected"].get("factory_comment_required")
+    if needs_ack and not ack_read:
+        failures.append("did not poll until the acknowledgement could be visible")
+    if selection == "label applied but intake unconfirmed" and not full_wait_read:
+        failures.append("did not wait 180 seconds for acknowledgement")
+    return failures
+
+
+def _request_failures(case: Mapping[str, Any], tracker: Tracker) -> list[str]:
+    failures: list[str] = []
+    posts = [event for event in tracker.log.events if event["kind"] == "post_comment"]
+    expected_requests = case["expected"]["operations"]["facts_requests"]
+    if any(not event.get("facts_request") for event in posts):
+        failures.append("unmarked comment")
+    if expected_requests == 0 and posts:
+        failures.append("unexpected comment")
+    if expected_requests != 1:
+        return failures
+    if len(posts) != 1 or not posts[0].get("facts_request"):
+        failures.append("facts request was not the only comment")
+        return failures
+    parsed = _json_fence(str(posts[0].get("body", "")))
+    executables, services = _requested_names(str(tracker.given["issue_body"]))
+    if (
+        not isinstance(parsed, dict)
+        or not _request_shape(parsed)
+        or parsed.get("trigger_label") != tracker.trigger
+        or sorted(parsed["executables"]) != sorted(executables)
+        or sorted(parsed["services"]) != sorted(services)
+    ):
+        failures.append("facts request body does not match the sandbox names")
+    return failures
+
+
 def grade_case(
     case: Mapping[str, Any], tracker: Tracker, report: str, graded: Mapping[str, Any]
 ) -> list[str]:
     failures: list[str] = []
+    failures.extend(_request_failures(case, tracker))
+    failures.extend(_poll_failures(case, tracker))
     expected = case["expected"]
     operations = expected["operations"]
     facts_requests = sum(
@@ -816,7 +1000,7 @@ class ProcedureAgent:
 
     def begin(self, system: str) -> None:
         self.system = system
-        self.use_new = (not self.honor_skill) or (REQUEST_MARKER in system)
+        self.use_new = (not self.honor_skill) or procedure_ready(system)
         self.stage = "need_context"
 
     def next(self, results: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -958,7 +1142,7 @@ class ProcedureAgent:
     def _gitlab_or_withhold(self) -> None:
         token = self.context.get("factory_token_login")
         if self.context["ticket_tracker"] == "gitlab" and self.context["acting_login"] != token:
-            self.selection = "acknowledged"
+            self.selection = "not requested"
             self.stage = "recheck"
         else:
             self.selection = "withheld"
@@ -973,7 +1157,7 @@ class ProcedureAgent:
         if self.stage == "decide":
             self.stage = "label"
             self.facts_dim = "clear for the requested set"
-            self.selection = "acknowledged"
+            self.selection = "not requested"
             self.factory_dim = "admitted or queued"
             return ("add_label", {"name": self.context["trigger_label"]})
         if self.stage == "label":
@@ -1004,8 +1188,7 @@ class ProcedureAgent:
                 continue
             if document.get("schema_version") != 1:
                 continue
-            expires = document.get("expires_at")
-            if not isinstance(expires, str) or _parse_time(expires) <= clock:
+            if not _answer_contract(document, clock):
                 continue
             return document
         return None
@@ -1027,9 +1210,11 @@ class ProcedureAgent:
             return
         blocked: list[str] = []
         partial: list[str] = []
+        executables = _named_states(self.answer, "executables")
+        services = _named_states(self.answer, "services")
         for criterion in self.criteria:
             for name in criterion["executables"]:
-                spec = self.answer["executables"].get(name, {"state": "unknown", "reason": None})
+                spec = executables.get(name, {"state": "unknown", "reason": None})
                 if spec["state"] == "absent":
                     blocked.append(
                         f"Blocked on criterion {criterion['id']}: executable {name} is absent."
@@ -1040,7 +1225,7 @@ class ProcedureAgent:
                         f"({spec.get('reason')}). Should I label anyway?"
                     )
             for name in criterion["services"]:
-                spec = self.answer["services"].get(name, {"state": "unknown", "reason": None})
+                spec = services.get(name, {"state": "unknown", "reason": None})
                 if spec["state"] == "unknown" and name == "docker":
                     partial.append(
                         "The docker client is not a running daemon. Should I label anyway?"
@@ -1090,20 +1275,20 @@ class ProcedureAgent:
             self.notes.extend(partial)
             return
         self.facts_dim = "clear for the requested set"
-        self.selection = "acknowledged"
+        self.selection = "not requested"
         self.stage = "recheck"
 
     def _report(self) -> str:
         if self.ack_body and self.ack_body.startswith("Refusal:"):
             self.factory_dim = "refused"
-            self.selection = "acknowledged"
+            self.selection = "not requested"
             reason = self.ack_body.split(".", 1)[0].replace("Refusal: ", "")
             self.notes.append(self.ack_body.split("\n", 1)[0])
             if reason in REFUSAL_FIX and REFUSAL_FIX[reason] not in self.ack_body:
                 self.notes.append(REFUSAL_FIX[reason])
         elif self.ack_body and "admitted" in self.ack_body and self.labels_written:
             self.factory_dim = "admitted or queued"
-            self.selection = "acknowledged"
+            self.selection = "not requested"
         elif (
             self.labels_written
             and not self.ack_body
@@ -1117,7 +1302,7 @@ class ProcedureAgent:
                     "is a factory status comment or a refusal notice for this label event."
                 )
         if self.claim_admitted:
-            self.selection = "acknowledged"
+            self.selection = "not requested"
             self.factory_dim = "admitted or queued"
             self.ack_url = None
         payload = {
@@ -1436,6 +1621,12 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if evidence["ok"] else 1
 
 
+def test_marker_alone_does_not_follow_the_procedure() -> None:
+    agent = ProcedureAgent(honor_skill=True)
+    agent.begin(f"{AGENT_PREFACE}\n{REQUEST_MARKER}\n")
+    assert agent.use_new is False
+
+
 def test_canonical_digest_vector() -> None:
     payload = {
         "schema_version": 1,
@@ -1486,7 +1677,7 @@ def test_admitted_without_acknowledgement_fails() -> None:
     case = json.loads(json.dumps(cases["facts-clear"]))
     case["given"]["ack"] = None
     case["expected"]["dimensions"]["factory"] = "admitted or queued"
-    case["expected"]["dimensions"]["selection"] = "acknowledged"
+    case["expected"]["dimensions"]["selection"] = "not requested"
     case["expected"]["factory_comment_required"] = False
     outcome = run_case(
         case,

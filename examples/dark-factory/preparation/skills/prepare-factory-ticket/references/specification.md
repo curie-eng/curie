@@ -422,19 +422,27 @@ Factory check requested for: uv, jq, docker, postgres. This starts no work.
    `<!-- curie-factory-facts:v1 label=<label> request=<request comment id> digest=sha256:<hex> -->`.
    Its `request` is the id of the comment you posted and its `label` is the
    trigger label you requested. The JSON under the details fold has
-   `schema_version` 1. `expires_at` is in the future on the tracker clock. When
-   you can compute SHA-256, compare the marker digest to the hex digest of the
-   canonical request: sort the four keys, sort and de-duplicate each name list,
-   join each list with `,`, join `key:value` pairs with `,`, and hash that UTF-8
-   string. For executables `jq` and `uv`, service `postgres`, and label
-   `acme-factory`, the canonical string is
-   `executables:jq,uv,schema_version:1,services:postgres,trigger_label:acme-factory`
+   `schema_version` 1. `expires_at` is `observed_at` plus 120 seconds and is still
+   in the future on the tracker clock. Any other lifetime is not this answer.
+   When you can compute SHA-256, compare the marker digest to the hex digest of
+   the canonical JSON request. Sort and de-duplicate each name list, sort the
+   four keys, and encode that object with separators `,` and `:` and no
+   whitespace, as UTF-8. For executables `jq` and `uv`, service `postgres`, and
+   label `acme-factory`, the canonical JSON is
+   `{"executables":["jq","uv"],"schema_version":1,"services":["postgres"],"trigger_label":"acme-factory"}`
    and the digest is
-   `86c7219a56fb17def17d3b1d9970a546911007363de7c9a404b7fe42a8b877e6`.
-   A marker in a person's comment, an expired answer, a digest mismatch, or an
-   answer to another request is not evidence. No accepted answer in 120 seconds
-   is facts `response unavailable`. That outcome is not healthy, unbound or
-   eligible.
+   `40b4c04bdf38f990f25e66576e019dbb417240096aeb8780e851a669dd2cfce5`.
+   Read states from the answer arrays, not from a map. Each executable entry has
+   `name`, `state` (`present`, `absent`, or `unknown`), `basis`, `reason`, and
+   `observed_at`. Each service entry has `name`, `state` (`configured`,
+   `observed`, or `unknown`), `reason`, and `observed_at`. `model_credit` and
+   `label_route` are objects with `state` and `reason`. `binding.state` is
+   `bound`. `factory` carries `enabled`, `kill_switch`, `upgrade_pause`, and
+   `code_host_credential`. `admission` is `not_requested` and
+   `deployment_readiness` is `unvalidated`. A marker in a person's comment, an
+   expired answer, a digest mismatch, or an answer to another request is not
+   evidence. No accepted answer in 120 seconds is facts `response unavailable`.
+   That outcome is not healthy, unbound or eligible.
 7. Classify from the accepted answer, for the criteria the sandbox must verify.
    Blocked wins over partial.
 
@@ -479,20 +487,24 @@ Factory check requested for: uv, jq, docker, postgres. This starts no work.
     a new explicit instruction after you have shown the existing work and the
     publication state.
 11. Finish with prose plus one JSON object using these tokens exactly.
-    `acknowledged` means a factory-owned acknowledgement comment was observed for
-    the label event you wrote. It is not a selection token for a label that was
-    already present; that path stays `existing selection inspected`.
+    Do not invent a selection token. Use `withheld` when you do not apply the
+    label. Use `existing selection inspected` when the label was already present.
+    Use `label applied but intake unconfirmed` only when you applied the label
+    and the wait ended with no acknowledgement. When you applied the label and
+    the factory acknowledgement is present, use `not requested`: the list has no
+    other selection token, and that acknowledgement is reported on the factory
+    dimension.
 
 | Dimension | Token |
 |---|---|
 | publication | `local draft`, `published`, or `publication failed` |
 | facts | `clear for the requested set`, `known blocker`, `partial or unknown`, or `response unavailable` |
-| selection | `not requested`, `withheld`, `label applied but intake unconfirmed`, `existing selection inspected`, or `acknowledged` |
+| selection | `not requested`, `withheld`, `label applied but intake unconfirmed`, or `existing selection inspected` |
 | factory | `admitted or queued`, `running`, `refused`, `terminal outcome`, or `none` |
 | deployment_validation | `unvalidated` |
 
 ```json
-{"publication":"published","facts":"clear for the requested set","selection":"acknowledged","factory":"admitted or queued","deployment_validation":"unvalidated","factory_comment_url":"https://github.com/example/widget/issues/21#issuecomment-1"}
+{"publication":"published","facts":"clear for the requested set","selection":"not requested","factory":"admitted or queued","deployment_validation":"unvalidated","factory_comment_url":"https://github.com/example/widget/issues/21#issuecomment-1"}
 ```
 
     Use `admitted or queued` or `running` only when the acknowledgement comment
