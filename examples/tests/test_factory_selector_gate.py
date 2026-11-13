@@ -580,3 +580,216 @@ def test_a_lock_wait_denies_before_the_runner_timeout(tmp_path: Path) -> None:
     assert elapsed < 60
     stored = json.loads((gate.state / "sess-1.json").read_text())
     assert stored["allowed"] == []
+
+
+# The runner image WORKDIR (runner/Dockerfile). ClaudeAgentOptions.cwd is
+# omitted when /workspace has no git checkout, so the CLI hook payload cwd
+# is this path. It is not a temporary directory standing in for that path.
+_SDK_CWD = "/app"
+_SESSION_WORKSPACE = "/workspace"
+
+_READONLY_ROOT_DRIVER = r"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HOOK = "/opt/selector_gate.py"
+POLICY = "/opt/policy.json"
+SESSION = "sess-keep"
+LABEL = "curie-factory"
+GET = "mcp__plugin_factory-selector_github__get_issue"
+UPDATE = "mcp__plugin_factory-selector_github__update_issue"
+
+
+def issue(labels):
+    body = {
+        "number": 1,
+        "title": "t",
+        "state": "open",
+        "labels": [
+            {"id": i + 1, "name": name, "color": "ededed"} for i, name in enumerate(labels)
+        ],
+    }
+    return [{"type": "text", "text": json.dumps(body)}]
+
+
+def send(event, **fields):
+    payload = {
+        "session_id": "payload-session",
+        "hook_event_name": event,
+        "cwd": "/app",
+        **fields,
+    }
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "FACTORY_SELECTOR_POLICY": POLICY,
+        "CURIE_SESSION_ID": SESSION,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HOME": "/tmp",
+    }
+    done = subprocess.run(
+        [sys.executable, HOOK],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if done.returncode != 0:
+        sys.stderr.write(done.stderr)
+        raise SystemExit(f"hook exit {done.returncode}")
+    if not done.stdout.strip():
+        return None
+    return json.loads(done.stdout)
+
+
+def read(number, labels):
+    send(
+        "PostToolUse",
+        tool_name=GET,
+        tool_input={"owner": "acme-corp", "repo": "acme-bot", "issue_number": number},
+        tool_response=issue(labels),
+    )
+
+
+def update(number, labels):
+    out = send(
+        "PreToolUse",
+        tool_name=UPDATE,
+        tool_input={
+            "owner": "acme-corp",
+            "repo": "acme-bot",
+            "issue_number": number,
+            "labels": labels,
+        },
+    )
+    return out["hookSpecificOutput"]
+
+
+def allow(number, labels):
+    read(number, labels)
+    decision = update(number, [*labels, LABEL])
+    if decision["permissionDecision"] != "allow":
+        raise SystemExit(f"allow failed: {decision}")
+
+
+def state_path():
+    workspace = Path("/workspace")
+    if workspace.is_dir() and os.access(workspace, os.W_OK):
+        return workspace / ".factory-selector" / f"{SESSION}.json"
+    return Path("/tmp/.factory-selector") / f"{SESSION}.json"
+
+
+if sys.argv[1:] == ["resume"]:
+    read(21, ["bug"])
+    denied = update(21, ["bug", LABEL])
+    reason = denied["permissionDecisionReason"]
+    if denied["permissionDecision"] != "deny" or "cap of 3" not in reason:
+        raise SystemExit(f"resumed session did not keep the cap: {denied}")
+    state = state_path()
+    if not state.is_file():
+        raise SystemExit(f"state missing at {state}")
+    resolved = str(state.resolve())
+    if resolved == "/app" or resolved.startswith("/app/"):
+        raise SystemExit(f"state path is under the read-only root: {resolved}")
+    if Path("/app/.factory-selector").exists():
+        raise SystemExit("state directory was created under /app")
+    saved = json.loads(state.read_text())
+    if saved["allowed"] != [
+        "acme-corp/acme-bot/12",
+        "acme-corp/acme-bot/15",
+        "acme-corp/acme-bot/18",
+    ]:
+        raise SystemExit(f"count not kept: {saved}")
+    print(f"STATE={resolved}")
+    raise SystemExit(0)
+
+for number, labels in ((12, ["bug"]), (15, ["docs"]), (18, ["help wanted"])):
+    allow(number, labels)
+child = subprocess.run([sys.executable, __file__, "resume"], check=False)
+raise SystemExit(child.returncode)
+"""
+
+_READONLY_ROOT_SETUP = r"""
+import subprocess
+import sys
+from pathlib import Path
+
+new = Path(sys.argv[1])
+mount_workspace = sys.argv[2] == "1"
+
+
+def mount(args):
+    done = subprocess.run(args, capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        sys.stderr.write(done.stderr)
+        raise SystemExit(done.returncode)
+
+
+for src, name in (("/usr", "usr"), ("/lib", "lib"), ("/bin", "bin"), ("/etc", "etc")):
+    if Path(src).exists():
+        mount(["mount", "--bind", src, str(new / name)])
+if Path("/lib64").exists():
+    mount(["mount", "--bind", "/lib64", str(new / "lib64")])
+mount(["mount", "-t", "tmpfs", "-o", "ro,mode=555", "tmpfs", str(new / "app")])
+mount(["mount", "-t", "tmpfs", "-o", "rw,mode=1777", "tmpfs", str(new / "tmp")])
+if mount_workspace:
+    mount(["mount", "-t", "tmpfs", "-o", "rw,mode=755", "tmpfs", str(new / "workspace")])
+raise SystemExit(
+    subprocess.run(
+        ["chroot", str(new), "/usr/bin/python3", "/opt/drive.py"],
+        check=False,
+    ).returncode
+)
+"""
+
+
+def _dispatch_under_readonly_image_root(tmp_path: Path, *, workspace: bool) -> str:
+    """Run the hook with payload cwd /app inside a read-only image root."""
+    new = tmp_path / "newroot"
+    for name in ("app", "tmp", "usr", "lib", "lib64", "bin", "etc", "opt"):
+        (new / name).mkdir(parents=True)
+    if workspace:
+        (new / "workspace").mkdir()
+    (new / "opt" / "selector_gate.py").write_bytes(HOOK.read_bytes())
+    (new / "opt" / "policy.json").write_bytes(
+        (REPO / "examples" / "factory-selector" / "policy.json").read_bytes()
+    )
+    (new / "opt" / "drive.py").write_text(_READONLY_ROOT_DRIVER)
+    setup = tmp_path / "setup.py"
+    setup.write_text(_READONLY_ROOT_SETUP)
+    done = subprocess.run(
+        [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            sys.executable,
+            str(setup),
+            str(new),
+            "1" if workspace else "0",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr or done.stdout
+    return done.stdout
+
+
+def test_a_read_only_image_root_keeps_the_cap_off_that_root(tmp_path: Path) -> None:
+    """Three label writes are allowed and the fourth is denied on resume.
+
+    The negative control is the state path. Putting it back under /app fails
+    this test: that directory is the read-only image root, so the writes
+    fail closed, and a file created there fails the path check.
+    """
+    with_workspace = _dispatch_under_readonly_image_root(tmp_path / "workspace", workspace=True)
+    assert f"STATE={_SESSION_WORKSPACE}/.factory-selector/sess-keep.json" in with_workspace
+    assert _SDK_CWD not in with_workspace.split("STATE=", 1)[1].splitlines()[0]
+
+    without_workspace = _dispatch_under_readonly_image_root(tmp_path / "temp", workspace=False)
+    assert "STATE=/tmp/.factory-selector/sess-keep.json" in without_workspace
+    assert _SDK_CWD not in without_workspace.split("STATE=", 1)[1].splitlines()[0]

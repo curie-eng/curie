@@ -27,4 +27,4 @@ The token must belong to a person or a machine user with write access to the rep
 
 ## The cap is per model session
 
-The hook counts allowed label writes in the model session and keeps that count in the session workspace, so a resumed session keeps its count. A retried scheduled run that starts a fresh session may take up to three more issues. The shipped query excludes issues that already carry the label, so the next session selects different issues. This bundle does not claim a durable cap across retried runs.
+The hook counts allowed label writes in the model session and keeps that count in the session workspace, so a resumed session keeps its count. When the session working directory is the read-only image root, the count is kept on the workspace mounted at `/workspace`, or in the temporary directory when no workspace is mounted. A resumed session in that same sandbox still sees the count. A retried scheduled run that starts a fresh session may take up to three more issues. The shipped query excludes issues that already carry the label, so the next session selects different issues. This bundle does not claim a durable cap across retried runs.
