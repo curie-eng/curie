@@ -497,6 +497,30 @@ async def observation_rows(world: Any) -> list[Any]:
         )
 
 
+@pytest.mark.parametrize("secrets", [None, {}])
+def test_tick_observes_agents_with_api_serialized_secrets(
+    observation_world: Any, secrets: dict[str, str] | None
+) -> None:
+    from sqlalchemy import text
+
+    world = observation_world
+    client = ProbeClient()
+
+    async def check() -> None:
+        async with world.engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE curie.agents SET secrets=CAST(:secrets AS jsonb) WHERE id=:id"),
+                {"secrets": json.dumps(secrets), "id": world.agent},
+            )
+        assert await observer(world, client).tick() == 1
+        rows = await observation_rows(world)
+        assert len(rows) == len(CATALOG)
+        assert {row["state"] for row in rows} == {"present", "absent"}
+        assert len(client.created) == 1 and client.released == client.created
+
+    asyncio.run(check())
+
+
 def test_tick_preserves_expiry_until_a_fresh_probe(
     observation_world: Any,
 ) -> None:

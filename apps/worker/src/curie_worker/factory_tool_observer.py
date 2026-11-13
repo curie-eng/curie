@@ -54,7 +54,7 @@ class FactoryToolObserver:
                        jsonb_agg(jsonb_build_array(c.id, c.generation) ORDER BY c.id),
                        'runner_resources', a.runner_resources)::text AS configuration,
                    ARRAY(SELECT jsonb_object_keys(
-                       COALESCE(a.secrets, '{{}}'::jsonb))) AS secret_names
+                       COALESCE(NULLIF(a.secrets, 'null'::jsonb), '{{}}'::jsonb))) AS secret_names
             FROM {self._schema}.agents a
             JOIN {self._schema}.agent_channels c ON c.agent_id = a.id AND c.tenant_id = a.tenant_id
             JOIN LATERAL (
