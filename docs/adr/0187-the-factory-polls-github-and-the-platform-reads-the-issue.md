@@ -4,6 +4,10 @@ Date: 2026-10-01
 
 Status: Accepted
 
+Partially amended by [ADR 0279](0279-a-person-acting-through-a-github-app-can-select-factory-work.md)
+under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md),
+only where this record ignores every App-related label event.
+
 **Partially amended by [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 the clause that reading the ticket is the bundle's job for the GitHub
