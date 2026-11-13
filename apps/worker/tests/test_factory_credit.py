@@ -25,6 +25,7 @@ from curie_worker.config import WorkerConfig
 from curie_worker.factory_credit import (
     LOCK_CLASS_ID,
     LOCK_OBJECT_ID,
+    READ_DEADLINE_SECONDS,
     CreditObservation,
     FactoryCreditLoop,
     observe,
@@ -273,6 +274,186 @@ def test_requests_are_only_key_and_credits() -> None:
         assert request.url.host == "credit.fixture.test"
         assert "messages" not in request.url.path
         assert request.headers["authorization"] == f"Bearer {sample_value()}"
+
+
+def test_a_balance_exactly_at_the_minimum_is_sufficient() -> None:
+    observation, _, script = asyncio.run(
+        _read(
+            Script(
+                [
+                    _ok(200, _key_body("10", "10")),
+                    _ok(200, _credits_body("10", "0")),
+                ]
+            )
+        )
+    )
+    assert observation == CreditObservation("sufficient", None)
+    assert _paths(script) == ["/api/v1/key", "/api/v1/credits"]
+    _assert_clean(repr(observation))
+
+
+async def _pause(seconds: float) -> None:
+    try:
+        await asyncio.wait_for(asyncio.Event().wait(), seconds)
+    except TimeoutError:
+        return
+
+
+async def _request_path(reader: asyncio.StreamReader) -> tuple[str, bool]:
+    start = await reader.readline()
+    if not start:
+        return "", False
+    saw_authorization = False
+    while True:
+        line = await reader.readline()
+        if line in (b"\r\n", b"\n", b""):
+            break
+        if line.lower().startswith(b"authorization:"):
+            saw_authorization = True
+    parts = start.decode("iso-8859-1").split(" ")
+    return (parts[1] if len(parts) > 1 else ""), saw_authorization
+
+
+async def _write_json(writer: asyncio.StreamWriter, payload: bytes) -> None:
+    head = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+        + str(len(payload)).encode("ascii")
+        + b"\r\nConnection: close\r\n\r\n"
+    )
+    writer.write(head + payload)
+    await writer.drain()
+
+
+async def _trickle(writer: asyncio.StreamWriter, payload: bytes) -> None:
+    writer.write(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    )
+    await writer.drain()
+    cut = max(1, len(payload) // 4)
+    pieces = [payload[:cut], payload[cut : cut * 2], payload[cut * 2 : cut * 3], payload[cut * 3 :]]
+    for index, piece in enumerate(pieces):
+        if index:
+            await _pause(4)
+        if writer.is_closing():
+            return
+        writer.write(f"{len(piece):X}\r\n".encode("ascii") + piece + b"\r\n")
+        await writer.drain()
+    writer.write(b"0\r\n\r\n")
+    await writer.drain()
+
+
+def test_a_body_that_trickles_past_ten_seconds_is_unknown() -> None:
+    async def go() -> tuple[CreditObservation, float]:
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                path, _saw = await _request_path(reader)
+                if path.endswith("/credits"):
+                    await _write_json(writer, b'{"data":{"total_credits":20,"total_usage":0}}')
+                else:
+                    await _trickle(
+                        writer,
+                        b'{"data":{"limit":100,"limit_remaining":50,"usage":0}}',
+                    )
+            except (ConnectionError, RuntimeError, TimeoutError, asyncio.IncompleteReadError):
+                return
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        sockets = server.sockets or []
+        port = sockets[0].getsockname()[1]
+        started = asyncio.get_running_loop().time()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+                observation, _digest = await observe(
+                    WorkerConfig(
+                        credentials=sample_value(),
+                        model_base_url="https://openrouter.ai/api",
+                        factory_min_model_credit_usd=10,
+                    ),
+                    client=client,
+                    environ={"CURIE_OPENROUTER_API_URL": f"http://127.0.0.1:{port}/api/v1"},
+                )
+            elapsed = asyncio.get_running_loop().time() - started
+        finally:
+            server.close()
+            await server.wait_closed()
+        return observation, elapsed
+
+    observation, elapsed = asyncio.run(go())
+    assert READ_DEADLINE_SECONDS == 10
+    assert observation == CreditObservation("unknown", "unreadable")
+    assert 9 <= elapsed < 11.5
+    _assert_clean(repr(observation))
+
+
+def test_a_redirect_is_refused() -> None:
+    async def go() -> tuple[CreditObservation, list[str]]:
+        decoy_hits: list[str] = []
+
+        async def decoy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                path, saw_authorization = await _request_path(reader)
+                decoy_hits.append(path)
+                if saw_authorization:
+                    decoy_hits.append("authorization")
+                payload = (
+                    b'{"data":{"total_credits":20,"total_usage":0}}'
+                    if path.endswith("/credits")
+                    else b'{"data":{"limit":100,"limit_remaining":50,"usage":0}}'
+                )
+                await _write_json(writer, payload)
+            except (ConnectionError, RuntimeError, TimeoutError, asyncio.IncompleteReadError):
+                return
+            finally:
+                writer.close()
+
+        decoy_server = await asyncio.start_server(decoy, "127.0.0.1", 0)
+        decoy_port = (decoy_server.sockets or [])[0].getsockname()[1]
+
+        async def front(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                path, _saw = await _request_path(reader)
+                target = f"http://127.0.0.1:{decoy_port}{path}".encode("ascii")
+                writer.write(
+                    b"HTTP/1.1 302 Found\r\nLocation: "
+                    + target
+                    + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                await writer.drain()
+            except (ConnectionError, RuntimeError, TimeoutError, asyncio.IncompleteReadError):
+                return
+            finally:
+                writer.close()
+
+        front_server = await asyncio.start_server(front, "127.0.0.1", 0)
+        front_port = (front_server.sockets or [])[0].getsockname()[1]
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=5.0),
+                follow_redirects=True,
+            ) as client:
+                observation, _digest = await observe(
+                    WorkerConfig(
+                        credentials=sample_value(),
+                        model_base_url="https://openrouter.ai/api",
+                        factory_min_model_credit_usd=10,
+                    ),
+                    client=client,
+                    environ={"CURIE_OPENROUTER_API_URL": f"http://127.0.0.1:{front_port}/api/v1"},
+                )
+        finally:
+            front_server.close()
+            decoy_server.close()
+            await front_server.wait_closed()
+            await decoy_server.wait_closed()
+        return observation, decoy_hits
+
+    observation, decoy_hits = asyncio.run(go())
+    assert decoy_hits == []
+    assert observation == CreditObservation("unknown", "unreadable")
+    _assert_clean(repr(observation))
 
 
 def test_other_host_makes_no_request_and_is_provider_unsupported() -> None:

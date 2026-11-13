@@ -48,6 +48,7 @@ LOCK_OBJECT_ID = 300
 DEFAULT_OPENROUTER_API = "https://openrouter.ai/api/v1"
 OPENROUTER_API_ENV = "CURIE_OPENROUTER_API_URL"
 OPENROUTER_HOST = "openrouter.ai"
+READ_DEADLINE_SECONDS = 10.0
 _SCHEMA_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 _LOCK = text("SELECT pg_try_advisory_lock(CAST(:classid AS integer), CAST(:objid AS integer))")
@@ -194,7 +195,11 @@ def _json(response: httpx.Response) -> object | None:
 
 async def _get(client: httpx.AsyncClient, url: str, key: str) -> httpx.Response | None:
     try:
-        return await client.get(url, headers={"Authorization": f"Bearer {key}"})
+        return await client.get(
+            url,
+            headers={"Authorization": f"Bearer {key}"},
+            follow_redirects=False,
+        )
     except httpx.HTTPError:
         return None
 
@@ -232,23 +237,31 @@ async def read_openrouter(
     api_url: str,
     client: httpx.AsyncClient,
 ) -> CreditObservation:
-    """GET ``/key`` and, unless that answer is 401, GET ``/credits``."""
+    """GET ``/key`` and, unless that answer is 401, GET ``/credits``.
 
-    key_response = await _get(client, f"{api_url}/key", key)
-    key_code = None if key_response is None else key_response.status_code
-    key_body = None if key_response is None else _json(key_response)
-    if key_code == 401:
-        return CreditObservation("unknown", "credential_rejected")
-    credits_response = await _get(client, f"{api_url}/credits", key)
-    credits_code = None if credits_response is None else credits_response.status_code
-    credits_body = None if credits_response is None else _json(credits_response)
-    return _classify(
-        minimum=minimum,
-        key_code=key_code,
-        key_body=key_body,
-        credits_code=credits_code,
-        credits_body=credits_body,
-    )
+    One wall-clock deadline covers both requests and their body reads. Past
+    it, the result is unknown. A partial body is not compared.
+    """
+
+    try:
+        async with asyncio.timeout(READ_DEADLINE_SECONDS):
+            key_response = await _get(client, f"{api_url}/key", key)
+            key_code = None if key_response is None else key_response.status_code
+            key_body = None if key_response is None else _json(key_response)
+            if key_code == 401:
+                return CreditObservation("unknown", "credential_rejected")
+            credits_response = await _get(client, f"{api_url}/credits", key)
+            credits_code = None if credits_response is None else credits_response.status_code
+            credits_body = None if credits_response is None else _json(credits_response)
+            return _classify(
+                minimum=minimum,
+                key_code=key_code,
+                key_body=key_body,
+                credits_code=credits_code,
+                credits_body=credits_body,
+            )
+    except TimeoutError:
+        return CreditObservation("unknown", "unreadable")
 
 
 async def observe(
@@ -318,7 +331,7 @@ class FactoryCreditLoop:
         stop = stop or asyncio.Event()
         owns_client = self._client is None
         if owns_client:
-            self._client = httpx.AsyncClient(timeout=_TIMEOUT)
+            self._client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False)
         logger.info("factory credit loop started interval=%ss", self._interval)
         try:
             while not stop.is_set():
@@ -346,7 +359,7 @@ class FactoryCreditLoop:
         if self._client is not None:
             await self._locked_tick(self._client)
             return
-        client = httpx.AsyncClient(timeout=_TIMEOUT)
+        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False)
         try:
             await self._locked_tick(client)
         finally:
