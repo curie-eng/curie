@@ -1746,6 +1746,17 @@ channelGateway:
   apiToken: null
   workerToken: null
   groupCacheTtlSeconds: 60
+  # Optional Slack user email lookup for an external HTTP identity provider, so
+  # the provider can map Slack senders to directory accounts without its own
+  # Slack token. existingSecret names an operator-supplied Secret whose tokenKey
+  # holds the identity caller credential; give the provider the same value as
+  # CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN. Empty (the default) leaves the lookup
+  # off. timeoutSeconds bounds each Slack users.info call. Restart the gateway
+  # after rotating the Secret.
+  identityLookup:
+    existingSecret: ""
+    tokenKey: token
+    timeoutSeconds: 5
   readinessProbe:
     initialDelaySeconds: 1
     periodSeconds: 5

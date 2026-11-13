@@ -478,3 +478,19 @@ def test_existing_branch_lookups_still_resolve_main_and_pushed_branches(
         {"ref": "refs/heads/factory/probe", "object": {"sha": pushed_sha, "type": "commit"}}
     ]
     assert stub.unknown_requests == []
+
+
+def test_label_actor_user_app_provenance_on_issue_events(stub: Any, github: httpx.Client) -> None:
+    # User tokens act for a person, independently of issue-event App provenance:
+    # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-on-behalf-of-a-user
+    # https://docs.github.com/en/rest/issues/events#list-issue-events
+    # Observed on #5510 (event 35610976470) and #4485 on 2026-11-12.
+    actor = {"id": 6601, "login": "octocat", "type": "User"}
+    stub._label_event(3815, "factory", "labeled", actor, performed_via_github_app={"id": 52})
+    events = _ok(github.get(f"/repos/{REPO}/issues/3815/events"))
+    assert events[-1]["actor"] == actor
+    assert events[-1]["performed_via_github_app"] == {"id": 52}
+    _ok(github.post(f"/repos/{REPO}/issues/3815/labels", json={"labels": ["fixture-label"]}))
+    events = _ok(github.get(f"/repos/{REPO}/issues/3815/events"))
+    assert events[-1]["actor"]["type"] == "Bot"
+    assert events[-1]["performed_via_github_app"] == {"id": 51}

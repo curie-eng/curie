@@ -160,12 +160,22 @@ def parse_factory_event(
     if "pull_request" in issue:
         raise FactoryRefused("pull_request_issue")
     issue_number = positive_identifier(issue.get("number"), "invalid_issue", 2**31 - 1)
-    sender = payload_object(data.get("sender"), "non_human_sender")
     action = data.get("action")
 
     if event == "issues":
-        _reject_app(sender, None)
-        sender_id, sender_login = human_sender(sender)
+        label = data.get("label")
+        label_name = label.get("name") if isinstance(label, dict) else None
+        canonical_admission = (
+            action == "labeled"
+            and isinstance(label_name, str)
+            and not label_name.startswith(BASE_LABEL_PREFIX)
+            and label_name in labels
+        )
+        sender_id, sender_login = 0, ""
+        if not canonical_admission:
+            sender = payload_object(data.get("sender"), "non_human_sender")
+            _reject_app(sender, None)
+            sender_id, sender_login = human_sender(sender)
         if action in {"labeled", "unlabeled"}:
             label_obj = payload_object(data.get("label"), "invalid_label")
             name = label_obj.get("name")
@@ -214,6 +224,7 @@ def parse_factory_event(
         raise FactoryRefused("unsupported_event")
     if action != "created":
         raise FactoryRefused("unsupported_action")
+    sender = payload_object(data.get("sender"), "non_human_sender")
     comment = payload_object(data.get("comment"), "invalid_comment")
     _reject_app(sender, comment)
     comment_user = payload_object(comment.get("user"), "non_human_sender")

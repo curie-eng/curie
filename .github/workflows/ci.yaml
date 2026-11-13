@@ -146,7 +146,7 @@ jobs:
   ci-policy:
     name: CI policy (workflow meta-tests)
     needs: [changes]
-    if: ${{ needs.changes.outputs.ci_policy == 'true' }}
+    if: ${{ needs.changes.outputs.ci_policy == 'true' && needs.changes.outputs.deep == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -197,15 +197,20 @@ jobs:
   # the full stack. Container fixtures run in `python-container-fixtures`, the
   # kind dry run regression in `python-dry-run-fixture`, static gates in
   # `python-static`, and workflow meta-tests in `ci-policy`. The required
-  # Python job below aggregates all of them.
+  # Python job below aggregates all of them. The four broad jobs run on a
+  # pull request only when `deep` is true (the merge queue, or the `ci:deep`
+  # label). An unlabeled pull request skips them and the aggregate names each
+  # selected one as deferred. `python-static` stays on every event.
   python-pytest:
     name: Python pytest (shard ${{ matrix.shard }}/6)
-    # Job-level gate (#3858): an unselected run (docs-only or version-only)
-    # skips the shards instead of booting six runners that only record a
-    # skip. The required `python` job below still reports, and its aggregate
-    # step accepts the skipped shard job only when it too selected no pytest.
+    # Job-level gate (#3858, #5574): an unselected run (docs-only or
+    # version-only) skips the shards instead of booting six runners that only
+    # record a skip, and so does an unlabeled pull request, which defers the
+    # suite to the merge queue. The required `python` job below still reports.
+    # Its aggregate accepts the skipped shard job when pytest was not selected,
+    # and when an unlabeled pull request deferred a selected run.
     needs: [changes]
-    if: ${{ needs.changes.outputs.pytest == 'true' }}
+    if: ${{ needs.changes.outputs.pytest == 'true' && needs.changes.outputs.deep == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -508,7 +513,7 @@ jobs:
   python-container-fixtures:
     name: Python container fixtures (pytest)
     needs: [changes]
-    if: ${{ needs.changes.outputs.pytest == 'true' }}
+    if: ${{ needs.changes.outputs.pytest == 'true' && needs.changes.outputs.deep == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -629,6 +634,7 @@ jobs:
     needs: [changes]
     if: >-
       ${{ needs.changes.outputs.pytest == 'true' &&
+          needs.changes.outputs.deep == 'true' &&
           !contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',tools/factory-e2e/tests/test_c4_dry_run.py,') }}
     runs-on: ubuntu-24.04
     permissions:
@@ -885,7 +891,7 @@ jobs:
           fi
           echo "Python static gates passed"
       - name: Download shard results
-        if: needs.changes.outputs.pytest == 'true'
+        if: needs.changes.outputs.pytest == 'true' && needs.changes.outputs.deep == 'true'
         uses: actions/download-artifact@v8
         with:
           pattern: python-pytest-shard-*
@@ -914,18 +920,103 @@ jobs:
           CONTAINER_RESULT: ${{ needs.python-container-fixtures.result }}
           CI_POLICY_SELECTED: ${{ needs.changes.outputs.ci_policy }}
           CI_POLICY_RESULT: ${{ needs.ci-policy.result }}
+          CI_POLICY_FILES: ${{ needs.changes.outputs.ci_policy_files }}
           CONTAINER_SELECTED: ${{ needs.changes.outputs.pytest == 'true' }}
           DRY_RUN_RESULT: ${{ needs.python-dry-run-fixture.result }}
           DRY_RUN_SELECTED: >-
             ${{ needs.changes.outputs.pytest == 'true' &&
                 !contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',tools/factory-e2e/tests/test_c4_dry_run.py,') }}
+          EVENT_NAME: ${{ github.event_name }}
+          DEEP: ${{ needs.changes.outputs.deep }}
           SHARD_COUNT: "6"
           SHARD_RESULTS_DIR: shard-results
         run: |
           set -euo pipefail
+          # `deep` is true in the merge queue, on a push, on a dispatch, and on
+          # a pull request labeled ci:deep. An unlabeled pull request defers the
+          # four broad jobs. Anything else is a broken selection and fails.
+          # `if`, not `case`: a repeated `*)` arm in this `run:` body is a
+          # hand-rolled retry to the CI policy gate.
+          if [[ "$DEEP" != "true" && "$DEEP" != "false" ]]; then
+            echo "Python deep selection must be true or false, got ${DEEP:-<empty>}" >&2
+            exit 1
+          fi
+          # Read once. The unlabeled path and the unselected path both refuse a
+          # stray record, and a second identical `find` is the same retry shape.
+          shard_record_present=false
+          if [[ -d "$SHARD_RESULTS_DIR" ]] && [[ -n "$(find "$SHARD_RESULTS_DIR" -type f -print -quit)" ]]; then
+            shard_record_present=true
+          fi
+          if [[ "$EVENT_NAME" != "pull_request" && "$DEEP" != "true" ]]; then
+            echo "Python deep tiers must run on ${EVENT_NAME:-<empty>}" >&2
+            exit 1
+          fi
+          # Once, ahead of both paths. A second copy is the same command twice
+          # to the CI policy gate, which does not follow the branch.
           if [[ "$CHANGES_RESULT" != "success" ]]; then
             echo "the changes job finished $CHANGES_RESULT; pytest selection cannot be trusted" >&2
             exit 1
+          fi
+          if [[ "$PYTEST_SELECTED" != "true" && "$PYTEST_SELECTED" != "false" ]]; then
+            echo "pytest selection must be true or false, got ${PYTEST_SELECTED:-<empty>}" >&2
+            exit 1
+          fi
+          if [[ "$DEEP" == "false" ]]; then
+            if [[ "$CI_POLICY_SELECTED" != "true" && "$CI_POLICY_SELECTED" != "false" ]]; then
+              echo "CI policy selection must be true or false, got ${CI_POLICY_SELECTED:-<empty>}" >&2
+              exit 1
+            fi
+            if [[ "$CONTAINER_SELECTED" != "true" && "$CONTAINER_SELECTED" != "false" ]]; then
+              echo "container selection must be true or false, got ${CONTAINER_SELECTED:-<empty>}" >&2
+              exit 1
+            fi
+            if [[ "$DRY_RUN_SELECTED" != "true" && "$DRY_RUN_SELECTED" != "false" ]]; then
+              echo "dry run selection must be true or false, got ${DRY_RUN_SELECTED:-<empty>}" >&2
+              exit 1
+            fi
+            if [[ "$PYTEST_SCOPE" != "full" && "$PYTEST_SCOPE" != "cli" && "$PYTEST_SCOPE" != "impact" ]]; then
+              echo "pytest scope must be full, cli or impact, got ${PYTEST_SCOPE:-<empty>}" >&2
+              exit 1
+            fi
+            if [[ "$SHARDS_RESULT" != "skipped" ]]; then
+              echo "Python pytest finished ${SHARDS_RESULT:-<empty>}, and an unlabeled pull request defers it" >&2
+              exit 1
+            fi
+            if [[ "$CONTAINER_RESULT" != "skipped" ]]; then
+              echo "Python container fixtures finished ${CONTAINER_RESULT:-<empty>}, and an unlabeled pull request defers them" >&2
+              exit 1
+            fi
+            if [[ "$DRY_RUN_RESULT" != "skipped" ]]; then
+              echo "Python dry run fixture finished ${DRY_RUN_RESULT:-<empty>}, and an unlabeled pull request defers it" >&2
+              exit 1
+            fi
+            if [[ "$CI_POLICY_RESULT" != "skipped" ]]; then
+              echo "CI policy finished ${CI_POLICY_RESULT:-<empty>}, and an unlabeled pull request defers it" >&2
+              exit 1
+            fi
+            if [[ "$shard_record_present" == "true" ]]; then
+              echo "an unlabeled pull request deferred pytest, but a shard recorded a result" >&2
+              exit 1
+            fi
+            defer() {
+              echo "$1"
+              if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+                echo "$1" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            }
+            if [[ "$PYTEST_SELECTED" == "true" ]]; then
+              defer "Deferred to the merge queue: Python pytest (shard n/6)"
+            fi
+            if [[ "$CONTAINER_SELECTED" == "true" ]]; then
+              defer "Deferred to the merge queue: Python container fixtures (pytest)"
+            fi
+            if [[ "$DRY_RUN_SELECTED" == "true" ]]; then
+              defer "Deferred to the merge queue: Python dry run fixture (pytest)"
+            fi
+            if [[ "$CI_POLICY_SELECTED" == "true" ]]; then
+              defer "Deferred to the merge queue: CI policy (workflow meta-tests): ${CI_POLICY_FILES}"
+            fi
+            exit 0
           fi
           if [[ "$CI_POLICY_SELECTED" == "true" ]]; then
             ci_policy_expected=success
@@ -937,10 +1028,6 @@ jobs:
           fi
           if [[ "$CI_POLICY_RESULT" != "$ci_policy_expected" ]]; then
             echo "CI policy finished ${CI_POLICY_RESULT:-<empty>}; expected $ci_policy_expected" >&2
-            exit 1
-          fi
-          if [[ "$PYTEST_SELECTED" != "true" && "$PYTEST_SELECTED" != "false" ]]; then
-            echo "pytest selection must be true or false, got ${PYTEST_SELECTED:-<empty>}" >&2
             exit 1
           fi
           case "$PYTEST_SCOPE" in
@@ -971,8 +1058,7 @@ jobs:
               echo "pytest was not selected, but the shards finished $SHARDS_RESULT" >&2
               exit 1
             fi
-            if [[ -d "$SHARD_RESULTS_DIR" ]] \
-              && [[ -n "$(find "$SHARD_RESULTS_DIR" -type f -print -quit)" ]]; then
+            if [[ "$shard_record_present" == "true" ]]; then
               echo "pytest was not selected, but a shard reported a result" >&2
               exit 1
             fi
@@ -3069,9 +3155,11 @@ jobs:
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      # Deep tiers (kind clusters, upgrades, convergence) run before merge in
-      # the merge queue. A pull request runs them only with the ci:deep label;
-      # the label is read from the event, so it takes effect on the next push.
+      # Deep tiers (Python pytest shards, container and dry run fixtures, CI
+      # policy tests, kind clusters, upgrades, convergence) run before merge in
+      # the merge queue. A pull request runs them only with the ci:deep label.
+      # The label is read from the event, so it takes effect on the next push
+      # or when the pull request is closed and reopened.
       - id: deep
         env:
           EVENT_NAME: ${{ github.event_name }}

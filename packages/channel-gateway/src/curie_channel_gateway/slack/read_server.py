@@ -21,6 +21,7 @@ from .reads import SlackChannelReader
 from .senders import SlackSenderIdentities
 from .slack_sink import SlackReplyAdapter
 from .tokens import SlackProviderConfig, slack_bot_tokens
+from .user_emails import SlackUserEmails
 
 
 class GatewayConfig(BaseSettings):
@@ -30,6 +31,14 @@ class GatewayConfig(BaseSettings):
     )
     worker_token: str = Field(
         default="", validation_alias="CURIE_CHANNEL_GATEWAY_WORKER_TOKEN", repr=False
+    )
+    # Optional third caller: an external HTTP identity provider that may only
+    # ask which email belongs to a Slack user (@spec GATEWAY-USER-EMAIL-1).
+    identity_token: str = Field(
+        default="", validation_alias="CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN", repr=False
+    )
+    user_email_timeout_s: float = Field(
+        default=5.0, gt=0, validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S"
     )
     host: str = Field(default="0.0.0.0", validation_alias="CURIE_CHANNEL_GATEWAY_HOST")
     port: int = Field(default=8081, validation_alias="CURIE_CHANNEL_GATEWAY_PORT")
@@ -50,6 +59,14 @@ class GatewayConfig(BaseSettings):
     slack_trusted_origins: str = Field(default="", validation_alias="CURIE_SLACK_TRUSTED_ORIGINS")
 
 
+def gateway_callers(config: GatewayConfig) -> dict[str, str]:
+    """The caller credentials; the identity caller exists only when configured."""
+    callers = {"api": config.api_token, "worker": config.worker_token}
+    if config.identity_token:
+        callers["identity"] = config.identity_token
+    return callers
+
+
 async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.Application:
     tokens = slack_bot_tokens(slack)
     http = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
@@ -63,12 +80,14 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
     )
     try:
         app = gateway_application(
-            tokens={"api": config.api_token, "worker": config.worker_token},
+            tokens=gateway_callers(config),
             replay=RequestReplayStore(config.replay_db),
             max_file_bytes=config.max_file_bytes,
             groups={
                 name: SlackUserGroupClient(
-                    http, token=token, ttl_s=config.group_cache_ttl_s,
+                    http,
+                    token=token,
+                    ttl_s=config.group_cache_ttl_s,
                     base_url=config.slack_api_base_url or "https://slack.com/api/",
                 )
                 for name, token in tokens.items()
@@ -79,6 +98,12 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
                 channel=SlackChannelReader(http, tokens),
                 canvas=SlackCanvasReader(http, tokens),
                 senders=SlackSenderIdentities(tokens, base_url=config.slack_api_base_url or None),
+                emails=SlackUserEmails(
+                    http,
+                    tokens,
+                    base_url=config.slack_api_base_url or None,
+                    timeout_s=config.user_email_timeout_s,
+                ),
             ),
             reply=sink,
             reply_state=ReplyDeliveryStore(Path(config.replay_db)),

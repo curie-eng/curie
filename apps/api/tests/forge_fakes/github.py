@@ -40,6 +40,26 @@ SENDER = "octocat"
 LABEL = "factory"
 MENTION = "curie"
 
+LABEL_ACTOR_PERMISSIONS = ["write", "maintain", "admin", "read", "triage", "none"]
+LABEL_ACTOR_REFUSALS = [
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, {"id": 51}, "actor_own_app"),
+    ({"id": 42, "login": "fixture[bot]", "type": "Bot"}, None, "actor_bot"),
+    ({"id": 42, "login": "fixture[bot]", "type": "Bot"}, {"id": 52}, "actor_bot"),
+    ({"id": 42, "login": "ghost", "type": "User"}, None, "actor_unverifiable"),
+    (None, None, "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, "invalid", "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, [], "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, {}, "actor_unverifiable"),
+    ({"login": "fixture[bot]", "type": "Bot"}, None, "actor_unverifiable"),
+    ({"id": 42, "login": "ghost", "type": "Bot"}, None, "actor_unverifiable"),
+    ({"id": True, "login": SENDER, "type": "User"}, None, "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": "", "type": "User"}, None, "actor_unverifiable"),
+]
+
+LABEL_ACTOR_REFUSAL_IDS = [
+    f"label_{reason}-{index}" for index, (_, _, reason) in enumerate(LABEL_ACTOR_REFUSALS)
+]
+
 BASE_SHA = "0" * 39 + "1"
 
 # The factory's GitHub App. A placeholder, never a real key: tests that mint
@@ -252,6 +272,10 @@ class GitHubAPI:
         self.permission = "write"
         self.permission_requests: list[httpx.Request] = []
         self.permission_user_id = SENDER_ID
+        self.label_actor: Any = {"id": SENDER_ID, "login": SENDER, "type": "User"}
+        self.label_app: Any = None
+        self.permission_status = 200
+        self.role_name = "write"
         self.comment_body: str | None = None
         self.comment_app: dict[str, Any] | None = None
         self.repository_id = REPO_ID
@@ -331,7 +355,8 @@ class GitHubAPI:
                         "id": event_id,
                         "event": "labeled",
                         "label": {"name": LABEL},
-                        "actor": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+                        "actor": self.label_actor,
+                        "performed_via_github_app": self.label_app,
                         "created_at": "2026-09-01T00:00:00Z",
                     }
                 ],
@@ -349,9 +374,10 @@ class GitHubAPI:
         if path == f"/repos/{REPO}/collaborators/{SENDER}/permission":
             self.permission_requests.append(request)
             return httpx.Response(
-                200,
+                self.permission_status,
                 json={
                     "permission": self.permission,
+                    "role_name": self.role_name,
                     "user": {"id": self.permission_user_id, "login": SENDER},
                 },
             )
@@ -696,7 +722,15 @@ class GitHubRepositoryFake:
             "html_url": f"https://github.com/{REPO}/pull/{number}",
         }
 
-    def label_event(self, number: int, kind: str, label: str, actor: dict[str, Any]) -> None:
+    def label_event(
+        self,
+        number: int,
+        kind: str,
+        label: str,
+        actor: dict[str, Any],
+        *,
+        performed_via_github_app: dict[str, Any] | None = None,
+    ) -> None:
         names = [entry["name"] for entry in self.issues[number]["labels"]]
         if kind == "labeled" and label not in names:
             names.append(label)
@@ -709,7 +743,7 @@ class GitHubRepositoryFake:
                 "event": kind,
                 "label": {"name": label},
                 "actor": actor,
-                "performed_via_github_app": None,
+                "performed_via_github_app": performed_via_github_app,
                 "issue": {"number": number},
                 "created_at": "2026-09-01T00:00:00Z",
             }

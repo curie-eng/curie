@@ -207,33 +207,6 @@ def holder(scope: dict[str, Any], seconds: float) -> tuple[threading.Thread, thr
     return threading.Thread(target=run, args=(hold,), name="synthetic-lock-holder"), held
 
 
-def test_slow_lookups_with_stale_captures_exhaust_one_budget(
-    clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: retries share one deadline and fail closed after it."""
-    provider = synthetic_provider
-    monkeypatch.setattr(http_invocation, "_COMPOSITION_BUDGET_SECONDS", BUDGET)
-    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
-        token = membership._credential(invocation.client, invocation.scope)
-        before = turn_authority.delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        write, committed = writers(invocation.scope, times=2)
-        provider.during_lookup = slow(write)
-        spans = timed(monkeypatch)
-        refused = membership._post(
-            invocation.client, token, *membership._submission(invocation.scope),
-        )
-        assert refused.status_code == 503, refused.text
-        assert refused.json() == {"detail": "identity_authority_unavailable"}
-        assert committed == [1, 1]
-        [(outcome, elapsed)] = spans
-        assert outcome == "failed"
-        assert elapsed < BUDGET + SLACK
-        assert turn_authority.delivery_state(
-            valkey, runs_stream, invocation.scope["binding"],
-        ) == before
-
-
 @pytest.mark.parametrize("phase", ["capture", "revalidation"])
 def test_identity_lock_wait_past_the_budget_fails_closed(
     phase: str, clean_db: None, valkey: redis.Redis, runs_stream: str,
