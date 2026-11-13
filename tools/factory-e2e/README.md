@@ -879,9 +879,13 @@ The judge has eight criteria, each computed from recorded observations only.
 `budget` checks the approved ceiling, the reservations and the grant probe, and
 passes on `budget.ceiling_enforced`: every session's charge (observed, or its
 full reservation share when unknown) stays inside its bounds, no bound was
-breached, the watchdog's recorded checks (`budget.guard_checks`) cover every
-response the transcripts hold, and the item's earlier charge plus this
-attempt's stays at or under the recorded item cap. Whether usage is exact is
+breached, and the watchdog's recorded checks (`budget.guard_checks`) cover every
+response. An assistant record that carries usage is a response whether or not it
+has an id; an id-less one keeps a stable key and is never dropped. A check of an
+empty harvest does not count. A session with any recorded turn, or one whose
+slot was reserved and launched, needs at least one response, every response
+checked, and a guard check after its first response. The item's earlier charge
+plus this attempt's stays at or under the recorded item cap. Whether usage is exact is
 reported as the `budget.usage_exact` observation with the capture rule's
 failure codes, never as a pass condition (coordinator ruling of 2026-11-13).
 `cleanup` checks that every owned resource is gone and no held secret reached a

@@ -3034,14 +3034,120 @@ def _judge_budget(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     }
 
 
+def guard_coverage(
+    reservations: Sequence[Reservation],
+    sessions: Sequence[Any] | None,
+    seen: Iterable[str],
+    *,
+    checks: int,
+) -> dict[str, Any]:
+    """The recorded per-response guard: one row per launched session. Pure.
+
+    A session in the harvest was launched. A reservation it did not match was
+    not started and is omitted, so an unused slot is not a missing response.
+    ``guard_after_first`` is true only when that session has a response, every
+    one of its response keys was seen, and at least one check ran.
+    """
+
+    covered_ids = frozenset(seen)
+    pending = {role: [item for item in reservations if item.role == role] for role in ROLES}
+    rows: list[dict[str, Any]] = []
+    ordered = sorted(sessions or (), key=lambda item: (item.first is None, item.first or 0.0))
+    for session in ordered:
+        queue = pending.get(session.role) or []
+        slot = queue.pop(0) if queue else None
+        keys = frozenset(session.message_ids)
+        responses = len(keys)
+        checked = len(keys & covered_ids)
+        row: dict[str, Any] = {
+            "role": session.role,
+            "turns": int(session.assistant_turns),
+            "launched": True,
+            "responses": responses,
+            "responses_checked": checked,
+            "guard_after_first": responses >= 1 and checked == responses and checks >= 1,
+        }
+        if slot is not None:
+            row["seq"] = slot.seq
+        rows.append(row)
+    return {
+        "checks": checks,
+        "responses": sum(int(row["responses"]) for row in rows),
+        "responses_checked": sum(int(row["responses_checked"]) for row in rows),
+        "sessions": rows,
+    }
+
+
+def _guard_record_failures(guard: Any) -> list[str]:
+    """Why ``budget.guard_checks`` does not show every launched response guarded."""
+
+    if not isinstance(guard, dict):
+        return ["guard_events"]
+    checks = guard.get("checks")
+    responses = guard.get("responses")
+    covered = guard.get("responses_checked")
+    sessions = guard.get("sessions")
+    if type(checks) is not int or type(responses) is not int or type(covered) is not int:
+        return ["guard_events"]
+    if not isinstance(sessions, list):
+        return ["guard_sessions"]
+    failures: list[str] = []
+    total_responses = 0
+    total_checked = 0
+    needs_check = False
+    for row in sessions:
+        if not isinstance(row, dict):
+            failures.append("guard_sessions")
+            continue
+        row_responses = row.get("responses")
+        row_checked = row.get("responses_checked")
+        turns = row.get("turns")
+        launched = row.get("launched")
+        after = row.get("guard_after_first")
+        if (
+            type(row_responses) is not int
+            or type(row_checked) is not int
+            or type(turns) is not int
+            or type(launched) is not bool
+            or type(after) is not bool
+            or row_responses < 0
+            or row_checked < 0
+            or turns < 0
+            or ("seq" in row and type(row.get("seq")) is not int)
+        ):
+            failures.append("guard_sessions")
+            continue
+        total_responses += row_responses
+        total_checked += row_checked
+        if not (launched or turns > 0):
+            continue
+        if row_responses < 1:
+            failures.append("responses_absent")
+        elif row_checked != row_responses:
+            failures.append("guard_missed_response")
+        elif after is not True:
+            failures.append("no_guard_after_response")
+        if row_responses >= 1:
+            needs_check = True
+    if total_responses != responses or total_checked != covered:
+        failures.append("guard_sessions")
+    if covered != responses:
+        failures.append("guard_missed_response")
+    if needs_check and checks < 1:
+        failures.append("no_guard_after_response")
+    return list(dict.fromkeys(failures))
+
+
 def ceiling_enforcement_failures(ledger: Ledger) -> list[str]:
     """Why the recorded ledger does not show the approved ceiling enforced; empty when it
     does. Reads only recorded observations and session rows.
 
     Every session's charge, observed or its full reservation share when unknown, stays
-    inside its bounds and the attempt's; no bound was breached; the per-response guard ran
-    (the watchdog's recorded checks cover every response the transcripts hold); and the
-    item's earlier charge plus this attempt's stays at or under the recorded item cap.
+    inside its bounds and the attempt's; no bound was breached; every assistant record
+    that carries usage is a response, id or not, and a launched session or one with a
+    recorded turn has at least one response, every response checked, and a guard check
+    after its first response. A check of an empty harvest does not count. The item's
+    earlier charge plus this attempt's stays at or under the recorded item cap.
     """
 
     observed = ledger.observations("budget")
@@ -3054,18 +3160,7 @@ def ceiling_enforcement_failures(ledger: Ledger) -> list[str]:
         failures.extend(f"bound:{item}" for item in budget_findings(rows, ceiling))
     if observed.get("allowance_breach") != []:
         failures.append("bound_breached")
-    guard = observed.get("guard_checks")
-    checks = guard.get("checks") if isinstance(guard, dict) else None
-    responses = guard.get("responses") if isinstance(guard, dict) else None
-    covered = guard.get("responses_checked") if isinstance(guard, dict) else None
-    if not (
-        type(checks) is int
-        and checks >= 1
-        and type(responses) is int
-        and type(covered) is int
-        and covered == responses
-    ):
-        failures.append("guard_events")
+    failures.extend(_guard_record_failures(observed.get("guard_checks")))
     item = observed.get("item_ledger")
     cap = item.get("cap") if isinstance(item, dict) else None
     before = item.get("charged_before") if isinstance(item, dict) else None

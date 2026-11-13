@@ -1695,12 +1695,13 @@ def test_watchdog_fences_paid_starts_at_the_first_reached_bound(tmp_path: Path) 
     capture = ledger.observations("budget")["capture"]
     assert capture["affirmed"] is False and "no_turn_end" in capture["failures"]
     assert ledger.budget_state() == "unknown"
-    # Both watchdog checks ran, and between them they saw every response.
-    assert ledger.observations("budget")["guard_checks"] == {
-        "checks": 2,
-        "responses": 32,
-        "responses_checked": 32,
-    }
+    # Both non-empty watchdog checks ran, and between them they saw every response.
+    guard = ledger.observations("budget")["guard_checks"]
+    assert (guard["checks"], guard["responses"], guard["responses_checked"]) == (2, 32, 32)
+    assert [row["role"] for row in guard["sessions"]] == [sks.IMPLEMENTER]
+    assert guard["sessions"][0]["turns"] == 32 and guard["sessions"][0]["launched"] is True
+    assert guard["sessions"][0]["responses_checked"] == 32
+    assert guard["sessions"][0]["guard_after_first"] is True
     assert ledger.observations("grant")["role_models"] == {sks.IMPLEMENTER: [IMPLEMENTER_MODEL]}
     with pytest.raises(sks.Refusal) as refused:
         ledger.reserve([sks.IMPLEMENTER], now=T0 + 900)
@@ -2892,6 +2893,9 @@ def test_settlement_takes_native_usage_only_once_capture_is_affirmed(
         pod.eof.set()
         monkeypatch.setattr(run, "requests_terminal", lambda: True)
         monkeypatch.setattr(run, "pods_gone", lambda: {"uid-1": True})
+        # Settlement charges native usage only for responses the guard has seen.
+        live.clock.at = T0 + 190
+        run.tick()
         run.settle()
         rows = ledger.sessions()
         assert [row["source"] for row in rows] == sources
@@ -2973,9 +2977,251 @@ def test_capture_findings_name_the_file_and_field_and_the_skeleton_keeps_no_cont
     assert not any(word in text for word in ("working", "review done", "work the issue"))
 
 
+def _noid(model: str, tokens: int, at: float, *, stop: str | None = None) -> dict[str, Any]:
+    """An assistant record that carries usage and has no message id."""
+
+    record = _assistant("placeholder", model, tokens, at)
+    del record["message"]["id"]
+    if stop is not None:
+        record["message"]["stop_reason"] = stop
+    return record
+
+
+def _budgeted(tmp_path: Path) -> Live:
+    """A live attempt with the budget observations the judge reads, and one runner pod."""
+
+    live = _live_run(tmp_path)
+    ledger, run = live.ledger, live.run
+    now = time.time()
+    ledger.record_item_ledger(32768, 8607, ledger.ceiling())
+    ledger.record("budget", "allowance_breach", [])
+    ledger.record("budget", "tool_search_calls", 0)
+    ledger.record("grant_probe", "started", {"at": now, "model": sks.GRANT_PROBE_MODEL})
+    ledger.record("grant_probe", "model", sks.GRANT_PROBE_MODEL)
+    ledger.record("grant_probe", "output_cap", sks.GRANT_PROBE_OUTPUT_CAP)
+    ledger.record("grant_probe", "turn_cap", sks.GRANT_PROBE_TURNS)
+    ledger.record(
+        "grant_probe",
+        "result",
+        {"ok": True, "turns": 1, "output_tokens": 4, "models": [sks.GRANT_PROBE_MODEL]},
+    )
+    ledger.begin_live(now=now, grant_expires_at=now + 3 * 3600)
+    run.reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=time.time() + 1)
+    run.attempt_live, run.attempt_started = True, T0
+    pod = _runner_pod(run, "uid-1")
+    run.pods[pod.uid] = pod
+    return live
+
+
+def _feed_transcripts(pod: psk.RunnerPod, files: Mapping[str, bytes]) -> None:
+    _feed(pod, {"kind": "process", "count": 1, "processes": []})
+    for name, data in files.items():
+        if name.endswith(".meta.json"):
+            _feed(pod, {"kind": "meta", "path": name, "data": base64.b64encode(data).decode()})
+        else:
+            _feed(pod, _file_record(name, 0, data))
+
+
+def _affirm_capture(
+    run: psk.LiveRun,
+    pod: psk.RunnerPod,
+    files: Mapping[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reports = _capture_trace(files)
+    pod.trace.turns = reports.turns
+    for at, sizes in reports.reports:
+        _feed(pod, {"kind": "sync", "sizes": sizes, "at": at})
+    pod.eof.set()
+    monkeypatch.setattr(run, "requests_terminal", lambda: True)
+    monkeypatch.setattr(run, "pods_gone", lambda: {pod.uid: True})
+
+
+def test_an_idless_usage_record_is_a_response_the_guard_must_see(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behavior: an assistant record with usage and no id keeps a stable key, counts in the
+    token total, and the ceiling passes once the guard has seen that key. A guard that
+    never saw it leaves the session unknown."""
+
+    synthetic = _assistant("msg_synth", "<synthetic>", 0, 0.5)
+    identified = _assistant("msg_real", IMPLEMENTER_MODEL, 40, 1)
+    missing = _noid(IMPLEMENTER_MODEL, 60, 2, stop="end_turn")
+    records = [_user(0), synthetic, identified, missing]
+    files = _pod_files(records)
+    session = sks.attempt_facts([files], not_before=T0 - 30).sessions[0]
+    path = next(name for name in files if name.endswith(".jsonl")).removesuffix(".jsonl")
+    # The synthetic record takes ordinal 0 and the identified record ordinal 1.
+    digest = hashlib.sha256(f"{path}\0{2}".encode()).hexdigest()[:16]
+    assert session.message_ids == {f"noid:{digest}", "msg_real"}
+    assert (session.output_tokens, session.assistant_turns, session.synthetic) == (100, 2, 1)
+    longer = _pod_files([*records, _noid(IMPLEMENTER_MODEL, 10, 3)])
+    again = sks.attempt_facts([longer], not_before=T0 - 30).sessions[0]
+    assert f"noid:{digest}" in again.message_ids and len(again.message_ids) == 3
+
+    live = _budgeted(tmp_path / "seen")
+    run, ledger, pod = live.run, live.ledger, live.run.pods["uid-1"]
+    _feed_transcripts(pod, files)
+    live.clock.at = T0 + 10
+    run.tick()
+    assert run.guard_checks == 1 and session.message_ids <= run.guard_responses
+    _affirm_capture(run, pod, files, monkeypatch)
+    run.settle()
+    guard = ledger.observations("budget")["guard_checks"]
+    assert (guard["checks"], guard["responses"], guard["responses_checked"]) == (1, 2, 2)
+    assert guard["sessions"][0]["turns"] == guard["sessions"][0]["responses"] == 2
+    assert ledger.sessions()[0]["source"] == "native"
+    assert ledger.sessions()[0]["output_tokens"] == 100
+    assert sks.ceiling_enforcement_failures(ledger) == []
+    assert sks.judge(ledger, "budget")["checks"]["budget.ceiling_enforced"] is True
+    ledger.close()
+
+    missed = _budgeted(tmp_path / "missed")
+    run, ledger, pod = missed.run, missed.ledger, missed.run.pods["uid-1"]
+    main = next(name for name in files if name.endswith(".jsonl"))
+    head = _jsonl([_user(0), synthetic, identified])
+    tail = _jsonl([missing])
+    assert files[main] == head + tail
+    _feed(pod, {"kind": "process", "count": 1, "processes": []}, _file_record(main, 0, head))
+    missed.clock.at = T0 + 10
+    run.tick()
+    assert run.guard_checks == 1 and run.guard_responses == {"msg_real"}
+    _feed(pod, _file_record(main, len(head), tail))
+    _affirm_capture(run, pod, files, monkeypatch)
+    run.settle()
+    assert ledger.sessions()[0]["source"] == "unknown"
+    assert ledger.sessions()[0]["output_tokens"] is None
+    assert "guard_missed_response" in sks.ceiling_enforcement_failures(ledger)
+    ledger.close()
+
+
+def test_a_session_whose_responses_are_all_idless_passes_only_when_guarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behavior: a session whose every assistant record lacks an id still has one response
+    per usage record, and the ceiling passes when the guard saw each of those keys."""
+
+    records = [
+        _user(0),
+        _noid(IMPLEMENTER_MODEL, 30, 1),
+        _noid(IMPLEMENTER_MODEL, 70, 2, stop="end_turn"),
+    ]
+    files = _pod_files(records)
+    session = sks.attempt_facts([files], not_before=T0 - 30).sessions[0]
+    assert session.assistant_turns == 2 and len(session.message_ids) == 2
+    assert all(key.startswith("noid:") for key in session.message_ids)
+    live = _budgeted(tmp_path)
+    run, ledger, pod = live.run, live.ledger, live.run.pods["uid-1"]
+    _feed_transcripts(pod, files)
+    live.clock.at = T0 + 10
+    run.tick()
+    assert run.guard_checks == 1 and run.guard_responses == set(session.message_ids)
+    _affirm_capture(run, pod, files, monkeypatch)
+    run.settle()
+    guard = ledger.observations("budget")["guard_checks"]
+    assert (guard["checks"], guard["responses"], guard["responses_checked"]) == (1, 2, 2)
+    assert guard["sessions"][0]["turns"] == 2 and guard["sessions"][0]["guard_after_first"] is True
+    assert ledger.sessions()[0]["source"] == "native"
+    assert ledger.sessions()[0]["output_tokens"] == 100
+    assert sks.ceiling_enforcement_failures(ledger) == []
+    assert sks.judge(ledger, "budget")["checks"]["budget.ceiling_enforced"] is True
+    ledger.close()
+
+
+def test_a_launched_session_with_no_response_is_not_enforced(tmp_path: Path) -> None:
+    """Behavior: a reserved slot whose transcript launched and holds no response fails
+    the ceiling, including when a check was recorded against that empty harvest."""
+
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        files = _pod_files([_user(0)])
+        facts = sks.attempt_facts([files], not_before=T0 - 30)
+        assert facts.sessions[0].message_ids == frozenset()
+        assert facts.sessions[0].assistant_turns == 0
+        reservations = [
+            sks.Reservation(
+                int(row["seq"]),
+                str(row["role"]),
+                int(row["reserved_output"]),
+                int(row["reserved_turns"]),
+                float(row["reserved_seconds"]),
+            )
+            for row in ledger.sessions()
+        ]
+        ledger.record(
+            "budget",
+            "guard_checks",
+            sks.guard_coverage(reservations, facts.sessions, (), checks=1),
+        )
+        result = sks.judge(ledger, "budget")
+        assert result["checks"]["budget.ceiling_enforced"] is False
+        assert "responses_absent" in result["observations"]["budget.ceiling_enforcement_failures"]
+    finally:
+        ledger.close()
+
+
+def test_a_guard_check_on_an_empty_harvest_does_not_count(tmp_path: Path) -> None:
+    """Behavior: watchdog ticks before any response do not count as checks, and a launched
+    session that still has no response fails the ceiling."""
+
+    files = _pod_files([_user(0)])
+    live = _budgeted(tmp_path)
+    run, ledger, pod = live.run, live.ledger, live.run.pods["uid-1"]
+    _feed_transcripts(pod, files)
+    live.clock.at = T0 + 10
+    run.tick()
+    run.tick()
+    assert run.guard_checks == 0
+    run.settle()
+    guard = ledger.observations("budget")["guard_checks"]
+    assert guard["checks"] == 0 and guard["responses"] == 0
+    assert guard["sessions"][0]["launched"] is True and guard["sessions"][0]["responses"] == 0
+    assert sks.ceiling_enforcement_failures(ledger) == ["responses_absent"]
+    ledger.close()
+
+
+def test_ceiling_is_enforced_when_the_watchdog_saw_every_recorded_response(
+    tmp_path: Path,
+) -> None:
+    """Behavior: one non-empty watchdog check over the attempt's transcripts, then
+    settlement, passes the ceiling. Capture is not affirmed, so every slot is charged
+    its full share, and that charge stays inside the recorded item cap."""
+
+    files = _attempt_files()
+    parsed = sks.attempt_facts([files], not_before=T0 - 30)
+    expected = sum(len(session.message_ids) for session in parsed.sessions)
+    live = _budgeted(tmp_path)
+    run, ledger, pod = live.run, live.ledger, live.run.pods["uid-1"]
+    _feed_transcripts(pod, files)
+    live.clock.at = T0 + 130
+    run.tick()
+    assert run.guard_checks == 1
+    run.settle()
+    guard = ledger.observations("budget")["guard_checks"]
+    assert expected >= 1
+    assert (guard["checks"], guard["responses"], guard["responses_checked"]) == (
+        1,
+        expected,
+        expected,
+    )
+    assert all(
+        row["launched"] and row["responses"] >= 1 and row["guard_after_first"]
+        for row in guard["sessions"]
+    )
+    result = sks.judge(ledger, "budget")
+    assert result["verdict"] == "pass", result["checks"]
+    assert result["checks"]["budget.ceiling_enforced"] is True
+    assert result["counts"]["budget.item_charged"] == 8607 + 16384
+    assert result["observations"]["budget.usage_exact"]["exact"] is False
+    assert result["observations"]["budget.usage_exact"]["unknown_slots"] == 5
+    assert result["observations"]["budget.ceiling_enforcement_failures"] == []
+    ledger.close()
+
+
 def _attempt_three_ledger(state: Path) -> sks.Ledger:
-    """Attempt 3's recorded budget shape: every slot unknown and charged its full share, no
-    breach, the watchdog's checks covering all 20 responses, 8,607 charged before."""
+    """Unknown full-share charges, with the guard recorded from the parsed transcripts."""
 
     _passing_ledger(state)
     ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
@@ -2986,37 +3232,9 @@ def _attempt_three_ledger(state: Path) -> sks.Ledger:
             (RUN_ID,),
         )
         db.execute("UPDATE runs SET budget_state='unknown' WHERE run_id=?", (RUN_ID,))
-    ledger.record(
-        "budget", "guard_checks", {"checks": 140, "responses": 20, "responses_checked": 20}
-    )
     codes = ["growth_after_turn_end", "result_frame_missing", "subagent_transcript_missing"]
     ledger.record("budget", "capture", {"affirmed": False, "failures": codes})
     return ledger
-
-
-def test_ceiling_is_enforced_for_attempt_threes_recorded_ledger(tmp_path: Path) -> None:
-    """Behavior: with every slot unknown and charged its full share inside its bounds, no
-    breach, guard checks covering every response and the item under its cap, the budget
-    criterion passes; exact usage is reported as an observation with its failure codes."""
-
-    ledger = _attempt_three_ledger(_private(tmp_path / "state"))
-    try:
-        result = sks.judge(ledger, "budget")
-        assert result["verdict"] == "pass", result["checks"]
-        assert result["checks"]["budget.ceiling_enforced"] is True
-        assert result["counts"]["budget.item_charged"] == 8607 + 16384
-        assert result["observations"]["budget.usage_exact"] == {
-            "exact": False,
-            "unknown_slots": 5,
-            "failure_codes": [
-                "growth_after_turn_end",
-                "result_frame_missing",
-                "subagent_transcript_missing",
-            ],
-        }
-        assert result["observations"]["budget.ceiling_enforcement_failures"] == []
-    finally:
-        ledger.close()
 
 
 def _over_bound(ledger: sks.Ledger) -> None:
@@ -3037,8 +3255,14 @@ def _no_guard_events(ledger: sks.Ledger) -> None:
 
 
 def _guard_missed_a_response(ledger: sks.Ledger) -> None:
+    guard = ledger.observations("budget")["guard_checks"]
+    sessions = [dict(row) for row in guard["sessions"]]
+    sessions[0]["responses_checked"] -= 1
+    sessions[0]["guard_after_first"] = False
     ledger.record(
-        "budget", "guard_checks", {"checks": 140, "responses": 20, "responses_checked": 19}
+        "budget",
+        "guard_checks",
+        {**guard, "responses_checked": guard["responses_checked"] - 1, "sessions": sessions},
     )
 
 
@@ -3048,7 +3272,7 @@ def _guard_missed_a_response(ledger: sks.Ledger) -> None:
         pytest.param(_over_bound, "bound:session_output_tokens", id="full-share-over-bound"),
         pytest.param(_over_cap, "item_cap", id="item-over-cap"),
         pytest.param(_no_guard_events, "guard_events", id="no-guard-events"),
-        pytest.param(_guard_missed_a_response, "guard_events", id="guard-missed-response"),
+        pytest.param(_guard_missed_a_response, "guard_missed_response", id="guard-missed-response"),
     ],
 )
 def test_ceiling_is_not_enforced_when_a_recorded_condition_fails(
@@ -3241,8 +3465,6 @@ def _passing_ledger(state: Path, *, rehearsal: bool = False) -> None:
         ledger.record_item_ledger(32768, 8607, sks.parse_ceiling(MODEL_CEILING))
         ledger.begin_live(now=now, grant_expires_at=now + 3 * 3600)
         ledger.record("budget", "allowance_breach", [])
-        guard = {"checks": 40, "responses": 20, "responses_checked": 20}
-        ledger.record("budget", "guard_checks", guard)
         ledger.record("budget", "tool_search_calls", 0)
         ledger.record("grant_probe", "started", {"at": now, "model": sks.GRANT_PROBE_MODEL})
         ledger.record("grant_probe", "model", sks.GRANT_PROBE_MODEL)
@@ -3253,6 +3475,12 @@ def _passing_ledger(state: Path, *, rehearsal: bool = False) -> None:
         # After every record above, however long they took: the judge orders them by time.
         reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=time.time() + 1)
         facts = sks.attempt_facts([_attempt_files()], not_before=T0 - 30)
+        seen = [key for session in facts.sessions for key in session.message_ids]
+        ledger.record(
+            "budget",
+            "guard_checks",
+            sks.guard_coverage(reservations, facts.sessions, seen, checks=1),
+        )
         sks.settle_attempt(ledger, reservations, facts.sessions, complete=True)
         request_id = str(sks.kickoff_request_id(sks.DEFAULT_IDENTITY, DELIVERY))
         run_observations: dict[tuple[str, str], Any] = {

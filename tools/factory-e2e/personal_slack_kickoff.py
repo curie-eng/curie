@@ -3018,9 +3018,12 @@ class LiveRun:
                 now=self.clock.now(),
                 running=self.native_running(),
             )
-            self.guard_checks += 1
-            for session in facts.sessions:
-                self.guard_responses.update(session.message_ids)
+            # An empty harvest is not a check: a tick before the first response
+            # must not let a later settlement claim the guard ran.
+            response_ids = {key for session in facts.sessions for key in session.message_ids}
+            if response_ids:
+                self.guard_checks += 1
+                self.guard_responses.update(response_ids)
         window = sum(item.seconds for item in self.reservations)
         if self.clock.now() - self.attempt_started > window + STARTUP_SECONDS:
             breaches.append("seconds:attempt")
@@ -3534,6 +3537,10 @@ class LiveRun:
         self.ledger.record("grant", "transcript_skeleton", skeleton)
         complete = not failures
         sessions = facts.sessions if facts is not None else None
+        if sessions is not None:
+            for session in sessions:
+                if any(key not in self.guard_responses for key in session.message_ids):
+                    session.usage_known = False
         settled = sks.settle_attempt(
             self.ledger,
             self.reservations,
@@ -3542,15 +3549,12 @@ class LiveRun:
             malformed=int(facts.malformed_lines) if facts is not None else 0,
         )
         self.ledger.record("budget", "settlement", settled)
-        responses = {key for s in (facts.sessions if facts else ()) for key in s.message_ids}
         self.ledger.record(
             "budget",
             "guard_checks",
-            {
-                "checks": self.guard_checks,
-                "responses": len(responses),
-                "responses_checked": len(responses & self.guard_responses),
-            },
+            sks.guard_coverage(
+                self.reservations, sessions, self.guard_responses, checks=self.guard_checks
+            ),
         )
         if facts is None:
             return
