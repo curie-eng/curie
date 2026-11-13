@@ -123,7 +123,8 @@ def mutation_guard(tool: str, inputs: dict[str, Any], cwd: Path) -> None:
             raise Refusal("Reproduction commands must finish in the foreground.")
         if re.search(r"\b(?:git\s+(?:push|remote)|gh|curl|wget|ssh|eval|exec)\b", command):
             raise Refusal(
-                "Use local reproduction tools; direct publication and remote shell access are refused."
+                "Use local reproduction tools; direct publication and remote shell access "
+                "are refused."
             )
         return
     raise Refusal(
