@@ -381,6 +381,10 @@ async def _admit_labeled(
                 label=label,
             )
             notice = factory_intake_notices.observe_label(notice, event, app_id=tracker.app_id)
+            if notice.actor_refusal is not None:
+                logger.info(
+                    "factory label actor refused %s#%d: %s", repo, number, notice.actor_refusal
+                )
             if await _label_already_admitted(
                 sessionmaker, tracker.issue(number), event, installation_id
             ):

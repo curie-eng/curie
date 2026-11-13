@@ -335,7 +335,7 @@ def test_ordinary_comment_and_app_sender_do_not_execute(
     assert ordinary.status_code == 200, ordinary.text
     assert _code(ordinary) == "ordinary_comment"
     assert app.status_code == 200, app.text
-    assert _code(app) == "actor_bot"
+    assert app.json()["status"] == "factory_duplicate"
     assert len(_requests(number)) == 1
 
 

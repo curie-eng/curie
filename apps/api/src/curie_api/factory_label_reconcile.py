@@ -231,6 +231,10 @@ async def _reconcile_label(
             label_event_id=event["id"],
         )
         notice = factory_intake_notices.observe_label(notice, event, app_id=tracker.app_id)
+        if notice.actor_refusal is not None:
+            logger.info(
+                "factory label actor refused %s#%d: %s", repo, number, notice.actor_refusal
+            )
         if await _admit(sessionmaker, settings, client, notice, tracker, repository):
             admitted += 1
     return admitted

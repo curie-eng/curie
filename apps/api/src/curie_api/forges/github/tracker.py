@@ -1202,7 +1202,7 @@ class GitHubTracker:
         except FeedbackIgnored as exc:
             if exc.code == "sender_permission_refused":
                 return "actor_no_permission"
-            raise FeedbackUnavailable("sender_permission_unavailable") from None
+            raise FeedbackUnavailable(exc.code) from None
         return None
 
     async def _verify_mention(self, notice: FactoryNotice, token: str) -> None:

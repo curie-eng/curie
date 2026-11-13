@@ -58,11 +58,13 @@ class GitHubAPI:
         self.role_name = "write"
         self.permission_user_id = SENDER_ID
         # Older events that precede the labeled event, and a newer relabel.
+        self.label_event_ids: dict[int, int] = {}
         self.padding_events = 0
         self.relabel_by_bot = False
 
     def label(self, number: int, *, age: timedelta) -> None:
         self.open_issues[number] = datetime.now(UTC) - age
+        self.label_event_ids[number] = self.label_event_ids.get(number, 800000 + number) + 1
 
     @staticmethod
     def _page(request: httpx.Request, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -107,7 +109,7 @@ class GitHubAPI:
             ]
             events.append(
                 {
-                    "id": 800000 + number,
+                    "id": self.label_event_ids[number],
                     "event": "labeled",
                     "label": {"name": LABEL},
                     "actor": {"id": 42, "login": "some-bot[bot]", "type": "Bot"}
@@ -385,6 +387,8 @@ def test_label_actor_own_app_bot_or_unverifiable(
     ]
     github.label_actor = {"id": SENDER_ID, "login": SENDER, "type": "User"}
     github.label_app = {"id": 52}
+    assert _reconcile(github) == 0
+    github.label(number, age=timedelta(minutes=30))
     assert _reconcile(github) == 1
     assert len(_requests(number)) == 1
 
