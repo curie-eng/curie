@@ -4600,12 +4600,19 @@ def test_ceiling_is_the_exact_approval_and_the_gate_holds_parallel_starts(tmp_pa
     parallel = [start("Agent", DIFF_KIND) for _ in range(4)] + [
         start("Task", PLAN_KIND) for _ in range(2)
     ]
-    codes = [process.wait(timeout=30) for process in parallel]
+    reported: list[tuple[int, str, str]] = []
     for process in parallel:
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                stream.close()
-    assert sorted(codes[:4]) == [0, 0, 2, 2] and sorted(codes[4:]) == [0, 2]
+        stdout, stderr = process.communicate(timeout=30)
+        reported.append((process.returncode, stdout, stderr))
+    codes = [code for code, _stdout, _stderr in reported]
+    slot_names = sorted(os.listdir(slots)) if slots.is_dir() else None
+    assert sorted(codes[:4]) == [0, 0, 2, 2] and sorted(codes[4:]) == [0, 2], (
+        [
+            {"code": code, "stdout": stdout, "stderr": stderr}
+            for code, stdout, stderr in reported
+        ],
+        slot_names,
+    )
     assert sorted(os.listdir(slots)) == ["diff-0", "diff-1", "plan-0"]
     other = start("Agent", "general-purpose")
     assert other.wait(timeout=30) == 2
