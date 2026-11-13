@@ -1400,6 +1400,128 @@ def test_poll_admits_a_mention_once(poll_factory: tuple[TestClient, PollGitHub])
     assert [row["id"] for row in _requests(number)] == [row["id"] for row in rows]
 
 
+@pytest.mark.parametrize("intake", ["poll", "webhook"])
+@pytest.mark.parametrize("plain_request", [False, True], ids=["quoted-marker", "request-on-pr"])
+def test_facts_marker_on_owned_pull_does_not_hide_feedback(
+    poll_factory: tuple[TestClient, PollGitHub], intake: str, plain_request: bool
+) -> None:
+    from curie_api.factory_facts_schema import REQUEST_MARKER
+    from test_factory_facts import request_body
+
+    client, github = poll_factory
+    number, first = _admit_label(client, github)
+    pull = github.plant_pull()
+    _own_pull_request(first["work_item_id"], pull)
+    _complete(client, first["id"])
+    body = (
+        request_body(
+            {"schema_version": 1, "trigger_label": LABEL, "executables": [], "services": []},
+            f"@{MENTION}",
+        )
+        if plain_request
+        else f"@{MENTION} please preserve this quoted marker: `{REQUEST_MARKER}`"
+    )
+    comment_id = 731510 + pull
+    github.add_issue_comment(pull, comment_id, body)
+    if intake == "poll":
+        _run_once(github)
+    else:
+        payload = _comment_event(pull, body, comment_id)
+        payload["issue"]["pull_request"] = {}
+        payload["comment"] = github.comments[comment_id]
+        response = _post(client, "issue_comment", payload)
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] != "ignored"
+    assert _feedback_request_id("issue_comment", comment_id) in {
+        row["id"] for row in _requests(number)
+    }
+    assert _rows("SELECT * FROM curie.factory_facts_requests") == []
+
+
+@pytest.mark.parametrize("status", [404, 410, 503])
+def test_owed_facts_failure_does_not_block_mentions_reviews_or_cursor(
+    poll_factory: tuple[TestClient, PollGitHub], status: int
+) -> None:
+    client, github = poll_factory
+    mentioned, _ = _admit_label(client, github)
+    reviewed, first = _admit_label(client, github)
+    pull = github.plant_pull()
+    _own_pull_request(first["work_item_id"], pull)
+    _complete(client, first["id"])
+    _execute(
+        "INSERT INTO curie.factory_facts_requests "
+        "(tracker_host,repository_id,issue_number,trigger_label,"
+        "request_comment_id,digest,actor_id,state) "
+        "VALUES ('github.com',:repo,900999,:label,79999999,:digest,:actor,'owed')",
+        {
+            "repo": str(REPO_ID),
+            "label": LABEL,
+            "digest": "sha256:" + "a" * 64,
+            "actor": str(SENDER_ID),
+        },
+    )
+    github.failures[f"/repos/{REPO}/issues/900999/comments"] = status
+    mention_id, review_id = 731520 + pull, 731530 + pull
+    github.add_issue_comment(mentioned, mention_id, f"@{MENTION} please revise the helper")
+    github.add_issue_comment(pull, review_id, f"@{MENTION} please address this review")
+    github._etags["issue-comments"] = '"owed-failure-other-comments"'
+    _run_once(github)
+    assert _mention_request_id(mention_id) in {row["id"] for row in _requests(mentioned)}
+    assert _feedback_request_id("issue_comment", review_id) in {
+        row["id"] for row in _requests(reviewed)
+    }
+    [cursor] = _rows("SELECT comments_since,etags FROM curie.factory_poll_cursors")
+    assert cursor["comments_since"] is not None
+    assert cursor["etags"]["issue-comments"] == github._etags["issue-comments"]
+    owed = _rows("SELECT * FROM curie.factory_facts_requests")
+    assert len(owed) == (1 if status == 503 else 0)
+
+
+def test_failed_facts_observation_advances_applied_comments_and_retries_by_id(
+    poll_factory: tuple[TestClient, PollGitHub],
+) -> None:
+    from test_factory_facts import request_body
+
+    client, github = poll_factory
+    mentioned, _ = _admit_label(client, github)
+    reviewed, first = _admit_label(client, github)
+    pull = github.plant_pull()
+    _own_pull_request(first["work_item_id"], pull)
+    _complete(client, first["id"])
+    failed = github.plant_issue(label="other-label")
+    github.permission_failures.add(failed)
+    github.add_issue_comment(
+        failed,
+        73154,
+        request_body(
+            {
+                "schema_version": 1,
+                "trigger_label": LABEL,
+                "executables": [],
+                "services": [],
+            }
+        ),
+    )
+    github.add_issue_comment(mentioned, 73155, f"@{MENTION} please revise the helper")
+    github.add_issue_comment(pull, 73156, f"@{MENTION} please address this review")
+    github._etags["issue-comments"] = '"mixed-facts-and-feedback"'
+    _run_once(github)
+    before = [_requests(mentioned), _requests(reviewed)]
+    assert len(before[0]) == len(before[1]) == 2
+    [cursor] = _rows("SELECT comments_since,etags FROM curie.factory_poll_cursors")
+    assert cursor["comments_since"] is not None
+    assert cursor["etags"]["issue-comments"] == github._etags["issue-comments"]
+    assert cursor["etags"]["facts-retry:73154"] == "pending"
+    assert _rows("SELECT * FROM curie.factory_facts_requests") == []
+    github.permission_failures.clear()
+    _run_once(github)
+    assert [_requests(mentioned), _requests(reviewed)] == before
+    [record] = _rows("SELECT state FROM curie.factory_facts_requests")
+    assert record["state"] == "answered"
+    pages = [r for r in github.calls if r.url.path.endswith("/issues/comments")]
+    assert pages[-1].headers["if-none-match"] == github._etags["issue-comments"]
+
+
 def test_poll_admits_review_feedback_once(
     poll_factory: tuple[TestClient, PollGitHub],
 ) -> None:
@@ -1909,9 +2031,7 @@ def test_label_actor_own_app_bot_or_unverifiable(
     _run_once(github)
     assert _requests(number) == []
     assert (REPO, number, reason) in [
-        record.args
-        for record in caplog.records
-        if record.name == "curie_api.factory_poll_intake"
+        record.args for record in caplog.records if record.name == "curie_api.factory_poll_intake"
     ]
     github.label_actor, github.label_app = _user(), {"id": 52}
     # A new observation with a usable person must still make progress.
@@ -1964,5 +2084,6 @@ def test_label_actor_reader_refuses_malformed_app(via: Any) -> None:
 @pytest.mark.parametrize("via", [None, {"id": 52}])
 def test_label_actor_reader_accepts_direct_or_other_app(via: Any) -> None:
     assert label_actor({"actor": _user(), "performed_via_github_app": via}, app_id="51") == (
-        SENDER_ID, SENDER
+        SENDER_ID,
+        SENDER,
     )

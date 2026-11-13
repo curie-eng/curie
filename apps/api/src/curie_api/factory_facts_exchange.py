@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from curie_internal.valkey import AsyncRedis
-from sqlalchemy import func, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .config import Settings
@@ -24,7 +24,7 @@ from .factory_facts_schema import (
     marker_prefix,
     parse_request,
 )
-from .forges.errors import NotFound, Unauthorized, Unavailable
+from .forges.errors import NotFound, Unavailable
 from .forges.github.review_polling import label_actor, trailing_id
 from .forges.github.tracker import GitHubTracker
 from .forges.github.transport import parse_time
@@ -37,10 +37,13 @@ logger = logging.getLogger(__name__)
 
 def _answer_facts(body: str) -> FactoryFacts | None:
     match = re.search(
-        r"<details><summary>Details \(JSON\)</summary>\s*```json\n(.*?)\n```", body, re.DOTALL
+        r"<details><summary>Details \(JSON\)</summary>\s*"
+        r"(?P<fence>`{3,})json\n(?P<json>.*?)\n(?P=fence)(?:\n|$)",
+        body,
+        re.DOTALL,
     )
     try:
-        return FactoryFacts.model_validate_json(match[1]) if match else None
+        return FactoryFacts.model_validate_json(match["json"]) if match else None
     except ValueError:
         return None
 
@@ -52,6 +55,7 @@ class FactsExchange:
         self, sessions: async_sessionmaker[AsyncSession], settings: Settings, tracker: GitHubTracker
     ) -> None:
         self.sessions, self.settings, self.tracker = sessions, settings, tracker
+        self._deferred: set[tuple[int, str, int]] = set()
 
     def _scope(self) -> tuple[Any, ...]:
         return (
@@ -72,30 +76,37 @@ class FactsExchange:
         await self.tracker.verify_facts_writer(actor_id, login)
         return actor_id, login
 
-    async def _rate_limited(self, session: AsyncSession, actor_id: str) -> bool:
-        count = await session.scalar(
-            select(func.count())
-            .select_from(FactoryFactsRequest)
-            .where(
-                *self._scope(),
-                FactoryFactsRequest.actor_id == actor_id,
+    async def _rate_limited(
+        self, session: AsyncSession, actor_id: str, *, current: FactoryFactsRequest | None = None
+    ) -> bool:
+        query = select(FactoryFactsRequest.request_comment_id).where(
+            *self._scope(),
+            FactoryFactsRequest.actor_id == actor_id,
+            or_(
+                FactoryFactsRequest.state == "owed",
                 FactoryFactsRequest.answered_at > datetime.now(UTC) - timedelta(minutes=10),
-            )
+            ),
         )
-        return (count or 0) >= 6
+        if current is not None:
+            query = query.where(
+                ~and_(
+                    FactoryFactsRequest.issue_number == current.issue_number,
+                    FactoryFactsRequest.trigger_label == current.trigger_label,
+                    FactoryFactsRequest.request_comment_id == current.request_comment_id,
+                )
+            )
+        return len((await session.scalars(query.limit(6))).all()) == 6
 
-    async def observe(self, comment: dict[str, Any], *, serves: bool) -> None:
+    async def observe(self, comment: dict[str, Any], *, serves: bool) -> bool:
         try:
             async with asyncio.timeout(FACTS_DEADLINE_SECONDS):
-                await self._observe(comment, serves=serves)
+                return await self._observe(comment, serves=serves)
         except FeedbackUnavailable:
             raise
         except Exception:  # noqa: BLE001 - no failed facts guard may reach another intake path
             raise FeedbackUnavailable("facts_unreadable") from None
 
-    async def _observe(self, comment: dict[str, Any], *, serves: bool) -> None:
-        if not serves or not self.settings.factory_enabled:
-            return
+    async def _observe(self, comment: dict[str, Any], *, serves: bool) -> bool:
         body, comment_id = comment.get("body"), comment.get("id")
         number = trailing_id(comment.get("issue_url"))
         if (
@@ -104,26 +115,28 @@ class FactsExchange:
             or comment_id <= 0
             or number is None
         ):
-            return
+            return False
         try:
             query = parse_request(body)
         except InvalidFactsRequest as exc:
             logger.info("factory facts request ignored reason=%s", exc.code)
-            return
+            return False
+        if not await self.tracker.facts_issue_is_plain(number):
+            return False
+        if not serves or not self.settings.factory_enabled:
+            return True
         async with self.sessions() as session:
             _, binding = await facts_binding(
                 session, self.settings, self.tracker.repo_full_name, query.trigger_label
             )
             if binding is None:
-                return
+                return True
             try:
                 actor_id, _ = await self._authorized(comment, number)
             except FeedbackUnavailable:
                 raise
             except FeedbackIgnored:
-                return
-            if not await self.tracker.facts_issue_is_plain(number):
-                return
+                return True
             key = (
                 self.tracker.host,
                 str(self.tracker.repository_id),
@@ -132,10 +145,10 @@ class FactsExchange:
                 comment_id,
             )
             if await session.get(FactoryFactsRequest, key) is not None:
-                return
+                return True
             if await self._rate_limited(session, str(actor_id)):
                 logger.info("factory facts request ignored reason=rate_limited")
-                return
+                return True
             session.add(
                 FactoryFactsRequest(
                     tracker_host=self.tracker.host,
@@ -149,6 +162,7 @@ class FactsExchange:
                 )
             )
             await session.commit()
+        return True
 
     async def deliver_owed(self) -> None:
         try:
@@ -170,32 +184,43 @@ class FactsExchange:
                         )
                     )
                     for row in rows:
-                        _, binding = await facts_binding(
-                            session, self.settings, self.tracker.repo_full_name, row.trigger_label
-                        )
-                        if binding is None:
-                            continue
-                        found = await self.tracker.marked_comments.find_facts(
-                            ReplyTarget.on_issue(self.tracker.issue(row.issue_number)),
-                            marker_prefix(row.trigger_label),
-                        )
-                        answer = _answer_facts(found.body) if found is not None else None
-                        if (
-                            answer is None
-                            or answer.request is None
-                            or answer.request.comment_id != str(row.request_comment_id)
-                            or answer.request.digest != row.digest
-                        ):
-                            continue
-                        assert found is not None
-                        written = await self.tracker.read_comment(int(found.id))
-                        at = parse_time(written.get("updated_at"))
-                        if at is None:
-                            raise Unavailable("comment")
-                        row.state, row.answer_comment_id, row.answered_at = "answered", found.id, at
-                    await session.commit()
-        except Exception:  # noqa: BLE001 - an uncertain quota read cannot authorize another write
-            raise FeedbackUnavailable("facts_unreadable") from None
+                        key = (row.issue_number, row.trigger_label, row.request_comment_id)
+                        self._deferred.add(key)
+                        try:
+                            await self._recover(session, row)
+                            self._deferred.discard(key)
+                        except NotFound:
+                            await session.delete(row)
+                        except Exception:  # noqa: BLE001 - isolate one unreadable request
+                            logger.info("factory facts recovery deferred reason=unreadable")
+                        await session.commit()
+        except Exception:  # noqa: BLE001 - recovery cannot stop ordinary comment intake
+            logger.info("factory facts recovery deferred reason=unreadable")
+
+    async def _recover(self, session: AsyncSession, row: FactoryFactsRequest) -> None:
+        _, binding = await facts_binding(
+            session, self.settings, self.tracker.repo_full_name, row.trigger_label
+        )
+        if binding is None or await self._rate_limited(session, row.actor_id, current=row):
+            return
+        found = await self.tracker.marked_comments.find_facts(
+            ReplyTarget.on_issue(self.tracker.issue(row.issue_number)),
+            marker_prefix(row.trigger_label),
+        )
+        answer = _answer_facts(found.body) if found is not None else None
+        if (
+            answer is None
+            or answer.request is None
+            or answer.request.comment_id != str(row.request_comment_id)
+            or answer.request.digest != row.digest
+        ):
+            return
+        assert found is not None
+        written = await self.tracker.read_comment(int(found.id))
+        at = parse_time(written.get("updated_at"))
+        if at is None:
+            raise Unavailable("comment")
+        row.state, row.answer_comment_id, row.answered_at = "answered", found.id, at
 
     async def _deliver_owed(self) -> None:
         async with self.sessions() as session:
@@ -210,9 +235,13 @@ class FactsExchange:
                 )
             )
             for row in owed:
+                if (row.issue_number, row.trigger_label, row.request_comment_id) in self._deferred:
+                    continue
                 try:
                     await self._deliver(session, row)
-                except (Unavailable, Unauthorized, FeedbackUnavailable):
+                except NotFound:
+                    await session.delete(row)
+                except Exception:  # noqa: BLE001 - isolate one failed delivery
                     logger.info("factory facts delivery deferred reason=unreadable")
                 await session.commit()
 
@@ -234,6 +263,10 @@ class FactsExchange:
             .limit(1)
         )
         if newer is not None:
+            await session.delete(row)
+            return
+        if await self._rate_limited(session, row.actor_id, current=row):
+            logger.info("factory facts request ignored reason=rate_limited")
             await session.delete(row)
             return
         try:
@@ -273,10 +306,6 @@ class FactsExchange:
                     answer.observed_at if prior_id == row.request_comment_id else datetime.now(UTC)
                 )
                 return
-        if await self._rate_limited(session, row.actor_id):
-            logger.info("factory facts request ignored reason=rate_limited")
-            await session.delete(row)
-            return
         valkey = AsyncRedis.from_url(self.settings.valkey_dsn(), retry_reads=False)
         try:
             facts = await read_facts(

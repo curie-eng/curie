@@ -171,7 +171,6 @@ def facts_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Any, clean_db: None) 
 
     async def seed() -> None:
         async with sessions() as session:
-            await session.execute(text("TRUNCATE curie.factory_facts_requests"))
             session.add(
                 Agent(id=agent_id, name=f"acme-facts-{agent_id.hex[:8]}", max_usd_per_day=12345.67)
             )

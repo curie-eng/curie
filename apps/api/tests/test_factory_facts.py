@@ -158,6 +158,33 @@ def request_body(value: dict[str, Any], prose: str = "") -> str:
     )
 
 
+@pytest.mark.parametrize("run", ["`", "```", "````"])
+def test_answer_label_cannot_escape_its_code_span_or_json_fold(run: str) -> None:
+    from curie_api.factory_facts_exchange import _answer_facts
+    from curie_api.factory_facts_schema import answer_body
+    from markdown_it import MarkdownIt
+
+    source = next(case for case in REPLIES["cases"] if case["accepted"])
+    facts = _answer_facts(source["comment"]["body"])
+    assert facts is not None
+    label = run + " @acme-reviewers <https://example.com> " + run
+    facts.subject.trigger_label = label
+    body = answer_body(facts, "dana")
+    parsed = _answer_facts(body)
+    assert parsed is not None and parsed.subject.trigger_label == label
+    renderer = MarkdownIt("commonmark")
+    tokens = renderer.parse(body)
+    spans = [
+        child for token in tokens for child in (token.children or []) if child.type == "code_inline"
+    ]
+    fences = [token for token in tokens if token.type == "fence"]
+    assert [token.content for token in spans] == [label]
+    assert len(fences) == 1
+    assert json.loads(fences[0].content)["subject"]["trigger_label"] == label
+    assert len(fences[0].markup) > len(run)
+    assert "<a " not in renderer.render(body)
+
+
 @pytest.mark.parametrize("vector", REQUESTS["valid"], ids=lambda v: v["name"])
 def test_shared_valid_request_vectors(vector: dict[str, Any]) -> None:
     parsed = parse_request(request_body(vector["request"], "Check tools. This starts no work."))

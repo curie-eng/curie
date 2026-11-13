@@ -41,7 +41,7 @@ def static_token(token: str) -> TokenSource:
 def _refusal(status: int | None, what: str) -> Exception:
     if status == 401 or status == 403:
         return Unauthorized(what)
-    if status == 404:
+    if status in {404, 410}:
         return NotFound(what)
     return Unavailable(what)
 

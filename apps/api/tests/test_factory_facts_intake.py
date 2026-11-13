@@ -108,7 +108,7 @@ def test_ineligible_actors_read_no_observations_or_delivery_records(
     assert_no_work(world)
 
 
-def test_failed_permission_replays_page_without_etag(facts_world: Any) -> None:
+def test_failed_permission_retries_comment_without_replaying_page(facts_world: Any) -> None:
     world = facts_world
     world.add()
     world.permission_failure = True
@@ -119,7 +119,10 @@ def test_failed_permission_replays_page_without_etag(facts_world: Any) -> None:
     world.cycle()
     assert facts(world).label_route.state == "eligible"
     pages = [r for r in world.github.calls if r.url.path.endswith("/issues/comments")]
-    assert all("if-none-match" not in r.headers for r in pages)
+    assert "if-none-match" in pages[-1].headers
+    cursor = asyncio.run(world.rows("factory_poll_cursors"))[0]
+    assert cursor["comments_since"] is not None
+    assert not any(key.startswith("facts-retry:") for key in cursor["etags"])
 
 
 def test_permission_failure_at_delivery_keeps_owed_for_next_cycle(facts_world: Any) -> None:
@@ -251,6 +254,84 @@ def test_lost_success_is_counted_before_the_next_rate_decision(facts_world: Any)
     assert sum(len(world.answers(42 + i)) for i in range(7)) == 6
 
 
+@pytest.mark.parametrize("status", [404, 410])
+def test_gone_owed_issue_is_discarded_without_blocking_other_answers(
+    facts_world: Any, status: int
+) -> None:
+    world = facts_world
+    world.add()
+    world.add(102, number=43)
+    world.fail_write = True
+    world.cycle()
+    world.github.failures["/repos/acme-corp/acme-bot/issues/42/comments"] = status
+    world.fail_write = False
+    world.cycle()
+    assert world.answers(42) == []
+    assert len(world.answers(43)) == 1
+    rows = asyncio.run(world.rows("factory_facts_requests"))
+    assert [(r["issue_number"], r["state"]) for r in rows] == [(43, "answered")]
+
+
+def test_failed_writes_reserve_the_six_request_window(facts_world: Any) -> None:
+    world = facts_world
+    world.fail_write = True
+    for index in range(12):
+        world.add(101 + index, number=42 + index)
+    world.cycle()
+    rows = asyncio.run(world.rows("factory_facts_requests"))
+    assert len(rows) == 6
+    assert all(row["state"] == "owed" for row in rows)
+    assert not [
+        request
+        for request in world.github.calls
+        if re.search(r"/issues/comments/10[7-9]$|/issues/comments/11[0-2]$", request.url.path)
+    ]
+    world.fail_write = False
+    world.cycle()
+    assert sum(len(world.answers(42 + index)) for index in range(12)) == 6
+    assert all(
+        row["state"] == "answered" for row in asyncio.run(world.rows("factory_facts_requests"))
+    )
+
+
+def test_over_cap_owed_row_is_dropped_before_github_reads(facts_world: Any) -> None:
+    from curie_api.models import FactoryFactsRequest
+
+    world = facts_world
+    world.fail_write = True
+    for index in range(6):
+        world.add(101 + index, number=42 + index)
+    world.cycle()
+
+    async def overflow() -> None:
+        async with world.sessions() as session:
+            session.add(
+                FactoryFactsRequest(
+                    tracker_host="github.com",
+                    repository_id=str(REPO_ID),
+                    issue_number=48,
+                    trigger_label=LABEL,
+                    request_comment_id=107,
+                    digest="sha256:" + "a" * 64,
+                    actor_id="77",
+                    state="owed",
+                )
+            )
+            await session.commit()
+
+    asyncio.run(overflow())
+    world.github.calls.clear()
+    world.fail_write = False
+    world.cycle()
+    assert not [
+        r
+        for r in world.github.calls
+        if "/issues/48/" in r.url.path or r.url.path.endswith("/issues/comments/107")
+    ]
+    assert len(asyncio.run(world.rows("factory_facts_requests"))) == 6
+    assert sum(len(world.answers(42 + index)) for index in range(6)) == 6
+
+
 def test_unserved_label_is_silent_and_never_scans_answers(facts_world: Any) -> None:
     world = facts_world
     world.add(label="other-factory")
@@ -341,7 +422,7 @@ def test_delivery_guard_failure_leaves_owed_and_recovers(
 
 
 @pytest.mark.parametrize("failure", ["crash", "deadline", "unparseable"])
-def test_recovery_guard_denies_new_answers_until_readable(
+def test_recovery_guard_isolates_one_unreadable_request(
     facts_world: Any, monkeypatch: Any, failure: str
 ) -> None:
     import curie_api.factory_facts_exchange as exchange
@@ -367,8 +448,9 @@ def test_recovery_guard_denies_new_answers_until_readable(
 
     world.handle = broken
     asyncio.run(asyncio.wait_for(world.poll(), timeout=3))
-    assert world.answers(42) == world.answers(43) == []
-    assert len(asyncio.run(world.rows("factory_facts_requests"))) == 1
+    assert world.answers(42) == []
+    assert len(world.answers(43)) == 1
+    assert len(asyncio.run(world.rows("factory_facts_requests"))) == 2
     assert_no_work(world)
     world.handle = original
     monkeypatch.setattr(exchange, "FACTS_DEADLINE_SECONDS", 45.0)

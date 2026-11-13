@@ -188,7 +188,7 @@ async def read_repository(
 def _status_error(status: int, what: str) -> Exception:
     if status == 401:
         return Unauthorized(what)
-    if status == 404:
+    if status in {404, 410}:
         return NotFound(what)
     return Unavailable(what)
 

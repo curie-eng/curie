@@ -98,7 +98,7 @@ async def read_facts(
 
             from .personal_execution import new_work_item_owner
 
-            owner = await new_work_item_owner(
+            owner_refusal = await new_work_item_owner(
                 session,
                 SimpleNamespace(
                     model_auth_mode="personal",
@@ -106,7 +106,7 @@ async def read_facts(
                     agent_id=binding.agent_id,
                 ),
             )
-            if owner is not None:
+            if owner_refusal is not None:
                 route = route.model_copy(
                     update={"state": "ineligible", "reason": "personal_owner_required"}
                 )

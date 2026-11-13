@@ -186,7 +186,10 @@ def marker_prefix(label: str) -> str:
 
 def answer_body(facts: FactoryFacts, login: str) -> str:
     """Human groups first, machine contract in one fold, marker supplied by adapter."""
-    label = facts.subject.trigger_label.replace("`", "\\`").replace("\n", " ").replace("\r", " ")
+    label = facts.subject.trigger_label.replace("\n", " ").replace("\r", " ")
+    span = "`" * (max((len(run) for run in re.findall(r"`+", label)), default=0) + 1)
+    encoded = facts.model_dump_json(indent=2)
+    fence = "`" * max(3, max((len(run) for run in re.findall(r"`+", encoded)), default=0) + 1)
     eligible = facts.label_route is not None and facts.label_route.state == "eligible"
     route = (
         "also through an app"
@@ -196,7 +199,7 @@ def answer_body(facts: FactoryFacts, login: str) -> str:
     lines = [
         "**Factory facts. No work was started.**",
         "",
-        f"Repository: {facts.binding.state}, trigger label `{label}`",
+        f"Repository: {facts.binding.state}, trigger label {span} {label} {span}",
         f"{login} may start work: {'yes' if eligible else 'no'}, {route}",
         f"Factory: {'enabled' if facts.factory.enabled else 'disabled'}, "
         f"kill switch {facts.factory.kill_switch}, upgrade pause {facts.factory.upgrade_pause}",
@@ -213,9 +216,9 @@ def answer_body(facts: FactoryFacts, login: str) -> str:
             "",
             "<details><summary>Details (JSON)</summary>",
             "",
-            "```json",
-            facts.model_dump_json(indent=2),
-            "```",
+            fence + "json",
+            encoded,
+            fence,
             "",
             "</details>",
         ]
