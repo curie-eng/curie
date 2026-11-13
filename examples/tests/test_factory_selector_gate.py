@@ -8,6 +8,7 @@ are objects with a name. Each refusal is paired with an allowed call.
 from __future__ import annotations
 
 import fcntl
+import importlib.util
 import json
 import os
 import subprocess
@@ -466,3 +467,58 @@ def test_missing_malformed_and_undecodable_input_fails_closed(tmp_path: Path) ->
     failed = gate.update(12, ["bug", LABEL])
     assert failed["permissionDecision"] == "deny"
     assert "hook failed closed" in failed["permissionDecisionReason"]
+
+
+def test_a_lock_wait_denies_before_the_runner_timeout(tmp_path: Path) -> None:
+    spec = importlib.util.spec_from_file_location("selector_gate_deadline", HOOK)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module._HOOK_DEADLINE_SECONDS < 60
+    os.environ["FACTORY_SELECTOR_DEADLINE_SECONDS"] = "120"
+    try:
+        assert module._deadline_seconds() == module._HOOK_DEADLINE_SECONDS
+        assert module._deadline_seconds() < 60
+    finally:
+        os.environ.pop("FACTORY_SELECTOR_DEADLINE_SECONDS", None)
+
+    gate = Gate(tmp_path)
+    gate.read(12, ["bug"])
+    gate.env["FACTORY_SELECTOR_DEADLINE_SECONDS"] = "0.2"
+    descriptor = os.open(gate.state / "sess-1.json.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    started = time.monotonic()
+    try:
+        done = subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=json.dumps(
+                {
+                    "session_id": "payload-session",
+                    "hook_event_name": "PreToolUse",
+                    "cwd": str(gate.cwd),
+                    "tool_name": UPDATE,
+                    "tool_input": {
+                        "owner": "acme-corp",
+                        "repo": "acme-bot",
+                        "issue_number": 12,
+                        "labels": ["bug", LABEL],
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            env=gate.env,
+            check=False,
+            timeout=5,
+        )
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+    elapsed = time.monotonic() - started
+    assert done.returncode == 0, done.stderr
+    output = json.loads(done.stdout)["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "deadline" in output["permissionDecisionReason"]
+    assert elapsed < 60
+    stored = json.loads((gate.state / "sess-1.json").read_text())
+    assert stored["allowed"] == []

@@ -5,11 +5,13 @@ PostToolUse on get_issue records that issue's labels. PreToolUse on
 update_issue allows the call only when it adds the policy label to those
 labels and this session is still under the cap. The read and the allow
 share one file lock for the whole state transaction, so concurrent calls
-cannot pass the cap. State is one JSON file per session. A missing policy,
-an out-of-range cap, or a bad state file refuses every label write.
-PreToolUse also refuses a shell command and any write that lands in the
-state directory, so the model cannot clear the cap. Missing, malformed, or
-undecodable hook input, and any other failure, deny.
+cannot pass the cap. The runner allows a tool when this hook is still
+running at 60 seconds, so the hook denies itself first. State is one JSON
+file per session. A missing policy, an out-of-range cap, or a bad state
+file refuses every label write. PreToolUse also refuses a shell command
+and any write that lands in the state directory, so the model cannot clear
+the cap. Missing, malformed, or undecodable hook input, and any other
+failure, deny.
 """
 
 from __future__ import annotations
@@ -18,12 +20,16 @@ import fcntl
 import json
 import os
 import re
+import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 _CHANGED = ("title", "body", "state", "assignees", "milestone")
+# The runner's hook limit is 60s and a timed-out hook is allowed through.
+# This deadline is also under the 10s command timeout declared for the hook.
+_HOOK_DEADLINE_SECONDS = 8.0
 _SHELL_TOOLS = frozenset({"bash", "shell", "powershell", "exec"})
 _WRITE_TOOLS = frozenset({"write", "edit", "multiedit", "notebookedit", "applypatch"})
 _READ_TOOLS = frozenset({"read", "glob", "grep"})
@@ -58,6 +64,42 @@ def state_file(data: dict[str, Any]) -> Path:
     return directory / f"{name}.json"
 
 
+class _Deadline(Exception):
+    """The hook's own clock ran out while a tool call could still be allowed."""
+
+
+def _deadline_seconds() -> float:
+    """A positive wait no longer than the built-in deadline.
+
+    An environment override can only shorten the wait. A longer value, zero,
+    or garbage keeps the built-in deadline, so a caller cannot outlast the
+    runner timeout that would allow the tool.
+    """
+    raw = (os.environ.get("FACTORY_SELECTOR_DEADLINE_SECONDS") or "").strip()
+    if not raw:
+        return _HOOK_DEADLINE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _HOOK_DEADLINE_SECONDS
+    if not value > 0:
+        return _HOOK_DEADLINE_SECONDS
+    return min(value, _HOOK_DEADLINE_SECONDS)
+
+
+def _on_deadline(_signum: int, _frame: object) -> None:
+    raise _Deadline()
+
+
+def _arm_deadline() -> None:
+    signal.signal(signal.SIGALRM, _on_deadline)
+    signal.setitimer(signal.ITIMER_REAL, _deadline_seconds())
+
+
+def _disarm_deadline() -> None:
+    signal.setitimer(signal.ITIMER_REAL, 0.0)
+
+
 def _decision(kind: str, reason: str) -> dict[str, Any]:
     return {
         "hookSpecificOutput": {
@@ -73,7 +115,9 @@ def _with_state_lock(path: Path, body: Callable[[], Any]) -> Any:
 
     The directory is created here, before the lock, so two callers cannot
     both observe a missing file and then write. A symlink in the lock's
-    place fails the open instead of being followed.
+    place fails the open instead of being followed. A waiter does not block
+    until the runner gives up: the deadline armed around the hook raises
+    first, and that failure denies the tool.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(
@@ -399,31 +443,51 @@ def _emit(decision: dict[str, Any]) -> None:
     sys.stdout.write("\n")
 
 
+def _body() -> dict[str, Any] | None:
+    raw = sys.stdin.buffer.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _decision("deny", "hook input is not valid UTF-8")
+    if not text.strip():
+        return _decision("deny", "hook input is missing")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return _decision("deny", "hook input is malformed")
+    if not isinstance(data, dict):
+        return _decision("deny", "hook input is malformed")
+    return _dispatch(data)
+
+
+def _safe_deny(reason: str) -> None:
+    try:
+        _disarm_deadline()
+    except Exception:  # noqa: BLE001 - disarm must not hide the deny
+        pass
+    try:
+        _emit(_decision("deny", reason))
+    except Exception:  # noqa: BLE001 - the last resort is still a deny
+        sys.stdout.write(
+            '{"hookSpecificOutput":{"hookEventName":"PreToolUse",'
+            '"permissionDecision":"deny",'
+            '"permissionDecisionReason":"hook failed closed"}}\n'
+        )
+
+
 def main() -> None:
     try:
-        raw = sys.stdin.buffer.read()
+        _arm_deadline()
         try:
-            text = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            _emit(_decision("deny", "hook input is not valid UTF-8"))
-            return
-        if not text.strip():
-            _emit(_decision("deny", "hook input is missing"))
-            return
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            _emit(_decision("deny", "hook input is malformed"))
-            return
-        if not isinstance(data, dict):
-            _emit(_decision("deny", "hook input is malformed"))
-            return
-        decision = _dispatch(data)
+            decision = _body()
+        finally:
+            _disarm_deadline()
+        if decision is not None:
+            _emit(decision)
+    except _Deadline:
+        _safe_deny("hook deadline exceeded")
     except Exception:  # noqa: BLE001 - any hook failure must deny
-        _emit(_decision("deny", "hook failed closed"))
-        return
-    if decision is not None:
-        _emit(decision)
+        _safe_deny("hook failed closed")
 
 
 if __name__ == "__main__":
