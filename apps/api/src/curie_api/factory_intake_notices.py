@@ -12,21 +12,18 @@ from curie_telemetry.metrics import record_metric
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from starlette.concurrency import run_in_threadpool
 
 from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_comment_text import redact_factory_comment
 from .factory_notices import body_digest, code_span, lease_available
 from .forges.errors import ForgeError
-from .forges.github.comments import static_token
-from .forges.github.review_polling import label_actor
-from .forges.hosts import factory_credentials, factory_tracker
+from .forges.hosts import factory_code_host, factory_repository, factory_tracker
+from .forges.ports import CodeHost, Tracker
 from .forges.registry import forges_registry
-from .forges.types import ReplyTarget, TrackerIssueRef
-from .github_app import GitHubAppError, GitHubInstallationRefused
+from .forges.types import Credential, ReplyTarget, TrackerIssueRef
 from .github_factory_events import FactoryNotice
-from .github_review_events import FeedbackIgnored, FeedbackUnavailable
+from .github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from .models import FactoryIntakeNotice
 
 METRIC = "curie.factory.intake.notice.oldest_owed_age_seconds"
@@ -227,29 +224,42 @@ async def sync_intake_notices(
         error = None
         try:
             registry = forges_registry(settings)
-            _, token = await run_in_threadpool(
-                factory_credentials(registry).fresh_installation_token, row.repository_path, None
-            )
             connection = factory_tracker(registry)
             if (
                 connection.config.host != row.tracker_host
                 or connection.config.kind != row.tracker_kind
             ):
                 raise ValueError("tracker_identity_changed")
-            tracker = connection.for_repository(
+            code_host: CodeHost = factory_code_host(registry, client)
+            repository = factory_repository(
+                registry, path=row.repository_path, project_id=row.tracker_scope_id
+            )
+            credential = await code_host.current_installation_credential(repository)
+
+            async def token(value: Credential = credential) -> str:
+                return value.secret
+
+            tracker: Tracker = connection.for_repository(
                 client,
                 repo_full_name=row.repository_path,
                 repository_id=int(row.tracker_scope_id),
-                token=static_token(token),
+                token=token,
             )
             written = await tracker.marked_comments.upsert_marked(
-                ReplyTarget.on_issue(tracker.issue(int(row.tracker_issue_id))),
+                ReplyTarget.on_issue(
+                    TrackerIssueRef(
+                        row.tracker_kind,
+                        row.tracker_host,
+                        row.tracker_scope_id,
+                        row.tracker_issue_id,
+                    )
+                ),
                 marker_for(row),
                 notice_body(row),
             )
             comment_id = int(written.comment.id)
             writes += int(written.written)
-        except (ForgeError, GitHubAppError, GitHubInstallationRefused, httpx.HTTPError, ValueError):
+        except (ForgeError, httpx.HTTPError, ValueError):
             error = "delivery_unavailable"
         async with sessionmaker() as session:
             await session.execute(
