@@ -13,6 +13,15 @@
 {{- if gt (float64 $workspaceStageBudget) (float64 .Values.worker.workspace.totalTimeoutSeconds) }}
 {{- fail "worker.workspace stage timeouts must sum to no more than totalTimeoutSeconds" }}
 {{- end }}
+{{- $factory := .Values.factory | default dict }}
+{{- $admission := index $factory "admission" | default dict }}
+{{- $creditMin := 10 }}
+{{- if hasKey $admission "minModelCreditUsd" }}
+{{- $creditMin = index $admission "minModelCreditUsd" }}
+{{- end }}
+{{- if lt (float64 $creditMin) 0.0 }}
+{{- fail "factory.admission.minModelCreditUsd must be at least 0" }}
+{{- end }}
 {{/* A runner request ceiling above the overall delivery budget is internally
      inconsistent. Refuse it before creating a worker Pod; the worker boot
      validator remains the backstop outside Helm. */}}
@@ -664,6 +673,10 @@ spec:
             # the same default as a fresh install.
             - name: CURIE_TURN_RECEIPT
               value: {{ (.Values.worker.turnReceipt | default "off") | quote }}
+            # Minimum remaining model credit, in USD, for a sufficient fact.
+            # factory.admission.minModelCreditUsd. A negative value fails above.
+            - name: CURIE_FACTORY_MIN_MODEL_CREDIT_USD
+              value: {{ $creditMin | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
             # chart Secret and is only wired when one is configured and the

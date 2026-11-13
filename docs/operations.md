@@ -1811,6 +1811,18 @@ When a publication request is refused, the issue's `Could not complete:`
 notice (cause `approval_create_failed`) carries the refusal code and message
 on its `Details:` line.
 
+### Model credit facts
+
+The worker reads model credit with its own model credential and records one model_credit fact per factory agent. A factory agent is an agent with a GitHub channel binding. The worker ticks when it starts and then every 300 seconds. One replica holds a Postgres advisory lock for the tick, so only one replica reads the provider at a time. Each row expires 900 seconds after it was observed. A later tick refreshes the row even when the comparison is unchanged.
+
+The minimum is factory.admission.minModelCreditUsd, rendered into the worker as CURIE_FACTORY_MIN_MODEL_CREDIT_USD. The default is 10 USD and the chart rejects a negative value. Zero still reads the provider. Any key the provider accepts is sufficient at that minimum.
+
+The worker treats the provider as OpenRouter when the model base URL host is openrouter.ai. It does the same when no base URL is set and the credential is one the runner would send to OpenRouter, because that is the host the runner selects from the env the worker builds for a claim. Any other explicit host is recorded as unknown with reason provider_unsupported, and the worker makes no request. OpenRouter is read with GET /key and GET /credits only. The worker never sends a model request for this fact, and it never stores, logs, or returns an amount or the key.
+
+Both halves at or above the minimum record sufficient. A null key limit counts as satisfied on the key half. Either readable half below the minimum records insufficient. A 401 from /key records unknown with reason credential_rejected. A half that cannot be read (a timeout, a 429, a 5xx response, or a 401 or 403 from /credits), when no readable half is below the minimum, records unknown with reason unreadable. The facts answer reports unknown with observation_expired when the row is older than 900 seconds, and unknown with observation_missing when no row exists.
+
+This observation does not admit or refuse a factory run. Admission remains the separate hold described by issue 4451.
+
 ### The default factory agent
 
 Curie ships its factory agent as the bundle in

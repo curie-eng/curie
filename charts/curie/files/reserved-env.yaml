@@ -40,6 +40,7 @@ worker:
   CURIE_E2E_REGISTRY_INSECURE: e2eConnector.registryInsecure
   CURIE_E2E_REGISTRY_TOKEN_HOSTS: e2eConnector.registryTokenHosts
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
+  CURIE_FACTORY_MIN_MODEL_CREDIT_USD: factory.admission.minModelCreditUsd
   CURIE_HEARTBEAT_FILE: the chart-managed heartbeat path (remove this override)
   CURIE_HOOK_CLAIM_LEASE_S: worker.hookClaimLeaseSeconds
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken

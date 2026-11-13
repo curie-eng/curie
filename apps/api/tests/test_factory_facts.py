@@ -570,3 +570,105 @@ def test_operator_guard_denies_failure_with_a_fixed_error(
 
     asyncio.run(read())
     assert world.observation_reads == []
+
+
+def test_facts_answer_reads_model_credit_and_expires_it(facts_world: Any) -> None:
+    from curie_api.models import FactoryFactObservation
+    from sqlalchemy import select
+    from test_factory_facts_intake import facts
+
+    world = facts_world
+    digest = "sha256:" + "c" * 64
+
+    async def plant(observed_at: datetime, expires_at: datetime) -> None:
+        async with world.sessions() as session:
+            row = (
+                await session.execute(
+                    select(FactoryFactObservation).where(
+                        FactoryFactObservation.kind == "model_credit",
+                        FactoryFactObservation.agent_id == world.agent_id,
+                        FactoryFactObservation.scope == "",
+                        FactoryFactObservation.item == "",
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                session.add(
+                    FactoryFactObservation(
+                        kind="model_credit",
+                        agent_id=world.agent_id,
+                        scope="",
+                        item="",
+                        subject_digest=digest,
+                        state="sufficient",
+                        reason=None,
+                        observed_at=observed_at,
+                        expires_at=expires_at,
+                    )
+                )
+            else:
+                row.subject_digest = digest
+                row.state = "sufficient"
+                row.reason = None
+                row.observed_at = observed_at
+                row.expires_at = expires_at
+            await session.commit()
+
+    async def remove() -> None:
+        async with world.sessions() as session:
+            row = (
+                await session.execute(
+                    select(FactoryFactObservation).where(
+                        FactoryFactObservation.kind == "model_credit",
+                        FactoryFactObservation.agent_id == world.agent_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is not None:
+                await session.delete(row)
+                await session.commit()
+
+    now = datetime.now(UTC)
+    asyncio.run(plant(now, now + timedelta(seconds=900)))
+    world.add(number=42)
+    world.cycle()
+    current = facts(world, 42)
+    assert current.model_credit.state == "sufficient"
+    assert current.model_credit.reason is None
+    assert current.model_credit.expires_at is not None
+    assert current.model_credit.observed_at is not None
+    assert current.model_credit.expires_at - current.model_credit.observed_at == timedelta(
+        seconds=900
+    )
+    assert set(current.model_credit.model_dump()) == {
+        "state",
+        "reason",
+        "observed_at",
+        "expires_at",
+    }
+
+    expired_at = datetime.now(UTC) - timedelta(seconds=901)
+    asyncio.run(plant(expired_at, expired_at + timedelta(seconds=900)))
+    world.add(identifier=201, number=43)
+    world.cycle()
+    expired = facts(world, 43)
+    assert (expired.model_credit.state, expired.model_credit.reason) == (
+        "unknown",
+        "observation_expired",
+    )
+    assert set(expired.model_credit.model_dump()) == {
+        "state",
+        "reason",
+        "observed_at",
+        "expires_at",
+    }
+
+    asyncio.run(remove())
+    world.add(identifier=301, number=44)
+    world.cycle()
+    missing = facts(world, 44)
+    assert (missing.model_credit.state, missing.model_credit.reason) == (
+        "unknown",
+        "observation_missing",
+    )
+    assert "amount" not in missing.model_credit.model_dump()
