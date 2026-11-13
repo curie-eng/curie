@@ -1043,9 +1043,11 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         return views
 
     def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
-        """No claim templates exist here; the reap tick re-admits clean shells.
+        """No claim templates exist here; the reap tick reconciles the slots.
 
-        A quarantined slot returns to the pool once its shell answers idle with
+        A leased slot whose shell reports a new incarnation since it
+        acknowledged the claim is retired, so an idle route cannot hold a slot
+        on a replaced shell. A quarantined slot returns to the pool once its shell answers idle with
         nothing running: a quarantined supervisor never does, so in practice
         that is a replaced task (a new incarnation), or a claim the shell ran
         with no record (its creator lost the lease mid-start) that was retired
@@ -1065,6 +1067,9 @@ class StaticPoolSandboxClient(ClaimInputStaging):
 
     def _reconcile_slot(self, slot: StaticShellSlot) -> None:
         state = self._slot_state(slot.slot)
+        if state.get("state") == "leased":
+            self._end_replaced_lease(slot, state)
+            return
         if state.get("state") != "quarantined":
             return
         shell = self.shell_status(slot, timeout=_CONTROL_READ_TIMEOUT_S)
@@ -1090,6 +1095,36 @@ class StaticPoolSandboxClient(ClaimInputStaging):
             ],
         ):
             logger.info("static shell %s re-admitted", slot.slot)
+
+    def _end_replaced_lease(self, slot: StaticShellSlot, state: Mapping[str, str]) -> None:
+        """End a lease whose shell was replaced since it acknowledged the claim.
+
+        A new incarnation wiped the old task, so the claim's runner provably no
+        longer runs, yet an idle route can keep the lease for as long as it
+        lives and nothing else would free the slot (#5569). Only an
+        acknowledged lease qualifies: one still starting has no incarnation to
+        compare and belongs to its creator. The retire goes through the same
+        generation-checked release as ``delete_claim``.
+        """
+
+        name = state.get("claim")
+        record = None if not name else self._record(name)
+        if (
+            record is None
+            or record.state != "active"
+            or not record.incarnation
+            or record.slot != slot.slot
+            or str(record.generation) != state.get("generation")
+        ):
+            return
+        shell = self.shell_status(slot, timeout=_CONTROL_READ_TIMEOUT_S)
+        incarnation = shell.get("incarnation")
+        if not incarnation or incarnation == record.incarnation:
+            return
+        logger.info(
+            "static shell %s was replaced; ending stale lease of claim %s", slot.slot, record.name
+        )
+        self._end_lease(record, mode="retire", timeout=self._retire_timeout_s)
 
     # -- sandbox lifecycle -----------------------------------------------------
 
