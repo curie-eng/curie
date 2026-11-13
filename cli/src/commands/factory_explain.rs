@@ -590,9 +590,10 @@ pub(crate) fn parse_decisions(body: &str) -> DecisionsParse {
         section.push(line.clone());
     }
     // The cap is the sum of the nonblank lines. Breaks between them do not count.
+    // A line is blank when Python `str.strip` would empty it, including U+001C through U+001F.
     let section_characters: usize = section
         .iter()
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !blank(line))
         .map(|line| line.chars().count())
         .sum();
     if section_characters > MAX_SECTION_CHARACTERS {
@@ -601,7 +602,7 @@ pub(crate) fn parse_decisions(body: &str) -> DecisionsParse {
     let content: Vec<&str> = section
         .iter()
         .map(String::as_str)
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !blank(line))
         .collect();
     if content.is_empty() {
         return DecisionsParse::Unparsed(section);
@@ -739,8 +740,13 @@ fn earliest_source(line: &str, reason_start: usize) -> Option<(usize, usize, &'s
     best
 }
 
+/// Python `str.isspace`: Unicode White_Space, plus U+001C through U+001F.
+fn python_space(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '\u{001c}'..='\u{001f}')
+}
+
 fn blank(value: &str) -> bool {
-    value.trim().is_empty()
+    value.chars().all(python_space)
 }
 
 fn summary_text(body: &str) -> String {
