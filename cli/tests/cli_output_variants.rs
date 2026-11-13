@@ -10,9 +10,8 @@
 //! This file closes that by discovering the population instead of naming it, in
 //! the shape `support/schema_inventory.rs` already uses:
 //!
-//! 1. `schema_inventory::cli_output_impls` finds every `impl CliOutput for T` in
-//!    `cli/src`.
-//! 2. `enum_variants::variant_names` reports T's variants; a T with none is a
+//! 1. A source walk finds every `impl CliOutput for T` in `cli/src`.
+//! 2. `enum_variants::variant_names_in_file` reports T's variants; a T with none is a
 //!    struct, not an enum, and is out of scope here (its single `to_json()` is
 //!    covered by the per-result tests in `json_contract.rs`).
 //! 3. `SAMPLES` below carries one constructed instance per variant. The two
@@ -33,19 +32,21 @@
 //! `Deserialize` impls rather than by exposing fields.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use curie::api::{
-    AgentAccessPolicy, ApprovalRecord, ChannelBinding, EnrollmentState, HookFireRecord,
-    HookWakeRotation, HookWakeSecret, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary,
-    PersonalEnrollmentStatus, PersonalEnrollmentTeardown, ScheduleList, Version,
+    AgentAccessPolicy, ApprovalRecord, ChannelBinding, CodingInstructionsApplication,
+    CodingInstructionsStatus, EnrollmentState, HookFireRecord, HookWakeRotation, HookWakeSecret,
+    MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, PersonalEnrollmentStatus,
+    PersonalEnrollmentTeardown, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
-    ChannelsOutput, DeleteOutput, DirectoryOutput, HookFireOutput, HookOutput, KillOutput,
-    MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput,
-    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, SubscriptionOutput, SubscriptionVerb,
-    VersionsOutput, WakeKeyOutput, WorkItemsOutput,
+    ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, HookFireOutput,
+    HookOutput, KillOutput, MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
+    ResetThreadOutput, ResumeOutput, SchedulesOutput, SkillApprovalsOutput, SubscriptionOutput,
+    SubscriptionVerb, VersionsOutput, WakeKeyOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -63,9 +64,9 @@ use curie::ops::{
     ClusterUpgradeOutput,
 };
 use curie::ui::{CliOutput, DryRunPlan};
+use syn::visit::Visit;
 
 use crate::support::enum_variants;
-use crate::support::schema_inventory;
 
 // ---------------------------------------------------------------------------
 // Discovery: the expectation side, derived from the source AST.
@@ -104,25 +105,62 @@ fn collect_rs_paths(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// Every `impl CliOutput for T` where T is declared as an `enum`, mapped to its
 /// variant names. Purely syntactic, so it cannot drift from the source.
 fn discovered_enums() -> BTreeMap<String, BTreeSet<String>> {
-    let srcs = cli_srcs();
-    let borrowed: Vec<(&str, &str)> = srcs.iter().map(|(n, s)| (n.as_str(), s.as_str())).collect();
-    let impls = schema_inventory::cli_output_impls(&borrowed);
+    static DISCOVERED: OnceLock<BTreeMap<String, BTreeSet<String>>> = OnceLock::new();
+    DISCOVERED.get_or_init(discover_enums).clone()
+}
+
+#[derive(Default)]
+struct OutputDeclarations {
+    impls: BTreeSet<String>,
+    enums: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for OutputDeclarations {
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if node
+            .trait_
+            .as_ref()
+            .and_then(|(path, _)| path.segments.last())
+            .is_some_and(|segment| segment.ident == "CliOutput")
+        {
+            if let syn::Type::Path(path) = node.self_ty.as_ref() {
+                if let Some(segment) = path.path.segments.last() {
+                    self.impls.insert(segment.ident.to_string());
+                }
+            }
+        }
+        syn::visit::visit_item_impl(self, node);
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        self.enums.insert(node.ident.to_string());
+        syn::visit::visit_item_enum(self, node);
+    }
+}
+
+fn discover_enums() -> BTreeMap<String, BTreeSet<String>> {
+    let mut parsed = Vec::new();
+    let mut impls = BTreeSet::new();
+    for (name, src) in cli_srcs() {
+        let file = syn::parse_file(&src).unwrap_or_else(|error| {
+            panic!("cannot enumerate CliOutput variants in {name}: {error}")
+        });
+        let mut declarations = OutputDeclarations::default();
+        declarations.visit_file(&file);
+        impls.extend(declarations.impls);
+        parsed.push((file, declarations.enums));
+    }
     assert!(
         !impls.is_empty(),
         "no `impl CliOutput for T` found in cli/src: discovery is broken, so every \
          assertion below would pass vacuously"
     );
 
-    let mut found = BTreeMap::new();
-    for name in impls {
-        // An impl target with no `enum <name>` declaration is a struct; the
-        // per-variant question does not apply to it.
-        let mut variants = BTreeSet::new();
-        for (_, src) in &srcs {
-            variants.extend(enum_variants::variant_names(src, &name));
-        }
-        if !variants.is_empty() {
-            found.insert(name, variants);
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (file, enums) in parsed {
+        for name in enums.intersection(&impls) {
+            let variants = enum_variants::variant_names_in_file(&file, name);
+            found.entry(name.clone()).or_default().extend(variants);
         }
     }
     assert!(
@@ -715,6 +753,32 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "CodingInstructionsOutput",
+        samples![
+            "DryRun" => CodingInstructionsOutput::DryRun(plan()),
+            "Document" => CodingInstructionsOutput::Document(CodingInstructionsStatus {
+                revision: 1,
+                sha256: Some("a".repeat(64)),
+                format_version: 1,
+                byte_length: 4,
+                text: Some("text".to_string()),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                tenant_enabled: true,
+                application: CodingInstructionsApplication::Unavailable,
+            }),
+            "Document" => CodingInstructionsOutput::Document(CodingInstructionsStatus {
+                revision: 0,
+                sha256: None,
+                format_version: 1,
+                byte_length: 0,
+                text: None,
+                updated_at: None,
+                tenant_enabled: false,
+                application: CodingInstructionsApplication::Unavailable,
+            }),
+        ],
+    );
+    m.insert(
         "SubscriptionOutput",
         samples![
             "DryRun" => SubscriptionOutput::DryRun(plan()),
@@ -1108,6 +1172,27 @@ fn every_cli_output_enum_has_samples() {
         "samples registered for {stale:?}, which are no longer CliOutput enums in \
          cli/src: remove the stale entry so the registry cannot drift from the source"
     );
+}
+
+#[test]
+fn coding_instructions_schema_requires_unavailable_application_for_every_variant() {
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/coding-instructions.schema.json"))
+            .expect("coding instructions schema parses");
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let registry = registry();
+    let samples = registry
+        .get("CodingInstructionsOutput")
+        .expect("coding instructions samples");
+    for (variant, value) in samples {
+        assert!(validator.is_valid(value), "{variant}: {value}");
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("application");
+        assert!(!validator.is_valid(&missing), "{variant}: {missing}");
+        let mut available = value.clone();
+        available["application"] = serde_json::json!("available");
+        assert!(!validator.is_valid(&available), "{variant}: {available}");
+    }
 }
 
 #[test]

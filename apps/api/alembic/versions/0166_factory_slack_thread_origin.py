@@ -20,7 +20,7 @@ cannot be inserted between the check and the drop, and it refuses before any
 DDL.
 
 Revision ID: 0166
-Revises: 0164
+Revises: 0165
 """
 
 from collections.abc import Sequence
@@ -29,7 +29,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0166"
-down_revision: str = "0164"
+down_revision: str = "0165"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 S = "curie"

@@ -55,6 +55,7 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # observations require the 0163 table, cached facts and request
     # delivery require the 0164 tables, and Slack kickoff thread origin
     # reads require 0166.
+    # Owner coding profiles and tenant policies require 0165, which stays below this floor.
     assert window == {"schema_min": "0166", "schema_head": "0166"}
 
 
@@ -86,7 +87,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-46:] == [
+    assert data["revisions"][-47:] == [
         "0095",
         "0096",
         "0097",
@@ -132,6 +133,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0162",
         "0163",
         "0164",
+        "0165",
         "0166",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
@@ -174,6 +176,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0162"] == "expand"
     assert kinds["0163"] == "expand"
     assert kinds["0164"] == "expand"
+    assert kinds["0165"] == "expand"
     assert kinds["0166"] == "expand"
 
 
@@ -318,6 +321,9 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
         ("factory_tracker_result_deliveries", "create_attempted_at"),
         ("factory_tracker_result_receipts", "result_comment_id"),
         ("factory_tracker_result_artifacts", "content"),
+        ("requester_coding_profiles", "revision"),
+        ("requester_coding_profiles", "sha256"),
+        ("requester_coding_policies", "enabled"),
     } <= columns
     assert {
         ("tenant_identity_providers", "http_selection"),

@@ -45,7 +45,9 @@ def test_packaged_schema_metadata_matches_api_authority() -> None:
     assert revisions["0163"]["parents"] == ["0162"]
     assert revisions["0164"]["parents"] == ["0163"]
     assert revisions["0164"]["kind"] == "expand"
-    assert revisions["0166"]["parents"] == ["0164"]
+    assert revisions["0165"]["parents"] == ["0164"]
+    assert revisions["0165"]["kind"] == "expand"
+    assert revisions["0166"]["parents"] == ["0165"]
     assert revisions["0166"]["kind"] == "expand"
     for revision in graph.walk_revisions():
         parent = revision.down_revision

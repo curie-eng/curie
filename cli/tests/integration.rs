@@ -1,6 +1,6 @@
-//! The one integration test crate root for the curie CLI. Every file
-//! cli/tests/<name>.rs is a module declared below. With `autotests = false`
-//! an undeclared file never compiles, which the guard test below catches.
+//! Shared integration test crate for the curie CLI. The subscription and
+//! requester coding instructions suites are independent Cargo test targets.
+//! With `autotests = false`, the inventory guard catches undeclared modules.
 
 mod support;
 
@@ -185,7 +185,6 @@ mod skill_up_auto_reload;
 mod skill_up_replace;
 mod spec_scaffold;
 mod sre_observability_provision;
-mod subscription;
 mod surfaces_trigger_label;
 mod surfaces_verb;
 mod trajectory_eval;
@@ -203,13 +202,18 @@ mod worker_claims;
 use std::fs;
 use std::path::Path;
 
-/// File names (sorted) ending in `.rs`, other than `integration.rs`, whose stem
-/// has no line in `root_source` that equals `mod <stem>;` after trimming.
+/// Module files whose stems have no matching declaration in `root_source`.
+/// Independent Cargo targets are excluded from this shared crate inventory.
 fn undeclared_test_files(file_names: &[String], root_source: &str) -> Vec<String> {
     let declared: Vec<&str> = root_source.lines().map(str::trim).collect();
     let mut missing: Vec<String> = file_names
         .iter()
-        .filter(|name| name.as_str() != "integration.rs")
+        .filter(|name| {
+            !matches!(
+                name.as_str(),
+                "integration.rs" | "subscription.rs" | "requester_coding_instructions.rs"
+            )
+        })
         .filter_map(|name| name.strip_suffix(".rs").map(|stem| (name, stem)))
         .filter(|(_, stem)| !declared.contains(&format!("mod {stem};").as_str()))
         .map(|(name, _)| name.clone())

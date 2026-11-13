@@ -1,9 +1,9 @@
 """Migration 0166 adds ``factory_slack_threads.origin`` (#5380).
 
-An expand revision above 0164. Every thread that exists before it reads
+An expand revision above 0165. Every thread that exists before it reads
 ``configured``; the server default stays so an application at the prior
 revision keeps inserting valid rows; the CHECK admits only ``configured`` and
-``kickoff``. The downgrade to 0164 takes an exclusive table lock and refuses,
+``kickoff``. The downgrade to 0165 takes an exclusive table lock and refuses,
 before any DDL, while a ``kickoff`` row exists. Rows are seeded with raw SQL at
 the revision they belong to, never through the current models.
 
@@ -38,7 +38,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 REVISION = "0166"
-BELOW = "0164"
+BELOW = "0165"
 TABLE = "factory_slack_threads"
 CHECK = "factory_slack_threads_origin_ck"
 REFUSAL = "factory_slack_kickoff_threads_present"
@@ -135,7 +135,7 @@ def test_0166_default_keeps_prior_application_inserts_valid(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     isolated_migration_db.at(REVISION)
-    # An application at 0164 never names origin.
+    # An application at 0165 never names origin.
     unnamed = _thread()
     assert _origins() == {unnamed: "configured"}
     columns = sql_dicts(

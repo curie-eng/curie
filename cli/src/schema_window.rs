@@ -775,6 +775,7 @@ print(json.dumps(graph))
         // the 0162 result policy columns, factory CI observations require the
         // 0163 table, cached facts and request delivery require the 0164
         // tables, and Slack kickoff thread origin reads require 0166.
+        // Owner coding profiles and tenant policies require 0165, which stays below this floor.
         assert_eq!(candidate.schema_min, "0166");
         assert_eq!(candidate.schema_head, "0166");
         assert_eq!(
@@ -829,6 +830,7 @@ print(json.dumps(graph))
         assert!(!live_in_window("0162", &current));
         assert!(!live_in_window("0163", &current));
         assert!(!live_in_window("0164", &current));
+        assert!(!live_in_window("0165", &current));
         assert!(live_in_window("0166", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));

@@ -7,6 +7,8 @@
 //! is never discovered. The ambient platform key is set where a test needs to
 //! prove it is never sent, and removed everywhere else.
 
+mod support;
+
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

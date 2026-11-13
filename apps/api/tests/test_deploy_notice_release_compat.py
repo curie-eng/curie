@@ -66,6 +66,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # observations require the 0163 table, cached facts and request
     # delivery require the 0164 tables, and Slack kickoff thread origin
     # reads require 0166.
+    # Owner coding profiles and tenant policies require 0165, which stays below this floor.
     candidate = {"schema_min": "0166", "schema_head": "0166"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
@@ -74,7 +75,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-46:] == [
+    assert catalog["revisions"][-47:] == [
         "0095",
         "0096",
         "0097",
@@ -120,6 +121,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0162",
         "0163",
         "0164",
+        "0165",
         "0166",
     ]
     assert "0074" not in catalog["revisions"]

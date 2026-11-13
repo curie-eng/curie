@@ -3,9 +3,7 @@ name = "curie"
 version = "0.16.0"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
-# Every cli/tests/<name>.rs is a module of the one `integration` test crate
-# below (#4382), except a file that is its own [[test]] target.
-# tests/integration.rs declares the modules and guards that none is missed.
+# Test files are integration modules or independently declared Cargo targets.
 autotests = false
 
 [[bin]]
@@ -23,6 +21,14 @@ path = "tests/factory_explain.rs"
 [[test]]
 name = "dev_test_env"
 path = "tests/dev_test_env.rs"
+
+[[test]]
+name = "subscription"
+path = "tests/subscription.rs"
+
+[[test]]
+name = "requester_coding_instructions"
+path = "tests/requester_coding_instructions.rs"
 
 [dependencies]
 curie-aci-protocol = { path = "../packages/aci-protocol/generated/rust" }
