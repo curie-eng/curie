@@ -771,7 +771,7 @@ def test_notice_untrusted_values_are_inline_code(
         assert " ".join(label.splitlines()) in values
         assert not any(
             token.type != "code_inline"
-            and ("@acme-user" in token.content or "https://example.com/" in token.content)
+            and not set("@:/`").isdisjoint(token.content)
             for token in tokens
         )
         assert not any(token.type in {"link_open", "softbreak", "hardbreak"} for token in tokens)
