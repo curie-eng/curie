@@ -1676,6 +1676,58 @@ def test_present_local_images_pass_the_check_and_reach_resource_creation(
     assert "stop at first resource command" in _evidence(tmp_path)["error"]
 
 
+
+def test_admitted_candidate_map_keeps_image_refs_through_budget_and_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate_curie: Path,
+) -> None:
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent))
+    from c4_admitted_kind import CANDIDATE_CLI_ENV, CANDIDATE_IMAGES_ENV, AdmittedKind
+
+    monkeypatch.setenv("DOCKER_HOST", "tcp://docker.example.com:2376")
+
+    monkeypatch.setenv(CANDIDATE_CLI_ENV, str(candidate_curie))
+    monkeypatch.setenv(CANDIDATE_IMAGES_ENV, "curie-{component}:candidate")
+    monkeypatch.setenv("CURIE_LOCAL_STUB_HOST", "192.0.2.10")
+    monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(sk.shutil, "disk_usage", lambda _path: type("Usage", (), {"free": 2**40})())
+    monkeypatch.setattr(sk, "client_loopback_port_is_free", lambda _port: True)
+    run = AdmittedKind(tmp_path, candidate_curie)
+    expected = tuple(run.images.values())
+    inspected: list[tuple[str, ...]] = []
+    imported: list[str] = []
+
+    class ImportsComplete(Exception):
+        pass
+
+    def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        output = ""
+        if argv[:3] == ("docker", "image", "inspect"):
+            refs = argv[3:]
+            assert all(ref in expected for ref in refs), refs
+            inspected.append(refs)
+            output = json.dumps([{"Id": "sha256:" + "a" * 64, "Size": 1024} for _ in refs])
+        elif argv[:2] == ("docker", "inspect"):
+            output = json.dumps([
+                {"NetworkSettings": {"Networks": {"kind": {"Gateway": "192.0.2.1"}}}}
+            ])
+        elif argv[:2] == ("docker", "version"):
+            output = "linux/amd64"
+        elif argv[:3] == ("kind", "get", "nodes"):
+            output = "acme-control-plane"
+        elif argv[:2] == ("docker", "exec"):
+            output = '[plugins."io.containerd.grpc.v1.cri".containerd]\nsnapshotter="overlayfs"\n'
+        elif argv[:3] == ("bash", "-o", "pipefail"):
+            imported.append(argv[-1])
+            if len(imported) == len(expected):
+                raise ImportsComplete
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+    with pytest.raises(ImportsComplete):
+        run.execute()
+    assert expected in inspected
+    assert tuple(imported) == expected
+
 def test_failed_publication_evidence_survives_verdict_without_transport_or_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

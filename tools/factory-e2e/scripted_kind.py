@@ -320,7 +320,7 @@ class ScriptedRun:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.run_id = uuid.uuid4().hex[:8]
-        self.images = (
+        self.image_refs = (
             IMAGES
             if args.scenario != "facts"
             else tuple(
@@ -601,7 +601,7 @@ class ScriptedRun:
                 self.check_disk("building runner")
                 self.command(self.curie, "build", "--tag", "curie-runner:latest", timeout=1800)
                 self.check_disk("built runner")
-        for image in self.images:
+        for image in self.image_refs:
             try:
                 self.command("docker", "image", "inspect", image, timeout=30)
             except ScriptedScenarioError:
@@ -609,7 +609,7 @@ class ScriptedRun:
                     f"local image {image} is missing; pass --build-images to build it"
                 ) from None
         self.check_disk(
-            "scripted factory", required_bytes=kind_images.import_budget(self.command, self.images)
+            "scripted factory", required_bytes=kind_images.import_budget(self.command, self.image_refs)
         )
 
     def execute(self) -> None:
@@ -664,9 +664,9 @@ class ScriptedRun:
             stub_host=self.env.get("CURIE_LOCAL_STUB_HOST"),
             gateway=gateway,
         )
-        required = kind_images.import_budget(self.command, self.images)
+        required = kind_images.import_budget(self.command, self.image_refs)
         self.check_disk("loading candidate images", required_bytes=required)
-        kind_images.load_images(self.command, self.cluster, self.images)
+        kind_images.load_images(self.command, self.cluster, self.image_refs)
         self.check_disk("loaded candidate images", required_bytes=kind_images.RUNTIME_RESERVE_BYTES)
         # curie build resolves the runner base with buildx imagetools, which
         # reads a registry and never the local daemon, so the base goes to the
@@ -756,7 +756,7 @@ class ScriptedRun:
                 key_container,
                 "--label",
                 f"curie.factory-scripted={self.run_id}",
-                self.images[1],
+                self.image_refs[1],
                 "python",
                 "-c",
                 key_code,
