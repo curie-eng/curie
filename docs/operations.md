@@ -2469,6 +2469,10 @@ is unreachable. The skill tier has no work items and exits 4.
 
 ### Personal Claude enrollment
 
+Developers follow the [personal subscription guide](guides/personal-subscription.md)
+to enroll and start a run. This section is the operator configuration that
+guide links to.
+
 A personal WorkItem runs on its owner's own Claude subscription. The owner
 enrolls once, and Curie keeps the resulting credential in custody for that
 owner alone.
