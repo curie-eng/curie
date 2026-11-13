@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "contract": "tracker_result",
+  "results": ["ticket", "findings"],
+  "implementation_label": "curie-factory"
+}
