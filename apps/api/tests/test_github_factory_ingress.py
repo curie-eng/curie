@@ -1012,7 +1012,7 @@ def test_label_actor_permission_retries_same_delivery(
 
 @pytest.mark.parametrize("actor,app,reason", LABEL_ACTOR_REFUSALS, ids=LABEL_ACTOR_REFUSAL_IDS)
 def test_label_actor_own_app_bot_or_unverifiable(
-    factory_app: tuple[TestClient, GitHubAPI], actor: Any, app: dict[str, Any] | None, reason: str
+    factory_app: tuple[TestClient, GitHubAPI], actor: Any, app: Any, reason: str
 ) -> None:
     client, api = factory_app
     api.label_actor, api.label_app = actor, app

@@ -93,8 +93,11 @@ def label_actor(event: dict[str, Any], *, app_id: str) -> tuple[int, str]:
     except FeedbackIgnored:
         raise FeedbackIgnored("actor_unverifiable") from None
     via = event.get("performed_via_github_app")
-    if isinstance(via, dict) and str(via.get("id")) == app_id:
-        raise FeedbackIgnored("actor_own_app")
+    if via is not None:
+        if not isinstance(via, dict) or type(via.get("id")) is not int:
+            raise FeedbackIgnored("actor_unverifiable")
+        if str(via["id"]) == app_id:
+            raise FeedbackIgnored("actor_own_app")
     return sender
 
 

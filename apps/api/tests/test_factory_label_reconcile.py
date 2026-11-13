@@ -53,7 +53,7 @@ class GitHubAPI:
         self.open_issues: dict[int, datetime] = {}
         self.permission = "write"
         self.label_actor: Any = {"id": SENDER_ID, "login": SENDER, "type": "User"}
-        self.label_app: dict[str, Any] | None = None
+        self.label_app: Any = None
         self.permission_status = 200
         self.role_name = "write"
         self.permission_user_id = SENDER_ID
@@ -365,14 +365,24 @@ def test_label_actor_permission_retry(factory: tuple[TestClient, GitHubAPI]) -> 
 
 @pytest.mark.parametrize("actor,app,reason", LABEL_ACTOR_REFUSALS, ids=LABEL_ACTOR_REFUSAL_IDS)
 def test_label_actor_own_app_bot_or_unverifiable(
-    factory: tuple[TestClient, GitHubAPI], actor: Any, app: dict[str, Any] | None, reason: str
+    factory: tuple[TestClient, GitHubAPI],
+    actor: Any,
+    app: Any,
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("INFO", logger="curie_api.factory_label_reconcile")
     _client, github = factory
     github.label_actor, github.label_app = actor, app
     number = next(_ISSUES)
     github.label(number, age=timedelta(minutes=30))
     assert _reconcile(github) == 0
     assert _requests(number) == []
+    assert (REPO, number, reason) in [
+        record.args
+        for record in caplog.records
+        if record.name == "curie_api.factory_label_reconcile"
+    ]
     github.label_actor = {"id": SENDER_ID, "login": SENDER, "type": "User"}
     github.label_app = {"id": 52}
     assert _reconcile(github) == 1

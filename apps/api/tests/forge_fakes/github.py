@@ -47,6 +47,9 @@ LABEL_ACTOR_REFUSALS = [
     ({"id": 42, "login": "fixture[bot]", "type": "Bot"}, {"id": 52}, "actor_bot"),
     ({"id": 42, "login": "ghost", "type": "User"}, None, "actor_unverifiable"),
     (None, None, "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, "invalid", "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, [], "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, {}, "actor_unverifiable"),
     ({"login": "fixture[bot]", "type": "Bot"}, None, "actor_unverifiable"),
     ({"id": 42, "login": "ghost", "type": "Bot"}, None, "actor_unverifiable"),
     ({"id": True, "login": SENDER, "type": "User"}, None, "actor_unverifiable"),
@@ -270,7 +273,7 @@ class GitHubAPI:
         self.permission_requests: list[httpx.Request] = []
         self.permission_user_id = SENDER_ID
         self.label_actor: Any = {"id": SENDER_ID, "login": SENDER, "type": "User"}
-        self.label_app: dict[str, Any] | None = None
+        self.label_app: Any = None
         self.permission_status = 200
         self.role_name = "write"
         self.comment_body: str | None = None

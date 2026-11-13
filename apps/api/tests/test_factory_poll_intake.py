@@ -38,6 +38,8 @@ import httpx
 import pytest
 import redis.asyncio as aioredis
 from curie_api.config import Settings, get_settings
+from curie_api.forges.github.review_polling import label_actor
+from curie_api.github_review_events import FeedbackIgnored
 from curie_api.main import create_app
 from curie_api.models import ExecutionRequest
 from curie_api.threadkeys import route_thread_key
@@ -156,7 +158,7 @@ class PollGitHub:
     permission: str = "write"
     role_name: str = "write"
     label_actor: Any = field(default_factory=_user)
-    label_app: dict[str, Any] | None = None
+    label_app: Any = None
     permission_user_id: int = SENDER_ID
     default_branch: str = "main"
     branches: dict[str, str] = field(default_factory=lambda: {"main": _MAIN_SHA, "next": _NEXT_SHA})
@@ -1894,13 +1896,23 @@ def test_label_actor_permission_retry(poll_factory: tuple[TestClient, PollGitHub
 
 @pytest.mark.parametrize("actor,app,reason", LABEL_ACTOR_REFUSALS, ids=LABEL_ACTOR_REFUSAL_IDS)
 def test_label_actor_own_app_bot_or_unverifiable(
-    poll_factory: tuple[TestClient, PollGitHub], actor: Any, app: dict[str, Any] | None, reason: str
+    poll_factory: tuple[TestClient, PollGitHub],
+    actor: Any,
+    app: Any,
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("INFO", logger="curie_api.factory_poll_intake")
     _client, github = poll_factory
     github.label_actor, github.label_app = actor, app
     number = github.plant_issue()
     _run_once(github)
     assert _requests(number) == []
+    assert (REPO, number, reason) in [
+        record.args
+        for record in caplog.records
+        if record.name == "curie_api.factory_poll_intake"
+    ]
     github.label_actor, github.label_app = _user(), {"id": 52}
     # A new observation with a usable person must still make progress.
     github._etags["issues"] = '"reapplied"'
@@ -1940,3 +1952,17 @@ def test_label_actor_reader_preserves_app_review_refusal(
     github._etags["issue-comments"] = '"human-comment"'
     _run_once(github)
     assert len(_requests(number)) == 2
+
+
+@pytest.mark.parametrize("via", ["invalid", [], {}, {"id": "52"}, {"id": True}, {"id": 52.0}])
+def test_label_actor_reader_refuses_malformed_app(via: Any) -> None:
+    with pytest.raises(FeedbackIgnored) as refused:
+        label_actor({"actor": _user(), "performed_via_github_app": via}, app_id="51")
+    assert refused.value.code == "actor_unverifiable"
+
+
+@pytest.mark.parametrize("via", [None, {"id": 52}])
+def test_label_actor_reader_accepts_direct_or_other_app(via: Any) -> None:
+    assert label_actor({"actor": _user(), "performed_via_github_app": via}, app_id="51") == (
+        SENDER_ID, SENDER
+    )
