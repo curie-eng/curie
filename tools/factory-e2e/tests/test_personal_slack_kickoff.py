@@ -1572,6 +1572,7 @@ def _feed(pod: psk.RunnerPod, *records: Mapping[str, Any], now: float = T0) -> N
         line = json.dumps(record).encode()
         pod.harvest.feed(line)
         pod.watch.feed(line, now=now)
+        pod.trace.feed_harvest(line)
 
 
 def _fence_order(shell: FakeShell, start: int) -> list[str]:
@@ -1675,21 +1676,19 @@ def test_watchdog_fences_paid_starts_at_the_first_reached_bound(tmp_path: Path) 
     assert budget["paid_starts_fenced"] is True
     assert budget["workers_stopped_first"] is True
     assert ledger.gate() == "closed" and run.attempt_live is False
-    # The native CLI exits and the harvester reports sizes after it: the capture settles.
+    # The fence stopped the runner before it logged a turn end: even with the CLI gone and
+    # a size report after it, the capture is not affirmed and every slot stays unknown.
     _feed(
         pod,
         {"kind": "process", "count": 0, "processes": []},
         {"kind": "sync", "sizes": {path: len(calm) + len(heavy)}, "at": T0 + 60},
     )
+    pod.eof.set()
     run.settle()
-    rows = ledger.sessions()
-    assert (rows[0]["source"], rows[0]["output_tokens"], rows[0]["assistant_turns"]) == (
-        "native",
-        4 * 100 + 28 * 300,
-        32,
-    )
-    assert [row["source"] for row in rows[1:]] == ["not_started"] * 4
-    assert ledger.budget_state() == "exceeded"
+    assert [row["source"] for row in ledger.sessions()] == ["unknown"] * 5
+    capture = ledger.observations("budget")["capture"]
+    assert capture["affirmed"] is False and "no_turn_end" in capture["failures"]
+    assert ledger.budget_state() == "unknown"
     assert ledger.observations("grant")["role_models"] == {sks.IMPLEMENTER: [IMPLEMENTER_MODEL]}
     with pytest.raises(sks.Refusal) as refused:
         ledger.reserve([sks.IMPLEMENTER], now=T0 + 900)
@@ -2223,6 +2222,7 @@ def test_follower_attaches_a_pending_claim_pod_and_audits_on_the_main_thread(
     streams = [argv for argv in shell.spawned if "logs" in argv]
     # Two silent harvester exits and one silent log stream were respawned until output.
     assert (len(execs), len(streams)) == (3, 2)
+    assert json.loads(execs[0][-1])["interval"] == sks.CAPTURE_REPORT_SECONDS
     assert execs[0][execs[0].index("exec") :][:6] == [
         "exec",
         "-i",
@@ -2605,34 +2605,322 @@ def test_harvest_stream_settles_only_after_a_post_exit_size_report(tmp_path: Pat
     scrubber = sks.Scrubber()
     scrubber.hold(sks.HeldSecret(GRANT_MARKER)).clear()
     scan = sks.TokenScan(scrubber)
-    harvest, watch = sks.HarvestState(scan), sks.ProcessWatch()
+    harvest, watch, trace = sks.HarvestState(scan), sks.ProcessWatch(), sks.CaptureTrace()
     for line in result.stdout.splitlines():
         harvest.feed(line)
         watch.feed(line, now=T0 + 10)
+        trace.feed_harvest(line)
     assert isinstance(scan.channels["harvest"], sks.ChannelScan) and sks.scan_clean(scan)
     assert (harvest.container_credential or {}).get("credential") == "present"
     assert harvest.transcript_files() == files
     assert harvest.complete and watch.ran and not watch.exited
     assert watch.running and watch.started == T0 + 10
-    assert not sks.settled_capture(harvest, watch)  # the CLI still runs
     sizes = {name: len(data) for name, data in files.items() if name.endswith(".jsonl")}
-    exited = json.dumps({"kind": "process", "count": 0, "processes": []}).encode()
-    harvest.feed(exited)
-    watch.feed(exited, now=T0 + 20)
-    assert not sks.settled_capture(harvest, watch)  # no size report since the exit
-    report = json.dumps({"kind": "sync", "sizes": sizes, "at": T0}).encode()
-    harvest.feed(report)
-    watch.feed(report, now=T0 + 21)
-    assert sks.settled_capture(harvest, watch)
-    main = next(name for name in files if name.endswith(f"{SESSION}.jsonl"))
-    late = json.dumps(_file_record(main, len(files[main]), b"{}\n")).encode()
-    harvest.feed(late)
-    watch.feed(late, now=T0 + 22)
-    assert not sks.settled_capture(harvest, watch)  # bytes after the last size report
+    # The real program reports bytes read right after its read pass, then ends on its own
+    # deadline (once): the trace holds that report and the deadline end.
+    assert [reported for _at, reported in trace.reports] == [sizes]
+    assert trace.harvester_ended is True
+    failures = sks.capture_failures(
+        trace,
+        harvest.transcript_files(),
+        delivered=harvest.complete,
+        pod_gone=True,
+        request_terminal=True,
+        runner_pods=1,
+    )
+    assert {"harvester_deadline", "no_turn_end"} <= set(failures)
     facts = sks.attempt_facts([harvest.transcript_files()], not_before=T0 - 30)
     summary = {item["role"]: item for item in map(sks.session_summary, facts.sessions)}
     assert summary[sks.IMPLEMENTER]["output_tokens"] == 360
     assert summary[sks.PLAN_REVIEWER]["models"] == [REVIEWER_MODEL]
+
+
+TURN_END = T0 + 181.0
+
+
+def _final(
+    message_id: str, model: str, tokens: int, at: float, *, stop: str | None = "end_turn"
+) -> dict[str, Any]:
+    """An assistant record that ends a turn; ``stop=None`` writes a null stop reason."""
+
+    record = _assistant(message_id, model, tokens, at)
+    record["message"]["stop_reason"] = stop
+    return record
+
+
+def _agent_call(use_id: str, kind: str, at: float) -> dict[str, Any]:
+    record = _final(f"msg_{use_id}", IMPLEMENTER_MODEL, 40, at, stop="tool_use")
+    record["message"]["content"] = [
+        {"type": "tool_use", "id": use_id, "name": "Agent", "input": {"subagent_type": kind}}
+    ]
+    return record
+
+
+def _agent_result(use_id: str, agent: str, at: float) -> dict[str, Any]:
+    """The tool result the native CLI writes when a subagent finishes (toolUseResult)."""
+
+    record = _user(at)
+    record["message"]["content"] = [
+        {"type": "tool_result", "tool_use_id": use_id, "content": "review done"}
+    ]
+    record["toolUseResult"] = {"agentId": agent, "status": "completed"}
+    return record
+
+
+def _capture_files(
+    *, main_stop: str | None = "end_turn", plan_stop: str | None = "end_turn", diff: bool = True
+) -> dict[str, bytes]:
+    """Attempt 2's sanitized shape: the implementer's 17 turns and 7,024 output tokens, a
+    plan review of 4 turns and 682 tokens and a diff review of 3 turns and 901 tokens,
+    each transcript ending in its result frame."""
+
+    main = [
+        _user(0),
+        *_turns("msg_impl", IMPLEMENTER_MODEL, 14, 480, start=1),
+        _agent_call("toolu_plan", PLAN_KIND, 20),
+        _agent_result("toolu_plan", "plan01", 35),
+        _agent_call("toolu_diff", DIFF_KIND, 140),
+        _agent_result("toolu_diff", "diff01", 174),
+        _final("msg_impl_end", IMPLEMENTER_MODEL, 224, 180, stop=main_stop),
+    ]
+    plan = [
+        *_turns("msg_plan", REVIEWER_MODEL, 3, 150, start=21),
+        _final("msg_plan_end", REVIEWER_MODEL, 232, 34, stop=plan_stop),
+    ]
+    review = [
+        *_turns("msg_diff", REVIEWER_MODEL, 2, 300, start=141),
+        _final("msg_diff_end", REVIEWER_MODEL, 301, 173),
+    ]
+    reviewers = [("plan01", PLAN_KIND, plan), ("diff01", DIFF_KIND, review)]
+    return _pod_files(main, reviewers if diff else reviewers[:1])
+
+
+def _runner_log(kind: str, at: float) -> bytes:
+    """The runner's own turn record (curie_runner.session), in attempt 2's recorded shape."""
+
+    message = (
+        f"turn start session=agent-{SESSION} user=slack:{SENDER_USER}"
+        if kind == "start"
+        else f"turn end session=agent-{SESSION} status=awaiting-approval duration_ms=182890"
+    )
+    return json.dumps(
+        {
+            "logger": "curie_runner.session",
+            "message": message,
+            "service.name": "curie-runner",
+            "severity": "INFO",
+            "timestamp": dt.datetime.fromtimestamp(at, dt.UTC).isoformat(),
+        }
+    ).encode()
+
+
+def _report(at: float, sizes: Mapping[str, int]) -> bytes:
+    """The harvester's size report (``sync`` in personal_profile_support.HARVEST_PROGRAM)."""
+
+    return json.dumps({"kind": "sync", "sizes": dict(sizes), "at": round(at, 3)}).encode()
+
+
+def _capture_trace(
+    files: Mapping[str, bytes],
+    *,
+    after: Sequence[float] = (0.1, 0.2),
+    late_start: bool = False,
+    grow: bool = False,
+    drop: bool = False,
+    ended: bool = False,
+) -> sks.CaptureTrace:
+    """A runner pod's trace: turn start, reports while it ran, the turn end, then a report
+    at each ``after`` offset; ``grow`` lengthens the last one and ``drop`` omits a file."""
+
+    sizes = {name: len(data) for name, data in files.items() if name.endswith(".jsonl")}
+    trace = sks.CaptureTrace()
+    trace.feed_log(_runner_log("start", T0 + 1.0))
+    trace.feed_harvest(_report(T0 + 60, {name: size // 2 for name, size in sizes.items()}))
+    trace.feed_harvest(_report(TURN_END - 0.05, sizes))
+    trace.feed_log(_runner_log("end", TURN_END))
+    if late_start:
+        trace.feed_log(_runner_log("start", TURN_END + 0.15))
+    for index, offset in enumerate(after):
+        report = dict(sizes)
+        last = index == len(after) - 1
+        if grow and last:
+            report[next(iter(report))] += 120
+        if drop and last:
+            report.pop(next(iter(report)))
+        trace.feed_harvest(_report(TURN_END + offset, report))
+    if ended:
+        trace.feed_harvest(json.dumps({"kind": "end"}).encode())
+    return trace
+
+
+def _affirm(files: Mapping[str, bytes], trace: sks.CaptureTrace, **evidence: Any) -> list[str]:
+    values = {
+        "delivered": True,
+        "pod_gone": True,
+        "request_terminal": True,
+        "runner_pods": 1,
+        **evidence,
+    }
+    return sks.capture_failures(trace, files, **values)
+
+
+@pytest.mark.parametrize("stop", sorted(sks.FINAL_STOP_REASONS))
+def test_capture_is_affirmed_after_the_runner_turn_end_in_attempt_twos_shape(stop: str) -> None:
+    """Behavior: two matching size reports after the runner's turn-end record, whole
+    transcripts ending in a stop reason that means the model stopped, every subagent's
+    transcript, one deleted pod and a terminal request affirm the capture, and the usage
+    comes from the transcripts."""
+
+    files = _capture_files(main_stop=stop)
+    trace = _capture_trace(files)
+    assert _affirm(files, trace) == []
+    facts = sks.attempt_facts([files], not_before=T0 - 30)
+    observed = {
+        item["role"]: (item["output_tokens"], item["assistant_turns"])
+        for item in map(sks.session_summary, facts.sessions)
+    }
+    assert observed == {
+        sks.IMPLEMENTER: (7024, 17),
+        sks.PLAN_REVIEWER: (682, 4),
+        sks.DIFF_REVIEWER: (901, 3),
+    }
+    sanitized = trace.sanitized()
+    assert [run["count"] for run in sanitized["reports"]] == [1, 3]
+    assert sanitized["turns"] == [["start", T0 + 1.0], ["end", TURN_END]]
+    assert not any(name in json.dumps(sanitized) for name in files)
+
+
+@pytest.mark.parametrize(
+    ("files", "trace", "evidence", "failure"),
+    [
+        pytest.param(None, {"after": ()}, {}, "reports_after_turn_end", id="report-before-end"),
+        pytest.param(
+            None, {"late_start": True}, {}, "turn_started_after_turn_end", id="turn-after-end"
+        ),
+        pytest.param(None, {"grow": True}, {}, "growth_after_turn_end", id="growth-between"),
+        pytest.param(None, {"after": (0.1,)}, {}, "reports_after_turn_end", id="one-report"),
+        pytest.param(None, {"ended": True}, {}, "harvester_deadline", id="harvester-deadline"),
+        pytest.param(None, {"drop": True}, {}, "report_dropped_a_file", id="report-drops-file"),
+        pytest.param(
+            {"main_stop": "tool_use"}, {}, {}, "result_frame_missing", id="final-is-tool-use"
+        ),
+        pytest.param({"main_stop": None}, {}, {}, "result_frame_missing", id="null-stop"),
+        pytest.param({"plan_stop": None}, {}, {}, "result_frame_missing", id="subagent-incomplete"),
+        pytest.param({"diff": False}, {}, {}, "subagent_transcript_missing", id="no-subagent"),
+        pytest.param(
+            None, {}, {"request_terminal": False}, "request_not_terminal", id="never-terminal"
+        ),
+        pytest.param(None, {}, {"runner_pods": 2}, "runner_pods", id="further-runner-pod"),
+        pytest.param(None, {}, {"pod_gone": False}, "pod_not_deleted", id="pod-not-deleted"),
+        pytest.param(None, {}, {"delivered": False}, "bytes_not_delivered", id="undelivered"),
+    ],
+)
+def test_capture_is_not_affirmed_when_any_recorded_check_fails(
+    files: dict[str, Any] | None,
+    trace: dict[str, Any],
+    evidence: dict[str, Any],
+    failure: str,
+) -> None:
+    """Behavior: each check of the capture rule fails closed on its own."""
+
+    harvested = _capture_files(**(files or {}))
+    assert failure in _affirm(harvested, _capture_trace(harvested, **trace), **evidence)
+
+
+def test_capture_is_not_affirmed_for_a_cut_missing_or_unanswered_transcript() -> None:
+    """Behavior: a cut final line, a missing stop reason, an unanswered tool use and a
+    subagent result with no agent id each fail the transcript checks."""
+
+    files = _capture_files()
+    main = next(name for name in files if name.endswith(f"{SESSION}.jsonl"))
+    cut = {**files, main: files[main][:-1]}
+    assert "transcript_truncated" in sks.transcript_failures(cut)
+    records = [json.loads(line) for line in files[main].splitlines()]
+    del records[-1]["message"]["stop_reason"]
+    assert "result_frame_missing" in sks.transcript_failures({**files, main: _jsonl(records)})
+    asking = [*records[:-1], _agent_call("toolu_more", DIFF_KIND, 179)]
+    assert "tool_use_unanswered" in sks.transcript_failures({**files, main: _jsonl(asking)})
+    records = [json.loads(line) for line in files[main].splitlines()]
+    del records[-2]["toolUseResult"]
+    assert "subagent_transcript_missing" in sks.transcript_failures(
+        {**files, main: _jsonl(records)}
+    )
+
+
+def test_settlement_takes_native_usage_only_once_capture_is_affirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behavior: settlement affirms the capture from one pod's recorded streams, takes each
+    slot's usage from the transcripts and records the sanitized trace; the same streams
+    without the second report after the turn end leave every slot unknown."""
+
+    for after, sources in (
+        ((0.1, 0.2), ["native", "not_started", "native", "native", "not_started"]),
+        ((0.1,), ["unknown"] * 5),
+    ):
+        live = _live_run(tmp_path / str(len(after)))
+        run, ledger = live.run, live.ledger
+        ledger.begin_live(now=T0, grant_expires_at=T0 + 3 * 3600)
+        run.reservations = ledger.reserve(sks.ATTEMPT_ROLES, now=T0)
+        run.attempt_live, run.attempt_started = True, T0
+        pod = _runner_pod(run, "uid-1")
+        run.pods[pod.uid] = pod
+        files = _capture_files()
+        _feed(pod, {"kind": "process", "count": 1, "processes": []})
+        for name, data in files.items():
+            if name.endswith(".meta.json"):
+                encoded = base64.b64encode(data).decode()
+                _feed(pod, {"kind": "meta", "path": name, "data": encoded})
+            else:
+                _feed(pod, _file_record(name, 0, data))
+        reports = _capture_trace(files, after=after)
+        pod.trace.turns = reports.turns
+        for at, sizes in reports.reports:
+            _feed(pod, {"kind": "sync", "sizes": sizes, "at": at})
+        pod.eof.set()
+        monkeypatch.setattr(run, "requests_terminal", lambda: True)
+        monkeypatch.setattr(run, "pods_gone", lambda: {"uid-1": True})
+        run.settle()
+        rows = ledger.sessions()
+        assert [row["source"] for row in rows] == sources
+        capture = ledger.observations("budget")["capture"]
+        assert capture["affirmed"] is (len(after) == 2)
+        assert capture["aci_usage"] == "not_carried"
+        assert not any(name in json.dumps(capture) for name in files)
+        if len(after) == 2:
+            assert [(row["output_tokens"], row["assistant_turns"]) for row in rows] == [
+                (7024, 17),
+                (0, 0),
+                (682, 4),
+                (901, 3),
+                (0, 0),
+            ]
+        else:
+            assert capture["failures"] == ["reports_after_turn_end"]
+        ledger.close()
+
+
+def test_a_runner_pod_counts_as_gone_only_when_deleted_or_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behavior: a pod being deleted or absent from the listing is gone, a listed pod
+    without a deletion time is not, and an unreadable listing proves nothing."""
+
+    live = _live_run(tmp_path)
+    run = live.run
+    for uid in ("uid-1", "uid-2", "uid-3"):
+        run.pods[uid] = _runner_pod(run, uid, name=f"acme-claim-{uid}-runner")
+    listing = {
+        "items": [
+            {"metadata": {"uid": "uid-1", "deletionTimestamp": "2026-11-13T00:08:42Z"}},
+            {"metadata": {"uid": "uid-2"}},
+        ]
+    }
+    monkeypatch.setattr(run.kube, "json", lambda *_args, **_kw: listing)
+    assert run.pods_gone() == {"uid-1": True, "uid-2": False, "uid-3": True}
+    monkeypatch.setattr(run.kube, "json", lambda *_args, **_kw: {"kind": "Status"})
+    assert run.pods_gone() == {}
+    live.ledger.close()
 
 
 # --------------------------------------------------------------------------

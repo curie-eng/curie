@@ -1639,6 +1639,7 @@ class RunnerPod:
     watch: sks.ProcessWatch
     lock: threading.Lock
     eof: threading.Event
+    trace: sks.CaptureTrace = dataclasses.field(default_factory=sks.CaptureTrace)
     stderr: list[bytes] = dataclasses.field(default_factory=list)
     processes: list[subprocess.Popen[bytes]] = dataclasses.field(default_factory=list)
     checks: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -3268,6 +3269,7 @@ class LiveRun:
             sks.HARVEST_PROGRAM,
             sks.harvest_config(
                 nonce=self.nonce,
+                interval=sks.CAPTURE_REPORT_SECONDS,
                 max_seconds=sum(item.seconds for item in self.reservations) + STARTUP_SECONDS,
             ),
         )
@@ -3277,11 +3279,13 @@ class LiveRun:
             with observed.lock:
                 observed.harvest.feed(line)
                 observed.watch.feed(line, now=self.clock.now())
+                observed.trace.feed_harvest(line)
 
         def log(line: bytes) -> None:
             self.scan.scan("children", line)
             text = self.scrubber.scrub(line.decode(errors="replace").rstrip("\r\n"))
             with observed.lock:
+                observed.trace.feed_log(line)
                 observed.log_tail.append(text)
                 if sks.stderr_error_classes([line]):
                     observed.stderr.append(line)
@@ -3439,19 +3443,35 @@ class LiveRun:
         ]
 
     def quiescent(self) -> bool:
-        """Every request of the WorkItem ended and every native CLI exited and was captured.
+        """Every request of the WorkItem ended and every runner pod's harvester stream ended.
 
-        A runner pod may stay up idle after its turn; its CLI processes having
-        exited, followed by a size report, is what proves the capture complete.
+        The runner's CLI lives until the kernel deletes its pod, so the stream
+        ends with the pod; settlement reads what it reported until then.
         """
 
-        requests = self.request_rows()
-        if not requests or not all(row.get("terminal") for row in requests):
+        if not self.requests_terminal():
             return False
-        return all(
-            pod.eof.is_set() or (pod.watch.exited and pod.watch.synced_after_exit)
-            for pod in self.followed()
-        )
+        return all(pod.eof.is_set() for pod in self.followed())
+
+    def requests_terminal(self) -> bool:
+        requests = self.request_rows()
+        return bool(requests) and all(row.get("terminal") for row in requests)
+
+    def pods_gone(self) -> dict[str, bool]:
+        """For each followed runner pod's uid, whether it is deleted or being deleted."""
+
+        listing = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL)
+        items = listing.get("items") if isinstance(listing, dict) else None
+        if not isinstance(items, list):
+            return {}
+        present = {
+            str((pod.get("metadata") or {}).get("uid") or ""): bool(
+                (pod.get("metadata") or {}).get("deletionTimestamp")
+            )
+            for pod in items
+            if isinstance(pod, dict)
+        }
+        return {pod.uid: present.get(pod.uid, True) for pod in self.followed()}
 
     def watch_attempt(self) -> None:
         window = sum(item.seconds for item in self.reservations) + STARTUP_SECONDS
@@ -3465,10 +3485,34 @@ class LiveRun:
         self.safe(self.record_diagnostics, None)
         facts = self.safe(self.attempt_facts, None)
         pods = self.followed()
-        complete = bool(pods)
+        terminal = bool(self.safe(self.requests_terminal, False))
+        gone = self.safe(self.pods_gone, None) or {}
+        failures: set[str] = set() if pods else {"runner_pods"}
+        traces: list[dict[str, Any]] = []
         for pod in pods:
             with pod.lock:
-                complete = complete and sks.settled_capture(pod.harvest, pod.watch)
+                failures.update(
+                    sks.capture_failures(
+                        pod.trace,
+                        pod.harvest.transcript_files(),
+                        delivered=pod.harvest.complete and pod.eof.is_set(),
+                        pod_gone=gone.get(pod.uid) is True,
+                        request_terminal=terminal,
+                        runner_pods=len(pods),
+                    )
+                )
+                traces.append(pod.trace.sanitized())
+        self.ledger.record(
+            "budget",
+            "capture",
+            {
+                "affirmed": not failures,
+                "failures": sorted(failures),
+                "aci_usage": "not_carried",
+                "pods": traces,
+            },
+        )
+        complete = not failures
         sessions = facts.sessions if facts is not None else None
         settled = sks.settle_attempt(
             self.ledger,

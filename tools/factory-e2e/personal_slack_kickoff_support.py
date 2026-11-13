@@ -29,7 +29,7 @@ import stat
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from curie_internal import driver_declaration
@@ -1258,11 +1258,11 @@ def watchdog_breaches(
 
 @dataclasses.dataclass
 class ProcessWatch:
-    """The native CLI's lifetime from one harvester stream, for settlement and the deadline.
+    """The native CLI's lifetime from one harvester stream, for the watchdog's deadline.
 
-    Complete capture needs a size report taken after the CLI processes exited:
-    every transcript byte is written by then, so a matching report proves none
-    was missed. Reads the harvester's ``process`` and ``sync`` records.
+    Reads the harvester's ``process`` records. The runner holds one long-lived
+    session, so its CLI lives until the pod is deleted; settlement reads the
+    pod's ``CaptureTrace`` instead.
 
     ``started`` is the wall-clock time the running native process started: the
     caller's ``now`` when the process count went from 0 to above 0, and for
@@ -1272,7 +1272,6 @@ class ProcessWatch:
 
     ran: bool = False
     exited: bool = False
-    synced_after_exit: bool = False
     container_started: float | None = None
     started: float | None = None
     count: int = 0
@@ -1304,16 +1303,275 @@ class ProcessWatch:
                     if not self.ran and self.container_started is not None:
                         start = min(start, self.container_started)
                     self.started = start
-                self.ran, self.exited, self.synced_after_exit = True, False, False
+                self.ran, self.exited = True, False
             elif self.ran:
                 self.exited = True
             self.count = count
-        elif kind == "sync" and self.exited:
-            self.synced_after_exit = True
 
 
-def settled_capture(harvest: HarvestState, watch: ProcessWatch) -> bool:
-    return harvest.complete and watch.ran and watch.exited and watch.synced_after_exit
+# --------------------------------------------------------------------------
+# Capture affirmation (coordinator rulings of 2026-11-13)
+# --------------------------------------------------------------------------
+
+# The harvester's report interval. It reports right after each full read pass,
+# so two reports after the runner's turn end prove that a whole pass, started
+# after the turn end, found nothing new.
+CAPTURE_REPORT_SECONDS = 0.1
+CAPTURE_REPORTS_AFTER_TURN_END = 2
+# Stop reasons meaning the model stopped generating; anything else is incomplete.
+FINAL_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "max_tokens"})
+_AGENT_TOOLS = frozenset({"Agent", "Task"})
+_SYNTHETIC_MODEL = "<synthetic>"
+_UNATTRIBUTED_AGENT = "<unattributed>"
+# The runner's own turn records (curie_runner.session): "turn start session=..."
+# and "turn end session=... status=... duration_ms=...".
+_TURN_KINDS = (("turn start ", "start"), ("turn end ", "end"))
+
+
+def _json_object(line: bytes) -> dict[str, Any] | None:
+    try:
+        value = json.loads(line)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+@dataclasses.dataclass
+class CaptureTrace:
+    """What one runner pod's streams show about its capture. Guarded by the pod's lock.
+
+    ``reports`` holds each harvester size report as (taken at, sizes by path) in
+    stream order, ``turns`` each runner turn start or end as (kind, logged at) in
+    log order, and ``harvester_ended`` whether the harvester stopped on its own
+    deadline. Both times come from the runner container's clock.
+    """
+
+    reports: list[tuple[float, dict[str, int]]] = dataclasses.field(default_factory=list)
+    turns: list[tuple[str, float]] = dataclasses.field(default_factory=list)
+    harvester_ended: bool = False
+
+    def feed_harvest(self, line: bytes) -> None:
+        record = _json_object(line)
+        if record is None:
+            return
+        if record.get("kind") == "end":
+            self.harvester_ended = True
+            return
+        sizes, at = record.get("sizes"), record.get("at")
+        if (
+            record.get("kind") == "sync"
+            and isinstance(sizes, dict)
+            and all(isinstance(key, str) and type(value) is int for key, value in sizes.items())
+            and isinstance(at, (int, float))
+            and not isinstance(at, bool)
+        ):
+            self.reports.append((float(at), dict(sizes)))
+
+    def feed_log(self, line: bytes) -> None:
+        record = _json_object(line)
+        if record is None:
+            return
+        message, stamp = record.get("message"), record.get("timestamp")
+        if not isinstance(message, str) or not isinstance(stamp, str):
+            return
+        kind = next((name for prefix, name in _TURN_KINDS if message.startswith(prefix)), None)
+        if kind is None:
+            return
+        try:
+            moment = dt.datetime.fromisoformat(stamp)
+        except ValueError:
+            return
+        if moment.tzinfo is not None:
+            self.turns.append((kind, moment.timestamp()))
+
+    def sanitized(self) -> dict[str, Any]:
+        """Times and sizes only: each path becomes its digest, and identical consecutive
+        reports fold into one run."""
+
+        runs: list[dict[str, Any]] = []
+        for at, sizes in self.reports:
+            keyed = {ref_digest(path): size for path, size in sorted(sizes.items())}
+            if runs and runs[-1]["sizes"] == keyed:
+                runs[-1]["last_at"] = at
+                runs[-1]["count"] += 1
+            else:
+                runs.append({"first_at": at, "last_at": at, "count": 1, "sizes": keyed})
+        return {
+            "reports": runs,
+            "turns": [[kind, at] for kind, at in self.turns],
+            "harvester_ended": self.harvester_ended,
+        }
+
+
+def capture_failures(
+    trace: CaptureTrace,
+    files: Mapping[str, bytes],
+    *,
+    delivered: bool,
+    pod_gone: bool,
+    request_terminal: bool,
+    runner_pods: int,
+) -> list[str]:
+    """Why an attempt's capture is not affirmed complete; empty when it is. Pure.
+
+    The coordinator's capture rule of 2026-11-13, anchored on the runner's last
+    turn-end record: a completed request turns terminal only after its pull
+    request opens, which is after the pod and its harvester are gone. Each
+    check reads recorded evidence:
+
+    1. The attempt ran in exactly one runner pod, the runner logged a turn end,
+       no turn started after it, and the request reached its terminal state.
+    2. Every transcript, subagent transcripts included, ends in a complete
+       result frame, every tool use has its result, and every subagent a result
+       names has its own transcript (``transcript_failures``).
+    3. At least two size reports were taken after the turn end and all of them
+       match, so a full read pass started after the turn end found nothing new.
+    4. No report drops a file an earlier one listed, the reassembled bytes equal
+       the last report (``delivered``), the harvester never stopped on its own
+       deadline, and the pod was deleted when the stream ended.
+
+    The runner's turn-end record carries no usage, so the usage agreement check
+    has nothing to compare. Any failure leaves every slot unknown.
+    """
+
+    failures: set[str] = set()
+    if runner_pods != 1:
+        failures.add("runner_pods")
+    if not request_terminal:
+        failures.add("request_not_terminal")
+    ends = [at for kind, at in trace.turns if kind == "end"]
+    if not ends:
+        failures.add("no_turn_end")
+    else:
+        anchor = ends[-1]
+        if trace.turns[-1][0] != "end" or any(
+            kind == "start" and at >= anchor for kind, at in trace.turns
+        ):
+            failures.add("turn_started_after_turn_end")
+        after = [sizes for at, sizes in trace.reports if at > anchor]
+        if len(after) < CAPTURE_REPORTS_AFTER_TURN_END:
+            failures.add("reports_after_turn_end")
+        if any(sizes != after[0] for sizes in after):
+            failures.add("growth_after_turn_end")
+    listed: set[str] = set()
+    for _at, sizes in trace.reports:
+        if not listed <= sizes.keys():
+            failures.add("report_dropped_a_file")
+        listed |= sizes.keys()
+    if trace.harvester_ended:
+        failures.add("harvester_deadline")
+    if not delivered:
+        failures.add("bytes_not_delivered")
+    if not pod_gone:
+        failures.add("pod_not_deleted")
+    failures.update(transcript_failures(files))
+    return sorted(failures)
+
+
+def _transcript_records(data: bytes) -> tuple[list[dict[str, Any]], bool]:
+    """A transcript's records, and whether every line, the last included, is whole."""
+
+    *lines, tail = data.split(b"\n")
+    records = [_json_object(line) for line in lines if line.strip()]
+    kept = [record for record in records if record is not None]
+    return kept, not tail and len(kept) == len(records)
+
+
+def _items(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return [item for item in content if isinstance(item, dict)] if isinstance(content, list) else []
+
+
+def _ends_in_result_frame(records: Sequence[Mapping[str, Any]]) -> bool:
+    """The last assistant record says the model stopped generating, with its usage."""
+
+    replies = [record for record in records if record.get("type") == "assistant"]
+    message = replies[-1].get("message") if replies else None
+    if not isinstance(message, dict):
+        return False
+    usage = message.get("usage")
+    tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
+    return (
+        message.get("stop_reason") in FINAL_STOP_REASONS
+        and message.get("model") != _SYNTHETIC_MODEL
+        and type(tokens) is int
+        and tokens >= 0
+    )
+
+
+def _unanswered_tool_uses(records: Sequence[Mapping[str, Any]]) -> bool:
+    uses = {
+        item.get("id")
+        for record in records
+        if record.get("type") == "assistant"
+        for item in _items(record)
+        if item.get("type") == "tool_use"
+    }
+    answered = {
+        item.get("tool_use_id")
+        for record in records
+        if record.get("type") == "user"
+        for item in _items(record)
+        if item.get("type") == "tool_result"
+    }
+    return bool(uses - answered)
+
+
+def _started_subagents(records: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The agent id of every subagent tool use that ran; a refused start is an error."""
+
+    agent_uses = {
+        item.get("id")
+        for record in records
+        for item in _items(record)
+        if item.get("type") == "tool_use" and item.get("name") in _AGENT_TOOLS
+    }
+    started: list[str] = []
+    for record in records:
+        for item in _items(record):
+            if (
+                item.get("type") != "tool_result"
+                or item.get("tool_use_id") not in agent_uses
+                or item.get("is_error") is True
+            ):
+                continue
+            result = record.get("toolUseResult")
+            agent = result.get("agentId") if isinstance(result, dict) else None
+            started.append(agent if isinstance(agent, str) else _UNATTRIBUTED_AGENT)
+    return started
+
+
+def transcript_failures(files: Mapping[str, bytes]) -> list[str]:
+    """Why the harvested transcripts are not whole: a cut line, a missing result frame, an
+    unanswered tool use, or a started subagent with no transcript. Pure."""
+
+    failures: set[str] = set()
+    mains: dict[str, list[dict[str, Any]]] = {}
+    subagents: dict[str, list[dict[str, Any]]] = {}
+    for name, data in files.items():
+        parts = PurePosixPath(name).parts
+        if "projects" not in parts or not name.endswith(".jsonl"):
+            continue
+        records, whole = _transcript_records(data)
+        if not whole:
+            failures.add("transcript_truncated")
+        if "subagents" in parts:
+            subagents[name.removesuffix(".jsonl")] = records
+        else:
+            mains[name.removesuffix(".jsonl")] = [r for r in records if not r.get("isSidechain")]
+    if not mains:
+        failures.add("no_main_transcript")
+    for records in (*mains.values(), *subagents.values()):
+        if not _ends_in_result_frame(records):
+            failures.add("result_frame_missing")
+        if _unanswered_tool_uses(records):
+            failures.add("tool_use_unanswered")
+    for stem, records in mains.items():
+        for agent in _started_subagents(records):
+            if f"{stem}/subagents/agent-{agent}" not in subagents:
+                failures.add("subagent_transcript_missing")
+    return sorted(failures)
 
 
 _TOOL_SEARCH = "ToolSearch"

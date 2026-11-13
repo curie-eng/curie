@@ -1079,6 +1079,25 @@ the attempt settles and until the disconnect's teardown completes, any runner
 the driver did not follow is an unreserved paid start and fences everything.
 ToolSearch calls in the transcripts are counted and reported with the budget.
 
+Settlement takes native usage only when the capture is affirmed complete
+(coordinator rulings of 2026-11-13, a recorded loosening). The runner holds one
+long-lived session, so its CLI never exits before the kernel deletes the pod,
+and a completed request turns terminal only after its pull request opens, which
+is after the pod is gone. The anchor is therefore the runner's own turn-end log
+record, on the same container clock as the harvester's size reports, which run
+every 0.1 s right after each read pass. The capture is affirmed only when the
+attempt ran in one runner pod, no turn started after the last turn end, and the
+request reached terminal; every transcript, subagent transcripts included, is
+whole and ends in an assistant record whose stop reason is `end_turn`,
+`stop_sequence` or `max_tokens`, every tool use has its result, and every
+subagent a result names has its transcript; at least two size reports after the
+turn end all match; no report drops a file; the reassembled bytes equal the
+last report; the harvester never stopped on its own deadline; and the pod was
+deleted when its stream ended. The turn-end record carries no usage, so there
+is no ACI usage to compare. Any failed check leaves every slot unknown and
+charged its full share. The ledger records the verdict and a sanitized trace
+(report times and sizes by path digest, turn times) as `budget.capture`.
+
 ### The grant probe
 
 Right before the first reservation, one turn on `claude-haiku-5-5` runs with an
