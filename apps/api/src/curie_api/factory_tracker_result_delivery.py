@@ -27,7 +27,8 @@ comment carries `result_marker`, ``curie-tracker-result:<request id>``, one per
 source execution request and distinct from the status comment marker
 (`curie_api.factory_comment_text.marker_for`). Model text cannot plant any of
 them: every rendered text has ``<!--`` written as ``&lt;!--``, after
-`redact_factory_comment`.
+`redact_factory_comment`. Nor can it mention anyone: every ``@`` in it is
+followed by U+200B, so a model-written ``@login`` never notifies that account.
 
 Fences, checked in this order at submission, again immediately before every
 tracker write of an attempt, and in the transaction that records delivery
@@ -545,9 +546,16 @@ async def _existing(session: AsyncSession, grant_id: uuid.UUID, digest: str) -> 
 
 
 def _publishable(text: str) -> str:
-    """Redacted, with no HTML comment opener left to carry a marker."""
+    """Redacted, with no HTML comment opener left to carry a marker, and no
+    live mention.
 
-    return redact_factory_comment(text).replace("<!--", "&lt;!--")
+    The tracker posts this text under the App's identity, so a model-written
+    ``@login`` would notify that account. A U+200B after every ``@`` keeps the
+    text readable and stops the mention, as `factory_notices` does for the
+    agent's last message.
+    """
+
+    return redact_factory_comment(text).replace("<!--", "&lt;!--").replace("@", "@\u200b")
 
 
 def _fenced(text: str) -> str:
