@@ -497,6 +497,7 @@ def test_duplicate_dm_creation_never_reposts_or_reregisters(make_harness: Any) -
     asyncio.run(run())
 
 
+@pytest.mark.usefixtures("fresh_agent_metric_labels")
 @pytest.mark.parametrize(
     "mode",
     [
