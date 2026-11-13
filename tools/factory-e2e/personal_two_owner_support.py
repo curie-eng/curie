@@ -18,7 +18,10 @@ can be tested without a cluster:
 7. the OIDC login flow with an injected opener;
 8. issue fixtures, and the evidence contract and judges;
 9. the native-process interruption program and the per-claim grant-delivery
-   readers (digests and names only).
+   readers (digests and names only);
+10. the recovery evidence each interruption is judged on: the read-only
+    workspace program, committed-state restoration against the owned forge,
+    the replayed history marker and the old runtime's epoch confirmation.
 
 Nothing here touches a cluster, a forge or a network. The only IO is the
 SQLite ledger file, the inputs file and the files it names (stat and the
@@ -54,6 +57,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import personal_owner_enforcement_support as poes  # noqa: E402
 import personal_profile_support as pps  # noqa: E402
 
 # --------------------------------------------------------------------------
@@ -2407,8 +2411,11 @@ def _restarts() -> dict[str, str]:
     template = {
         "lineage_before": "request and native session lineage recorded before the interruption",
         "marker_before": "the durable transcript conversation marker was present before",
-        "old_runtime_absent": "the old runtime (pod, worker pod or CLI identity) is absent",
-        "termination_epoch": "termination evidence names the current runtime epoch",
+        "old_runtime_absent": "the old runtime is observed absent: its pod UID, the old worker "
+        "pod UIDs, or the held CLI after its container restarted or its pod went",
+        "termination_epoch": "the epoch the old runtime held is confirmed: the WorkItem's "
+        "binding moved past it (pod) or the request still binds it under the fresh runtime "
+        "(worker, process); a terminal status alone never passes",
         "fresh_runtime": "a fresh runtime runs after (new pod UID, worker pod UID, or CLI "
         "pid plus starttime)",
         "same_work_item": "the WorkItem id is unchanged",
@@ -2416,7 +2423,12 @@ def _restarts() -> dict[str, str]:
         "owner_unchanged": "the immutable owner principal and tenant are unchanged",
         "generation_unchanged": "the authorized enrollment generation is unchanged",
         "grant_unchanged": "the new claim's delivery still matches the same owner's own grant",
-        "marker_after": "the durable transcript marker is present after",
+        "marker_after": "the durable marker is in the fresh native session's own transcript "
+        "(the product's history replay), not only in central storage",
+        "committed_head_restored": "the workspace HEAD equals the branch's committed head on "
+        "the owned forge, before (where a runner existed) and in the fresh runtime",
+        "committed_files_restored": "every committed blob's SHA-256 equals the forge's before "
+        "and after, and the fresh checkout holds them outside its uncommitted paths",
         "continued_native": "native execution continued after (a new native tool observation)",
         "usage_settled": "terminal capture settled the interrupted session's usage as known",
     }
@@ -2436,6 +2448,40 @@ def _restarts() -> dict[str, str]:
             "worker_candidate_image": "the replacement worker pod runs the candidate worker image",
             "worker_owner_lost_safe": "B's request stayed owner-lost-safe (publication "
             "succeeded) across the worker restart",
+        }
+    )
+    return keys
+
+
+def _restart_observations() -> dict[str, str]:
+    """AC 5's observations (coordinator decision 2): recorded, never required."""
+
+    keys = {
+        f"{kind}_{key}": f"{INTERRUPTIONS[kind].split(';')[0]}: {meaning}"
+        for kind in INTERRUPTIONS
+        for key, meaning in {
+            "marker_stored_after": "the marker's record is still in central storage after "
+            "(storage, not the replayed history)",
+            "git_status_after": "the fresh runtime's porcelain status before its first prompt "
+            "release",
+        }.items()
+    }
+    for kind in ("pod", "process"):
+        keys[f"{kind}_git_status_before"] = "the interrupted runtime's porcelain status"
+        keys[f"{kind}_uncommitted_restored"] = (
+            "uncommitted edits in the fresh runtime (restored, not_restored or none_before); "
+            "Not met: #5541, never claimed"
+        )
+    keys.update(
+        {
+            "process_recovery": "where B-r2 recovered: in_place (same pod, container "
+            "restarted) or new_pod (a new pod UID)",
+            "process_same_pod": "B-r2 ran in B-r1's pod",
+            "process_container_restarted": "B-r1's runner container restarted in place",
+            "pod_termination_recorded": "A1's request carries a recorded termination "
+            "observation (a publication_denied request owes none)",
+            "worker_runtime_owner_moved": "B's request names the new worker's consumer (the "
+            "product rewrites it only at a start or a termination claim)",
         }
     )
     return keys
@@ -2671,6 +2717,10 @@ COMPARISONS: dict[str, dict[str, tuple[str, int]]] = {
 NOT_MET: dict[str, list[str]] = {
     "restarts": ["uncommitted workspace restoration: Not met, tracked in #5541"]
 }
+#: Recorded and reported under ``observed``, never required: same pod, an
+#: in-place container restart and uncommitted files are observations (AC 5,
+#: coordinator decision 2); the uncommitted ones are the #5541 Not met item.
+OBSERVATIONS: dict[str, dict[str, str]] = {"restarts": _restart_observations()}
 #: The unpaid rehearsal's summary keys (``judge(ledger, "rehearsal")``).
 REHEARSAL_EXPECTED: dict[str, str] = {
     "install_no_runner_grant": "the install rendered no runner grant env and "
@@ -2870,25 +2920,30 @@ def judge(ledger: TwoOwnerLedger, criterion: str) -> dict[str, Any]:
     comparison; a missing, None or other value fails. ``all`` runs every
     criterion. A rehearsal ledger passes no live criterion: each answers
     ``live_ledger: False``, while ``cleanup`` and ``rehearsal`` judge it.
-    ``not_met`` lists what is reported Not met and never fails the verdict.
+    ``not_met`` lists what is reported Not met and never fails the verdict;
+    ``observed`` carries the recorded ``OBSERVATIONS`` keys, which never fail
+    it either.
     """
 
     if criterion == "all":
         checks: dict[str, bool] = {}
         counts: dict[str, int] = {}
         not_met: list[str] = []
+        observed: dict[str, Any] = {}
         names = (*CRITERIA, "rehearsal") if ledger.is_rehearsal() else CRITERIA
         for name in names:
             result = judge(ledger, name)
             checks.update({f"{name}.{key}": value for key, value in result["checks"].items()})
             counts.update({f"{name}.{key}": value for key, value in result["counts"].items()})
             not_met.extend(result["not_met"])
+            observed.update({f"{name}.{key}": value for key, value in result["observed"].items()})
         return {
             "criterion": "all",
             "verdict": "pass" if checks and all(checks.values()) else "fail",
             "checks": checks,
             "counts": counts,
             "not_met": not_met,
+            "observed": observed,
         }
     if criterion == "rehearsal":
         checks, counts = _judge_rehearsal(ledger)
@@ -2902,12 +2957,16 @@ def judge(ledger: TwoOwnerLedger, criterion: str) -> dict[str, Any]:
         checks, counts = _judge_cleanup(ledger)
     else:
         checks, counts = _judge_expected(ledger, criterion)
+    recorded = ledger.observations(criterion)
     return {
         "criterion": criterion,
         "verdict": "pass" if checks and all(checks.values()) else "fail",
         "checks": checks,
         "counts": counts,
         "not_met": list(NOT_MET.get(criterion, [])),
+        "observed": {
+            key: recorded[key] for key in OBSERVATIONS.get(criterion, {}) if key in recorded
+        },
     }
 
 
@@ -3529,3 +3588,347 @@ def custody_secret_matches(row: Mapping[str, Any], listed: bytes, *, namespace: 
     enrollment = uuid.UUID(str(row["enrollment_id"])).hex
     expected = [name, str(row["secret_uid"]), "curie", "true", enrollment, str(row["generation"])]
     return lines[0].strip().split("|") == expected
+
+
+# --------------------------------------------------------------------------
+# L. Recovery evidence: the workspace, the replayed history and the epoch
+# --------------------------------------------------------------------------
+
+#: The chart runner's repository workspace: the chart's default workspace
+#: mount, which #5378's WORKSPACE_PROGRAM reads too.
+RUNNER_WORKSPACE = poes.WORKSPACE_MOUNT
+#: Each interruption's fresh runtime, by group. Its workspace is read when the
+#: driver adopts its pod, before the gate stream opens, so before any prompt
+#: is released and before the model could change anything.
+RECOVERED_GROUPS = {"a2": "pod", "b-r1": "worker", "b-r2": "process"}
+WORKSPACE_KEYS = frozenset({"head", "files", "committed", "status", "uncommitted", "nonce_paths"})
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+# Run as ``kubectl exec <pod> -c runner -- python3 -c WORKSPACE_PROGRAM
+# <workspace> <nonce>``. It is #5378's WORKSPACE_PROGRAM
+# (personal_owner_enforcement.py: HEAD, the SHA-256 of every tracked file and
+# the porcelain status), changed only where this scenario needs it:
+# 1. it never writes. The runtime it reads continues from this workspace and B's
+#    repair publishes from it, so #5378's planted untracked nonce file would
+#    enter that publication; the uncommitted observation is instead the run's
+#    own issue nonce in the uncommitted paths, and their SHA-256;
+# 2. it also hashes every blob of HEAD's tree (``committed``), the committed
+#    state any uncommitted edit sits on, so a runtime with edits still shows it;
+# 3. git runs with a minimal environment, never the container's, and reads no
+#    system or global configuration (HOME is the runner's writable /tmp) and
+#    takes no optional lock, so ``status`` never rewrites the index;
+# 4. the workspace path is an argument, so the program runs unchanged against a
+#    local repository in the tests.
+# Importing #5378's driver for its constant would also import its harness
+# (factory_e2e and tls_code_host), which the two-owner driver never loads.
+WORKSPACE_PROGRAM = r"""
+import hashlib, json, os, subprocess, sys
+root, nonce = sys.argv[1], sys.argv[2].encode()
+env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "GIT_CONFIG_NOSYSTEM": "1",
+       "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C",
+       "GIT_OPTIONAL_LOCKS": "0"}
+git = ["git", "-c", "safe.directory=" + root, "-C", root]
+
+
+def run(*args, data=None):
+    try:
+        done = subprocess.run(
+            git + list(args), input=data, capture_output=True, env=env, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def names(raw):
+    return [item.decode("utf-8", "replace") for item in (raw or b"").split(b"\0") if item]
+
+
+def content(path):
+    full = os.path.join(root, path)
+    try:
+        if os.path.islink(full):
+            return os.readlink(full).encode()
+        if not os.path.isfile(full):
+            return None
+        with open(full, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def digest(data):
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+state = {"head": None, "files": {}, "committed": {}, "status": None,
+         "uncommitted": {}, "nonce_paths": []}
+head = run("rev-parse", "--verify", "HEAD")
+if head is not None:
+    state["head"] = head.decode().strip()
+    for path in names(run("ls-files", "-z")):
+        state["files"][path] = digest(content(path))
+    tree = names(run("ls-tree", "-r", "-z", "--name-only", "HEAD"))
+    query = "".join("HEAD:" + path + "\n" for path in tree).encode()
+    out = run("cat-file", "--batch", data=query) or b""
+    at = 0
+    for path in tree:
+        end = out.find(b"\n", at)
+        if end < 0:
+            break
+        header = out[at:end].split()
+        at = end + 1
+        if len(header) != 3 or not header[2].isdigit():
+            continue
+        size = int(header[2])
+        if header[1] == b"blob":
+            state["committed"][path] = hashlib.sha256(out[at:at + size]).hexdigest()
+        at += size + 1
+    status = run("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if status is not None:
+        fields = status.split(b"\0")
+        entries = []
+        index = 0
+        while index < len(fields):
+            item = fields[index]
+            index += 1
+            if len(item) < 4:
+                continue
+            code = item[:2].decode("utf-8", "replace")
+            entries.append([code, item[3:].decode("utf-8", "replace")])
+            if code[0] in "RC" and index < len(fields):
+                entries.append([code, fields[index].decode("utf-8", "replace")])
+                index += 1
+        state["status"] = sorted(entries)
+        found = set()
+        for _code, path in entries:
+            data = content(path)
+            state["uncommitted"][path] = digest(data)
+            if nonce and data is not None and nonce in data:
+                found.add(path)
+        state["nonce_paths"] = sorted(found)
+print(json.dumps(state, sort_keys=True))
+"""
+
+
+def _digest_map(value: Any) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(path, str)
+        and path
+        and (digest is None or (isinstance(digest, str) and _SHA256_HEX.fullmatch(digest)))
+        for path, digest in value.items()
+    )
+
+
+def workspace_state(stdout: bytes) -> dict[str, Any] | None:
+    """WORKSPACE_PROGRAM's one line, or None for anything else. Pure.
+
+    Exactly one non-blank JSON line with exactly WORKSPACE_KEYS: a 40-hex HEAD
+    or None, three path-to-SHA-256 (or None) maps, the porcelain status as
+    ``[code, path]`` pairs or None, and the sorted nonce paths.
+    """
+
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    try:
+        value = json.loads(lines[0])
+    except ValueError:
+        return None
+    if not isinstance(value, dict) or set(value) != WORKSPACE_KEYS:
+        return None
+    head, status, nonce_paths = value["head"], value["status"], value["nonce_paths"]
+    if head is not None and not (isinstance(head, str) and pps.is_commit_sha(head)):
+        return None
+    if not all(_digest_map(value[key]) for key in ("files", "committed", "uncommitted")):
+        return None
+    if status is not None and not (
+        isinstance(status, list)
+        and all(
+            isinstance(entry, list)
+            and len(entry) == 2
+            and all(isinstance(part, str) and part for part in entry)
+            for entry in status
+        )
+    ):
+        return None
+    if not isinstance(nonce_paths, list) or not all(isinstance(p, str) for p in nonce_paths):
+        return None
+    return copy.deepcopy(value)
+
+
+def changed_paths(state: Mapping[str, Any]) -> set[str] | None:
+    """The paths a workspace's porcelain status names (its uncommitted edits). Pure."""
+
+    status = state.get("status")
+    if not isinstance(status, list):
+        return None
+    return {str(entry[1]) for entry in status}
+
+
+def workspace_restoration(
+    source: Mapping[str, Any],
+    before: Mapping[str, Any] | None,
+    after: Mapping[str, Any] | None,
+) -> dict[str, bool]:
+    """Whether the fresh runtime's workspace holds the branch's committed state. Pure.
+
+    ``source`` is the branch head on the owned forge and the SHA-256 of each
+    blob in its tree; ``before`` the interrupted runtime's workspace (None
+    where no runner existed during the interruption, the worker stop) and
+    ``after`` the fresh runtime's, read before its first prompt release. HEAD
+    and the committed tree's blobs go through #5378's
+    ``poes.committed_restoration`` on both sides, so an uncommitted edit counts
+    neither for nor against them. The fresh checkout must also hold exactly
+    the committed bytes in every tracked file its status does not name: a
+    named path is an uncommitted edit, observed separately (#5541).
+    """
+
+    if not isinstance(after, Mapping):
+        return {"committed_head_restored": False, "committed_files_restored": False}
+
+    def committed(state: Mapping[str, Any]) -> dict[str, Any]:
+        return {"head": state.get("head"), "files": state.get("committed")}
+
+    sides = poes.committed_restoration(
+        source, committed(before if isinstance(before, Mapping) else after), committed(after)
+    )
+    files = source.get("files")
+    tracked = after.get("files")
+    changed = changed_paths(after)
+    checkout = (
+        isinstance(files, Mapping)
+        and bool(files)
+        and isinstance(tracked, Mapping)
+        and changed is not None
+        and all(
+            tracked.get(path) == digest for path, digest in files.items() if path not in changed
+        )
+        and all(path in files or path in changed for path in tracked)
+    )
+    return {
+        "committed_head_restored": sides["committed_head_restored"],
+        "committed_files_restored": sides["committed_files_restored"] and checkout,
+    }
+
+
+def uncommitted_restoration(
+    before: Mapping[str, Any] | None, after: Mapping[str, Any] | None
+) -> str:
+    """Observation only (Not met: #5541): whether uncommitted edits came back. Pure.
+
+    ``none_before`` when the interrupted workspace was unread or had no
+    uncommitted path, ``restored`` when the fresh one holds the same paths with
+    the same bytes, else ``not_restored``.
+    """
+
+    if not isinstance(before, Mapping) or not before.get("uncommitted"):
+        return "none_before"
+    if isinstance(after, Mapping) and after.get("uncommitted") == before.get("uncommitted"):
+        return "restored"
+    return "not_restored"
+
+
+def forge_tree_paths(body: Any) -> list[str] | None:
+    """Every blob path of a recursive ``GET /repos/{repo}/git/trees/{sha}`` answer. Pure.
+
+    A truncated or malformed listing, or one with no blob, is None: the
+    committed source cannot be read whole, so nothing compares equal to it.
+    """
+
+    if not isinstance(body, dict) or body.get("truncated") is not False:
+        return None
+    tree = body.get("tree")
+    if not isinstance(tree, list):
+        return None
+    paths: list[str] = []
+    for entry in tree:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            return None
+        if entry.get("type") == "blob":
+            paths.append(entry["path"])
+    return sorted(paths) or None
+
+
+def marker_replayed(files: Mapping[str, bytes], marker: str) -> bool:
+    """Whether a main native transcript of a runtime holds ``marker``. Pure.
+
+    ``files`` are the transcripts harvested from the runtime that continued,
+    past any earlier runtime's bytes in the same container. The marker is
+    appended to the durable thread before the interruption, so finding it here
+    means the product replayed that history into the fresh native session;
+    reading central storage proves nothing about the runtime. Subagent
+    transcripts (under ``subagents``) never carry the conversation, and an
+    empty marker matches nothing.
+    """
+
+    if not marker:
+        return False
+    needle = marker.encode()
+    return any(
+        path.endswith(".jsonl") and "subagents" not in PurePosixPath(path).parts and needle in data
+        for path, data in files.items()
+    )
+
+
+def successor_epoch_confirmed(
+    old: Mapping[str, Any], new: Mapping[str, Any], *, held_epoch: Any, claim: str
+) -> bool:
+    """The WorkItem's runtime binding moved past the epoch an interrupted runtime held. Pure.
+
+    For the pod recreation. ``old`` is the interrupted runtime's request, read
+    after the fresh runtime bound; ``new`` the fresh runtime's own request,
+    read while it runs; ``held_epoch`` the epoch the old runtime held when it
+    was observed; ``claim`` the claim the fresh pod serves. The old request
+    started, binds no live runtime any more (not waiting, running or
+    stopping) and kept or advanced that epoch; a later request of the same
+    WorkItem started on the fresh claim at its own epoch under a runtime
+    owner. A terminal status alone never confirms it.
+    """
+
+    if type(held_epoch) is not int or held_epoch < 1 or not claim:
+        return False
+    old_epoch, new_epoch = old.get("runtime_epoch"), new.get("runtime_epoch")
+    old_sequence, new_sequence = old.get("sequence"), new.get("sequence")
+    status = old.get("status")
+    return (
+        old.get("started") is True
+        and isinstance(status, str)
+        and status not in (*poes.ACTIVE_REQUEST_STATUSES, "queued")
+        and type(old_epoch) is int
+        and old_epoch >= held_epoch
+        and bool(old.get("id"))
+        and new.get("id") != old.get("id")
+        and bool(new.get("work_item_id"))
+        and new.get("work_item_id") == old.get("work_item_id")
+        and type(old_sequence) is int
+        and type(new_sequence) is int
+        and new_sequence > old_sequence
+        and new.get("status") == "running"
+        and new.get("started") is True
+        and new.get("runtime_claim_name") == claim
+        and type(new_epoch) is int
+        and new_epoch >= 1
+        and bool(new.get("runtime_owner"))
+    )
+
+
+def current_epoch_confirmed(row: Mapping[str, Any], *, request_id: str, held_epoch: Any) -> bool:
+    """The request still binds the epoch its interrupted runtime held, under the fresh one. Pure.
+
+    For the worker restart: a CI continuation adopts the same running request
+    at the same epoch (the API's heartbeat refuses any other), so the same
+    request, still running at exactly the held epoch, shows that no
+    termination claim or owner-lost successor superseded the old runtime's
+    lease. The process interruption's equivalent is #5378's
+    ``poes.process_interruption_checks``.
+    """
+
+    return (
+        type(held_epoch) is int
+        and held_epoch >= 1
+        and bool(request_id)
+        and row.get("id") == request_id
+        and row.get("status") == "running"
+        and row.get("runtime_epoch") == held_epoch
+    )

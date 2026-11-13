@@ -23,6 +23,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import hashlib
 import json
 import os
 import queue
@@ -2489,6 +2490,7 @@ def test_judges_pass_on_a_complete_ledger(tmp_path: Path) -> None:
     every = pto.judge(ledger, "all")
     assert every["verdict"] == "pass"
     assert every["not_met"] == ["uncommitted workspace restoration: Not met, tracked in #5541"]
+    assert every["observed"] == {}
     assert pto.judge(ledger, "restarts")["not_met"] == every["not_met"]
     budget = pto.judge(ledger, "budget")["counts"]
     assert budget["sessions"] == 16 and budget["output_tokens"] == 20564
@@ -2807,6 +2809,7 @@ def test_rehearsal_ledger_passes_no_live_criterion(tmp_path: Path) -> None:
                 "checks": {"live_ledger": False},
                 "counts": {},
                 "not_met": pto.NOT_MET.get(criterion, []),
+                "observed": {},
             }
     rehearsal = pto.judge(ledger, "rehearsal")
     assert rehearsal["verdict"] == "pass" and rehearsal["checks"]["no_native_sessions"] is True
@@ -2857,8 +2860,11 @@ def test_every_criterion_has_expected_keys_and_meanings() -> None:
             "lineage_before",
             "marker_before",
             "old_runtime_absent",
+            "termination_epoch",
             "fresh_runtime",
             "marker_after",
+            "committed_head_restored",
+            "committed_files_restored",
         ):
             assert f"{kind}_{key}" in pto.EXPECTED["restarts"]
 
@@ -3452,3 +3458,362 @@ def test_custody_secret_matches_the_published_row_name_uid_and_labels() -> None:
         listed + b"\n" + listed,
     ):
         assert not pto.custody_secret_matches(row, line, namespace=GRANT_NAMESPACE), line
+
+
+# --------------------------------------------------------------------------
+# L. Recovery evidence: the workspace, the replayed history and the epoch
+# --------------------------------------------------------------------------
+
+#: The PATH WORKSPACE_PROGRAM gives git, as in the runner image.
+PROGRAM_PATH = "/usr/local/bin:/usr/bin:/bin"
+needs_git = pytest.mark.skipif(
+    shutil.which("git", path=PROGRAM_PATH) is None, reason="runs git as the runner image does"
+)
+NONCE = "acme-nonce-0123456789"
+HEAD = "c" * 40
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _git(repo: Path, *args: str) -> str:
+    env = {"PATH": PROGRAM_PATH, "HOME": str(repo.parent), "GIT_CONFIG_NOSYSTEM": "1"}
+    identity = ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid"]
+    done = subprocess.run(
+        ["git", *identity, "-C", str(repo), *args],
+        capture_output=True,
+        env=env,
+        timeout=60,
+        check=True,
+    )
+    return done.stdout.decode().strip()
+
+
+def _read_workspace(repo: Path) -> dict[str, Any] | None:
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", pto.WORKSPACE_PROGRAM, str(repo), NONCE],
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+    return pto.workspace_state(done.stdout)
+
+
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+@needs_git
+def test_workspace_program_reads_a_real_checkout_and_writes_nothing(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    readme, core = b"acme fixture\n", b"def convert() -> int:\n    return 1\n"
+    (repo / "README.md").write_bytes(readme)
+    (repo / "unitconv").mkdir()
+    (repo / "unitconv" / "core.py").write_bytes(core)
+    (repo / "link").symlink_to("README.md")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "fixture")
+    head = _git(repo, "rev-parse", "HEAD")
+    committed = {"README.md": _digest(readme), "link": _digest(b"README.md")}
+    committed["unitconv/core.py"] = _digest(core)
+    assert _read_workspace(repo) == {
+        "head": head,
+        "files": committed,
+        "committed": committed,
+        "status": [],
+        "uncommitted": {},
+        "nonce_paths": [],
+    }
+    # A staged rename, an unstaged edit carrying the nonce and an untracked file.
+    _git(repo, "mv", "README.md", "DOCS.md")
+    edited = core + f"# {NONCE}\n".encode()
+    (repo / "unitconv" / "core.py").write_bytes(edited)
+    (repo / "notes").mkdir()
+    (repo / "notes" / "NONCE.md").write_bytes(f"nonce {NONCE}\n".encode())
+    before = _tree_bytes(repo)
+    state = _read_workspace(repo)
+    assert _tree_bytes(repo) == before, "the program wrote into the workspace"
+    assert state is not None and state["head"] == head
+    # HEAD's tree is unchanged; the tracked files are the index's.
+    assert state["committed"] == committed
+    assert state["files"] == {
+        "DOCS.md": _digest(readme),
+        "link": _digest(b"README.md"),
+        "unitconv/core.py": _digest(edited),
+    }
+    # Both sides of the rename are named, however this git reports it.
+    named = {"DOCS.md", "README.md", "notes/NONCE.md", "unitconv/core.py"}
+    assert pto.changed_paths(state) == named
+    assert state["uncommitted"] == {
+        "DOCS.md": _digest(readme),
+        "README.md": None,
+        "notes/NONCE.md": _digest(f"nonce {NONCE}\n".encode()),
+        "unitconv/core.py": _digest(edited),
+    }
+    assert state["nonce_paths"] == ["notes/NONCE.md", "unitconv/core.py"]
+    source = {"head": head, "files": committed}
+    # The committed state holds under the edits, which are only observed (#5541).
+    clean = pto.workspace_state(json.dumps({**state, "status": [], "uncommitted": {}}).encode())
+    assert pto.workspace_restoration(source, state, state) == {
+        "committed_head_restored": True,
+        "committed_files_restored": True,
+    }
+    assert pto.uncommitted_restoration(state, clean) == "not_restored"
+
+
+@needs_git
+def test_workspace_program_outside_a_repository_reads_no_head(tmp_path: Path) -> None:
+    # A .git file naming no repository stops git's search in the parents.
+    (tmp_path / ".git").write_text("gitdir: missing\n")
+    state = _read_workspace(tmp_path)
+    assert state == {
+        "head": None,
+        "files": {},
+        "committed": {},
+        "status": None,
+        "uncommitted": {},
+        "nonce_paths": [],
+    }
+    source = {"head": HEAD, "files": {"README.md": _digest(b"x")}}
+    assert set(pto.workspace_restoration(source, state, state).values()) == {False}
+
+
+def _state(**changes: Any) -> dict[str, Any]:
+    files = {"README.md": _digest(b"readme"), "unitconv/core.py": _digest(b"core")}
+    state = {
+        "head": HEAD,
+        "files": dict(files),
+        "committed": dict(files),
+        "status": [],
+        "uncommitted": {},
+        "nonce_paths": [],
+    }
+    return {**state, **changes}
+
+
+def _line(value: Any) -> bytes:
+    return json.dumps(value).encode() + b"\n"
+
+
+def test_workspace_state_reads_exactly_the_program_line() -> None:
+    assert pto.workspace_state(_line(_state())) == _state()
+    assert pto.workspace_state(b"\n" + _line(_state()) + b"\n") == _state()
+    unread = _state(head=None, files={}, committed={}, status=None)
+    assert pto.workspace_state(_line(unread)) == unread
+    for value in (
+        b"",
+        b"not json\n",
+        _line(_state()) * 2,
+        _line([_state()]),
+        _line({**_state(), "extra": 1}),
+        _line({key: value for key, value in _state().items() if key != "nonce_paths"}),
+        _line(_state(head="main")),
+        _line(_state(head="C" * 40)),
+        _line(_state(files={"README.md": "abc"})),
+        _line(_state(committed={"": _digest(b"x")})),
+        _line(_state(uncommitted=[])),
+        _line(_state(status=[["??"]])),
+        _line(_state(status=[["??", ""]])),
+        _line(_state(status="clean")),
+        _line(_state(nonce_paths="NONCE.md")),
+    ):
+        assert pto.workspace_state(value) is None, value
+
+
+def test_workspace_restoration_holds_the_forge_head_and_blobs_on_both_sides() -> None:
+    source = {"head": HEAD, "files": _state()["committed"]}
+    good = {"committed_head_restored": True, "committed_files_restored": True}
+    assert pto.workspace_restoration(source, _state(), _state()) == good
+    # The worker stop: no runner existed, so only the fresh checkout is read.
+    assert pto.workspace_restoration(source, None, _state()) == good
+    # An uncommitted edit is observed, never counted for or against.
+    edited = _state(
+        files={**_state()["files"], "unitconv/core.py": _digest(b"edit")},
+        status=[[" M", "unitconv/core.py"], ["??", "NONCE.md"]],
+        uncommitted={"unitconv/core.py": _digest(b"edit"), "NONCE.md": _digest(b"nonce")},
+    )
+    assert pto.workspace_restoration(source, edited, edited) == good
+    other = "d" * 40
+    tracked = _state()["files"]
+    # (source, before, after, HEAD restored, committed files restored)
+    cases: list[tuple[Any, Any, Any, bool, bool]] = [
+        (source, _state(), None, False, False),
+        (source, _state(head=other), _state(), False, True),
+        (source, _state(), _state(head=other), False, True),
+        (source, _state(committed={}), _state(), True, False),
+        (source, _state(), _state(committed={"README.md": _digest(b"readme")}), True, False),
+        # A tracked file off its committed bytes that the status does not name.
+        (source, _state(), _state(files={**tracked, "README.md": _digest(b"x")}), True, False),
+        # A tracked path the forge does not hold and the status does not name.
+        (source, _state(), _state(files={**tracked, "extra.py": _digest(b"x")}), True, False),
+        (source, _state(), _state(status=None), True, False),
+        # An unreadable forge source compares equal to nothing.
+        ({"head": None, "files": {}}, _state(), _state(), False, False),
+    ]
+    for case_source, before, after, head_ok, files_ok in cases:
+        result = pto.workspace_restoration(case_source, before, after)
+        assert result == {
+            "committed_head_restored": head_ok,
+            "committed_files_restored": files_ok,
+        }, (before, after)
+
+
+def test_uncommitted_restoration_is_an_observation_of_5541() -> None:
+    edits = {"NONCE.md": _digest(b"nonce")}
+    with_edits = _state(status=[["??", "NONCE.md"]], uncommitted=edits)
+    assert pto.uncommitted_restoration(None, _state()) == "none_before"
+    assert pto.uncommitted_restoration(_state(), _state()) == "none_before"
+    assert pto.uncommitted_restoration(with_edits, with_edits) == "restored"
+    assert pto.uncommitted_restoration(with_edits, _state()) == "not_restored"
+    assert pto.uncommitted_restoration(with_edits, None) == "not_restored"
+    other = _state(uncommitted={"NONCE.md": _digest(b"other")})
+    assert pto.uncommitted_restoration(with_edits, other) == "not_restored"
+
+
+def test_forge_tree_paths_needs_the_whole_recursive_tree() -> None:
+    # GET /repos/{repo}/git/trees/{sha}?recursive=1, GitHub's documented shape.
+    tree = {
+        "sha": HEAD,
+        "url": "https://api.github.com/repos/acme-corp/acme-fixture/git/trees/" + HEAD,
+        "truncated": False,
+        "tree": [
+            {"path": "unitconv", "mode": "040000", "type": "tree", "sha": "a" * 40},
+            {"path": "unitconv/core.py", "mode": "100644", "type": "blob", "sha": "b" * 40},
+            {"path": "README.md", "mode": "100644", "type": "blob", "sha": "d" * 40},
+            {"path": "vendor/lib", "mode": "160000", "type": "commit", "sha": "e" * 40},
+        ],
+    }
+    assert pto.forge_tree_paths(tree) == ["README.md", "unitconv/core.py"]
+    for broken in (
+        {**tree, "truncated": True},
+        {key: value for key, value in tree.items() if key != "truncated"},
+        {**tree, "tree": None},
+        {**tree, "tree": [*tree["tree"], {"type": "blob"}]},
+        {**tree, "tree": tree["tree"][:1]},
+        [tree],
+        None,
+    ):
+        assert pto.forge_tree_paths(broken) is None, broken
+
+
+def test_marker_replayed_reads_only_main_native_transcripts() -> None:
+    marker = "pto-b-0123456789ab"
+    record = json.dumps({"type": "user", "message": {"content": f"Remember {marker}."}})
+    main = "curie-claude-config-t2/projects/-workspace/session-2.jsonl"
+    agent = "curie-claude-config-t2/projects/-workspace/session-2/subagents/agent-1.jsonl"
+    assert pto.marker_replayed({main: record.encode()}, marker)
+    assert not pto.marker_replayed({main: record.encode()}, "")
+    assert not pto.marker_replayed({main: b"{}\n"}, marker)
+    assert not pto.marker_replayed({agent: record.encode()}, marker)
+    assert not pto.marker_replayed({main.removesuffix(".jsonl") + ".txt": record.encode()}, marker)
+    assert not pto.marker_replayed({}, marker)
+
+
+WORK = "5d0c7f3e-0000-4000-8000-0000000c0001"
+OLD_ROW = {
+    "id": "5d0c7f3e-0000-4000-8000-0000000d0a01",
+    "work_item_id": WORK,
+    "sequence": 1,
+    "status": "failed",
+    "terminal_cause": "publication_denied",
+    "started": True,
+    "runtime_epoch": 2,
+}
+NEW_ROW = {
+    "id": "5d0c7f3e-0000-4000-8000-0000000d0a02",
+    "work_item_id": WORK,
+    "sequence": 2,
+    "status": "running",
+    "started": True,
+    "runtime_claim_name": "claim-a2",
+    "runtime_epoch": 1,
+    "runtime_owner": "curie-worker-1-7",
+}
+
+
+def test_successor_epoch_confirmed_needs_a_successor_bound_on_the_fresh_claim() -> None:
+    def confirmed(old: Mapping[str, Any], new: Mapping[str, Any], held: Any = 2) -> bool:
+        return pto.successor_epoch_confirmed(old, new, held_epoch=held, claim="claim-a2")
+
+    assert confirmed(OLD_ROW, NEW_ROW)
+    assert confirmed({**OLD_ROW, "status": "completed", "runtime_epoch": 3}, NEW_ROW)
+    # A terminal old request alone never confirms it: no successor bound.
+    waiting = {**NEW_ROW, "status": "waiting", "started": False, "runtime_claim_name": None}
+    assert not confirmed(OLD_ROW, waiting)
+    for old in (
+        {**OLD_ROW, "status": status}
+        for status in ("waiting", "running", "cancellation_requested", "queued", None)
+    ):
+        assert not confirmed(old, NEW_ROW), old
+    for changes in ({"started": False}, {"runtime_epoch": 1}, {"runtime_epoch": None}):
+        assert not confirmed({**OLD_ROW, **changes}, NEW_ROW), changes
+    for changes in (
+        {"id": OLD_ROW["id"]},
+        {"work_item_id": "5d0c7f3e-0000-4000-8000-0000000c0002"},
+        {"sequence": 1},
+        {"sequence": None},
+        {"started": False},
+        {"runtime_claim_name": "claim-a1"},
+        {"runtime_epoch": 0},
+        {"runtime_epoch": True},
+        {"runtime_owner": None},
+        {"runtime_owner": ""},
+    ):
+        assert not confirmed(OLD_ROW, {**NEW_ROW, **changes}), changes
+    for held in (None, 0, True, "2"):
+        assert not confirmed(OLD_ROW, NEW_ROW, held), held
+    assert not pto.successor_epoch_confirmed(OLD_ROW, NEW_ROW, held_epoch=2, claim="")
+
+
+def test_current_epoch_confirmed_needs_the_same_running_request_at_the_held_epoch() -> None:
+    row = {"id": NEW_ROW["id"], "status": "running", "runtime_epoch": 2}
+
+    def confirmed(value: Mapping[str, Any], held: Any = 2, request: str = NEW_ROW["id"]) -> bool:
+        return pto.current_epoch_confirmed(value, request_id=request, held_epoch=held)
+
+    assert confirmed(row)
+    # A termination claim or an owner-lost successor moves the epoch on.
+    assert not confirmed({**row, "runtime_epoch": 3})
+    assert not confirmed({**row, "status": "failed"})
+    assert not confirmed({**row, "id": OLD_ROW["id"]})
+    assert not confirmed(row, request="")
+    for held in (None, 0, True):
+        assert not confirmed({**row, "runtime_epoch": held}, held), held
+
+
+def test_restart_observations_are_reported_and_never_required(tmp_path: Path) -> None:
+    observations = pto.OBSERVATIONS["restarts"]
+    assert not set(observations) & set(pto.EXPECTED["restarts"])
+    for key, meaning in observations.items():
+        assert isinstance(meaning, str) and meaning and "\n" not in meaning, key
+    for kind in ("pod", "process"):
+        assert "#5541" in observations[f"{kind}_uncommitted_restored"]
+    assert "worker_uncommitted_restored" not in observations
+    assert any("#5541" in line for line in pto.NOT_MET["restarts"])
+    ledger = _complete(tmp_path)
+    recorded = {
+        "process_recovery": "new_pod",
+        "process_same_pod": False,
+        "process_container_restarted": False,
+        "process_uncommitted_restored": "none_before",
+        "pod_uncommitted_restored": "not_restored",
+        "pod_termination_recorded": False,
+        "worker_runtime_owner_moved": False,
+        "worker_git_status_after": [],
+    }
+    for key, value in recorded.items():
+        ledger.record("restarts", key, value)
+    ledger.record("restarts", "unlisted_key", True)
+    result = pto.judge(ledger, "restarts")
+    assert result["verdict"] == "pass" and result["observed"] == recorded
+    assert not set(recorded) & set(result["checks"])
+    every = pto.judge(ledger, "all")
+    assert every["verdict"] == "pass"
+    assert every["observed"] == {f"restarts.{key}": value for key, value in recorded.items()}

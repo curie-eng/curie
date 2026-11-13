@@ -472,6 +472,8 @@ class PodRun(pp.Attempt):
     hold and the next hold: the CLI asks the model for nothing in between.
     ``stopped`` is true once the driver ended the native runtime itself (a
     pod deletion or the process interruption); no clock acts on it again.
+    ``workspace_first`` is a fresh runtime's workspace (``pto.workspace_state``)
+    read when its pod is adopted, before any prompt release.
     """
 
     owner: str = ""
@@ -513,6 +515,7 @@ class PodRun(pp.Attempt):
     stale_clis: set[tuple[int, int]] = dataclasses.field(default_factory=set)
     last_facts: pps.TranscriptFacts | None = None
     reviewed: dict[str, Any] | None = None
+    workspace_first: dict[str, Any] | None = None
     epoch: int | None = None
     restart_count: int = 0
     branch_known: bool = False
@@ -1165,6 +1168,15 @@ class TwoOwnerRun(pp.LiveRun):
         self.no_push: dict[int, bool] = {}
         self.threads: dict[str, str] = {}
         self.markers: dict[str, str] = {}
+        # The marker text each owner's thread carries, looked for in the
+        # transcript of the runtime that continued after each interruption.
+        self.marker_texts: dict[str, str] = {}
+        # Per interruption kind: the interrupted runtime's workspace (none for
+        # the worker stop), the branch head its committed source is read at,
+        # and each head's committed source on the owned forge.
+        self.restore_before: dict[str, dict[str, Any] | None] = {}
+        self.restore_heads: dict[str, str] = {}
+        self.sources: dict[str, dict[str, Any]] = {}
         self.pod_deletions: list[tuple[str, str, float]] = []
         self.worker_before: list[str] = []
         self.worker_started_at = 0.0
@@ -2122,10 +2134,103 @@ class TwoOwnerRun(pp.LiveRun):
         self.adopt_runner(run)
 
     def adopt_runner(self, run: PodRun) -> None:
-        """A discovered runner pod becomes the run's: checks, capture, gate and limits."""
+        """A discovered runner pod becomes the run's: checks, capture, gate and limits.
+
+        A fresh runtime after an interruption (``pto.RECOVERED_GROUPS``) first
+        has its workspace read, before the gate stream opens: no prompt can be
+        released yet, so nothing the model does is in it.
+        """
 
         run.started_at = self.clock.now()
+        if run.group in pto.RECOVERED_GROUPS:
+            run.workspace_first = self.workspace_state(run)
         self.begin_pod_run(run)
+
+    def workspace_state(self, run: PodRun) -> dict[str, Any] | None:
+        """``pto.WORKSPACE_PROGRAM`` in the run's runner container; None when unreadable.
+
+        Read only: HEAD, every tracked file's and committed blob's SHA-256, the
+        porcelain status and the uncommitted paths carrying the run's nonce.
+        """
+
+        if not run.pod:
+            return None
+        result = self.safe(
+            lambda: self.kube.ctl(
+                "exec",
+                run.pod,
+                "-c",
+                pps.RUNNER_CONTAINER,
+                "--",
+                "python3",
+                "-c",
+                pto.WORKSPACE_PROGRAM,
+                pto.RUNNER_WORKSPACE,
+                self.nonce,
+                check=False,
+                timeout=60,
+            ),
+            None,
+        )
+        if not isinstance(result, pp.Completed) or result.returncode != 0:
+            return None
+        return pto.workspace_state(result.stdout)
+
+    def committed_source(self, head: str) -> dict[str, Any]:
+        """A branch head's committed files on the owned forge: its tree and each blob's SHA-256.
+
+        The tree is read recursively and every blob through the driver's blob
+        reader (``head_blobs``). An unreadable or truncated tree or any
+        unreadable blob leaves no files, so nothing compares equal to it; only
+        a complete source is kept for the next interruption on the same head.
+        """
+
+        known = self.sources.get(head)
+        if known is not None:
+            return known
+        empty: dict[str, Any] = {"head": None, "files": {}}
+        if not pps.is_commit_sha(head):
+            return empty
+        paths = self.safe(
+            lambda: pto.forge_tree_paths(self.forge_get(f"/git/trees/{head}?recursive=1")), None
+        )
+        if not paths:
+            return empty
+        hashes = self.safe(lambda: self.head_blobs({"hashes": dict.fromkeys(paths)}, head), {})
+        found = hashes.get("hashes") if isinstance(hashes, dict) else None
+        if not isinstance(found, dict) or not all(isinstance(found.get(p), str) for p in paths):
+            return empty
+        source = {"head": head, "files": {path: found[path] for path in paths}}
+        self.sources[head] = source
+        return source
+
+    def read_before(self, kind: str, run: PodRun, head: str) -> None:
+        """The interrupted runtime's workspace and its branch head, read before the interruption."""
+
+        state = self.workspace_state(run)
+        self.restore_before[kind] = state
+        self.restore_heads[kind] = head
+        self.ledger.record("restarts", f"{kind}_git_status_before", (state or {}).get("status"))
+
+    def record_restoration(self, kind: str, after: Mapping[str, Any] | None) -> dict[str, bool]:
+        """One interruption's committed-state keys; its uncommitted part is an observation.
+
+        Compares the interrupted runtime's workspace (none for the worker stop)
+        and the fresh runtime's, read before its first prompt release, with
+        the committed source of ``restore_heads[kind]`` on the owned forge.
+        """
+
+        before = self.restore_before.get(kind)
+        source = self.committed_source(self.restore_heads.get(kind, ""))
+        restored = pto.workspace_restoration(source, before, after)
+        self.ledger.record("restarts", f"{kind}_git_status_after", (after or {}).get("status"))
+        if kind != "worker":
+            self.ledger.record(
+                "restarts",
+                f"{kind}_uncommitted_restored",
+                pto.uncommitted_restoration(before, after),
+            )
+        return {f"{kind}_{key}": value for key, value in restored.items()}
 
     def watch_early_start(self) -> None:
         """Look for a B-r1 runner pod while the worker stop is not yet observed.
@@ -2520,7 +2625,13 @@ class TwoOwnerRun(pp.LiveRun):
             self.fail_paid(f"owner {owner.name} marker append returned {status}")
         self.threads[owner.name] = thread
         self.markers[owner.name] = record_id
+        self.marker_texts[owner.name] = marker
         return self.marker_present(owner)
+
+    def marker_replayed(self, owner: Owner, run: PodRun) -> bool:
+        """The owner's marker is in ``run``'s own native transcript: its history was replayed."""
+
+        return pto.marker_replayed(self.pod_files(run), self.marker_texts.get(owner.name, ""))
 
     def marker_present(self, owner: Owner) -> bool:
         record_id = self.markers.get(owner.name, "")
@@ -2854,7 +2965,11 @@ class TwoOwnerRun(pp.LiveRun):
             self.fail_paid(f"owner {owner.name}'s grant probe failed: {error or 'no usage'}")
 
     def phase_attempt_a1(self) -> None:
-        """A1 parks on card 1; its lineage and marker are recorded, then its pod is deleted."""
+        """A1 parks on card 1; its lineage, marker and workspace are recorded, then its pod goes.
+
+        A1 publishes nothing (its card is rejected), so its committed source is
+        the default branch's head on the owned forge.
+        """
 
         self.require_live("attempt-a1")
         a = self.owners["a"]
@@ -2864,6 +2979,12 @@ class TwoOwnerRun(pp.LiveRun):
         self.await_park(run)
         lineage = self.record_lineage(run)
         marker = self.append_marker(a)
+        head = (
+            self.safe(lambda: self.branch_head(self.default_branch), None)
+            if self.default_branch
+            else None
+        )
+        self.read_before("pod", run, head if isinstance(head, str) else "")
         self.ledger.record("restarts", "pod_lineage_before", lineage)
         self.ledger.record("restarts", "pod_marker_before", marker)
         self.finish_park(run)
@@ -2974,7 +3095,14 @@ class TwoOwnerRun(pp.LiveRun):
         self.require(checks, "card 1 rejection")
 
     def phase_attempt_a2(self) -> None:
-        """A's fresh successor: same WorkItem and conversation, a new pod, A's own grant."""
+        """A's fresh successor: same WorkItem and conversation, a new pod, A's own grant.
+
+        The pod recreation is judged on the fresh runtime itself: A's marker in
+        A2's own native transcript, A2's workspace (read before its first
+        prompt release) against the committed default-branch head A1 also
+        held, and A2's request bound on A2's claim past the epoch A1 held,
+        read at A2's park while that binding is live.
+        """
 
         self.require_live("attempt-a2")
         a = self.owners["a"]
@@ -2987,15 +3115,23 @@ class TwoOwnerRun(pp.LiveRun):
             self.controls_done_at is not None and self.controls_done_at <= run.admitted_at,
         )
         self.await_runner(run)
-        self.park_and_settle(run)
-        old_row = self.request_row(first.request_id)
+        self.await_park(run)
         new_row = self.request_row(run.request_id)
+        self.finish_park(run)
+        self.deliver_card(run)
+        old_row = self.request_row(first.request_id)
         code, status = self.subscription(a, "status")
         tool = self.first_tool(run, run.started_at - pp.REPLAY_MARGIN_SECONDS)
+        self.ledger.record("restarts", "pod_marker_stored_after", self.marker_present(a))
+        self.ledger.record(
+            "restarts",
+            "pod_termination_recorded",
+            old_row.get("observed") is True and old_row.get("teardown_pending") is False,
+        )
         checks = {
-            "pod_termination_epoch": first.epoch is not None
-            and old_row.get("terminal_cause") is not None
-            and old_row.get("runtime_epoch") == first.epoch,
+            "pod_termination_epoch": pto.successor_epoch_confirmed(
+                old_row, new_row, held_epoch=first.epoch, claim=run.claim
+            ),
             "pod_fresh_runtime": bool(run.pod_uid) and run.pod_uid != first.pod_uid,
             "pod_same_work_item": run.work_item_id == first.work_item_id,
             "pod_same_conversation": bool(run.conversation_id)
@@ -3008,9 +3144,10 @@ class TwoOwnerRun(pp.LiveRun):
             and status.get("generation") == pps.OWNER_GENERATION,
             "pod_grant_unchanged": run.delivery.get("own_grant") is True
             and run.delivery.get("not_other") is True,
-            "pod_marker_after": self.marker_present(a),
+            "pod_marker_after": self.marker_replayed(a, run),
             "pod_continued_native": tool is not None,
             "pod_usage_settled": self.settled_known("a1"),
+            **self.record_restoration("pod", run.workspace_first),
         }
         absent = self.pod_uid_gone(first)
         observed = self.ledger.observations("restarts").get("pod_old_runtime_absent") is True
@@ -3258,7 +3395,16 @@ class TwoOwnerRun(pp.LiveRun):
         self.require({"fresh": fresh, "candidate": candidate}, "the worker restart")
 
     def phase_hold_both(self) -> None:
-        """B-r1 held at its prompt with zero usage; A3 runs one tool and is held at its next."""
+        """B-r1 held at its prompt with zero usage; A3 runs one tool and is held at its next.
+
+        The worker interruption is judged on B-r1, the runtime the new worker
+        started: B's marker in B-r1's own native transcript, B-r1's workspace
+        (no runner existed during the stop) against B1's published head on the
+        owned forge, the old worker pods gone, and B's request still running at
+        the epoch B1 held. A CI continuation adopts the running request without
+        a start, so its runtime owner keeps the old consumer's name; whether it
+        moved is recorded, not required.
+        """
 
         self.require_live("hold-both")
         b = self.owners["b"]
@@ -3286,14 +3432,18 @@ class TwoOwnerRun(pp.LiveRun):
             {"zero_usage": zero, "sessions": len(facts.sessions) if facts else None},
         )
         row = self.request_row(first.request_id)
-        epoch = row.get("runtime_epoch")
         consumer = str(row.get("runtime_owner") or "")
         stale = {str((pod.get("metadata") or {}).get("uid") or "") for pod in self.worker_pods()}
+        self.restore_heads["worker"] = self.b1_head
+        consumer_moved = bool(self.worker_name) and consumer.startswith(self.worker_name + "-")
+        self.ledger.record("restarts", "worker_runtime_owner_moved", consumer_moved)
+        self.ledger.record("restarts", "worker_marker_stored_after", self.marker_present(b))
         checks = {
-            "worker_termination_epoch": not (stale & set(self.worker_before))
-            and first.epoch is not None
-            and type(epoch) is int
-            and epoch >= first.epoch,
+            "worker_termination_epoch": bool(self.worker_before)
+            and not (stale & set(self.worker_before))
+            and pto.current_epoch_confirmed(
+                row, request_id=first.request_id, held_epoch=first.epoch
+            ),
             "worker_same_work_item": row.get("work_item_id") == first.work_item_id
             and row.get("id") == first.request_id,
             "worker_same_conversation": held.conversation_id == first.conversation_id
@@ -3305,14 +3455,13 @@ class TwoOwnerRun(pp.LiveRun):
             "worker_generation_unchanged": row.get("enrollment_generation") == pps.OWNER_GENERATION,
             "worker_grant_unchanged": held.delivery.get("own_grant") is True
             and held.delivery.get("not_other") is True,
-            "worker_marker_after": self.marker_present(b),
+            "worker_marker_after": self.marker_replayed(b, held),
             "worker_usage_settled": all(self.settled_known(name) for name in ("a1", "b1", "a2")),
             "worker_owner_lost_safe": row.get("owner_lost_retry") is False
             and row.get("status") == "running"
             and self.publication(first.publication_id).get("status") == "succeeded",
+            **self.record_restoration("worker", held.workspace_first),
         }
-        consumer_moved = bool(self.worker_name) and consumer.startswith(self.worker_name + "-")
-        checks["worker_termination_epoch"] = checks["worker_termination_epoch"] and consumer_moved
         for key, value in checks.items():
             self.ledger.record("restarts", key, value)
         tool = any(
@@ -3407,7 +3556,19 @@ class TwoOwnerRun(pp.LiveRun):
         return grown
 
     def phase_process_interruption(self) -> None:
-        """B-r1's held CLI is killed in place; the kernel's retry runs B-r2 on the same claim."""
+        """B-r1's held CLI is killed; the kernel's retry runs B-r2 in a fresh native process.
+
+        Before the signals, B-r1's lineage, marker and workspace are read while
+        its CLI holds its prompt. Recovery may land in place (the same pod, its
+        runner container restarted) or on a new pod; either is a fresh process,
+        which one happened is an observation, and either way B-r2's pod gets
+        its own capture and gate, so its holds are gated and its usage settles
+        on B-r2's reservations. The old runtime must be observed gone (the
+        held CLI's container restarted, or its pod UID absent) with #5378's
+        epoch confirmation, B's marker must be in B-r2's own native transcript,
+        and B-r2's workspace, read before its first prompt release, must hold
+        B1's committed head from the owned forge, as B-r1's did.
+        """
 
         self.require_live("process-interruption")
         b = self.owners["b"]
@@ -3428,6 +3589,7 @@ class TwoOwnerRun(pp.LiveRun):
         }
         self.ledger.record("restarts", "process_lineage_before", all(lineage.values()))
         self.ledger.record("restarts", "process_marker_before", self.marker_present(b))
+        self.read_before("process", held, self.b1_head)
         repair = self.new_run("b-r2", card=4)
         repair.request_id, repair.work_item_id = held.request_id, held.work_item_id
         repair.conversation_id = held.conversation_id
@@ -3436,8 +3598,8 @@ class TwoOwnerRun(pp.LiveRun):
         witness = self.interrupt_native_process(held.pod, held.kept)
         # The held native process is gone: no clock acts on B-r1 again.
         held.stopped = True
-        pod = self.await_container_restart(held)
-        # The restarted runner container is B-r2's native process: its clock starts here.
+        shape, pod = self.await_recovery(held, repair)
+        # The recovered runner container is B-r2's native process: its clock starts here.
         self.observe_start(repair, self.runner_clock_start(pod))
         self.wait_until(
             held.eof.is_set,
@@ -3449,6 +3611,11 @@ class TwoOwnerRun(pp.LiveRun):
         with held.harvest_lock:
             baseline = held.harvest.transcript_files() if held.harvest is not None else {}
         self.close_pod(held)
+        # In place, the restarted container ended every process of the old one;
+        # on a new pod, the old pod's UID must be gone.
+        pod_gone = shape == "in_place" or self.observed(
+            lambda: self.pod_uid_gone(held), SETTLE_SECONDS, "B-r1's old pod gone"
+        )
         after = self.request_row(held.request_id)
         claims = self.owner_claims(b)
         facts = dict(witness)
@@ -3465,15 +3632,17 @@ class TwoOwnerRun(pp.LiveRun):
         )
         verdict = poes.process_interruption_checks(facts)
         self.ledger.record("diagnostics", "process_interruption", verdict)
-        repair.claim, repair.pod, repair.pod_uid = held.claim, held.pod, held.pod_uid
-        repair.claim_labels = dict(held.claim_labels)
-        repair.pod_record = pod
-        repair.grant_ref = pps.pod_grant_ref(pod)
-        repair.restart_count = self.runner_restarts(pod)
-        repair.baseline = {path: data for path, data in baseline.items() if path.endswith(".jsonl")}
-        repair.stale_clis = set(held.clis)
-        repair.started_at = self.clock.now()
-        self.begin_pod_run(repair)
+        self.ledger.record("restarts", "process_recovery", shape)
+        self.ledger.record("restarts", "process_same_pod", repair.pod_uid == held.pod_uid)
+        self.ledger.record("restarts", "process_container_restarted", shape == "in_place")
+        if shape == "in_place":
+            # The container's temporary root survives its restart: B-r1's
+            # transcripts stay readable there and its CLI identity is stale.
+            repair.baseline = {
+                path: data for path, data in baseline.items() if path.endswith(".jsonl")
+            }
+            repair.stale_clis = set(held.clis)
+        self.adopt_runner(repair)
         tool_at: float | None = None
 
         def tool_after_stop() -> bool:
@@ -3485,9 +3654,18 @@ class TwoOwnerRun(pp.LiveRun):
             tool_after_stop, until=self.deadline(), what="B-r2's first tool call after A's stop"
         )
         row = self.request_row(repair.request_id)
-        fresh = bool(repair.clis) and not (set(repair.clis) & set(held.clis))
+        old_cli = set(held.clis)
+        fresh = (
+            bool(repair.clis)
+            and not (set(repair.clis) & old_cli)
+            and (shape == "in_place" or repair.pod_uid != held.pod_uid)
+        )
+        self.ledger.record("restarts", "process_marker_stored_after", self.marker_present(b))
         checks = {
-            "process_old_runtime_absent": witness.get("native_gone") is True and not grown,
+            "process_old_runtime_absent": witness.get("native_gone") is True
+            and pod_gone
+            and not grown
+            and not (set(repair.clis) & old_cli),
             "process_termination_epoch": verdict["old_epoch_confirmed_before_bind"],
             "process_fresh_runtime": fresh,
             "process_same_work_item": row.get("work_item_id") == held.work_item_id,
@@ -3498,7 +3676,7 @@ class TwoOwnerRun(pp.LiveRun):
             == pps.OWNER_GENERATION,
             "process_grant_unchanged": repair.delivery.get("own_grant") is True
             and repair.delivery.get("not_other") is True,
-            "process_marker_after": self.marker_present(b),
+            "process_marker_after": self.marker_replayed(b, repair),
             "process_continued_native": tool_at is not None,
             "worker_continued_native": tool_at is not None and tool_at > self.worker_started_at,
             "process_usage_settled": self.settled_known("b-r1"),
@@ -3509,6 +3687,7 @@ class TwoOwnerRun(pp.LiveRun):
             "process_same_request_epoch": row.get("id") == held.request_id
             and type(epoch) is int
             and row.get("runtime_epoch") == epoch,
+            **self.record_restoration("process", repair.workspace_first),
         }
         for key, value in checks.items():
             self.ledger.record("restarts", key, value)
@@ -3519,30 +3698,49 @@ class TwoOwnerRun(pp.LiveRun):
         )
         self.require(checks, "B's process interruption")
 
-    def await_container_restart(self, run: PodRun) -> dict[str, Any]:
-        """The same pod uid with the runner container restarted and running again."""
+    def await_recovery(self, held: PodRun, repair: PodRun) -> tuple[str, dict[str, Any]]:
+        """Where B-r1's runtime recovered: ``in_place`` or ``new_pod``, and that pod.
+
+        In place: B-r1's pod UID with its runner container restarted and running
+        again; ``repair`` takes B-r1's claim and pod. On a new pod: a Running
+        runner pod on one of B's claims with a UID never seen before
+        (``find_runner_pod``, which binds it to ``repair``). Both are pass
+        conditions for a fresh process; a successor claim is judged after.
+        """
 
         found: dict[str, Any] = {}
+        shape = ""
 
-        def restarted() -> bool:
-            nonlocal found
-            pods = self.kube.json("get", "pods", "-l", f"{pp.POD_CLAIM_LABEL}={run.claim}")
+        def recovered() -> bool:
+            nonlocal found, shape
+            pods = self.kube.json("get", "pods", "-l", f"{pp.POD_CLAIM_LABEL}={held.claim}")
             for pod in pods.get("items") or [] if isinstance(pods, dict) else []:
                 uid = str((pod.get("metadata") or {}).get("uid") or "")
-                if uid != run.pod_uid:
-                    self.fail_paid("B-r1's pod was replaced, not restarted in place")
-                if self.runner_restarts(pod) > run.restart_count and self.runner_running(pod):
-                    found = pod
+                if (
+                    uid == held.pod_uid
+                    and self.runner_restarts(pod) > held.restart_count
+                    and self.runner_running(pod)
+                ):
+                    found, shape = pod, "in_place"
                     return True
+            if self.find_runner_pod(repair):
+                found, shape = repair.pod_record, "new_pod"
+                return True
             return False
 
         self.wait_until(
-            restarted,
+            recovered,
             until=self.clock.now() + RESTART_SECONDS,
-            what="runner container restart",
+            what="B-r1's recovery in place or on a new pod",
             every=2.0,
         )
-        return found
+        if shape == "in_place":
+            repair.claim, repair.pod, repair.pod_uid = held.claim, held.pod, held.pod_uid
+            repair.claim_labels = dict(held.claim_labels)
+            repair.pod_record = found
+            repair.grant_ref = pps.pod_grant_ref(found)
+            repair.restart_count = self.runner_restarts(found)
+        return shape, found
 
     def phase_approve_b2(self) -> None:
         """B-r2 parks on card 4; the operator approves; the same lineage branch moves."""
@@ -3756,8 +3954,9 @@ class TwoOwnerRun(pp.LiveRun):
         ``hold`` is B-r1's kept prompt-hold record; its ``cli_pid`` and raw
         ``cli_start`` ticks name the native process, and ``pto.INTERRUPT_PROGRAM``
         signals nothing unless that pid still has that starttime. Only the held
-        CLI (SIGKILL) and the runner (SIGTERM, so the container restarts in
-        place) are signalled; the pod is never deleted. Returns the witness
+        CLI (SIGKILL) and the runner (SIGTERM, so the container restarts) are
+        signalled; the driver never deletes the pod, though the product may
+        recover onto a new one (``await_recovery``). Returns the witness
         (``action``, ``native_identity_matched``, ``native_gone``) merged with
         what ``poes.process_interruption_checks`` reads, read right after the
         signals: ``old_epoch`` (the request row before), ``confirmed_epoch``

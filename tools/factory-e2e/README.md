@@ -381,8 +381,17 @@ private inputs file instead.
    CI ingestion; the production repair keeps B's owner and grant, pushes a
    repaired head and its latest and required checks pass.
 4. `restarts`: pod, worker and native-process interruptions each keep the
-   WorkItem, conversation, owner and generation, confirm the old runtime gone
-   and show a fresh native process continuing on the same owner's grant.
+   WorkItem, conversation, owner and generation, and show a fresh native
+   process continuing on the same owner's grant. Each one must observe the old
+   runtime gone and confirm the epoch it held: A2's request bound on A2's claim
+   past A1's epoch (a terminal A1 alone never passes), B's request still
+   running at B1's epoch under the new worker, and #5378's process checks for
+   the CLI kill. The durable marker must appear in the fresh native session's
+   own transcript, the product's history replay, not only in central storage.
+   The fresh runtime's workspace, read before its first prompt release, and
+   the interrupted one's where a runner existed, must hold the branch head and
+   every committed blob's SHA-256 as the owned forge serves them (B1's
+   published head for the worker stop, which has no runner).
 5. `wrong-owner`: B cannot adopt or read A's work before A's authorized
    continuation, which then runs with its original tuple.
 6. `disconnect`: A's disconnect during active work fences and tears A down; B
@@ -465,7 +474,8 @@ p judge --criterion all
 6. `judge` reads receipts only: no inputs file, no credential, no inference.
    Criteria: `owners`, `roles`, `approval`, `publication`, `ci-repair`,
    `restarts`, `wrong-owner`, `disconnect`, `budget`, `cleanup`, `rehearsal`,
-   `all`. Output carries `not_met` for items reported but never failing.
+   `all`. Output carries `not_met` for items reported but never failing and
+   `observed` for recorded observations that are never required.
 
 The approved ceiling, exactly as `approved_ceiling()` builds it:
 
@@ -596,8 +606,12 @@ CLI reads session files the driver writes 0600 and the finalizer removes.
 
 1. Pod recreation lands at the quiescent approval park between A's first and
    second attempts; A1's pod is deleted after its terminal capture and A2 must
-   run in a new pod. The process interruption restarts the runner container in
-   place, and the same pod, claim, request and epoch continue.
+   run in a new pod. After the process interruption the product may restart
+   the runner container in place or recover onto a new pod on B's claim; both
+   pass as a fresh process, the new pod gets its own gate and capture mapped to
+   B-r2's reservation, and which one happened is recorded under `observed`
+   (`process_recovery`, `process_same_pod`, `process_container_restarted`).
+   The same claim, request and epoch continue either way.
 2. B's fourth repair start is a second diff-review round, admitted only when the
    first returns changes, so b-r2 reserves for it either way.
 3. Principal sessions are minted during the run through a run-local identity
@@ -619,7 +633,11 @@ CLI reads session files the driver writes 0600 and the finalizer removes.
 
 Restoring uncommitted workspace edits into a fresh or continuing process is Not
 met and not claimed. It is tracked in #5541. `judge` lists it under `not_met`
-for `restarts` and it never changes a verdict.
+for `restarts` and it never changes a verdict. The workspace reads never write,
+so the observation is the run's nonce in uncommitted paths:
+`pod_uncommitted_restored` and `process_uncommitted_restored` under `observed`
+are `restored`, `not_restored` or `none_before`, beside each interruption's
+porcelain status.
 
 ## Personal owner enforcement proof
 

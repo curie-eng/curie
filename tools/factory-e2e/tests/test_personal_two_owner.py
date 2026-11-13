@@ -1831,12 +1831,137 @@ def test_pod_run_finds_a_reserved_run_before_its_pod(tmp_path: Path) -> None:
         h.run.pod_run("a3")
 
 
-def _interruption_setup(h: _Harness, *, prompt_only: bool = True) -> pt.PodRun:
+REQUEST_A2 = "5d0c7f3e-0000-4000-8000-0000000d0a02"
+HEAD_A = "a" * 40
+HEAD_OTHER = "3" * 40
+MARKER_TEXT_A = "pto-a-0123456789ab"
+MARKER_TEXT_B = "pto-b-0123456789ab"
+#: A transcript in a configuration directory a later runtime created.
+RECOVERED = "curie-claude-config-t2/projects/-workspace/session-2.jsonl"
+#: The fixture repository's committed files at every head these tests read.
+TREE_FILES = {
+    "README.md": b"acme fixture\n",
+    "unitconv/core.py": b"def convert() -> int:\n    return 1\n",
+}
+#: The committed files at HEAD_OTHER, a commit the owned forge never served.
+OTHER_TREE = {**TREE_FILES, "unitconv/core.py": b"def convert() -> int:\n    return 2\n"}
+B_CLAIM_LABELS = {
+    pto.CLAIM_OWNER_LABELS["principal"]: PRINCIPAL_B,
+    pto.CLAIM_OWNER_LABELS["tenant"]: TENANT,
+    pto.CLAIM_OWNER_LABELS["generation"]: "1",
+    pto.CLAIM_OWNER_LABELS["mode"]: pps.PERSONAL_MODE,
+}
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _workspace_line(head: str, *, edits: Mapping[str, bytes] | None = None) -> bytes:
+    """pto.WORKSPACE_PROGRAM's stdout for a checkout at ``head`` plus uncommitted ``edits``.
+
+    Every head holds TREE_FILES except HEAD_OTHER, which holds OTHER_TREE.
+    """
+
+    tree = OTHER_TREE if head == HEAD_OTHER else TREE_FILES
+    committed = {path: _sha(data) for path, data in tree.items()}
+    tracked = dict(committed)
+    status: list[list[str]] = []
+    uncommitted: dict[str, str] = {}
+    for path, data in sorted((edits or {}).items()):
+        status.append([" M" if path in tracked else "??", path])
+        uncommitted[path] = _sha(data)
+        if path in tracked:
+            tracked[path] = _sha(data)
+    state = {
+        "head": head,
+        "files": tracked,
+        "committed": committed,
+        "status": sorted(status),
+        "uncommitted": uncommitted,
+        "nonce_paths": [],
+    }
+    return json.dumps(state, sort_keys=True).encode() + b"\n"
+
+
+def _workspaces(h: _Harness, lines: Mapping[str, list[bytes]]) -> None:
+    """Answer each pod's pto.WORKSPACE_PROGRAM exec with its next recorded line."""
+
+    pending = {pod: list(items) for pod, items in lines.items()}
+
+    @h.shell.on("exec", pto.WORKSPACE_PROGRAM)
+    def workspace(argv: list[str], _stdin: bytes | None) -> bytes:
+        items = pending[argv[argv.index("exec") + 1]]
+        return items.pop(0) if len(items) > 1 else items[0]
+
+
+def _forge_source(h: _Harness, head: str) -> None:
+    """The owned forge's recursive tree at ``head`` (GitHub's git/trees shape) and its blobs."""
+
+    entries: list[dict[str, Any]] = [
+        {"path": "unitconv", "mode": "040000", "type": "tree", "sha": "c" * 40}
+    ]
+    entries += [
+        {"path": path, "mode": "100644", "type": "blob", "sha": "d" * 40, "size": len(data)}
+        for path, data in TREE_FILES.items()
+    ]
+    tree = {"sha": head, "truncated": False, "tree": entries}
+    h.run.forge_get = lambda suffix: tree if suffix == f"/git/trees/{head}?recursive=1" else None  # type: ignore[method-assign]
+    h.run.forge_file = lambda path, ref: TREE_FILES.get(path) if ref == head else None  # type: ignore[method-assign]
+
+
+def _replayed(marker: str, at: float = -100) -> dict[str, Any]:
+    """The durable marker turn as a resumed native session replays it into its transcript."""
+
+    user = f"Remember the proof marker {marker}."
+    return {"type": "user", "timestamp": _stamp(at), "message": {"role": "user", "content": user}}
+
+
+def _recovered_pod(name: str, uid: str, *, restarts: int) -> dict[str, Any]:
+    """A Running runner pod of B-r1's claim reading its grant from ``<claim>-tokens``."""
+
+    pod = _pod(name, pps.RUNNER_CONTAINER, "curie-runner", DIGESTS["curie-runner"], uid=uid)
+    ref = {
+        "secretKeyRef": {
+            "name": f"claim-b-r1{pto.CLAIM_TOKENS_SUFFIX}",
+            "key": pps.PERSONAL_GRANT_ENV,
+        }
+    }
+    pod["spec"]["containers"][0]["env"] = [{"name": pps.PERSONAL_GRANT_ENV, "valueFrom": ref}]
+    status = pod["status"]["containerStatuses"][0]
+    status["restartCount"] = restarts
+    status["state"] = {"running": {"startedAt": _stamp(0)}}
+    return pod
+
+
+def _interruption_setup(
+    h: _Harness,
+    *,
+    prompt_only: bool = True,
+    recovery: str = "in_place",
+    replay: str = "own",
+    after_head: str = HEAD_B1,
+) -> pt.PodRun:
+    """B-r1 held at its prompt, then its recovery as the cluster and the new runtime show it.
+
+    ``recovery`` is where the product restarts B's runtime: ``in_place`` (the
+    same pod uid, its runner container restarted) or ``new_pod`` (a new pod on
+    B's claim). The recovered runtime's gate stream delivers its prompt hold and
+    its capture holds ``replay``: ``own`` (the replayed marker in a transcript
+    it wrote), ``none`` (no marker at all) or ``baseline`` (the marker only in
+    the bytes B-r1 left in the same file). Workspace reads answer a clean
+    checkout of B1's head before, and of ``after_head`` in the recovered pod.
+    """
+
     _through(h, "b-r1")
     held = _pod_run(h, "b-r1", policy=pt.KEEP_PROMPT)
     held.request_id, held.work_item_id = REQUEST_B1, WORK_ITEM_B
     held.conversation_id = "issue-12"
-    records = [_prompt()] if prompt_only else [_prompt(), _reply("m1", 1, 40, [])]
+    held.claim_labels = dict(B_CLAIM_LABELS)
+    # B-r1 resumed B's conversation: the replayed marker turn precedes its prompt.
+    records = [_replayed(MARKER_TEXT_B), _prompt()]
+    if not prompt_only:
+        records.append(_reply("m1", 1, 40, []))
     files = {MAIN: _jsonl(records)}
     _feed(held, files)
     held.kept = _hold("prompt", 1, size=len(files[MAIN]))["hold"]
@@ -1844,6 +1969,8 @@ def _interruption_setup(h: _Harness, *, prompt_only: bool = True) -> pt.PodRun:
     held.clis = [(4242, 77)]
     held.eof.set()
     h.run.a_stop_at = T0 + 5
+    h.run.b1_head = HEAD_B1
+    h.run.marker_texts["b"] = MARKER_TEXT_B
     row = {
         "id": REQUEST_B1,
         "work_item_id": WORK_ITEM_B,
@@ -1856,15 +1983,44 @@ def _interruption_setup(h: _Harness, *, prompt_only: bool = True) -> pt.PodRun:
     h.run.request_row = lambda _request: dict(row)  # type: ignore[method-assign]
     h.run.marker_present = lambda _owner: True  # type: ignore[method-assign]
     h.run.owner_claims = lambda _owner: [held.claim]  # type: ignore[method-assign]
-    h.run.await_container_restart = lambda _run: {"metadata": {"uid": held.pod_uid}}  # type: ignore[method-assign]
-
-    def begin(run: pt.PodRun) -> None:
-        run.clis = [(5151, 88)]
-        run.delivery = {"own_grant": True, "not_other": True}
-        h.run.pods.append(run)
-
-    h.run.begin_pod_run = begin  # type: ignore[method-assign]
     h.run.first_tool = lambda _run, _moment: T0 + 50  # type: ignore[method-assign]
+    _forge_source(h, HEAD_B1)
+    if recovery == "in_place":
+        pod = _recovered_pod(held.pod, held.pod_uid, restarts=held.restart_count + 1)
+        _workspaces(h, {held.pod: [_workspace_line(HEAD_B1), _workspace_line(after_head)]})
+    else:
+        pod = _recovered_pod("pod-b-r2", "uid-b-r2", restarts=0)
+        labels = {pp.CLAIM_AGENT_LABEL: h.run.agent, **B_CLAIM_LABELS}
+        claim = {
+            "metadata": {"name": held.claim, "labels": labels},
+            "status": {"sandbox": {"name": "sandbox-b"}},
+        }
+        h.shell.on("get", pp.CLAIM_RESOURCE, "-l")(lambda _argv, _stdin: {"items": [claim]})
+        _workspaces(
+            h, {held.pod: [_workspace_line(HEAD_B1)], "pod-b-r2": [_workspace_line(after_head)]}
+        )
+    h.shell.on("get", "pods", "-l")(lambda _argv, _stdin: {"items": [pod]})
+    if replay == "baseline":
+        path = MAIN
+        recovered = {MAIN: files[MAIN] + _jsonl([_prompt(11)])}
+    else:
+        path = RECOVERED
+        lines = [_replayed(MARKER_TEXT_B, 10)] if replay == "own" else []
+        recovered = {RECOVERED: _jsonl([*lines, _prompt(11)])}
+        if recovery == "in_place":
+            # The container's temporary root survives its restart, B-r1's file with it.
+            recovered[MAIN] = files[MAIN]
+    event = _hold("prompt", 1, size=len(recovered[path]), cli=(5151, 88))
+    event["hold"]["transcript_path"] = f"/tmp/{path}"
+    gate = _FakeGate()
+    gate.queue.append(event)
+    h.run.open_gate = lambda _run: gate  # type: ignore[method-assign]
+
+    def harvest(run: pt.PodRun) -> None:
+        run.harvest = pps.HarvestState(h.runtime.scan)
+        _feed(run, recovered)
+
+    h.run.open_harvest = harvest  # type: ignore[method-assign]
     return held
 
 
@@ -1922,7 +2078,7 @@ def _answer(stdout: bytes) -> Answer:
 
 
 def _interrupts(h: _Harness) -> list[list[str]]:
-    return [argv for argv in h.shell.kubectl() if "exec" in argv and "python3" in argv]
+    return [argv for argv in h.shell.kubectl() if "exec" in argv and pto.INTERRUPT_PROGRAM in argv]
 
 
 def test_interruption_signals_the_held_identity_and_returns_the_judged_facts(
@@ -2032,6 +2188,397 @@ def test_process_phase_passes_through_the_real_interruption(tmp_path: Path) -> N
         "interruption_process_only": True,
         "old_epoch_confirmed_before_bind": True,
     }
+
+
+# -- AC 5 recovery evidence: replayed history, committed workspace, epochs ---------
+
+PROCESS_KEYS = [key for key in pto.EXPECTED["restarts"] if key.startswith("process_")]
+
+
+@pytest.mark.parametrize("recovery", ["in_place", "new_pod"])
+def test_b_r2_recovers_in_place_or_on_a_new_pod_and_is_gated_there(
+    tmp_path: Path, recovery: str
+) -> None:
+    h = _live(tmp_path)
+    held = _interruption_setup(h, recovery=recovery)
+    h.shell.on("exec", held.pod, "python3")(lambda _a, _s: _witness())
+    reads: list[tuple[str, bool]] = []
+    read = h.run.workspace_state
+
+    def workspace_state(run: pt.PodRun) -> dict[str, Any] | None:
+        reads.append((run.group, run.gate is None))
+        return read(run)
+
+    h.run.workspace_state = workspace_state  # type: ignore[method-assign]
+    h.run.phase_process_interruption()
+    repair = h.run.pod_run("b-r2")
+    restarts = h.ledger.observations("restarts")
+    for key in PROCESS_KEYS:
+        assert restarts[key] is True, key
+    new_pod = recovery == "new_pod"
+    # Where it recovered is an observation; both shapes pass.
+    assert restarts["process_recovery"] == recovery
+    assert restarts["process_same_pod"] is (not new_pod)
+    assert restarts["process_container_restarted"] is (not new_pod)
+    assert restarts["process_uncommitted_restored"] == "none_before"
+    assert (repair.pod, repair.claim) == ("pod-b-r2" if new_pod else held.pod, held.claim)
+    # B-r1's workspace was read before the signals, B-r2's before its gate opened.
+    assert reads == [("b-r1", False), ("b-r2", True)]
+    # The recovered pod's prompt hold was gated on that pod and mapped to B-r2's
+    # reserved implementer, so its usage settles like any other pod's.
+    implementer = next(item for item in repair.reservations if item.role == pto.IMPLEMENTER)
+    assert _gate(repair).sent[-1] == {"release": "prompt-1-1", "verdict": "go"}
+    assert repair.sessions == {RECOVERED.removesuffix(".jsonl"): implementer.seq}
+    assert repair.baseline == ({} if new_pod else {MAIN: held.kept_files[MAIN]})
+    assert repair.stale_clis == (set() if new_pod else {(4242, 77)})
+    assert not [argv for argv in h.shell.kubectl() if "delete" in argv]
+    assert "fence" not in _trace(h)
+
+
+@pytest.mark.parametrize(
+    ("recovery", "replay"),
+    [("in_place", "baseline"), ("in_place", "none"), ("new_pod", "none")],
+    ids=["marker-only-in-b-r1s-bytes", "in-place-without-replay", "new-pod-without-replay"],
+)
+def test_b_r2_must_carry_the_replayed_marker_in_its_own_transcript(
+    tmp_path: Path, recovery: str, replay: str
+) -> None:
+    h = _live(tmp_path)
+    held = _interruption_setup(h, recovery=recovery, replay=replay)
+    h.shell.on("exec", held.pod, "python3")(lambda _a, _s: _witness())
+    # Central storage still holds the marker record (marker_present answers
+    # True); that proves nothing about the history the fresh runtime received.
+    with pytest.raises(pp.StepFailed, match="failed: process_marker_after; paid work fenced"):
+        h.run.phase_process_interruption()
+    restarts = h.ledger.observations("restarts")
+    assert restarts["process_marker_after"] is False
+    assert restarts["process_marker_stored_after"] is True
+    assert "fence" in _trace(h)
+
+
+@pytest.mark.parametrize("recovery", ["in_place", "new_pod"])
+def test_a_recovered_workspace_off_b1s_committed_head_fails(tmp_path: Path, recovery: str) -> None:
+    h = _live(tmp_path)
+    held = _interruption_setup(h, recovery=recovery, after_head=HEAD_OTHER)
+    h.shell.on("exec", held.pod, "python3")(lambda _a, _s: _witness())
+    with pytest.raises(
+        pp.StepFailed,
+        match="failed: process_committed_files_restored, process_committed_head_restored;",
+    ):
+        h.run.phase_process_interruption()
+    restarts = h.ledger.observations("restarts")
+    assert restarts["process_committed_head_restored"] is False
+    assert restarts["process_marker_after"] is True and "fence" in _trace(h)
+
+
+def test_workspace_reads_run_the_read_only_program_in_the_runner(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    answers = iter([pp.Completed(0, _workspace_line(HEAD_A), b""), pp.Completed(1, b"", b"x")])
+    h.shell.on("exec", pto.WORKSPACE_PROGRAM)(lambda _argv, _stdin: next(answers))
+    assert h.run.workspace_state(run) == pto.workspace_state(_workspace_line(HEAD_A))
+    (argv,) = [argv for argv in h.shell.kubectl() if pto.WORKSPACE_PROGRAM in argv]
+    assert argv[:3] == ["kubectl", "--context", CONTEXT]
+    assert argv[argv.index("exec") :] == [
+        "exec",
+        run.pod,
+        "-c",
+        pps.RUNNER_CONTAINER,
+        "--",
+        "python3",
+        "-c",
+        pto.WORKSPACE_PROGRAM,
+        pto.RUNNER_WORKSPACE,
+        h.run.nonce,
+    ]
+    # A failed exec is no reading: every comparison with it fails.
+    assert h.run.workspace_state(run) is None
+
+
+def test_committed_source_reads_the_whole_tree_once_and_fails_closed(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _forge_source(h, HEAD_B1)
+    reads: list[str] = []
+    tree = h.run.forge_get
+
+    def forge_get(suffix: str) -> Any:
+        reads.append(suffix)
+        return tree(suffix)
+
+    h.run.forge_get = forge_get  # type: ignore[method-assign]
+    source = h.run.committed_source(HEAD_B1)
+    assert source == {"head": HEAD_B1, "files": {p: _sha(d) for p, d in TREE_FILES.items()}}
+    assert h.run.committed_source(HEAD_B1) is source and reads == [
+        f"/git/trees/{HEAD_B1}?recursive=1"
+    ]
+    empty = {"head": None, "files": {}}
+    # A truncated tree, an unreadable blob or a head that is not a commit is no source.
+    h.run.forge_get = lambda _suffix: {"truncated": True, "tree": []}  # type: ignore[method-assign]
+    assert h.run.committed_source(HEAD_OTHER) == empty
+    _forge_source(h, HEAD_A)
+    blob = h.run.forge_file
+    h.run.forge_file = lambda path, ref: None if path == "README.md" else blob(path, ref)  # type: ignore[method-assign]
+    assert h.run.committed_source(HEAD_A) == empty
+    assert h.run.committed_source("main") == empty
+    # Control: a failed read is not kept, so a later complete read is used.
+    h.run.forge_file = blob  # type: ignore[method-assign]
+    assert h.run.committed_source(HEAD_A)["head"] == HEAD_A
+
+
+A2_ROW = {
+    "id": REQUEST_A2,
+    "work_item_id": WORK_ITEM,
+    "sequence": 2,
+    "status": "running",
+    "started": True,
+    "runtime_claim_name": "claim-a2",
+    "runtime_epoch": 1,
+    "runtime_owner": "curie-worker-1-7",
+    "owner_principal_id": PRINCIPAL_A,
+    "tenant_id": TENANT,
+    "enrollment_generation": 1,
+}
+A2_RECORDS = [
+    _replayed(MARKER_TEXT_A),
+    _prompt(10),
+    _reply("m1", 11, 30, [_tool("t1")]),
+    _result("t1", 12),
+]
+
+
+def _a2_setup(
+    h: _Harness, *, new_row: Mapping[str, Any], records: Sequence[Any], after_head: str
+) -> None:
+    """A1 parked, rejected and gone; A2 admitted, adopted on pod-a2 and parked.
+
+    The request rows are ``execution_requests`` as ``_REQUEST_COLUMNS`` reads
+    them: A1 failed ``publication_denied`` at the epoch its runtime held (no
+    termination observation is owed for it) and ``new_row`` for A2.
+    """
+
+    for spec in pto.MANIFEST[: pto.group_index("a2") - 1]:
+        _settle_group(h, spec.name)
+    first = _pod_run(h, "a1", card=1, reserve=False)
+    first.request_id, first.work_item_id, first.conversation_id = REQUEST_A1, WORK_ITEM, "issue-11"
+    first.epoch = 2
+    h.run.controls_done_at = T0 - 1
+    h.ledger.record("restarts", "pod_old_runtime_absent", True)
+    h.run.marker_texts["a"] = MARKER_TEXT_A
+    nonce = {"NONCE.md": b"acceptance nonce: run-a\n"}
+    h.run.restore_before["pod"] = pto.workspace_state(_workspace_line(HEAD_A, edits=nonce))
+    h.run.restore_heads["pod"] = HEAD_A
+    _forge_source(h, HEAD_A)
+    _workspaces(h, {"pod-a2": [_workspace_line(after_head)]})
+    h.api.route("POST", "/v1/internal/work-items/admissions")(
+        lambda _p, _h, _b: (200, _admission_answer("a", REQUEST_A2))
+    )
+
+    def find(run: pt.PodRun) -> bool:
+        run.claim, run.pod, run.pod_uid = "claim-a2", "pod-a2", "uid-a2"
+        return True
+
+    def begin(run: pt.PodRun) -> None:
+        run.delivery = {"own_grant": True, "not_other": True}
+        run.harvest = pps.HarvestState(h.runtime.scan)
+        _feed(run, {RECOVERED: _jsonl(records)})
+        h.run.pods.append(run)
+
+    h.run.find_runner_pod = find  # type: ignore[method-assign]
+    h.run.begin_pod_run = begin  # type: ignore[method-assign]
+    for name in ("await_park", "finish_park", "deliver_card"):
+        setattr(h.run, name, lambda _run: None)
+    old = {
+        "id": REQUEST_A1,
+        "work_item_id": WORK_ITEM,
+        "sequence": 1,
+        "status": "failed",
+        "terminal_cause": "publication_denied",
+        "started": True,
+        "runtime_epoch": 2,
+        "runtime_claim_name": "claim-a1",
+        "observed": False,
+        "teardown_pending": False,
+    }
+    rows = {REQUEST_A1: old, REQUEST_A2: dict(new_row)}
+    h.run.request_row = lambda request: dict(rows[request])  # type: ignore[method-assign]
+    h.run.subscription = lambda owner, verb, *extra: (0, {"generation": 1})  # type: ignore[method-assign]
+    h.run.first_tool = lambda _run, _moment: T0 + 50  # type: ignore[method-assign]
+    h.run.marker_present = lambda _owner: True  # type: ignore[method-assign]
+
+
+POD_KEYS = [
+    key
+    for key in pto.EXPECTED["restarts"]
+    if key.startswith("pod_") and key not in {"pod_lineage_before", "pod_marker_before"}
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "failing"),
+    [
+        ("successor-bound", None),
+        ("terminal-only", "pod_termination_epoch"),
+        ("marker-in-storage-only", "pod_marker_after"),
+        ("workspace-off-head", "pod_committed_files_restored, pod_committed_head_restored"),
+    ],
+)
+def test_the_pod_recreation_is_judged_on_the_fresh_runtime(
+    tmp_path: Path, case: str, failing: str | None
+) -> None:
+    h = _live(tmp_path)
+    new_row, records, after = dict(A2_ROW), list(A2_RECORDS), HEAD_A
+    if case == "terminal-only":
+        # A1 is terminal at the epoch it held, but no successor bound the fresh pod.
+        new_row.update(
+            {
+                "status": "waiting",
+                "started": False,
+                "runtime_claim_name": None,
+                "runtime_epoch": 0,
+                "runtime_owner": None,
+            }
+        )
+    elif case == "marker-in-storage-only":
+        records = records[1:]
+    elif case == "workspace-off-head":
+        after = HEAD_OTHER
+    _a2_setup(h, new_row=new_row, records=records, after_head=after)
+    if failing is None:
+        h.run.phase_attempt_a2()
+        restarts = h.ledger.observations("restarts")
+        for key in POD_KEYS:
+            assert restarts[key] is True, key
+        # Observations, never required: A1's uncommitted nonce file did not come
+        # back (#5541), and a publication_denied request owes no termination record.
+        assert restarts["pod_uncommitted_restored"] == "not_restored"
+        assert restarts["pod_termination_recorded"] is False
+        assert restarts["pod_marker_stored_after"] is True
+        assert restarts["pod_git_status_after"] == []
+        assert "fence" not in _trace(h)
+        return
+    with pytest.raises(pp.StepFailed, match=f"failed: {failing}; paid work fenced"):
+        h.run.phase_attempt_a2()
+    assert h.ledger.observations("restarts")[failing.split(",")[0]] is False
+    assert "fence" in _trace(h)
+
+
+def _hold_both_setup(
+    h: _Harness, *, runtime_owner: str, epoch: int, marker: bool, after_head: str
+) -> None:
+    """B-r1 held at its prompt on the new worker, A3 held after one tool, B1 published."""
+
+    for spec in pto.MANIFEST[: pto.group_index("b-r1") - 1]:
+        _settle_group(h, spec.name)
+    first = _pod_run(h, "b1", card=3, reserve=False)
+    first.request_id, first.work_item_id, first.conversation_id = (
+        REQUEST_B1,
+        WORK_ITEM_B,
+        "issue-12",
+    )
+    first.epoch, first.publication_id = 2, "publication-b1"
+    held = _pod_run(h, "b-r1", policy=pt.KEEP_PROMPT)
+    held.conversation_id = "issue-12"
+    held.delivery = {"own_grant": True, "not_other": True}
+    held_files = {MAIN: _jsonl([*([_replayed(MARKER_TEXT_B)] if marker else []), _prompt()])}
+    _feed(held, held_files)
+    held.kept = _hold("prompt", 1, size=len(held_files[MAIN]))["hold"]
+    held.kept_files, held.kept_facts = held_files, h.run.pod_facts(held, held_files)
+    # Read at its adoption, before its gate opened (adopt_runner).
+    held.workspace_first = pto.workspace_state(_workspace_line(after_head))
+    follow = _pod_run(h, "a3", policy=pt.KEEP_AFTER_TOOL)
+    follow_files = {MAIN: _jsonl([_prompt(), _reply("m1", 1, 20, [_tool("t1")]), _result("t1", 2)])}
+    _feed(follow, follow_files)
+    follow.kept = _hold("response", 2, size=len(follow_files[MAIN]), tool="Bash")["hold"]
+    follow.kept_files = follow_files
+    held.kept_at = follow.kept_at = h.clock.monotonic()
+    h.run.owners["b"].conversation_ids = ["issue-12"]
+    h.run.threads["b"] = "issue-12"
+    h.run.worker_before, h.run.worker_name = ["uid-w1"], "curie-worker-2"
+    worker = _pod("curie-worker-2", "worker", "curie-worker", DIGESTS["curie-worker"], uid="uid-w2")
+    h.run.worker_pods = lambda pods=None: [worker]  # type: ignore[method-assign]
+    row = {
+        "id": REQUEST_B1,
+        "work_item_id": WORK_ITEM_B,
+        "status": "running",
+        "runtime_epoch": epoch,
+        "runtime_owner": runtime_owner,
+        "owner_principal_id": PRINCIPAL_B,
+        "tenant_id": TENANT,
+        "model_auth_mode": pps.PERSONAL_MODE,
+        "enrollment_generation": 1,
+        "owner_lost_retry": False,
+    }
+    h.run.request_row = lambda _request: dict(row)  # type: ignore[method-assign]
+    h.run.publication = lambda _id: {"status": "succeeded"}  # type: ignore[method-assign]
+    h.run.marker_present = lambda _owner: True  # type: ignore[method-assign]
+    h.run.b1_head = HEAD_B1
+    h.run.marker_texts["b"] = MARKER_TEXT_B
+    _forge_source(h, HEAD_B1)
+
+
+WORKER_KEYS = [
+    f"worker_{key}"
+    for key in (
+        "termination_epoch",
+        "same_work_item",
+        "same_conversation",
+        "owner_unchanged",
+        "generation_unchanged",
+        "grant_unchanged",
+        "marker_after",
+        "usage_settled",
+        "owner_lost_safe",
+        "committed_head_restored",
+        "committed_files_restored",
+    )
+]
+OLD_CONSUMER = "curie-worker-1-7"
+NEW_CONSUMER = "curie-worker-2-1"
+
+
+@pytest.mark.parametrize(
+    ("owner", "epoch", "marker", "after", "failing"),
+    [
+        pytest.param(OLD_CONSUMER, 2, True, HEAD_B1, None, id="old-consumer-name-kept"),
+        pytest.param(NEW_CONSUMER, 2, True, HEAD_B1, None, id="consumer-name-moved"),
+        pytest.param(
+            NEW_CONSUMER, 2, False, HEAD_B1, "worker_marker_after", id="marker-in-storage-only"
+        ),
+        pytest.param(
+            NEW_CONSUMER, 3, True, HEAD_B1, "worker_termination_epoch", id="epoch-advanced"
+        ),
+        pytest.param(
+            NEW_CONSUMER,
+            2,
+            True,
+            HEAD_OTHER,
+            "worker_committed_files_restored, worker_committed_head_restored",
+            id="workspace-off-head",
+        ),
+    ],
+)
+def test_the_worker_restart_is_judged_on_b_r1(
+    tmp_path: Path, owner: str, epoch: int, marker: bool, after: str, failing: str | None
+) -> None:
+    h = _live(tmp_path)
+    _hold_both_setup(h, runtime_owner=owner, epoch=epoch, marker=marker, after_head=after)
+    if failing is None:
+        # A CI continuation adopts the running request without a start, so its
+        # runtime owner may keep the old consumer's name: recorded, not required.
+        h.run.phase_hold_both()
+        restarts = h.ledger.observations("restarts")
+        for key in WORKER_KEYS:
+            assert restarts[key] is True, key
+        assert restarts["worker_runtime_owner_moved"] is (owner == NEW_CONSUMER)
+        assert restarts["worker_marker_stored_after"] is True
+        assert restarts["worker_git_status_after"] == []
+        assert "worker_uncommitted_restored" not in restarts
+        return
+    with pytest.raises(pp.StepFailed, match=f"failed: {failing}; paid work fenced"):
+        h.run.phase_hold_both()
+    assert h.ledger.observations("restarts")[failing.split(",")[0]] is False
+    assert "fence" in _trace(h)
 
 
 ENROLLMENT_A = "5d0c7f3e-0000-4000-8000-0000000e0a01"
