@@ -609,7 +609,8 @@ class ScriptedRun:
                     f"local image {image} is missing; pass --build-images to build it"
                 ) from None
         self.check_disk(
-            "scripted factory", required_bytes=kind_images.import_budget(self.command, self.image_refs)
+            "scripted factory",
+            required_bytes=kind_images.import_budget(self.command, self.image_refs),
         )
 
     def execute(self) -> None:
