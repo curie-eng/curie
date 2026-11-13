@@ -3853,6 +3853,50 @@ class Principal(Base):
     )
 
 
+class RequesterCodingProfile(Base):
+    """One revision-bearing owner document, independent of personal enrollment."""
+
+    __tablename__ = "requester_coding_profiles"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="requester_coding_profiles_principal_fkey", ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "revision >= 1 AND revision <= 9223372036854775807",
+            name="requester_coding_profiles_revision_ck",
+        ),
+        CheckConstraint("format_version = 1", name="requester_coding_profiles_format_ck"),
+        CheckConstraint(
+            "((text IS NULL AND sha256 IS NULL) OR (text IS NOT NULL AND sha256 IS NOT NULL "
+            "AND octet_length(text) BETWEEN 1 AND 16384 AND position(chr(13) in text) = 0 "
+            "AND sha256 ~ '^[0-9a-f]{64}$' "
+            "AND sha256 = encode(sha256(convert_to(text, 'UTF8')), 'hex'))) IS TRUE",
+            name="requester_coding_profiles_text_ck",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    text: Mapped[str | None] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    format_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RequesterCodingPolicy(Base):
+    """Default-enabled tenant switch; administrators never receive owner text."""
+
+    __tablename__ = "requester_coding_policies"
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    enabled: Mapped[bool] = mapped_column(default=True, server_default=text("true"))
+
+
 class PersonalClaudeEnrollment(Base):
     """The token-free header of one principal's personal enrollment (#5376, ADR 0268).
 

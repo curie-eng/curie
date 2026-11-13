@@ -126,6 +126,11 @@ pub fn variant_names(src: &str, target: &str) -> BTreeSet<String> {
              PARSE failure, not an absent enum"
         )
     });
+    variant_names_in_file(&file, target)
+}
+
+/// Enumerate a parsed source with the same duplicate and cfg checks.
+pub fn variant_names_in_file(file: &syn::File, target: &str) -> BTreeSet<String> {
     let mut collector = VariantCollector {
         target,
         names: BTreeSet::new(),
@@ -133,7 +138,7 @@ pub fn variant_names(src: &str, target: &str) -> BTreeSet<String> {
         cfg_gated: BTreeSet::new(),
         cfg_mods: Vec::new(),
     };
-    collector.visit_file(&file);
+    collector.visit_file(file);
 
     assert!(
         collector.declarations <= 1,

@@ -124,6 +124,12 @@
       "version": "1.1"
     },
     {
+      "result": "CodingInstructionsOutput",
+      "kind": "CliOutput",
+      "schema": "coding-instructions.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "CommsOutput",
       "kind": "CliOutput",
       "schema": "comms.schema.json",

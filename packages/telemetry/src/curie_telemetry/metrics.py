@@ -418,6 +418,7 @@ _HTTP_OPERATIONS = [
     "/console/session",
     # Owner personal Claude enrollment (#5377).
     "/personal-claude/enrollment",
+    "/coding-instructions",
     "/deploy-targets/list",
     "/deploy-targets/resolve",
     "/deployments",
@@ -452,6 +453,7 @@ _HTTP_OPERATIONS = [
     "/identity/resolve",
     "/identity/slack-reports",
     "/identity/admin/{tenant_id}/{resource}",
+    "/identity/admin/{tenant_id}/coding-instructions-policy",
     # Operator code host links and link revocation (#5414).
     "/identity/admin/{tenant_id}/code-host-links",
     "/identity/admin/{tenant_id}/links/{link_id}/revoke",

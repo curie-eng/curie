@@ -1910,6 +1910,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/coding-instructions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read */
+        get: operations["read_coding_instructions_get"];
+        /** Write */
+        put: operations["write_coding_instructions_put"];
+        post?: never;
+        /** Clear */
+        delete: operations["clear_coding_instructions_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/config": {
         parameters: {
             query?: never;
@@ -2655,6 +2674,24 @@ export interface paths {
          *     person may hold several accounts; one account belongs to one active link.
          */
         post: operations["create_code_host_link_identity_admin__tenant_id__code_host_links_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/admin/{tenant_id}/coding-instructions-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Coding Instructions Policy */
+        get: operations["coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_get"];
+        /** Set Coding Instructions Policy */
+        put: operations["set_coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_put"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -6975,6 +7012,48 @@ export interface components {
              * Format: uuid
              */
             link_id: string;
+        };
+        /** CodingInstructionsOut */
+        CodingInstructionsOut: {
+            /**
+             * Application
+             * @constant
+             */
+            application: "unavailable";
+            /** Byte Length */
+            byte_length: number;
+            /**
+             * Format Version
+             * @constant
+             */
+            format_version: 1;
+            /** Revision */
+            revision: number;
+            /** Sha256 */
+            sha256: string | null;
+            /** Tenant Enabled */
+            tenant_enabled: boolean;
+            /** Text */
+            text: string | null;
+            /** Updated At */
+            updated_at: string | null;
+        };
+        /** CodingInstructionsPolicyOut */
+        CodingInstructionsPolicyOut: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** CodingInstructionsPolicyWrite */
+        CodingInstructionsPolicyWrite: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** CodingInstructionsWrite */
+        CodingInstructionsWrite: {
+            /** Expected Revision */
+            expected_revision: number;
+            /** Text */
+            text: string;
         };
         /** Completed */
         Completed: {
@@ -16930,6 +17009,105 @@ export interface operations {
             };
         };
     };
+    read_coding_instructions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    write_coding_instructions_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodingInstructionsWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    clear_coding_instructions_delete: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_config_config_get: {
         parameters: {
             query?: never;
@@ -18273,6 +18451,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CodeHostLinkOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsPolicyOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodingInstructionsPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsPolicyOut"];
                 };
             };
             /** @description Validation Error */

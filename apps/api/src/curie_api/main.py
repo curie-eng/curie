@@ -83,6 +83,7 @@ from .routers import (
     channel_read,
     channels,
     cluster_message_replies,
+    coding_instructions,
     config,
     console,
     control,
@@ -775,6 +776,7 @@ def create_app(
     app.include_router(identity_admin.router)
     app.include_router(identity_operator.router)
     app.include_router(personal_enrollments.router)
+    app.include_router(coding_instructions.router)
     app.include_router(identity_authority.router)
     app.include_router(identity_authority.grant_router)
     app.include_router(identity_authority.classification_router)

@@ -4,6 +4,11 @@ Date: 2026-09-21
 
 Status: Accepted
 
+**Partially amended by [ADR 0278](0278-requester-coding-instructions.md)**: the
+rejection of per-person memory no longer excludes the explicit owner-written instruction
+store, and the rejection of version history does not apply to pinned instruction
+snapshots. Agent and channel memory are unchanged.
+
 Accepted by Brian on 2026-09-30. This is the design for
 [#1461](https://github.com/curie-eng/curie/issues/1461), shipping in v0.12.0
 from `next`. Memory implementation merged on `next` in

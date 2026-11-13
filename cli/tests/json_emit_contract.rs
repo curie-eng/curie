@@ -41,12 +41,11 @@ fn manifest() -> serde_json::Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("manifest {path} must be valid JSON: {e}"))
 }
 
-/// Placeholder value for a required arg. `--limit` parses as an f64, so a
-/// non-numeric placeholder would be a clap parse error (empty stdout -> false
-/// failure); everything else is a plain string.
+/// Valid representatives for required argument parsers.
 fn placeholder(id: &str) -> &'static str {
     match id {
         "limit" => "1",
+        "expected_revision" => "0",
         "tenant" => "00000000-0000-0000-0000-000000000001",
         "resource" => "config",
         // `migrate-store --phase` restricts its values, so the generic "x" is

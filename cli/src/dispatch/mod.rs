@@ -22,6 +22,7 @@ use crate::args::*;
 
 mod cluster_action;
 mod cluster_target;
+mod coding_instructions;
 mod dev_action;
 mod local_action;
 mod skill_action;
