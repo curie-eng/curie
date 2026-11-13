@@ -484,7 +484,7 @@ def test_additive_migration_preserves_existing_failed_execution(migration_admitt
     )
     command.downgrade(config, "0162")
     assert _snapshot(published["id"]) == before
-    command.upgrade(config, "0163")
+    command.upgrade(config, "head")
     assert _snapshot(published["id"]) == before
     assert _rows("SELECT request_id FROM curie.factory_ci_observations") == []
 
