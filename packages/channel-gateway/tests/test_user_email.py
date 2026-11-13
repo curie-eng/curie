@@ -218,7 +218,7 @@ def test_network_failure_refuses(monkeypatch):
 
 def test_slow_slack_times_out_at_the_gateway(monkeypatch):
     async def slack(_request):
-        await asyncio.sleep(5)
+        await asyncio.Event().wait()  # never answers; the bound must fire
         return _ok(_user())
 
     async def scenario(endpoint, _calls):
@@ -241,7 +241,7 @@ def test_slow_slack_times_out_at_the_gateway(monkeypatch):
 def test_client_timeout_refuses(monkeypatch):
     class Slow:
         async def email_of(self, *, identity, user_id, workspace):
-            await asyncio.sleep(5)
+            await asyncio.Event().wait()  # never answers; the bound must fire
             return EMAIL
 
     async def scenario(endpoint, _calls):
