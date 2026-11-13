@@ -125,6 +125,16 @@ Python or running Curie service. Starting work
 still needs a configured factory, tracker access and the start authority described
 below. The skill does not deploy a factory or guarantee that a task can finish.
 
+## Read a factory pull request
+
+After a factory run, `curie factory explain` reads that issue's factory pull requests with your own GitHub login. Pass `owner/repo#number` or a github.com issue URL:
+
+```bash
+curie factory explain curie-eng/curie#120 --json
+```
+
+The command checks `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. It never reads the Curie platform key. Each match prints the pull request summary, the parsed Decisions entries, verification counts, review text, forge review states, and head-commit checks. The pull request summary and the Decisions entries are the plan record. Zero matches print `no factory pull request`. A pull request that never wrote `## Decisions` reports `not recorded`.
+
 ## Delegate, inspect, and refine
 
 The GitHub workflow is below. The GitLab and Jira Cloud quickstarts above

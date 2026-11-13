@@ -4,7 +4,8 @@ version = "0.16.0"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
 # Every cli/tests/<name>.rs is a module of the one `integration` test crate
-# below (#4382); tests/integration.rs declares them and guards that none is missed.
+# below (#4382), except a file that is its own [[test]] target.
+# tests/integration.rs declares the modules and guards that none is missed.
 autotests = false
 
 [[bin]]
@@ -14,6 +15,10 @@ path = "src/main.rs"
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[test]]
+name = "factory_explain"
+path = "tests/factory_explain.rs"
 
 [[test]]
 name = "dev_test_env"
