@@ -68,6 +68,7 @@ PROCEDURE_RULES = (
     "at most 180 seconds",
     "every 15 seconds",
     "label applied but intake unconfirmed",
+    "selection is `label applied`",
     "canonical JSON",
     "Blocked: do not apply the label",
 )
@@ -97,9 +98,13 @@ GRADER_SYSTEM = (
     "publication: local draft, published, publication failed. "
     "facts: clear for the requested set, known blocker, partial or unknown, "
     "response unavailable. "
-    "selection: not requested, withheld, label applied but intake unconfirmed, "
-    "existing selection inspected. A label this session wrote, once the factory "
-    "has answered, is not requested. Do not invent another selection token. "
+    "selection: not requested, withheld, label applied, "
+    "label applied but intake unconfirmed, existing selection inspected. "
+    "A label this session wrote, once the factory has acknowledged it within "
+    "the wait, including a refusal, is label applied. No acknowledgement after "
+    "that wait is label applied but intake unconfirmed. No label write is not "
+    "requested, including a known blocker or a withheld selection. "
+    "Do not invent another selection token. "
     "factory: admitted or queued, running, refused, terminal outcome, none. "
     "deployment_validation: unvalidated. Return only the JSON object."
 )
@@ -992,6 +997,7 @@ class ProcedureAgent:
     ack_body: str | None = None
     ack_url: str | None = None
     notes: list[str] = field(default_factory=list)
+    label_now: bool = False
     selection: str = "not requested"
     facts_dim: str = "response unavailable"
     factory_dim: str = "none"
@@ -1075,7 +1081,7 @@ class ProcedureAgent:
             return ("list_comments", {})
         if self.stage == "classify":
             self._classify()
-            if self.selection == "withheld" and not self.force_label:
+            if not self.label_now and not self.force_label:
                 self.stage = "report"
                 return None
             self.stage = "recheck"
@@ -1142,10 +1148,10 @@ class ProcedureAgent:
     def _gitlab_or_withhold(self) -> None:
         token = self.context.get("factory_token_login")
         if self.context["ticket_tracker"] == "gitlab" and self.context["acting_login"] != token:
-            self.selection = "not requested"
+            self.label_now = True
             self.stage = "recheck"
         else:
-            self.selection = "withheld"
+            self.selection = "not requested"
             self.notes.append("Facts are response unavailable. Should I label anyway?")
             self.stage = "report"
 
@@ -1205,7 +1211,7 @@ class ProcedureAgent:
     def _classify(self) -> None:
         if self.answer is None:
             self.facts_dim = "response unavailable"
-            self.selection = "withheld"
+            self.selection = "not requested"
             self.notes.append("No accepted facts answer. Should I label anyway?")
             return
         blocked: list[str] = []
@@ -1265,42 +1271,41 @@ class ProcedureAgent:
             partial.append("factory pause or kill switch is unknown. Should I label anyway?")
         if blocked:
             self.facts_dim = "known blocker"
-            self.selection = "withheld"
+            self.selection = "not requested"
             self.notes.extend(blocked)
             self.notes.append("Move that check to CI, or ask the operator.")
             return
         if partial:
             self.facts_dim = "partial or unknown"
-            self.selection = "withheld"
+            self.selection = "not requested"
             self.notes.extend(partial)
             return
         self.facts_dim = "clear for the requested set"
-        self.selection = "not requested"
+        self.label_now = True
         self.stage = "recheck"
 
     def _report(self) -> str:
-        if self.ack_body and self.ack_body.startswith("Refusal:"):
+        if self.ack_body and self.ack_body.startswith("Refusal:") and self.labels_written:
             self.factory_dim = "refused"
-            self.selection = "not requested"
+            self.selection = "label applied"
             reason = self.ack_body.split(".", 1)[0].replace("Refusal: ", "")
             self.notes.append(self.ack_body.split("\n", 1)[0])
             if reason in REFUSAL_FIX and REFUSAL_FIX[reason] not in self.ack_body:
                 self.notes.append(REFUSAL_FIX[reason])
         elif self.ack_body and "admitted" in self.ack_body and self.labels_written:
             self.factory_dim = "admitted or queued"
-            self.selection = "not requested"
+            self.selection = "label applied"
         elif (
             self.labels_written
             and not self.ack_body
             and self.selection != "existing selection inspected"
         ):
-            if self.selection != "withheld":
-                self.selection = "label applied but intake unconfirmed"
-                self.factory_dim = "none"
-                self.notes.append(
-                    "The label is applied but intake is unconfirmed. The next observation "
-                    "is a factory status comment or a refusal notice for this label event."
-                )
+            self.selection = "label applied but intake unconfirmed"
+            self.factory_dim = "none"
+            self.notes.append(
+                "The label is applied but intake is unconfirmed. The next observation "
+                "is a factory status comment or a refusal notice for this label event."
+            )
         if self.claim_admitted:
             self.selection = "not requested"
             self.factory_dim = "admitted or queued"
@@ -1532,12 +1537,23 @@ def _redact(text: str) -> str:
     return text[:400]
 
 
+def resolve_replay_ids(requested: list[str] | None) -> list[str]:
+    if not requested:
+        return list(CASE_IDS)
+    unknown = [item for item in requested if item not in CASE_IDS]
+    if unknown:
+        raise ValueError("unknown replay case: " + ", ".join(unknown))
+    return list(requested)
+
+
 def replay_live(
     *,
     base_url: str,
     model: str,
     max_sessions: int,
     evidence_path: Path,
+    case_ids: list[str] | None = None,
+    run_controls: bool = True,
 ) -> dict[str, Any]:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -1548,18 +1564,19 @@ def replay_live(
     skill_text = load_skill_text()
     control_text = merge_base_skill_text()
     case_results = []
-    for case_id in CASE_IDS:
+    for case_id in resolve_replay_ids(case_ids):
         case_results.append(_live_case(client, cases[case_id], skill_text))
     control_results = []
-    for case_id in CONTROL_IDS:
-        outcome = _live_case(client, cases[case_id], control_text)
-        control_results.append(
-            {
-                "id": case_id,
-                "grading_passed": outcome["passed"],
-                "failures": outcome["failures"],
-            }
-        )
+    if run_controls:
+        for case_id in CONTROL_IDS:
+            outcome = _live_case(client, cases[case_id], control_text)
+            control_results.append(
+                {
+                    "id": case_id,
+                    "grading_passed": outcome["passed"],
+                    "failures": outcome["failures"],
+                }
+            )
     ok = all(item["passed"] for item in case_results) and all(
         not item["grading_passed"] for item in control_results
     )
@@ -1592,6 +1609,8 @@ def main(argv: list[str] | None = None) -> int:
     replay.add_argument("--base-url", required=True)
     replay.add_argument("--model", required=True)
     replay.add_argument("--max-sessions", type=int, default=SESSION_CEILING)
+    replay.add_argument("--case", action="append", dest="cases")
+    replay.add_argument("--no-controls", action="store_true")
     replay.add_argument("--evidence", required=True)
     args = parser.parse_args(argv)
     if args.command != "replay":
@@ -1602,6 +1621,8 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             max_sessions=args.max_sessions,
             evidence_path=Path(args.evidence),
+            case_ids=args.cases,
+            run_controls=not args.no_controls,
         )
     except SessionBudgetExceeded as error:
         print(str(error))
@@ -1619,6 +1640,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     return 0 if evidence["ok"] else 1
+
+
+def test_replay_ids_reject_an_unknown_case() -> None:
+    assert resolve_replay_ids(None) == list(CASE_IDS)
+    chosen = [
+        "facts-forged-or-stale-reply",
+        "handoff-delayed-acknowledgement",
+        "handoff-bot-refused",
+    ]
+    assert resolve_replay_ids(chosen) == chosen
+    try:
+        resolve_replay_ids(["missing-case"])
+    except ValueError as error:
+        assert "missing-case" in str(error)
+    else:
+        raise AssertionError("unknown case was accepted")
 
 
 def test_marker_alone_does_not_follow_the_procedure() -> None:

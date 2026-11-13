@@ -1072,7 +1072,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "clear for the requested set",
-        "selection": "not requested",
+        "selection": "label applied",
         "factory": "admitted or queued",
         "deployment_validation": "unvalidated"
       },
@@ -1131,7 +1131,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "known blocker",
-        "selection": "withheld",
+        "selection": "not requested",
         "factory": "none",
         "deployment_validation": "unvalidated"
       },
@@ -1194,7 +1194,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "partial or unknown",
-        "selection": "withheld",
+        "selection": "not requested",
         "factory": "none",
         "deployment_validation": "unvalidated"
       },
@@ -1262,7 +1262,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "partial or unknown",
-        "selection": "withheld",
+        "selection": "not requested",
         "factory": "none",
         "deployment_validation": "unvalidated"
       },
@@ -1325,7 +1325,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "partial or unknown",
-        "selection": "withheld",
+        "selection": "not requested",
         "factory": "none",
         "deployment_validation": "unvalidated"
       },
@@ -1381,7 +1381,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "known blocker",
-        "selection": "withheld",
+        "selection": "not requested",
         "factory": "none",
         "deployment_validation": "unvalidated"
       },
@@ -1437,7 +1437,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "partial or unknown",
-        "selection": "withheld",
+        "selection": "not requested",
         "factory": "none",
         "deployment_validation": "unvalidated"
       },
@@ -1493,7 +1493,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "known blocker",
-        "selection": "withheld",
+        "selection": "not requested",
         "factory": "none",
         "deployment_validation": "unvalidated"
       },
@@ -1550,7 +1550,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "clear for the requested set",
-        "selection": "not requested",
+        "selection": "label applied",
         "factory": "admitted or queued",
         "deployment_validation": "unvalidated"
       },
@@ -1606,7 +1606,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "clear for the requested set",
-        "selection": "not requested",
+        "selection": "label applied",
         "factory": "refused",
         "deployment_validation": "unvalidated"
       },
@@ -1667,7 +1667,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "response unavailable",
-        "selection": "withheld",
+        "selection": "not requested",
         "factory": "none",
         "deployment_validation": "unvalidated"
       },
@@ -1831,7 +1831,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "response unavailable",
-        "selection": "not requested",
+        "selection": "label applied",
         "factory": "admitted or queued",
         "deployment_validation": "unvalidated"
       },
@@ -1885,7 +1885,7 @@
       "dimensions": {
         "publication": "published",
         "facts": "clear for the requested set",
-        "selection": "not requested",
+        "selection": "label applied",
         "factory": "admitted or queued",
         "deployment_validation": "unvalidated"
       },

@@ -9,9 +9,13 @@ final report. The report has five dimensions.
 1. Publication is `local draft`, `published`, or `publication failed`.
 2. Facts are `clear for the requested set`, `known blocker`, `partial or unknown`,
    or `response unavailable`.
-3. Selection is `not requested`, `withheld`, `label applied but intake unconfirmed`,
-   or `existing selection inspected`. A factory acknowledgement for a label this
-   session wrote is a factory outcome. Selection in that report is `not requested`.
+3. Selection is `not requested`, `withheld`, `label applied`, `label applied but
+   intake unconfirmed`, or `existing selection inspected`. The issue's decision 12
+   table gains `label applied`. Use it when this session applied the trigger label
+   and the factory acknowledged it within the wait, including a refusal. The
+   factory dimension carries that acknowledgement. `label applied but intake
+   unconfirmed` is the silent 180 second wait. `not requested` means this session
+   applied no label, including a known blocker or a withheld selection.
 4. Factory is `admitted or queued`, `running`, `refused`, `terminal outcome`, or
    `none`. `admitted or queued` and `running` require the factory's acknowledgement
    comment and a link to it.

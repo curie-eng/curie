@@ -456,22 +456,25 @@ Factory check requested for: uv, jq, docker, postgres. This starts no work.
    under the developer's existing selection choice. Preserve other labels.
    Blocked: do not apply the label. Name the criterion and the missing fact.
    Offer two ways out: move that check to CI, or ask the operator. Partial: name
-   what the factory could not observe and ask the developer before labelling.
-   Do not label in the same turn. On the docker case, say that the client being
-   present does not show a running daemon. A clear answer still leaves deployment
+   what the factory could not observe and ask the developer whether to label.
+   That ask is a question. Do not label in the same turn. On the docker case, say
+   that the client being present does not show a running daemon. A clear answer
+   still leaves deployment
    readiness `unvalidated`. The answer's `admission` value `not_requested` is not
    a factory acknowledgement.
 8. After the label write, read the latest label event's actor and provenance.
    Poll every 15 seconds for at most 180 seconds, using the wait tool the same
    way. Acknowledgement is a later comment by the factory App that is a status
    comment for that label event (admitted, queued, running, or a terminal
-   outcome) or a refusal notice. A state label alone is not acknowledgement.
-   Stop when the comment appears. When 180 seconds end with none, report
+   outcome) or a refusal notice. A refusal notice counts as acknowledgement.
+   A state label alone is not acknowledgement.
+   Stop when the comment appears. If it does not, do not report until you have
+   listed comments at least 180 seconds after the label write. Then report
    selection `label applied but intake unconfirmed` and factory `none`, and name
    the next observation: a factory status comment or refusal notice for this
    label event. Do not remove or reapply the label.
 9. Report a refusal as factory `refused`, with the reason code and the fix, and
-   do not relabel.
+   selection `label applied`. Do not relabel.
 
 | Reason | Fix to report, and not to perform |
 |---|---|
@@ -487,24 +490,27 @@ Factory check requested for: uv, jq, docker, postgres. This starts no work.
     a new explicit instruction after you have shown the existing work and the
     publication state.
 11. Finish with prose plus one JSON object using these tokens exactly.
-    Do not invent a selection token. Use `withheld` when you do not apply the
-    label. Use `existing selection inspected` when the label was already present.
-    Use `label applied but intake unconfirmed` only when you applied the label
-    and the wait ended with no acknowledgement. When you applied the label and
-    the factory acknowledgement is present, use `not requested`: the list has no
-    other selection token, and that acknowledgement is reported on the factory
-    dimension.
+    The issue's decision 12 table gains the selection outcome `label applied`.
+    Use `label applied` when you applied the label and the factory acknowledged
+    it within the wait, whether that acknowledgement admits or refuses. Put
+    `admitted or queued`, `running`, or `refused` on the factory dimension, with
+    the reason, the fix, and the comment link. Use `label applied but intake
+    unconfirmed` only when you applied the label and the wait ended with no
+    acknowledgement. Use `not requested` only when you applied no label,
+    including a known blocker or a withheld selection. Never use `not requested`
+    after a label write. Use `existing selection inspected` when the label was
+    already present. Do not invent a further selection token.
 
 | Dimension | Token |
 |---|---|
 | publication | `local draft`, `published`, or `publication failed` |
 | facts | `clear for the requested set`, `known blocker`, `partial or unknown`, or `response unavailable` |
-| selection | `not requested`, `withheld`, `label applied but intake unconfirmed`, or `existing selection inspected` |
+| selection | `not requested`, `withheld`, `label applied`, `label applied but intake unconfirmed`, or `existing selection inspected` |
 | factory | `admitted or queued`, `running`, `refused`, `terminal outcome`, or `none` |
 | deployment_validation | `unvalidated` |
 
 ```json
-{"publication":"published","facts":"clear for the requested set","selection":"not requested","factory":"admitted or queued","deployment_validation":"unvalidated","factory_comment_url":"https://github.com/example/widget/issues/21#issuecomment-1"}
+{"publication":"published","facts":"clear for the requested set","selection":"label applied","factory":"admitted or queued","deployment_validation":"unvalidated","factory_comment_url":"https://github.com/example/widget/issues/21#issuecomment-1"}
 ```
 
     Use `admitted or queued` or `running` only when the acknowledgement comment

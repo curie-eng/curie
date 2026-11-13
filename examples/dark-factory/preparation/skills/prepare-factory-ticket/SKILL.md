@@ -234,21 +234,30 @@ or a state label as proof that the factory admitted the issue.
    seconds. When the session provides a wait tool, advance 15 seconds with that
    tool instead of sleeping. No accepted answer is `response unavailable`.
 6. Classify locally with the reference table. Clear: apply the trigger label
-   once. Blocked: do not apply it, name the criterion and the missing fact, and
-   offer the two ways out. Partial, including `response unavailable` on GitHub:
-   name the unknown fact and ask the developer before labelling. GitLab still
-   labels under its own person rule after reporting facts `response unavailable`.
+   once. Blocked: do not apply the label, name the criterion and the missing
+   fact, and offer the two ways out. Partial, including `response unavailable`
+   on GitHub: name the unknown fact and ask the developer whether to label.
+   That ask is a question. Do not label in that turn. GitLab still labels under
+   its own person rule after reporting facts `response unavailable`.
 7. After the one label write, read the latest label event. Poll every 15 seconds
    for at most 180 seconds for a factory-owned status comment or refusal notice.
-   A state label alone is corroboration, never proof. Do not write the label
-   twice. Do not remove it and apply it again.
-8. Close with the five dimensions in the reference. Selection is only
-   `not requested`, `withheld`, `label applied but intake unconfirmed`, or
-   `existing selection inspected`. When you applied the label and the factory
-   acknowledgement is present, selection is `not requested` and the factory
-   dimension carries that acknowledgement. Report `admitted or queued` or
-   `running` only when the tracker holds the acknowledgement, and include a
-   link to that comment. Deployment validation stays `unvalidated`.
+   A refusal notice is an acknowledgement. Stop when that comment appears. If it
+   does not, keep polling until a comment read is at least 180 seconds after the
+   label write, then stop. A state label alone is corroboration, never proof.
+   Do not write the label twice. Do not remove it and apply it again.
+8. Close with the five dimensions in the reference. The selection tokens are
+   `not requested`, `withheld`, `label applied`, `label applied but intake
+   unconfirmed`, and `existing selection inspected`. When you applied the label
+   and the factory acknowledged it within the wait, selection is `label applied`,
+   whether that acknowledgement admits or refuses. The factory dimension then
+   carries `admitted or queued`, `running`, or `refused`, with the reason, the
+   fix, and a link to the factory comment. Use `label applied but intake
+   unconfirmed` only when you applied the label and the 180 second wait ended
+   with no acknowledgement. Use `not requested` only when you applied no label,
+   including a known blocker or a withheld selection. Never use `not requested`
+   after a label write. Report `admitted or queued` or `running` only when the
+   tracker holds the acknowledgement, and include a link to that comment.
+   Deployment validation stays `unvalidated`.
 
 ## Readiness boundary
 
