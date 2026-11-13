@@ -402,6 +402,7 @@ pub struct WorkItemsOpts {
     pub api_url: String,
     pub api_key: String,
     pub id: Option<String>,
+    pub report: Option<String>,
     pub agent: Option<String>,
     pub dry_run: bool,
     /// "local" or "cluster", for the transient-error remediation hint.
@@ -417,6 +418,9 @@ pub enum WorkItemsOutput {
     },
     Detail {
         item: Box<crate::api::WorkItemOutcome>,
+    },
+    Report {
+        report: serde_json::Value,
     },
     DryRun(crate::ui::DryRunPlan),
 }
@@ -442,6 +446,7 @@ impl crate::ui::CliOutput for WorkItemsOutput {
         match self {
             WorkItemsOutput::List { list } => serde_json::to_value(list).unwrap_or_default(),
             WorkItemsOutput::Detail { item } => serde_json::json!({ "item": item }),
+            WorkItemsOutput::Report { report } => serde_json::json!({ "report": report }),
             WorkItemsOutput::DryRun(plan) => plan.to_json(),
         }
     }
@@ -449,6 +454,9 @@ impl crate::ui::CliOutput for WorkItemsOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             WorkItemsOutput::DryRun(plan) => plan.render(ui),
+            WorkItemsOutput::Report { report } => {
+                ui.payload_plain(&serde_json::to_string_pretty(report).unwrap_or_default());
+            }
             WorkItemsOutput::List { list } => {
                 if list.items.is_empty() {
                     ui.payload("no work items");
@@ -559,9 +567,16 @@ impl crate::ui::CliOutput for WorkItemsOutput {
 /// unfiltered list.
 pub async fn work_items(opts: WorkItemsOpts) -> Result<WorkItemsOutput> {
     if opts.dry_run {
-        let path = match &opts.id {
-            Some(id) => format!("GET {}/work-items/{id}", opts.api_url),
-            None => format!(
+        let path = match (&opts.id, &opts.report) {
+            (Some(id), Some(request_id)) => format!(
+                "GET {}/work-items/{id}/runs/{request_id}/report",
+                opts.api_url
+            ),
+            (None, Some(request_id)) => {
+                format!("GET {}/work-items/runs/{request_id}/report", opts.api_url)
+            }
+            (Some(id), None) => format!("GET {}/work-items/{id}", opts.api_url),
+            (None, None) => format!(
                 "GET {}/work-items?limit={}",
                 opts.api_url,
                 ApiClient::WORK_ITEMS_LIST_LIMIT
@@ -587,11 +602,21 @@ pub async fn work_items(opts: WorkItemsOpts) -> Result<WorkItemsOutput> {
         ),
         None => None,
     };
-    match opts.id {
-        Some(id) => Ok(WorkItemsOutput::Detail {
+    match (opts.id, opts.report) {
+        (Some(id), Some(request_id)) => Ok(WorkItemsOutput::Report {
+            report: client
+                .get_work_item_report(Some(&id), &request_id, agent_id.as_deref())
+                .await?,
+        }),
+        (None, Some(request_id)) => Ok(WorkItemsOutput::Report {
+            report: client
+                .get_work_item_report(None, &request_id, agent_id.as_deref())
+                .await?,
+        }),
+        (Some(id), None) => Ok(WorkItemsOutput::Detail {
             item: Box::new(client.get_work_item(&id, agent_id.as_deref()).await?),
         }),
-        None => Ok(WorkItemsOutput::List {
+        (None, None) => Ok(WorkItemsOutput::List {
             list: client
                 .list_work_items(agent_id.as_deref(), ApiClient::WORK_ITEMS_LIST_LIMIT)
                 .await?,

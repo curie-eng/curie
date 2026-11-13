@@ -1611,6 +1611,9 @@ api:
   # (16 MiB) holds a dark-factory turn with several plan-review rounds. Raise it
   # for longer factory runs; lower it only to bound Postgres row size.
   transcriptMaxThreadBytes: 16777216
+  # Retained operator diagnostics for terminal factory executions (#5601).
+  factoryRunReportRetentionSeconds: 2592000
+  factoryRunReportMaxBytes: 1048576
   # Level for the API's own loggers (#1270). INFO surfaces the operator-facing
   # records -- connector drift corrected, polled deploys, webhook outcomes --
   # which were silently dropped before. WARNING to quieten it.

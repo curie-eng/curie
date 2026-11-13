@@ -363,6 +363,8 @@ export type WorkItemRequest = Schemas["WorkItemRequestOut"];
 
 export type WorkItemOutcome = Schemas["WorkItemOutcomeOut"];
 
+export type FactoryRunReport = Schemas["FactoryRunReportOut"];
+
 export type WorkItemsList = Schemas["WorkItemOutcomeList"];
 
 // Stage progress (#4102): the same phase_view derivation the GitHub status
@@ -382,6 +384,13 @@ export async function listWorkItems(params: { agentId?: string } = {}): Promise<
 export async function getWorkItem(id: string): Promise<WorkItemOutcome> {
   const resp = await request(`/work-items/${encodeURIComponent(id)}`);
   return jsonOrThrow<WorkItemOutcome>(resp);
+}
+
+export async function getFactoryRunReport(itemId: string, requestId: string): Promise<FactoryRunReport> {
+  const resp = await request(
+    `/work-items/${encodeURIComponent(itemId)}/runs/${encodeURIComponent(requestId)}/report`,
+  );
+  return jsonOrThrow<FactoryRunReport>(resp);
 }
 
 export async function getWorkItemUsage(id: string): Promise<WorkItemUsage> {

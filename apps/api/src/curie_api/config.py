@@ -740,6 +740,10 @@ class Settings(BaseSettings):
     # thread is deleted at its terminal.
     transcript_max_thread_bytes: int = 16 * 1024 * 1024  # 16 MiB per thread
     transcript_idle_ttl_seconds: int = 30 * 24 * 3600  # 30 days
+    # Terminal factory diagnostics outlive the active transcript, with an
+    # independent operator retention clock and a strict per-execution budget.
+    factory_run_report_retention_seconds: int = Field(default=30 * 24 * 3600, gt=0)
+    factory_run_report_max_bytes: int = Field(default=1024 * 1024, ge=4096, le=1024 * 1024)
     # The thread attachment ledger (ADR 0205, #4079) lives as long as the
     # transcript. This caps how many file references one thread may record;
     # an append that would pass it is refused whole (413). The worker's own

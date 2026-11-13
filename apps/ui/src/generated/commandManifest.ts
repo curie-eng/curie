@@ -4053,6 +4053,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Read one terminal execution's retained report",
+              "id": "report",
+              "long": "report",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Scope to one agent (name or id)",
               "id": "agent",
               "long": "agent",
@@ -7745,6 +7753,14 @@ export const commandManifest = {
               "help": "Work item id to read. Omit to list",
               "id": "id",
               "positional": true,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Read one terminal execution's retained report",
+              "id": "report",
+              "long": "report",
+              "positional": false,
               "required": false
             },
             {

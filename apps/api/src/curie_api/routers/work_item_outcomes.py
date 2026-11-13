@@ -12,11 +12,17 @@ import uuid
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy import select
 
 from curie_api.crud import agents as crud_agents
-from curie_api.schemas.workitems import WorkItemOutcomeList, WorkItemOutcomeOut, WorkItemUsageOut
+from curie_api.schemas.workitems import (
+    FactoryRunReportOut,
+    WorkItemOutcomeList,
+    WorkItemOutcomeOut,
+    WorkItemUsageOut,
+)
 
-from .. import factory_ci, factory_usage, workitem_outcomes
+from .. import factory_ci, factory_run_reports, factory_usage, workitem_outcomes
 from ..auth import require_api_key
 from ..code_host_trust import code_host_verify
 from ..config import get_settings
@@ -25,6 +31,7 @@ from ..forges.errors import Unavailable
 from ..forges.ports import CodeHost
 from ..forges.registry import ForgeRegistry
 from ..forges.trackers import code_host_for_repository, stored_repository
+from ..models import ExecutionRequest, WorkItem
 
 router = APIRouter(
     prefix="/work-items",
@@ -104,6 +111,60 @@ async def get_work_item(
             repository=repository,
         )
     return view
+
+
+@router.get("/{work_item_id}/runs/{request_id}/report", response_model=FactoryRunReportOut)
+async def get_run_report(
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    session: SessionDep,
+    response: Response,
+    agent_id: uuid.UUID | None = None,
+) -> FactoryRunReportOut:
+    """Read one terminal execution's retained diagnostic record (#5601)."""
+
+    response.headers["Cache-Control"] = "no-store"
+    owned = await session.scalar(
+        select(ExecutionRequest.id)
+        .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
+        .where(
+            ExecutionRequest.id == request_id,
+            ExecutionRequest.work_item_id == work_item_id,
+            *(() if agent_id is None else (WorkItem.agent_id == agent_id,)),
+        )
+    )
+    if owned is None:
+        raise _not_found()
+    report = await factory_run_reports.get_report(session, work_item_id, request_id)
+    if report is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            {"code": "report_unavailable", "reason": "not_captured_or_expired"},
+            headers={"Cache-Control": "no-store"},
+        )
+    return FactoryRunReportOut.model_validate(report)
+
+
+@router.get("/runs/{request_id}/report", response_model=FactoryRunReportOut)
+async def get_run_report_by_id(
+    request_id: uuid.UUID,
+    session: SessionDep,
+    response: Response,
+    agent_id: uuid.UUID | None = None,
+) -> FactoryRunReportOut:
+    """Inspect a run directly when its request ID is all the operator has."""
+
+    work_item_id = await session.scalar(
+        select(ExecutionRequest.work_item_id)
+        .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
+        .where(
+            ExecutionRequest.id == request_id,
+            *(() if agent_id is None else (WorkItem.agent_id == agent_id,)),
+        )
+    )
+    if work_item_id is None:
+        raise _not_found()
+    return await get_run_report(work_item_id, request_id, session, response, agent_id)
 
 
 @router.get("/{work_item_id}/usage", response_model=WorkItemUsageOut)

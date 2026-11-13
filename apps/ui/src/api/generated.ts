@@ -4515,6 +4515,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/runs/{request_id}/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Run Report By Id
+         * @description Inspect a run directly when its request ID is all the operator has.
+         */
+        get: operations["get_run_report_by_id_work_items_runs__request_id__report_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/{work_item_id}": {
         parameters: {
             query?: never;
@@ -4575,6 +4595,26 @@ export interface paths {
         };
         /** Object Download */
         get: operations["object_download_work_items__work_item_id__recovery__checkpoint_id__objects__kind__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/{work_item_id}/runs/{request_id}/report": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Run Report
+         * @description Read one terminal execution's retained diagnostic record (#5601).
+         */
+        get: operations["get_run_report_work_items__work_item_id__runs__request_id__report_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -7922,6 +7962,104 @@ export interface components {
              * Format: uuid
              */
             tenant_id: string;
+        };
+        /** FactoryRunAnalysisOut */
+        FactoryRunAnalysisOut: {
+            /** Evidence */
+            evidence: components["schemas"]["FactoryRunEvidenceOut"][];
+            /** Immediate Cause */
+            immediate_cause: string;
+            /** Summary */
+            summary: string;
+        };
+        /** FactoryRunEventOut */
+        FactoryRunEventOut: {
+            /**
+             * At
+             * Format: date-time
+             */
+            at: string;
+            /** Id */
+            id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "conversation" | "phase" | "publication" | "state" | "terminal";
+            /** Phase */
+            phase?: string | null;
+            /** Reference Url */
+            reference_url?: string | null;
+            /** Round */
+            round?: number | null;
+            /** Text */
+            text: string;
+        };
+        /** FactoryRunEvidenceOut */
+        FactoryRunEvidenceOut: {
+            /** Event Id */
+            event_id: string;
+            /** Statement */
+            statement: string;
+        };
+        /** FactoryRunReportOut */
+        FactoryRunReportOut: {
+            analysis: components["schemas"]["FactoryRunAnalysisOut"];
+            /** Events */
+            events: components["schemas"]["FactoryRunEventOut"][];
+            /**
+             * Execution Request Id
+             * Format: uuid
+             */
+            execution_request_id: string;
+            sources: components["schemas"]["FactoryRunSourcesOut"];
+            /** Status */
+            status: string;
+            /**
+             * Terminal At
+             * Format: date-time
+             */
+            terminal_at: string;
+            /** Terminal Cause */
+            terminal_cause: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** FactoryRunSourcesOut */
+        FactoryRunSourcesOut: {
+            /**
+             * Artifacts
+             * @enum {string}
+             */
+            artifacts: "complete" | "unavailable" | "truncated";
+            /**
+             * Phase Reports
+             * @enum {string}
+             */
+            phase_reports: "complete" | "missing" | "truncated";
+            /**
+             * Publications
+             * @enum {string}
+             */
+            publications: "complete" | "missing" | "truncated";
+            /**
+             * State Changes
+             * @enum {string}
+             */
+            state_changes: "partial" | "truncated";
+            /**
+             * Traces
+             * @constant
+             */
+            traces: "unavailable";
+            /**
+             * Transcript
+             * @enum {string}
+             */
+            transcript: "complete" | "missing" | "truncated" | "malformed" | "unattributed";
         };
         /**
          * FactorySlackSteerIn
@@ -12079,6 +12217,11 @@ export interface components {
             enrollment_generation?: number | null;
             /** Execution Deadline */
             execution_deadline: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
             /** Last Deferral Reason */
             last_deferral_reason: string | null;
             /** Last Start Failure Detail */
@@ -21854,6 +21997,41 @@ export interface operations {
             };
         };
     };
+    get_run_report_by_id_work_items_runs__request_id__report_get: {
+        parameters: {
+            query?: {
+                agent_id?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactoryRunReportOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_work_item_work_items__work_item_id__get: {
         parameters: {
             query?: {
@@ -21978,6 +22156,42 @@ export interface operations {
                 };
                 content: {
                     "application/octet-stream": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_run_report_work_items__work_item_id__runs__request_id__report_get: {
+        parameters: {
+            query?: {
+                agent_id?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactoryRunReportOut"];
                 };
             };
             /** @description Validation Error */

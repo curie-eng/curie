@@ -514,6 +514,10 @@ spec:
             # Per-thread conversation transcript cap in bytes (#3301).
             - name: TRANSCRIPT_MAX_THREAD_BYTES
               value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
+            - name: FACTORY_RUN_REPORT_RETENTION_SECONDS
+              value: {{ .Values.api.factoryRunReportRetentionSeconds | int64 | quote }}
+            - name: FACTORY_RUN_REPORT_MAX_BYTES
+              value: {{ .Values.api.factoryRunReportMaxBytes | int64 | quote }}
             {{- if include "curie.httpIdentity.apiSecret" . }}
             # HTTP identity operator file (HTTP-INVOCATION-EXECUTION-20).
             - name: CURIE_HTTP_IDENTITY_DIR

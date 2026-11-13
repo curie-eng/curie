@@ -17,6 +17,7 @@ use support::{serve, MockServer, Response};
 const TEST_API_KEY: &str = "curie-work-items-test-key";
 const AGENT_ID: &str = "11111111-1111-1111-1111-111111111111";
 const ITEM_ID: &str = "22222222-2222-4222-8222-222222222222";
+const REQUEST_ID: &str = "33333333-3333-4333-8333-333333333333";
 const UNREACHABLE_API_URL: &str = "http://127.0.0.1:1";
 /// A cause string the CLI cannot have special-cased: it must be rendered
 /// verbatim, never re-derived.
@@ -413,6 +414,73 @@ fn detail_scoped_to_an_agent_passes_the_agent_id() {
         "{}",
         request.path
     );
+}
+
+#[test]
+fn terminal_report_reads_the_exact_execution_and_preserves_its_evidence() {
+    let body = json!({
+        "work_item_id": ITEM_ID,
+        "execution_request_id": REQUEST_ID,
+        "status": "failed",
+        "terminal_cause": "no_pull_request",
+        "terminal_at": "2026-11-12T20:18:29Z",
+        "sources": {"transcript": "complete", "phase_reports": "missing"},
+        "events": [{"id": "transcript:0", "at": "2026-11-12T20:00:00Z", "kind": "conversation", "text": "Five review findings remain"}],
+        "analysis": {"immediate_cause": "no_pull_request", "summary": "Inspect the final reply", "evidence": [{"event_id": "transcript:0", "statement": "Final reply"}]}
+    })
+    .to_string();
+    let server = serve(move |req| match route(&req.path) {
+        p if p == format!("/work-items/{ITEM_ID}/runs/{REQUEST_ID}/report") => {
+            Response::json(200, &body)
+        }
+        _ => Response::json(500, "{}"),
+    });
+
+    let output = local(&[ITEM_ID, "--report", REQUEST_ID], &server.base_url, true);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let value = one_object(&output);
+    assert_eq!(value["report"]["execution_request_id"], REQUEST_ID);
+    assert_eq!(
+        value["report"]["events"][0]["text"],
+        "Five review findings remain"
+    );
+    assert_schema(&value);
+
+    let human = local(&[ITEM_ID, "--report", REQUEST_ID], &server.base_url, false);
+    assert_eq!(human.status.code(), Some(0), "{}", describe(&human));
+    assert!(stdout(&human).contains("Five review findings remain"));
+
+    let direct = serve(|req| match route(&req.path) {
+        p if p == format!("/work-items/runs/{REQUEST_ID}/report") => Response::json(
+            200,
+            &json!({"execution_request_id": REQUEST_ID}).to_string(),
+        ),
+        _ => Response::json(500, "{}"),
+    });
+    let by_request = local(&["--report", REQUEST_ID], &direct.base_url, true);
+    assert_eq!(
+        by_request.status.code(),
+        Some(0),
+        "{}",
+        describe(&by_request)
+    );
+    assert_eq!(
+        one_object(&by_request)["report"]["execution_request_id"],
+        REQUEST_ID
+    );
+}
+
+#[test]
+fn missing_terminal_report_has_an_explicit_operator_error() {
+    let server = serve(|req| match route(&req.path) {
+        p if p == format!("/work-items/runs/{REQUEST_ID}/report") => {
+            Response::json(404, r#"{"detail":{"code":"report_unavailable"}}"#)
+        }
+        _ => Response::json(500, "{}"),
+    });
+    let output = local(&["--report", REQUEST_ID], &server.base_url, false);
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(describe(&output).contains("run report not found or expired"));
 }
 
 fn detail_status(status: u16) -> Output {

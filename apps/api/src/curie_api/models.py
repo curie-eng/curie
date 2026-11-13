@@ -1616,6 +1616,32 @@ class ExecutionRequestPhaseReport(Base):
     )
 
 
+class FactoryRunReport(Base):
+    """Bounded operator diagnostic for one terminal factory execution (#5601).
+
+    This is separate from the resumable thread transcript. A request's report
+    is inserted once before terminal transcript cleanup and expires on its own
+    operator configured clock.
+    """
+
+    __tablename__ = "factory_run_reports"
+    __table_args__ = (Index("ix_factory_run_reports_expires_at", "expires_at"),)
+
+    execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"), index=True
+    )
+    report: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.clock_timestamp()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class FactorySlackThread(Base):
     """The one Slack root a WorkItem's factory progress posts into (#5414).
 
