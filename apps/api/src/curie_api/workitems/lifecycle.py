@@ -1566,6 +1566,9 @@ async def link_publication_lineage(
                 session, "lineage_already_owned", work_item=work_item, request=request
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    from ..factory_notices import mark_status_comment_stale
+
+    await mark_status_comment_stale(session, work_item_id)
     work_item = await reload_work_item(session, work_item_id)
     return await outcome(session, work_item, request)
 

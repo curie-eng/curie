@@ -95,7 +95,7 @@ async def _bind_running_work_item_lineage(
             ),
         )
     )
-    await session.execute(
+    bound_id = await session.scalar(
         update(WorkItem)
         .where(*predicates)
         .values(
@@ -103,7 +103,12 @@ async def _bind_running_work_item_lineage(
             version=WorkItem.version + 1,
             updated_at=func.clock_timestamp(),
         )
+        .returning(WorkItem.id)
     )
+    if bound_id is not None:
+        from ..factory_notices import mark_status_comment_stale
+
+        await mark_status_comment_stale(session, bound_id)
 
 
 async def select_thread_publication_lineage(
@@ -533,6 +538,9 @@ async def mark_publication_lineage_terminal(
             "publication.lineage_stale",
             "pull request lineage changed while its terminal state was refreshed",
         )
+    from ..factory_notices import mark_lineage_status_comment_stale
+
+    await mark_lineage_status_comment_stale(session, lineage.id)
     await session.commit()
     refreshed = await session.get(ThreadPublicationLineage, lineage.id)
     assert refreshed is not None
@@ -842,6 +850,9 @@ async def advance_publication_lineage(
             "publication.lineage_stale",
             "publication revision changed before its lineage could advance",
         )
+    from ..factory_notices import mark_lineage_status_comment_stale
+
+    await mark_lineage_status_comment_stale(session, lineage.id)
     if not terminal_state:
         await _bind_running_work_item_lineage(
             session,
