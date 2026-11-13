@@ -232,6 +232,56 @@
         }
       ]
     },
+    "ciObservation": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "head_sha",
+            "reason",
+            "created_at",
+            "expires_at",
+            "observed_at"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "observing",
+                "completed",
+                "expired",
+                "invalidated"
+              ]
+            },
+            "head_sha": {
+              "type": "string"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "created_at": {
+              "type": "string"
+            },
+            "expires_at": {
+              "type": "string"
+            },
+            "observed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      ]
+    },
     "tracker": {
       "type": "object",
       "additionalProperties": false,
@@ -313,6 +363,7 @@
         "publication",
         "correctness",
         "ci",
+        "ci_observation",
         "requests"
       ],
       "properties": {
@@ -386,6 +437,9 @@
         },
         "ci": {
           "$ref": "#/$defs/ci"
+        },
+        "ci_observation": {
+          "$ref": "#/$defs/ciObservation"
         },
         "requests": {
           "type": "array",

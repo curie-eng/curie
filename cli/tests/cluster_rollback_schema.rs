@@ -276,6 +276,13 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         .expect("the factory tracker result revision is packaged");
     assert_eq!(tracker_results.parents, vec![String::from("0160")]);
     assert_eq!(tracker_results.kind, "expand");
+    let ci_observation = target
+        .revisions
+        .iter()
+        .find(|node| node.revision == "0162")
+        .expect("the work item CI observation revision is packaged");
+    assert_eq!(ci_observation.parents, vec![String::from("0160")]);
+    assert_eq!(ci_observation.kind, "expand");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");

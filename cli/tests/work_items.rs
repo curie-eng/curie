@@ -118,6 +118,7 @@ fn item(state: &str) -> Value {
         "publication": {"status": "succeeded", "revision_number": 1, "approval_status": "approved"},
         "correctness": {"asserted": false, "owner": "bundle"},
         "ci": null,
+        "ci_observation": null,
         "requests": [{
             "sequence": 1,
             "status": "expired",
@@ -141,6 +142,14 @@ fn detail_item() -> Value {
         "reason": "github_forbidden",
         "observed_at": "2026-09-22T10:06:00Z",
         "head_sha": "1123456789abcdef0123456789abcdef01234567"
+    });
+    value["ci_observation"] = json!({
+        "status": "completed",
+        "head_sha": "1123456789abcdef0123456789abcdef01234567",
+        "reason": "checks_green",
+        "created_at": "2026-09-22T10:05:00Z",
+        "expires_at": "2026-09-23T10:05:00Z",
+        "observed_at": "2026-09-22T10:06:00Z"
     });
     value
 }
@@ -222,6 +231,7 @@ fn list_json_is_the_stable_envelope_and_validates_against_the_schema() {
         value["items"][0]["correctness"],
         json!({"asserted": false, "owner": "bundle"})
     );
+    assert_eq!(value["items"][0].get("ci_observation"), Some(&Value::Null));
     assert_eq!(value["truncated"], false);
     assert_schema(&value);
     let recorded = server.recorded();
@@ -355,7 +365,9 @@ fn truncated_list_is_reported() {
 
 #[test]
 fn detail_shows_ci_state_and_reason() {
-    let body = detail_item().to_string();
+    let detail = detail_item();
+    let observation = detail["ci_observation"].clone();
+    let body = detail.to_string();
     let server = serve(move |req| {
         if route(&req.path) == format!("/work-items/{ITEM_ID}") {
             Response::json(200, &body)
@@ -383,6 +395,7 @@ fn detail_shows_ci_state_and_reason() {
     let value = one_object(&machine);
     assert_eq!(value["item"]["id"], ITEM_ID);
     assert_eq!(value["item"]["ci"]["reason"], "github_forbidden");
+    assert_eq!(value["item"]["ci_observation"], observation);
     assert_eq!(
         value["item"]["tracker"]["url"],
         "https://github.com/acme-corp/acme-bot/issues/2577"
