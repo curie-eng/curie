@@ -10,6 +10,7 @@
       "reason": "no_pull_request",
       "state": "not_applicable"
     },
+    "ci_observation": null,
     "correctness": {
       "asserted": false,
       "owner": "bundle"
@@ -96,6 +97,7 @@
       "reason": "no_pull_request",
       "state": "not_applicable"
     },
+    "ci_observation": null,
     "correctness": {
       "asserted": false,
       "owner": "bundle"
@@ -161,6 +163,7 @@
         "agent_id": "00000000-0000-4000-8000-000000000001",
         "cancelled_at": null,
         "ci": null,
+        "ci_observation": null,
         "correctness": {
           "asserted": false,
           "owner": "bundle"
@@ -242,6 +245,7 @@
         "agent_id": "00000000-0000-4000-8000-000000000001",
         "cancelled_at": null,
         "ci": null,
+        "ci_observation": null,
         "correctness": {
           "asserted": false,
           "owner": "bundle"
