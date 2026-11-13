@@ -161,6 +161,7 @@ tools/factory-e2e/tests/test_repo_runner.py
 tools/factory-e2e/tests/test_scripted_driver.py
 tools/factory-e2e/tests/test_scripted_scenario.py
 tools/factory-e2e/tests/test_tls_code_host.py
+tools/factory-e2e/tests/test_tool_facts_scenario.py
 tools/fix-pin-ci/tests/test_fix_pin_ci.py
 tools/helm-ci-gate/tests/test_decide.py
 tools/identity-e2e/tests/test_answer_authority_scenario.py
