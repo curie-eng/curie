@@ -12001,6 +12001,33 @@ export interface components {
             version_id?: string | null;
         };
         /**
+         * WorkItemCiObservationOut
+         * @description Item-level observation; the failed execution remains historical truth.
+         */
+        WorkItemCiObservationOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Head Sha */
+            head_sha: string;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "observing" | "completed" | "expired" | "invalidated";
+        };
+        /**
          * WorkItemCiOut
          * @description A live, unpersisted CI observation of the published head.
          */
@@ -12056,6 +12083,7 @@ export interface components {
             /** Cancelled At */
             cancelled_at: string | null;
             ci: components["schemas"]["WorkItemCiOut"] | null;
+            ci_observation?: components["schemas"]["WorkItemCiObservationOut"] | null;
             correctness: components["schemas"]["WorkItemCorrectnessOut"];
             /**
              * Created At

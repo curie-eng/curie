@@ -17290,6 +17290,68 @@
         "title": "WebhookResult",
         "type": "object"
       },
+      "WorkItemCiObservationOut": {
+        "description": "Item-level observation; the failed execution remains historical truth.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "status": {
+            "enum": [
+              "observing",
+              "completed",
+              "expired",
+              "invalidated"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "head_sha",
+          "reason",
+          "created_at",
+          "expires_at",
+          "observed_at"
+        ],
+        "title": "WorkItemCiObservationOut",
+        "type": "object"
+      },
       "WorkItemCiOut": {
         "description": "A live, unpersisted CI observation of the published head.",
         "properties": {
@@ -17418,6 +17480,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/WorkItemCiOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ci_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkItemCiObservationOut"
               },
               {
                 "type": "null"

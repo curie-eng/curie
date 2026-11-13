@@ -32,7 +32,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -70,6 +70,7 @@ from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
     FactoryBaseTransition,
+    FactoryCiObservation,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -661,6 +662,19 @@ def _digest(body: str) -> str:
     return hashlib.sha256(body.encode()).hexdigest()
 
 
+def completed_proof() -> Any:
+    """SQL predicate shared by status selection and item projections."""
+
+    return exists().where(
+        FactoryCiObservation.request_id == ExecutionRequest.id,
+        FactoryCiObservation.status == "completed",
+        FactoryCiObservation.lineage_id == WorkItem.publication_lineage_id,
+        FactoryCiObservation.head_sha == ThreadPublicationLineage.head_sha,
+        ThreadPublicationLineage.status == "open",
+        WorkItem.cancelled_at.is_(None),
+    )
+
+
 def _desired_label_sql() -> Any:
     return case(
         (
@@ -672,6 +686,7 @@ def _desired_label_sql() -> Any:
             ),
             literal(""),
         ),
+        (completed_proof(), literal("curie-factory:pr-open")),
         *[
             (ExecutionRequest.status == status, literal(label))
             for status, label in _DESIRED_LABEL.items()
@@ -808,6 +823,7 @@ async def _claim_next(
                 ThreadPublicationLineage.pr_number,
                 ThreadPublicationLineage.status,
                 is_latest.label("is_latest"),
+                _desired_label_sql().label("desired_label"),
             )
             .join(WorkItem, WorkItem.id == FactoryStatusComment.work_item_id)
             .join(
@@ -838,7 +854,7 @@ async def _claim_next(
     ).one_or_none()
     if selected is None:
         return None
-    row, work_item, request, pr_url, pr_number, pr_state, latest = selected
+    row, work_item, request, pr_url, pr_number, pr_state, latest, label = selected
     if pr_number is None or not pr_url:
         pr_state = None
     if pr_state == "merged" and request.status in {"failed", "expired"}:
@@ -892,7 +908,7 @@ async def _claim_next(
         tracker_issue=work_item.tracker_issue,
         opened_pr=opened_pr,
         work_item_id=work_item.id,
-        status=request.status,
+        status="completed" if label == "curie-factory:pr-open" else request.status,
         pr_state=pr_state,
         target=target,
         body=body,
@@ -1370,6 +1386,22 @@ async def _render(
         body = redact_factory_comment(
             f"Continuing on the existing pull request: {pr_url}\n\n{body}"
         )
+    observation = await session.get(FactoryCiObservation, request.id)
+    if observation is not None:
+        until = observation.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if observation.status == "observing":
+            line = f"Checks are still being watched until {until}."
+        elif observation.status == "completed" and observation.observed_at is not None:
+            when = observation.observed_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+            line = (
+                f"Checks passed on head {code_span(observation.head_sha)}, "
+                f"observed at {when} after the run ended."
+            )
+        elif observation.status == "expired":
+            line = "Checks were not verified within 24 hours."
+        else:
+            line = f"Checks were not verified: {code_span(observation.reason or 'invalidated')}."
+        body += f"\n\n{line}"
     return body
 
 

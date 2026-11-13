@@ -207,6 +207,7 @@ class CiView:
     conflicted: bool | None = None
     merged: bool | None = None
     closed_unmerged: bool | None = None
+    pull_head_sha: str | None = None
 
     @property
     def runs(self) -> list[NormalizedCheck]:
@@ -279,6 +280,7 @@ async def observe(
         return view
     return replace(
         view,
+        pull_head_sha=pull.head_sha,
         conflicted=pull.conflicted if pull.head_sha == head_sha else None,
         merged=pull.state is PullRequestState.MERGED,
         closed_unmerged=pull.state is PullRequestState.CLOSED,
@@ -1099,7 +1101,7 @@ def tried_summary(
 
 
 @dataclass(frozen=True)
-class _Facts:
+class CiFacts:
     request: ExecutionRequest
     work_item: WorkItem
     lineage: ThreadPublicationLineage
@@ -1109,9 +1111,9 @@ class _Facts:
     published_at: datetime
 
 
-async def _load(
-    session: AsyncSession, settlement: lifecycle.PublicationSettlement
-) -> _Facts | None:
+async def load_ci_facts(
+    session: AsyncSession, settlement: lifecycle.PublicationSettlement, *, recovery: bool = False
+) -> CiFacts | None:
     request = await session.get(ExecutionRequest, settlement.request_id)
     work_item = await session.get(WorkItem, settlement.work_item_id)
     if (
@@ -1120,7 +1122,7 @@ async def _load(
         or request.work_item_id != work_item.id
         or request.version != settlement.request_version
         or work_item.version != settlement.work_item_version
-        or request.status != "running"
+        or request.status not in (("failed",) if recovery else ("running",))
         or request.execution_deadline is None
         or work_item.publication_lineage_id is None
     ):
@@ -1180,7 +1182,12 @@ async def _load(
             or base_transition is None
             or base_transition.id != subject.id
             or base_transition.version != subject.version
-            or not await session.scalar(select(lifecycle.ready_base_transition_exists(request.id)))
+            or (
+                not recovery
+                and not await session.scalar(
+                    select(lifecycle.ready_base_transition_exists(request.id))
+                )
+            )
         ):
             return None
         published_at = base_transition.ci_pushed_at
@@ -1188,7 +1195,9 @@ async def _load(
     if published_at is None:
         return None
     subject = replace(subject, changed_paths=changed_paths, published_at=published_at)
-    return _Facts(request, work_item, lineage, subject, publications, base_transition, published_at)
+    return CiFacts(
+        request, work_item, lineage, subject, publications, base_transition, published_at
+    )
 
 
 _RELEASE_CLAIM = """
@@ -1223,74 +1232,24 @@ def enqueue_marker(request_id: uuid.UUID, round_: int) -> str:
 Dispatch = Callable[[ExecutionRequest, int, str], Awaitable[bool]]
 
 
-async def gate(
+async def inspect_ci(
     sessionmaker: async_sessionmaker[AsyncSession],
     valkey: redis.Redis,
     settings: Settings,
-    client: httpx.AsyncClient,
-    settlement: lifecycle.PublicationSettlement,
+    code_host: CodeHost,
+    repository: RepositoryRef,
+    facts: CiFacts,
+    now: datetime,
     *,
-    owner: str,
-    next_poll: dict[uuid.UUID, datetime],
-    dispatch: Dispatch,
-    may_observe: Callable[[uuid.UUID], bool],
-) -> GateResult:
-    """Observe one published request's CI and act on the verdict.
+    may_observe: Callable[[], bool],
+) -> tuple[Verdict | None, CiView | None, datetime | None, MetadataCiPolicy | None, datetime]:
+    """Read current CI policy and evidence without execution or publication effects."""
 
-    ``dispatch`` enqueues the continuation turn; it runs only after the round's
-    claim and the fenced lease hold, and a failure releases the claim.
-    ``may_observe`` spends the caller's per-pass observation budget; it is asked
-    only when a CI read is actually due, so a request that is not due never
-    takes a later request's slot.
-    """
-
-    async with sessionmaker() as session:
-        facts = await _load(session, settlement)
-        now = await lifecycle.database_now(session)
-        # Keep the loaded snapshots; nothing is locked or written here.
-        session.expunge_all()
-        await session.rollback()
-    if facts is None:
-        return "waiting"
     request, work_item, lineage = facts.request, facts.work_item, facts.lineage
-    registry = forges_registry(settings)
-    # The code host entry the lineage recorded, or its WorkItem's when the
-    # lineage carries no code host identity (it is all set or all unset),
-    # never the install's GitHub accessor (#4358 plan D14).
-    if lineage.code_host_kind is not None:
-        repository = stored_repository(
-            settings,
-            kind=lineage.code_host_kind,
-            host=lineage.code_host_host,
-            path=lineage.repo_full_name or work_item.repository_path,
-            project_id=lineage.repository_project_id,
-        )
-    else:
-        repository = stored_repository(
-            settings,
-            kind=work_item.code_host_kind,
-            host=work_item.code_host_host,
-            path=work_item.repository_path,
-            project_id=work_item.repository_project_id,
-        )
-    try:
-        code_host = code_host_for_repository(
-            registry, client, repository, installations=stored_installation(lineage, work_item)
-        )
-    except ForgeError:
-        # An entry this install no longer configures is never read elsewhere.
-        return "waiting"
-    capabilities = ci_capabilities(code_host.capabilities)
     assert request.execution_deadline is not None
-    baseline_rounds = int(facts.base_transition is not None)
-    round_ = baseline_rounds + len(facts.publications)
-    if await valkey.exists(ci_key(request.id, round_ + 1)):
-        return "fixing"
-    async with sessionmaker() as session:
-        await factory_progress.record_wait_ci(session, request.id)
-    due = next_poll.get(request.id)
-    if due is not None and now < due:
-        return "waiting"
+    registry = forges_registry(settings)
+    capabilities = ci_capabilities(code_host.capabilities)
+    round_ = int(facts.base_transition is not None) + len(facts.publications)
     subject = facts.subject
     observed_sha = subject.head_sha
     changed_paths = _publication_changed_paths(facts.publications)
@@ -1354,10 +1313,9 @@ async def gate(
     fresh_after: datetime | None = None
     if preflight_verdict is not None:
         verdict = preflight_verdict
-        head_sha = observed_sha or ""
     else:
-        if not may_observe(request.id):
-            return "waiting"
+        if not may_observe():
+            return None, None, None, metadata_ci, now
         view = await observe(
             code_host,
             repository,
@@ -1385,7 +1343,6 @@ async def gate(
         async with sessionmaker() as session:
             now = await lifecycle.database_now(session)
             await session.rollback()
-        head_sha = view.head_sha or observed_sha or ""
         host_required: frozenset[str] | None = None
         if (
             supports(code_host.capabilities, Operation.REQUIRED_CHECKS)
@@ -1428,6 +1385,91 @@ async def gate(
                     ),
                     reason="base_transition_checks_missing",
                 )
+    return verdict, view, fresh_after, metadata_ci, now
+
+
+async def gate(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    valkey: redis.Redis,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    settlement: lifecycle.PublicationSettlement,
+    *,
+    owner: str,
+    next_poll: dict[uuid.UUID, datetime],
+    dispatch: Dispatch,
+    may_observe: Callable[[uuid.UUID], bool],
+) -> GateResult:
+    """Observe one published request's CI and act on the verdict.
+
+    ``dispatch`` enqueues the continuation turn; it runs only after the round's
+    claim and the fenced lease hold, and a failure releases the claim.
+    ``may_observe`` spends the caller's per-pass observation budget; it is asked
+    only when a CI read is actually due, so a request that is not due never
+    takes a later request's slot.
+    """
+
+    async with sessionmaker() as session:
+        facts = await load_ci_facts(session, settlement)
+        now = await lifecycle.database_now(session)
+        # Keep the loaded snapshots; nothing is locked or written here.
+        session.expunge_all()
+        await session.rollback()
+    if facts is None:
+        return "waiting"
+    request, work_item, lineage = facts.request, facts.work_item, facts.lineage
+    registry = forges_registry(settings)
+    # The code host entry the lineage recorded, or its WorkItem's when the
+    # lineage carries no code host identity (it is all set or all unset),
+    # never the install's GitHub accessor (#4358 plan D14).
+    if lineage.code_host_kind is not None:
+        repository = stored_repository(
+            settings,
+            kind=lineage.code_host_kind,
+            host=lineage.code_host_host,
+            path=lineage.repo_full_name or work_item.repository_path,
+            project_id=lineage.repository_project_id,
+        )
+    else:
+        repository = stored_repository(
+            settings,
+            kind=work_item.code_host_kind,
+            host=work_item.code_host_host,
+            path=work_item.repository_path,
+            project_id=work_item.repository_project_id,
+        )
+    try:
+        code_host = code_host_for_repository(
+            registry, client, repository, installations=stored_installation(lineage, work_item)
+        )
+    except ForgeError:
+        # An entry this install no longer configures is never read elsewhere.
+        return "waiting"
+    capabilities = ci_capabilities(code_host.capabilities)
+    assert request.execution_deadline is not None
+    baseline_rounds = int(facts.base_transition is not None)
+    round_ = baseline_rounds + len(facts.publications)
+    if await valkey.exists(ci_key(request.id, round_ + 1)):
+        return "fixing"
+    async with sessionmaker() as session:
+        await factory_progress.record_wait_ci(session, request.id)
+    due = next_poll.get(request.id)
+    if due is not None and now < due:
+        return "waiting"
+    subject = facts.subject
+    verdict, view, fresh_after, metadata_ci, now = await inspect_ci(
+        sessionmaker,
+        valkey,
+        settings,
+        code_host,
+        repository,
+        facts,
+        now,
+        may_observe=lambda: may_observe(request.id),
+    )
+    if verdict is None:
+        return "waiting"
+    head_sha = (view.head_sha if view is not None else subject.head_sha) or ""
     if verdict.kind == "pending":
         next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)
         return "waiting"

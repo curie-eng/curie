@@ -90,7 +90,7 @@ def test_superseded_cancellation_completes_without_a_repair_or_metadata_revision
     assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
 
 
-@pytest.mark.parametrize("failure", ["newest-cancelled", "older-failure"])
+@pytest.mark.parametrize("failure", ["newest-cancelled", "independent-app-failure"])
 def test_an_unsuperseded_failure_still_dispatches_a_repair(admitted: Any, failure: str) -> None:
     client, github, sink = admitted
     number = 9811
@@ -101,8 +101,14 @@ def test_an_unsuperseded_failure_still_dispatches_a_repair(admitted: Any, failur
         ]
         if failure == "newest-cancelled"
         else [
-            _run("failure", run_id=9, started_at=EARLIER, suite_id=101),
-            _run("success", run_id=10, started_at=LATER, suite_id=202),
+            {
+                **_run("failure", run_id=9, started_at=EARLIER, suite_id=101),
+                "app": {"id": 1, "slug": "external-ci"},
+            },
+            {
+                **_run("success", run_id=10, started_at=LATER, suite_id=202),
+                "app": {"id": 2, "slug": "github-actions"},
+            },
         ]
     )
     sink.ci_script = [ci_entry(*runs, check_run("lint"))]

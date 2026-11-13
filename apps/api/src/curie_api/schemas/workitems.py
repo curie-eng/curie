@@ -202,6 +202,17 @@ class WorkItemRepositoryOut(BaseModel):
     path: str
 
 
+class WorkItemCiObservationOut(BaseModel):
+    """Item-level observation; the failed execution remains historical truth."""
+
+    status: Literal["observing", "completed", "expired", "invalidated"]
+    head_sha: str
+    reason: str | None
+    created_at: datetime
+    expires_at: datetime
+    observed_at: datetime | None
+
+
 class WorkItemOutcomeOut(BaseModel):
     id: uuid.UUID
     agent_id: uuid.UUID
@@ -220,6 +231,7 @@ class WorkItemOutcomeOut(BaseModel):
     correctness: WorkItemCorrectnessOut
     # Null on the list route: CI is observed live on the detail route only.
     ci: WorkItemCiOut | None
+    ci_observation: WorkItemCiObservationOut | None = None
     requests: list[WorkItemRequestOut]
     # ``derive_outcome`` stays pure and leaves these null; ``_views`` fills
     # them from the factory status comment rows and phase reports.

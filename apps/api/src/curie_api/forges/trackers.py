@@ -105,6 +105,7 @@ def tracker_for_work_item(
     installation_id: int | None,
     *,
     timeout_s: float | None = None,
+    label: str | None = None,
 ) -> Tracker:
     """The tracker a WorkItem's ``issue`` lives on.
 
@@ -140,11 +141,12 @@ def tracker_for_work_item(
             repo_full_name=repository.path,
             repository_id=int(issue.scope_id),
             token=token,
+            label=label,
         )
     binding = binding_for_scope(registry, issue)
     if binding is None:
         raise NotFound("binding")
-    return tracker_for_binding(registry, client, binding)
+    return tracker_for_binding(registry, client, binding, label=label)
 
 
 def code_host_for_repository(
