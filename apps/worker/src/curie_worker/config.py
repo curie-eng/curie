@@ -284,6 +284,14 @@ class WorkerConfig(BaseSettings):
     # Local model demo path: the worker can point the runner at an
     # Anthropic-compatible local endpoint without changing the fake-model default.
     model_base_url: str = Field(default="", validation_alias="CURIE_MODEL_BASE_URL")
+    # Minimum remaining model credit in USD for a sufficient model_credit fact
+    # (issue 5581). The worker observer reads it. Zero still contacts the
+    # provider. A negative value is refused at startup.
+    factory_min_model_credit_usd: float = Field(
+        default=10,
+        ge=0,
+        validation_alias="CURIE_FACTORY_MIN_MODEL_CREDIT_USD",
+    )
     # The endpoint's wire protocol and the env var(s) carrying the credential
     # (#514), both declared rather than inferred. Operator scope like
     # model_base_url: they select which env var a credential is read from and

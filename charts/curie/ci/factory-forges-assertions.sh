@@ -602,4 +602,52 @@ for source in "$CHART/values.yaml" "$CHART/values.schema.json" "$CHART"/template
 done
 echo "  ok: worker.publication.githubHttpsCidrs is gone from values, schema and templates"
 
+# Model credit minimum. Default, an override, the zero boundary, and a negative refusal.
+credit_min() {
+  python3 -c '
+import sys, yaml
+docs = list(yaml.safe_load_all(sys.stdin))
+workers = [
+    doc for doc in docs
+    if isinstance(doc, dict)
+    and doc.get("kind") == "Deployment"
+    and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "worker"
+]
+if len(workers) != 1:
+    sys.stderr.write("FAIL: expected one worker Deployment\n")
+    sys.exit(1)
+containers = workers[0]["spec"]["template"]["spec"]["containers"]
+worker = [item for item in containers if item.get("name") == "worker"]
+if len(worker) != 1:
+    sys.stderr.write("FAIL: expected one worker container\n")
+    sys.exit(1)
+hits = [item for item in worker[0].get("env", []) if item.get("name") == "CURIE_FACTORY_MIN_MODEL_CREDIT_USD"]
+if len(hits) != 1 or set(hits[0]) != {"name", "value"}:
+    sys.stderr.write("FAIL: model credit env is %r\n" % (hits,))
+    sys.exit(1)
+sys.stdout.write(hits[0]["value"])
+'
+}
+
+default_credit=$(render | credit_min)
+if [ "$default_credit" != "10" ]; then
+  echo "FAIL: default min model credit rendered $default_credit" >&2
+  exit 1
+fi
+echo "  ok: CURIE_FACTORY_MIN_MODEL_CREDIT_USD defaults to 10"
+override_credit=$(render --set factory.admission.minModelCreditUsd=25 | credit_min)
+if [ "$override_credit" != "25" ]; then
+  echo "FAIL: override min model credit rendered $override_credit" >&2
+  exit 1
+fi
+echo "  ok: CURIE_FACTORY_MIN_MODEL_CREDIT_USD renders an override"
+zero_credit=$(render --set factory.admission.minModelCreditUsd=0 | credit_min)
+if [ "$zero_credit" != "0" ]; then
+  echo "FAIL: zero min model credit rendered $zero_credit" >&2
+  exit 1
+fi
+echo "  ok: a zero model credit minimum still renders"
+refused "a negative model credit minimum" "minModelCreditUsd" \
+  render --set-json 'factory.admission.minModelCreditUsd=-1'
+
 echo "factory-forges-assertions: all assertions passed"

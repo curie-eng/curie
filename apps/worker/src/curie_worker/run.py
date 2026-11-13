@@ -65,6 +65,7 @@ from .delivery_lease import DeliveryLeaseStore
 from .deploy_notice import DeployNoticeConsumer
 from .e2e_reaper import E2EReaperLoop
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
+from .factory_credit import FactoryCreditLoop
 from .factory_slack_progress import FactorySlackProgressLoop, PostgresFactorySlackStore
 from .factory_steering import FactorySteeringClient
 from .heartbeat import run_heartbeat
@@ -193,6 +194,10 @@ class Runtime:
     # run's owed progress to its agent's Slack destination, outside the
     # consumer, the thread lock and the markers.
     factory_slack_progress: FactorySlackProgressLoop | None = None
+    # Always built. Records model_credit facts from this worker's own model
+    # credential (issue 5581). Optional only so a Runtime constructed in tests
+    # need not name it.
+    factory_credit: FactoryCreditLoop | None = None
     # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
     # beside the connector reconcile loop, never inside the consumer.
     action_executor: ActionExecutorLoop | None = None
@@ -829,10 +834,12 @@ def build(
     # current checks and the binding owner's per-identity classification.
     identity_authority = (
         HttpTurnAuthorityClient(
-            api_base_url=config.api_base_url, worker_token=config.internal_worker_token,
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
             client=eval_http,
         )
-        if config.internal_worker_token else None
+        if config.internal_worker_token
+        else None
     )
     binding = BindingResolver(engine, config, identity_classifier=identity_authority)
     recovery_gc: RecoveryCollector | None = None
@@ -1180,6 +1187,7 @@ def build(
         remediation_cards=_build_remediation_cards(config, engine, sink, card_store),
         remediation_receipts=_build_remediation_receipts(config, engine, sink),
         factory_slack_progress=_build_factory_slack_progress(config, engine, sink),
+        factory_credit=FactoryCreditLoop(engine, config),
         stream_retention=build_stream_retention(config, async_redis),
     )
 
@@ -1195,6 +1203,7 @@ _SUPERVISED_OPERATIONS = frozenset(
         "publications",
         "e2e-reaper",
         "workspace-recovery-gc",
+        "factory-credit",
     }
 )
 
@@ -1483,8 +1492,7 @@ def _build_action_executor(
 
         if not config.connector_reconcile_enabled:
             logger.info(
-                "action executor reads connector Deployments by name; "
-                "connector reconcile loop off"
+                "action executor reads connector Deployments by name; connector reconcile loop off"
             )
         deployments = connector_deployments_api()
         manifests = HttpManifestSource(
@@ -1778,9 +1786,7 @@ def _build_publication_loop(
 ) -> PublicationReconcileLoop | None:
     """Build the worker-owned Kubernetes publication lane, never a local twin."""
 
-    if (
-        not config.publication_enabled or sandbox_substrate(env) != "kubernetes"
-    ):
+    if not config.publication_enabled or sandbox_substrate(env) != "kubernetes":
         return None
     namespace = config.publication_namespace
     cluster = KubernetesPublicationCluster(namespace)
@@ -2015,6 +2021,13 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             launch(
                 "factory-slack-progress",
                 lambda: rt.factory_slack_progress.run_forever(shutdown),  # type: ignore[union-attr]
+            )
+        )
+    if getattr(rt, "factory_credit", None) is not None:
+        tasks.append(
+            launch(
+                "factory-credit",
+                lambda: rt.factory_credit.run_forever(shutdown),  # type: ignore[union-attr]
             )
         )
     if sweeper is not None:

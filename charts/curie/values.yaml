@@ -1319,6 +1319,12 @@ factory:
   trackers: []
   bindings: []
   sandboxEgress: {}
+  # Minimum remaining model credit, in USD, for a sufficient model credit fact.
+  # The worker reads the provider with its own credential and records only the
+  # comparison. Zero still reads the provider and treats an accepted key as
+  # sufficient. A negative value is refused.
+  admission:
+    minModelCreditUsd: 10
   # Per-run Docker daemons (ADR 0217). Read only when a bindings[].repos[]
   # entry with a runner block sets docker.enabled: true and worker.deploy is
   # true; otherwise templates/docker-daemon.yaml renders nothing. See the
