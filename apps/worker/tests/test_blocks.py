@@ -711,33 +711,12 @@ def test_an_expired_card_still_names_its_requester() -> None:
     assert "expired" in str(card[-1]).lower()
 
 
-@pytest.mark.parametrize(
-    "requested_by",
-    [
-        "requester@example.com",
-        "Ada Lovelace",
-        "<@U0EXAMPLE1>",
-        "U0EXAMPLE1\n",
-        "U0EXAMPLE1",
-        "W0EXAMPLE1",
-        "",
-    ],
-)
-def test_requester_identity_renders_safely_across_approval_states(
-    requested_by: str,
-) -> None:
-    """#5515: a requester line is a mention only for a Slack user id.
+def _assert_requester_identity_across_approval_states(requested_by: str) -> None:
+    """Assert one requester value on the pending, resolved and expired cards.
 
-    The requester field is untrusted display input: the same card carries a
-    Slack user id, an email address or a plain display name depending on who
-    triggered the turn, and a live card once rendered
-    ``Requested by <@requester@example.com>`` -- a mention attempt wrapping the
-    address. Only a value matching the Slack user-id shape may render as a
-    mention; every other nonempty requester renders as literal text in a
-    plain_text context element, which Slack never parses for mention syntax,
-    so requester text cannot introduce a mention. An empty requester omits the
-    line. All three card states render it one way (ADR-0179), so all three
-    real builders are asserted.
+    A mention is only for a Slack user id. Every other nonempty requester is
+    literal plain_text, and an empty requester omits the line. All three card
+    states render it one way (ADR-0179), so all three real builders are asserted.
     """
 
     from curie_channel_gateway.slack.blocks import (
@@ -793,6 +772,50 @@ def test_requester_identity_renders_safely_across_approval_states(
             rendered = json.dumps(blocks)
             assert f"<@{requested_by}>" not in rendered, (state, blocks)
             assert f'<@{json.dumps(requested_by)[1:-1]}>' not in rendered, (state, blocks)
+
+
+@pytest.mark.parametrize(
+    "requested_by",
+    [
+        "requester@example.com",
+        "Ada Lovelace",
+        "<@U0EXAMPLE1>",
+        "U0EXAMPLE1\n",
+    ],
+)
+def test_requester_identity_renders_safely_across_approval_states(
+    requested_by: str,
+) -> None:
+    """#5515: non-id requester text renders as literal text, never a mention.
+
+    The requester field is untrusted display input. A live card once rendered
+    ``Requested by <@requester@example.com>`` -- a mention attempt wrapping the
+    address. Email, a display name, mention-shaped text and a trailing-newline
+    id are not Slack user ids, so each renders as literal plain_text. These are
+    the inputs whose expected output changes with that fix.
+    """
+
+    _assert_requester_identity_across_approval_states(requested_by)
+
+
+@pytest.mark.parametrize(
+    "requested_by",
+    [
+        "U0EXAMPLE1",
+        "W0EXAMPLE1",
+        "",
+    ],
+)
+def test_requester_identity_keeps_id_mentions_and_omits_empty(
+    requested_by: str,
+) -> None:
+    """Valid Slack user ids stay mentions, and an empty requester stays omitted.
+
+    Those outputs match the previous renderer, so they are not part of the fix
+    pin. The same three builders still cover pending, resolved and expired.
+    """
+
+    _assert_requester_identity_across_approval_states(requested_by)
 
 
 def test_expired_approval_card_clamps_oversized_summary() -> None:
