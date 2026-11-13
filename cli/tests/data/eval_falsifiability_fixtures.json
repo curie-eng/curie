@@ -123,7 +123,8 @@
     "dark-factory/admits-unrecorded-decision": ["No changes needed: The PR body does not explain why 256 was selected; the repository excerpt only defines that capacity."],
     "factory-selector/reports-labelled-and-skipped": [
       "Labelled:\n#7 Retry the flaky checkout\nSkipped:\n#2 search excluded it\nThe next session can select different issues.\n",
-      "Labelled:\n#7 Retry the flaky checkout\n#31 Document the cap\nSkipped:\n#2 search excluded it\n#8 the session cap was already full\n"
+      "Labelled:\n#7 Retry the flaky checkout\n#31 Document the cap\nSkipped:\n#2 search excluded it\n#8 the session cap was already full\n",
+      "Labelled:\n#12 Widget flaky on cold start\nSkipped:\n#4 already carries the factory label"
     ],
     "factory-selector/reports-nothing-matched": [
       "Nothing matched. The policy search returned no open issues."
@@ -252,7 +253,10 @@
     "factory-selector/reports-labelled-and-skipped": [
       "Skipped:\n#4 already carries the factory label\nLabelled:\n#12 Widget flaky on cold start\n",
       "Labelled:\n#12\nSkipped:\n#4 already carries the factory label\n",
-      "Nothing matched."
+      "Nothing matched.",
+      "Labelled:\n#12 Widget flaky on cold start\nSkipped:\n#4 already carries the factory label\n#9\n",
+      "Labelled:\n#12 Widget flaky on cold start\nSkipped:\n#4 already carries the factory label\nSee notes.\n#9\n",
+      "Labelled:\n#12 \nSkipped:\n#4 already carries the factory label\n"
     ],
     "factory-selector/reports-nothing-matched": [
       "Labelled:\n#12 Widget flaky on cold start\nSkipped:\n#4 already carries the factory label\n",
