@@ -4,6 +4,15 @@ Date: 2026-09-22
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Adds the single internal delegated-selection exception to the human-event
+admission authority, while retaining bot/App event rejection.
+
+Partially amended by [ADR 0279](0279-a-person-acting-through-a-github-app-can-select-factory-work.md)
+under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md),
+only where this record ignores every App-related label event.
+
 **Partially amended by [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 only where it names GitHub as the sole source of a notice; notices come
@@ -16,11 +25,6 @@ cancels on. Each tracker surface carries its own
 trigger label, or serves the tracker's configured label when it has none, and
 a removed label cancels a WorkItem only when it is the label stored as having
 admitted it. Everything else in this ADR stands.
-
-**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
-(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
-Adds the single internal delegated-selection exception to the human-event
-admission authority, while retaining bot/App event rejection.
 
 Partially amends
 [ADR 0145](0145-a-labelled-issue-is-a-backlog-item-and-the-stream-is-its-queue.md).

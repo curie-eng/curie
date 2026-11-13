@@ -4,6 +4,11 @@ Date: 2026-10-05
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Adds tracker-result completion and explicitly permits the initial-release use of
+current checks while its viability evaluator remains deferred.
+
 **Partially amended by [ADR 0222](0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 decisions 2.5, 4.2 and 7 become the factory bundle's versioned input contract
@@ -21,11 +26,6 @@ decision 2's "can it start" gains an environment half (model credit, base
 branch health, runner toolchain, and a sandbox canary), checked before the
 ticket checks, and a failing environment check is decision 6's `unknown`, never
 a rejection. Everything else in this ADR stands.
-
-**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
-(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
-Adds tracker-result completion and explicitly permits the initial-release use of
-current checks while its viability evaluator remains deferred.
 
 Accepted 2026-10-05 with explicit maintainer approval from Brian Conn
 (TheConnMan), given after the Draft merged in
