@@ -68,6 +68,7 @@ from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .factory_credit import FactoryCreditLoop
 from .factory_slack_progress import FactorySlackProgressLoop, PostgresFactorySlackStore
 from .factory_steering import FactorySteeringClient
+from .factory_tool_observer import FactoryToolObserver
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
 from .hook_source_guard import CronHookSourceGuard
@@ -178,6 +179,7 @@ class Runtime:
     # here so `_run` supervises it beside the consumers rather than letting it
     # run unsupervised.
     connector_loop: ConnectorReconcileLoop | None = None
+    factory_tool_observer: FactoryToolObserver | None = None
     # The cron scheduler (#268). Always built by ``build``; optional only so a
     # Runtime constructed elsewhere need not name it.
     cron_loop: CronSchedulerLoop | None = None
@@ -1157,6 +1159,10 @@ def build(
             else None
         ),
         connector_loop=_build_connector_loop(config, engine, client=eval_http),
+        factory_tool_observer=(
+            FactoryToolObserver(engine=engine, substrate=substrate, db_schema=config.db_schema)
+            if isinstance(sandbox_client, KubernetesSandboxClient) else None
+        ),
         action_executor=_build_action_executor(
             config,
             engine,
@@ -1991,6 +1997,9 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         tasks.append(launch("deploy-notices", rt.deploy_notice_consumer.run))
     if rt.connector_loop is not None:
         tasks.append(launch("connectors", lambda: rt.connector_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    tool_observer = rt.factory_tool_observer
+    if tool_observer is not None:
+        tasks.append(launch("factory-tools", lambda: tool_observer.run_forever(shutdown)))
     if getattr(rt, "action_executor", None) is not None:
         tasks.append(launch("action-executor", lambda: rt.action_executor.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "e2e_reaper", None) is not None:

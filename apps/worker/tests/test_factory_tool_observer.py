@@ -100,6 +100,12 @@ class ClusterAPI:
         self, group: str, version: str, namespace: str, plural: str, name: str, **kwargs: Any
     ) -> None:
         self.objects.pop((plural, name), None)
+        if plural == "sandboxtemplates":
+            for key, value in list(self.objects.items()):
+                if any(
+                    owner["name"] == name for owner in value["metadata"].get("ownerReferences", [])
+                ):
+                    del self.objects[key]
 
 
 def cluster_client() -> tuple[KubernetesSandboxClient, ClusterAPI]:
@@ -107,6 +113,7 @@ def cluster_client() -> tuple[KubernetesSandboxClient, ClusterAPI]:
     api = ClusterAPI()
     client._api = api  # type: ignore[assignment]
     client._namespace = "acme"
+    client._tool_probe_sandboxes = {}
     return client, api
 
 
@@ -282,13 +289,14 @@ class ProbeClient(KubernetesSandboxClient):
         self.pool_present = True
         self.runtime_digest = "sha256:" + "a" * 64
         self.runtime_present = frozenset({"sh", "git"})
+        self.release_confirmed = True
 
     def warm_pool_exists(self, pool: str) -> bool:
-        return self.pool_present
+        return self.pool_present and "-agent-" not in pool
 
     def inspect_tool_probe(self, pool: str, *, deadline: float) -> ProbeSelection:
         return ProbeSelection(
-            pool, "acme-selected", copy.deepcopy(self.spec), digest([pool, self.spec])
+            pool, "acme-selected", copy.deepcopy(self.spec), digest([pool, self.spec]), frozenset()
         )
 
     def create_tool_probe(self, name: str, selection: ProbeSelection, *, deadline: float) -> None:
@@ -310,6 +318,8 @@ class ProbeClient(KubernetesSandboxClient):
         return ProbeResult(self.runtime_present, self.runtime_digest, "linux/amd64", 1000)
 
     def delete_tool_probe(self, name: str, *, deadline: float) -> bool:
+        if not self.release_confirmed:
+            return False
         self.claims.pop(name, None)
         self.released.append(name)
         return True
@@ -324,7 +334,9 @@ def observer(world: Any, client: ProbeClient) -> Any:
         substrate=SandboxSubstrate(
             client,
             None,
-            SubstrateConfig(namespace="acme", warm_pool=POOL),  # type: ignore[arg-type]
+            SubstrateConfig(
+                namespace="acme", warm_pool=POOL, platform_runner_digest="sha256:" + "a" * 64
+            ),  # type: ignore[arg-type]
         ),
         db_schema="curie",
     )
@@ -347,7 +359,7 @@ async def observation_rows(world: Any) -> list[Any]:
         )
 
 
-def test_tick_writes_every_name_then_refreshes_without_another_claim(
+def test_tick_preserves_expiry_until_a_fresh_probe(
     observation_world: Any,
 ) -> None:
     world = observation_world
@@ -366,8 +378,13 @@ def test_tick_writes_every_name_then_refreshes_without_another_claim(
         assert await loop.tick(now=now + timedelta(seconds=300)) == 1
         refreshed = await observation_rows(world)
         assert all(row["observed_at"] == now for row in refreshed)
-        assert all(row["expires_at"] == now + timedelta(seconds=1200) for row in refreshed)
+        assert all(row["expires_at"] == now + timedelta(seconds=900) for row in refreshed)
         assert len(client.created) == 1 and client.released == client.created
+        await loop.tick(now=now + timedelta(seconds=900))
+        reprobed = await observation_rows(world)
+        assert all(row["observed_at"] == now + timedelta(seconds=900) for row in reprobed)
+        assert all(row["expires_at"] == now + timedelta(seconds=1800) for row in reprobed)
+        assert len(client.created) == 2 and client.released == client.created
         assert not client.claims
 
     asyncio.run(check())
@@ -387,7 +404,9 @@ def test_changed_identity_deletes_rows_before_failed_probe(
     loop = observer(world, client)
     asyncio.run(loop.tick())
     if change == "image":
-        client.spec["podTemplate"]["spec"]["containers"][0]["image"] += "-changed"
+        client.spec["podTemplate"]["spec"]["containers"][0]["image"] = (
+            "registry.example.com/acme-other-runner@sha256:" + "a" * 64
+        )
     elif change == "user":
         client.spec["podTemplate"]["spec"]["securityContext"]["runAsUser"] = 1001
     elif change == "catalog":
@@ -504,8 +523,8 @@ def test_one_failed_subject_does_not_prevent_other_subject_observations(
 
     async def targets(conn: Any) -> list[Any]:
         return [
-            Subject(world.agent, "acme", "other", world.repository, "first"),
-            Subject(world.agent, "acme", world.scope, world.repository, "second"),
+            Subject(world.agent, "acme", "other", world.repository, "first", ()),
+            Subject(world.agent, "acme", world.scope, world.repository, "second", ()),
         ]
 
     loop.subjects = targets
@@ -579,6 +598,228 @@ def test_mutable_image_identity_change_does_not_refresh_old_positive_rows(
         await loop.tick(now=now + timedelta(seconds=300))
         rows = await observation_rows(world)
         git = next(row for row in rows if row["item"] == "git")
-        assert git["state"] != "present", "the prior image's positive row was refreshed"
+        assert all(row["state"] == "unknown" and row["reason"] == "unreadable" for row in rows)
+        assert git["state"] == "unknown"
+        assert client.created == []
+
+    asyncio.run(check())
+
+
+def test_runtime_digest_must_match_the_deployments_declared_digest(observation_world: Any) -> None:
+    world = observation_world
+    client = ProbeClient()
+    client.runtime_digest = "sha256:" + "b" * 64
+    loop = observer(world, client)
+
+    async def check() -> None:
+        await loop.tick()
+        rows = await observation_rows(world)
+        assert len(rows) == len(CATALOG)
+        assert all(row["state"] == "unknown" and row["reason"] == "unreadable" for row in rows)
+        assert len(client.created) == 1 and client.created == client.released
+        client.runtime_digest = "sha256:" + "a" * 64
+        await loop.tick()
+        assert {row["state"] for row in await observation_rows(world)} == {"present", "absent"}
+
+    asyncio.run(check())
+
+
+def test_platform_image_needs_the_worker_configuration_declaration(observation_world: Any) -> None:
+    from dataclasses import replace
+
+    world = observation_world
+    client = ProbeClient()
+    loop = observer(world, client)
+    loop._substrate._config = replace(loop._substrate._config, platform_runner_digest=None)
+
+    async def check() -> None:
+        await loop.tick()
+        rows = await observation_rows(world)
+        assert all(row["state"] == "unknown" and row["reason"] == "unreadable" for row in rows)
+        assert not client.created
+
+    asyncio.run(check())
+
+
+def test_cancellation_keeps_tick_lock_until_probe_cleanup(observation_world: Any) -> None:
+    import threading
+
+    world = observation_world
+    client = ProbeClient()
+    loop = observer(world, client)
+    entered, release = threading.Event(), threading.Event()
+
+    def hold_probe() -> None:
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("observation test did not release probe")
+
+    client.before_probe = hold_probe
+
+    async def check() -> None:
+        running = asyncio.create_task(loop.tick())
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            running.cancel()
+            assert await observer(world, ProbeClient()).tick() == 0
+        finally:
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await running
+        assert len(client.created) == 1 and client.created == client.released
+        assert not client.claims
+
+    asyncio.run(check())
+
+
+def test_unconfirmed_release_prevents_another_probe(observation_world: Any) -> None:
+    world = observation_world
+    client = ProbeClient()
+    client.release_confirmed = False
+    loop = observer(world, client)
+
+    async def check() -> None:
+        await loop.tick()
+        assert len(client.created) == 1
+        await loop.tick()
+        assert len(client.created) == 1
+        assert all(row["state"] == "unknown" for row in await observation_rows(world))
+        client.release_confirmed = True
+        await loop.tick()
+        assert len(client.created) == 2 and client.created == client.released
+        assert not client.claims
+
+    asyncio.run(check())
+
+
+def test_docker_service_uses_the_same_repository_daemon_configuration(
+    observation_world: Any,
+) -> None:
+    from dataclasses import replace
+
+    from curie_worker.repo_runner_pools import RepoRunnerPool
+
+    world = observation_world
+    client = ProbeClient()
+    loop = observer(world, client)
+    daemon = json.loads(
+        (Path(__file__).resolve().parents[3] / "tests/vectors/daemon-config.json").read_text()
+    )["daemon"]
+
+    async def check() -> None:
+        for enabled in (True, False):
+            entry = RepoRunnerPool.model_validate(
+                {
+                    "pool": "acme-repo-runner",
+                    "digests": ["sha256:" + c * 64 for c in "abc"],
+                    "base": "sha256:" + "a" * 64,
+                    "docker": enabled,
+                    **({"daemon": daemon} if enabled else {}),
+                }
+            )
+            loop._substrate._config = replace(
+                loop._substrate._config, repo_runner_pools={world.repository: entry}
+            )
+            await loop.tick()
+            rows = await observation_rows(world)
+            services = [row for row in rows if row["item"] == "service:docker"]
+            assert len(services) == int(enabled)
+            if enabled:
+                assert services[0]["state"] == "configured"
+            assert not client.claims
+
+    asyncio.run(check())
+
+
+def test_capacity_refusal_leaves_no_positive_observation(observation_world: Any) -> None:
+    from curie_worker.sandbox.types import CapacityExhaustedError, QuotaRejection
+
+    world = observation_world
+    client = ProbeClient()
+    client.failure = CapacityExhaustedError(
+        QuotaRejection(
+            quota_name="acme-quota",
+            requested={"pods": "1"},
+            used={"pods": "1"},
+            hard={"pods": "1"},
+        )
+    )
+    loop = observer(world, client)
+
+    async def check() -> None:
+        await loop.tick()
+        assert await observation_rows(world) == []
+        assert client.created == client.released
+        client.failure = None
+        await loop.tick()
+        assert {row["state"] for row in await observation_rows(world)} == {"present", "absent"}
+
+    asyncio.run(check())
+
+
+def test_probe_deadline_leaves_cleanup_budget_and_unknown_rows(
+    observation_world: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import curie_worker.sandbox.substrate as substrate
+
+    world = observation_world
+    client = ProbeClient()
+    clock = [0.0]
+    monkeypatch.setattr(substrate, "_probe_monotonic", lambda: clock[0])
+
+    def never_complete(sandbox: str, *, deadline: float) -> None:
+        assert deadline == 90
+        clock[0] = 91
+
+    client.read_tool_probe = never_complete
+    loop = observer(world, client)
+
+    async def check() -> None:
+        await loop.tick()
+        rows = await observation_rows(world)
+        assert len(rows) == len(CATALOG)
+        assert all(row["state"] == "unknown" and row["reason"] == "unreadable" for row in rows)
+        assert len(client.created) == 1 and client.created == client.released
+        assert not client.claims
+
+    asyncio.run(check())
+
+
+def test_observer_keeps_the_real_claims_connector_pool_refusal(
+    observation_world: Any,
+    caplog: Any,
+) -> None:
+    from dataclasses import replace
+
+    from sqlalchemy import text
+
+    world = observation_world
+    client = ProbeClient()
+    loop = observer(world, client)
+
+    async def check() -> None:
+        await loop.tick()
+        async with world.engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE curie.agents SET secrets=CAST(:secrets AS jsonb) WHERE id=:id"),
+                {"secrets": json.dumps({"ACME_TOKEN": SENTINEL}), "id": world.agent},
+            )
+            name = await conn.scalar(
+                text("SELECT name FROM curie.agents WHERE id=:id"), {"id": world.agent}
+            )
+        await loop.tick()
+        rows = await observation_rows(world)
+        assert all(
+            row["state"] == "unknown" and row["reason"] == "runner_unavailable" for row in rows
+        )
+        assert len(client.created) == 1
+        loop._substrate._config = replace(
+            loop._substrate._config, connector_secret_pools=frozenset({name})
+        )
+        await loop.tick()
+        assert {row["state"] for row in await observation_rows(world)} == {"present", "absent"}
+        assert len(client.created) == 2
+        assert SENTINEL not in str(await observation_rows(world)) + caplog.text
 
     asyncio.run(check())

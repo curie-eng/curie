@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,8 +13,9 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from .binding import inject_connector_secrets
 from .sandbox import SandboxSubstrate
-from .sandbox.tool_probe import CATALOG, CATALOG_VERSION, digest
+from .sandbox.tool_probe import CATALOG, CATALOG_VERSION, ProbeResult, ProbeSelection, digest
 from .sandbox.types import AdmissionUnavailableError, CapacityExhaustedError, MissingAgentPoolError
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,7 @@ class Subject:
     repository_id: str
     repository: str
     configuration: str
+    secret_names: tuple[str, ...]
 
 
 class FactoryToolObserver:
@@ -46,15 +49,21 @@ class FactoryToolObserver:
                 await conn.execute(
                     text(f"""
             SELECT a.id AS agent_id, a.name AS agent_name,
-                   p.tracker_scope_id AS repository_id, c.address AS repository,
-                   jsonb_agg(jsonb_build_array(c.id, c.generation)
-                             ORDER BY c.id)::text AS configuration
+                   p.tracker_scope_id AS repository_id, lower(c.address) AS repository,
+                   jsonb_build_object('bindings',
+                       jsonb_agg(jsonb_build_array(c.id, c.generation) ORDER BY c.id),
+                       'runner_resources', a.runner_resources)::text AS configuration,
+                   ARRAY(SELECT jsonb_object_keys(
+                       COALESCE(a.secrets, '{{}}'::jsonb))) AS secret_names
             FROM {self._schema}.agents a
             JOIN {self._schema}.agent_channels c ON c.agent_id = a.id AND c.tenant_id = a.tenant_id
-            JOIN {self._schema}.factory_poll_cursors p
-              ON p.tracker_kind = 'github' AND lower(p.scope_path) = lower(c.address)
+            JOIN LATERAL (
+                SELECT tracker_scope_id FROM {self._schema}.factory_poll_cursors
+                WHERE tracker_kind = 'github' AND lower(scope_path) = lower(c.address)
+                ORDER BY updated_at DESC, tracker_scope_id LIMIT 1
+            ) p ON true
             WHERE c.kind = 'github'
-            GROUP BY a.id, a.name, p.tracker_scope_id, c.address
+            GROUP BY a.id, a.name, p.tracker_scope_id, lower(c.address)
             ORDER BY a.id, p.tracker_scope_id
         """)
                 )
@@ -62,7 +71,10 @@ class FactoryToolObserver:
             .mappings()
             .all()
         )
-        return [Subject(**dict(row)) for row in rows]
+        return [
+            Subject(**{**dict(row), "secret_names": tuple(sorted(row["secret_names"]))})
+            for row in rows
+        ]
 
     async def _delete(self, subject: Subject) -> None:
         async with self._engine.begin() as conn:
@@ -124,11 +136,16 @@ class FactoryToolObserver:
 
     async def _one(self, subject: Subject, *, now: datetime) -> None:
         key = subject.agent_id, subject.repository_id
+        selector_env: dict[str, str] = {}
+        inject_connector_secrets(
+            selector_env, dict.fromkeys(subject.secret_names, ""), agent_label=subject.agent_id
+        )
         try:
             selection, docker = await asyncio.to_thread(
                 self._substrate.inspect_tools,
                 workspace_repo=subject.repository,
                 agent_name=subject.agent_name,
+                selector_env=selector_env,
             )
         except MissingAgentPoolError:
             self._current.pop(key, None)
@@ -163,34 +180,54 @@ class FactoryToolObserver:
                 now=now,
             )
             return
-        configuration = digest([selection.identity, subject.configuration, CATALOG_VERSION, docker])
+        configuration = digest(
+            [
+                selection.identity,
+                sorted(selection.declared_digests),
+                subject.configuration,
+                subject.secret_names,
+                CATALOG_VERSION,
+                docker,
+            ]
+        )
         previous = self._current.get(key)
         if previous is not None and previous[0] == configuration:
             async with self._engine.begin() as conn:
-                updated = await conn.execute(
+                current = await conn.scalar(
                     text(f"""
-                    UPDATE {self._schema}.factory_fact_observations SET expires_at = :expires
+                    SELECT count(*) FROM {self._schema}.factory_fact_observations
                     WHERE kind = 'tool' AND agent_id = :agent AND scope = :scope
-                      AND subject_digest = :digest
+                      AND subject_digest = :digest AND expires_at > :now
                 """),
                     {
-                        "expires": now + timedelta(seconds=EXPIRY_SECONDS),
+                        "now": now,
                         "agent": subject.agent_id,
                         "scope": subject.repository_id,
                         "digest": previous[1],
                     },
                 )
-                if updated.rowcount == len(CATALOG) + int(docker):
+                if current == len(CATALOG) + int(docker):
                     return
         self._current.pop(key, None)
         await self._delete(subject)
         identity = digest(
             [str(subject.agent_id), subject.repository_id, selection.identity, CATALOG_VERSION]
         )
-        try:
-            result = await asyncio.to_thread(
-                self._substrate.probe_tools, selection, agent_name=subject.agent_name
+        if not selection.declared_digests:
+            await self._write(
+                subject,
+                identity=identity,
+                present=None,
+                reason="unreadable",
+                docker=docker,
+                now=now,
             )
+            self._current[key] = configuration, identity
+            return
+        try:
+            result = await self._probe(selection, agent_name=subject.agent_name)
+            if result.image_digest not in selection.declared_digests:
+                raise ValueError("observed runner identity differs from its declaration")
         except (CapacityExhaustedError, AdmissionUnavailableError):
             return
         except Exception:  # noqa: BLE001 - isolate each observation failure
@@ -219,6 +256,18 @@ class FactoryToolObserver:
         )
         self._current[key] = configuration, identity
 
+    async def _probe(self, selection: ProbeSelection, *, agent_name: str) -> ProbeResult:
+        task = asyncio.create_task(
+            asyncio.to_thread(self._substrate.probe_tools, selection, agent_name=agent_name)
+        )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
+
     async def tick(self, *, now: datetime | None = None) -> int:
         now = now or datetime.now(UTC)
         async with self._engine.connect() as lock:
@@ -239,11 +288,14 @@ class FactoryToolObserver:
 
     async def run_forever(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
+            started = time.monotonic()
             try:
                 await self.tick()
             except Exception:  # noqa: BLE001 - isolate each observation failure
                 logger.warning("factory tool observation tick failed")
             try:
-                await asyncio.wait_for(stop.wait(), timeout=INTERVAL_SECONDS)
+                await asyncio.wait_for(
+                    stop.wait(), timeout=max(0, INTERVAL_SECONDS - (time.monotonic() - started))
+                )
             except TimeoutError:
                 pass

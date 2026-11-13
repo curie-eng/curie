@@ -127,6 +127,7 @@ def test_facts_scenario_executes_assertions_and_refuses_violations(
     driver.facts_api = api
     driver.wait_facts = wait
     driver.sql = lambda query: {"work_items": 0, "execution_requests": 0, "deliveries": 2}
+    driver.run_tool_facts = lambda: calls.append(("tool-facts",))
     github = types.SimpleNamespace(HUMAN={"type": "User"}, BOT={"type": "Bot"})
     if violation is None:
         driver.run_facts(github)

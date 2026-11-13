@@ -663,13 +663,16 @@ class KubernetesSandboxClient:
         self._networking_api = k8s_client.NetworkingV1Api(api_client)
         self._node_api = k8s_client.NodeV1Api(api_client)
         self._namespace = namespace
+        self._tool_probe_sandboxes: dict[str, str] = {}
 
     def inspect_tool_probe(self, pool: str, *, deadline: float) -> ProbeSelection:
         template = self._pool_template_name(pool, request_timeout_seconds=_claim_timeout(deadline))
         spec = self._source_template_spec(
             template, request_timeout_seconds=_claim_timeout(deadline)
         )
-        return ProbeSelection(pool, template, spec, probe_digest([pool, template, spec]))
+        return ProbeSelection(
+            pool, template, spec, probe_digest([pool, template, spec]), frozenset()
+        )
 
     def create_tool_probe(self, name: str, selection: ProbeSelection, *, deadline: float) -> None:
         """Create a cold claim from the selected image, with no runtime credentials."""
@@ -784,8 +787,22 @@ class KubernetesSandboxClient:
         if not name.startswith(PROBE_PREFIX):
             raise ValueError("invalid observation claim")
         claim = self.get_claim(name, request_timeout_seconds=_claim_timeout(deadline))
-        sandbox = None if claim is None else claim.sandbox_name
-        self.delete_claim(name, request_timeout_seconds=_claim_timeout(deadline))
+        if claim is not None and claim.sandbox_name is not None:
+            self._tool_probe_sandboxes[name] = claim.sandbox_name
+        sandbox = self._tool_probe_sandboxes.get(name)
+        try:
+            self._api.delete_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxclaims",
+                name,
+                body=k8s_client.V1DeleteOptions(propagation_policy="Foreground"),
+                _request_timeout=_claim_timeout(deadline),
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status != 404:
+                raise
         self._rollback_delete("sandboxtemplates", claim_object_names(name).template)
         while True:
             claim = self.get_claim(name, request_timeout_seconds=_claim_timeout(deadline))
@@ -806,7 +823,23 @@ class KubernetesSandboxClient:
                     except k8s_client.ApiException as exc:
                         if exc.status != 404:
                             raise
-            if claim is None and pod is None:
+            names = claim_object_names(name)
+            template = self._get(
+                EXT_GROUP,
+                EXT_VERSION,
+                "sandboxtemplates",
+                names.template,
+                request_timeout_seconds=_claim_timeout(deadline),
+            )
+            pool = self._get(
+                EXT_GROUP,
+                EXT_VERSION,
+                "sandboxwarmpools",
+                names.pool,
+                request_timeout_seconds=_claim_timeout(deadline),
+            )
+            if claim is None and pod is None and template is None and pool is None:
+                self._tool_probe_sandboxes.pop(name, None)
                 return True
             time.sleep(min(0.2, _claim_timeout(deadline)))
 

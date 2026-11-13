@@ -57,7 +57,7 @@ from .docker import DockerSandboxClient
 from .k8s import KubernetesSandboxClient
 from .quota import admission_quota_headroom, resource_vector
 from .static import StaticPoolSandboxClient
-from .tool_probe import PROBE_PREFIX, ProbeResult, ProbeSelection
+from .tool_probe import PROBE_PREFIX, ProbeResult, ProbeSelection, pinned_runner_digest
 from .types import (
     AGENT_LABEL,
     EXECUTOR_THREAD_KEY_PREFIX,
@@ -159,6 +159,7 @@ _CONTROL_REQUEST_TIMEOUT_S = 5.0
 _MIN_POLL_BUDGET_S = 0.5
 _GONE_READ_TIMEOUT_S = 1.0
 _POD_TERMINATION_TIMEOUT_S = 2.0
+_probe_monotonic = time.monotonic
 
 
 def _poll_sleeps(config: SubstrateConfig) -> Iterator[float]:
@@ -2153,18 +2154,36 @@ class SandboxSubstrate:
         )
         return runner, self._claim_pool(env=env, agent_name=agent_name, runner=runner)
 
-    def inspect_tools(self, *, workspace_repo: str, agent_name: str) -> tuple[ProbeSelection, bool]:
+    def inspect_tools(
+        self, *, workspace_repo: str, agent_name: str, selector_env: Mapping[str, str]
+    ) -> tuple[ProbeSelection, bool]:
         if not isinstance(self._k8s, KubernetesSandboxClient):
             raise ValueError("image observations require the Kubernetes substrate")
-        runner, pool = self.select_runner(workspace_repo=workspace_repo, agent_name=agent_name)
+        runner, pool = self.select_runner(
+            workspace_repo=workspace_repo, agent_name=agent_name, env=selector_env
+        )
         selection = self._k8s.inspect_tool_probe(pool, deadline=time.monotonic() + 10)
-        return selection, bool(runner is not None and runner.docker and runner.daemon is not None)
+        if runner is not None:
+            declared = frozenset(runner.digests)
+        elif pool != self._config.warm_pool:
+            pinned = pinned_runner_digest(selection)
+            declared = frozenset() if pinned is None else frozenset({pinned})
+        else:
+            platform = self._config.platform_runner_digest
+            declared = frozenset() if platform is None else frozenset({platform})
+        if pinned_runner_digest(selection) not in declared:
+            declared = frozenset()
+        return replace(selection, declared_digests=declared), bool(
+            runner is not None and runner.docker and runner.daemon is not None
+        )
 
     def probe_tools(self, selection: ProbeSelection, *, agent_name: str) -> ProbeResult:
+        if not selection.declared_digests:
+            raise ValueError("runner has no declared immutable identity")
         if not isinstance(self._k8s, KubernetesSandboxClient):
             raise ValueError("image observations require the Kubernetes substrate")
         name = PROBE_PREFIX + uuid.uuid4().hex[:16]
-        deadline = time.monotonic() + 120
+        deadline = _probe_monotonic() + 120
         if self._pending_tool_probe is not None:
             if not self._k8s.delete_tool_probe(self._pending_tool_probe, deadline=deadline - 90):
                 raise ClaimTimeoutError("previous observation release unconfirmed")
@@ -2181,10 +2200,10 @@ class SandboxSubstrate:
         try:
             self._k8s.create_tool_probe(name, selection, deadline=deadline - 30)
             reservation = self._advance_admission(name, reservation, "submitted")
-            while time.monotonic() < deadline - 30:
+            while _probe_monotonic() < deadline - 30:
                 claim = self._k8s.get_claim(
                     name,
-                    request_timeout_seconds=max(0.001, min(5, deadline - 30 - time.monotonic())),
+                    request_timeout_seconds=max(0.001, min(5, deadline - 30 - _probe_monotonic())),
                 )
                 if claim is not None and claim.quota_rejection is not None:
                     raise CapacityExhaustedError(claim.quota_rejection)
@@ -2192,7 +2211,7 @@ class SandboxSubstrate:
                     result = self._k8s.read_tool_probe(claim.sandbox_name, deadline=deadline - 30)
                     if result is not None:
                         return result
-                time.sleep(min(0.2, max(0, deadline - 30 - time.monotonic())))
+                time.sleep(min(0.2, max(0, deadline - 30 - _probe_monotonic())))
             raise ClaimTimeoutError("tool observation timed out")
         finally:
             if not self._k8s.delete_tool_probe(name, deadline=deadline):

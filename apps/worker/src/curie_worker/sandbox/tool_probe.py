@@ -72,6 +72,7 @@ class ProbeSelection:
     template: str
     spec: dict[str, Any] = field(compare=False)
     identity: str
+    declared_digests: frozenset[str] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -143,3 +144,11 @@ def reported_digest(image_id: str) -> str:
     if match is None:
         raise ValueError("runner image identity unavailable")
     return match[1]
+
+
+def pinned_runner_digest(selection: ProbeSelection) -> str | None:
+    runner = next(
+        c for c in selection.spec["podTemplate"]["spec"]["containers"] if c["name"] == "runner"
+    )
+    match = re.search(r"@(sha256:[0-9a-f]{64})$", runner["image"])
+    return None if match is None else match[1]

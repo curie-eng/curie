@@ -328,6 +328,7 @@ class ScriptedRun:
             )
         )
         self.created_images: list[str] = []
+        self.facts_runner_images: dict[str, str] = {}
         self.cluster = f"curie-factory-scripted-{self.run_id}"
         self.context = f"kind-{self.cluster}"
         self.registry = f"{self.cluster}-registry"
@@ -650,11 +651,12 @@ class ScriptedRun:
             "120s",
             timeout=300,
         )
-        self.command("docker", "network", "connect", "kind", self.registry)
+        network_name = self.env.get("KIND_EXPERIMENTAL_DOCKER_NETWORK", "kind")
+        self.command("docker", "network", "connect", network_name, self.registry)
         node = json.loads(self.command("docker", "inspect", f"{self.cluster}-control-plane"))[0]
-        gateway = node["NetworkSettings"]["Networks"]["kind"].get("Gateway", "")
+        gateway = node["NetworkSettings"]["Networks"][network_name].get("Gateway", "")
         if not gateway or ipaddress.ip_address(gateway).version != 4:
-            network = json.loads(self.command("docker", "network", "inspect", "kind"))[0]
+            network = json.loads(self.command("docker", "network", "inspect", network_name))[0]
             gateway = next(
                 item["Gateway"]
                 for item in network["IPAM"]["Config"]
@@ -676,6 +678,8 @@ class ScriptedRun:
         if self.args.scenario != "facts":
             self.command("docker", "tag", "curie-runner:latest", f"{runner_image}:latest")
             self.command("docker", "push", f"{runner_image}:latest", timeout=900)
+        else:
+            self.build_facts_runner_images(registry_ref)
         github = _module("factory_github_stub", REPO_ROOT / "tools/github-stub/github_stub.py")
         model = _module("factory_model_script", REPO_ROOT / "tools/model-script/model_script.py")
         recording = json.loads(
@@ -727,7 +731,7 @@ class ScriptedRun:
             f"--from-file=privateKey={app_key}",
         )
         values = scripted_values(
-            model_base_url="http://127.0.0.1:1" if self.model is None else self.model.base_url,
+            model_base_url=self.stub.base_url if self.model is None else self.model.base_url,
             github_api=self.stub.base_url + "/api/v3",
             clone_base=self.stub.base_url,
             ca_configmap="github-stub-ca",
@@ -737,6 +741,12 @@ class ScriptedRun:
             for component in ("api", "worker", "ui"):
                 values[component]["image"]["tag"] = f"facts-{self.run_id}"
             values["agentSandbox"]["runner"]["prewarm"]["enabled"] = False
+            values["agentSandbox"]["runner"].update(
+                image=f"{registry_ref}/curie-facts-runner", tag="present", digest="",
+                imagePullPolicy="IfNotPresent",
+            )
+            values["agentSandbox"]["runnerImages"] = self.facts_runner_images
+            values["worker"]["replicas"] = 0
         # Direct Helm installation follows the existing factory preflight.
         # Generate the same sealed credential/caller inputs as cluster up,
         # without exposing their values in argv or build logs.
@@ -864,7 +874,7 @@ class ScriptedRun:
         )
 
     def run_facts(self, github: Any) -> None:
-        """No bundle, sandbox or model: only the installed facts exchange runs."""
+        """Prove the exchange before starting worker-owned image observations."""
         self.facts_api(
             "POST",
             "/agents",
@@ -916,6 +926,47 @@ class ScriptedRun:
             facts=answer,
             github_requests=self.stub.request_log,
         )
+        self.run_tool_facts()
+
+    def build_facts_runner_images(self, registry_ref: str) -> None:
+        assert self.workdir is not None
+        context = self.workdir / "probe-images"
+        context.mkdir()
+        base = f"{registry_ref}/curie-facts-runner:present"
+        removed = f"{registry_ref}/curie-facts-runner:absent"
+        dockerfile = context / "Dockerfile"
+        dockerfile.write_text(
+            "FROM python:3.13.15-slim-bookworm@sha256:"
+            "ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e\n"
+            "RUN apt-get update && apt-get install -y --no-install-recommends jq "
+            "&& rm -rf /var/lib/apt/lists/* && mkdir -p /etc/curie "
+            '&& printf \'%s\\n\' \'{"schema_version":1,"tools":{"jq":true}}\' '
+            "> /etc/curie/tool-manifest.json\nUSER 1000:1000\n"
+        )
+        self.command("docker", "build", "-t", base, str(context), timeout=600)
+        self.command("docker", "push", base, timeout=600)
+        dockerfile.write_text(f"FROM {base}\nUSER 0\nRUN rm /usr/bin/jq\nUSER 1000:1000\n")
+        self.command("docker", "build", "-t", removed, str(context), timeout=600)
+        self.command("docker", "push", removed, timeout=600)
+        for name, image in (("acme-facts-present", base), ("acme-facts-absent", removed)):
+            identities = json.loads(
+                self.command(
+                    "docker", "image", "inspect", image, "--format", "{{json .RepoDigests}}"
+                )
+            )
+            matches = [
+                identity
+                for identity in identities
+                if identity.startswith(f"{registry_ref}/curie-facts-runner@sha256:")
+            ]
+            if len(matches) != 1:
+                raise ScriptedScenarioError("runner image did not report one immutable identity")
+            self.facts_runner_images[name] = matches[0]
+
+    def run_tool_facts(self) -> None:
+        from tool_facts_scenario import run_observations
+
+        run_observations(self)
 
     def wait_facts(self, request_id: str) -> dict[str, Any]:
         assert self.deadline is not None
@@ -929,10 +980,10 @@ class ScriptedRun:
             if len(comments) > 1:
                 raise ScriptedScenarioError("facts scenario produced duplicate answers")
             if comments and f" request={request_id} " in comments[0]["body"]:
-                match = re.search(r"```json\n(.*?)\n```", comments[0]["body"], re.DOTALL)
+                match = re.search(r"(`{3,})json\n(.*?)\n\1", comments[0]["body"], re.DOTALL)
                 if match is None:
                     raise ScriptedScenarioError("facts answer omitted JSON fold")
-                return dict(json.loads(match[1]))
+                return dict(json.loads(match[2]))
             if self.stub.unknown_requests:
                 raise ScriptedScenarioError("facts scenario made an unsupported GitHub request")
             time.sleep(1)
