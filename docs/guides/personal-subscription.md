@@ -111,7 +111,7 @@ The environment variable for the namespace is `CURIE_NAMESPACE`.
 | `--release NAME` | every verb | Optional. Default `curie`. |
 | `--dry-run` | every verb | Checks the files the verb requires, prints the plan, and sends nothing. |
 | `--expected-version N` | `replace`, `reconnect`, `disconnect` | Optional integer, 1 or greater. See [The version check](#the-version-check). |
-| `--context NAME` | `curie cluster` | Kubernetes context. Defaults to the current context, pinned for the command. |
+| `--context <context>` | `curie cluster` | Kubernetes context. Defaults to the current context, pinned for the command. |
 | `--json` | `curie` | One JSON object on stdout. Human text goes to stderr. |
 | `--quiet`, `-q` | `curie` | Payload only. Progress and diagnostics are suppressed. |
 | `--debug` | `curie` | Verbose plumbing. The token and cookie are still omitted. |
