@@ -200,6 +200,46 @@ def test_budget_exhausted_is_platform_only() -> None:
     assert [(issue.field, issue.code) for issue in refused.value.issues] == [("reason", "value")]
 
 
+@pytest.mark.parametrize(
+    ("field", "path"),
+    [
+        ("title", "title"),
+        ("body", "body"),
+        ("tried", "tried"),
+        ("command", "reproduction.command"),
+    ],
+)
+def test_a_lone_surrogate_is_a_text_issue_not_an_encode_error(field: str, path: str) -> None:
+    # A JSON "\ud800" escape decodes to a lone surrogate, which UTF-8 cannot
+    # encode, so the proposal digest would raise UnicodeEncodeError (review).
+    ticket: dict[str, Any] = {
+        "kind": "ticket",
+        "title": "t",
+        "body": "b",
+        "reproduction": {"command": "c", "observed": "o", "revision": REVISION},
+    }
+    findings: dict[str, Any] = {
+        "kind": "findings",
+        "reason": "not_reproduced",
+        "tried": "t",
+        "missing": "m",
+    }
+    raw = findings if field == "tried" else ticket
+    if field == "command":
+        raw["reproduction"]["command"] = "run \ud800"
+    else:
+        raw[field] = "x \ud800"
+    with pytest.raises(ProposalInvalid) as refused:
+        parse_proposal(raw)
+    assert [(issue.field, issue.code) for issue in refused.value.issues] == [(path, "text")]
+    # Liveness: the same proposal without the surrogate parses and digests.
+    if field == "command":
+        raw["reproduction"]["command"] = "run \u00e9"
+    else:
+        raw[field] = "x \u00e9"
+    assert len(proposal_sha256(parse_proposal(raw))) == 64
+
+
 def test_the_delivery_deadline_setting_is_a_positive_finite_number(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -533,6 +573,43 @@ def test_a_duplicate_submission_delivers_once(admitted: Any, kind: str) -> None:
         _submit(src, other)
     assert refused.value.reason is RefusalReason.PROPOSAL_CONFLICT
     _assert_delivered_once(src, first, kind)
+
+
+@pytest.mark.parametrize("kind", ["ticket", "findings"])
+def test_a_mention_in_submitted_text_never_reaches_the_tracker_live(
+    admitted: Any, kind: str
+) -> None:
+    # Review finding: model text holding "@login" was posted as live GitHub
+    # text under the App's identity and notified that account.
+    src = _source(admitted, 9392)
+    mention = "@octocat"
+    if kind == "ticket":
+        proposal = parse_proposal(
+            {
+                "kind": "ticket",
+                "title": f"Ping {mention}",
+                "body": f"Seen by {mention} and team@example.com.",
+                "reproduction": {
+                    "command": f"echo {mention}",
+                    "observed": f"printed {mention}",
+                    "revision": REVISION,
+                },
+            }
+        )
+    else:
+        proposal = _findings(tried=f"Asked {mention}.", missing=f"Word from {mention}.")
+    delivery_id = _submit(src, proposal)
+    assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
+    written = list(_comments(src))
+    if kind == "ticket":
+        (issue,) = _own_issues(src)
+        written.append(src.tracker.issue_body(issue))
+        written.extend(src.tracker.sent_issue_bodies)
+    assert written
+    for posted in written:
+        assert mention not in posted
+    # The text is still there for a reader, only the mention is broken.
+    assert any("@\u200boctocat" in posted for posted in written)
 
 
 class _Restart(BaseException):

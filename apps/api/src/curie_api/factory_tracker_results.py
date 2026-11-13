@@ -50,7 +50,8 @@ value, can reach an exception, a log line or a row. Codes (`PROPOSAL_ISSUE_CODES
 4. ``missing_field``: a required key is absent.
 5. ``type``: a value of the wrong JSON type.
 6. ``length``: a text outside its bounds.
-7. ``text``: a text that is blank or holds NUL.
+7. ``text``: a text that is blank or holds NUL or a lone UTF-16 surrogate
+   (which cannot be encoded as UTF-8 for the digest).
 8. ``value``: a value outside its vocabulary (``reason``).
 9. ``revision``: a revision that is not 40 lowercase hex characters.
 
@@ -127,8 +128,8 @@ PROPOSAL_ISSUE_CODES = frozenset(
 
 
 def _plain_text(value: str) -> str:
-    if "\x00" in value or not value.strip():
-        raise PydanticCustomError("text", "the text is blank or holds NUL")
+    if "\x00" in value or not value.strip() or any("\ud800" <= char <= "\udfff" for char in value):
+        raise PydanticCustomError("text", "the text is blank or holds NUL or a lone surrogate")
     return value
 
 

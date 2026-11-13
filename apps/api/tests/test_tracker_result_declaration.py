@@ -390,6 +390,18 @@ def test_validate_archive_accepts_the_same_bundle_without_the_file(pack: Any) ->
     assert extension in {".tar.gz", ".zip"}
 
 
+def test_a_lone_surrogate_label_is_a_validation_error_not_an_encode_error() -> None:
+    # Review finding: a JSON "\ud800" escape in the label once escaped
+    # validate_archive as UnicodeEncodeError from the canonical digest.
+    case = next(c for c in VECTORS["invalid"] if c["name"] == "label_lone_surrogate")
+    archive = _tar_gz(_files(case["text"]))
+
+    with pytest.raises(deploy.BundleInvalid) as raised:
+        deploy.validate_archive(archive, get_settings())
+
+    assert [error["code"] for error in raised.value.errors] == ["tracker_result.invalid_json"]
+
+
 def test_a_malformed_declaration_is_a_validation_error_not_the_refusal() -> None:
     archive = _tar_gz(_files('{"schema_version": 2, "contract": "tracker_result"}'))
 

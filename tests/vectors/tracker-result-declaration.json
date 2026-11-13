@@ -139,6 +139,16 @@
       "name": "not_json",
       "text": "schema_version: 1\ncontract: tracker_result\nresults: [findings]\n",
       "codes": ["tracker_result.invalid_json"]
+    },
+    {
+      "name": "label_lone_surrogate",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"ticket\", \"findings\"], \"implementation_label\": \"\\ud800\"}",
+      "codes": ["tracker_result.invalid_json"]
+    },
+    {
+      "name": "key_lone_surrogate",
+      "text": "{\"schema_version\": 1, \"contract\": \"tracker_result\", \"results\": [\"findings\"], \"\\udfff\": 1}",
+      "codes": ["tracker_result.invalid_json"]
     }
   ]
 }

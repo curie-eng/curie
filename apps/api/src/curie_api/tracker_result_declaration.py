@@ -114,6 +114,23 @@ def _refuse_constant(_name: str) -> object:
     raise ValueError("non-finite number")
 
 
+def _holds_lone_surrogate(value: object) -> bool:
+    """Whether any key or string in ``value`` holds a UTF-16 surrogate.
+
+    Strict UTF-8 bytes never decode to one, but a JSON ``\\ud800`` escape
+    does, and such a string cannot be encoded back to UTF-8, so the canonical
+    digest could not be computed.
+    """
+
+    if isinstance(value, str):
+        return any("\ud800" <= char <= "\udfff" for char in value)
+    if isinstance(value, dict):
+        return any(_holds_lone_surrogate(k) or _holds_lone_surrogate(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_holds_lone_surrogate(item) for item in value)
+    return False
+
+
 def _decode(data: bytes) -> object:
     """Strict UTF-8 then strict JSON, or ``DeclarationInvalid``."""
 
@@ -148,6 +165,16 @@ def _decode(data: bytes) -> object:
                 )
             ]
         ) from None
+    if _holds_lone_surrogate(value):
+        raise DeclarationInvalid(
+            [
+                _issue(
+                    _CODE_INVALID_JSON,
+                    "the result declaration escapes a lone UTF-16 surrogate, which is not "
+                    "valid Unicode text",
+                )
+            ]
+        )
     return value
 
 
