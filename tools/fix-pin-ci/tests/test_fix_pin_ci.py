@@ -1342,12 +1342,16 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     ]
     assert job.get("if") == "always()", "the required Python check must not be skippable"
     shard_job, steps = _python_job(document, "python-pytest")
-    # #3858: the shards wait for the `changes` selection and run only when it
-    # selected pytest; the required job above still reports either way.
+    # #3858, #5574: the shards wait for the `changes` selection and run only when
+    # it selected pytest and the run is deep (the queue, or a labeled pull
+    # request). An unlabeled pull request defers them. The required job above
+    # still reports either way.
     shard_needs = shard_job.get("needs")
     shard_needs = [shard_needs] if isinstance(shard_needs, str) else list(shard_needs or [])
     assert "changes" in shard_needs
-    assert shard_job.get("if") == "${{ needs.changes.outputs.pytest == 'true' }}"
+    assert shard_job.get("if") == (
+        "${{ needs.changes.outputs.pytest == 'true' && needs.changes.outputs.deep == 'true' }}"
+    )
 
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the Python job must declare job level permissions"
