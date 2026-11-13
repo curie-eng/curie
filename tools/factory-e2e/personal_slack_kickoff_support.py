@@ -1412,6 +1412,36 @@ def capture_failures(
     request_terminal: bool,
     runner_pods: int,
 ) -> list[str]:
+    """The codes of ``capture_findings``; empty when the capture is affirmed. Pure."""
+
+    findings = capture_findings(
+        trace,
+        files,
+        delivered=delivered,
+        pod_gone=pod_gone,
+        request_terminal=request_terminal,
+        runner_pods=runner_pods,
+    )
+    return sorted({item["code"] for item in findings})
+
+
+def _finding(
+    code: str, field: str, value: Any = None, *, file: str | None = None
+) -> dict[str, Any]:
+    """One capture failure: its code, the file (a path digest) and the field it read."""
+
+    return {"code": code, "file": file, "field": field, "value": value}
+
+
+def capture_findings(
+    trace: CaptureTrace,
+    files: Mapping[str, bytes],
+    *,
+    delivered: bool,
+    pod_gone: bool,
+    request_terminal: bool,
+    runner_pods: int,
+) -> list[dict[str, Any]]:
     """Why an attempt's capture is not affirmed complete; empty when it is. Pure.
 
     The coordinator's capture rule of 2026-11-13, anchored on the runner's last
@@ -1434,38 +1464,48 @@ def capture_failures(
     has nothing to compare. Any failure leaves every slot unknown.
     """
 
-    failures: set[str] = set()
+    found: list[dict[str, Any]] = []
     if runner_pods != 1:
-        failures.add("runner_pods")
+        found.append(_finding("runner_pods", "runner_pods", runner_pods))
     if not request_terminal:
-        failures.add("request_not_terminal")
+        found.append(_finding("request_not_terminal", "execution_requests.terminal_at"))
     ends = [at for kind, at in trace.turns if kind == "end"]
     if not ends:
-        failures.add("no_turn_end")
+        found.append(_finding("no_turn_end", "runner_log.turn_end"))
     else:
         anchor = ends[-1]
         if trace.turns[-1][0] != "end" or any(
             kind == "start" and at >= anchor for kind, at in trace.turns
         ):
-            failures.add("turn_started_after_turn_end")
+            found.append(_finding("turn_started_after_turn_end", "runner_log.turn_start"))
         after = [sizes for at, sizes in trace.reports if at > anchor]
         if len(after) < CAPTURE_REPORTS_AFTER_TURN_END:
-            failures.add("reports_after_turn_end")
-        if any(sizes != after[0] for sizes in after):
-            failures.add("growth_after_turn_end")
+            found.append(_finding("reports_after_turn_end", "sync.at", len(after)))
+        for path in sorted({path for sizes in after for path in sizes}):
+            seen = [sizes.get(path) for sizes in after]
+            if len(set(seen)) > 1:
+                found.append(
+                    _finding(
+                        "growth_after_turn_end",
+                        "sync.sizes",
+                        [seen[0], seen[-1]],
+                        file=ref_digest(path),
+                    )
+                )
     listed: set[str] = set()
     for _at, sizes in trace.reports:
-        if not listed <= sizes.keys():
-            failures.add("report_dropped_a_file")
+        for path in sorted(listed - sizes.keys()):
+            found.append(_finding("report_dropped_a_file", "sync.sizes", file=ref_digest(path)))
         listed |= sizes.keys()
     if trace.harvester_ended:
-        failures.add("harvester_deadline")
+        found.append(_finding("harvester_deadline", "harvester.end"))
     if not delivered:
-        failures.add("bytes_not_delivered")
+        found.append(_finding("bytes_not_delivered", "harvest.bytes"))
     if not pod_gone:
-        failures.add("pod_not_deleted")
-    failures.update(transcript_failures(files))
-    return sorted(failures)
+        found.append(_finding("pod_not_deleted", "pod.metadata.deletionTimestamp"))
+    found.extend(transcript_findings(files))
+    unique = {json.dumps(item, sort_keys=True): item for item in found}
+    return [unique[key] for key in sorted(unique)]
 
 
 def _transcript_records(data: bytes) -> tuple[list[dict[str, Any]], bool]:
@@ -1483,24 +1523,29 @@ def _items(record: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [item for item in content if isinstance(item, dict)] if isinstance(content, list) else []
 
 
-def _ends_in_result_frame(records: Sequence[Mapping[str, Any]]) -> bool:
-    """The last assistant record says the model stopped generating, with its usage."""
+def _result_frame_gap(records: Sequence[Mapping[str, Any]]) -> tuple[str, Any] | None:
+    """The field that keeps the last assistant record from being a complete result frame
+    (the model stopped generating, with its usage), with the value it read; None when it is
+    one."""
 
     replies = [record for record in records if record.get("type") == "assistant"]
-    message = replies[-1].get("message") if replies else None
+    if not replies:
+        return ("type", "no assistant record")
+    message = replies[-1].get("message")
     if not isinstance(message, dict):
-        return False
+        return ("message", None)
+    if message.get("stop_reason") not in FINAL_STOP_REASONS:
+        return ("message.stop_reason", message.get("stop_reason", "absent"))
+    if message.get("model") == _SYNTHETIC_MODEL:
+        return ("message.model", _SYNTHETIC_MODEL)
     usage = message.get("usage")
     tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
-    return (
-        message.get("stop_reason") in FINAL_STOP_REASONS
-        and message.get("model") != _SYNTHETIC_MODEL
-        and type(tokens) is int
-        and tokens >= 0
-    )
+    if type(tokens) is not int or tokens < 0:
+        return ("message.usage.output_tokens", tokens)
+    return None
 
 
-def _unanswered_tool_uses(records: Sequence[Mapping[str, Any]]) -> bool:
+def _unanswered_tool_uses(records: Sequence[Mapping[str, Any]]) -> int:
     uses = {
         item.get("id")
         for record in records
@@ -1515,7 +1560,7 @@ def _unanswered_tool_uses(records: Sequence[Mapping[str, Any]]) -> bool:
         for item in _items(record)
         if item.get("type") == "tool_result"
     }
-    return bool(uses - answered)
+    return len(uses - answered)
 
 
 def _started_subagents(records: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -1543,10 +1588,17 @@ def _started_subagents(records: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def transcript_failures(files: Mapping[str, bytes]) -> list[str]:
-    """Why the harvested transcripts are not whole: a cut line, a missing result frame, an
-    unanswered tool use, or a started subagent with no transcript. Pure."""
+    """The codes of ``transcript_findings``. Pure."""
 
-    failures: set[str] = set()
+    return sorted({item["code"] for item in transcript_findings(files)})
+
+
+def transcript_findings(files: Mapping[str, bytes]) -> list[dict[str, Any]]:
+    """Why the harvested transcripts are not whole, each naming its file (a path digest)
+    and field: a cut line, a missing result frame, an unanswered tool use, or a started
+    subagent with no transcript. Pure."""
+
+    found: list[dict[str, Any]] = []
     mains: dict[str, list[dict[str, Any]]] = {}
     subagents: dict[str, list[dict[str, Any]]] = {}
     for name, data in files.items():
@@ -1555,23 +1607,89 @@ def transcript_failures(files: Mapping[str, bytes]) -> list[str]:
             continue
         records, whole = _transcript_records(data)
         if not whole:
-            failures.add("transcript_truncated")
+            found.append(_finding("transcript_truncated", "line", file=ref_digest(name)))
         if "subagents" in parts:
             subagents[name.removesuffix(".jsonl")] = records
         else:
             mains[name.removesuffix(".jsonl")] = [r for r in records if not r.get("isSidechain")]
     if not mains:
-        failures.add("no_main_transcript")
-    for records in (*mains.values(), *subagents.values()):
-        if not _ends_in_result_frame(records):
-            failures.add("result_frame_missing")
-        if _unanswered_tool_uses(records):
-            failures.add("tool_use_unanswered")
+        found.append(_finding("no_main_transcript", "projects/*.jsonl"))
+    for stem, records in (*mains.items(), *subagents.items()):
+        file = ref_digest(stem + ".jsonl")
+        gap = _result_frame_gap(records)
+        if gap is not None:
+            found.append(_finding("result_frame_missing", gap[0], gap[1], file=file))
+        unanswered = _unanswered_tool_uses(records)
+        if unanswered:
+            found.append(
+                _finding("tool_use_unanswered", "tool_result.tool_use_id", unanswered, file=file)
+            )
     for stem, records in mains.items():
         for agent in _started_subagents(records):
             if f"{stem}/subagents/agent-{agent}" not in subagents:
-                failures.add("subagent_transcript_missing")
-    return sorted(failures)
+                value = "absent" if agent == _UNATTRIBUTED_AGENT else "no subagent transcript"
+                found.append(
+                    _finding(
+                        "subagent_transcript_missing",
+                        "toolUseResult.agentId",
+                        value,
+                        file=ref_digest(stem + ".jsonl"),
+                    )
+                )
+    return found
+
+
+def transcript_skeleton(files: Mapping[str, bytes]) -> dict[str, dict[str, Any]]:
+    """Each transcript's record shapes, with no content, keyed by path digest. Pure.
+
+    For each record: its byte offset, type, subtype, stop reason, whether it carries
+    usage and the usage numbers, its sidechain flag and its agent ids. This is the shape
+    evidence a later capture rule is checked against.
+    """
+
+    skeleton: dict[str, dict[str, Any]] = {}
+    for name, data in sorted(files.items()):
+        parts = PurePosixPath(name).parts
+        if "projects" not in parts or not name.endswith(".jsonl"):
+            continue
+        records: list[dict[str, Any]] = []
+        offset = 0
+        for line in data.split(b"\n"):
+            record = _json_object(line) if line.strip() else None
+            if line.strip():
+                message = record.get("message") if record is not None else None
+                message = message if isinstance(message, dict) else {}
+                usage = message.get("usage")
+                result = record.get("toolUseResult") if record is not None else None
+                records.append(
+                    {
+                        "offset": offset,
+                        "whole": record is not None,
+                        "type": record.get("type") if record is not None else None,
+                        "subtype": record.get("subtype") if record is not None else None,
+                        "stop_reason": message.get("stop_reason", "absent"),
+                        "has_usage": isinstance(usage, dict),
+                        "usage": {
+                            key: usage[key]
+                            for key in sorted(usage)
+                            if isinstance(usage, dict) and type(usage[key]) is int
+                        }
+                        if isinstance(usage, dict)
+                        else None,
+                        "is_sidechain": record.get("isSidechain") if record is not None else None,
+                        "agent_id": record.get("agentId") if record is not None else None,
+                        "result_agent_id": result.get("agentId")
+                        if isinstance(result, dict)
+                        else None,
+                    }
+                )
+            offset += len(line) + 1
+        skeleton[ref_digest(name)] = {
+            "kind": "subagent" if "subagents" in parts else "main",
+            "bytes": len(data),
+            "records": records,
+        }
+    return skeleton
 
 
 _TOOL_SEARCH = "ToolSearch"
@@ -1846,6 +1964,27 @@ class Ledger:
             raise Refusal("live_unapproved", "a reservation exists before the ceiling")
         self.record("budget", "approved_ceiling", text)
         self.record("budget", "ceiling", ceiling.as_json())
+
+    def record_item_ledger(self, cap: int, charged_before: int, ceiling: Ceiling) -> None:
+        """Record the item's cap and what earlier attempts were charged, before the first
+        reservation. A run whose full charge would pass the cap refuses to start."""
+
+        if type(cap) is not int or type(charged_before) is not int or not 0 <= charged_before:
+            raise Refusal("arguments_invalid", "--item-cap, --item-charged-before")
+        if charged_before + ceiling.output_tokens > cap:
+            raise Refusal("item_cap_exceeded", "--item-charged-before")
+        value = {"cap": cap, "charged_before": charged_before}
+        recorded = self.observations("budget").get("item_ledger")
+        if recorded is not None:
+            if recorded != value:
+                raise Refusal("live_unapproved", "the item ledger differs from the recorded one")
+            return
+        reserved = self.db.execute(
+            "SELECT COUNT(*) FROM sessions WHERE run_id=?", (self.run_id,)
+        ).fetchone()[0]
+        if reserved:
+            raise Refusal("live_unapproved", "a reservation exists before the item ledger")
+        self.record("budget", "item_ledger", value)
 
     def ceiling(self) -> Ceiling:
         ceiling = Ceiling.from_json(self.observations("budget").get("ceiling"))
@@ -2868,8 +3007,7 @@ def _judge_budget(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
         and ceiling_at <= first,
         "sessions_reserved": bool(rows),
         "within_ceiling": ceiling is not None and not budget_findings(rows, ceiling),
-        "no_unknown_usage": bool(rows) and all(row["output_tokens"] is not None for row in rows),
-        "budget_state_ok": run["budget_state"] == "ok",
+        "ceiling_enforced": not ceiling_enforcement_failures(ledger),
         "one_live_start": ceiling is not None
         and 1 <= int(run["live_starts"]) <= 1 + ceiling.paid_retries,
         "no_allowance_breach": observed.get("allowance_breach") == [],
@@ -2885,11 +3023,70 @@ def _judge_budget(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
         and all(same_model(str(m), str(probe.get("model"))) for m in result.get("models") or []),
     }
     totals = [charged(row) for row in rows]
+    item = observed.get("item_ledger")
+    before = item.get("charged_before") if isinstance(item, dict) else None
     return checks, {
         "sessions": len(rows),
-        "output_tokens": sum(item[0] for item in totals),
-        "assistant_turns": sum(item[1] for item in totals),
+        "output_tokens": sum(entry[0] for entry in totals),
+        "assistant_turns": sum(entry[1] for entry in totals),
         "tool_search_calls": int(observed.get("tool_search_calls") or 0),
+        "item_charged": (before if type(before) is int else 0) + sum(e[0] for e in totals),
+    }
+
+
+def ceiling_enforcement_failures(ledger: Ledger) -> list[str]:
+    """Why the recorded ledger does not show the approved ceiling enforced; empty when it
+    does. Reads only recorded observations and session rows.
+
+    Every session's charge, observed or its full reservation share when unknown, stays
+    inside its bounds and the attempt's; no bound was breached; the per-response guard ran
+    (the watchdog's recorded checks cover every response the transcripts hold); and the
+    item's earlier charge plus this attempt's stays at or under the recorded item cap.
+    """
+
+    observed = ledger.observations("budget")
+    ceiling = Ceiling.from_json(observed.get("ceiling"))
+    rows = ledger.sessions()
+    failures: list[str] = []
+    if ceiling is None or not rows:
+        failures.append("ledger_incomplete")
+    else:
+        failures.extend(f"bound:{item}" for item in budget_findings(rows, ceiling))
+    if observed.get("allowance_breach") != []:
+        failures.append("bound_breached")
+    guard = observed.get("guard_checks")
+    checks = guard.get("checks") if isinstance(guard, dict) else None
+    responses = guard.get("responses") if isinstance(guard, dict) else None
+    covered = guard.get("responses_checked") if isinstance(guard, dict) else None
+    if not (
+        type(checks) is int
+        and checks >= 1
+        and type(responses) is int
+        and type(covered) is int
+        and covered == responses
+    ):
+        failures.append("guard_events")
+    item = observed.get("item_ledger")
+    cap = item.get("cap") if isinstance(item, dict) else None
+    before = item.get("charged_before") if isinstance(item, dict) else None
+    if type(cap) is not int or type(before) is not int:
+        failures.append("item_ledger_missing")
+    elif before + sum(charged(row)[0] for row in rows) > cap:
+        failures.append("item_cap")
+    return failures
+
+
+def usage_exact(ledger: Ledger) -> dict[str, Any]:
+    """An observation, never a pass condition: whether every slot holds observed usage,
+    with the capture rule's recorded failure codes."""
+
+    rows = ledger.sessions()
+    capture = ledger.observations("budget").get("capture")
+    codes = capture.get("failures") if isinstance(capture, dict) else None
+    return {
+        "exact": bool(rows) and all(row["output_tokens"] is not None for row in rows),
+        "unknown_slots": sum(1 for row in rows if row["output_tokens"] is None),
+        "failure_codes": list(codes) if isinstance(codes, list) else None,
     }
 
 
@@ -2966,11 +3163,16 @@ def judge(ledger: Ledger, criterion: str) -> dict[str, Any]:
         counts.update({f"{name}.{key}": value for key, value in number.items()})
     budget = ledger.observations("budget")
     roles = ledger.observations("grant").get("role_models")
+    observations: dict[str, Any] = {}
+    if "budget" in names:
+        observations["budget.usage_exact"] = usage_exact(ledger)
+        observations["budget.ceiling_enforcement_failures"] = ceiling_enforcement_failures(ledger)
     return {
         "criterion": criterion,
         "verdict": "pass" if checks and all(checks.values()) else "fail",
         "checks": checks,
         "counts": counts,
+        "observations": observations,
         "role_models": roles if isinstance(roles, dict) else {},
         "ceiling": budget.get("ceiling") if isinstance(budget.get("ceiling"), dict) else {},
     }

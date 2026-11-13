@@ -877,6 +877,13 @@ The judge has eight criteria, each computed from recorded observations only.
    and runner pod counts are unchanged, with zero new native sessions.
 
 `budget` checks the approved ceiling, the reservations and the grant probe, and
+passes on `budget.ceiling_enforced`: every session's charge (observed, or its
+full reservation share when unknown) stays inside its bounds, no bound was
+breached, the watchdog's recorded checks (`budget.guard_checks`) cover every
+response the transcripts hold, and the item's earlier charge plus this
+attempt's stays at or under the recorded item cap. Whether usage is exact is
+reported as the `budget.usage_exact` observation with the capture rule's
+failure codes, never as a pass condition (coordinator ruling of 2026-11-13).
 `cleanup` checks that every owned resource is gone and no held secret reached a
 scanned channel.
 
@@ -951,6 +958,10 @@ host, workspace or channel.
    least 2,700 s remaining.
 10. `--approve-live`: the exact ceiling string below.
 11. `--grant-probe-cli` (default `claude`).
+12. `--item-cap` and `--item-charged-before` (run only): the item's output token
+    cap across attempts and what earlier attempts were charged, recorded before
+    the first reservation. A run whose full charge would pass the cap refuses
+    `item_cap_exceeded`.
 
 The calling shell must hold no service credential and no `CURIE_FAKE_MODEL`.
 The `curie` binary is `CURIE_BIN`, or `cli/target/debug/curie` in the checkout.
@@ -1095,8 +1106,11 @@ turn end all match; no report drops a file; the reassembled bytes equal the
 last report; the harvester never stopped on its own deadline; and the pod was
 deleted when its stream ended. The turn-end record carries no usage, so there
 is no ACI usage to compare. Any failed check leaves every slot unknown and
-charged its full share. The ledger records the verdict and a sanitized trace
-(report times and sizes by path digest, turn times) as `budget.capture`.
+charged its full share. The ledger records the verdict, each failure with the
+file (a path digest) and field it read, and a sanitized trace (report times and
+sizes by path digest, turn times) as `budget.capture`, and a transcript
+skeleton (each record's offset, type, subtype, stop reason, usage numbers,
+sidechain flag and agent ids, no content) as `grant.transcript_skeleton`.
 
 ### The grant probe
 

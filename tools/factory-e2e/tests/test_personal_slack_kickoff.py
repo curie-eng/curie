@@ -446,9 +446,10 @@ FLAGS_CLUSTER = (
     "--app-dir",
 )
 FLAGS_GRANT = ("--grant-file", "--grant-expires-at", "--approve-live")
+FLAGS_ITEM = ("--item-cap", "--item-charged-before")
 FLAGS = {
-    "run": (*FLAGS_BASE, *FLAGS_CLUSTER, *FLAGS_SLACK, *FLAGS_GRANT),
-    "--live": (*FLAGS_BASE, *FLAGS_CLUSTER, *FLAGS_SLACK, *FLAGS_GRANT),
+    "run": (*FLAGS_BASE, *FLAGS_CLUSTER, *FLAGS_SLACK, *FLAGS_GRANT, *FLAGS_ITEM),
+    "--live": (*FLAGS_BASE, *FLAGS_CLUSTER, *FLAGS_SLACK, *FLAGS_GRANT, *FLAGS_ITEM),
     "rehearse": (*FLAGS_BASE, *FLAGS_CLUSTER, *FLAGS_SLACK),
     "preflight": (*FLAGS_BASE, "--app-dir", *FLAGS_SLACK, *FLAGS_GRANT),
     "slack-probe": (*FLAGS_BASE, *FLAGS_SLACK),
@@ -513,6 +514,8 @@ def _kit(tmp_path: Path) -> Kit:
         "--grant-file": str(_private_file(files / "grant", GRANT_MARKER)),
         "--grant-expires-at": str(int(T0 + 3 * 3600)),
         "--approve-live": CEILING,
+        "--item-cap": "32768",
+        "--item-charged-before": "8607",
     }
     environ = {"PATH": str(stubs), "HOME": str(_private(tmp_path / "home"))}
     return Kit(
@@ -753,6 +756,9 @@ REFUSALS = [
         _value("--approve-live", CEILING.replace("sessions=8", "sessions=9")),
         "live_unapproved",
         id="above-approval",
+    ),
+    pytest.param(
+        "run", _value("--item-charged-before", "16385"), "item_cap_exceeded", id="item-cap"
     ),
     pytest.param(
         "run",
@@ -1689,6 +1695,12 @@ def test_watchdog_fences_paid_starts_at_the_first_reached_bound(tmp_path: Path) 
     capture = ledger.observations("budget")["capture"]
     assert capture["affirmed"] is False and "no_turn_end" in capture["failures"]
     assert ledger.budget_state() == "unknown"
+    # Both watchdog checks ran, and between them they saw every response.
+    assert ledger.observations("budget")["guard_checks"] == {
+        "checks": 2,
+        "responses": 32,
+        "responses_checked": 32,
+    }
     assert ledger.observations("grant")["role_models"] == {sks.IMPLEMENTER: [IMPLEMENTER_MODEL]}
     with pytest.raises(sks.Refusal) as refused:
         ledger.reserve([sks.IMPLEMENTER], now=T0 + 900)
@@ -2923,6 +2935,139 @@ def test_a_runner_pod_counts_as_gone_only_when_deleted_or_absent(
     live.ledger.close()
 
 
+def test_capture_findings_name_the_file_and_field_and_the_skeleton_keeps_no_content() -> None:
+    """Behavior: each capture failure names its file (a path digest) and the field it read,
+    and the transcript skeleton keeps each record's shape and usage with no content."""
+
+    files = _capture_files(main_stop=None)
+    main = next(name for name in files if name.endswith(f"{SESSION}.jsonl"))
+    findings = sks.capture_findings(
+        _capture_trace(files, grow=True),
+        files,
+        delivered=True,
+        pod_gone=True,
+        request_terminal=True,
+        runner_pods=1,
+    )
+    digest = sks.ref_digest(main)
+    assert {
+        "code": "result_frame_missing",
+        "file": digest,
+        "field": "message.stop_reason",
+        "value": None,
+    } in findings
+    grown = [item for item in findings if item["code"] == "growth_after_turn_end"]
+    assert [(item["file"], item["field"]) for item in grown] == [(digest, "sync.sizes")]
+    skeleton = sks.transcript_skeleton(files)
+    entry = skeleton[digest]
+    assert entry["kind"] == "main" and entry["bytes"] == len(files[main])
+    last = entry["records"][-1]
+    assert (last["type"], last["stop_reason"], last["has_usage"]) == ("assistant", None, True)
+    assert last["usage"] == {"input_tokens": 10, "output_tokens": 224}
+    assert last["offset"] + len(files[main].splitlines()[-1]) + 1 == len(files[main])
+    assert [r["result_agent_id"] for r in entry["records"] if r["result_agent_id"]] == [
+        "plan01",
+        "diff01",
+    ]
+    text = json.dumps(skeleton)
+    assert not any(word in text for word in ("working", "review done", "work the issue"))
+
+
+def _attempt_three_ledger(state: Path) -> sks.Ledger:
+    """Attempt 3's recorded budget shape: every slot unknown and charged its full share, no
+    breach, the watchdog's checks covering all 20 responses, 8,607 charged before."""
+
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    with ledger.transaction() as db:
+        db.execute(
+            "UPDATE sessions SET output_tokens=NULL, assistant_turns=NULL, elapsed=NULL, "
+            "source='unknown' WHERE run_id=?",
+            (RUN_ID,),
+        )
+        db.execute("UPDATE runs SET budget_state='unknown' WHERE run_id=?", (RUN_ID,))
+    ledger.record(
+        "budget", "guard_checks", {"checks": 140, "responses": 20, "responses_checked": 20}
+    )
+    codes = ["growth_after_turn_end", "result_frame_missing", "subagent_transcript_missing"]
+    ledger.record("budget", "capture", {"affirmed": False, "failures": codes})
+    return ledger
+
+
+def test_ceiling_is_enforced_for_attempt_threes_recorded_ledger(tmp_path: Path) -> None:
+    """Behavior: with every slot unknown and charged its full share inside its bounds, no
+    breach, guard checks covering every response and the item under its cap, the budget
+    criterion passes; exact usage is reported as an observation with its failure codes."""
+
+    ledger = _attempt_three_ledger(_private(tmp_path / "state"))
+    try:
+        result = sks.judge(ledger, "budget")
+        assert result["verdict"] == "pass", result["checks"]
+        assert result["checks"]["budget.ceiling_enforced"] is True
+        assert result["counts"]["budget.item_charged"] == 8607 + 16384
+        assert result["observations"]["budget.usage_exact"] == {
+            "exact": False,
+            "unknown_slots": 5,
+            "failure_codes": [
+                "growth_after_turn_end",
+                "result_frame_missing",
+                "subagent_transcript_missing",
+            ],
+        }
+        assert result["observations"]["budget.ceiling_enforcement_failures"] == []
+    finally:
+        ledger.close()
+
+
+def _over_bound(ledger: sks.Ledger) -> None:
+    with ledger.transaction() as db:
+        db.execute("UPDATE sessions SET reserved_output=9000 WHERE run_id=? AND seq=1", (RUN_ID,))
+
+
+def _over_cap(ledger: sks.Ledger) -> None:
+    ledger.record("budget", "item_ledger", {"cap": 32768, "charged_before": 16385})
+
+
+def _no_guard_events(ledger: sks.Ledger) -> None:
+    with ledger.transaction() as db:
+        db.execute(
+            "DELETE FROM observations WHERE run_id=? AND criterion='budget' AND key='guard_checks'",
+            (RUN_ID,),
+        )
+
+
+def _guard_missed_a_response(ledger: sks.Ledger) -> None:
+    ledger.record(
+        "budget", "guard_checks", {"checks": 140, "responses": 20, "responses_checked": 19}
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "failure"),
+    [
+        pytest.param(_over_bound, "bound:session_output_tokens", id="full-share-over-bound"),
+        pytest.param(_over_cap, "item_cap", id="item-over-cap"),
+        pytest.param(_no_guard_events, "guard_events", id="no-guard-events"),
+        pytest.param(_guard_missed_a_response, "guard_events", id="guard-missed-response"),
+    ],
+)
+def test_ceiling_is_not_enforced_when_a_recorded_condition_fails(
+    tmp_path: Path, mutate: Callable[[sks.Ledger], None], failure: str
+) -> None:
+    """Behavior: a full-share charge over its bound, an item over its cap, or guard events
+    that are missing or miss a response each fail ``budget.ceiling_enforced``."""
+
+    ledger = _attempt_three_ledger(_private(tmp_path / "state"))
+    try:
+        mutate(ledger)
+        result = sks.judge(ledger, "budget")
+        assert result["checks"]["budget.ceiling_enforced"] is False
+        assert failure in result["observations"]["budget.ceiling_enforcement_failures"]
+        assert result["verdict"] == "fail"
+    finally:
+        ledger.close()
+
+
 # --------------------------------------------------------------------------
 # 5. The grant probe: one capped haiku turn, recorded outside the ceiling
 # --------------------------------------------------------------------------
@@ -3093,8 +3238,11 @@ def _passing_ledger(state: Path, *, rehearsal: bool = False) -> None:
         if rehearsal:
             return
         ledger.record_ceiling(MODEL_CEILING, sks.parse_ceiling(MODEL_CEILING))
+        ledger.record_item_ledger(32768, 8607, sks.parse_ceiling(MODEL_CEILING))
         ledger.begin_live(now=now, grant_expires_at=now + 3 * 3600)
         ledger.record("budget", "allowance_breach", [])
+        guard = {"checks": 40, "responses": 20, "responses_checked": 20}
+        ledger.record("budget", "guard_checks", guard)
         ledger.record("budget", "tool_search_calls", 0)
         ledger.record("grant_probe", "started", {"at": now, "model": sks.GRANT_PROBE_MODEL})
         ledger.record("grant_probe", "model", sks.GRANT_PROBE_MODEL)
@@ -3354,7 +3502,11 @@ def test_judge_fails_each_criterion_on_a_missing_observation(tmp_path: Path) -> 
         ledger.db.execute(
             "UPDATE sessions SET output_tokens=NULL WHERE run_id=? AND seq=2", (RUN_ID,)
         )
-        assert _verdict(ledger, "budget") == "fail"  # unknown usage is never a pass
+        # Unknown usage is charged its full share (coordinator ruling of 2026-11-13): the
+        # ceiling still holds, and the judge reports the usage as not exact.
+        result = sks.judge(ledger, "budget")
+        assert result["verdict"] == "pass"
+        assert result["observations"]["budget.usage_exact"]["exact"] is False
     finally:
         ledger.close()
 

@@ -513,6 +513,11 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "rehearse":
             # The kickoff and read-back on the rehearsal's own never-issued token.
             sub.add_argument("--kickoff", action="store_true")
+        if name == "run":
+            # The item's ledger across attempts: its cap and what earlier attempts were
+            # charged, both from the caller's approval.
+            sub.add_argument("--item-cap", type=int, required=True)
+            sub.add_argument("--item-charged-before", type=int, required=True)
         if name == "judge":
             sub.add_argument("--criterion", required=True, choices=[*sks.CRITERIA, "all"])
     return parser
@@ -1562,6 +1567,7 @@ def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
         ledger.ensure_run(inputs.candidate, phase="run")
         ledger.mark_live_kind("run")
         ledger.record_ceiling(args.approve_live, ceiling)
+        ledger.record_item_ledger(args.item_cap, args.item_charged_before, ceiling)
     except sks.Refusal:
         ledger.close()
         raise
@@ -1725,6 +1731,9 @@ class LiveRun:
         self.attempt_live = False
         self.guard_starts = False
         self.attempt_started = 0.0
+        # The per-response guard's events: watchdog checks, and every response they saw.
+        self.guard_checks = 0
+        self.guard_responses: set[str] = set()
         # The deadline enforcer's thread. Only ``deadline_breach`` is shared with the main
         # thread, under ``deadline_lock``; the fired set and spawned list are its own.
         self.deadline_lock = threading.Lock()
@@ -3009,6 +3018,9 @@ class LiveRun:
                 now=self.clock.now(),
                 running=self.native_running(),
             )
+            self.guard_checks += 1
+            for session in facts.sessions:
+                self.guard_responses.update(session.message_ids)
         window = sum(item.seconds for item in self.reservations)
         if self.clock.now() - self.attempt_started > window + STARTUP_SECONDS:
             breaches.append("seconds:attempt")
@@ -3487,14 +3499,18 @@ class LiveRun:
         pods = self.followed()
         terminal = bool(self.safe(self.requests_terminal, False))
         gone = self.safe(self.pods_gone, None) or {}
-        failures: set[str] = set() if pods else {"runner_pods"}
+        findings: list[dict[str, Any]] = (
+            [] if pods else [{"code": "runner_pods", "file": None, "field": "pods", "value": 0}]
+        )
         traces: list[dict[str, Any]] = []
+        skeleton: dict[str, Any] = {}
         for pod in pods:
             with pod.lock:
-                failures.update(
-                    sks.capture_failures(
+                files = pod.harvest.transcript_files()
+                findings.extend(
+                    sks.capture_findings(
                         pod.trace,
-                        pod.harvest.transcript_files(),
+                        files,
                         delivered=pod.harvest.complete and pod.eof.is_set(),
                         pod_gone=gone.get(pod.uid) is True,
                         request_terminal=terminal,
@@ -3502,16 +3518,20 @@ class LiveRun:
                     )
                 )
                 traces.append(pod.trace.sanitized())
+                skeleton.update(sks.transcript_skeleton(files))
+        failures = {item["code"] for item in findings}
         self.ledger.record(
             "budget",
             "capture",
             {
                 "affirmed": not failures,
                 "failures": sorted(failures),
+                "findings": findings,
                 "aci_usage": "not_carried",
                 "pods": traces,
             },
         )
+        self.ledger.record("grant", "transcript_skeleton", skeleton)
         complete = not failures
         sessions = facts.sessions if facts is not None else None
         settled = sks.settle_attempt(
@@ -3522,6 +3542,16 @@ class LiveRun:
             malformed=int(facts.malformed_lines) if facts is not None else 0,
         )
         self.ledger.record("budget", "settlement", settled)
+        responses = {key for s in (facts.sessions if facts else ()) for key in s.message_ids}
+        self.ledger.record(
+            "budget",
+            "guard_checks",
+            {
+                "checks": self.guard_checks,
+                "responses": len(responses),
+                "responses_checked": len(responses & self.guard_responses),
+            },
+        )
         if facts is None:
             return
         self.ledger.record("grant", "sessions", [sks.session_record(s) for s in facts.sessions])
