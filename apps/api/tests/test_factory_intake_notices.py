@@ -319,6 +319,18 @@ def test_each_reason(factory: Any, monkeypatch: pytest.MonkeyPatch, path: str, r
     assert len(comments) == 1
     assert comments[0]["performed_via_github_app"]["id"] == 51
     assert f"reason={reason}" in comments[0]["body"]
+    visible = comments[0]["body"].split("<!--", 1)[0]
+    facts = {
+        "actor_bot": (REPO,),
+        "actor_own_app": ("GitHub App",),
+        "actor_no_permission": (SENDER, REPO),
+        "actor_unverifiable": (REPO,),
+        "personal_owner_required": (SENDER,),
+        "binding_ambiguous": (f"label {LABEL}", REPO),
+        "publication_completed": (f"https://github.com/{REPO}/pull/76",),
+        "installation_changed": ("GitHub App",),
+    }
+    assert all(fact in visible for fact in facts[reason])
     if reason == "publication_completed":
         assert rows[0]["publication_url"] == f"https://github.com/{REPO}/pull/76"
         assert rows[0]["publication_url"] in comments[0]["body"]
@@ -607,7 +619,7 @@ def test_silent_untrusted_or_unserved(
             },
         )
         assert result.status_code == 401
-        assert _rows("SELECT id FROM curie.github_review_deliveries") == []
+        assert _rows("SELECT delivery_id FROM curie.github_review_deliveries") == []
     else:
         if case == "disabled":
             monkeypatch.setenv("FACTORY_ENABLED", "false")
