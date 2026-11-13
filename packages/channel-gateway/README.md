@@ -75,7 +75,8 @@ bot token, bounded by `CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S` (default 5
 seconds), and answers `{"user_id", "email"}`. An unknown or invisible user, a
 workspace mismatch, a deleted, bot or app user and a missing email answer 404
 `{"code": "user_email.unknown"}`. A Slack failure answers 502 and a timeout 504.
-The Slack app needs the `users:read.email` scope. Requests use the same signed,
+The Slack app needs the `users:read` and `users:read.email` scopes; without the
+email scope the lookup answers 502 rather than silently unknown. Requests use the same signed,
 single-use proof as every gateway caller (`request_replay.request_headers`).
 Nothing on this path logs an email.
 
@@ -92,7 +93,7 @@ async with GatewayUserEmails.from_settings(GatewayUserEmailSettings()) as emails
 
 `GatewayUserEmailSettings` reads `CURIE_CHANNEL_GATEWAY_URL`,
 `CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN`, `CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY`
-(default `default`), `CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S` (default 5),
+(default `default`), `CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S` (default 8),
 `CURIE_CHANNEL_GATEWAY_CA_FILE` and `CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE`, and
 refuses to load when any Slack token is present. `UserEmailUnknown` means
 answer `unresolved`; any other `UserEmailLookupError` means `unavailable`.

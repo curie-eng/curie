@@ -21,6 +21,7 @@ import httpx
 from ..ports.reads import UserEmailSource
 from ..user_email_models import UserEmailLookupError, UserEmailUnknown
 
+_EMAIL_SCOPE = "users:read.email"
 _UNKNOWN_ERRORS = frozenset({"user_not_found", "user_not_visible", "users_not_found"})
 
 
@@ -68,16 +69,30 @@ class SlackUserEmails:
         user = body.get("user")
         if not isinstance(user, dict):
             raise UserEmailLookupError("slack user lookup returned no user")
-        return _usable_email(user, user_id, workspace)
+        email = _usable_email(user, user_id, workspace)
+        if email is None:
+            # Slack omits the email, still answering ok, when the token lacks
+            # users:read.email. That is a configuration outage, not an unknown
+            # user: every sender would otherwise silently become unresolved.
+            granted = response.headers.get("X-OAuth-Scopes")
+            if granted is not None and _EMAIL_SCOPE not in {
+                scope.strip() for scope in granted.split(",")
+            }:
+                raise UserEmailLookupError("slack token lacks the email scope")
+            raise UserEmailUnknown("slack user unknown")
+        return email
 
 
-def _usable_email(user: Mapping[str, Any], user_id: str, workspace: str) -> str:
+def _usable_email(user: Mapping[str, Any], user_id: str, workspace: str) -> str | None:
+    """The email, None when Slack omitted it, or UserEmailUnknown for an unusable user."""
     if user.get("id") != user_id or not _in_workspace(user, workspace):
         raise UserEmailUnknown("slack user unknown")
     if user.get("deleted") is not False or user.get("is_bot") or user.get("is_app_user"):
         raise UserEmailUnknown("slack user unknown")
     profile = user.get("profile")
     email = profile.get("email") if isinstance(profile, dict) else None
+    if email is None:
+        return None
     if not isinstance(email, str) or not email.strip():
         raise UserEmailUnknown("slack user unknown")
     return email

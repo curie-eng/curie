@@ -122,7 +122,9 @@ class GatewayTimeoutError(GatewayError):
 
 
 class GatewayNotFoundError(GatewayError):
-    pass
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def gateway_error(status: int) -> GatewayError:
@@ -153,6 +155,15 @@ def validate_endpoint(endpoint: str, token: str, *, allow_insecure_http: bool = 
         or parts.scheme not in ({"https", "http"} if allow_insecure_http else {"https"})
     ):
         raise ValueError("gateway requires a credential and a TLS endpoint")
+
+
+def _refusal_code(body: bytes | bytearray) -> str | None:
+    """The bounded refusal code a gateway put in a 404 body, if any."""
+    try:
+        code = json.loads(body).get("code")
+    except (ValueError, AttributeError):
+        return None
+    return code if isinstance(code, str) else None
 
 
 class _Parameters(BaseModel):
@@ -534,6 +545,8 @@ class GatewayClient:
                                 )
                         except (ValueError, KeyError, TypeError):
                             pass
+                    if response.status_code == 404:
+                        raise GatewayNotFoundError("gateway answer not found", _refusal_code(body))
                     raise gateway_error(response.status_code)
                 return result.validate_json(body)
         except (httpx.HTTPError, ValidationError):

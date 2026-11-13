@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .read_transport import (
+    UNKNOWN_USER_EMAIL_CODE,
     GatewayClient,
     GatewayError,
     GatewayNotFoundError,
@@ -41,8 +42,10 @@ class GatewayUserEmailSettings(BaseSettings):
     slack_identity: str = Field(
         default="default", min_length=1, validation_alias="CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY"
     )
+    # Longer than the gateway's own 5 second Slack bound, so a slow Slack
+    # surfaces as the gateway's 504 rather than a client-side give-up.
     timeout_s: float = Field(
-        default=5.0, gt=0, validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S"
+        default=8.0, gt=0, validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S"
     )
     ca_file: str = Field(default="", validation_alias="CURIE_CHANNEL_GATEWAY_CA_FILE")
     allow_insecure_http: bool = Field(
@@ -69,7 +72,7 @@ class GatewayUserEmails:
         client: GatewayClient,
         *,
         slack_identity: str = "default",
-        timeout_s: float = 5.0,
+        timeout_s: float = 8.0,
         owned_http: httpx.AsyncClient | None = None,
     ) -> None:
         self._client = client
@@ -105,8 +108,12 @@ class GatewayUserEmails:
                     {"user_id": user_id, "workspace": workspace},
                     TypeAdapter(_Answer),
                 )
-        except GatewayNotFoundError:
-            raise UserEmailUnknown("slack user unknown") from None
+        except GatewayNotFoundError as error:
+            # Only the gateway's own code means "unknown"; any other 404 (a
+            # wrong path or proxy) is an outage, never a silent unresolved.
+            if error.code == UNKNOWN_USER_EMAIL_CODE:
+                raise UserEmailUnknown("slack user unknown") from None
+            raise UserEmailLookupError("gateway user email unavailable") from None
         except (GatewayError, TimeoutError):
             raise UserEmailLookupError("gateway user email unavailable") from None
         if answer.user_id != user_id or not answer.email.strip():

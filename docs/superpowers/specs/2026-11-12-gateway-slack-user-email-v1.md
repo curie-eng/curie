@@ -45,7 +45,8 @@ call; the gateway caches no email.
 <!-- @spec GATEWAY-USER-EMAIL-3 -->
 A user Slack does not know or show, a workspace mismatch, a deleted, bot or
 app user, and a missing email all answer 404 `{"code": "user_email.unknown"}`.
-An unknown gateway identity, a Slack error, a non-JSON body and a network
+A missing email when Slack reports that the token lacks `users:read.email` is a
+configuration outage and answers 502 instead. An unknown gateway identity, a Slack error, a non-JSON body and a network
 failure answer 502. A Slack call that does not finish within the gateway's
 bound (`CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S`, default 5 seconds)
 answers 504. No refusal echoes the request, the provider body or an email.
@@ -57,12 +58,13 @@ answers 504. No refusal echoes the request, the provider body or an email.
 client for an identity provider. `GatewayUserEmailSettings` reads
 `CURIE_CHANNEL_GATEWAY_URL`, `CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN`,
 `CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY` (default `default`),
-`CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S` (default 5 seconds),
-`CURIE_CHANNEL_GATEWAY_CA_FILE` and `CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE`.
+`CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S` (default 8 seconds, longer than
+the gateway's bound), `CURIE_CHANNEL_GATEWAY_CA_FILE` and `CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE`.
 Construction refuses any Slack token in its settings or environment, through
 the existing `token_custody.refuse_slack_tokens` check. `email_of(user_id,
 workspace)` returns the email or raises `UserEmailLookupError`;
-`UserEmailUnknown` is the subclass for the 404 answer. A gateway error, an
+`UserEmailUnknown` is the subclass for the 404 answer carrying the
+`user_email.unknown` code; any other 404 is an outage. A gateway error, an
 authentication refusal, a malformed or mismatched answer and the client's own
 timeout all raise `UserEmailLookupError`. The client never returns an empty or
 default email.
