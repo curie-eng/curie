@@ -3875,6 +3875,60 @@ def test_maintenance_inventory_503_does_not_skip_independent_steps(
         assert str(record.exc_info[1]) == "kube API 503 listing pods"
 
 
+def test_maintenance_inventory_503_with_failing_expiry_logs_the_substrate_error(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5630 Decision 5.3: when the substrate reap and the expiry reap both
+    fail, the substrate error is the logged exception and the expiry failure
+    rides on it as a note, so one traceback carries both."""
+
+    client, _api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=1
+    )
+
+    class _FailingWorkspace:
+        def enumerate_expired(self) -> list[str]:
+            raise RuntimeError("workspace ledger unreadable")
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            reclaim_interval_s=1e-6,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            h.kernel._workspace = _FailingWorkspace()
+            real_observe = consumer._observe_capacity_waits
+
+            async def last_observer() -> None:
+                await real_observe()
+                consumer.request_stop()
+
+            consumer._observe_capacity_waits = last_observer  # type: ignore[method-assign]
+            await consumer._maintenance_loop()
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(go())
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["maintenance tick failed"]
+    record = errors[0]
+    assert getattr(record, "maintenance_step", None) == "reap_orphans"
+    assert record.exc_info is not None
+    assert record.exc_info[0] is KubeTransientError
+    assert str(record.exc_info[1]) == "kube API 503 listing pods"
+    notes = getattr(record.exc_info[1], "__notes__", [])
+    assert len(notes) == 1
+    assert "expiry reap also failed" in notes[0]
+    assert "workspace ledger unreadable" in notes[0]
+    assert "workspace ledger unreadable" in logging.Formatter().format(record)
+
+
 def test_maintenance_tick_settles_pending_progress_without_a_deliverer(make_harness) -> None:
     """The real tick against real keys: nothing delivers progress yet, so the
     tick quarantines a malformed record and dead-letters one whose attempts are

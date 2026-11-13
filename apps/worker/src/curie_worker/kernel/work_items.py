@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -473,19 +474,22 @@ async def reap_orphans(self: Kernel) -> list[str]:
         reaped.extend(await asyncio.to_thread(self._substrate.reap_orphans))
     except Exception as exc:  # noqa: BLE001 - re-raised after the expiry reaps
         substrate_error = exc
+    expiry_error: Exception | None = None
     try:
         await _reap_expired(self)
-    except Exception as expiry_error:
+    except Exception as exc:
         if substrate_error is None:
             raise
-        # Both failed. Raise them together so neither is lost: chaining one
-        # as the other's context would be hidden when the outer one already
-        # carries an explicit cause (KubeTransientError does).
-        raise ExceptionGroup(
-            "substrate orphan reap and expiry reap both failed",
-            [substrate_error, expiry_error],
-        ) from None
+        expiry_error = exc
     if substrate_error is not None:
+        # The substrate error stays the propagated exception (#5630 Decision
+        # 5.3). An expiry failure rides on it as a note, so the one logged
+        # traceback carries both and no new log line is added.
+        if expiry_error is not None:
+            substrate_error.add_note(
+                "expiry reap also failed:\n"
+                + "".join(traceback.format_exception(expiry_error))
+            )
         raise substrate_error
     return reaped
 
