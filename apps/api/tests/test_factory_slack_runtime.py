@@ -63,10 +63,12 @@ from curie_channel_gateway.slack.slack_sink import (
 )
 from curie_internal import sandbox_token
 from curie_test_support.valkey import connect_or_skip
+from curie_worker import factory_slack_progress
 from curie_worker.factory_slack_progress import (
     FactorySlackProgressLoop,
     PostgresFactorySlackStore,
 )
+from curie_worker.factory_slack_triage import render_triage
 from curie_worker.reply_sink import build_reply_sink
 from curie_worker.run import _build_factory_slack_progress
 from fastapi.testclient import TestClient
@@ -5075,3 +5077,447 @@ def test_steering_refuses_a_root_receipt_and_a_driver_receipt(steering: Steering
     live = steer_with(message_ts="1800000900.000002")
     assert live["outcome"] == "admitted", live
     assert len([row for row in stack.requests() if row["id"] not in known]) == 1
+# --- #5586 AC8: one triage line per ending -----------------------------------------
+#
+# The completion contract, grant, delivery and receipt rows are written with plain
+# SQL in the shapes migration 0167 and the stage 1 delivery service store; the
+# routes and lifecycle transitions that write them are covered by
+# test_factory_tracker_results.py and test_workitem_dispatch.py. Here the
+# production progress loop materializes and posts from those rows.
+
+_TRIAGE_REVISION = "0123456789abcdef0123456789abcdef01234567"
+_TRIAGE_HEX = "ab" * 32
+
+
+@dataclass
+class _TriageRun:
+    number: int
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    epoch: int
+    root_ts: str
+    ticket_url: str
+    comment_url: str
+
+
+def _triage_run(stack: Stack, *, contract: str = "tracker_result") -> _TriageRun:
+    """A started request with its posted Slack root, under ``contract``."""
+
+    number = next(_ISSUES)
+    request_id, work_item_id = stack.admit(number)
+    epoch = stack.start(request_id)
+    if contract == "tracker_result":
+        _rows(
+            "UPDATE curie.execution_requests SET completion_contract = 'tracker_result', "
+            "result_policy_digest = :digest WHERE id = :id",
+            {"id": request_id, "digest": "cd" * 32},
+        )
+    enabled = stack.enable_destination()
+    assert enabled.status_code == 200, enabled.text
+    stack.drain()
+    (thread,) = stack.threads(work_item_id)
+    assert thread["root_ts"], thread
+    return _TriageRun(
+        number,
+        work_item_id,
+        request_id,
+        epoch,
+        thread["root_ts"],
+        f"https://github.com/{REPO}/issues/{number + 1000}",
+        f"https://github.com/{REPO}/issues/{number}#issuecomment-{number}01",
+    )
+
+
+def _triage_delivery(
+    run: _TriageRun,
+    *,
+    kind: str,
+    reason: str | None = None,
+    state: str = "delivered",
+    origin: str = "submitted",
+) -> uuid.UUID:
+    """The run's grant and its one delivery in ``state``; a delivered one gets its receipt.
+
+    An owed delivery's next attempt is a day away, so nothing attempts it here.
+    """
+
+    delivery_id = uuid.uuid4()
+    grant_id = uuid.uuid4()
+    output = kind == "ticket" and state == "delivered"
+    params: dict[str, Any] = {
+        "grant": grant_id,
+        "delivery": delivery_id,
+        "request": run.request_id,
+        "identity": f"curie-result-{run.request_id}",
+        "kind": kind,
+        "reason": reason,
+        "hex": _TRIAGE_HEX,
+        "epoch": run.epoch,
+        "state": state,
+        "origin": origin,
+        "output": output,
+        "issue": str(run.number + 1000),
+        "url": run.ticket_url,
+    }
+    _rows(
+        "INSERT INTO curie.factory_tracker_result_grants (id, work_item_id, "
+        "execution_request_id, source_fingerprint, repository_id, allowed_result_kinds, "
+        "output_identity, implementation_label, expires_at) "
+        "SELECT CAST(:grant AS uuid), w.id, r.id, :hex, w.repository_project_id, "
+        "CAST('[\"findings\", \"ticket\"]' AS jsonb), :identity, 'factory-implement', "
+        "now() + interval '1 hour' "
+        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE r.id = CAST(:request AS uuid)",
+        params,
+    )
+    _rows(
+        "INSERT INTO curie.factory_tracker_result_deliveries (id, grant_id, "
+        "execution_request_id, result_kind, reason, proposal_sha256, runtime_epoch, state, "
+        "origin, next_attempt_at, failure_code, settled_at, deadline_at, output_tracker_kind, "
+        "output_tracker_host, output_scope_id, output_issue_id, output_url, output_body_sha256) "
+        "SELECT CAST(:delivery AS uuid), CAST(:grant AS uuid), r.id, :kind, "
+        "CAST(:reason AS text), :hex, CAST(:epoch AS bigint), CAST(:state AS text), :origin, "
+        "now() + interval '1 day', "
+        "CASE WHEN CAST(:state AS text) = 'failed' THEN 'delivery_deadline_exceeded' END, "
+        "CASE WHEN CAST(:state AS text) <> 'owed' THEN now() END, "
+        "now() + interval '1 hour', "
+        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_kind END, "
+        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_host END, "
+        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_scope_id END, "
+        "CASE WHEN CAST(:output AS boolean) THEN CAST(:issue AS text) END, "
+        "CASE WHEN CAST(:output AS boolean) THEN CAST(:url AS text) END, "
+        "CASE WHEN CAST(:output AS boolean) THEN :hex END "
+        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE r.id = CAST(:request AS uuid)",
+        params,
+    )
+    if state == "delivered":
+        _triage_receipt(run, delivery_id)
+    return delivery_id
+
+
+def _triage_receipt(run: _TriageRun, delivery_id: uuid.UUID) -> None:
+    _rows(
+        "INSERT INTO curie.factory_tracker_result_receipts (delivery_id, grant_id, "
+        "execution_request_id, result_kind, reason, proposal_sha256, revision, "
+        "result_comment_id, result_comment_url, output_tracker_kind, output_tracker_host, "
+        "output_scope_id, output_issue_id, output_url, output_body_sha256, output_labels) "
+        "SELECT d.id, d.grant_id, d.execution_request_id, d.result_kind, d.reason, "
+        "d.proposal_sha256, :revision, '4401', :comment_url, d.output_tracker_kind, "
+        "d.output_tracker_host, d.output_scope_id, d.output_issue_id, d.output_url, "
+        "d.output_body_sha256, CASE WHEN d.result_kind = 'ticket' THEN '[]'::jsonb END "
+        "FROM curie.factory_tracker_result_deliveries d WHERE d.id = CAST(:id AS uuid)",
+        {"id": delivery_id, "revision": _TRIAGE_REVISION, "comment_url": run.comment_url},
+    )
+
+
+def _settle_delivery(run: _TriageRun, delivery_id: uuid.UUID, state: str) -> None:
+    """An owed delivery settles later: delivered with its receipt, or failed."""
+
+    _rows(
+        "UPDATE curie.factory_tracker_result_deliveries SET state = CAST(:state AS text), "
+        "settled_at = now(), failure_code = CASE WHEN CAST(:state AS text) = 'failed' "
+        "THEN 'delivery_deadline_exceeded' END WHERE id = CAST(:id AS uuid)",
+        {"id": delivery_id, "state": state},
+    )
+    if state == "delivered":
+        _triage_receipt(run, delivery_id)
+
+
+def _end_request(run: _TriageRun, status: str, cause: str) -> None:
+    """The terminal transition, in the shape the lifecycle writes it."""
+
+    _rows(
+        "UPDATE curie.execution_requests SET status = :status, terminal_at = now(), "
+        "terminal_cause = :cause, termination_observation = CASE WHEN :observed "
+        "THEN 'fixture runtime termination observed' END WHERE id = :id",
+        {
+            "id": run.request_id,
+            "status": status,
+            "cause": cause,
+            "observed": status in {"expired", "cancelled"},
+        },
+    )
+
+
+def _result_lines(stack: Stack, root_ts: str) -> list[str]:
+    """The message text of every result line posted in the root's thread."""
+
+    texts = [call.text for call in stack.slack.thread_posts(stack.factory_token, root_ts)]
+    return [t for t in texts if t.startswith(("Triage ", "Investigation stopped:", "Run "))]
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason", "status", "line"),
+    [
+        ("ticket", None, "completed", "Triage published a ticket: {ticket}."),
+        ("findings", "not_reproduced", "completed", "Triage reported: not reproduced. {comment}"),
+        ("findings", "already_fixed", "completed", "Triage reported: already fixed. {comment}"),
+        (
+            "findings",
+            "product_decision_needed",
+            "completed",
+            "Triage reported: product decision needed. {comment}",
+        ),
+        (
+            "findings",
+            "capability_unavailable",
+            "completed",
+            "Triage reported: capability unavailable. {comment}",
+        ),
+        (
+            "findings",
+            "budget_exhausted",
+            "expired",
+            "Investigation stopped: budget exhausted; findings delivered. {comment}",
+        ),
+    ],
+)
+def test_each_triage_ending_posts_one_result_line_in_the_tickets_thread(
+    stack: Stack, kind: str, reason: str | None, status: str, line: str
+) -> None:
+    """AC8: the ending's line carries the ticket or result comment URL, once, in
+    the WorkItem's thread, and the generic terminal line is not posted."""
+
+    run = _triage_run(stack)
+    if status == "expired":
+        # Exhaustion: the platform findings are sealed as the request expires.
+        _end_request(run, "expired", "execution_deadline")
+        _triage_delivery(run, kind=kind, reason=reason, origin="platform")
+    else:
+        _triage_delivery(run, kind=kind, reason=reason)
+        _end_request(run, "completed", "completed")
+    stack.drain()
+    stack.drain(fresh=True)
+
+    expected = line.format(ticket=run.ticket_url, comment=run.comment_url)
+    lines = _result_lines(stack, run.root_ts)
+    assert len(lines) == 1 and lines[0].strip() == expected, lines
+    assert len(stack.slack.roots(stack.factory_token)) == 1
+    (post,) = _rows(
+        "SELECT kind, post_key, posted_at FROM curie.factory_slack_posts "
+        "WHERE work_item_id = :id AND kind IN ('triage', 'terminal')",
+        {"id": run.work_item_id},
+    )
+    assert (post["kind"], post["post_key"]) == ("triage", f"triage:{run.request_id}")
+    assert post["posted_at"] is not None
+
+
+_HANDOFFS: dict[str, tuple[dict[str, object], str]] = {
+    "admitted": (
+        {"handoff_admitted": True},
+        "Triage published a ticket: {ticket}. Implementation admitted.",
+    ),
+    "refused": (
+        {"handoff_admitted": False, "refusal_reason": "the repository is paused"},
+        "Triage published a ticket: {ticket}. Implementation not started: "
+        "the repository is paused.",
+    ),
+}
+_HANDOFF_KEYS = ("handoff_admitted", "implementation_status_url", "refusal_reason")
+
+
+def _handoff_triage_post(run: _TriageRun, handoff: dict[str, object]) -> None:
+    """The run's ``triage`` post record as it stands once its handoff is recorded.
+
+    #5588 records the handoff; until then the record is constructed here, in the
+    shape the progress loop's own insert writes plus the handoff keys. The
+    loop's insert then conflicts on the post key and leaves this record alone.
+    """
+
+    payload = {
+        "result_kind": "ticket",
+        "reason": None,
+        "revision": _TRIAGE_REVISION,
+        "ticket_url": run.ticket_url,
+        "result_comment_url": run.comment_url,
+        **handoff,
+    }
+    _rows(
+        "INSERT INTO curie.factory_slack_posts (work_item_id, post_key, kind, sequence, "
+        "rank, ordinal, payload) SELECT q.work_item_id, 'triage:' || q.id, 'triage', "
+        "q.sequence, 3, 0, CAST(:payload AS jsonb) FROM curie.execution_requests q "
+        "WHERE q.id = :id",
+        {"id": run.request_id, "payload": json.dumps(payload)},
+    )
+
+
+def _drive_handoff_ending(stack: Stack, handoff: dict[str, object]) -> _TriageRun:
+    run = _triage_run(stack)
+    _triage_delivery(run, kind="ticket")
+    _end_request(run, "completed", "completed")
+    _handoff_triage_post(run, handoff)
+    stack.drain()
+    stack.drain(fresh=True)
+    return run
+
+
+@pytest.mark.parametrize("ending", sorted(_HANDOFFS))
+def test_a_handoff_ending_posts_one_result_line_through_the_progress_loop(
+    stack: Stack, ending: str
+) -> None:
+    """AC8: the admitted and refused handoff endings travel from the stored post
+    record through the progress loop to the Slack stub as one line, with the
+    ticket URL, in the ticket's thread."""
+
+    handoff, line = _HANDOFFS[ending]
+    run = _drive_handoff_ending(stack, handoff)
+
+    lines = _result_lines(stack, run.root_ts)
+    assert [text.strip() for text in lines] == [line.format(ticket=run.ticket_url)], lines
+    assert len(stack.slack.roots(stack.factory_token)) == 1
+    (post,) = _rows(
+        "SELECT kind, post_key, posted_at FROM curie.factory_slack_posts "
+        "WHERE work_item_id = :id AND kind IN ('triage', 'terminal')",
+        {"id": run.work_item_id},
+    )
+    assert (post["kind"], post["post_key"]) == ("triage", f"triage:{run.request_id}")
+    assert post["posted_at"] is not None
+
+
+@pytest.mark.parametrize("ending", sorted(_HANDOFFS))
+def test_a_handoff_dropped_before_rendering_does_not_post_the_handoff_line(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    """Negative control: a loop that drops the handoff before rendering posts the
+    plain published line, which the positive test above rejects."""
+
+    def dropping(payload: dict[str, Any]) -> str:
+        return render_triage({k: v for k, v in payload.items() if k not in _HANDOFF_KEYS})
+
+    monkeypatch.setattr(factory_slack_progress, "render_triage", dropping)
+    handoff, line = _HANDOFFS[ending]
+    run = _drive_handoff_ending(stack, handoff)
+
+    lines = [text.strip() for text in _result_lines(stack, run.root_ts)]
+    assert lines == [f"Triage published a ticket: {run.ticket_url}."], lines
+    assert line.format(ticket=run.ticket_url) not in lines
+
+
+_RENDER_TICKET = "https://tracker.example/acme/app/issues/7"
+_RENDER_COMMENT = "https://tracker.example/acme/app/issues/3#comment-1"
+
+
+def test_all_seven_triage_endings_render_distinct_lines_through_render_triage() -> None:
+    """AC8: the handoff endings reach Slack rendering through the payload's handoff keys."""
+
+    ticket = {"result_kind": "ticket", "ticket_url": _RENDER_TICKET}
+    payloads: dict[str, dict[str, object]] = {
+        "published": ticket,
+        "admitted": {**ticket, "handoff_admitted": True},
+        "refused": {
+            **ticket,
+            "handoff_admitted": False,
+            "refusal_reason": "the repository is paused",
+        },
+    }
+    for reason in (
+        "not_reproduced",
+        "already_fixed",
+        "product_decision_needed",
+        "capability_unavailable",
+        "budget_exhausted",
+    ):
+        payloads[reason] = {
+            "result_kind": "findings",
+            "reason": reason,
+            "result_comment_url": _RENDER_COMMENT,
+        }
+    lines = {name: render_triage(payload) for name, payload in payloads.items()}
+    # The seven endings plus a delivered ticket with no handoff recorded yet.
+    assert len(lines) == 8
+    assert len(set(lines.values())) == len(lines), lines
+    assert "admitted" in lines["admitted"].lower()
+    assert "not started" in lines["refused"].lower()
+    assert "the repository is paused" in lines["refused"]
+    assert "admitted" not in lines["published"].lower()
+    assert "not started" not in lines["published"].lower()
+    assert "admitted" not in lines["refused"].lower()
+    for name in ("admitted", "refused", "published"):
+        assert _RENDER_TICKET in lines[name]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"handoff_admitted": "yes"},
+        {"handoff_admitted": 1},
+        {"handoff_admitted": False, "refusal_reason": 5},
+        {"handoff_admitted": True, "implementation_status_url": ["x"]},
+    ],
+)
+def test_a_wrong_typed_handoff_value_is_refused_by_render_triage(bad: dict[str, object]) -> None:
+    payload = {"result_kind": "ticket", "ticket_url": _RENDER_TICKET, **bad}
+    with pytest.raises(ValueError):
+        render_triage(payload)
+
+
+def test_an_owed_delivery_withholds_the_terminal_line_until_it_fails(stack: Stack) -> None:
+    """A failed delivery never resumes, so its run gets the generic terminal line."""
+
+    run = _triage_run(stack)
+    delivery_id = _triage_delivery(run, kind="ticket", state="owed")
+    _end_request(run, "failed", "tracker_result_undelivered")
+    stack.drain()
+    assert _result_lines(stack, run.root_ts) == []
+
+    _settle_delivery(run, delivery_id, "failed")
+    stack.drain()
+    stack.drain(fresh=True)
+    lines = _result_lines(stack, run.root_ts)
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("Run failed"), lines
+    assert "tracker_result_undelivered" in lines[0]
+
+
+def test_a_delivery_owed_past_the_run_posts_the_triage_line_once_delivered(
+    stack: Stack,
+) -> None:
+    """Reading 5: delivered after the run failed undelivered; one triage line,
+    and never the generic terminal line."""
+
+    run = _triage_run(stack)
+    delivery_id = _triage_delivery(run, kind="findings", reason="not_reproduced", state="owed")
+    _end_request(run, "failed", "tracker_result_undelivered")
+    stack.drain()
+    assert _result_lines(stack, run.root_ts) == []
+
+    _settle_delivery(run, delivery_id, "delivered")
+    stack.drain()
+    stack.drain(fresh=True)
+    lines = _result_lines(stack, run.root_ts)
+    assert [line.strip() for line in lines] == [
+        f"Triage reported: not reproduced. {run.comment_url}"
+    ], lines
+
+
+def test_a_tracker_result_run_with_no_delivery_posts_the_terminal_line(stack: Stack) -> None:
+    run = _triage_run(stack)
+    _end_request(run, "failed", "no_tracker_result")
+    stack.drain()
+    lines = _result_lines(stack, run.root_ts)
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("Run failed") and "no_tracker_result" in lines[0], lines
+
+
+def test_an_implementation_runs_posts_are_unchanged(stack: Stack) -> None:
+    """The triage post keys on the request's contract: even a receipt row on an
+    implementation request (which no route can write) posts no triage line, and
+    its terminal line still posts."""
+
+    run = _triage_run(stack, contract="implementation")
+    _triage_delivery(run, kind="findings", reason="not_reproduced")
+    stack.finish(run.request_id, run.epoch)
+    stack.drain()
+    stack.drain(fresh=True)
+
+    lines = _result_lines(stack, run.root_ts)
+    assert [line.strip() for line in lines] == ["Run failed (runner_failed)"], lines
+    kinds = {
+        row["kind"]
+        for row in _rows(
+            "SELECT kind FROM curie.factory_slack_posts WHERE work_item_id = :id",
+            {"id": run.work_item_id},
+        )
+    }
+    assert kinds == {"root", "terminal"}, kinds

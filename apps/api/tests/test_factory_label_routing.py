@@ -958,3 +958,42 @@ def test_label_routing_a_label_no_binding_owns_stays_unrelated(
 
     _refused(response, "unrelated_label")
     assert _owner(number) is None
+
+
+# --- #5586 AC7: the triaged state label is reserved -------------------------------
+
+
+def test_label_routing_the_triaged_state_label_cannot_be_a_trigger_label(
+    factory: LabelFactory,
+) -> None:
+    """A binding refuses ``curie-factory:triaged`` as its trigger label, at agent
+    creation and when a surface is added; a free label still binds."""
+
+    triaged = "curie-factory:triaged"
+    agent_id = factory.agent({"kind": "slack", "address": f"C0{uuid.uuid4().hex[:8].upper()}"})
+    refused = factory.client.post(
+        f"/agents/{agent_id}/channels",
+        headers=factory.headers(),
+        json={"kind": "github", "address": REPO, "trigger_label": triaged},
+    )
+    assert refused.status_code == 422, refused.text
+    assert "curie-factory:" in refused.text
+    assert "a label family the factory owns" in refused.text
+
+    created = factory.client.post(
+        "/agents",
+        headers=factory.headers(),
+        json={
+            "name": f"acme-factory-{uuid.uuid4().hex[:8]}",
+            "repo_full_name": "acme-corp/factory-home",
+            "channel": {"kind": "github", "address": REPO, "trigger_label": triaged},
+        },
+    )
+    assert created.status_code == 422, created.text
+
+    bound = factory.client.post(
+        f"/agents/{agent_id}/channels",
+        headers=factory.headers(),
+        json={"kind": "github", "address": REPO, "trigger_label": FAST},
+    )
+    assert bound.status_code == 201, bound.text

@@ -44,7 +44,9 @@ existing records, with no lifecycle hook:
    materialized on any later pass regardless of age, and per-pass work is
    bounded per request by the progress report limit;
 3. one ``pull_request`` post per lineage pull request;
-4. one ``terminal`` post per ended request at or after ``first_sequence``.
+4. one ``terminal`` post per ended request at or after ``first_sequence``,
+   except a tracker-result request whose result is owed or delivered, which
+   gets one ``triage`` post once delivered instead (``factory_slack_triage``).
 
 Delivery is ordered per WorkItem by (sequence, rank, ordinal): the root first,
 every other post only once the root has a ts, and never a post before an
@@ -74,6 +76,12 @@ from curie_channel_gateway.reply_errors import InvalidReplyTargetError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from .factory_slack_triage import (
+    TRIAGE_KIND,
+    render_triage,
+    terminal_post_owed,
+    triage_posts_sql,
+)
 from .reply_sink import ReplySink, TargetRoute
 
 logger = logging.getLogger(__name__)
@@ -120,6 +128,8 @@ def render_post(kind: str, payload: dict[str, Any]) -> str:
             f"Pull request #{_escaped(payload.get('number') or '')} is open: "
             f"{_escaped(payload.get('url') or '')}"
         )
+    if kind == TRIAGE_KIND:
+        return _escaped(render_triage(payload))
     if kind == "terminal":
         line = f"Run {_escaped(payload.get('status') or 'ended')}"
         cause = payload.get("cause")
@@ -180,6 +190,8 @@ class PostgresFactorySlackStore:
         self._lineages = f'"{schema}".thread_publication_lineages'
         self._threads = f'"{schema}".factory_slack_threads'
         self._posts = f'"{schema}".factory_slack_posts'
+        self._deliveries = f'"{schema}".factory_tracker_result_deliveries'
+        self._receipts = f'"{schema}".factory_tracker_result_receipts'
         self._lease_owner = lease_owner
         self._lease_seconds = lease_seconds
         self._backoff_base = backoff_base_seconds
@@ -299,14 +311,24 @@ class PostgresFactorySlackStore:
               JOIN {self._requests} q
                 ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
              WHERE q.terminal_at IS NOT NULL
+               AND {terminal_post_owed("q", self._deliveries)}
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
+        )
+        triages = text(
+            triage_posts_sql(
+                posts=self._posts,
+                requests=self._requests,
+                receipts=self._receipts,
+                live_threads=live_threads,
+            )
         )
         async with self._engine.begin() as connection:
             await connection.execute(discover)
             await connection.execute(phases)
             await connection.execute(pull_requests)
             await connection.execute(terminals)
+            await connection.execute(triages)
 
     async def claim_next(self) -> FactorySlackWork | None:
         """Lease the next deliverable post, or None when nothing is due."""

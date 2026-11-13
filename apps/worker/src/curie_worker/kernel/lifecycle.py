@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from .core import Kernel
 
 from . import (
+    approval,
     capacity,
     channel_read,
     claim,
@@ -78,11 +79,22 @@ from . import (
     identity,
     log,
     memory,
+    publication,
     routing,
     work_items,
     workspace,
 )
 from .log import logger
+
+# ADR 0277 (#5586): the internal bound on a tracker_result run's capability
+# mint. The mint is that run's gate, and a gate decides within a minute.
+_TRACKER_RESULT_MINT_TIMEOUT_S = 30.0
+# The coded refusal a tracker_result run's publish request finishes with; the
+# API refuses the same request at its own boundary under this code.
+_TRACKER_RESULT_PUBLICATION_REFUSAL = (
+    "publication.tracker_result_request: this run reports a tracker result "
+    "and does not publish a branch or pull request."
+)
 
 
 async def process_event(
@@ -1160,7 +1172,30 @@ async def _process_event(
             # WorkItem's issue, and the runner mounts get_issue only when
             # it is present. A refused or failed mint leaves the tool off
             # and never stops the boot; the bundle states the gap.
-            if owned_work_item_id is not None and self._work_items is not None:
+            tracker_result_run = _tracker_result_run(self, owned_work_item_id, event_id)
+            if (
+                owned_work_item_id is not None
+                and self._work_items is not None
+                and tracker_result_run is not None
+            ):
+                # ADR 0277 (#5586): a tracker_result session cannot report its
+                # result without this capability, so its mint fails closed: no
+                # sandbox, no runner, no model session.
+                minted = await _mint_tracker_result_capability(
+                    self, tracker_result_run, owned_work_item_id, event_id
+                )
+                if minted is None:
+                    return
+                issue, capability = minted
+                base = self._config.runner_facing_api_base_url.rstrip("/")
+                boot_env[ISSUE_READ_URL_ENV] = f"{base}/work-items/issue-read"
+                boot_env[ISSUE_READ_TOKEN_ENV] = capability
+                logger.info(
+                    "issue read capability bound for %s to %s",
+                    owned_work_item_id,
+                    issue,
+                )
+            elif owned_work_item_id is not None and self._work_items is not None:
                 try:
                     issue, capability = await self._work_items.issue_read_context(
                         owned_work_item_id
@@ -1752,14 +1787,22 @@ async def _process_event(
                 # A gate fired (ADR-0010): persist the durable record, then
                 # suspend the session until a human resolves it. The event
                 # is done -- the resolution arrives as its own queued turn.
-                pause = await self._pause_for_approval(
-                    qevent,
-                    route,
-                    outcome,
-                    agent_id,
-                    approval_routes,
-                    deployment_id=workspace_deployment_id,
-                )
+                if publication._is_publish_provenance(
+                    outcome.approval_gate_kind, outcome.approval_granted_tool
+                ) and _tracker_result_run(self, owned_work_item_id, event_id):
+                    # ADR 0277 (#5586): a tracker_result run never publishes.
+                    # Refused here, before any API call: no publication row,
+                    # no approval, nothing pushed.
+                    pause = await _refuse_tracker_result_publication(self, qevent, route)
+                else:
+                    pause = await self._pause_for_approval(
+                        qevent,
+                        route,
+                        outcome,
+                        agent_id,
+                        approval_routes,
+                        deployment_id=workspace_deployment_id,
+                    )
                 if pause.abandoned:
                     # #4331: a stale owner writes no finish and posts no
                     # escalation; the API termination chain owns the lost
@@ -1924,6 +1967,13 @@ async def _process_event(
                 if dependency_retry
                 else retryable and qevent.source is not TurnSource.CRON
             )
+            if retryable and not dependency_retry:
+                tracker_run = _tracker_result_run(self, owned_work_item_id, event_id)
+                if tracker_run is not None and tracker_run.started and not tracker_run.finished:
+                    # ADR 0277 (#5586): a retry would open a second model
+                    # session. The started tracker_result run settles failed
+                    # with its classification cause instead.
+                    retryable = False
             if not retryable or (attempt >= self._config.max_attempts and not dependency_retry):
                 if (
                     outcome.classification in {"runner-error", "sandbox-capacity"}
@@ -2127,3 +2177,80 @@ def _release_order_entry(self: Kernel, thread_key: str, entry: delivery._LockEnt
     entry.refs -= 1
     if entry.refs == 0 and self._order_locks.get(thread_key) is entry:
         del self._order_locks[thread_key]
+
+
+def _tracker_result_run(
+    self: Kernel, owned_work_item_id: uuid.UUID | None, event_id: str
+) -> WorkItemRun | None:
+    """This delivery's own WorkItem run when its request is tracker_result (ADR 0277)."""
+
+    if owned_work_item_id is None:
+        return None
+    run = self._work_item_runs.get(owned_work_item_id)
+    if run is None or run.event_id != event_id or not run.is_tracker_result:
+        return None
+    return run
+
+
+async def _mint_tracker_result_capability(
+    self: Kernel, run: WorkItemRun, request_id: uuid.UUID, event_id: str
+) -> tuple[str, str] | None:
+    """Mint a tracker_result run's issue read capability, failing closed.
+
+    The capability is how the runner learns the completion contract and
+    submits the result, so a session booted without it could not do its one
+    job. Any mint fault (a refusal, a transport error, a malformed answer, its
+    own deadline) returns None after settling the delivery: an unstarted run
+    defers its acquisition (``issue_read_unavailable``, not a capacity
+    deferral) and claims no sandbox, so dispatch retries it within its waiting
+    deadline. A started run, which no tracker_result path adopts, finishes
+    failed rather than boot without it.
+    """
+
+    assert self._work_items is not None
+    try:
+        async with asyncio.timeout(_TRACKER_RESULT_MINT_TIMEOUT_S):
+            return await self._work_items.issue_read_context(request_id)
+    except Exception as exc:  # noqa: BLE001 - this gate fails closed on any fault
+        reason = type(exc).__name__
+    logger.warning(
+        "tracker_result issue read capability unavailable for %s: %s; starting no session",
+        request_id,
+        reason,
+    )
+    try:
+        if run.started:
+            await run.finish(
+                outcome="failed",
+                cause="runner_escalated",
+                detail="The issue read capability for this investigation is unavailable.",
+                ci_fix_round=None,
+            )
+        else:
+            await run.defer("issue_read_unavailable", capacity=False, start_failure_detail=None)
+    except WorkItemConflict as conflict:
+        logger.info(
+            "tracker_result capability settlement for %s refused: %s", event_id, conflict.code
+        )
+        if run.started and conflict.code == "not_running":
+            run.finished = True
+    await self._markers.mark_done(event_id, marker_value="1")
+    return None
+
+
+async def _refuse_tracker_result_publication(
+    self: Kernel, qevent: QueuedTurn, route: TargetRoute
+) -> approval._ApprovalPause:
+    """Refuse a tracker_result run's publish request before any API call."""
+
+    logger.info("publication refused for tracker_result event %s", qevent.event_id)
+    escalation_update = await self._escalate(
+        qevent,
+        route,
+        "This investigation reports its result to the tracker and does not publish; "
+        "nothing was pushed and no pull request was opened.",
+        failure_class="publication-refused",
+    )
+    return approval._ApprovalPause.refused(
+        _TRACKER_RESULT_PUBLICATION_REFUSAL, escalation_update=escalation_update
+    )

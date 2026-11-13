@@ -885,9 +885,21 @@ async def _attempt_turn(
         outcome.workspace_inferred_repo = inferred
         if verified_review is not None:
             outcome.review_origin_key = verified_review.origin_key
-        if outcome.status is SessionStatus.AWAITING_APPROVAL and publication._is_publish_provenance(
-            outcome.approval_gate_kind,
-            outcome.approval_granted_tool,
+        owned_id = constants._OWNED_WORK_ITEM.get()
+        owned_run = self._work_item_runs.get(owned_id) if owned_id is not None else None
+        if (
+            outcome.status is SessionStatus.AWAITING_APPROVAL
+            and publication._is_publish_provenance(
+                outcome.approval_gate_kind,
+                outcome.approval_granted_tool,
+            )
+            # ADR 0277 (#5586): a tracker_result run's publish request is
+            # refused unread; no snapshot of its workspace is taken.
+            and not (
+                owned_run is not None
+                and owned_run.event_id == qevent.event_id
+                and owned_run.is_tracker_result
+            )
         ):
             snapshot = None
             # The worker names the base the snapshot is anchored at: the

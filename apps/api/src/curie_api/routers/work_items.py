@@ -16,6 +16,7 @@ from .. import personal_execution, workitem_dispatch
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import LivenessSessionDep, SessionDep
+from ..factory_tracker_result_runtime import CompletionContractName
 from ..forges.types import RepositoryRef, TrackerIssueRef
 from ..personal_execution import ModelAuthMode, OwnerContext
 from ..workitem_dispatch import DispatchConflict
@@ -197,6 +198,9 @@ class RunningWorkItemRequest(BaseModel):
     repository_path: str
     context: workitem_dispatch.FactoryContext | None
     refusal: workitem_dispatch.RefusalCode | None
+    # How the running request completes (ADR 0277): by a pull request, or by
+    # one delivered tracker result with no pull request.
+    completion_contract: CompletionContractName
 
 
 class PersonalContextRequestOut(BaseModel):
@@ -331,6 +335,7 @@ async def running_work_item_request(
         repository_path=row.repository_path,
         context=row.context,
         refusal=row.refusal,
+        completion_contract=row.completion_contract,
     )
 
 
@@ -457,6 +462,7 @@ async def acquire_work_item_request(
         "wait_deadline": result.wait_deadline,
         "repository_path": result.repository_path,
         "context": result.context,
+        "completion_contract": result.completion_contract,
     }
 
 
@@ -504,6 +510,7 @@ async def start_work_item_request(
         "execution_deadline": result.execution_deadline,
         "remaining_s": result.remaining_s,
         "heartbeat_interval_s": result.heartbeat_interval_s,
+        "completion_contract": result.completion_contract,
     }
 
 

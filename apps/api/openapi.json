@@ -6074,6 +6074,44 @@
         "title": "Completion",
         "type": "object"
       },
+      "CompletionContractOut": {
+        "description": "How the execution completes (ADR 0277, #5586): by a pull request\n(``implementation``) or by one delivered tracker result (``tracker_result``).\n\n``result_kinds`` are the kinds the deployed policy allows and\n``session_usd_allowance`` the per-session model allowance in USD (the\nagent's dollar limit, else 5); both empty for ``implementation``.",
+        "properties": {
+          "completion_contract": {
+            "enum": [
+              "implementation",
+              "tracker_result"
+            ],
+            "title": "Completion Contract",
+            "type": "string"
+          },
+          "result_kinds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Result Kinds",
+            "type": "array"
+          },
+          "session_usd_allowance": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Usd Allowance"
+          }
+        },
+        "required": [
+          "completion_contract",
+          "result_kinds",
+          "session_usd_allowance"
+        ],
+        "title": "CompletionContractOut",
+        "type": "object"
+      },
       "ConnectorManifests": {
         "description": "Kubernetes objects derived from a version's ``connectors.yaml``.\n\nThe API renders; the caller applies. Rendering is a pure function of the\nbundle plus the deployment context the caller supplies, so producing this\nneeds no cluster access and the API's read-only RBAC is untouched\n(ADR-0086, #1063).",
         "properties": {
@@ -15676,6 +15714,14 @@
             "title": "Agent Id",
             "type": "string"
           },
+          "completion_contract": {
+            "enum": [
+              "implementation",
+              "tracker_result"
+            ],
+            "title": "Completion Contract",
+            "type": "string"
+          },
           "context": {
             "anyOf": [
               {
@@ -15731,6 +15777,7 @@
                   "factory_start_failed",
                   "stale_version",
                   "termination_observation_required",
+                  "tracker_result_no_revision",
                   "personal_owner_required",
                   "owner_context_unexpected",
                   "owner_tenant_mismatch",
@@ -15792,7 +15839,8 @@
           "wait_deadline",
           "repository_path",
           "context",
-          "refusal"
+          "refusal",
+          "completion_contract"
         ],
         "title": "RunningWorkItemRequest",
         "type": "object"
@@ -17263,6 +17311,72 @@
           "issue_id"
         ],
         "title": "TrackerIssueIn",
+        "type": "object"
+      },
+      "TrackerResultOut": {
+        "description": "The accepted result after one inline delivery attempt.\n\n``state`` ``owed`` means the platform keeps retrying until the delivery\ndeadline. ``result_comment_url`` is the source issue's marked result\ncomment and ``ticket_url`` the published ticket, each once delivered.",
+        "properties": {
+          "result_comment_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Comment Url"
+          },
+          "result_kind": {
+            "enum": [
+              "ticket",
+              "findings"
+            ],
+            "title": "Result Kind",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "owed",
+              "delivered",
+              "failed"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "ticket_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ticket Url"
+          }
+        },
+        "required": [
+          "result_kind",
+          "state",
+          "result_comment_url",
+          "ticket_url"
+        ],
+        "title": "TrackerResultOut",
+        "type": "object"
+      },
+      "TrackerResultSubmission": {
+        "description": "The runner result tool's call: one typed proposal, validated by the API\n(`curie_api.factory_tracker_results.parse_proposal`).",
+        "properties": {
+          "proposal": {
+            "description": "A ticket or findings proposal object.",
+            "title": "Proposal"
+          }
+        },
+        "required": [
+          "proposal"
+        ],
+        "title": "TrackerResultSubmission",
         "type": "object"
       },
       "Transfer": {
@@ -38101,6 +38215,56 @@
         ]
       }
     },
+    "/work-items/completion-contract": {
+      "post": {
+        "description": "The execution's completion contract; for a tracker result request, the\nreservation of its one model session.\n\nThe first call for a tracker result request reads the source issue's\ntitle and body, mints the request's grant and reserves the session; any\nlater call is 409 ``session_already_started``, so a second runner starts\nno model. An implementation request reserves nothing and gets no grant.",
+        "operationId": "read_completion_contract_work_items_completion_contract_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Issue-Read",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Issue-Read"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompletionContractOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Completion Contract",
+        "tags": [
+          "work-items"
+        ]
+      }
+    },
     "/work-items/issue-read": {
       "post": {
         "operationId": "read_work_item_issue_work_items_issue_read_post",
@@ -38145,6 +38309,66 @@
           }
         },
         "summary": "Read Work Item Issue",
+        "tags": [
+          "work-items"
+        ]
+      }
+    },
+    "/work-items/tracker-result": {
+      "post": {
+        "description": "Seal the execution's one tracker result and attempt its delivery once.\n\nRefuses (409, nothing written) an implementation request, a request\nwhose session was never reserved, a second submission, a source issue\nwhose title or body changed since the reservation, and every grant fence\n(`RefusalReason`); an invalid proposal is 422 with field paths and codes\nonly. An accepted result is answered with its delivery state after one\ninline attempt; the WorkItem reconciler retries an owed one.",
+        "operationId": "submit_tracker_result_work_items_tracker_result_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Issue-Read",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Issue-Read"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrackerResultSubmission"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrackerResultOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Tracker Result",
         "tags": [
           "work-items"
         ]

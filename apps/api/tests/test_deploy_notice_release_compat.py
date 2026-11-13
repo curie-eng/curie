@@ -66,8 +66,10 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # observations require the 0163 table, cached facts and request
     # delivery require the 0164 tables, and Slack kickoff thread origin
     # reads require 0166.
-    # Owner coding profiles and tenant policies require 0165, which stays below this floor.
-    candidate = {"schema_min": "0166", "schema_head": "0166"}
+    # Owner coding profiles and tenant policies require 0165, which stays below
+    # this floor. Execution request reads select the 0167 completion contract
+    # columns.
+    candidate = {"schema_min": "0167", "schema_head": "0167"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -123,6 +125,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0164",
         "0165",
         "0166",
+        "0167",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

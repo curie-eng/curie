@@ -98,6 +98,7 @@ STATE_LABELS = {
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
+    "curie-factory:triaged",
 }
 WAITING = "_Waiting for the agent to report progress._"
 CARD_BASE = "https://curie.example.com"
@@ -2703,3 +2704,454 @@ def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotentl
     assert repeated["attempts"] == after["attempts"]
     assert repeated["finalized_at"] == after["finalized_at"]
     assert jira.writes == writes
+
+
+# --- #5586 AC7: the triaged state label and the triage endings ----------------------
+#
+# The completion contract, grant, delivery and receipt rows are written with plain
+# SQL in the shapes migration 0167 and the stage 1 delivery service store: the
+# submission route, the delivery service and the lifecycle transitions that write
+# them belong to other suites (test_factory_tracker_results.py,
+# test_workitem_dispatch.py). Here the real reconciler renders the status comment
+# and moves the labels from those rows, and ``on_tracker_result_settled`` is the
+# hook the delivery service calls when a delivery settles.
+
+TRIAGED = "curie-factory:triaged"
+TRIAGE_REVISION = "0123456789abcdef0123456789abcdef01234567"
+_HEX = "ab" * 32
+
+
+def _triage_running(client: Any, github: Any, sink: Any, number: int) -> tuple[uuid.UUID, int]:
+    """A started request whose WorkItem's binding selected the tracker-result contract."""
+
+    request_id = _admit(client, github, sink, number)
+    epoch = _start_running(client, request_id)
+    _execute(
+        "UPDATE curie.execution_requests SET completion_contract = 'tracker_result', "
+        "result_policy_digest = :digest WHERE id = :id",
+        {"id": request_id, "digest": "cd" * 32},
+    )
+    return request_id, epoch
+
+
+def _result_urls(number: int) -> tuple[str, str]:
+    """(ticket URL, marked result comment URL) of a result delivered on ``number``."""
+
+    return (
+        f"https://github.com/{REPO}/issues/{number + 1000}",
+        f"https://github.com/{REPO}/issues/{number}#issuecomment-{number}01",
+    )
+
+
+def _settle(
+    request_id: uuid.UUID,
+    epoch: int,
+    number: int,
+    *,
+    kind: str,
+    reason: str | None = None,
+    state: str = "delivered",
+    origin: str = "submitted",
+) -> uuid.UUID:
+    """One grant and its delivery in ``state``; a delivered one also gets its receipt.
+
+    Written in one transaction with ``on_tracker_result_settled``, as the
+    delivery service settles. An owed delivery's next attempt is a day away so
+    no reconciler pass attempts it.
+    """
+
+    from curie_api.factory_triage_status import on_tracker_result_settled
+
+    ticket_url, comment_url = _result_urls(number)
+    ticket = kind == "ticket"
+    delivery_id = uuid.uuid4()
+    params: dict[str, Any] = {
+        "grant": uuid.uuid4(),
+        "delivery": delivery_id,
+        "request": request_id,
+        "kinds": '["findings", "ticket"]',
+        "identity": f"curie-result-{request_id}",
+        "kind": kind,
+        "reason": reason,
+        "hex": _HEX,
+        "epoch": epoch,
+        "state": state,
+        "origin": origin,
+        "revision": TRIAGE_REVISION,
+        "ticket_url": ticket_url if ticket else None,
+        "ticket_id": str(number + 1000) if ticket else None,
+        "body_hex": _HEX if ticket else None,
+        "labels": "[]" if ticket else None,
+        "comment_url": comment_url,
+        # A ticket's output columns are recorded only once it is delivered.
+        "output": ticket and state == "delivered",
+    }
+    statements = [
+        "INSERT INTO curie.factory_tracker_result_grants (id, work_item_id, "
+        "execution_request_id, source_fingerprint, repository_id, allowed_result_kinds, "
+        "output_identity, implementation_label, expires_at) "
+        "SELECT CAST(:grant AS uuid), w.id, r.id, :hex, w.repository_project_id, "
+        "CAST(:kinds AS jsonb), "
+        ":identity, 'factory-implement', clock_timestamp() + interval '1 hour' "
+        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE r.id = CAST(:request AS uuid)",
+        "INSERT INTO curie.factory_tracker_result_deliveries (id, grant_id, "
+        "execution_request_id, result_kind, reason, proposal_sha256, runtime_epoch, state, "
+        "origin, next_attempt_at, failure_code, settled_at, deadline_at, output_tracker_kind, "
+        "output_tracker_host, output_scope_id, output_issue_id, output_url, output_body_sha256) "
+        "SELECT CAST(:delivery AS uuid), CAST(:grant AS uuid), r.id, :kind, "
+        "CAST(:reason AS text), :hex, CAST(:epoch AS bigint), "
+        "CAST(:state AS text), :origin, clock_timestamp() + interval '1 day', "
+        "CASE WHEN CAST(:state AS text) = 'failed' THEN 'delivery_deadline_exceeded' END, "
+        "CASE WHEN CAST(:state AS text) <> 'owed' THEN clock_timestamp() END, "
+        "clock_timestamp() + interval '1 hour', "
+        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_kind END, "
+        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_host END, "
+        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_scope_id END, "
+        "CASE WHEN CAST(:output AS boolean) THEN CAST(:ticket_id AS text) END, "
+        "CASE WHEN CAST(:output AS boolean) THEN CAST(:ticket_url AS text) END, "
+        "CASE WHEN CAST(:output AS boolean) THEN CAST(:body_hex AS text) END "
+        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE r.id = CAST(:request AS uuid)",
+    ]
+    if state == "delivered":
+        statements.append(
+            "INSERT INTO curie.factory_tracker_result_receipts (delivery_id, grant_id, "
+            "execution_request_id, result_kind, reason, proposal_sha256, revision, "
+            "result_comment_id, result_comment_url, output_tracker_kind, output_tracker_host, "
+            "output_scope_id, output_issue_id, output_url, output_body_sha256, output_labels) "
+            "SELECT d.id, d.grant_id, d.execution_request_id, d.result_kind, d.reason, "
+            "d.proposal_sha256, :revision, '4401', :comment_url, d.output_tracker_kind, "
+            "d.output_tracker_host, d.output_scope_id, d.output_issue_id, d.output_url, "
+            "d.output_body_sha256, CAST(:labels AS jsonb) "
+            "FROM curie.factory_tracker_result_deliveries d "
+            "WHERE d.id = CAST(:delivery AS uuid)"
+        )
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with async_sessionmaker(engine)() as session:
+                for statement in statements:
+                    await session.execute(text(statement), params)
+                await on_tracker_result_settled(session, request_id)
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+    return delivery_id
+
+
+def _deliver_owed(delivery_id: uuid.UUID, request_id: uuid.UUID, number: int) -> None:
+    """A delivery that was owed when its run ended is delivered later (reading 5)."""
+
+    from curie_api.factory_triage_status import on_tracker_result_settled
+
+    _ticket_url, comment_url = _result_urls(number)
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with async_sessionmaker(engine)() as session:
+                await session.execute(
+                    text(
+                        "UPDATE curie.factory_tracker_result_deliveries "
+                        "SET state = 'delivered', settled_at = clock_timestamp() WHERE id = :id"
+                    ),
+                    {"id": delivery_id},
+                )
+                await session.execute(
+                    text(
+                        "INSERT INTO curie.factory_tracker_result_receipts (delivery_id, "
+                        "grant_id, execution_request_id, result_kind, reason, proposal_sha256, "
+                        "revision, result_comment_id, result_comment_url) "
+                        "SELECT id, grant_id, execution_request_id, result_kind, reason, "
+                        "proposal_sha256, :revision, '4401', :url "
+                        "FROM curie.factory_tracker_result_deliveries WHERE id = :id"
+                    ),
+                    {"id": delivery_id, "revision": TRIAGE_REVISION, "url": comment_url},
+                )
+                await on_tracker_result_settled(session, request_id)
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def _end(request_id: uuid.UUID, status: str, cause: str) -> None:
+    """The request's terminal transition, in the shape the lifecycle writes it."""
+
+    observed = status in {"expired", "cancelled"}
+    _execute(
+        "UPDATE curie.execution_requests SET status = :status, "
+        "terminal_at = clock_timestamp(), terminal_cause = :cause, "
+        "termination_observation = CASE WHEN :observed "
+        "THEN 'fixture runtime termination observed' END WHERE id = :id",
+        {"id": request_id, "status": status, "cause": cause, "observed": observed},
+    )
+
+
+def _label_added(sink: Any, number: int, label: str) -> bool:
+    path = f"/repos/{REPO}/issues/{number}/labels"
+    return any(
+        method == "POST" and called == path and body is not None and label in body
+        for method, called, body in sink.requests
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason", "ending"),
+    [
+        ("ticket", None, "Ticket published: {ticket}."),
+        ("findings", "not_reproduced", "Triage reported: not reproduced."),
+        ("findings", "already_fixed", "Triage reported: already fixed."),
+        ("findings", "product_decision_needed", "Triage reported: product decision needed."),
+        ("findings", "capability_unavailable", "Triage reported: capability unavailable."),
+    ],
+)
+def test_a_delivered_triage_result_shows_triaged_and_its_ending(
+    admitted: Any,  # noqa: F811
+    kind: str,
+    reason: str | None,
+    ending: str,
+) -> None:
+    client, github, sink = admitted
+    number = 58601
+    request_id, epoch = _triage_running(client, github, sink, number)
+    _reconcile()
+    assert _curie_labels(sink, number) == {"curie-factory:running"}
+
+    # Delivered inline while the run is still live: triaged whatever its status.
+    _settle(request_id, epoch, number, kind=kind, reason=reason)
+    _reconcile()
+    assert _curie_labels(sink, number) == {TRIAGED}
+    assert _notices(request_id)[0]["applied_label"] == TRIAGED
+
+    _end(request_id, "completed", "completed")
+    _reconcile()
+
+    ticket_url, comment_url = _result_urls(number)
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert ending.format(ticket=ticket_url) in body
+    assert comment_url in body
+    assert TRIAGE_REVISION in body
+    assert FINAL_MARKER in body
+    assert "Implementation" not in body
+    assert (ticket_url in body) is (kind == "ticket")
+    assert _curie_labels(sink, number) == {TRIAGED}
+    # Stored without violating factory_terminal_notices_applied_label_ck.
+    assert _notices(request_id)[0]["applied_label"] == TRIAGED
+    assert _notices(request_id)[0]["finalized_at"] is not None
+    assert not _label_added(sink, number, "curie-factory:pr-open")
+    assert "bug" in sink.issue_labels[number]
+
+
+def test_cancellation_removes_the_triaged_label(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 58602
+    request_id, epoch = _triage_running(client, github, sink, number)
+    _settle(request_id, epoch, number, kind="findings", reason="not_reproduced")
+    _reconcile()
+    assert _curie_labels(sink, number) == {TRIAGED}
+
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.status_code == 200, removed.text
+    _reconcile()
+    # The cancelled WorkItem clears the state label even before the run ends.
+    assert _curie_labels(sink, number) == set()
+
+    _end(request_id, "cancelled", "issue_cancelled")
+    _reconcile()
+    assert _curie_labels(sink, number) == set()
+    assert _notices(request_id)[0]["applied_label"] == ""
+    assert (
+        "DELETE",
+        f"/repos/{REPO}/issues/{number}/labels/{TRIAGED}",
+        None,
+    ) in sink.requests
+    (comment,) = _marked(sink, request_id)
+    assert "Cause: issue_cancelled" in comment["body"]
+    assert "bug" in sink.issue_labels[number]
+
+
+def _remove_trigger_label(client: Any, github: Any, number: int) -> None:
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.status_code == 200, removed.text
+
+
+def test_findings_delivered_then_work_item_cancelled_removes_triaged(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 58608
+    request_id, epoch = _triage_running(client, github, sink, number)
+    _settle(request_id, epoch, number, kind="findings", reason="not_reproduced")
+    _end(request_id, "completed", "completed")
+    _reconcile()
+    assert _curie_labels(sink, number) == {TRIAGED}
+
+    # The request stays completed; only the WorkItem is cancelled.
+    _remove_trigger_label(client, github, number)
+    _reconcile()
+    assert _request(number)["status"] == "completed"
+    assert _curie_labels(sink, number) == set()
+    assert _notices(request_id)[0]["applied_label"] == ""
+    assert (
+        "DELETE",
+        f"/repos/{REPO}/issues/{number}/labels/{TRIAGED}",
+        None,
+    ) in sink.requests
+    assert "bug" in sink.issue_labels[number]
+
+
+def test_findings_delivered_and_work_item_live_keeps_triaged(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 58609
+    request_id, epoch = _triage_running(client, github, sink, number)
+    _settle(request_id, epoch, number, kind="findings", reason="not_reproduced")
+    _end(request_id, "completed", "completed")
+    _reconcile()
+    _reconcile()
+    assert _curie_labels(sink, number) == {TRIAGED}
+    assert _notices(request_id)[0]["applied_label"] == TRIAGED
+    assert not any(
+        method == "DELETE" and called.endswith(f"/labels/{TRIAGED}")
+        for method, called, _body in sink.requests
+    )
+
+
+def test_a_cancelled_work_item_keeps_an_implementation_completed_label(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 58610
+    request_id = _admit(client, github, sink, number)
+    _start_running(client, request_id)
+    _end(request_id, "completed", "completed")
+    _reconcile()
+    assert _curie_labels(sink, number) == {"curie-factory:pr-open"}
+
+    _remove_trigger_label(client, github, number)
+    _reconcile()
+    assert _request(number)["status"] == "completed"
+    assert _curie_labels(sink, number) == {"curie-factory:pr-open"}
+    assert _notices(request_id)[0]["applied_label"] == "curie-factory:pr-open"
+
+
+def test_a_failed_delivery_shows_needs_human_and_no_result(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 58603
+    request_id, epoch = _triage_running(client, github, sink, number)
+    _settle(request_id, epoch, number, kind="ticket", state="failed")
+    _end(request_id, "failed", "tracker_result_undelivered")
+    _reconcile()
+
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+    assert _notices(request_id)[0]["applied_label"] == "curie-factory:needs-human"
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert "Could not complete: the investigation submitted a result" in body
+    assert "Cause: tracker_result_undelivered" in body
+    assert "Ticket published" not in body and "Triage reported" not in body
+    assert FINAL_MARKER in body
+    assert not _label_added(sink, number, TRIAGED)
+
+
+def test_a_run_ending_with_no_result_shows_needs_human(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 58604
+    request_id, _epoch = _triage_running(client, github, sink, number)
+    _end(request_id, "failed", "no_tracker_result")
+    _reconcile()
+
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+    (comment,) = _marked(sink, request_id)
+    assert "Cause: no_tracker_result" in comment["body"]
+    assert not _label_added(sink, number, TRIAGED)
+
+
+def test_a_delivery_owed_past_the_run_shows_triaged_once_delivered(
+    admitted: Any,  # noqa: F811
+) -> None:
+    """Reading 5: the run fails undelivered, a later delivery records the result
+    and the label becomes triaged while the execution status stays failed."""
+
+    client, github, sink = admitted
+    number = 58605
+    request_id, epoch = _triage_running(client, github, sink, number)
+    delivery_id = _settle(
+        request_id, epoch, number, kind="findings", reason="already_fixed", state="owed"
+    )
+    _end(request_id, "failed", "tracker_result_undelivered")
+    _reconcile()
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+    (failed,) = _marked(sink, request_id)
+    assert "Cause: tracker_result_undelivered" in failed["body"]
+    assert FINAL_MARKER in failed["body"]
+
+    _deliver_owed(delivery_id, request_id, number)
+    _reconcile()
+
+    assert _curie_labels(sink, number) == {TRIAGED}
+    assert _notices(request_id)[0]["applied_label"] == TRIAGED
+    (comment,) = _marked(sink, request_id)
+    assert comment["id"] == failed["id"]
+    assert "Triage reported: already fixed." in comment["body"]
+    assert _result_urls(number)[1] in comment["body"]
+    assert FINAL_MARKER in comment["body"]
+    assert _request(number)["status"] == "failed"
+
+
+def test_exhaustion_with_delivered_platform_findings_shows_triaged(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 58606
+    request_id, epoch = _triage_running(client, github, sink, number)
+    _end(request_id, "expired", "execution_deadline")
+    _settle(
+        request_id,
+        epoch,
+        number,
+        kind="findings",
+        reason="budget_exhausted",
+        origin="platform",
+    )
+    _reconcile()
+
+    assert _curie_labels(sink, number) == {TRIAGED}
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert "Investigation stopped: budget exhausted; findings delivered." in body
+    assert f"Revision checked out: {TRIAGE_REVISION}" in body
+    assert _result_urls(number)[1] in body
+    assert "reproduc" not in body.split(FINAL_MARKER)[0].lower()
+    assert _request(number)["status"] == "expired"
+
+
+def test_an_implementation_request_never_shows_triaged(admitted: Any) -> None:  # noqa: F811
+    """The label keys on the request's contract: even a receipt row on an
+    implementation request (which no route can write) changes nothing."""
+
+    client, github, sink = admitted
+    number = 58607
+    request_id = _admit(client, github, sink, number)
+    epoch = _start_running(client, request_id)
+    _settle(request_id, epoch, number, kind="findings", reason="not_reproduced")
+    _reconcile()
+    assert _curie_labels(sink, number) == {"curie-factory:running"}
+
+    _finish_failed(client, request_id, epoch, "runner_failed")
+    _reconcile()
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+    (comment,) = _marked(sink, request_id)
+    assert "Triage reported" not in comment["body"]
+    assert "Cause: runner_failed" in comment["body"]
+    assert not _label_added(sink, number, TRIAGED)

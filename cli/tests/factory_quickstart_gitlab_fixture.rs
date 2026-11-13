@@ -14,8 +14,8 @@
 //! `docker` to exit 1, so each stops at its first cluster step, after (f).
 //!
 //! Idempotence across reruns: each run uses a fresh trigger label and first
-//! deletes the four `curie-factory:*` state labels from `widgets` with the root
-//! token, so the first quickstart run must create all five. The fresh trigger
+//! deletes the five `curie-factory:*` state labels from `widgets` with the root
+//! token, so the first quickstart run must create all six. The fresh trigger
 //! label is deleted at the end; the state labels are left, as the quickstart
 //! leaves them.
 //!
@@ -32,11 +32,12 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-const STATE_LABELS: [&str; 4] = [
+const STATE_LABELS: [&str; 5] = [
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
+    "curie-factory:triaged",
 ];
 
 struct Fixture {

@@ -38,11 +38,12 @@ pub const GITLAB_DEFAULT_URL: &str = "https://gitlab.com";
 /// The kind of the code host and tracker entries this module writes.
 const KIND: &str = "gitlab";
 /// The state labels the factory moves on an issue, with their colors.
-const STATE_LABELS: [(&str, &str); 4] = [
+const STATE_LABELS: [(&str, &str); 5] = [
     ("curie-factory:queued", "#fbca04"),
     ("curie-factory:running", "#1d76db"),
     ("curie-factory:pr-open", "#0e8a16"),
     ("curie-factory:needs-human", "#d93f0b"),
+    ("curie-factory:triaged", "#0052cc"),
 ];
 /// The trigger label's color, the one the GitHub quickstart uses.
 const TRIGGER_LABEL_COLOR: &str = "#5319e7";
@@ -541,7 +542,10 @@ mod tests {
     fn wanted_labels_lead_with_the_trigger() {
         let labels = wanted_labels("factory-fast");
         assert_eq!(labels[0].0, "factory-fast");
-        assert_eq!(labels.len(), 5);
+        assert_eq!(labels.len(), 6);
+        assert!(labels
+            .iter()
+            .any(|(name, _)| name == "curie-factory:triaged"));
         assert!(labels
             .iter()
             .all(|(_, color)| color.len() == 7 && color.starts_with('#')));

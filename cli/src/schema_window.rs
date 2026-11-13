@@ -774,10 +774,12 @@ print(json.dumps(graph))
         // reads and enrollment fences require 0160, agent version reads select
         // the 0162 result policy columns, factory CI observations require the
         // 0163 table, cached facts and request delivery require the 0164
-        // tables, and Slack kickoff thread origin reads require 0166.
-        // Owner coding profiles and tenant policies require 0165, which stays below this floor.
-        assert_eq!(candidate.schema_min, "0166");
-        assert_eq!(candidate.schema_head, "0166");
+        // tables. Owner coding profiles and tenant policies require 0165,
+        // which stays below this floor. Slack kickoff thread origin reads
+        // require 0166, which stays below this floor. Execution request reads
+        // select the 0167 completion contract columns, which is the floor.
+        assert_eq!(candidate.schema_min, "0167");
+        assert_eq!(candidate.schema_head, "0167");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -831,7 +833,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0163", &current));
         assert!(!live_in_window("0164", &current));
         assert!(!live_in_window("0165", &current));
-        assert!(live_in_window("0166", &current));
+        assert!(!live_in_window("0166", &current));
+        assert!(live_in_window("0167", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

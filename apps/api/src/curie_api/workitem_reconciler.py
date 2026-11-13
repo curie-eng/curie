@@ -42,10 +42,19 @@ from . import (
     factory_review_feedback,
     factory_tracker_intake,
 )
+from . import factory_tracker_result_runtime as tracker_result_runtime
 from .code_host_trust import code_host_verify
 from .config import Settings
+from .factory_tracker_result_delivery import (
+    TrackerResultStorageError,
+    deliver,
+    due_deliveries,
+    expire_overdue,
+)
+from .forges.errors import ForgeError
+from .forges.ports import Tracker
 from .forges.registry import forges_registry
-from .models import ExecutionRequest, WorkItem
+from .models import ExecutionRequest, FactoryTrackerResultDelivery, WorkItem
 from .workitem_dispatch import (
     claim_due,
     claim_terminate_publishes,
@@ -55,6 +64,9 @@ from .workitem_dispatch import (
 )
 
 logger = logging.getLogger(__name__)
+
+# One reconciler delivery attempt; the attempt lease (120 s) outlives it.
+_TRACKER_RESULT_ATTEMPT_SECONDS = 55.0
 
 
 # Set the round's enqueue marker NX and append the turn atomically, so no crash
@@ -163,6 +175,10 @@ class WorkItemReconciler:
             ("poll_trackers", self._poll_trackers),
             ("redispatch_lapsed_acquisitions", self._redispatch_lapsed_acquisitions),
             ("reconcile_base_transitions", self._reconcile_base_transitions),
+            # Tracker results (ADR 0277, #5586): settle overdue deliveries, then
+            # attempt the due ones, a run's submission and platform findings alike.
+            ("expire_tracker_results", self._expire_tracker_results),
+            ("deliver_tracker_results", self._deliver_tracker_results),
             ("publish_execute_wakes", self._publish_execute_wakes),
         ):
             attributes = {"service.name": "curie-api", "step": name}
@@ -181,6 +197,62 @@ class WorkItemReconciler:
                 self._step_consecutive_failures[name],
                 attributes=attributes,
             )
+
+    async def _expire_tracker_results(self) -> None:
+        await expire_overdue(self._sessionmaker, limit=self._settings.work_item_batch_limit)
+
+    async def _deliver_tracker_results(self) -> None:
+        """One attempt for each due tracker result delivery, through the
+        WorkItem's own tracker, under this reconciler's attempt owner."""
+
+        async with self._sessionmaker() as session:
+            due = await due_deliveries(session, limit=self._settings.work_item_batch_limit)
+            if not due:
+                return
+            rows = (
+                await session.execute(
+                    select(FactoryTrackerResultDelivery.id, WorkItem)
+                    .join(
+                        ExecutionRequest,
+                        ExecutionRequest.id == FactoryTrackerResultDelivery.execution_request_id,
+                    )
+                    .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
+                    .where(FactoryTrackerResultDelivery.id.in_(due))
+                )
+            ).all()
+            client = httpx.AsyncClient(
+                timeout=self._settings.github_app_timeout_seconds,
+                verify=code_host_verify(self._settings),
+            )
+            # Built here, while the rows are attached; building makes no request.
+            targets: list[tuple[uuid.UUID, Tracker]] = []
+            for delivery_id, work_item in rows:
+                try:
+                    tracker = tracker_result_runtime.work_item_tracker(
+                        self._settings, client, work_item
+                    )
+                except ForgeError:
+                    logger.warning(
+                        "tracker result delivery %s has no tracker configured", delivery_id
+                    )
+                    continue
+                targets.append((delivery_id, tracker))
+            await session.rollback()
+        try:
+            for delivery_id, tracker in targets:
+                try:
+                    async with asyncio.timeout(_TRACKER_RESULT_ATTEMPT_SECONDS):
+                        await deliver(
+                            self._sessionmaker,
+                            delivery_id,
+                            tracker=tracker,
+                            settings=self._settings,
+                            owner=self._owner,
+                        )
+                except (TrackerResultStorageError, TimeoutError):
+                    logger.warning("tracker result delivery %s attempt did not finish", delivery_id)
+        finally:
+            await client.aclose()
 
     async def _redispatch_lapsed_acquisitions(self) -> None:
         async with self._sessionmaker() as session:
