@@ -2422,6 +2422,16 @@ to refresh those checksums. Rotation is explicit;
 ordinary upgrades never silently rotate the certificate. Do not delete the
 replay PVC during rotation.
 
+`channelGateway.identityLookup.existingSecret` turns on the gateway's Slack
+user email lookup for an external HTTP identity provider. It names an
+operator-supplied Secret whose `channelGateway.identityLookup.tokenKey`
+(default `token`) holds a dedicated identity caller credential; the gateway
+receives it as `CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN` and the provider uses
+the same value. `channelGateway.identityLookup.timeoutSeconds` (default 5)
+bounds each Slack call. That caller can only read a user's email. Restart the
+gateway after rotating the Secret. See the
+[http identity operator guide](../../docs/http-identity-operator.md).
+
 An external gateway uses `channelGateway.url`; configure separate
 `channelGateway.apiToken` and `channelGateway.workerToken`. For a private CA,
 `channelGateway.tlsSecret` supplies `ca.crt` to callers. For a chart-deployed

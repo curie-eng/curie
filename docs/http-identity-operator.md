@@ -43,7 +43,19 @@ runs refuse an unregistered reference with `provider_credential_unavailable`
 before committing any authority change. Registrations must match the tenant,
 issuer and exact lookup URL as well as the credential ID and generation.
 This workflow requires configuration files and operator API calls, not custom
-application code. The [chart installation reference](../charts/curie/README.md#http-identity-operator-files)
+application code.
+
+A provider that maps Slack senders by email does not need its own Slack token.
+When Slack tokens live only in the channel gateway, set
+`channelGateway.identityLookup.existingSecret` (and `tokenKey`, default
+`token`) to a Secret holding a dedicated identity caller credential. Give the
+provider that same value as `CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN`, with
+`CURIE_CHANNEL_GATEWAY_URL` and `CURIE_CHANNEL_GATEWAY_CA_FILE` for the
+gateway. The provider then asks the gateway for the sender's email with the
+lookup request's `native_id` and namespace `key`, through the
+[gateway user email lookup](../packages/channel-gateway/README.md#slack-user-email-lookup-for-identity-providers).
+An unknown user should be answered `unresolved`; a gateway error or timeout
+`unavailable`. The [chart installation reference](../charts/curie/README.md#http-identity-operator-files)
 describes the protected files and activation wiring.
 
 ## Adopt and inspect
