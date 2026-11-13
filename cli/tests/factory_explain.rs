@@ -20,16 +20,6 @@ use std::thread;
 
 use serde_json::{json, Value};
 
-fn explain_target() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().starts_with("factory_explain"))
-        })
-        .unwrap_or(false)
-}
-
 #[derive(Clone)]
 struct Req {
     method: String,
@@ -271,10 +261,10 @@ fn scene(issue: u64, pulls: Vec<Pull>, foreign: bool) -> impl Fn(&Req) -> Resp {
         if path.contains("/check-runs") {
             return Resp {
                 status: 200,
-                body: json!({"total_count": 2, "check_runs": [
+                body: json!({"total_count": 3, "check_runs": [
+                    {"name": "Python", "status": "completed", "conclusion": "failure", "completed_at": "2026-01-02T00:00:00Z"},
                     {"name": "Rust", "status": "completed", "conclusion": "success", "completed_at": "2026-01-02T00:00:00Z"},
-                    {"name": "Python", "status": "completed", "conclusion": "success", "completed_at": "2026-01-01T00:00:00Z"},
-                    {"name": "Python", "status": "completed", "conclusion": "failure", "completed_at": "2026-01-02T00:00:00Z"}
+                    {"name": "Python", "status": "completed", "conclusion": "success", "completed_at": "2026-01-01T00:00:00Z"}
                 ]}).to_string(),
                 extra: vec![],
             };
@@ -283,8 +273,8 @@ fn scene(issue: u64, pulls: Vec<Pull>, foreign: bool) -> impl Fn(&Req) -> Resp {
             return Resp {
                 status: 200,
                 body: json!([
-                    {"context": "ci/local", "state": "success", "created_at": "2026-01-01T00:00:00Z"},
-                    {"context": "ci/local", "state": "pending", "created_at": "2026-01-02T00:00:00Z"}
+                    {"context": "ci/local", "state": "pending", "created_at": "2026-01-02T00:00:00Z"},
+                    {"context": "ci/local", "state": "success", "created_at": "2026-01-01T00:00:00Z"}
                 ]).to_string(),
                 extra: vec![],
             };
@@ -347,11 +337,89 @@ fn marked(number: u64, created: &'static str, issue: u64) -> Pull {
     }
 }
 
+fn one_pull_checks(check_runs: Value, statuses: Value) -> impl Fn(&Req) -> Resp {
+    move |req| {
+        let path = route(&req.path);
+        if path == "/repos/curie-eng/curie" {
+            return Resp {
+                status: 200,
+                body: json!({"id": 101, "html_url": "https://github.com/curie-eng/curie", "name": "curie", "owner": {"login": "curie-eng"}}).to_string(),
+                extra: vec![],
+            };
+        }
+        if path == "/repos/curie-eng/curie/issues/12" {
+            return Resp {
+                status: 200,
+                body: json!({"number": 12, "title": "Explain", "state": "open"}).to_string(),
+                extra: vec![],
+            };
+        }
+        if path == "/repos/curie-eng/curie/issues/12/timeline" {
+            return Resp {
+                status: 200,
+                body: json!([{
+                    "event": "cross-referenced",
+                    "created_at": "2026-03-01T00:00:00Z",
+                    "source": {"issue": {"number": 7, "created_at": "2026-03-01T00:00:00Z", "pull_request": {"url": "https://api.github.com/repos/curie-eng/curie/pulls/7"}}}
+                }]).to_string(),
+                extra: vec![],
+            };
+        }
+        if path == "/repos/curie-eng/curie/pulls/7" {
+            return Resp {
+                status: 200,
+                body: json!({
+                    "number": 7,
+                    "html_url": "https://github.com/curie-eng/curie/pull/7",
+                    "title": "Change 7",
+                    "state": "closed",
+                    "merged_at": "2026-05-01T00:00:00Z",
+                    "created_at": "2026-03-01T00:00:00Z",
+                    "body": format!("Summary.\n{}", marker(12)),
+                    "head": {"sha": "abc07"}
+                })
+                .to_string(),
+                extra: vec![],
+            };
+        }
+        if path.contains("/reviews") {
+            return Resp {
+                status: 200,
+                body: "[]".into(),
+                extra: vec![],
+            };
+        }
+        if path.contains("/check-runs") {
+            return Resp {
+                status: 200,
+                body: json!({"check_runs": check_runs.clone()}).to_string(),
+                extra: vec![],
+            };
+        }
+        if path.contains("/statuses") {
+            return Resp {
+                status: 200,
+                body: statuses.to_string(),
+                extra: vec![],
+            };
+        }
+        Resp {
+            status: 404,
+            body: "{}".into(),
+            extra: vec![],
+        }
+    }
+}
+
+fn explained_checks(check_runs: Value, statuses: Value) -> Value {
+    let server = serve(one_pull_checks(check_runs, statuses));
+    let output = run(&["curie-eng/curie#12", "--json"], &server, &token(), None);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    json_stdout(&output)["pull_requests"][0]["checks"].clone()
+}
+
 #[test]
 fn one_marked_pull_request_prints_the_record() {
-    if !explain_target() {
-        return;
-    }
     let server = serve(scene(
         12,
         vec![
@@ -460,9 +528,6 @@ fn one_marked_pull_request_prints_the_record() {
 
 #[test]
 fn zero_several_unrecorded_outcomes() {
-    if !explain_target() {
-        return;
-    }
     let ignored = serve(scene(
         12,
         vec![
@@ -636,9 +701,6 @@ fn zero_several_unrecorded_outcomes() {
 
 #[test]
 fn caller_login_uses_only_the_forge_token() {
-    if !explain_target() {
-        return;
-    }
     let dir = std::env::temp_dir().join(format!("explain-gh-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -810,9 +872,6 @@ fn caller_login_uses_only_the_forge_token() {
 
 #[test]
 fn caller_login_gh_receives_hostname_for_a_non_github_host() {
-    if !explain_target() {
-        return;
-    }
     let dir = std::env::temp_dir().join(format!("explain-gh-args-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -847,9 +906,6 @@ fn caller_login_gh_receives_hostname_for_a_non_github_host() {
 
 #[test]
 fn exit_codes_for_usage_failure_and_transient() {
-    if !explain_target() {
-        return;
-    }
     let server = serve(scene(12, vec![], false));
     for reference in [
         "nope",
@@ -964,9 +1020,6 @@ fn exit_codes_for_usage_failure_and_transient() {
 
 #[test]
 fn timeline_stops_at_ten_pages() {
-    if !explain_target() {
-        return;
-    }
     let server = serve(|req: &Req| {
         let path = route(&req.path);
         if path == "/repos/curie-eng/curie" {
@@ -1035,9 +1088,6 @@ fn token() -> [(&'static str, &'static str); 1] {
 
 #[test]
 fn pagination_rejects_a_next_link_on_another_origin() {
-    if !explain_target() {
-        return;
-    }
     let server = serve(|req: &Req| {
         let path = route(&req.path);
         if path == "/repos/curie-eng/curie" {
@@ -1096,9 +1146,6 @@ fn pagination_rejects_a_next_link_on_another_origin() {
 
 #[test]
 fn response_body_reset_is_transient() {
-    if !explain_target() {
-        return;
-    }
     let server = serve(|_req: &Req| Resp {
         status: 200,
         body: json!({"id": 101, "html_url": "https://github.com/curie-eng/curie"}).to_string(),
@@ -1116,9 +1163,6 @@ fn response_body_reset_is_transient() {
 
 #[test]
 fn equal_timestamps_keep_the_newest_first_row() {
-    if !explain_target() {
-        return;
-    }
     let server = serve(|req: &Req| {
         let path = route(&req.path);
         if path == "/repos/curie-eng/curie" {
@@ -1208,10 +1252,36 @@ fn equal_timestamps_keep_the_newest_first_row() {
 }
 
 #[test]
+fn newer_queued_rerun_stays_pending() {
+    let checks = explained_checks(
+        json!([
+            {"name": "Lint", "status": "queued", "conclusion": null, "started_at": null, "completed_at": null},
+            {"name": "Lint", "status": "completed", "conclusion": "success", "started_at": "2026-01-01T00:00:00Z", "completed_at": "2026-01-02T00:00:00Z"}
+        ]),
+        json!([]),
+    );
+    assert_eq!(checks["passing"], 0, "{checks}");
+    assert_eq!(checks["failing"], 0, "{checks}");
+    assert_eq!(checks["pending"], 1, "{checks}");
+}
+
+#[test]
+fn newer_failure_beats_an_older_success_that_completed_later() {
+    let checks = explained_checks(
+        json!([
+            {"name": "Lint", "status": "completed", "conclusion": "failure", "started_at": "2026-01-02T00:00:00Z", "completed_at": "2026-01-02T01:00:00Z"},
+            {"name": "Lint", "status": "completed", "conclusion": "success", "started_at": "2026-01-01T00:00:00Z", "completed_at": "2026-01-02T02:00:00Z"}
+        ]),
+        json!([]),
+    );
+    assert_eq!(checks["passing"], 0, "{checks}");
+    assert_eq!(checks["failing"], 1, "{checks}");
+    assert_eq!(checks["pending"], 0, "{checks}");
+    assert_eq!(checks["failing_names"], json!(["Lint"]), "{checks}");
+}
+
+#[test]
 fn mixed_case_reference_uses_the_canonical_repository() {
-    if !explain_target() {
-        return;
-    }
     let server = serve(|req: &Req| {
         let path = route(&req.path);
         if path.eq_ignore_ascii_case("/repos/curie-eng/curie") {

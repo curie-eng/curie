@@ -16,6 +16,8 @@ const MAX_ENTRIES: usize = 7;
 const MAX_PAGES: usize = 10;
 const SUMMARY_CHARS: usize = 1000;
 const REVIEW_CHARS: usize = 2000;
+/// Nonblank lines in the Decisions section, not counting the breaks between them.
+const MAX_SECTION_CHARACTERS: usize = 7000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DecisionEntry {
@@ -476,7 +478,7 @@ enum Bucket {
 }
 
 fn checks_out(check_runs: &[Value], statuses: &[Value]) -> ChecksOut {
-    let mut runs: BTreeMap<String, (String, Bucket)> = BTreeMap::new();
+    let mut runs: BTreeMap<String, Bucket> = BTreeMap::new();
     for run in check_runs {
         let Some(name) = run
             .get("name")
@@ -485,19 +487,16 @@ fn checks_out(check_runs: &[Value], statuses: &[Value]) -> ChecksOut {
         else {
             continue;
         };
-        let when = run
-            .get("completed_at")
-            .and_then(Value::as_str)
-            .or_else(|| run.get("started_at").and_then(Value::as_str))
-            .unwrap_or("");
         let bucket = check_run_bucket(
             run.get("status").and_then(Value::as_str).unwrap_or(""),
             run.get("conclusion").and_then(Value::as_str),
         );
-        // Check runs are newest first, so the first row wins a shared timestamp.
-        replace_latest(&mut runs, name, when, bucket, true);
+        // GitHub lists check runs newest first. The first row for a name is
+        // that check, including a queued rerun with no completion time and a
+        // newer failure whose older sibling completed later.
+        runs.entry(name.to_string()).or_insert(bucket);
     }
-    let mut contexts: BTreeMap<String, (String, Bucket)> = BTreeMap::new();
+    let mut contexts: BTreeMap<String, Bucket> = BTreeMap::new();
     for status in statuses {
         let Some(name) = status
             .get("context")
@@ -506,19 +505,15 @@ fn checks_out(check_runs: &[Value], statuses: &[Value]) -> ChecksOut {
         else {
             continue;
         };
-        let when = status
-            .get("created_at")
-            .and_then(Value::as_str)
-            .unwrap_or("");
         let bucket = status_bucket(status.get("state").and_then(Value::as_str).unwrap_or(""));
-        // Statuses are newest first, so the first row wins a shared timestamp.
-        replace_latest(&mut contexts, name, when, bucket, true);
+        // Commit statuses are newest first, so the first row for a context wins.
+        contexts.entry(name.to_string()).or_insert(bucket);
     }
     let mut passing = 0;
     let mut failing = 0;
     let mut pending = 0;
     let mut failing_names = Vec::new();
-    for (name, (_, bucket)) in runs.into_iter().chain(contexts) {
+    for (name, bucket) in runs.into_iter().chain(contexts) {
         match bucket {
             Bucket::Passing => passing += 1,
             Bucket::Failing => {
@@ -535,23 +530,6 @@ fn checks_out(check_runs: &[Value], statuses: &[Value]) -> ChecksOut {
         failing,
         pending,
         failing_names,
-    }
-}
-
-fn replace_latest(
-    map: &mut BTreeMap<String, (String, Bucket)>,
-    name: &str,
-    when: &str,
-    bucket: Bucket,
-    keep_first_on_tie: bool,
-) {
-    let keep = match map.get(name) {
-        Some((prev, _)) if prev.as_str() > when => true,
-        Some((prev, _)) if keep_first_on_tie && prev.as_str() == when => true,
-        _ => false,
-    };
-    if !keep {
-        map.insert(name.to_string(), (when.to_string(), bucket));
     }
 }
 
@@ -608,6 +586,15 @@ pub(crate) fn parse_decisions(body: &str) -> DecisionsParse {
             break;
         }
         section.push(line.clone());
+    }
+    // The cap is the sum of the nonblank lines. Breaks between them do not count.
+    let section_characters: usize = section
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.chars().count())
+        .sum();
+    if section_characters > MAX_SECTION_CHARACTERS {
+        return DecisionsParse::Unparsed(section);
     }
     let content: Vec<&str> = section
         .iter()
@@ -1064,5 +1051,27 @@ mod tests {
                 assert_eq!(entry.evidence, want["evidence"].as_str().unwrap(), "{id}");
             }
         }
+    }
+
+    #[test]
+    fn decisions_section_character_cap() {
+        let line_for = |choice_len: usize| {
+            format!(
+                "1. {}. Rejected: a, because r. (plan) Evidence: e.",
+                "c".repeat(choice_len)
+            )
+        };
+        let mut choice_len = 1;
+        while line_for(choice_len).chars().count() < MAX_SECTION_CHARACTERS {
+            choice_len += 1;
+        }
+        assert_eq!(line_for(choice_len).chars().count(), MAX_SECTION_CHARACTERS);
+        let at_cap = parse_decisions(&format!("## Decisions\n{}\n", line_for(choice_len)));
+        assert!(
+            matches!(at_cap, DecisionsParse::Recorded(ref entries) if entries.len() == 1),
+            "{at_cap:?}"
+        );
+        let over = parse_decisions(&format!("## Decisions\n{}\n", line_for(choice_len + 1)));
+        assert!(matches!(over, DecisionsParse::Unparsed(_)), "{over:?}");
     }
 }
