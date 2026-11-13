@@ -8,7 +8,7 @@ bytes so a runner can pull a bundle by version.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
-from sqlalchemy import delete, exists
+from sqlalchemy import delete, exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -98,7 +98,7 @@ async def _read_bounded_upload(file: UploadFile, max_bytes: int) -> bytes:
     return b"".join(chunks)
 
 
-async def _discard_upload_version(session: AsyncSession, version: AgentVersion) -> None:
+async def _discard_upload_version(session: AsyncSession, version_id: uuid.UUID) -> None:
     """Delete the version a refused tracker result upload was made for (#5585).
 
     Acceptance criterion 2 says a refused tracker result deployment leaves no
@@ -108,18 +108,29 @@ async def _discard_upload_version(session: AsyncSession, version: AgentVersion) 
     with no bundle that no deployment references exists only for this upload,
     and nothing will ever upload into it again: a retry creates a new version.
     A version a deployment already references (the documented
-    deploy-then-attach order) is kept. One guarded DELETE decides, so a
-    deployment created concurrently keeps its version. Only this refusal
-    discards: any other refused upload leaves the version as it always has.
+    deploy-then-attach order) is kept. Only this refusal discards: any other
+    refused upload leaves the version as it always has.
+
+    The order is load-bearing because ``deployments.version_id`` cascades on
+    delete. A ``NOT EXISTS`` inside the DELETE could be judged before a
+    concurrent deployment INSERT commits and then cascade away that new
+    deployment. ``FOR UPDATE`` conflicts with the key-share lock the INSERT's
+    foreign key check holds on the version row, so it waits until that
+    transaction ends; the checks after it then see the committed deployment.
+    And once this lock is held, a new deployment INSERT waits for this
+    transaction, then fails its foreign key check if the row is gone.
     """
 
-    await session.execute(
-        delete(AgentVersion).where(
-            AgentVersion.id == version.id,
-            AgentVersion.bundle_ref.is_(None),
-            ~exists().where(Deployment.version_id == AgentVersion.id),
-        )
+    locked = await session.scalar(
+        select(AgentVersion.bundle_ref)
+        .where(AgentVersion.id == version_id)
+        .with_for_update()
     )
+    referenced = await session.scalar(
+        select(exists().where(Deployment.version_id == version_id))
+    )
+    if locked is None and not referenced:
+        await session.execute(delete(AgentVersion).where(AgentVersion.id == version_id))
     await session.commit()
 
 
@@ -154,7 +165,7 @@ async def upload_bundle(
     except deploy.TrackerResultNotEnabled as exc:
         # Before the route join, `store.put` and `attach_bundle`, so a refused
         # bundle stores no object and leaves `bundle_ref` null (#5585).
-        await _discard_upload_version(session, version)
+        await _discard_upload_version(session, version.id)
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
         ) from exc

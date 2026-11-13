@@ -680,6 +680,28 @@ async def process_push(
         sibling = await _bundled_version_for_commit(
             session, repo_agents, after, exclude_agent_id=agent.id
         )
+        if sibling is not None:
+            # @spec ACTION-EXECUTOR-16: the sibling object is stored bytes too,
+            # so it gets the intake re-check upload would give: sealing key
+            # custody and the tracker result refusal (#5585). It runs before
+            # the version row below and before the route join, so a refused
+            # object leaves no row for this agent, and a malformed declaration
+            # reports its own validation codes rather than a route error the
+            # join would raise first. Its extract is also this object's bounds
+            # check: nothing revalidates it later, because `bundle_built` is
+            # true and the `revalidate_stored_bundle` block below is skipped,
+            # so an over-cap legacy sibling is refused here as
+            # `bundle.too_large` (ADR-0059 decision 3).
+            try:
+                await deploy.check_stored_bundle_intake(store, sibling, settings)
+            except deploy.BundleInvalid as exc:
+                return WebhookResult(status="rejected", agent_id=agent.id, errors=exc.errors)
+            except (
+                deploy.BundleTooLarge,
+                deploy.SealingKeyCustody,
+                deploy.TrackerResultNotEnabled,
+            ) as exc:
+                return _rejected(exc, agent.id)
         if version is None:
             # The row, and only the row, precedes the refusal below: it is the
             # BUNDLE that must not be written yet (#2436). A bundleless row is
@@ -733,27 +755,14 @@ async def process_push(
                 await deploy.check_approval_route_bindings(
                     store, sibling, agent.approval_routes, settings
                 )
-                # @spec ACTION-EXECUTOR-16: the sibling object is stored
-                # bytes too, so it gets the custody re-check intake would give,
-                # and the tracker result refusal (#5585) with it.
-                await deploy.check_stored_bundle_intake(store, sibling, settings)
-            except deploy.BundleInvalid as exc:
-                return WebhookResult(status="rejected", agent_id=agent.id, errors=exc.errors)
             except (
                 deploy.BundleTooLarge,
                 deploy.ApprovalRoutesUnbound,
                 approver_tickets.BundleGateMismatch,
-                deploy.SealingKeyCustody,
-                deploy.TrackerResultNotEnabled,
             ) as exc:
-                # `bundle.too_large` is live here, not theoretical: the sibling
-                # object is a DIFFERENT object from the archive
-                # `validate_archive` cleared moments ago, and on this path
-                # nothing revalidates it -- `bundle_built` is true, so the
-                # `revalidate_stored_bundle` block below is skipped. This gate's
-                # extract is the only bounds check the attached object gets, so
-                # an over-cap legacy sibling is refused here and is not attached
-                # (ADR-0059 decision 3).
+                # The intake re-check above already applied the current caps
+                # to this object, so `bundle.too_large` here would mean the
+                # caps moved mid-delivery; it keeps the same envelope.
                 return _rejected(exc, agent.id)
             version = await crud_versions.attach_bundle(
                 session, version, str(sibling.bundle_ref), str(sibling.bundle_sha256)

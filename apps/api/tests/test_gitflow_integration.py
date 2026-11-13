@@ -3463,9 +3463,16 @@ def _replace_stored_bundle_with(agent_id: str, version_id: str, connectors_yaml:
     the version row is repointed with SQL.
     """
 
+    files = {**VALID_FILES, "connectors.yaml": connectors_yaml}
+    _repoint_stored_bundle(agent_id, version_id, files)
+
+
+def _repoint_stored_bundle(agent_id: str, version_id: str, files: dict[str, str]) -> None:
+    """Store ``files`` as a tar.gz under a fresh key and repoint the version at it."""
+
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for rel, content in {**VALID_FILES, "connectors.yaml": connectors_yaml}.items():
+        for rel, content in files.items():
             data = content.encode()
             info = tarfile.TarInfo(f"demo-plugin/{rel}")
             info.size = len(data)
@@ -3544,3 +3551,136 @@ def test_a_prod_promote_of_a_stored_bundle_with_the_sealing_key_secret_ref_is_pr
 
     assert body["status"] == "promoted", body
     assert body["version_id"] == dev["version_id"], body
+
+
+# --------------------------------------------------------------------------- #
+# #5585: a sibling promote re-checks the stored object's result declaration
+# --------------------------------------------------------------------------- #
+
+_RESULT_DECLARATION = (
+    '{"schema_version": 1, "contract": "tracker_result", "results": ["findings"]}'
+)
+
+
+def _work_item_count(agent_id: str) -> int:
+    async def _run() -> int:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                value = await conn.scalar(
+                    text("SELECT count(*) FROM curie.work_items WHERE agent_id = :agent_id"),
+                    {"agent_id": uuid.UUID(agent_id)},
+                )
+        finally:
+            await engine.dispose()
+        return int(value or 0)
+
+    return asyncio.run(_run())
+
+
+def _dev_deployed_sibling(
+    client: Any, auth_headers: dict[str, str], trusted_clone_base: Path, files: dict[str, str]
+) -> tuple[str, str, str, str, str]:
+    """Deploy ``files`` to the dev agent; return (dev_id, prod_id, sha, url, dev version)."""
+
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, files)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    assert dev["agent_id"] == dev_id, dev
+    return dev_id, prod_id, sha, clone_url, str(dev["version_id"])
+
+
+def _assert_prod_untouched(client: Any, auth_headers: dict[str, str], prod_id: str) -> None:
+    assert client.get(f"/agents/{prod_id}/versions", headers=auth_headers).json() == []
+    assert (
+        client.get("/deployments", params={"agent_id": prod_id}, headers=auth_headers).json()
+        == []
+    )
+    assert _work_item_count(prod_id) == 0
+
+
+def test_a_sibling_promote_of_a_stored_result_declaration_is_refused_before_any_row(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """The sibling object is refused before the prod agent gets a version row.
+
+    The dev agent's stored object is repointed at bytes that carry a valid
+    `workflow/result.json`, as a bundle stored before intake refused it would.
+    The main push resolves to the prod agent, which has no version for this
+    sha, so it takes the bundle-once/bind-many branch and reads that object.
+    """
+
+    dev_id, prod_id, sha, clone_url, dev_version = _dev_deployed_sibling(
+        client, auth_headers, trusted_clone_base, TWO_TARGET_FILES
+    )
+    _repoint_stored_bundle(
+        dev_id,
+        dev_version,
+        {**TWO_TARGET_FILES, "workflow/result.json": _RESULT_DECLARATION},
+    )
+
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert prod["status"] == "rejected", prod
+    assert prod["agent_id"] == prod_id, prod
+    assert [e["code"] for e in prod["errors"]] == ["tracker_result_not_enabled"], prod
+    _assert_prod_untouched(client, auth_headers, prod_id)
+
+
+def test_a_sibling_promote_of_a_malformed_stored_declaration_reports_it_before_routes(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A malformed declaration reports its own code, not the route join's.
+
+    The stored object also declares the `ops` route, which only the dev agent
+    binds, so a route join run first would answer `approval_routes.unbound`
+    for the prod agent and hide the declaration's validation error.
+    """
+
+    gated = _gated_files(TWO_TARGET_FILES, "ops")
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    _bind_route(client, auth_headers, dev_id, "ops")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, gated)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    _repoint_stored_bundle(
+        dev_id, str(dev["version_id"]), {**gated, "workflow/result.json": "[]"}
+    )
+
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert prod["status"] == "rejected", prod
+    assert [e["code"] for e in prod["errors"]] == ["tracker_result.not_object"], prod
+    _assert_prod_untouched(client, auth_headers, prod_id)
+
+
+def test_a_sibling_promote_of_the_same_stored_bundle_without_the_declaration_promotes(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """The paired control: a repointed sibling object without the file still promotes."""
+
+    dev_id, prod_id, sha, clone_url, dev_version = _dev_deployed_sibling(
+        client, auth_headers, trusted_clone_base, TWO_TARGET_FILES
+    )
+    _repoint_stored_bundle(dev_id, dev_version, dict(TWO_TARGET_FILES))
+
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert prod["status"] == "promoted", prod
+    assert prod["agent_id"] == prod_id, prod
+    deployments = client.get(
+        "/deployments", params={"agent_id": prod_id}, headers=auth_headers
+    ).json()
+    assert [d["environment"] for d in deployments] == ["prod"], deployments

@@ -13,8 +13,11 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import pytest
 from curie_api import bundles
 from curie_api.config import get_settings
+from curie_api.db import create_sessionmaker
+from curie_api.routers.bundles import _discard_upload_version
 from curie_api.storage import BundleStore
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -432,6 +435,69 @@ def test_upload_with_a_malformed_result_declaration_reports_validation_first(
     assert detail["detail"] == "bundle failed validation"
     assert [e["code"] for e in detail["errors"]] == ["tracker_result.schema_version"]
     assert "tracker_result_not_enabled" not in resp.text
+
+
+def test_the_refusal_cleanup_waits_for_a_concurrent_deployment_and_keeps_both(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The discard locks the version before it decides (#5585, review C2).
+
+    `deployments.version_id` cascades on delete, so a cleanup that judged "no
+    deployment" before a concurrent deployment INSERT committed would delete
+    that new deployment with the version. Connection A inserts a deployment
+    and holds its transaction open; the cleanup runs as a task and must block
+    on A's foreign key lock (observed through `pg_blocking_pids`, no sleeps);
+    after A commits, both rows must survive. Calls the router's cleanup helper
+    directly because the TestClient cannot interleave with an open transaction.
+    """
+
+    agent_id, version_id = _create_version(client, auth_headers)
+    deployment_id = uuid.uuid4()
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as holder, engine.connect() as observer:
+                await holder.execute(
+                    text(
+                        "INSERT INTO curie.deployments "
+                        "(id, agent_id, version_id, environment, status) VALUES "
+                        "(:id, :agent, :version, CAST('dev' AS curie.environment), 'active')"
+                    ),
+                    {
+                        "id": deployment_id,
+                        "agent": uuid.UUID(agent_id),
+                        "version": uuid.UUID(version_id),
+                    },
+                )
+                holder_pid = await holder.scalar(text("SELECT pg_backend_pid()"))
+                async with create_sessionmaker(engine)() as session:
+                    cleaner_pid = await session.scalar(text("SELECT pg_backend_pid()"))
+                    task = asyncio.create_task(
+                        _discard_upload_version(session, uuid.UUID(version_id))
+                    )
+                    # Each observation is a database round trip, which yields
+                    # to the task; the bound only stops a broken run.
+                    for _ in range(10_000):
+                        blockers = await observer.scalar(
+                            text("SELECT pg_blocking_pids(:pid)"), {"pid": cleaner_pid}
+                        )
+                        if holder_pid in (blockers or []):
+                            break
+                        assert not task.done(), "the cleanup finished without waiting for A"
+                    else:
+                        pytest.fail("the cleanup never blocked on the open deployment insert")
+                    assert not task.done()
+                    await holder.commit()
+                    await task
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
+    assert [v["id"] for v in versions] == [version_id]
+    assert _count_rows("deployments", agent_id) == 1
 
 
 def test_deploying_a_stored_bundle_with_a_result_declaration_is_refused(
