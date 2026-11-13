@@ -462,7 +462,10 @@ def test_stale_metadata_cannot_recover_until_fresh_checks_exist(
 
 @pytest.fixture
 def migration_admitted(isolated_migration_db: Any, request: pytest.FixtureRequest) -> Any:
-    isolated_migration_db.at("0163")
+    # The guard under test is 0163. The application refuses to start below
+    # 0167, so the client starts at that floor. Downgrade to 0162 still passes
+    # through 0163, and 0167 only drops origin when no kickoff row exists.
+    isolated_migration_db.at("0167")
     return request.getfixturevalue("admitted")
 
 
