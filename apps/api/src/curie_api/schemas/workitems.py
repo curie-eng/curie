@@ -244,7 +244,7 @@ class WorkItemOutcomeList(BaseModel):
 class FactoryRunEventOut(BaseModel):
     id: str
     at: datetime
-    kind: Literal["conversation", "phase", "publication", "state", "terminal"]
+    kind: Literal["phase", "publication", "state", "terminal"]
     text: str
     reference_url: str | None = None
     phase: str | None = None
@@ -263,11 +263,10 @@ class FactoryRunAnalysisOut(BaseModel):
 
 
 class FactoryRunSourcesOut(BaseModel):
-    transcript: Literal["complete", "missing", "truncated", "malformed", "unattributed"]
     phase_reports: Literal["complete", "missing", "truncated"]
     state_changes: Literal["partial", "truncated"]
     publications: Literal["complete", "missing", "truncated"]
-    traces: Literal["unavailable"]
+    traces: Literal["time_matched", "missing", "truncated", "unavailable"]
     artifacts: Literal["complete", "unavailable", "truncated"]
 
 
@@ -278,6 +277,7 @@ class FactoryRunReportOut(BaseModel):
     terminal_cause: str
     terminal_at: datetime
     sources: FactoryRunSourcesOut
+    trace_ids: list[str]
     events: list[FactoryRunEventOut]
     analysis: FactoryRunAnalysisOut
 

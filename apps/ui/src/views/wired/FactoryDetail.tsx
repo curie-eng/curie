@@ -157,7 +157,7 @@ function RunReport({ itemId, requestId }: { itemId: string; requestId: string })
 }
 
 function RunReportBody({ report }: { report: FactoryRunReport }) {
-  const { state } = useStore();
+  const { state, dispatch } = useStore();
   return (
     <div data-testid="factory-run-report" style={{ borderTop: `1px solid ${C.border}`, paddingTop: 12, marginTop: 10 }}>
       <CliHint command={cliCommand(state.env === "prod" ? "cluster.work-items" : "local.work-items", {
@@ -167,8 +167,14 @@ function RunReportBody({ report }: { report: FactoryRunReport }) {
       <Row label="Terminal cause"><span style={{ fontFamily: C.mono }}>{report.terminal_cause}</span></Row>
       <Row label="Analysis"><span>{report.analysis.summary}</span></Row>
       <Row label="Sources">
-        <span>{`conversation: ${report.sources.transcript}; phases: ${report.sources.phase_reports}; state changes: ${report.sources.state_changes}; publications: ${report.sources.publications}; traces: ${report.sources.traces}; artifacts: ${report.sources.artifacts}`}</span>
+        <span>{`phases: ${report.sources.phase_reports}; state changes: ${report.sources.state_changes}; publications: ${report.sources.publications}; Langfuse traces: ${report.sources.traces}; artifacts: ${report.sources.artifacts}`}</span>
       </Row>
+      {report.trace_ids.length ? <Muted>Traces match this thread and execution time window; exact request binding is unavailable.</Muted> : null}
+      {report.trace_ids.map((id) => (
+        <button key={id} type="button" onClick={() => dispatch({ type: "openFactoryTrace", id })} style={{ color: C.link, background: "none", border: 0, cursor: "pointer", marginRight: 8 }}>
+          {`Open trace ${id}`}
+        </button>
+      ))}
       <div style={{ marginTop: 12, color: C.text2, fontSize: 12 }}>Timeline</div>
       {report.events.map((event) => (
         <div id={`factory-event-${event.id}`} key={event.id} style={{ borderLeft: `2px solid ${C.borderStrong}`, padding: "8px 12px", marginTop: 6 }}>

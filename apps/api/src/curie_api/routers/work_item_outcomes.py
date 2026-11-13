@@ -26,7 +26,7 @@ from .. import factory_ci, factory_run_reports, factory_usage, workitem_outcomes
 from ..auth import require_api_key
 from ..code_host_trust import code_host_verify
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import LangfuseDep, SessionDep
 from ..forges.errors import Unavailable
 from ..forges.ports import CodeHost
 from ..forges.registry import ForgeRegistry
@@ -119,20 +119,23 @@ async def get_run_report(
     request_id: uuid.UUID,
     session: SessionDep,
     response: Response,
+    langfuse: LangfuseDep,
     agent_id: uuid.UUID | None = None,
 ) -> FactoryRunReportOut:
     """Read one terminal execution's retained diagnostic record (#5601)."""
 
     response.headers["Cache-Control"] = "no-store"
-    owned = await session.scalar(
-        select(ExecutionRequest.id)
-        .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
-        .where(
-            ExecutionRequest.id == request_id,
-            ExecutionRequest.work_item_id == work_item_id,
-            *(() if agent_id is None else (WorkItem.agent_id == agent_id,)),
+    owned = (
+        await session.execute(
+            select(ExecutionRequest, WorkItem)
+            .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
+            .where(
+                ExecutionRequest.id == request_id,
+                ExecutionRequest.work_item_id == work_item_id,
+                *(() if agent_id is None else (WorkItem.agent_id == agent_id,)),
+            )
         )
-    )
+    ).one_or_none()
     if owned is None:
         raise _not_found()
     report = await factory_run_reports.get_report(session, work_item_id, request_id)
@@ -142,6 +145,19 @@ async def get_run_report(
             {"code": "report_unavailable", "reason": "not_captured_or_expired"},
             headers={"Cache-Control": "no-store"},
         )
+    request_row, item = owned
+    report = dict(report)
+    report["sources"] = dict(report["sources"])
+    if request_row.started_at is not None and request_row.terminal_at is not None:
+        session_id = f"agent-{item.agent_id}-thread-{item.conversation_id}"
+        try:
+            trace_ids, trace_status = await langfuse.list_factory_traces(
+                session_id, request_row.started_at, request_row.terminal_at
+            )
+        except (httpx.HTTPError, ValueError):
+            trace_ids, trace_status = [], "unavailable"
+        report["trace_ids"] = trace_ids
+        report["sources"]["traces"] = trace_status
     return FactoryRunReportOut.model_validate(report)
 
 
@@ -150,6 +166,7 @@ async def get_run_report_by_id(
     request_id: uuid.UUID,
     session: SessionDep,
     response: Response,
+    langfuse: LangfuseDep,
     agent_id: uuid.UUID | None = None,
 ) -> FactoryRunReportOut:
     """Inspect a run directly when its request ID is all the operator has."""
@@ -164,7 +181,7 @@ async def get_run_report_by_id(
     )
     if work_item_id is None:
         raise _not_found()
-    return await get_run_report(work_item_id, request_id, session, response, agent_id)
+    return await get_run_report(work_item_id, request_id, session, response, langfuse, agent_id)
 
 
 @router.get("/{work_item_id}/usage", response_model=WorkItemUsageOut)

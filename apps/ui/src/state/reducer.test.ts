@@ -5,6 +5,13 @@ import type { AppState, PromotedEvalCase } from "./types";
 const fresh = (): AppState => initialState();
 
 describe("reducer state machine", () => {
+  it("opens a factory trace in observability", () => {
+    const s = reducer(fresh(), { type: "openFactoryTrace", id: "trace-1" });
+    expect(s.nav).toBe("observability");
+    expect(s.obsTab).toBe("traces");
+    expect(s.traceOpen).toBe("trace-1");
+  });
+
   it("go navigates and clears transient sub-views", () => {
     let s = reducer(fresh(), { type: "openTrace", id: "tr_8f3k21" });
     s = reducer(s, { type: "viewTraces", agentId: "agent-1" });

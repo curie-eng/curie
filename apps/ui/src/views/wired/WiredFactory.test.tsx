@@ -525,15 +525,15 @@ describe("WiredFactory (#4102)", () => {
       terminal_cause: "no_pull_request",
       terminal_at: iso(HOUR),
       sources: {
-        transcript: "complete",
         phase_reports: "missing",
         state_changes: "partial",
         publications: "missing",
-        traces: "unavailable",
+        traces: "time_matched",
         artifacts: "unavailable",
       },
-      events: [{ id: "transcript:0", at: iso(HOUR), kind: "conversation", text: "Five review findings remain", phase: null, round: null }],
-      analysis: { immediate_cause: "no_pull_request", summary: "Inspect the final reply", evidence: [{ event_id: "transcript:0", statement: "Final reply" }] },
+      trace_ids: ["trace-1"],
+      events: [{ id: "terminal", at: iso(HOUR), kind: "terminal", text: "No pull request", phase: null, round: null }],
+      analysis: { immediate_cause: "no_pull_request", summary: "Inspect linked Langfuse traces", evidence: [] },
     });
     renderView();
     await userEvent.click((await screen.findAllByTestId("factory-card"))[0]);
@@ -541,9 +541,9 @@ describe("WiredFactory (#4102)", () => {
     await waitFor(() => expect(client.getFactoryRunReport).toHaveBeenCalledWith("wi-1", "req-1"));
     const report = await screen.findByTestId("factory-run-report");
     expect(report).toHaveTextContent("no_pull_request");
-    expect(report).toHaveTextContent("Five review findings remain");
+    expect(report).toHaveTextContent("No pull request");
     expect(report).toHaveTextContent("phases: missing");
-    expect(within(report).getByRole("link", { name: "Final reply" })).toHaveAttribute("href", "#factory-event-transcript:0");
+    expect(within(report).getByRole("button", { name: "Open trace trace-1" })).toBeTruthy();
   });
 
   it("keeps its detail cache apart from the Work items view", async () => {

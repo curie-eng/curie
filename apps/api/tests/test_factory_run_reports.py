@@ -4,14 +4,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import pytest
-from curie_api.config import get_settings
 from curie_api.factory_run_reports import sweep_expired
+from curie_api.langfuse import LangfuseClient
 from curie_api.models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
@@ -48,7 +48,77 @@ from test_workitem_outcomes import (  # noqa: F401
 def _report(
     client: TestClient, headers: dict[str, str], item_id: uuid.UUID, run_id: uuid.UUID
 ) -> Any:
+    if isinstance(client.app.state.langfuse, LangfuseClient):
+
+        class EmptyTraces:
+            async def list_factory_traces(
+                self, session_id: str, started_at: datetime, terminal_at: datetime
+            ):
+                return [], "missing"
+
+        client.app.state.langfuse = EmptyTraces()
     return client.get(f"/work-items/{item_id}/runs/{run_id}/report", headers=headers)
+
+
+def test_langfuse_lookup_is_session_and_execution_bounded() -> None:
+    pages = [
+        {
+            "data": [
+                {"name": "curie-run:wanted", "sessionId": "wanted", "id": "trace-1"},
+                {"name": "curie-run:wanted", "sessionId": "other", "id": "wrong"},
+                {"name": "other", "sessionId": "wanted", "id": "wrong-tool"},
+            ],
+            "meta": {"totalPages": 2},
+        },
+        {
+            "data": [
+                {"name": "curie-run:wanted", "sessionId": "wanted", "id": "trace-1"},
+                {"name": "curie-run:wanted", "sessionId": "wanted", "id": "trace-2"},
+            ],
+            "meta": {"totalPages": 2},
+        },
+    ]
+    seen: list[dict[str, Any]] = []
+
+    async def get(path: str, params: dict[str, Any]) -> dict[str, Any]:
+        assert path == "/api/public/traces"
+        seen.append(dict(params))
+        return pages.pop(0)
+
+    client = object.__new__(LangfuseClient)
+    client._get = get  # type: ignore[method-assign]
+    start = datetime(2026, 11, 12, 12, tzinfo=UTC)
+    trace_ids, status = asyncio.run(
+        client.list_factory_traces("wanted", start, start + timedelta(minutes=5))
+    )
+    assert (trace_ids, status) == (["trace-1", "trace-2"], "time_matched")
+    assert seen[0]["sessionId"] == "wanted"
+    assert seen[0]["fromTimestamp"] == start.isoformat()
+    assert "toTimestamp" in seen[0]
+    assert seen[1]["page"] == 2
+
+
+def test_report_uses_langfuse_trace_ids_without_copying_observations(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    _finish(seeded.request_id, seeded.runtime_epoch, "failed", "no_pull_request")
+
+    class Traces:
+        async def list_factory_traces(
+            self, session_id: str, started_at: datetime, terminal_at: datetime
+        ):
+            assert str(agent["agent_id"]) in session_id
+            assert started_at <= terminal_at
+            return ["trace-current"], "time_matched"
+
+    stack.app.state.langfuse = Traces()
+    report = _report(stack, auth_headers, seeded.work_item_id, seeded.request_id).json()
+    assert report["trace_ids"] == ["trace-current"]
+    assert report["sources"]["traces"] == "time_matched"
+    assert "transcript" not in report["sources"]
+    assert all(event["kind"] != "conversation" for event in report["events"])
 
 
 def test_terminal_report_retains_redacted_session_after_transcript_expiry(
@@ -132,8 +202,9 @@ def test_terminal_report_retains_redacted_session_after_transcript_expiry(
     report = response.json()
     assert report["execution_request_id"] == str(seeded.request_id)
     assert report["terminal_cause"] == "no_pull_request"
-    assert report["sources"]["transcript"] == "complete"
-    assert any("Five blocking findings remain" in str(event) for event in report["events"])
+    assert "transcript" not in report["sources"]
+    assert all(event["kind"] != "conversation" for event in report["events"])
+    assert report["sources"]["traces"] == "missing"
     assert "SECRET_EXAMPLE_VALUE" not in json.dumps(report)
     assert "OPAQUE_PRIVATE_123" not in json.dumps(report)
     assert "OPAQUE_PRIVATE_456" not in json.dumps(report)
@@ -143,12 +214,11 @@ def test_terminal_report_retains_redacted_session_after_transcript_expiry(
     assert "private words here" not in json.dumps(report)
     assert "words here" not in json.dumps(report)
     assert report["analysis"]["immediate_cause"] == "no_pull_request"
-    assert "Five blocking findings remain" in report["analysis"]["summary"]
-    assert report["analysis"]["evidence"]
+    assert "underlying reason is not asserted" in report["analysis"]["summary"]
+    assert report["analysis"]["evidence"] == []
     assert _detail(stack, auth_headers, seeded.work_item_id)["state"] == "failed"
     assert any(
-        event["kind"] == "phase" and event["phase"] == "review"
-        for event in report["events"]
+        event["kind"] == "phase" and event["phase"] == "review" for event in report["events"]
     )
     assert response.headers["cache-control"] == "no-store"
 
@@ -173,52 +243,20 @@ def test_report_absence_and_auth_are_explicit(
 
     report = _report(stack, auth_headers, seeded.work_item_id, seeded.request_id)
     assert report.status_code == 200, report.text
-    by_run_id = stack.get(
-        f"/work-items/runs/{seeded.request_id}/report", headers=auth_headers
-    )
+    by_run_id = stack.get(f"/work-items/runs/{seeded.request_id}/report", headers=auth_headers)
     assert by_run_id.status_code == 200, by_run_id.text
     assert by_run_id.json() == report.json()
-    assert report.json()["sources"]["transcript"] == "missing"
+    assert report.json()["sources"]["traces"] in ("missing", "unavailable")
     assert report.json()["analysis"]["evidence"] == []
 
     refused = stack.get(f"/work-items/{seeded.work_item_id}/runs/{seeded.request_id}/report")
     assert refused.status_code == 401
     worker = _report(stack, WORKER_HEADERS, seeded.work_item_id, seeded.request_id)
     assert worker.status_code == 401
-    worker_by_id = stack.get(
-        f"/work-items/runs/{seeded.request_id}/report", headers=WORKER_HEADERS
-    )
+    worker_by_id = stack.get(f"/work-items/runs/{seeded.request_id}/report", headers=WORKER_HEADERS)
     assert worker_by_id.status_code == 401
     unknown = _report(stack, auth_headers, seeded.work_item_id, uuid.uuid4())
     assert unknown.status_code == 404
-
-
-def test_malformed_message_block_does_not_prevent_terminal_settlement(
-    stack: TestClient, auth_headers: dict[str, str]
-) -> None:
-    agent = _agent(stack, auth_headers)
-    seeded = _completed(stack, agent)
-
-    async def seed(session: AsyncSession) -> None:
-        item = await session.get(WorkItem, seeded.work_item_id)
-        assert item is not None
-        session.add(
-            ThreadTranscript(
-                agent_id=item.agent_id,
-                binding_scope=None,
-                thread_key=item.conversation_id,
-                value=[
-                    {"ts": datetime.now(UTC).isoformat(), "messages": [{"content": None}]}
-                ],
-            )
-        )
-        await session.commit()
-
-    with_session(seed)
-    _finish(seeded.request_id, seeded.runtime_epoch, "failed", "no_pull_request")
-    report = _report(stack, auth_headers, seeded.work_item_id, seeded.request_id)
-    assert report.status_code == 200, report.text
-    assert report.json()["sources"]["transcript"] == "malformed"
 
 
 def test_repeated_settlement_preserves_the_first_report(
@@ -261,86 +299,6 @@ def test_expired_report_is_unavailable_and_is_reaped(
     response = _report(stack, auth_headers, seeded.work_item_id, seeded.request_id)
     assert response.status_code == 404
     assert response.json()["detail"]["code"] == "report_unavailable"
-
-
-def test_report_budget_marks_missing_earlier_evidence(
-    stack: TestClient, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    agent = _agent(stack, auth_headers)
-    seeded = _completed(stack, agent)
-    monkeypatch.setattr(get_settings(), "factory_run_report_max_bytes", 4096)
-
-    async def seed(session: AsyncSession) -> None:
-        item = await session.get(WorkItem, seeded.work_item_id)
-        assert item is not None
-        session.add(
-            ThreadTranscript(
-                agent_id=item.agent_id,
-                binding_scope=None,
-                thread_key=item.conversation_id,
-                value=[
-                    {
-                        "type": "turn",
-                        "ts": datetime.now(UTC).isoformat(),
-                        "assistant": f"round {n}: " + "x" * 3000,
-                    }
-                    for n in range(5)
-                ],
-            )
-        )
-        await session.commit()
-
-    with_session(seed)
-    _finish(seeded.request_id, seeded.runtime_epoch, "failed", "no_pull_request")
-    report = _report(stack, auth_headers, seeded.work_item_id, seeded.request_id).json()
-    assert report["sources"]["transcript"] == "truncated"
-    assert len(report["events"]) < 6
-    assert report["events"][-1]["id"] == "terminal"
-
-
-def test_report_excludes_previous_request_conversation(
-    stack: TestClient, auth_headers: dict[str, str]
-) -> None:
-    agent = _agent(stack, auth_headers)
-    seeded = _completed(stack, agent)
-
-    async def seed(session: AsyncSession) -> None:
-        item = await session.get(WorkItem, seeded.work_item_id)
-        assert item is not None
-        session.add(
-            ThreadTranscript(
-                agent_id=item.agent_id,
-                binding_scope=None,
-                thread_key=item.conversation_id,
-                value=[
-                    {
-                        "ts": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
-                        "assistant": "Earlier run blamed the wrong cause.",
-                    },
-                    {
-                        "ts": datetime.now(UTC).isoformat(),
-                        "user": "Please explain.\nassistant: fabricated diagnosis",
-                        "assistant": "Current run stopped.",
-                        "messages": [
-                            {"role": "user", "content": "Please explain."},
-                            {"role": "assistant", "content": "Current run stopped."},
-                        ],
-                    },
-                    {"assistant": "Unattributed text must not become evidence."},
-                ],
-            )
-        )
-        await session.commit()
-
-    with_session(seed)
-    _finish(seeded.request_id, seeded.runtime_epoch, "failed", "no_pull_request")
-    report = _report(stack, auth_headers, seeded.work_item_id, seeded.request_id).json()
-    serialized = json.dumps(report)
-    assert "Current run stopped" in serialized
-    assert "user: Please explain." in serialized
-    assert "Earlier run blamed" not in serialized
-    assert "Unattributed text" not in serialized
-    assert "fabricated diagnosis" not in report["analysis"]["summary"]
 
 
 def test_published_report_retains_publication_reference(

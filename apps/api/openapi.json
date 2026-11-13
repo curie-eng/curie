@@ -8074,7 +8074,6 @@
           },
           "kind": {
             "enum": [
-              "conversation",
               "phase",
               "publication",
               "state",
@@ -8181,6 +8180,13 @@
             "title": "Terminal Cause",
             "type": "string"
           },
+          "trace_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Trace Ids",
+            "type": "array"
+          },
           "work_item_id": {
             "format": "uuid",
             "title": "Work Item Id",
@@ -8194,6 +8200,7 @@
           "terminal_cause",
           "terminal_at",
           "sources",
+          "trace_ids",
           "events",
           "analysis"
         ],
@@ -8238,24 +8245,17 @@
             "type": "string"
           },
           "traces": {
-            "const": "unavailable",
-            "title": "Traces",
-            "type": "string"
-          },
-          "transcript": {
             "enum": [
-              "complete",
+              "time_matched",
               "missing",
               "truncated",
-              "malformed",
-              "unattributed"
+              "unavailable"
             ],
-            "title": "Transcript",
+            "title": "Traces",
             "type": "string"
           }
         },
         "required": [
-          "transcript",
           "phase_reports",
           "state_changes",
           "publications",

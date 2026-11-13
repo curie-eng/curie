@@ -7985,7 +7985,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "conversation" | "phase" | "publication" | "state" | "terminal";
+            kind: "phase" | "publication" | "state" | "terminal";
             /** Phase */
             phase?: string | null;
             /** Reference Url */
@@ -8022,6 +8022,8 @@ export interface components {
             terminal_at: string;
             /** Terminal Cause */
             terminal_cause: string;
+            /** Trace Ids */
+            trace_ids: string[];
             /**
              * Work Item Id
              * Format: uuid
@@ -8052,14 +8054,9 @@ export interface components {
             state_changes: "partial" | "truncated";
             /**
              * Traces
-             * @constant
-             */
-            traces: "unavailable";
-            /**
-             * Transcript
              * @enum {string}
              */
-            transcript: "complete" | "missing" | "truncated" | "malformed" | "unattributed";
+            traces: "time_matched" | "missing" | "truncated" | "unavailable";
         };
         /**
          * FactorySlackSteerIn

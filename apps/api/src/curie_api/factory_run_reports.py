@@ -1,8 +1,7 @@
-"""Bounded terminal diagnostics for factory executions (#5601).
+"""Durable factory facts for a terminal execution (#5601).
 
-The active conversation is still removed at WorkItem termination. This module
-captures an operator-only projection in the same transaction, before removal.
-Only explicitly selected text and phase metadata enter the retained report.
+Langfuse owns the runner observation timeline. This record holds only request,
+phase, and publication facts that Langfuse does not authoritatively supply.
 """
 
 from __future__ import annotations
@@ -24,12 +23,10 @@ from .models import (
     ExecutionRequestPhaseReport,
     FactoryRunReport,
     Publication,
-    ThreadTranscript,
     WorkItem,
 )
 
 _TEXT_LIMIT = 4000
-_TRANSCRIPT_EVENT_LIMIT = 120
 _PHASE_EVENT_LIMIT = 80
 _CREDENTIAL_FIELD = re.compile(
     r"(?i)((?<![A-Za-z0-9_])(?:['\"]?(?:authorization|api[_-]?key|access[_-]?token|"
@@ -40,8 +37,7 @@ _CREDENTIAL_FIELD = re.compile(
 
 def _safe_text(value: Any) -> str:
     raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-    redacted = _CREDENTIAL_FIELD.sub(r"\1[REDACTED:credential_field]", raw)
-    redacted = redact_text(redacted)
+    redacted = redact_text(_CREDENTIAL_FIELD.sub(r"\1[REDACTED:credential_field]", raw))
     redacted = redacted.replace("\r", "\\r").replace("\n", "\\n")
     return redacted[:_TEXT_LIMIT] + ("... [truncated]" if len(redacted) > _TEXT_LIMIT else "")
 
@@ -55,115 +51,18 @@ def _safe_reference_url(value: str | None) -> str | None:
     return parsed._replace(query="", fragment="").geturl()
 
 
-def _event_time(raw: Any) -> datetime | None:
-    if isinstance(raw, str):
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if parsed.tzinfo is not None:
-                return parsed.astimezone(UTC)
-        except ValueError:
-            pass
-    return None
-
-
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-def _transcript_events(
-    value: Any, started_at: datetime | None, terminal_at: datetime
-) -> tuple[list[dict[str, Any]], str]:
-    if not isinstance(value, list):
-        return [], "malformed"
-    records = value[-_TRANSCRIPT_EVENT_LIMIT:]
-    status = "truncated" if len(records) < len(value) else "complete"
-    events: list[dict[str, Any]] = []
-    unattributed = False
-    offset = len(value) - len(records)
-    for index, record in enumerate(records, start=offset):
-        if not isinstance(record, dict):
-            status = "malformed"
-            continue
-        at = _event_time(record.get("ts"))
-        if at is None or started_at is None:
-            unattributed = True
-            continue
-        if not started_at <= at <= terminal_at:
-            continue
-        lines: list[str] = []
-        for field in ("user", "assistant", "summary"):
-            content = record.get(field)
-            if isinstance(content, str) and content.strip():
-                lines.append(f"{field}: {_safe_text(content)}")
-        messages = record.get("messages")
-        if isinstance(messages, list):
-            for message in messages:
-                if not isinstance(message, dict):
-                    continue
-                role = message.get("role")
-                if role not in ("user", "assistant", "system", "tool"):
-                    role = "unknown"
-                blocks = message.get("content", [])
-                if isinstance(blocks, str):
-                    if blocks.strip():
-                        lines.append(f"{role}: {_safe_text(blocks)}")
-                    continue
-                if not isinstance(blocks, list):
-                    status = "malformed"
-                    continue
-                for block in blocks:
-                    if not isinstance(block, dict):
-                        continue
-                    kind = block.get("type")
-                    if kind == "text":
-                        lines.append(f"{role}: {_safe_text(block.get('text', ''))}")
-                    elif kind == "tool_use":
-                        lines.append(f"tool call {_safe_text(block.get('name', 'unknown'))}")
-                    elif kind == "tool_result":
-                        result = "error" if block.get("is_error") is True else "returned"
-                        lines.append(f"tool result: {result}")
-        elif messages is not None:
-            status = "malformed"
-        if not lines:
-            continue
-        events.append(
-            {
-                "id": f"transcript:{index}",
-                "at": at.isoformat(),
-                "kind": "conversation",
-                "text": "\n".join(lines)[:_TEXT_LIMIT],
-            }
-        )
-    if unattributed and status == "complete":
-        status = "unattributed"
-    return events, status
-
-
-def _analysis(cause: str, events: list[dict[str, Any]]) -> dict[str, Any]:
-    assistant = [
-        (event, line[len("assistant:") :].strip())
-        for event in events
-        if event["kind"] == "conversation"
-        for line in event["text"].splitlines()
-        if line.startswith("assistant:") and line[len("assistant:") :].strip()
-    ]
-    if not assistant:
-        return {
-            "immediate_cause": cause,
-            "summary": (
-                "The underlying reason is unknown because no conversation evidence was retained."
-            ),
-            "evidence": [],
-        }
-    final, reply = assistant[-1]
+def _analysis(cause: str) -> dict[str, Any]:
     return {
         "immediate_cause": cause,
         "summary": (
-            f"The run ended without a pull request. The agent reported: {reply[:300]}"
-            if cause == "no_pull_request"
-            else "The agent's final reply is available for inspection."
+            "The platform recorded this terminal cause. Inspect linked Langfuse "
+            "traces for runner activity; the underlying reason is not asserted here."
         ),
-        "evidence": [{"event_id": final["id"], "statement": "Agent's reported explanation"}],
+        "evidence": [],
     }
 
 
@@ -180,20 +79,6 @@ async def capture(
         return
     if await session.get(FactoryRunReport, request.id) is not None:
         return
-    transcript = await session.scalar(
-        select(ThreadTranscript).where(
-            ThreadTranscript.agent_id == work_item.agent_id,
-            ThreadTranscript.binding_scope.is_(None),
-            ThreadTranscript.thread_key == work_item.conversation_id,
-        )
-    )
-    if transcript is None:
-        conversation_events: list[dict[str, Any]] = []
-        transcript_status = "missing"
-    else:
-        conversation_events, transcript_status = _transcript_events(
-            transcript.value, request.started_at, request.terminal_at
-        )
     phase_rows = list(
         await session.scalars(
             select(ExecutionRequestPhaseReport)
@@ -205,7 +90,7 @@ async def capture(
     if len(phase_rows) > _PHASE_EVENT_LIMIT:
         phase_rows = phase_rows[-_PHASE_EVENT_LIMIT:]
         phase_status = "truncated"
-    phase_events = [
+    phase_events: list[dict[str, Any]] = [
         {
             "id": f"phase:{row.id}",
             "at": _utc(row.reported_at).isoformat(),
@@ -249,7 +134,7 @@ async def capture(
         )
     if len(publications) > 20:
         publication_status = "truncated"
-    state_events = [
+    state_events: list[dict[str, Any]] = [
         {
             "id": "created",
             "at": _utc(request.created_at).isoformat(),
@@ -284,8 +169,8 @@ async def capture(
         "kind": "terminal",
         "text": _safe_text(detail or request.terminal_cause)[:1000],
     }
-    events = sorted(
-        [*state_events, *conversation_events, *phase_events, *publication_events, terminal_event],
+    events: list[dict[str, Any]] = sorted(
+        [*state_events, *phase_events, *publication_events, terminal_event],
         key=lambda event: (event["at"], event["id"]),
     )
     report: dict[str, Any] = {
@@ -295,11 +180,10 @@ async def capture(
         "terminal_cause": request.terminal_cause,
         "terminal_at": request.terminal_at.astimezone(UTC).isoformat(),
         "sources": {
-            "transcript": transcript_status,
             "phase_reports": phase_status,
             "state_changes": "partial",
             "publications": publication_status,
-            "traces": "unavailable",
+            "traces": "missing",
             "artifacts": (
                 "complete"
                 if any(_safe_reference_url(row.result_url) for row in publications)
@@ -307,9 +191,10 @@ async def capture(
             ),
         },
         "events": events,
+        "trace_ids": [],
     }
     budget = get_settings().factory_run_report_max_bytes
-    report["analysis"] = _analysis(request.terminal_cause, events)
+    report["analysis"] = _analysis(request.terminal_cause)
     while len(json.dumps(report, ensure_ascii=False).encode()) > budget and len(events) > 1:
         # Preserve the terminal event and newest evidence. Never present a
         # shortened timeline as complete.
@@ -318,7 +203,6 @@ async def capture(
             break
         events.remove(earliest)
         source = {
-            "conversation": "transcript",
             "phase": "phase_reports",
             "publication": "publications",
             "state": "state_changes",
@@ -327,7 +211,6 @@ async def capture(
             report["sources"][source] = "truncated"
             if earliest.get("reference_url"):
                 report["sources"]["artifacts"] = "truncated"
-        report["analysis"] = _analysis(request.terminal_cause, events)
     expires_at = request.terminal_at + timedelta(
         seconds=get_settings().factory_run_report_retention_seconds
     )
