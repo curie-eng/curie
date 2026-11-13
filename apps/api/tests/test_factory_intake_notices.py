@@ -12,6 +12,10 @@ https://docs.github.com/en/rest/apps/installations#create-an-installation-access
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
+import subprocess
+import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -152,6 +156,15 @@ class NoticeGitHub(PollGitHub):
         return super().handle(request)
 
 
+def _sync_client_type(github: NoticeGitHub) -> type[httpx.Client]:
+    class GitHubClient(httpx.Client):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["transport"] = httpx.MockTransport(github.handle)
+            super().__init__(*args, **kwargs)
+
+    return GitHubClient
+
+
 @pytest.fixture(scope="session")
 def app_key() -> str:
     return (
@@ -174,14 +187,7 @@ def factory(
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", app_key)
     get_settings.cache_clear()
     github = NoticeGitHub()
-    original_sync = httpx.Client
-
-    class GitHubClient(original_sync):
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            kwargs["transport"] = httpx.MockTransport(github.handle)
-            super().__init__(*args, **kwargs)
-
-    monkeypatch.setattr(httpx, "Client", GitHubClient)
+    monkeypatch.setattr(httpx, "Client", _sync_client_type(github))
     monkeypatch.setattr(httpx, "AsyncClient", _client_type(github))
     with TestClient(create_app()) as client:
         response = client.post(
@@ -383,8 +389,31 @@ def test_one_per_event_restart_lost_success_and_forged_marker(factory: Any) -> N
     forged_snapshot = dict(forged)
     _sql("UPDATE curie.factory_intake_notices SET not_before = NULL")
     github.comment_failure = False
-    github.lose_write = True
-    _pass(github, "delivery")
+    restarted = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import json, sys, httpx
+sys.path.insert(0, "apps/api/tests")
+from test_factory_intake_notices import NoticeGitHub, _sync_client_type, _client_type, _pass
+provider = NoticeGitHub()
+provider.comments = {int(key): value for key, value in json.load(sys.stdin).items()}
+provider.lose_write = True
+httpx.Client = _sync_client_type(provider)
+httpx.AsyncClient = _client_type(provider)
+_pass(provider, "delivery")
+print(json.dumps(provider.comments))
+""",
+        ],
+        input=json.dumps(github.comments),
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=True,
+    )
+    github.comments = {int(key): value for key, value in json.loads(restarted.stdout).items()}
+    github._comment_ids = itertools.count(max(github.comments) + 1)
     assert len(_comments(github, number)) == 2
     assert _notices(number)[0]["posted_at"] is None
     _sql("UPDATE curie.factory_intake_notices SET not_before = NULL")
