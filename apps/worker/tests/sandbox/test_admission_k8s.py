@@ -7,9 +7,11 @@ import json
 import sys
 import threading
 import time as real_time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -554,13 +556,12 @@ def test_inventory_exhausted_budget_stops_before_next_kubernetes_request(
         "pending-claim",
         {"warmPoolRef": {"name": "curie-agent-acme-a-runner-pool"}},
     )
-    # Every LIST answers exactly as the whole budget runs out.
+    # Every LIST answers exactly as the whole budget runs out. The simulated
+    # clock hands all three the same issue instant, so each is issued with the
+    # whole budget; the call then raises either at its own deadline check or at
+    # the template read's, with the same TimeoutError either way.
     issued = _slow_inventory_lists(
-        api,
-        monkeypatch,
-        _SimulatedClock(),
-        dict.fromkeys(_INVENTORY_LISTS, 0.01),
-        barrier=threading.Barrier(3, timeout=5),
+        api, monkeypatch, _SimulatedClock(), dict.fromkeys(_INVENTORY_LISTS, 0.01)
     )
     with pytest.raises(TimeoutError, match="capacity inventory deadline expired"):
         _client(api).capacity_inventory(
@@ -619,23 +620,44 @@ _INVENTORY_LISTS = ("sandboxclaims", "sandboxes", "pods")
 class _SimulatedClock:
     """Monotonic time that only the fake Kubernetes API advances.
 
-    A fake LIST reads its issue instant, then moves the clock to the instant its
-    own response arrives; ``advance_to`` keeps the latest arrival, so LISTs in
-    flight together cost the slowest of them, not their sum. Thread-safe, because
-    the client issues the LISTs from worker threads.
+    A fake LIST reads its issue instant, then reports the instant its own
+    response arrives. The thread that builds the clock is the caller's: a LIST
+    answered on it moves the clock at once, which is what a caller issuing the
+    LISTs one after another sees, so their latencies sum. A LIST answered on any
+    other thread belongs to a concurrent inventory group: its arrival is held
+    until every LIST of the group has reported, then the clock moves to the
+    latest of them and the next group starts. Until then every thread reads the
+    instant the group was issued at, so each LIST of a group sees the same issue
+    instant however the pool schedules it. Nothing blocks and nothing waits in
+    real time, so the result does not depend on thread scheduling.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, group: int = len(_INVENTORY_LISTS)) -> None:
         self._now = 0.0
+        self._owner = threading.current_thread()
+        self._group = group
+        self._held: list[float] = []
         self._lock = threading.Lock()
 
     def monotonic(self) -> float:
         with self._lock:
             return self._now
 
+    def latest(self) -> float:
+        """The latest arrival any LIST has reported, applied or still held."""
+
+        with self._lock:
+            return max([self._now, *self._held])
+
     def advance_to(self, instant: float) -> None:
         with self._lock:
-            self._now = max(self._now, instant)
+            if threading.current_thread() is self._owner:
+                self._now = max(self._now, instant)
+                return
+            self._held.append(instant)
+            if len(self._held) == self._group:
+                self._now = max([self._now, *self._held])
+                self._held.clear()
 
 
 def _slow_inventory_lists(
@@ -652,9 +674,11 @@ def _slow_inventory_lists(
     own claim and template LISTs pass straight through. A LIST whose latency
     exceeds the timeout it was handed raises urllib3's ``ReadTimeoutError`` once
     that timeout elapses, as a real server's client would; otherwise it answers
-    after its latency. ``barrier`` holds each LIST until all three are in
-    flight, which a sequential caller never achieves. Returns the
-    ``(resource, timeout)`` of every inventory LIST issued.
+    after its latency. Every LIST reports its arrival to ``clock`` as its last
+    step, after the fake API has recorded it, whether it answers or raises.
+    ``barrier`` holds each LIST until all three are in flight, which a
+    sequential caller never achieves. Returns the ``(resource, timeout)`` of
+    every inventory LIST issued.
     """
 
     issued: list[tuple[str, float]] = []
@@ -675,8 +699,10 @@ def _slow_inventory_lists(
             if cost > timeout:
                 clock.advance_to(issued_at + timeout)
                 raise ReadTimeoutError(None, resource, f"read timeout={timeout}")
-            clock.advance_to(issued_at + cost)
-            return inner(*args, **kwargs)
+            try:
+                return inner(*args, **kwargs)
+            finally:
+                clock.advance_to(issued_at + cost)
 
         return call
 
@@ -748,10 +774,13 @@ def test_inventory_lists_overlap_within_one_second_budget(
         assert set(result.claim_resources) == {"pending-claim"}
         assert clock.monotonic() == pytest.approx(0.45)
     else:
-        with pytest.raises(ReadTimeoutError):
+        # The slow LIST's read timeout and the call's deadline fall on the same
+        # instant, so the caller may see either; both fail closed, and admission
+        # treats both as unavailable inventory.
+        with pytest.raises((ReadTimeoutError, TimeoutError)):
             inventory()
         # Bounded by the 1.0 s total, not by the slow LIST.
-        assert clock.monotonic() == pytest.approx(1.0)
+        assert clock.latest() == pytest.approx(1.0)
     # Each LIST issued exactly once (no retry), with a positive timeout no
     # larger than the one-second bound.
     assert sorted(resource for resource, _timeout in issued) == sorted(_INVENTORY_LISTS)
@@ -800,12 +829,10 @@ def test_reap_with_slow_healthy_lists_reconciles_admission(
         return real_inventory(**kwargs)
 
     monkeypatch.setattr(client, "capacity_inventory", recording_inventory)
+    # No barrier: the simulated clock alone decides overlap. On the caller's
+    # thread, one LIST after another, the Pod LIST is left 0.1 s and times out.
     issued = _slow_inventory_lists(
-        api,
-        monkeypatch,
-        _SimulatedClock(),
-        dict.fromkeys(_INVENTORY_LISTS, 0.45),
-        barrier=threading.Barrier(3, timeout=5),
+        api, monkeypatch, _SimulatedClock(), dict.fromkeys(_INVENTORY_LISTS, 0.45)
     )
     probe = install(monkeypatch, substrate_module)
 
@@ -835,3 +862,130 @@ def test_reap_with_slow_healthy_lists_reconciles_admission(
     assert all(0 < bound <= 1.0 for _caller, bound in bounds)
     assert sorted(resource for resource, _timeout in issued) == sorted(_INVENTORY_LISTS * 2)
     assert all(0 < timeout <= 1.0 for _resource, timeout in issued)
+
+
+# -- #5630: a deciding failure or the deadline ends the call, over real sockets --
+#
+# The simulated clock cannot show how long the call really waits, so these drive
+# the real Kubernetes SDK against a local HTTP server. The SDK turns a float
+# ``_request_timeout`` into ``urllib3.Timeout(total=...)`` (kubernetes 37.0.1,
+# ``kubernetes/client/rest.py``), and urllib3 2.8.0 documents that its read and
+# total timeouts "only measure the time between read operations on the socket
+# ... not the total amount of time for the request to return a complete
+# response" (``urllib3/util/timeout.py``). A server that keeps sending bytes in
+# gaps shorter than that timeout therefore holds a LIST open for as long as it
+# likes: only the inventory's own deadline bounds the call.
+
+_STREAM_GAP_S = 0.4
+_STREAM_GAPS = 4  # 1.6 s in all, past the 1.0 s bound, if never released
+
+
+@contextmanager
+def _streaming_inventory_server(
+    fail_fast: frozenset[str],
+) -> Iterator[tuple[k8s_module.KubernetesSandboxClient, threading.Event]]:
+    """A real client against a local API whose healthy LISTs stream slowly.
+
+    A LIST of a resource in ``fail_fast`` answers HTTP 503 at once. Every other
+    inventory LIST sends its headers and the start of an empty list, then one
+    padding byte every ``_STREAM_GAP_S`` until ``release`` is set or
+    ``_STREAM_GAPS`` gaps have passed, then finishes the body.
+    """
+
+    release = threading.Event()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            resource = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
+            if resource in fail_fast:
+                status = {
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "metadata": {},
+                    "status": "Failure",
+                    "message": "service unavailable",
+                    "reason": "ServiceUnavailable",
+                    "code": 503,
+                }
+                body = json.dumps(status).encode()
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(b'{"kind": "List", "apiVersion": "v1", "metadata": {}, "items": [')
+                self.wfile.flush()
+                for _gap in range(_STREAM_GAPS):
+                    # An Event wait, so ``release`` ends the stream at once.
+                    if release.wait(timeout=_STREAM_GAP_S):
+                        break
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                self.wfile.write(b"]}")
+            except OSError:
+                return  # the client gave up on this LIST
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    configuration = kube.Configuration()
+    configuration.host = f"http://127.0.0.1:{server.server_address[1]}"
+    # As KubernetesSandboxClient.__init__ sets it: no urllib3 retries.
+    configuration.retries = 0
+    api_client = kube.ApiClient(configuration=configuration)
+    client = k8s_module.KubernetesSandboxClient.__new__(k8s_module.KubernetesSandboxClient)
+    client._configuration = configuration  # type: ignore[attr-defined]
+    client._api = kube.CustomObjectsApi(api_client)  # type: ignore[attr-defined]
+    client._core_api = kube.CoreV1Api(api_client)  # type: ignore[attr-defined]
+    client._namespace = "test-ns"  # type: ignore[attr-defined]
+    try:
+        yield client, release
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        serving.join(timeout=5)
+        api_client.close()
+
+
+def test_inventory_fast_failure_does_not_wait_for_slow_siblings_over_real_sockets() -> None:
+    # The claims LIST fails at once while the sandboxes and Pod LISTs keep
+    # streaming. The sequential code raised the claims failure in milliseconds;
+    # a call that joins every LIST first waits about 1.6 s for the slow ones.
+    with _streaming_inventory_server(frozenset({"sandboxclaims"})) as (client, release):
+        started = real_time.monotonic()
+        with pytest.raises(kube.ApiException) as error:
+            client.capacity_inventory(
+                priority_class="acme-sandbox",
+                known_claim_resources={},
+                request_timeout_seconds=1.0,
+            )
+        elapsed = real_time.monotonic() - started
+        release.set()
+    assert error.value.status == 503
+    assert elapsed < 0.5
+
+
+def test_inventory_slow_healthy_lists_end_at_the_deadline_over_real_sockets() -> None:
+    # All three LISTs keep streaming past the bound, each read gap well inside
+    # the SDK's read timeout, so the inventory's own deadline ends the call.
+    with _streaming_inventory_server(frozenset()) as (client, release):
+        started = real_time.monotonic()
+        with pytest.raises(TimeoutError, match="capacity inventory deadline expired"):
+            client.capacity_inventory(
+                priority_class="acme-sandbox",
+                known_claim_resources={},
+                request_timeout_seconds=1.0,
+            )
+        elapsed = real_time.monotonic() - started
+        release.set()
+    assert 0.9 <= elapsed < 1.5

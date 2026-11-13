@@ -20,7 +20,7 @@ import socket
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -621,6 +621,19 @@ def _daemon_view(kind: DaemonObjectKind, obj: Any) -> DaemonObjectView:
 # threads behind repeated pings (each one fails closed instead).
 _PORT_FORWARDS = threading.BoundedSemaphore(8)
 
+# The capacity inventory's three LISTs run here (#5630): three for each of up to
+# 16 inventories in flight at once, the default per-worker turn concurrency
+# (CURIE_WORKER_MAX_CONCURRENCY). One bounded pool for the process, not one per
+# call: threads start lazily and are reused, so ticks do not grow them. A LIST
+# still queued when its call ends is cancelled and never issues a request. A
+# LIST already reading cannot be interrupted; it finishes in the background on
+# its pool thread within the SDK's own timeouts, its result or error is
+# discarded, and nothing retries it.
+_INVENTORY_LIST_THREADS = 48
+_INVENTORY_POOL = ThreadPoolExecutor(
+    max_workers=_INVENTORY_LIST_THREADS, thread_name_prefix="capacity-inventory"
+)
+
 
 def _owner_ref(api_version: str, kind: str, name: str, uid: str) -> dict[str, str]:
     """An ownerReference with no ``controller`` or ``blockOwnerDeletion``."""
@@ -967,18 +980,45 @@ class KubernetesSandboxClient:
         # ordinary API latency failed admission and maintenance. The bound is
         # unchanged (#5296 Decision 3): each LIST still gets the budget
         # remaining when it is issued, and an expired budget raises before any
-        # request. Leaving the ``with`` block joins every thread, so nothing
-        # outlives the call. Results are read in a fixed order and the first
-        # failure in that order is raised as-is; there is no partial inventory
-        # and no retry. Each LIST runs in its own copy of the caller's context,
-        # as ``asyncio.to_thread`` would, so context variables set by the
-        # caller (the delivery lease, the active span) stay visible to it.
-        with ThreadPoolExecutor(
-            max_workers=3, thread_name_prefix="capacity-inventory"
-        ) as pool:
-            claims_listed = pool.submit(contextvars.copy_context().run, list_claims)
-            sandboxes_listed = pool.submit(contextvars.copy_context().run, list_sandboxes)
-            pods_listed = pool.submit(contextvars.copy_context().run, list_pods)
+        # request. The call returns or raises at the first deciding outcome or
+        # the deadline, whichever comes first, never later than the sequential
+        # code would for the same fault. Results are taken in the fixed order
+        # claims, sandboxes, Pods: the first failure whose earlier siblings all
+        # succeeded is raised as-is, and a later LIST's failure never preempts
+        # an earlier one still in flight. Past the deadline the call raises the
+        # same TimeoutError an exhausted budget always has. There is no partial
+        # inventory and no retry. On the way out every LIST is cancelled, so
+        # one still queued never issues a request; one already reading cannot
+        # be interrupted, finishes in the background on its pool thread within
+        # the SDK's own timeouts, and its result or error is discarded. Each
+        # LIST runs in its own copy of the caller's context, as
+        # ``asyncio.to_thread`` would, so context variables set by the caller
+        # (the delivery lease, the active span) stay visible to it.
+        claims_listed = _INVENTORY_POOL.submit(contextvars.copy_context().run, list_claims)
+        sandboxes_listed = _INVENTORY_POOL.submit(
+            contextvars.copy_context().run, list_sandboxes
+        )
+        pods_listed = _INVENTORY_POOL.submit(contextvars.copy_context().run, list_pods)
+        listed: tuple[Future[Any], ...] = (claims_listed, sandboxes_listed, pods_listed)
+        try:
+            while True:
+                for future in listed:
+                    if not future.done():
+                        break
+                    future.result()
+                else:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("sandbox capacity inventory deadline expired")
+                wait(
+                    [future for future in listed if not future.done()],
+                    timeout=remaining,
+                    return_when=FIRST_COMPLETED,
+                )
+        finally:
+            for future in listed:
+                future.cancel()
         claims = claims_listed.result()
         sandboxes = sandboxes_listed.result()
         pods = pods_listed.result()
