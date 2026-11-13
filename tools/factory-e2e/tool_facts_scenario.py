@@ -8,7 +8,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 
 def assert_tools(answer: dict[str, Any], expected: dict[str, str]) -> None:
@@ -156,6 +156,12 @@ def watch_claims(driver: Any) -> Iterator[set[str]]:
         driver.kubectl("-n", driver.namespace, "get", "sandboxclaims", "-o", "json")
     )
     version = current["metadata"]["resourceVersion"]
+    watch_path = (
+        "/apis/extensions.agents.x-k8s.io/v1alpha1/namespaces/"
+        + quote(driver.namespace, safe="")
+        + "/sandboxclaims?"
+        + urlencode({"watch": "true", "resourceVersion": version})
+    )
     output = driver.workdir / "probe-watch.json"
     errors = driver.workdir / "probe-watch-errors.txt"
     seen: set[str] = set()
@@ -165,17 +171,10 @@ def watch_claims(driver: Any) -> Iterator[set[str]]:
                 "kubectl",
                 "--context",
                 driver.context,
-                "-n",
-                driver.namespace,
                 "get",
-                "sandboxclaims",
-                "--watch-only",
-                "--output-watch-events",
-                "--resource-version",
-                version,
+                "--raw",
+                watch_path,
                 f"--request-timeout={max(1, int(driver.deadline - time.monotonic()))}s",
-                "-o",
-                "json",
             ],
             env=driver.env,
             stdout=stdout,
