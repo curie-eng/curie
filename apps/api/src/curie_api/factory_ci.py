@@ -29,10 +29,11 @@ pure ``decide``:
   CI deadline, ends ``ci_unverified``. The notice names each check that never
   started and says it may need a trigger the factory does not apply (for
   example a label). The configured Python aggregate is the exception while a
-  shard matching its pending prefix is queued or in progress: the verdict
-  stays pending with reason ``required_python_aggregate_waiting_on_shards``
-  and, at the same deadline, is ``timed_out`` (``ci_timeout``). The notice
-  names those shards and does not say the aggregate never started.
+  shard matching its pending prefix is queued or in progress, whether or not
+  the change includes a Python path: the verdict stays pending with reason
+  ``required_python_aggregate_waiting_on_shards`` and, at the same deadline,
+  is ``timed_out`` (``ci_timeout``). The notice names those shards and does
+  not say the aggregate never started.
   Publication applies only operator-configured labels. A rules
   HTTP 404 or an empty rules list adds no names. A transient required-check read stays
   pending until the deadline and then ends ``ci_timeout``. Any other unreadable
@@ -788,13 +789,19 @@ def decide(
             for name in dict.fromkeys(host_required_checks)
             if name not in present and status_key(name) not in present
         )
-        if missing and not (
-            requires_python_ci
-            and python_ci is not None
+        if (
+            python_ci is not None
             and missing == [python_ci.check]
             and not required_python_runs
             and _aggregate_waiting_on_shards(check_runs, python_ci)
         ):
+            # Running shards are dependency evidence with or without a Python path.
+            return Verdict(
+                kind="timed_out" if expired else "pending",
+                pending=pending,
+                reason=PYTHON_AGGREGATE_WAITING_ON_SHARDS,
+            )
+        if missing:
             # Any other missing required check keeps the absent-trigger ending.
             return Verdict(
                 kind="unverified" if expired else "pending",

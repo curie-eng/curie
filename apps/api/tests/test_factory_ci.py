@@ -936,13 +936,20 @@ def _running_shard(status: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("status", ["queued", "in_progress"])
-def test_required_python_aggregate_waits_for_running_shards(status: str) -> None:
+@pytest.mark.parametrize(
+    "changed_paths",
+    [[_PYTHON_PATH], ["README.md"]],
+    ids=["python-path", "other-path"],
+)
+def test_required_python_aggregate_waits_for_running_shards(
+    status: str, changed_paths: list[str]
+) -> None:
     """#5276: a required aggregate still waiting on a shard times out, it does not
-    claim the aggregate never started."""
+    claim the aggregate never started. A non-Python change is the same case."""
 
     detail = _detail(_running_shard(status), _actions_run("Conversion secret scan", run_id=2))
     paths = {
-        "changed_paths": [_PYTHON_PATH],
+        "changed_paths": changed_paths,
         "python_ci": conversion_python_ci(),
         "host_required_checks": (_PYTHON_AGGREGATE,),
     }
@@ -987,11 +994,45 @@ def test_required_checks_missing_python_aggregate_with_another_check_stays_absen
     assert "for example a label" in verdict.note
 
 
-def test_required_checks_missing_python_aggregate_after_shards_finish_stays_absent() -> None:
+@pytest.mark.parametrize("changed_paths", [[_PYTHON_PATH], ["README.md"]])
+def test_required_checks_missing_python_aggregate_after_shards_finish_stays_absent(
+    changed_paths: list[str],
+) -> None:
     verdict = _decide(
         _detail(*_pytest_shards(status="completed")),
         1200,
-        changed_paths=[_PYTHON_PATH],
+        changed_paths=changed_paths,
+        python_ci=conversion_python_ci(),
+        host_required_checks=(_PYTHON_AGGREGATE,),
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "required_check_absent"
+    assert verdict.note is not None
+    assert "for example a label" in verdict.note
+
+
+def test_a_failing_check_still_fails_while_shards_run_on_other_paths() -> None:
+    verdict = _decide(
+        _detail(
+            _running_shard("in_progress"),
+            _actions_run("lint", conclusion="failure", run_id=9),
+        ),
+        1200,
+        changed_paths=["README.md"],
+        python_ci=conversion_python_ci(),
+        host_required_checks=(_PYTHON_AGGREGATE,),
+    )
+
+    assert verdict.kind == "failing"
+    assert verdict.reason != "required_python_aggregate_waiting_on_shards"
+
+
+def test_a_required_aggregate_with_no_running_shard_stays_absent_on_other_paths() -> None:
+    verdict = _decide(
+        _detail(_actions_run("lint", run_id=2)),
+        1200,
+        changed_paths=["README.md"],
         python_ci=conversion_python_ci(),
         host_required_checks=(_PYTHON_AGGREGATE,),
     )
