@@ -17,6 +17,8 @@ const MAX_PAGES: usize = 10;
 const SUMMARY_CHARS: usize = 1000;
 const REVIEW_CHARS: usize = 2000;
 /// Nonblank lines in the Decisions section, not counting the breaks between them.
+/// Breaks are Python `str.splitlines` boundaries, so a break is not a character
+/// of the section and does not count toward this cap.
 const MAX_SECTION_CHARACTERS: usize = 7000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -564,7 +566,7 @@ pub(crate) fn parse_decisions_body(body: &Value) -> DecisionsParse {
 }
 
 pub(crate) fn parse_decisions(body: &str) -> DecisionsParse {
-    let lines = normalized_lines(body);
+    let lines = decision_lines(body);
     let headings = lines
         .iter()
         .filter(|line| line.as_str() == "## Decisions")
@@ -634,36 +636,69 @@ fn normalized_lines(body: &str) -> Vec<String> {
         .collect()
 }
 
+/// The same boundaries as Python `str.splitlines`. A trailing break does not
+/// add an empty line. `\r\n` is one break.
+fn decision_lines(body: &str) -> Vec<String> {
+    fn is_break(ch: char) -> bool {
+        matches!(
+            ch,
+            '\n' | '\r'
+                | '\u{000b}'
+                | '\u{000c}'
+                | '\u{001c}'
+                | '\u{001d}'
+                | '\u{001e}'
+                | '\u{0085}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    }
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    let mut chars = body.char_indices().peekable();
+    while let Some((pos, ch)) = chars.next() {
+        if !is_break(ch) {
+            continue;
+        }
+        lines.push(body[line_start..pos].to_string());
+        if ch == '\r' && matches!(chars.peek(), Some((_, '\n'))) {
+            chars.next();
+        }
+        line_start = chars.peek().map(|(next, _)| *next).unwrap_or(body.len());
+    }
+    if line_start < body.len() {
+        lines.push(body[line_start..].to_string());
+    }
+    lines
+}
+
 fn parse_entry(line: &str) -> Option<DecisionEntry> {
-    if line != line.trim() || !line.ends_with('.') {
+    // `n. ` is one ASCII digit, a period and a space. Each later separator is
+    // the earliest one that still leaves one character in the field before it,
+    // the same spans as the grammar's lazy fields. A reason may contain `. (`
+    // when that is not one of the three source markers.
+    let mut chars = line.chars();
+    let n = chars.next()?.to_digit(10)?;
+    if !(1..=7).contains(&n) || chars.next() != Some('.') || chars.next() != Some(' ') {
         return None;
     }
-    let (number, rest) = line.split_once(". ")?;
-    if number.is_empty()
-        || number.starts_with('0')
-        || !number.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    let rejected_at = find_after_one_char(line, 3, ". Rejected: ")?;
+    let alternative_start = rejected_at + ". Rejected: ".len();
+    let because_at = find_after_one_char(line, alternative_start, ", because ")?;
+    let reason_start = because_at + ", because ".len();
+    let (reason_end, evidence_start, source) = earliest_source(line, reason_start)?;
+    if !line.ends_with('.') || line.len().checked_sub(1)? <= evidence_start {
         return None;
     }
-    let n = number.parse().ok()?;
-    let (choice, rest) = rest.split_once(". Rejected: ")?;
-    let (rejected, rest) = rest.split_once(", because ")?;
-    // The source delimiter is the last `. (source) Evidence:` so a reason may
-    // contain parentheses and periods.
-    let (reason_and_source, evidence_raw) = rest.rsplit_once(") Evidence: ")?;
-    if !evidence_raw.ends_with('.') {
-        return None;
-    }
-    let evidence = &evidence_raw[..evidence_raw.len() - 1];
-    let (reason, source) = reason_and_source.rsplit_once(". (")?;
-    if !matches!(source, "plan" | "plan review" | "diff review") {
-        return None;
-    }
+    let choice = &line[3..rejected_at];
+    let rejected = &line[alternative_start..because_at];
+    let reason = &line[reason_start..reason_end];
+    let evidence = &line[evidence_start..line.len() - 1];
     if blank(choice) || blank(rejected) || blank(reason) || blank(evidence) {
         return None;
     }
     Some(DecisionEntry {
-        n,
+        n: u64::from(n),
         choice: choice.to_string(),
         rejected: rejected.to_string(),
         reason: reason.to_string(),
@@ -672,8 +707,40 @@ fn parse_entry(line: &str) -> Option<DecisionEntry> {
     })
 }
 
+fn find_after_one_char(haystack: &str, start: usize, needle: &str) -> Option<usize> {
+    let rest = haystack.get(start..)?;
+    let first = rest.chars().next()?;
+    let search_at = start + first.len_utf8();
+    haystack
+        .get(search_at..)?
+        .find(needle)
+        .map(|index| search_at + index)
+}
+
+fn earliest_source(line: &str, reason_start: usize) -> Option<(usize, usize, &'static str)> {
+    let rest = line.get(reason_start..)?;
+    let first = rest.chars().next()?;
+    let search_at = reason_start + first.len_utf8();
+    let haystack = line.get(search_at..)?;
+    const MARKERS: &[(&str, &str)] = &[
+        (". (plan review) Evidence: ", "plan review"),
+        (". (diff review) Evidence: ", "diff review"),
+        (". (plan) Evidence: ", "plan"),
+    ];
+    let mut best: Option<(usize, usize, &'static str)> = None;
+    for (marker, source) in MARKERS {
+        if let Some(index) = haystack.find(marker) {
+            let at = search_at + index;
+            if best.map(|(found, _, _)| at < found).unwrap_or(true) {
+                best = Some((at, at + marker.len(), *source));
+            }
+        }
+    }
+    best
+}
+
 fn blank(value: &str) -> bool {
-    value.trim().is_empty() || value != value.trim()
+    value.trim().is_empty()
 }
 
 fn summary_text(body: &str) -> String {
