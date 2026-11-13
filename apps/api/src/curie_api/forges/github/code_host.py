@@ -233,7 +233,8 @@ def _latest_ci_entries(
 ) -> list[dict[str, Any]]:
     """Retain ambiguous ordering rather than guessing which evidence is newest.
 
-    GitHub check identity includes the App, name and head; statuses use context.
+    Failed checks require the same suite to prove replacement. Pending runs
+    remain evidence; cancelled runs retain their existing supersession rule.
     https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
     https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference
     """
@@ -257,10 +258,25 @@ def _latest_ci_entries(
         left_id, right_id = _check_id(candidate), _check_id(earlier)
         return left_id is not None and right_id is not None and int(left_id) > int(right_id)
 
+    def supersedes(candidate: dict[str, Any], earlier: dict[str, Any]) -> bool:
+        if identity(candidate) != identity(earlier):
+            return False
+        if not statuses:
+            state = _run_state(earlier)
+            if state is CheckState.PENDING:
+                return False
+            if state is not CheckState.CANCELLED:
+                suite, replacement = earlier.get("check_suite"), candidate.get("check_suite")
+                suite_id = _check_id(suite) if isinstance(suite, dict) else None
+                replacement_id = _check_id(replacement) if isinstance(replacement, dict) else None
+                if suite_id is None or suite_id != replacement_id:
+                    return False
+        return later(candidate, earlier)
+
     return [
         entry
         for entry in entries
-        if not any(identity(other) == identity(entry) and later(other, entry) for other in entries)
+        if not any(supersedes(other, entry) for other in entries)
     ]
 
 

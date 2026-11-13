@@ -200,6 +200,28 @@ def test_an_older_failure_is_superseded_by_same_named_success() -> None:
     assert _decide(checks).kind == "green"
 
 
+@pytest.mark.parametrize(
+    ("conclusion", "suite_id", "state", "verdict"),
+    [
+        (None, 101, CheckState.PENDING, "pending"),
+        (None, 202, CheckState.PENDING, "pending"),
+        ("failure", 101, CheckState.FAILURE, "failing"),
+        ("failure", None, CheckState.FAILURE, "failing"),
+    ],
+    ids=["independent-running", "same-suite-running", "independent-failed", "unknown-suite"],
+)
+def test_later_success_cannot_hide_unfinished_or_independent_workflow(
+    conclusion: str | None, suite_id: int | None, state: CheckState, verdict: str
+) -> None:
+    checks = _checks(
+        _run(conclusion, id=9, started_at=EARLIER, check_suite={"id": suite_id}),
+        _run("success"),
+    )
+
+    assert [check.state for check in checks] == [state, CheckState.SUCCESS]
+    assert _decide(checks).kind == verdict
+
+
 def test_newest_commit_statuses_do_not_supersede_a_cancelled_run() -> None:
     # https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
     statuses = (

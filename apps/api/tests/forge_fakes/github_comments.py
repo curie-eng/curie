@@ -63,6 +63,7 @@ def check_run(
         "status": status,
         "conclusion": conclusion if status == "completed" else None,
         "started_at": started_at,
+        "check_suite": {"id": 202},
         "output": {"title": title, "summary": summary},
     }
 
@@ -304,6 +305,8 @@ class _GitHubComments(BaseHTTPRequestHandler):
             if isinstance(payload, dict) and isinstance(payload.get(field), list):
                 start = (page - 1) * per_page
                 payload = {**payload, field: payload[field][start : start + per_page]}
+                if (sha, kind, page) in server.ci_page_totals:
+                    payload["total_count"] = server.ci_page_totals[(sha, kind, page)]
             self._send(status, payload)
             return True
         annotations = re.fullmatch(rf"/repos/{repo}/check-runs/([0-9]+)/annotations", path)
@@ -458,6 +461,7 @@ class _CommentServer(ThreadingHTTPServer):
         self.issue_statuses: dict[int, int] = {}
         self.issue_overrides: dict[int, dict[str, Any]] = {}
         self.ci_pages: list[tuple[str, str, int]] = []
+        self.ci_page_totals: dict[tuple[str, str, int], int] = {}
         self.on_ci_read: Any = None
         self.ci_script: list[CiEntry] = [ci_green()]
         self.ci_scripts: dict[str, list[CiEntry]] = {}

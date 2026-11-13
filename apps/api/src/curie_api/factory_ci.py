@@ -139,7 +139,9 @@ PERMANENT_UNREADABLE = frozenset(
     }
 )
 # Reason codes that count as pending until the CI deadline.
-TRANSIENT = frozenset({"timeout", "observation_busy", "github_rate_limited", "github_error"})
+TRANSIENT = frozenset(
+    {"timeout", "observation_busy", "github_rate_limited", "github_error", "listing_incomplete"}
+)
 
 # Which GitHub read each attributed 403 refused (#5222). The notice names the
 # operation GitHub refused; it does not infer a missing App permission from the

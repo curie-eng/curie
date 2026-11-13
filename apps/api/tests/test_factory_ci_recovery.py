@@ -279,6 +279,40 @@ def test_distinct_app_failure_is_not_superseded_by_another_apps_success(
     assert _observation(published["id"])["status"] == "observing"
 
 
+@pytest.mark.parametrize("status", ["in_progress", "completed"], ids=["running", "failed"])
+def test_an_independent_workflow_cannot_supply_recovery_proof(admitted: Any, status: str) -> None:
+    _client, _github, sink = admitted
+    published = _failed(admitted, 9814)
+    before = _snapshot(published["id"])
+    earlier = check_run(
+        "build", status=status, conclusion="failure", started_at="2026-01-01T00:00:00Z"
+    )
+    earlier["check_suite"] = {"id": 101}
+    later = check_run("build", started_at="2026-01-01T00:01:00Z")
+    earlier["app"] = later["app"] = {"id": 1, "slug": "github-actions"}
+    sink.ci_script = [ci_entry(earlier, later)]
+
+    _later()
+
+    assert _observation(published["id"])["status"] == "observing"
+    assert _snapshot(published["id"]) == before
+
+
+def test_a_paginated_snapshot_change_can_recover_after_a_stable_read(admitted: Any) -> None:
+    _client, _github, sink = admitted
+    published = _failed(admitted, 9814)
+    sink.ci_script = [ci_entry(*[check_run(f"check-{index}") for index in range(101)])]
+    sink.ci_page_totals[(HEAD_A, "check-runs", 2)] = 102
+
+    _later()
+
+    assert _observation(published["id"])["status"] == "observing"
+    assert _observation(published["id"])["reason"] == "listing_incomplete"
+    sink.ci_page_totals.clear()
+    _later(3760)
+    assert _observation(published["id"])["status"] == "completed"
+
+
 def test_newest_status_is_required_and_old_failure_can_be_superseded(admitted: Any) -> None:
     _client, _github, sink = admitted
     published = _failed(admitted, 9815)

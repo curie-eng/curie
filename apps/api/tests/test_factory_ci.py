@@ -64,7 +64,9 @@ PERMANENT = [
     "too_many_check_runs",
     "no_head_sha",
 ]
-TRANSIENT = ["timeout", "observation_busy", "github_rate_limited", "github_error"]
+TRANSIENT = [
+    "timeout", "observation_busy", "github_rate_limited", "github_error", "listing_incomplete"
+]
 
 
 # A foreign unit conversion repository has its own layout and CI job names.
