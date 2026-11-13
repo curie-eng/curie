@@ -105,11 +105,20 @@ def test_report_uses_langfuse_trace_ids_without_copying_observations(
     seeded = _completed(stack, agent)
     _finish(seeded.request_id, seeded.runtime_epoch, "failed", "no_pull_request")
 
+    async def creation_time(session: AsyncSession) -> datetime:
+        request = await session.get(ExecutionRequest, seeded.request_id)
+        assert request is not None and request.started_at is not None
+        assert request.created_at < request.started_at
+        return request.created_at
+
+    created_at = with_session(creation_time)
+
     class Traces:
         async def list_factory_traces(
             self, session_id: str, started_at: datetime, terminal_at: datetime
         ):
             assert str(agent["agent_id"]) in session_id
+            assert started_at == created_at
             assert started_at <= terminal_at
             return ["trace-current"], "time_matched"
 

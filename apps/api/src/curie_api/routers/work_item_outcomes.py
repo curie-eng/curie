@@ -152,7 +152,7 @@ async def get_run_report(
         session_id = f"agent-{item.agent_id}-thread-{item.conversation_id}"
         try:
             trace_ids, trace_status = await langfuse.list_factory_traces(
-                session_id, request_row.started_at, request_row.terminal_at
+                session_id, request_row.created_at, request_row.terminal_at
             )
         except (httpx.HTTPError, ValueError):
             trace_ids, trace_status = [], "unavailable"
