@@ -358,3 +358,66 @@ def test_gateway_process_adds_the_identity_caller_only_when_configured(monkeypat
     assert gateway_callers(config) == TOKENS
     assert config.user_email_timeout_s == 2.5
     assert TOKENS["identity"] not in repr(config)
+
+
+def test_missing_email_scope_refuses_as_an_outage_not_unknown(monkeypatch):
+    def slack(_request):
+        return httpx.Response(
+            200,
+            json={"ok": True, "user": _user(profile={})},
+            headers={"X-OAuth-Scopes": "chat:write,users:read"},
+        )
+
+    async def scenario(endpoint, _calls):
+        async with GatewayUserEmails.from_settings(_settings(monkeypatch, endpoint)) as emails:
+            with pytest.raises(UserEmailLookupError) as error:
+                await emails.email_of("U0EXAMPLE1", "T0EXAMPLE1")
+            assert not isinstance(error.value, UserEmailUnknown)
+
+    asyncio.run(_run(slack, scenario))
+
+
+def test_a_404_without_the_gateway_code_is_unavailable_not_unknown(monkeypatch):
+    from aiohttp import web
+
+    async def not_found(_request):
+        return web.json_response({"error": "no route"}, status=404)
+
+    async def scenario():
+        app = web.Application()
+        app.router.add_post("/v1/gateway/default/user_email", not_found)
+        async with TestServer(app) as server:
+            endpoint = str(server.make_url("")).rstrip("/")
+            async with GatewayUserEmails.from_settings(_settings(monkeypatch, endpoint)) as emails:
+                with pytest.raises(UserEmailLookupError) as error:
+                    await emails.email_of("U0EXAMPLE1", "T0EXAMPLE1")
+                assert not isinstance(error.value, UserEmailUnknown)
+
+    asyncio.run(scenario())
+
+
+def test_client_default_timeout_outlasts_the_gateway_bound(monkeypatch):
+    settings = _settings(monkeypatch, "https://gateway.example.test")
+    from curie_channel_gateway.slack.read_server import GatewayConfig
+
+    assert settings.timeout_s > GatewayConfig().user_email_timeout_s
+
+
+def test_identity_caller_cannot_fetch_files_or_reply(monkeypatch):
+    async def scenario(endpoint, calls):
+        fetch = endpoint + "/v1/gateway/default/fetch/F0EXAMPLE1"
+        reply = endpoint + "/v1/gateway/default/reply"
+        async with httpx.AsyncClient() as http:
+            response = await http.get(
+                fetch, headers=request_headers(TOKENS["identity"], "GET", fetch)
+            )
+            assert response.status_code == 403
+            response = await http.post(
+                reply,
+                content=b"{}",
+                headers=request_headers(TOKENS["identity"], "POST", reply, b"{}"),
+            )
+            assert response.status_code == 403
+        assert calls == []
+
+    asyncio.run(_run(lambda _request: _ok(_user()), scenario))
