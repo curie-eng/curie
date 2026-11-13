@@ -1,7 +1,7 @@
 """Bounded read-only factory CI observations (#5430).
 
 Revision ID: 0163
-Revises: 0160
+Revises: 0162
 """
 
 from collections.abc import Sequence
@@ -11,7 +11,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0163"
-down_revision: str = "0160"
+down_revision: str = "0162"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

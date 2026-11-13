@@ -474,12 +474,12 @@ def test_additive_migration_preserves_existing_failed_execution(migration_admitt
     before = _snapshot(published["id"])
     config = alembic_config()
     with pytest.raises(RuntimeError, match="factory_ci_observation_records_present"):
-        command.downgrade(config, "0160")
+        command.downgrade(config, "0162")
     assert _snapshot(published["id"]) == before
     _execute(
         "DELETE FROM curie.factory_ci_observations WHERE request_id = :id", {"id": published["id"]}
     )
-    command.downgrade(config, "0160")
+    command.downgrade(config, "0162")
     assert _snapshot(published["id"]) == before
     command.upgrade(config, "0163")
     assert _snapshot(published["id"]) == before

@@ -824,6 +824,7 @@ print(json.dumps(graph))
         assert!(!live_in_window("0158", &current));
         assert!(!live_in_window("0159", &current));
         assert!(!live_in_window("0160", &current));
+        assert!(!live_in_window("0162", &current));
         assert!(live_in_window("0163", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
