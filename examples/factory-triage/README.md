@@ -39,8 +39,8 @@ limits are platform settings, not enforced by the example's prompt.
 
 The shell recorder stores session observations in the workspace under
 `.curie/factory-triage`. Each completed command records its exit status, up to
-32 KiB of output, checkout commit and tracked-file cleanliness. The last 128
-commands are retained. The gate checks a ticket against that evidence and the
+32,768 characters of output, checkout commit and tracked-file cleanliness. Up to
+128 recent commands are retained. The gate checks a ticket against that evidence and the
 checkout at submission. Its observed result must quote at least one recorded
 nonempty output line verbatim. Untracked probe files are allowed; tracked source
 patches must be reverted before the baseline probe and before submission.

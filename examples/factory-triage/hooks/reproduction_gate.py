@@ -222,9 +222,7 @@ def output(response: Any, *, failed: bool) -> tuple[int, str]:
     text = stdout + "\n" + stderr
     if re.search(r"running in (?:the )?background|Background task|Process running", text, re.I):
         raise Refusal("The shell command is unfinished; it cannot be reproduction evidence.")
-    match = re.match(r"Exit code (\d+)\n", stdout)
-    status = int(match.group(1)) if match else 0
-    return status, text[:MAX_OUTPUT]
+    return 0, text[:MAX_OUTPUT]
 
 
 def record(state: dict[str, Any], event: str, data: dict[str, Any], cwd: Path) -> None:

@@ -250,6 +250,12 @@ def test_recorder_retains_failure_exit_status(session: Session) -> None:
     assert state["runs"][-1]["exit_status"] == 1
 
 
+def test_successful_output_cannot_invent_a_failure_exit_status(session: Session) -> None:
+    session.run("python3 -c 'print(\"Exit code 7\\nprobe\")'")
+    state = json.loads(next((session.cwd / ".curie/factory-triage").glob("*.json")).read_text())
+    assert state["runs"][-1]["exit_status"] == 0
+
+
 def test_lock_is_held_through_check_and_save(session: Session) -> None:
     import fcntl
 
