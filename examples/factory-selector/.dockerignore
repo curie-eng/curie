@@ -1,0 +1,3 @@
+# runner.Dockerfile installs onto the platform runner and reads nothing from
+# this directory, so nothing else here is build input.
+*

@@ -580,3 +580,58 @@ def test_a_lock_wait_denies_before_the_runner_timeout(tmp_path: Path) -> None:
     assert elapsed < 60
     stored = json.loads((gate.state / "sess-1.json").read_text())
     assert stored["allowed"] == []
+
+
+# The image root is a non-writable directory the hook is told about through
+# FACTORY_SELECTOR_IMAGE_ROOT, which defaults to /app. GitHub runners reject
+# an unprivileged user namespace, so this stand-in is the read-only root.
+def _cap_off_image_root(tmp_path: Path, *, workspace: bool) -> None:
+    gate = Gate(tmp_path, session="sess-keep")
+    del gate.env["FACTORY_SELECTOR_STATE_DIR"]
+    image = tmp_path / "app"
+    image.mkdir()
+    os.chmod(image, 0o555)
+    gate.cwd = image
+    gate.env["FACTORY_SELECTOR_IMAGE_ROOT"] = str(image)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    gate.env["TMPDIR"] = str(scratch)
+    if workspace:
+        expected = tmp_path / "workspace"
+        gate.env["FACTORY_SELECTOR_WORKSPACE"] = str(expected)
+    else:
+        gate.env["FACTORY_SELECTOR_WORKSPACE"] = str(tmp_path / "unmounted")
+        expected = scratch
+    for number, labels in ((12, ["bug"]), (15, ["docs"]), (18, ["help wanted"])):
+        _allow(gate, number, labels)
+    gate.read(21, ["bug"])
+    denied = gate.update(21, ["bug", LABEL])
+    assert denied["permissionDecision"] == "deny", denied
+    assert "cap of 3" in denied["permissionDecisionReason"]
+    state = expected / ".factory-selector" / "sess-keep.json"
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["allowed"] == [
+        "acme-corp/acme-bot/12",
+        "acme-corp/acme-bot/15",
+        "acme-corp/acme-bot/18",
+    ]
+    resolved = state.resolve()
+    image_root = image.resolve()
+    assert resolved != image_root and image_root not in resolved.parents
+    assert not (image / ".factory-selector").exists()
+
+
+def test_a_read_only_image_root_keeps_the_cap_off_that_root(tmp_path: Path) -> None:
+    """Three label writes are allowed and the fourth is denied on resume.
+
+    The negative control is the state path. Putting it back under the image
+    root fails this test: that directory is not writable, so the writes fail
+    closed, and a file created there fails the path check.
+    """
+    try:
+        _cap_off_image_root(tmp_path / "workspace", workspace=True)
+        _cap_off_image_root(tmp_path / "temp", workspace=False)
+    finally:
+        for image in (tmp_path / "workspace" / "app", tmp_path / "temp" / "app"):
+            if image.is_dir():
+                os.chmod(image, 0o755)

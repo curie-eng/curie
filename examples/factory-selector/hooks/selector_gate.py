@@ -7,8 +7,9 @@ labels and this session is still under the cap. The read and the allow
 share one file lock for the whole state transaction, so concurrent calls
 cannot pass the cap. The runner allows a tool when this hook is still
 running at 60 seconds, so the hook denies itself first. State is one JSON
-file per session. A missing policy, an out-of-range cap, or a bad state
-file refuses every label write. PreToolUse refuses a shell command and
+file per session, in a directory the runner can write. A missing policy,
+an out-of-range cap, or a bad state file refuses every label write.
+PreToolUse refuses a shell command and
 every file write, whatever the path, so the model cannot replace this
 hook or clear the cap. Missing, malformed, or undecodable hook input, and
 any other failure, deny.
@@ -22,6 +23,7 @@ import os
 import re
 import signal
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -73,12 +75,77 @@ def policy_path() -> Path:
     return root / "policy.json"
 
 
+# runner/Dockerfile WORKDIR. ClaudeAgentOptions.cwd is omitted when no git
+# checkout is mounted, so the SDK session cwd, and this hook's payload cwd,
+# is that directory. The chart mounts it read-only.
+_IMAGE_ROOT = Path("/app")
+# The managed checkout the runner mounts beside that root, when one exists.
+_SESSION_WORKSPACE = Path("/workspace")
+
+
+def _image_root() -> Path:
+    """Read-only image root. A test names a stand-in; the runner leaves this unset."""
+    return _env_path("FACTORY_SELECTOR_IMAGE_ROOT") or _IMAGE_ROOT
+
+
+def _session_workspace() -> Path:
+    """Managed checkout. A test names a stand-in; the runner leaves this unset."""
+    return _env_path("FACTORY_SELECTOR_WORKSPACE") or _SESSION_WORKSPACE
+
+
+def _under_image_root(path: Path) -> bool:
+    root = _image_root()
+    try:
+        candidate = path.resolve()
+        root = root.resolve()
+    except OSError:
+        candidate = path
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _writable_directory(path: Path) -> bool:
+    """A directory this hook can create the cap file in.
+
+    Anything under the image root is refused even if a local tree is
+    writable there. The runner's root is not.
+    """
+    if not str(path) or _under_image_root(path):
+        return False
+    try:
+        return path.is_dir() and os.access(path, os.W_OK)
+    except OSError:
+        return False
+
+
+def state_directory(data: dict[str, Any]) -> Path:
+    """Where this session's cap file lives.
+
+    An explicit directory wins. Otherwise the payload cwd is the session
+    workspace when it is writable. When that cwd is the read-only image
+    root, the file goes on the managed checkout if it is mounted, and
+    otherwise in the temporary directory the runner mounts writable (the
+    same place the dark-factory gate keeps its session files). A resumed
+    session uses the same key and the same directory, so it keeps the count.
+    """
+    override = _env_path("FACTORY_SELECTOR_STATE_DIR")
+    if override is not None:
+        return override
+    payload = Path(str(data.get("cwd") or ""))
+    if _writable_directory(payload):
+        return payload / ".factory-selector"
+    workspace = _session_workspace()
+    if _writable_directory(workspace):
+        return workspace / ".factory-selector"
+    return Path(tempfile.gettempdir()) / ".factory-selector"
+
+
 def state_file(data: dict[str, Any]) -> Path:
-    directory = _env_path("FACTORY_SELECTOR_STATE_DIR")
-    if directory is None:
-        directory = Path(str(data.get("cwd") or "")) / ".factory-selector"
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", session_key(data) or "default")
-    return directory / f"{name}.json"
+    return state_directory(data) / f"{name}.json"
 
 
 class _Deadline(Exception):

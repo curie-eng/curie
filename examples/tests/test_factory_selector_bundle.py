@@ -7,6 +7,7 @@ by the real plugin_format classifier. Wording of the skill is not asserted.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import yaml
@@ -17,6 +18,8 @@ from plugin_format import (
     load_tool_policy,
     validate_bundle,
 )
+from plugin_format.connector_lock import source_digest_of
+from plugin_format.connectors import ConnectorBuild
 from plugin_format.models import PluginManifest
 from plugin_format.validate import _Collector, _validate_triggers
 
@@ -107,6 +110,31 @@ def test_the_hook_declaration_matches_the_two_tools():
     declared = yaml.safe_load((BUNDLE / "connectors.yaml").read_text())
     assert declared["connectors"] == {}
     assert declared["runner"]["build"]["dockerfile"] == "runner.Dockerfile"
+
+
+def test_a_bytecode_cache_does_not_move_the_runner_source_digest(tmp_path: Path):
+    """The packer omits bytecode, and deploy recomputes this digest on what it
+    uploaded. The runner image reads nothing from the directory, so a cache
+    beside the hook must not make that recomputation disagree with the lock.
+    """
+    dockerfile = (BUNDLE / "runner.Dockerfile").read_text()
+    assert "\nCOPY " not in dockerfile
+    assert "\nADD " not in dockerfile
+    copy = tmp_path / "bundle"
+    shutil.copytree(
+        BUNDLE,
+        copy,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    declared = yaml.safe_load((copy / "connectors.yaml").read_text())
+    build = ConnectorBuild.model_validate(declared["runner"]["build"])
+    baseline = source_digest_of(copy, build)
+    cache = copy / "hooks" / "__pycache__"
+    cache.mkdir()
+    (cache / "selector_gate.cpython-313.pyc").write_bytes(b"\x00cache")
+    assert source_digest_of(copy, build) == baseline
+    (copy / ".dockerignore").unlink()
+    assert source_digest_of(copy, build) != baseline
 
 
 def test_the_readme_states_the_token_and_session_cap():
