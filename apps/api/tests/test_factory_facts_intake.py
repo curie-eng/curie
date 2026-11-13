@@ -488,7 +488,7 @@ def test_two_install_databases_touch_only_their_label(
     from sqlalchemy.pool import NullPool
 
     world = facts_world
-    isolated_migration_db.at("0166")
+    isolated_migration_db.at("0164")
     other_engine = create_async_engine(get_settings().database_url, poolclass=NullPool)
     other_sessions = async_sessionmaker(other_engine, expire_on_commit=False)
     other_id = uuid.uuid4()

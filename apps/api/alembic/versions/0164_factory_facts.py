@@ -1,6 +1,6 @@
 """Cached facts and metadata-only request delivery (ADR 0280).
 
-Revision ID: 0166
+Revision ID: 0164
 Revises: 0163
 """
 
@@ -8,7 +8,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0166"
+revision: str = "0164"
 down_revision: str = "0163"
 branch_labels: None = None
 depends_on: None = None

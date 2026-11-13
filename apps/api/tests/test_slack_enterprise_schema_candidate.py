@@ -13,7 +13,7 @@ from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[3]
 MIGRATION = ROOT / "apps/api/alembic/versions/0139_slack_enterprise_namespaces.py"
-CANDIDATE = {"schema_min": "0166", "schema_head": "0166"}
+CANDIDATE = {"schema_min": "0164", "schema_head": "0164"}
 
 
 def load(relative: str) -> Any:
@@ -31,7 +31,7 @@ def script() -> ScriptDirectory:
 def test_migration_0139_keeps_parent_0138_below_factory_base_head() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: additive revision after approval provenance."""
     graph = script()
-    assert graph.get_heads() == ["0166"]
+    assert graph.get_heads() == ["0164"]
     revision = graph.get_revision("0139")
     assert revision is not None and revision.down_revision == "0138"
     assert Path(revision.path).resolve() == MIGRATION.resolve()
@@ -54,7 +54,7 @@ def test_migration_0139_keeps_parent_0138_below_factory_base_head() -> None:
         ),
     ],
 )
-def test_every_coupled_candidate_consumer_requires_0166(relative: str, extract: Any) -> None:
+def test_every_coupled_candidate_consumer_requires_0164(relative: str, extract: Any) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: Grid reports write slack_enterprise namespaces."""
     assert extract(load(relative)) == CANDIDATE
 
@@ -62,7 +62,7 @@ def test_every_coupled_candidate_consumer_requires_0166(relative: str, extract: 
 def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: exact graph parent and file digest."""
     revisions = load("cli/src/application_schema_windows.json")["revisions"]
-    assert revisions[-22:] == [
+    assert revisions[-23:] == [
         "0138",
         "0139",
         "0140",
@@ -85,7 +85,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
         "0160",
         "0162",
         "0163",
-        "0166",
+        "0164",
     ]
     kinds = load("apps/api/src/curie_api/revision_kinds.json")
     assert kinds["0139"] == "expand"
@@ -106,7 +106,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
     assert kinds["0159"] == "expand"
     assert kinds["0160"] == "expand"
     assert kinds["0162"] == "expand"
-    assert kinds["0166"] == "expand"
+    assert kinds["0164"] == "expand"
     serving = load("packages/protected-hooks/src/curie_protected_hooks/schema_serving.json")
     assert serving["revision_parents"]["0139"] == ["0138"]
     assert serving["revision_parents"]["0143"] == ["0141"]
@@ -126,7 +126,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
     assert serving["revision_parents"]["0159"] == ["0158"]
     assert serving["revision_parents"]["0160"] == ["0159"]
     assert serving["revision_parents"]["0162"] == ["0160"]
-    assert serving["revision_parents"]["0166"] == ["0163"]
+    assert serving["revision_parents"]["0164"] == ["0163"]
     chart_rows = load("charts/curie/files/schema-compat.json")["revisions"]
     chart = {row["revision"]: row for row in chart_rows}
     assert chart["0139"] == {

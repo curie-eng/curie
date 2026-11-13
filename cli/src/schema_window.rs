@@ -773,9 +773,9 @@ print(json.dumps(graph))
         // kind 0158 allows. Owner tuple reads require 0159, personal custody
         // reads and enrollment fences require 0160, and agent version reads
         // select the 0162 result policy columns. Cached facts and request delivery
-        // require the 0166 tables.
-        assert_eq!(candidate.schema_min, "0166");
-        assert_eq!(candidate.schema_head, "0166");
+        // require the 0164 tables.
+        assert_eq!(candidate.schema_min, "0164");
+        assert_eq!(candidate.schema_head, "0164");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -827,7 +827,7 @@ print(json.dumps(graph))
         assert!(!live_in_window("0160", &current));
         assert!(!live_in_window("0162", &current));
         assert!(!live_in_window("0163", &current));
-        assert!(live_in_window("0166", &current));
+        assert!(live_in_window("0164", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
