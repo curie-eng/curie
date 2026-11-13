@@ -1,6 +1,8 @@
 {
   "_comment": "Fixtures for the eval falsifiability gate (issue #619). NOT eval cases: this is gate data. `exemplars` maps <suite-name>/<case-id> to a known-good synthetic agent answer that MUST green the case's grader today (the positive control, AC2). `exemplar_tools` adds tool-note events for tool-call positive controls. `paraphrases` maps selected cases to additional compliant answers that MUST stay green. `counterexamples` maps selected cases to known-bad answers that MUST stay red. `input_satisfiable_baseline` lists the committed cases whose grader is already satisfied by the case's own input verbatim (the input-parrot broken agent, AC4): the gate blocks NEW input-satisfiable cases while baselining these known ones so it stays green on main without editing a committed case. Tightening or removing a baselined case is tracked separately, not done in this gate. See ADR-0022, #527, #553.",
   "exemplars": {
+    "dark-factory/answers-recorded-decision": "No changes needed: Decision 1 rejects per-event commits because their transaction overhead grows with the event count. The recorded trace compares 40 commits with one batch commit.",
+    "dark-factory/admits-unrecorded-decision": "No changes needed: The rationale for choosing 256 was not recorded. The supplied diff establishes the value, but not why it was selected.",
     "dark-factory/ordinary-delivery-starts-factory": "Could not complete: The issue-read tool is unavailable in this runner.\nDecisions needed:\n1. Can the next run provide the issue-read capability?\nSettled:\n1. No pull request was opened.",
     "dark-factory/no-pr-handoff-counts-omitted-blockers": "Could not complete: Seven maintainer decisions remain unresolved.\nDecisions needed:\n1. What rollback behavior is required?\n2. Which behavior must the regression test assert?\n3. Which verification evidence is required?\n4 additional unresolved blockers omitted.\nSettled:\n1. No pull request was opened.",
     "dark-factory/no-pr-handoff-keeps-blockers-open": "Could not complete: Three unresolved blockers remain and no pull request was opened.\nDecisions needed:\n1. What rollback behavior must the migration down path restore?\n2. Which observable behavior should the new test assert so it fails on the old source?\n3. Which required checks and results must the verification table record?\nSettled:\n1. No pull request was opened.",
@@ -117,6 +119,8 @@
     "dark-factory/ordinary-delivery-starts-factory": ["Skill"]
   },
   "paraphrases": {
+    "dark-factory/answers-recorded-decision": ["No changes needed: Batching reduces the cost of a commit for each event; entry #1 records this choice and its storage trace.", "No changes needed: the accumulation is intentional and its rationale is already recorded. This is recorded in Decisions entry 1 of the pull request body: batching was chosen over saving each event in its own transaction because repeated per-event transaction setup grows with the number of events."],
+    "dark-factory/admits-unrecorded-decision": ["No changes needed: The PR body does not explain why 256 was selected; the repository excerpt only defines that capacity."],
     "factory-selector/reports-labelled-and-skipped": [
       "Labelled:\n#7 Retry the flaky checkout\nSkipped:\n#2 search excluded it\nThe next session can select different issues.\n",
       "Labelled:\n#7 Retry the flaky checkout\n#31 Document the cap\nSkipped:\n#2 search excluded it\n#8 the session cap was already full\n"
@@ -243,6 +247,8 @@
     ]
   },
   "counterexamples": {
+    "dark-factory/answers-recorded-decision": ["No changes needed: Decision 1 uses batches to preserve event order.", "No changes needed: Decision 2 avoids per-event commit overhead.", "No changes needed: The code saves a batch in one transaction."],
+    "dark-factory/admits-unrecorded-decision": ["No changes needed: 256 was selected to match the expected peak load.", "No changes needed: The queue is bounded at 256 entries."],
     "factory-selector/reports-labelled-and-skipped": [
       "Skipped:\n#4 already carries the factory label\nLabelled:\n#12 Widget flaky on cold start\n",
       "Labelled:\n#12\nSkipped:\n#4 already carries the factory label\n",

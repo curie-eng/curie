@@ -1153,7 +1153,12 @@ class _Hook:
         return out
 
     def decision(self, session_id: str, tool: str, tool_input: dict[str, Any]) -> dict[str, Any]:
-        out = self.fire(session_id, "PreToolUse", tool_name=tool, tool_input=tool_input)
+        out = self.fire(
+            session_id,
+            "PreToolUse",
+            tool_name=tool,
+            tool_input=gate._publish_input(tool, tool_input),
+        )
         assert out is not None, (tool, tool_input)
         decision: dict[str, Any] = out["hookSpecificOutput"]
         return decision

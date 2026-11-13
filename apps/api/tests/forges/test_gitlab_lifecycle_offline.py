@@ -23,8 +23,10 @@ Run with ``uv run pytest apps/api/tests -k gitlab_lifecycle``.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Callable, Iterator
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -213,6 +215,90 @@ def _forget_cursor(lineage_id: uuid.UUID) -> None:
         client.delete(cursor_key(lineage_id))
     finally:
         client.close()
+
+
+def _review_publication(lineage_id: uuid.UUID, revision: int, status: str, body: str) -> None:
+    stamp = datetime(2026, 1, 1) + timedelta(minutes=revision)
+    gl.execute(
+        "WITH approval AS ("
+        "INSERT INTO curie.approvals "
+        "(id, agent_id, conversation_id, author, summary, reply_kind, reply_channel, "
+        "dedupe_key, status, purpose) "
+        "SELECT :approval, agent_id, conversation_id, 'fixture', 'Publish changes', "
+        "'gitlab', repo_full_name, :dedupe, 'approved', 'publication' "
+        "FROM curie.thread_publication_lineages WHERE id = :lineage RETURNING id) "
+        "INSERT INTO curie.publications "
+        "(id, approval_id, deployment_id, lineage_id, revision_number, repo_full_name, "
+        "status, base_sha, changed_paths, title, body, reply_kind, reply_channel, "
+        "created_at, terminal_at) "
+        "SELECT :id, approval.id, lineage.deployment_id, lineage.id, :revision, "
+        "lineage.repo_full_name, :status, lineage.base_sha, CAST('[]' AS jsonb), "
+        "'Update parser', :body, 'gitlab', lineage.repo_full_name, "
+        ":created_at, :terminal_at "
+        "FROM curie.thread_publication_lineages lineage CROSS JOIN approval "
+        "WHERE lineage.id = :lineage",
+        {
+            "id": uuid.uuid4(),
+            "approval": uuid.uuid4(),
+            "dedupe": f"review-body-{uuid.uuid4().hex}",
+            "lineage": lineage_id,
+            "revision": revision,
+            "status": status,
+            "body": body,
+            "created_at": stamp,
+            "terminal_at": None if status == "pending" else stamp,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "publication_body",
+    ["The parser accepts quoted fields.", "é" * 20000, "é" * 20001, None],
+    ids=["latest-succeeded", "at-limit", "clipped", "no-succeeded"],
+)
+def test_gitlab_review_objective_carries_latest_succeeded_pull_request_body(
+    install: GitLabInstall, publication_body: str | None
+) -> None:
+    iid = gl.admit(install)
+    (item,) = gl.work_items(iid)
+    work_item_id = uuid.UUID(str(item["id"]))
+    mr, lineage_id = _open_merge_request(install, work_item_id)
+    install.fake.merge_requests[mr].description = (
+        "Provider description differs from the stored publication."
+    )
+    try:
+        if publication_body is not None:
+            _review_publication(lineage_id, 1, "succeeded", "Earlier description")
+            _review_publication(lineage_id, 2, "succeeded", publication_body)
+        _review_publication(lineage_id, 3, "failed", "Unpublished failed description")
+        _review_publication(lineage_id, 4, "pending", "Unpublished pending description")
+        question = f"@{install.backend.bot.login} why does the parser need this check?"
+        install.backend.mr_discussion(mr, install.backend.developer, question)
+
+        gl.reconcile()
+
+        rows = gl.requests_of(work_item_id)
+        assert len(rows) == 2, rows
+        revision = rows[1]
+        provenance = json.loads(revision["objective"].splitlines()[-1])
+        assert provenance["body"] == question
+        assert provenance["sender"] == install.backend.developer.login
+        assert provenance["url"] == install.mr_url(mr)
+        assert revision["requester"].startswith(f"gitlab:{install.backend.developer.id}:")
+        assert revision["reply_target_kind"] == "review_thread"
+        assert revision["reply_target_pr_number"] == str(mr)
+        assert revision["reply_target_url"] == install.mr_url(mr)
+        if publication_body is None:
+            assert "pull_request_body" not in provenance
+            assert "pull_request_body_truncated" not in provenance
+        else:
+            assert provenance["pull_request_body"] == publication_body[:20000]
+            if len(publication_body) > 20000:
+                assert provenance["pull_request_body_truncated"] is True
+            else:
+                assert "pull_request_body_truncated" not in provenance
+    finally:
+        _forget_cursor(lineage_id)
 
 
 def _admit_personal(install: GitLabInstall, owner: uuid.UUID) -> uuid.UUID:

@@ -1412,7 +1412,8 @@ def _gate(tmp_path: Path, event: Mapping[str, Any]) -> subprocess.CompletedProce
     script = tmp_path / pps.RESERVATION_GATE_FILE
     script.write_text(pps.RESERVATION_GATE_PROGRAM)
     # The gate resolves reviewers with the bundle's own review_gate.py beside it.
-    shutil.copy(REPO_ROOT / "examples/dark-factory/hooks/review_gate.py", tmp_path)
+    for name in ("review_gate.py", "decisions_section.py"):
+        shutil.copy(REPO_ROOT / "examples/dark-factory/hooks" / name, tmp_path)
     limits = json.dumps(pps.RESERVATION_LIMITS)
     return subprocess.run(
         [sys.executable, "-I", str(script), limits],

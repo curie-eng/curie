@@ -195,6 +195,34 @@ covers the diff it read. List diff-review notes in the pull request body as
 notes you did not address.
 Never start another review round only to address notes.
 
+## Decision record
+
+Keep a short record of consequential choices as you plan, implement and
+resolve review findings. Record only choices and rejected alternatives that
+the plan, plan review or diff review actually supports. Keep the reason and
+evidence current when revisions change a choice. Do not reconstruct an
+unrecorded rationale or invent an alternative to fill a slot.
+
+The pull request body contains exactly one heading line `## Decisions`, after
+the summary and before the acceptance checklist. The section ends at the next
+line beginning with `## `, or at the end of the body. Its nonblank lines use
+exactly one of these two forms:
+
+1. One to seven entries, numbered contiguously from 1, each on one line:
+
+   `n. <choice>. Rejected: <alternative>, because <reason>. (<source>) Evidence: <evidence>.`
+
+   Every field is nonblank. `<source>` is exactly `plan`, `plan review` or
+   `diff review`. Cite a concrete observation, check or repository fact in
+   `<evidence>`; the reason explains why the alternative was rejected.
+2. The sole line `None: the change follows directly from the acceptance criteria.`
+
+Never mix the None declaration with entries or add prose inside the section.
+Preserve and update this section on every pull request revision, including
+CI repair rounds. A publication refusal for this section is recoverable:
+correct the body and request publication again without changing the reviewed
+candidate.
+
 ## Verification contract
 
 The review gate hook gives you the bundle's verification contract with your
@@ -225,6 +253,17 @@ repository itself is already checked out at `/workspace`.
 If the issue cannot be read (the tool is missing, refused, or returns an
 error), stop: say that the issue could not be read and why. Never guess what
 an issue says from its title or number.
+
+For a follow-up that asks a question about an existing pull request without
+requesting a change, read the supplied issue, `pull_request_body`, diff and
+relevant repository context. Make no edits and do not call
+`mcp__curie__publish_changes`. Reply with `No changes needed:` in fewer than
+3000 characters, answer the question from that evidence, and cite the
+Decisions entry number when it records the reason. When it does not, say
+plainly that the reason was not recorded. A plausible explanation from the
+current code is not a historical decision record. Such an answer never enters
+plan review or publication, so a review gate notice about the checkout does
+not stop it; answer from the sources you can read and name any you could not.
 
 ## 2. Pin the acceptance criteria (phase `pin_criteria`)
 
@@ -479,20 +518,21 @@ check or an unmet criterion as a service gap. First
 read the repository's pull request conventions: `AGENTS.md` and `CONTRIBUTING.md`, the pull request
 template (often under `.github/`), and any CI job that checks pull request
 bodies. Follow them in the pull request's title and body, including required
-trailers and selectors; when they conflict with the outline below, the
-repository's conventions win. Call `mcp__curie__publish_changes` once, with:
+trailers and selectors, while retaining the required Decisions section below.
+Call `mcp__curie__publish_changes` once, with:
 
-- `title`: a short summary that ends with the issue reference, for example
+1. `title`: a short summary that ends with the issue reference, for example
   `Add inch to centimeter conversion (#12)`.
-- `body`: a short summary of the change, then, for a GitHub issue,
+2. `body`: a short summary of the change, then, for a GitHub issue,
   `Closes #<number>` (for any other tracker the platform adds the issue
-  reference), then a
-  checklist that maps each acceptance criterion to its evidence, then the
+  reference), then the `## Decisions` section defined in "Decision record",
+  then an acceptance checklist that maps each criterion to its evidence, then the
   checks you ran with their results, then the verification table with every
   delegated or blocked check, its cause and the evidence the verification
-  contract requires, then the plan review's verdict and how each of its
-  findings was resolved, then the diff review rounds it took, then anything
-  else you did not verify or deliberately declined, and any reviewer `NOTES:` you did not address.
+  contract requires. Under `## Reviews`, give the plan review verdict and
+  each finding's resolution, then each completed diff review round's verdict
+  and the resolution of its findings. Include reviewer `NOTES:` you did not
+  address, and anything else you did not verify or deliberately declined.
 
 After calling it, end your turn and say that the publication request is
 pending. Do not report `wait_ci`; the platform reports it (step 9). Do not call it twice. Never push with git; the platform publishes
@@ -501,7 +541,10 @@ from outside the sandbox.
 **Finish with no changes needed** only when this run is a follow-up on an
 open pull request and nothing needs to change. A relabelled issue whose open
 pull request this run continues counts as a follow-up. Your final reply begins with
-`No changes needed:` and gives the reason. Do not call
+`No changes needed:` and gives the reason in fewer than 3000 characters. For
+a question about a choice, use the supplied issue, `pull_request_body`, diff
+and repository context, cite its Decisions entry number, or say plainly that
+the reason was not recorded. Make no edits and do not call
 `mcp__curie__publish_changes`.
 
 **Stop with a stated reason** in every other case. Do not call

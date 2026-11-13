@@ -426,9 +426,7 @@ def result_section(
     if cause == "completed":
         if unchanged:
             if feedback_url is not None:
-                text = (
-                    "No changes needed: this pull request already covers the requested revision.\n"
-                )
+                text = "No changes needed: this pull request is unchanged.\n"
             elif isinstance(pr_url, str) and pr_url.strip():
                 text = (
                     "No changes needed: the open pull request already covers this request: "
