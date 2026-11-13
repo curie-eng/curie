@@ -52,12 +52,19 @@ CONTRACT_FILE = BUNDLE / "verification" / "contract.md"
 CONTEXT_LIMIT = 10_000
 PLAN, DIFF = "dark-factory:plan-reviewer", "dark-factory:diff-reviewer"
 PUBLISH = "mcp__curie__publish_changes"
-VALID_PR_BODY = (
-    "## Decisions\nNone: the change follows directly from the acceptance criteria.\n"
-)
+VALID_PR_BODY = "## Decisions\nNone: the change follows directly from the acceptance criteria.\n"
 DECISIONS_CASES = json.loads(
     (REPO_ROOT / "tests" / "vectors" / "factory-decisions-section.json").read_text()
 )["cases"]
+
+
+def _publish_input(tool: str, tool_input: dict[str, Any] | None) -> dict[str, Any]:
+    """A publish call with no input, or the placeholder body "b", carries a valid
+    Decisions section, so review policy tests are not refused by that check."""
+    tool_input = dict(tool_input or {})
+    if tool == PUBLISH and (not tool_input or tool_input.get("body") == "b"):
+        tool_input["body"] = VALID_PR_BODY
+    return tool_input
 
 
 REPORT = "mcp__curie__report_progress"
@@ -258,7 +265,7 @@ class Session:
         return json.loads(done.stdout) if done.stdout.strip() else None
 
     def pre(self, tool: str, tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
-        out = self.fire("PreToolUse", tool_name=tool, tool_input=tool_input or {})
+        out = self.fire("PreToolUse", tool_name=tool, tool_input=_publish_input(tool, tool_input))
         assert out is not None
         decision: dict[str, Any] = out["hookSpecificOutput"]
         return decision
@@ -615,7 +622,7 @@ def test_fifth_diff_rejection_caps_the_loop(session: Session, plan_verdict: str)
     rework(session, 5)
     sixth = session.pre("Agent", {"subagent_type": DIFF, "description": "r", "prompt": "p"})
     assert sixth["permissionDecision"] == "deny"
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert [p for p in session.phases() if p[0] == "review_diff"] == [
         ("review_diff", n) for n in range(1, 6)
     ]
@@ -660,7 +667,7 @@ def test_reply_without_a_verdict_grants_nothing(session: Session, text: str) -> 
         ]
         == "deny"
     )
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     session.load_workflow()
     assert not allowed(session.edit("Write", TEST))
 
@@ -676,27 +683,27 @@ def test_errored_reviewer_call_grants_nothing(session: Session) -> None:
     )
     assert out is not None
     assert not out["hookSpecificOutput"]["additionalContext"].startswith("STOP.")
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _saved_state(session)["diff"] == {"round": 0, "verdict": None}
     assert _saved_state(session)["stopped"] is None
     # The retried review on the same checkout is round 1, and it counts.
     _, context = session.review(DIFF, reply(DIFF, "APPROVE"))
     assert "round 1: APPROVED" in context
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 # --- Publication ----------------------------------------------------------------
 
 
 def test_publish_only_after_the_diff_reviewer_approves(session: Session) -> None:
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     session.review(PLAN, reply(PLAN, "APPROVE"))
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     session.review(DIFF, reply(DIFF, "CHANGES"))
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     rework(session, 1)
     session.review(DIFF, reply(DIFF, "APPROVE"))
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 @pytest.mark.parametrize("case", DECISIONS_CASES, ids=lambda case: case["id"])
@@ -735,7 +742,7 @@ def test_publish_decisions_missing_body_is_recoverable(session: Session) -> None
     session.review(PLAN, reply(PLAN, "APPROVE"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
     before = _saved_state(session)
-    refused = session.pre(PUBLISH, {})
+    refused = session.pre(PUBLISH, {"title": "t"})
     assert refused["permissionDecision"] == "deny"
     assert "## Decisions" in refused["permissionDecisionReason"]
     assert _saved_state(session) == before
@@ -769,7 +776,7 @@ def test_a_new_message_continues_the_run_and_a_new_session_starts_fresh(
     # The same session continues: planning stays complete and the approval stands.
     plan = session.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
     assert plan["permissionDecision"] == "deny"
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
     # A new session is a new run: nothing approved, and plan review starts at round 1.
     session.fire("UserPromptSubmit", prompt="next issue", session_id="sess-2")
@@ -935,7 +942,7 @@ def test_an_approve_with_notes_reply_is_accepted(session: Session) -> None:
     diff_reply = "REVIEWER: diff-reviewer\nVERDICT: APPROVE\nNOTES:\n- none\n"
     _, context = session.review(DIFF, diff_reply)
     assert "APPROVED" in context
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 # --- The verdict is read from the reviewer's reply, not the echoed prompt ---------
@@ -1017,7 +1024,7 @@ def test_a_response_without_content_grants_nothing(session: Session) -> None:
     assert "no reviewer verdict" in context
     assert "APPROVED" not in context and not context.startswith("STOP.")
     assert _saved_state(session)["plan"] == {"round": 0, "verdict": None}
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     session.load_workflow()
     assert not allowed(session.edit("Write", TEST))
 
@@ -1073,9 +1080,9 @@ def test_ci_round_goes_straight_to_implement_and_diff_review(tmp_path: Path) -> 
     plan = s.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
     assert plan["permissionDecision"] == "deny"
     # The diff reviewer still gates publication.
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     s.review(DIFF, reply(DIFF, "APPROVE"))
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
     assert s.phases() == [("wait_ci", 2), ("review_diff", 1)]
 
 
@@ -1090,7 +1097,7 @@ def test_ci_round_is_found_inside_the_runner_sender_frame(tmp_path: Path, event:
     assert "CI fix round" in context_of(out)
     assert s.phases() == [("wait_ci", 2)]
     s.review(DIFF, reply(DIFF, "APPROVE"))
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 @pytest.mark.parametrize("marker_line", [2, 3])
@@ -1113,7 +1120,7 @@ def test_ci_round_diff_rejection_still_loops_and_blocks_publish(tmp_path: Path) 
     s, _ = _ci_session(tmp_path, _ci_prompt(2))
     _, context = s.review(DIFF, reply(DIFF, "CHANGES"))
     assert "phase implement, round 2 of 5" in context
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 @pytest.mark.parametrize("marker_line", [2, 3])
@@ -1324,10 +1331,7 @@ def test_service_backed_diff_is_published_not_stalled_at_the_cap(session: Sessio
     )
     assert post is not None
     assert "APPROVED" in post["hookSpecificOutput"]["additionalContext"]
-    assert (
-        session.pre(PUBLISH, {"title": "t", "body": VALID_PR_BODY})["permissionDecision"]
-        == "allow"
-    )
+    assert session.pre(PUBLISH, {"title": "t", "body": "b"})["permissionDecision"] == "allow"
 
 
 def test_service_evidence_demands_still_stall_at_the_cap(session: Session) -> None:
@@ -1336,10 +1340,7 @@ def test_service_evidence_demands_still_stall_at_the_cap(session: Session) -> No
     for round_ in range(1, 6):
         session.review(DIFF, reply(DIFF, "CHANGES"))
         rework(session, round_)
-    assert (
-        session.pre(PUBLISH, {"title": "t", "body": VALID_PR_BODY})["permissionDecision"]
-        == "deny"
-    )
+    assert session.pre(PUBLISH, {"title": "t", "body": "b"})["permissionDecision"] == "deny"
 
 
 # --- #3851: no repository edit before the workflow and an approved plan --------
@@ -1845,7 +1846,7 @@ def _assert_approval_refused(session: Session, cause: str) -> None:
     assert not allowed(session.edit("Edit", SOURCE))
     diff = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
     assert diff["permissionDecision"] == "deny"
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert [p for p in session.phases() if p[0] != "plan_review"] == []
 
 
@@ -2172,7 +2173,7 @@ class HooksJsonRuntime:
         return outs
 
     def pre(self, tool: str, tool_input: dict[str, Any]) -> dict[str, Any] | None:
-        outs = self.dispatch("PreToolUse", tool, tool_input=tool_input)
+        outs = self.dispatch("PreToolUse", tool, tool_input=_publish_input(tool, tool_input))
         assert len(outs) == 1, (tool, outs)
         return outs[0]
 
@@ -2278,7 +2279,7 @@ class HooksJsonRuntime:
 
     def decision(self, tool: str, tool_input: dict[str, Any] | None = None) -> str:
         """The PreToolUse permission decision for a gated, non-edit tool call."""
-        out = self.pre(tool, tool_input or {})
+        out = self.pre(tool, _publish_input(tool, tool_input))
         assert out is not None, tool
         return str(out["hookSpecificOutput"]["permissionDecision"])
 
@@ -2334,7 +2335,7 @@ def test_a_fresh_execution_through_hooks_json_gates_edits_in_phase_order(
     assert run.bash(pytest_cmd) == 0
 
     assert "APPROVED" in run.review(DIFF, "APPROVE")
-    published = run.pre(PUBLISH, {"title": "t", "body": VALID_PR_BODY})
+    published = run.pre(PUBLISH, {"title": "t", "body": "b"})
     assert published is not None
     assert published["hookSpecificOutput"]["permissionDecision"] == "allow"
 
@@ -2757,7 +2758,7 @@ def test_a_valid_delegated_service_test_publishes_and_waits_for_its_named_check(
     assert "APPROVED" in context
     assert diff_input["prompt"].startswith(diff_prompt)
     assert diff_input["prompt"].endswith(contract() + expected_candidate_block(s, base))
-    assert run.decision(PUBLISH, {"title": "t", "body": VALID_PR_BODY}) == "allow"
+    assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "allow"
 
     # The platform then holds the run on the named check at the published head.
     head = _head(s)
@@ -2879,7 +2880,7 @@ def test_an_incorrect_test_or_missing_ci_route_is_refused_at_both_reviews(
     assert "round 1: CHANGES" in context and why in context
     assert "failing_test" in deny_reason(run.edit("Write", queue))
     assert "return 0" in (s.cwd / "pkg" / "queue.py").read_text()
-    assert run.decision(PUBLISH, {"title": "t", "body": VALID_PR_BODY}) == "deny"
+    assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "deny"
 
     if case == "invalid_test":
         # The test replaces the function it claims to verify: green on the base code.
@@ -2900,7 +2901,7 @@ def test_an_incorrect_test_or_missing_ci_route_is_refused_at_both_reviews(
 
     _, context = run.review_with(DIFF, verified_reply(DIFF, "CHANGES", refused, finding))
     assert "phase implement, round 2 of 5" in context
-    assert run.decision(PUBLISH, {"title": "t", "body": VALID_PR_BODY}) == "deny"
+    assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "deny"
     plan_again = run.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
     assert "returns to implement" in deny_reason(plan_again)
 
@@ -2956,7 +2957,7 @@ def test_an_available_failing_check_returns_to_implement_and_a_failing_ci_run_re
     finding = ("AC1: tests/test_add.py still fails: add(2, 3) returns 6",)
     _, context = run.review_with(DIFF, verified_reply(DIFF, "CHANGES", failing, finding))
     assert "phase implement, round 2 of 5" in context
-    assert run.decision(PUBLISH, {"title": "t", "body": VALID_PR_BODY}) == "deny"
+    assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "deny"
 
     assert allowed(
         run.edit("Edit", {"file_path": source, "old_string": "a * b", "new_string": "a + b"})
@@ -2964,7 +2965,7 @@ def test_an_available_failing_check_returns_to_implement_and_a_failing_ci_run_re
     assert run.bash(check) == 0
     _, context = run.review_with(DIFF, verified_reply(DIFF, "APPROVE", sandbox))
     assert "APPROVED" in context
-    assert run.decision(PUBLISH, {"title": "t", "body": VALID_PR_BODY}) == "allow"
+    assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "allow"
 
     # The delegated check then fails in CI at the published head.
     head = _head(s)
@@ -3008,10 +3009,7 @@ def test_a_reply_without_a_verification_block_still_approves(session: Session) -
     assert "APPROVED" in context
     _, context = session.review(DIFF, reply(DIFF, "APPROVE"))
     assert "APPROVED" in context
-    assert (
-        session.pre(PUBLISH, {"title": "t", "body": VALID_PR_BODY})["permissionDecision"]
-        == "allow"
-    )
+    assert session.pre(PUBLISH, {"title": "t", "body": "b"})["permissionDecision"] == "allow"
     records = classified(session)
     assert stages(session) == [("plan_review", 1, "APPROVE"), ("review_diff", 1, "APPROVE")]
     for record in records:
@@ -3039,10 +3037,7 @@ def test_the_verification_block_never_changes_the_verdict(session: Session) -> N
     ]
     _, context = session.review(DIFF, verified_reply(DIFF, "APPROVE", lines))
     assert "APPROVED" in context
-    assert (
-        session.pre(PUBLISH, {"title": "t", "body": VALID_PR_BODY})["permissionDecision"]
-        == "allow"
-    )
+    assert session.pre(PUBLISH, {"title": "t", "body": "b"})["permissionDecision"] == "allow"
 
     records = classified(session)
     assert stages(session) == [
@@ -3096,7 +3091,7 @@ def test_only_a_label_the_resolved_declaration_names_reaches_the_pod_log(
     rework(s, 1)
     _, context = s.review(DIFF, verified_reply(DIFF, "APPROVE", lines))
     assert "APPROVED" in context
-    assert s.pre(PUBLISH, {"title": "t", "body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH, {"title": "t", "body": "b"})["permissionDecision"] == "allow"
 
     log = s.log.read_text()
     assert SECRET not in log and "TOKEN=" not in log
@@ -3202,7 +3197,7 @@ def test_a_missing_or_empty_contract_stops_the_run_before_any_review(
     plan = s.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
     assert plan["permissionDecision"] == "deny"
     assert plan["permissionDecisionReason"].startswith("STOP.")
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     s.load_workflow()
     assert not allowed(s.edit("Write", TEST))
     assert s.phases() == []
@@ -3223,7 +3218,7 @@ def test_a_contract_lost_mid_run_denies_the_next_review(tmp_path: Path) -> None:
     assert [e["stage"] for e in gates] == ["review_diff"]
     # The refused call consumed no round.
     assert ("review_diff", 1) not in s.phases()
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 def test_a_bundle_declaration_reaches_both_reviewers_after_the_contract(tmp_path: Path) -> None:
@@ -3272,7 +3267,7 @@ def test_an_oversized_bundle_declaration_stops_the_review(tmp_path: Path) -> Non
 
     assert plan["permissionDecision"] == "deny"
     assert plan["permissionDecisionReason"].startswith("STOP.")
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     s.load_workflow()
     assert not allowed(s.edit("Write", TEST))
 
@@ -3303,7 +3298,7 @@ def _assert_github_path_stops_run(s: Session, out: dict[str, Any] | None, path: 
     diff = s.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
     assert diff["permissionDecision"] == "deny", diff
     assert diff["permissionDecisionReason"] == reason
-    publication = s.pre(PUBLISH, {"body": VALID_PR_BODY})
+    publication = s.pre(PUBLISH)
     assert publication["permissionDecision"] == "deny", publication
     assert publication["permissionDecisionReason"] == reason
     assert all(phase != "review_diff" for phase, _ in s.phases())
@@ -3369,7 +3364,7 @@ def test_edits_outside_the_root_github_directory_remain_allowed(
 
     _, context = s.review(DIFF, reply(DIFF, "APPROVE"))
     assert "APPROVED" in context
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
     assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
 
 
@@ -3446,7 +3441,7 @@ def test_a_change_outside_root_github_still_reaches_the_diff_reviewer(
     _, context = s.review(DIFF, reply(DIFF, "APPROVE"))
 
     assert "APPROVED" in context
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
     assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
 
 
@@ -3487,7 +3482,7 @@ def test_an_unreadable_git_status_does_not_hide_an_untracked_github_file(
     refused = [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
     assert [e["path"] for e in refused] == [".github/e2e-selection.yaml"]
     assert decision["permissionDecision"] == "deny"
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _saved_state(s)["stopped"] is not None
     assert _saved_state(s)["diff"]["round"] == 0
     assert not invocation.exists()
@@ -3538,7 +3533,7 @@ def _advisory_outcome(s: Session, verdict: str) -> dict[str, Any]:
     observed: dict[str, Any] = {"context": context, "state": _state(s)}
     observed["test_edit"] = s.edit("Write", TEST)
     observed["source_edit"] = s.edit("Edit", SOURCE)
-    observed["publish"] = s.pre(PUBLISH, {"body": VALID_PR_BODY})
+    observed["publish"] = s.pre(PUBLISH)
     observed["second_plan"] = _call(s, PLAN)
     return observed
 
@@ -3582,7 +3577,7 @@ def test_a_pending_plan_review_keeps_edits_and_publication_shut(session: Session
 
     assert "plan review" in deny_reason(session.edit("Write", TEST)).lower()
     assert not allowed(session.edit("Edit", SOURCE))
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _call(session, DIFF)["permissionDecision"] == "deny"
     assert _state(session)["stage"] is None
 
@@ -3628,7 +3623,7 @@ def test_a_plan_review_without_a_real_verdict_remains_closed_and_can_retry(
     assert state["stage"] is None
     assert not allowed(session.edit("Write", TEST))
     assert not allowed(session.edit("Edit", SOURCE))
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _call(session, DIFF)["permissionDecision"] == "deny"
     assert classified(session) == []
 
@@ -3646,7 +3641,7 @@ def _through_implement(s: Session) -> None:
     s.run_bash("uv run pytest tests/test_calc.py", failed=True)
     s.report("implement", 1)
     s.apply_edit("Edit", SOURCE)
-    assert s.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 def test_after_plan_changes_the_fifth_diff_changes_caps_the_run(session: Session) -> None:
@@ -3655,7 +3650,7 @@ def test_after_plan_changes_the_fifth_diff_changes_caps_the_run(session: Session
     for round_ in range(1, 5):
         _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
         assert f"phase implement, round {round_ + 1} of 5" in context
-        assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+        assert session.pre(PUBLISH)["permissionDecision"] == "deny"
         # A diff rejection never reopens the plan review.
         plan_again = _call(session, PLAN)
         assert plan_again["permissionDecision"] == "deny"
@@ -3668,7 +3663,7 @@ def test_after_plan_changes_the_fifth_diff_changes_caps_the_run(session: Session
     assert state["diff"] == {"round": 5, "verdict": "CHANGES"}
     assert state["plan"] == {"round": 1, "verdict": "CHANGES"}
     assert state["stopped"]
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _call(session, DIFF)["permissionDecision"] == "deny"
     assert stages(session) == [
         ("plan_review", 1, "CHANGES"),
@@ -3688,11 +3683,11 @@ def test_after_plan_changes_only_a_diff_approval_opens_publication(
     _through_implement(session)
     for round_ in range(1, diff_rounds):
         session.review(DIFF, reply(DIFF, "CHANGES"))
-        assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+        assert session.pre(PUBLISH)["permissionDecision"] == "deny"
         rework(session, round_)
     _, context = session.review(DIFF, reply(DIFF, "APPROVE"))
     assert "APPROVED" in context
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
     assert _state(session)["diff"] == {"round": diff_rounds, "verdict": "APPROVE"}
 
 
@@ -3712,7 +3707,7 @@ def test_a_checkout_changed_before_either_plan_verdict_refuses_it(
     assert state["plan"]["verdict"] is None
     assert not allowed(session.edit("Write", TEST))
     assert not allowed(session.edit("Edit", SOURCE))
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _call(session, DIFF)["permissionDecision"] == "deny"
 
 
@@ -3817,7 +3812,7 @@ def test_stale_publication_refused(session: Session, change: str) -> None:
     _plant_untracked(session, change)
     session.review(DIFF, reply(DIFF, "APPROVE"))
     _mutate_checkout(session, change)
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _saved_state(session)["diff"]["verdict"] is None
 
 
@@ -3836,7 +3831,7 @@ def test_mutation_during_review_refused(session: Session, change: str) -> None:
     )
     assert post is not None
     assert _saved_state(session)["diff"]["verdict"] is None
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 def test_a_commit_that_leaves_the_final_files_unchanged_keeps_the_approval(
@@ -3848,7 +3843,7 @@ def test_a_commit_that_leaves_the_final_files_unchanged_keeps_the_approval(
     session.review(DIFF, reply(DIFF, "APPROVE"))
     approved = _saved_state(session)["diff"]
     _mutate_checkout(session, "head")
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
     assert _saved_state(session)["diff"] == approved
 
 
@@ -3856,7 +3851,7 @@ def test_unchanged_approved_tree_allowed(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
     approved = _saved_state(session)["diff"]
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
     assert _saved_state(session)["diff"] == approved
 
 
@@ -3873,7 +3868,7 @@ def test_untracked_byte_boundary_cannot_reuse_approval(session: Session) -> None
     a.chmod(0o644)
     b.write_bytes(b"X")
     b.chmod(0o644)
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _saved_state(session)["diff"]["verdict"] is None
 
 
@@ -3885,7 +3880,7 @@ def test_untracked_symlink_replaced_by_file_cannot_reuse_approval(session: Sessi
     p.unlink()
     p.write_bytes(b"target")
     p.chmod(0o755)
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _saved_state(session)["diff"]["verdict"] is None
 
 
@@ -3895,7 +3890,7 @@ def test_ignored_publication_content_does_not_invalidate(session: Session) -> No
     approved = _saved_state(session)["diff"]
     (session.cwd / ".venv").mkdir()
     (session.cwd / ".venv" / "x").write_text("site-packages\n")
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
     assert _saved_state(session)["diff"] == approved
 
 
@@ -3903,12 +3898,12 @@ def test_stale_then_fresh_review_preserves_round(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
     (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _saved_state(session)["diff"]["round"] == 1
     assert _saved_state(session)["diff"]["verdict"] is None
     session.review(DIFF, reply(DIFF, "APPROVE"))
     assert _saved_state(session)["diff"]["round"] == 2
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 def test_before_review_unreadable_refused_without_spending_round(session: Session) -> None:
@@ -3946,7 +3941,7 @@ def test_unreadable_before_review_can_resume_without_round_reset(session: Sessio
     session.review(DIFF, reply(DIFF, "APPROVE"))
     assert _saved_state(session)["diff"]["round"] == 1
     assert _saved_state(session)["stopped"] is None
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 def test_stale_at_cap_does_not_get_more_rounds(session: Session) -> None:
@@ -3956,7 +3951,7 @@ def test_stale_at_cap_does_not_get_more_rounds(session: Session) -> None:
         rework(session, round_)
     session.review(DIFF, reply(DIFF, "APPROVE"))
     (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _saved_state(session)["diff"]["round"] == 5
     assert _saved_state(session)["diff"]["verdict"] is None
     denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
@@ -3970,12 +3965,12 @@ def test_missing_workspace_can_restore_and_re_review(session: Session) -> None:
     session.review(DIFF, reply(DIFF, "APPROVE"))
     away = session.cwd.with_name(session.cwd.name + "-away")
     session.cwd.rename(away)
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _saved_state(session)["diff"]["verdict"] is None
     away.rename(session.cwd)
     session.review(DIFF, reply(DIFF, "APPROVE"))
     assert _saved_state(session)["diff"]["round"] == 2
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 def _delay_hook_start(session: Session, seconds: float) -> None:
@@ -4024,7 +4019,7 @@ def test_review_git_calls_share_hook_budget(session: Session) -> None:
 def test_publication_gate_is_not_atomic_snapshot_authority(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
     (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
     diff = subprocess.run(
         ["git", "diff", "--", SOURCE],
@@ -4035,7 +4030,7 @@ def test_publication_gate_is_not_atomic_snapshot_authority(session: Session) -> 
         text=True,
     )
     assert "return a - b" in diff.stdout
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 def test_task_notification_preserves_approval_until_a_later_edit(session: Session) -> None:
@@ -4046,4 +4041,4 @@ def test_task_notification_preserves_approval_until_a_later_edit(session: Sessio
     assert out is None
     assert _saved_state(session) == before
     (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
-    assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "deny"
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"

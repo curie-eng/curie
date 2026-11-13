@@ -51,8 +51,6 @@ def _load_gate_helpers() -> Any:
 gate = _load_gate_helpers()
 Session = gate.Session
 PLAN, DIFF, PUBLISH, REPORT = gate.PLAN, gate.DIFF, gate.PUBLISH, gate.REPORT
-# A body the publish hook's Decisions check accepts.
-PUBLISH_INPUT = {"body": gate.VALID_PR_BODY}
 SOURCE, TEST, ISSUE = gate.SOURCE, gate.TEST, gate.ISSUE
 FAR_SECONDS = gate.FAR_SECONDS
 
@@ -337,7 +335,7 @@ def test_advisory_plan_incomplete_review_grants_nothing_until_a_retry(
     # Nothing is granted: no edit, no diff review, no publication.
     assert not gate.allowed(s.edit("Write", TEST))
     _deny(s.pre("Agent", DIFF_INPUT))
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
     # A retried plan review completes and opens the test edit.
     _, context = s.review(PLAN, gate.reply(PLAN, "APPROVE"))
@@ -349,17 +347,17 @@ def test_advisory_plan_incomplete_review_grants_nothing_until_a_retry(
 def test_advisory_plan_changes_alone_never_allows_publish(tmp_path: Path) -> None:
     s = _prompted(tmp_path)
     s.review(PLAN, changes(PLAN, "the plan skips criterion 3"))
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
     s.apply_edit("Write", TEST)
     s.report("implement", 1)
     _edit_source(s, "fix")
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
     # Only a diff approval publishes.
     _, context = s.review(DIFF, gate.reply(DIFF, "APPROVE"))
     assert "APPROVED" in context
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 # --- AC2: five counted diff rounds ---------------------------------------------
@@ -373,12 +371,12 @@ def test_diff_round_four_changes_then_an_approve_on_the_fifth_publishes(tmp_path
         context = _diff_changes(s, f"finding of round {round_}")
         assert not context.startswith("STOP."), context
         assert f"round {round_ + 1} of 5" in context
-        assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+        assert s.pre(PUBLISH)["permissionDecision"] == "deny"
         _edit_source(s, f"rework {round_}")
     _, context = s.review(DIFF, gate.reply(DIFF, "APPROVE"))
 
     assert "round 5: APPROVED" in context
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
     assert _state(s)["diff"] == {"round": 5, "verdict": "APPROVE"}
     assert [p for p in s.phases() if p[0] == "review_diff"] == [
         ("review_diff", n) for n in range(1, 6)
@@ -405,7 +403,7 @@ def test_diff_round_five_changes_stop_the_run_with_the_last_findings(tmp_path: P
     (s.cwd / SOURCE).write_text("def add(a, b):\n    return b + a\n")
     sixth = _deny(s.pre("Agent", DIFF_INPUT))
     assert sixth.startswith("STOP.") and FINDING in sixth
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     assert [p for p in s.phases() if p[0] == "review_diff"] == [
         ("review_diff", n) for n in range(1, 6)
     ]
@@ -464,7 +462,7 @@ def test_diff_round_a_call_the_runner_denied_does_not_count(tmp_path: Path) -> N
     _, context = s.review(DIFF, gate.reply(DIFF, "APPROVE"))
     assert "round 2: APPROVED" in context
     assert _state(s)["diff"] == {"round": 2, "verdict": "APPROVE"}
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 def test_diff_round_after_an_approve_the_same_checkout_is_not_reviewed_again(
@@ -485,7 +483,7 @@ def test_diff_round_after_an_approve_the_same_checkout_is_not_reviewed_again(
     state = _state(s)
     assert state["diff"] == {"round": 1, "verdict": "APPROVE"}
     assert state["stopped"] is None
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 def test_diff_round_ci_rounds_keep_their_three_round_marker(
@@ -554,7 +552,7 @@ def test_round_cap_an_edit_after_the_fifth_approve_meets_the_cap_at_the_next_rev
 
     assert reason.startswith("STOP.")
     assert _round_cap_fields(s) == [("review_diff", 5, 5)]
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     assert _round_cap_fields(s) == [("review_diff", 5, 5)]
     _finding_never_logged(s)
 
@@ -567,7 +565,7 @@ def test_round_cap_an_approve_on_the_fifth_round_writes_no_cap_line(tmp_path: Pa
     _, context = s.review(DIFF, gate.reply(DIFF, "APPROVE"))
 
     assert "round 5: APPROVED" in context
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
     assert _gates(s, "review_refused") == []
 
 
@@ -736,7 +734,7 @@ def test_timing_missing_refuses_a_cold_ci_round_until_an_issue_read(tmp_path: Pa
     # Edits, the diff review and publication all wait for the timing.
     edit = gate.deny_reason(s.edit("Edit", SOURCE))
     diff = _deny(s.pre("Agent", DIFF_INPUT))
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
     for reason in (edit, diff):
         assert "mcp__curie__get_issue" in reason and not reason.startswith("STOP."), reason
@@ -755,7 +753,7 @@ def test_timing_missing_refuses_a_cold_ci_round_until_an_issue_read(tmp_path: Pa
     assert gate.allowed(s.edit("Edit", SOURCE))
     _, context = s.review(DIFF, gate.reply(DIFF, "APPROVE"))
     assert "round 1: APPROVED" in context
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 def test_timing_missing_leaves_bash_as_it_is(tmp_path: Path) -> None:
@@ -931,7 +929,7 @@ def test_timing_plan_review_after_the_round_cutoff_stops_the_run(
     assert state["stopped"]
     assert state["plan"] == {"round": 0, "verdict": None}
     assert not gate.allowed(s.edit("Write", TEST))
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 def test_timing_a_diff_changes_after_the_round_cutoff_stops_instead_of_opening_a_round(
@@ -953,7 +951,7 @@ def test_timing_a_diff_changes_after_the_round_cutoff_stops_instead_of_opening_a
     assert state["diff"] == {"round": 1, "verdict": "CHANGES"}
     assert state["stopped"]
     assert ("open_round", "round_cutoff") in _timing_refusals(s)
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 @pytest.mark.parametrize("seconds", [3600, 600])
@@ -1021,7 +1019,7 @@ def test_timing_an_approved_checkout_publishes_after_wrap_up_before_the_deadline
     # Wrap up started 60 seconds ago; the deadline is 240 seconds ahead.
     _read_timing(s, deadline_in=300 - 60, seconds=3600)
 
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
     assert _gates(s, "timing_refused") == []
 
 
@@ -1033,7 +1031,7 @@ def test_timing_publish_after_the_deadline_is_refused(tmp_path: Path) -> None:
     _open_round_earlier(s)
     _read_timing(s, deadline_in=-60, seconds=3600)
 
-    reason = _deny(s.pre(PUBLISH, PUBLISH_INPUT))
+    reason = _deny(s.pre(PUBLISH))
 
     assert reason.startswith("STOP.")
     assert _timing_refusals(s) == [("publish", "deadline_passed")]
@@ -1095,7 +1093,7 @@ def test_timing_a_warm_ci_round_after_the_round_cutoff_stops_with_the_failing_ch
     _plan_approved(s)
     _edit_source(s, "fix")
     s.review(DIFF, gate.reply(DIFF, "APPROVE"))
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
     _open_round_earlier(s)
     # CI comes back after the round cutoff: no new round may open.
     _read_timing(s, deadline_in=600 - 60, seconds=3600)
@@ -1155,7 +1153,12 @@ class _Hook:
         return out
 
     def decision(self, session_id: str, tool: str, tool_input: dict[str, Any]) -> dict[str, Any]:
-        out = self.fire(session_id, "PreToolUse", tool_name=tool, tool_input=tool_input)
+        out = self.fire(
+            session_id,
+            "PreToolUse",
+            tool_name=tool,
+            tool_input=gate._publish_input(tool, tool_input),
+        )
         assert out is not None, (tool, tool_input)
         decision: dict[str, Any] = out["hookSpecificOutput"]
         return decision
@@ -1284,9 +1287,9 @@ def test_timing_publish_at_the_deadline_is_refused(
         assert "APPROVED" in hook.review(session_id, DIFF, gate.reply(DIFF, "APPROVE"))
 
     hook.now = DEADLINE - 1
-    assert hook.decision("before", PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert hook.decision("before", PUBLISH, {})["permissionDecision"] == "allow"
     hook.now = DEADLINE
-    reason = _deny(hook.decision("at", PUBLISH, PUBLISH_INPUT))
+    reason = _deny(hook.decision("at", PUBLISH, {}))
 
     assert reason.startswith("STOP.")
     assert hook.timing_refusals() == [("publish", "deadline_passed")]
@@ -1329,7 +1332,7 @@ def test_unchanged_candidate_after_a_real_change_is_reviewed_and_counts(tmp_path
     assert "round 2: APPROVED" in context
     assert _state(s)["diff"] == {"round": 2, "verdict": "APPROVE"}
     assert _gates(s, "review_refused") == []
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 def test_unchanged_candidate_restored_to_the_rejected_bytes_is_refused_again(
@@ -1403,7 +1406,7 @@ def test_retained_findings_from_the_plan_review_reach_a_later_stop(tmp_path: Pat
     _open_round_earlier(s)
     _read_timing(s, deadline_in=-60, seconds=3600)
 
-    reason = _deny(s.pre(PUBLISH, PUBLISH_INPUT))
+    reason = _deny(s.pre(PUBLISH))
 
     assert reason.startswith("STOP.")
     assert plan_finding in reason
@@ -1422,7 +1425,7 @@ def test_retained_findings_are_resolved_by_a_diff_approval(tmp_path: Path) -> No
     _open_round_earlier(s)
     _read_timing(s, deadline_in=-60, seconds=3600)
 
-    reason = _deny(s.pre(PUBLISH, PUBLISH_INPUT))
+    reason = _deny(s.pre(PUBLISH))
 
     assert reason.startswith("STOP.")
     assert FINDING not in reason
@@ -1477,7 +1480,7 @@ def test_continuation_a_stopped_run_stays_stopped_with_its_findings(tmp_path: Pa
         assert after[key] == before[key], key
     (s.cwd / SOURCE).write_text("def add(a, b):\n    return b + a\n")
     assert _deny(s.pre("Agent", DIFF_INPUT)).startswith("STOP.")
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 def test_continuation_a_ci_marker_keeps_a_stop_and_its_findings(tmp_path: Path) -> None:
@@ -1492,7 +1495,7 @@ def test_continuation_a_ci_marker_keeps_a_stop_and_its_findings(tmp_path: Path) 
     after = _state(s)
     for key in ("stopped", "findings", "diff"):
         assert after[key] == before[key], key
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 def test_continuation_a_ci_marker_opens_one_repair_round_in_the_same_session(
@@ -1502,7 +1505,7 @@ def test_continuation_a_ci_marker_opens_one_repair_round_in_the_same_session(
     _plan_approved(s)
     _edit_source(s, "fix")
     s.review(DIFF, gate.reply(DIFF, "APPROVE"))
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
     context = gate.context_of(s.fire("UserPromptSubmit", prompt=_ci_text(2)))
 
@@ -1513,7 +1516,7 @@ def test_continuation_a_ci_marker_opens_one_repair_round_in_the_same_session(
     assert "wait_ci" in state["findings"]["source"]
     assert FAILING_CHECK in state["findings"]["text"]
     assert [p for p in s.phases() if p[0] == "wait_ci"] == [("wait_ci", 2)]
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     _edit_source(s, "ci fix")
     _, context = s.review(DIFF, gate.reply(DIFF, "APPROVE"))
     assert "round 1: APPROVED" in context
@@ -1569,7 +1572,7 @@ def test_continuation_a_new_curie_session_starts_fresh(tmp_path: Path) -> None:
     _plan_approved(s)
     _edit_source(s, "fix")
     s.review(DIFF, gate.reply(DIFF, "APPROVE"))
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
     s.env["CURIE_SESSION_ID"] = "curie-run-2"
     assert gate.contract() in gate.context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
@@ -1578,7 +1581,7 @@ def test_continuation_a_new_curie_session_starts_fresh(tmp_path: Path) -> None:
     assert state["plan"] == {"round": 0, "verdict": None}
     assert state["diff"] == {"round": 0, "verdict": None}
     assert state["stopped"] is None
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     assert "run the plan review first" in _deny(s.pre("Agent", DIFF_INPUT))
     s.load_workflow()
     assert s.pre("Agent", PLAN_INPUT)["permissionDecision"] == "allow"
@@ -1837,17 +1840,17 @@ def test_approval_after_edit_clears_it_until_a_fresh_review(tmp_path: Path) -> N
     _plan_approved(s)
     _edit_source(s, "fix")
     s.review(DIFF, gate.reply(DIFF, "APPROVE"))
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
     # An accepted edit, even one that writes the same bytes back.
     _edit_source(s, "fix")
 
     assert [e["cause"] for e in _gates(s, "diff_approval_cleared")] == ["edit"]
     assert _state(s)["diff"]["verdict"] is None
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     _, context = s.review(DIFF, gate.reply(DIFF, "APPROVE"))
     assert "round 2: APPROVED" in context
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 def test_approval_after_edit_requested_but_never_run_keeps_it(tmp_path: Path) -> None:
@@ -1862,7 +1865,7 @@ def test_approval_after_edit_requested_but_never_run_keeps_it(tmp_path: Path) ->
 
     assert _gates(s, "diff_approval_cleared") == []
     assert _state(s)["diff"] == {"round": 1, "verdict": "APPROVE"}
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "allow"
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
 # --- The root .github stays protected through symlinks --------------------------
@@ -1876,7 +1879,7 @@ def _assert_github_stop(s: Any, reason: str) -> None:
     assert len(_gates(s, "github_path_refused")) == 1
     assert _state(s)["stopped"]
     assert [p for p in s.phases() if p[0] == "review_diff"] == []
-    assert s.pre(PUBLISH, PUBLISH_INPUT)["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
 
 
 @pytest.mark.parametrize("symlink", ["untracked", "retargeted"])
