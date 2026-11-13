@@ -4,6 +4,16 @@ use std::process::Command;
 
 use serde_json::Value;
 
+fn render_schema_validator() -> jsonschema::Validator {
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args(["schema-index", "factory-triage-render"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let schema: Value = serde_json::from_slice(&output.stdout).unwrap();
+    jsonschema::validator_for(&schema).unwrap()
+}
+
 #[test]
 fn renders_exact_bundle_with_explicit_target_and_one_json_object() {
     let temporary = tempfile::tempdir().unwrap();
@@ -20,6 +30,7 @@ fn renders_exact_bundle_with_explicit_target_and_one_json_object() {
         String::from_utf8_lossy(&result.stderr)
     );
     let receipt: Value = serde_json::from_slice(&result.stdout).unwrap();
+    render_schema_validator().validate(&receipt).unwrap();
     assert_eq!(receipt["rendered"], true);
     assert_eq!(receipt["implementation_label"], "ready");
     assert_eq!(receipt["bundle_dir"], out.to_str().unwrap());
@@ -48,6 +59,34 @@ fn renders_exact_bundle_with_explicit_target_and_one_json_object() {
             0o111
         );
     }
+}
+
+#[test]
+fn receipt_schema_rejects_invalid_success_and_target_values() {
+    let validator = render_schema_validator();
+    let valid = serde_json::json!({
+        "bundle_dir": "bundle",
+        "rendered": true,
+        "implementation_label": "ready",
+    });
+    assert!(validator.is_valid(&valid));
+    for (key, value) in [
+        ("rendered", serde_json::json!(false)),
+        ("implementation_label", serde_json::Value::Null),
+        ("implementation_label", serde_json::json!("")),
+        ("implementation_label", serde_json::json!("x".repeat(51))),
+        ("unknown", serde_json::json!("unexpected")),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[key] = value;
+        assert!(!validator.is_valid(&invalid), "{invalid}");
+    }
+    let mut missing = valid;
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("implementation_label");
+    assert!(!validator.is_valid(&missing));
 }
 
 #[test]
