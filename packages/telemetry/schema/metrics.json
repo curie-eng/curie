@@ -633,6 +633,7 @@
           "/v1/turn-progress/{progress_id}",
           "/v1/factory/cards/{token}.svg",
           "/forges/credentials/health",
+          "/factory/facts",
           "/remediation-nominations",
           "/remediation-nominations/{nomination_id}",
           "/schedules",
@@ -664,7 +665,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1792,
+      "cardinality_bound": 1800,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -884,6 +885,7 @@
           "/v1/turn-progress/{progress_id}",
           "/v1/factory/cards/{token}.svg",
           "/forges/credentials/health",
+          "/factory/facts",
           "/remediation-nominations",
           "/remediation-nominations/{nomination_id}",
           "/schedules",
@@ -922,7 +924,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8960,
+      "cardinality_bound": 9000,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -1142,6 +1144,7 @@
           "/v1/turn-progress/{progress_id}",
           "/v1/factory/cards/{token}.svg",
           "/forges/credentials/health",
+          "/factory/facts",
           "/remediation-nominations",
           "/remediation-nominations/{nomination_id}",
           "/schedules",
@@ -1180,7 +1183,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 8960,
+      "cardinality_bound": 9000,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

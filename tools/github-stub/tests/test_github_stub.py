@@ -53,6 +53,29 @@ def _app_key() -> str:
     )
 
 
+def test_seeded_comments_keep_author_and_app_provenance_and_log_reads(
+    stub: Any, github: httpx.Client
+) -> None:
+    writer = {"id": 6601, "login": "octocat", "type": "User"}
+    first = stub.add_issue_comment(3815, "request", author=writer, app={"id": 8001})
+    second = stub.add_issue_comment(
+        3815, "ordinary", author={"id": 6602, "login": "reader", "type": "User"}
+    )
+    response = github.get(f"/repos/{REPO}/issues/comments/{first['id']}")
+    assert response.status_code == 200
+    assert response.json()["user"] == writer
+    assert response.json()["performed_via_github_app"] == {"id": 8001}
+    response = github.get(f"/repos/{REPO}/issues/comments/{second['id']}")
+    assert response.json()["performed_via_github_app"] is None
+    assert {
+        "method": "GET",
+        "path": f"/repos/{REPO}/issues/comments/{first['id']}",
+    } in stub.request_log
+    assert (
+        github.get(f"/repos/{REPO}/collaborators/reader/permission").json()["permission"] == "read"
+    )
+
+
 @pytest.fixture
 def recording() -> dict[str, Any]:
     return json.loads(RECORDING.read_text())  # type: ignore[no-any-return]

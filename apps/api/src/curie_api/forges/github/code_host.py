@@ -438,7 +438,7 @@ def _log_refusal(
     """Keep GitHub's diagnostics for an operator (#4159) without carrying them
     across the port: the status, request id and a clipped ``message``.
 
-    ``diagnostics`` is false for a CI read whose refusal must not put a response
+    ``diagnostics`` is false for a read whose refusal must not put a response
     body or request header into a log (#5222); only the method, the named
     operation and the status are then recorded, and neither the repository path
     nor any response text can reach an operator-facing log.
@@ -683,7 +683,13 @@ class GitHubCodeHost:
             if not hint:
                 raise NotFound("repository_not_bound")
             path = f"/repositories/{project_id}"
-        payload = await self._json("GET", path, token=await self._token(hint))
+        payload = await self._json(
+            "GET",
+            path,
+            token=await self._token(hint),
+            operation="resolve_repository",
+            diagnostics=False,
+        )
         if not isinstance(payload, dict):
             raise Unavailable("malformed_response")
         repository_id, full_name = payload.get("id"), payload.get("full_name")

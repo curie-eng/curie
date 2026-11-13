@@ -72,8 +72,8 @@ CONTRACT = "0041"
 # progress loop reads the 0157 thread tables. GitHub host namespaces require
 # 0158; owner tuple reads require 0159; personal custody reads and the
 # enrollment_fenced cause require 0160; agent version reads select the 0162
-# result policy columns; factory CI observations require the 0163 table.
-APP_SCHEMA_MIN = "0163"
+# result policy columns. Cached facts and request delivery require the 0164 tables.
+APP_SCHEMA_MIN = "0164"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -105,7 +105,8 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
-    assert window.schema_head == HEAD
+    assert window.schema_head == "0164"
+    assert HEAD == "0164"
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
     # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
@@ -113,8 +114,8 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0102"] == KIND_EXPAND
     assert kinds["0070"] == KIND_CONTRACT
     assert kinds[REVIEW_SCHEMA_MIN] == KIND_CONTRACT
-    if HEAD != APP_SCHEMA_MIN:
-        assert kinds[HEAD] == KIND_EXPAND
+    assert kinds["0162"] == KIND_EXPAND
+    assert kinds["0164"] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
@@ -192,6 +193,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0160",
             "0162",
             "0163",
+            "0164",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -240,8 +242,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0160",
             "0162",
             "0163",
+            "0164",
         }
-    assert current_revision() == "0163"
+    assert current_revision() == "0164"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -347,8 +350,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # progress reads the 0157 tables. GitHub host namespaces require 0158,
     # execution owner reads require 0159, personal custody reads and
     # enrollment fences require 0160, and agent version reads select the 0162
-    # result policy columns. Factory CI observations require the 0163 table.
-    for revision in sorted(known - {"0163"}):
+    # result policy columns. Cached facts and request delivery require the 0164 tables.
+    for revision in sorted(known - {"0164"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -369,7 +372,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0159", window, known) is False
     assert can_serve("0160", window, known) is False
     assert can_serve("0162", window, known) is False
-    assert can_serve("0163", window, known) is True
+    assert can_serve("0163", window, known) is False
+    assert can_serve("0164", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
@@ -870,10 +874,11 @@ def _capture_pause_client(
     return tasks
 
 
-async def _repoint_pause_client(client: AsyncRedis, port: int) -> None:
+async def _repoint_pause_client(client: AsyncRedis, host: str, port: int) -> None:
     # The installed redis-py pool reset clears cached connections after disconnect.
     # Source: https://redis.readthedocs.io/en/stable/_modules/redis/asyncio/connection.html
     await client.connection_pool.disconnect()
+    client.connection_pool.connection_kwargs["host"] = host
     client.connection_pool.connection_kwargs["port"] = port
     client.connection_pool.reset()
 
@@ -1095,12 +1100,13 @@ def test_initial_real_valkey_connection_failure_never_grants_permission_to_probe
 
         def from_url(cls: type[AsyncRedis], url: str, **kwargs: Any) -> AsyncRedis:
             client = original_factory(url, **kwargs)
+            client.connection_pool.connection_kwargs["host"] = unreachable.getsockname()[0]
             client.connection_pool.connection_kwargs["port"] = unreachable.getsockname()[1]
 
             async def restore() -> None:
                 nonlocal recovered
                 await asyncio.sleep(0.05)
-                await _repoint_pause_client(client, VALKEY_PORT)
+                await _repoint_pause_client(client, VALKEY_HOST, VALKEY_PORT)
                 recovered = True
 
             if recover:
@@ -1149,15 +1155,15 @@ def test_real_valkey_transport_failure_respects_the_last_confirmation_deadline(
                 await asyncio.sleep(0.01)
             if mode == "stall":
                 client.connection_pool.connection_kwargs["socket_timeout"] = 15
-            await _repoint_pause_client(client, outage.getsockname()[1])
+            await _repoint_pause_client(client, *outage.getsockname())
             interrupted = True
             if mode == "recover":
                 await renewals["transport_failed"].wait()
                 await asyncio.sleep(_PAUSE_TEST_INTERVAL_S / 10)
-                await _repoint_pause_client(client, VALKEY_PORT)
+                await _repoint_pause_client(client, VALKEY_HOST, VALKEY_PORT)
             elif mode == "late_recover":
                 await renewals["deadline_expired"].wait()
-                await _repoint_pause_client(client, VALKEY_PORT)
+                await _repoint_pause_client(client, VALKEY_HOST, VALKEY_PORT)
 
         tasks = _capture_pause_client(monkeypatch, interrupt)
         assert schema_compat.main(["upgrade"]) == (0 if mode == "recover" else 1)

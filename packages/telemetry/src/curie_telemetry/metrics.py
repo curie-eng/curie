@@ -545,6 +545,7 @@ _HTTP_OPERATIONS = [
     "/v1/factory/cards/{token}.svg",
     # Forge credential health (#4630).
     "/forges/credentials/health",
+    "/factory/facts",
     "/remediation-nominations",
     "/remediation-nominations/{nomination_id}",
     "/schedules",
