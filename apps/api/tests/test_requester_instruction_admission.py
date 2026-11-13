@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Iterator
 
 import pytest
+from curie_api.config import get_settings
 from fastapi.testclient import TestClient
 from test_factory_label_reconcile import factory as reconcile_factory
 from test_factory_poll_intake import poll_factory
@@ -26,6 +28,12 @@ from test_personal_execution_admission import (
 )
 
 TEXT = "EXAMPLE_PRIVATE_INSTRUCTIONS_5591\nPrefer explicit names.\n"
+
+
+@pytest.fixture(autouse=True)
+def reset_settings_cache() -> Iterator[None]:
+    yield
+    get_settings.cache_clear()
 
 
 def _profile(tenant: uuid.UUID, principal: uuid.UUID) -> None:
@@ -223,6 +231,33 @@ def test_linked_github_actor_supplies_the_personal_owner(
     else:
         assert response.json()["status"] == "factory_ignored", response.text
         assert _stored(number) == []
+
+
+def test_disabled_application_still_persists_the_verified_requester(
+    github_factory, owned_rows, links, monkeypatch
+):
+    from forge_fakes.github import _post
+    from test_personal_execution_admission import (
+        DEFAULT_TENANT,
+        _owner_text_event,
+        _seed_default_tenant_owner,
+    )
+
+    _application(monkeypatch, False)
+    principal = _seed_default_tenant_owner()
+    client, github = github_factory(None)
+    links(DEFAULT_TENANT, principal, github.label_actor["id"])
+    _profile(DEFAULT_TENANT, principal)
+    response = _post(client, "issues", _owner_text_event(5591250, principal))
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_admitted", response.text
+    [row] = _stored(5591250)
+    assert row["requester_principal_id"] == principal
+    assert row["owner_principal_id"] is None
+    assert row["enrollment_generation"] is None
+    assert row["coding_instructions_absence_reason"] == "application_unavailable"
+    assert row["snapshot_text"] is None
+    assert row["coding_instructions_evidence"] == "none"
 
 
 @pytest.mark.parametrize("enabled", [False, True])

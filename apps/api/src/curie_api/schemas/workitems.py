@@ -3,6 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
+from curie_internal.requester_coding_instructions import AbsenceReason
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
@@ -95,10 +96,7 @@ class CodingInstructionsMetadata(BaseModel):
     """Public selection metadata; the private snapshot text is never serialized."""
 
     state: Literal["absent", "selected"]
-    absence_reason: Literal[
-        "no_profile", "no_verified_requester", "tenant_disabled",
-        "application_unavailable", "historical",
-    ] | None = None
+    absence_reason: AbsenceReason | None = None
     revision: int | None = None
     sha256: str | None = None
     format_version: Literal[1] | None = None

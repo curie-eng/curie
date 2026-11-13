@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 
 import personal_execution_support as support
 import pytest
@@ -14,6 +15,12 @@ from curie_api.requester_coding_profiles import write_profile
 from test_personal_execution_lifecycle import api, world
 
 TEXT = "EXAMPLE_PINNED_CODING_SELECTION_5591\n"
+
+
+@pytest.fixture(autouse=True)
+def reset_settings_cache() -> Iterator[None]:
+    yield
+    get_settings.cache_clear()
 
 
 def _write(world, *, value, expected_revision):
