@@ -152,6 +152,55 @@ def bound_worker_roles(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return roles
 
 
+def assert_worker_cluster_reads(
+    docs: list[dict[str, Any]], *, observer: bool = True, runtime_class: str | None = None
+) -> None:
+    worker = next(
+        doc
+        for doc in docs
+        if doc.get("kind") == "Deployment"
+        and doc["metadata"]["labels"].get("app.kubernetes.io/component") == "worker"
+    )
+    account = worker["spec"]["template"]["spec"]["serviceAccountName"]
+    roles = []
+    for binding in docs:
+        if binding.get("kind") != "ClusterRoleBinding" or not any(
+            subject.get("kind") == "ServiceAccount" and subject.get("name") == account
+            for subject in binding.get("subjects", [])
+        ):
+            continue
+        assert binding["subjects"] == [
+            {"kind": "ServiceAccount", "name": account, "namespace": "acme-admission"}
+        ]
+        reference = binding["roleRef"]
+        assert reference["kind"] == "ClusterRole"
+        assert reference["apiGroup"] == "rbac.authorization.k8s.io"
+        referenced = [
+            doc
+            for doc in docs
+            if doc.get("kind") == "ClusterRole" and doc["metadata"]["name"] == reference["name"]
+        ]
+        assert len(referenced) == 1, "worker cluster binding must resolve to one role"
+        roles.append(referenced[0]["rules"])
+    expected = []
+    if observer:
+        expected.append([{"apiGroups": [""], "resources": ["nodes"], "verbs": ["get"]}])
+    if runtime_class is not None:
+        expected.append(
+            [
+                {
+                    "apiGroups": ["node.k8s.io"],
+                    "resources": ["runtimeclasses"],
+                    "resourceNames": [runtime_class],
+                    "verbs": ["get"],
+                }
+            ]
+        )
+    assert sorted(json.dumps(rules, sort_keys=True) for rules in roles) == sorted(
+        json.dumps(rules, sort_keys=True) for rules in expected
+    ), "worker cluster reads must match the exact observer and RuntimeClass grants"
+
+
 @pytest.mark.parametrize(
     ("hard", "ceiling"),
     [
@@ -336,13 +385,7 @@ def test_worker_admission_adds_only_namespaced_inventory_reads(tmp_path: Path) -
         ("", "pods"): {"get", "list"},
         ("agents.x-k8s.io", "sandboxes"): {"get", "patch", "list"},
     }
-    assert not any(
-        doc.get("kind") == "ClusterRoleBinding"
-        and any(
-            subject.get("name") == "acme-admission-worker" for subject in doc.get("subjects", [])
-        )
-        for doc in docs
-    )
+    assert_worker_cluster_reads(docs)
 
 
 @pytest.mark.parametrize(
@@ -380,12 +423,8 @@ def test_disabled_admission_omits_inventory_grants(
     ]:
         assert permissions[("", "pods")] == {"get"}
         assert permissions[("agents.x-k8s.io", "sandboxes")] == {"get", "patch"}
-    assert not any(
-        doc.get("kind") == "ClusterRoleBinding"
-        and any(
-            subject.get("name") == "acme-admission-worker" for subject in doc.get("subjects", [])
-        )
-        for doc in docs
+    assert_worker_cluster_reads(
+        docs, observer=overrides.get("agentSandbox", {}).get("deploy", True)
     )
 
 
@@ -399,43 +438,4 @@ def test_worker_reads_only_the_selected_runtime_class(tmp_path: Path) -> None:
             }
         },
     )
-    worker = next(
-        doc
-        for doc in docs
-        if doc.get("kind") == "Deployment"
-        and doc["metadata"]["labels"].get("app.kubernetes.io/component") == "worker"
-    )
-    account = worker["spec"]["template"]["spec"]["serviceAccountName"]
-    bindings = [
-        doc
-        for doc in docs
-        if doc.get("kind") == "ClusterRoleBinding"
-        and any(
-            subject.get("kind") == "ServiceAccount" and subject.get("name") == account
-            for subject in doc.get("subjects", [])
-        )
-    ]
-    assert len(bindings) == 1, "worker needs one narrowly scoped RuntimeClass grant"
-    assert bindings[0]["subjects"] == [
-        {
-            "kind": "ServiceAccount",
-            "name": account,
-            "namespace": "acme-admission",
-        }
-    ]
-    reference = bindings[0]["roleRef"]
-    assert reference["kind"] == "ClusterRole"
-    assert reference["apiGroup"] == "rbac.authorization.k8s.io"
-    role = next(
-        doc
-        for doc in docs
-        if doc.get("kind") == "ClusterRole" and doc["metadata"]["name"] == reference["name"]
-    )
-    assert role["rules"] == [
-        {
-            "apiGroups": ["node.k8s.io"],
-            "resources": ["runtimeclasses"],
-            "resourceNames": ["acme-runtime"],
-            "verbs": ["get"],
-        }
-    ]
+    assert_worker_cluster_reads(docs, runtime_class="acme-runtime")

@@ -97,6 +97,9 @@ class _Stoppable:
 
 
 class _CardStore:
+    async def run_retention(self, reader: Any, shutdown: asyncio.Event) -> None:
+        await shutdown.wait()
+
     async def migrate_legacy_thread_keyed_refs(self) -> None:
         return None
 
@@ -134,9 +137,11 @@ def _runtime(executor: _Executor | None) -> Any:
         eval_consumer=_Stoppable(),
         deploy_notice_consumer=None,
         card_store=_CardStore(),
+        approval_reference_reader=object(),
         orphan_sweeper=None,
         stream_retention=None,
         connector_loop=None,
+        factory_tool_observer=None,
         e2e_reaper=None,
         cron_loop=None,
         publication_loop=None,
