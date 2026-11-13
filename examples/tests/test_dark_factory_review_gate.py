@@ -749,6 +749,32 @@ def test_publish_decisions_missing_body_is_recoverable(session: Session) -> None
     assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
 
 
+ADVERSARIAL_ENTRY = "x. Rejected: y, because z. (nomatch) Evidence: w. "
+
+
+def test_publish_decisions_adversarial_sections_are_denied_quickly(
+    session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    hook = _load_hook(monkeypatch, tmp_path, "dark_factory_decisions_adversarial")
+    # Repeated separators made the earlier regex backtrack for minutes; a hook
+    # timeout lets the publication through, so each body must be refused fast.
+    under_cap = "## Decisions\n1. " + ADVERSARIAL_ENTRY * 130
+    over_cap = "## Decisions\n1. " + ADVERSARIAL_ENTRY * 2000
+    for body in (under_cap, over_cap):
+        started = time.monotonic()
+        with pytest.raises(ValueError):
+            hook.parse_decisions_section(body)
+        assert time.monotonic() - started < 1.0
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    for body in (under_cap, over_cap):
+        started = time.monotonic()
+        refused = session.pre(PUBLISH, {"title": "t", "body": body})
+        assert time.monotonic() - started < 20.0
+        assert refused["permissionDecision"] == "deny"
+        assert "## Decisions" in refused["permissionDecisionReason"]
+
+
 @pytest.mark.parametrize("case_id", ["answers-recorded-decision", "admits-unrecorded-decision"])
 def test_decision_followup_eval_grades_the_answer(case_id: str) -> None:
     from curie_worker.eval.models import EvalSuite
