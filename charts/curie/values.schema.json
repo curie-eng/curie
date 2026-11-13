@@ -239,6 +239,23 @@
           "type": "number",
           "minimum": 0
         },
+        "identityLookup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": {
+              "type": "string"
+            },
+            "tokenKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "timeoutSeconds": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
         "resources": {
           "type": "object"
         },

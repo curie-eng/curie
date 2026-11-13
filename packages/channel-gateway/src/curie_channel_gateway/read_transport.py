@@ -21,7 +21,13 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 from .group_models import UserGroupLookupError, UserGroupMembership
 from .http_reply import GATEWAY_DELIVERY_TIMEOUT_S
 from .ports.groups import GroupMembershipSource
-from .ports.reads import CanvasReader, ChannelReader, FileSource, SenderIdentities
+from .ports.reads import (
+    CanvasReader,
+    ChannelReader,
+    FileSource,
+    SenderIdentities,
+    UserEmailSource,
+)
 from .ports.reply import ReplyEventTransport
 from .read_errors import ChannelReadRefused
 from .read_models import (
@@ -61,6 +67,7 @@ from .request_replay import (
     request_headers,
 )
 from .slack.files import FileResponse, SlackFileError
+from .user_email_models import UserEmailLookupError, UserEmailUnknown
 
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_RESULT_BYTES = 4 * 1024 * 1024
@@ -79,6 +86,15 @@ _API_OPERATIONS = frozenset(
     }
 )
 _WORKER_OPERATIONS = frozenset({"identity_of", "fetch", "reply"})
+# The identity caller is an external HTTP identity provider. It may ask only
+# which email belongs to a Slack user (@spec GATEWAY-USER-EMAIL-1).
+_IDENTITY_OPERATIONS = frozenset({"user_email"})
+_CALLER_OPERATIONS = {
+    "api": _API_OPERATIONS,
+    "worker": _WORKER_OPERATIONS,
+    "identity": _IDENTITY_OPERATIONS,
+}
+UNKNOWN_USER_EMAIL_CODE = "user_email.unknown"
 
 
 class GatewayError(RuntimeError):
@@ -105,6 +121,10 @@ class GatewayTimeoutError(GatewayError):
     pass
 
 
+class GatewayNotFoundError(GatewayError):
+    pass
+
+
 def gateway_error(status: int) -> GatewayError:
     if status in (401, 403):
         return GatewayAuthenticationError("gateway authentication refused")
@@ -112,6 +132,8 @@ def gateway_error(status: int) -> GatewayError:
         return GatewayReplayError("gateway replay refused")
     if status == 413:
         return GatewayLimitError("gateway size limit exceeded")
+    if status == 404:
+        return GatewayNotFoundError("gateway answer not found")
     if status == 504:
         return GatewayTimeoutError("gateway outcome unknown")
     if status in (502, 503):
@@ -148,6 +170,8 @@ class _Parameters(BaseModel):
     text: str | None = None
     file: CanvasFile | None = None
     author: str | None = None
+    user_id: str | None = None
+    workspace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +179,7 @@ class GatewayProviders:
     channel: ChannelReader[BindingRoute, ResolvedWindow, ProviderPage, ChannelMessage] | None = None
     canvas: CanvasReader[BindingRoute, CanvasFile, CanvasPage, CanvasDocument] | None = None
     senders: SenderIdentities | None = None
+    emails: UserEmailSource | None = None
 
 
 def gateway_application(
@@ -171,7 +196,7 @@ def gateway_application(
 ) -> web.Application:
     """Per-caller authentication and bounded provider operations, composed by the gateway."""
     if (
-        set(tokens) != {"api", "worker"}
+        set(tokens) not in ({"api", "worker"}, {"api", "worker", "identity"})
         or any(not t.strip() for t in tokens.values())
         or len(set(tokens.values())) != len(tokens)
         or max_file_bytes <= 0
@@ -198,7 +223,7 @@ def gateway_application(
         if caller is None:
             return web.json_response({"error": "authentication_refused"}, status=401)
         operation = request.match_info.get("operation", "")
-        allowed = _API_OPERATIONS if caller == "api" else _WORKER_OPERATIONS
+        allowed = _CALLER_OPERATIONS[caller]
         if operation not in allowed:
             return web.json_response({"error": "operation_refused"}, status=403)
         try:
@@ -320,6 +345,8 @@ def gateway_application(
                 if len(membership_body) > MAX_RESULT_BYTES:
                     return web.json_response({"error": "response_size_exceeded"}, status=413)
                 return web.Response(body=membership_body, content_type="application/json")
+            if operation == "user_email":
+                return await user_email(identity, params)
             if operation == "identity_of":
                 if set(arguments) != {"author"} or params.author is None:
                     raise ValueError
@@ -372,6 +399,28 @@ def gateway_application(
             raise web.HTTPBadGateway(text="provider unavailable") from None
         except Exception:  # noqa: BLE001 - provider failures must never echo data
             return web.json_response({"error": "provider_unavailable"}, status=502)
+
+    async def user_email(identity: str, params: _Parameters) -> web.Response:
+        """@spec GATEWAY-USER-EMAIL-2, GATEWAY-USER-EMAIL-3."""
+        if (
+            params.model_fields_set != {"user_id", "workspace"}
+            or not params.user_id
+            or not params.workspace
+        ):
+            raise ValueError
+        if ports.emails is None:
+            return web.json_response({"error": "provider_unavailable"}, status=502)
+        try:
+            email = await ports.emails.email_of(
+                identity=identity, user_id=params.user_id, workspace=params.workspace
+            )
+        except UserEmailUnknown:
+            return web.json_response({"code": UNKNOWN_USER_EMAIL_CODE}, status=404)
+        except TimeoutError:
+            return web.json_response({"error": "provider_timeout"}, status=504)
+        except UserEmailLookupError:
+            return web.json_response({"error": "provider_unavailable"}, status=502)
+        return web.json_response({"user_id": params.user_id, "email": email})
 
     def fetch_bytes(identity: str, file_id: str) -> bytes:
         source = (files or {}).get(identity)

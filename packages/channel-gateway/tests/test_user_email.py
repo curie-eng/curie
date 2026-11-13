@@ -103,9 +103,7 @@ def test_provider_configured_for_gateway_lookup_resolves_email_without_a_slack_t
 ):
     async def scenario(endpoint, calls):
         settings = _settings(monkeypatch, endpoint)
-        assert not any(
-            "SLACK" in name.upper() and "TOKEN" in name.upper() for name in os.environ
-        )
+        assert not any("SLACK" in name.upper() and "TOKEN" in name.upper() for name in os.environ)
         assert "xox" not in repr(settings) and "identity-credential" not in repr(settings)
         async with GatewayUserEmails.from_settings(settings) as emails:
             assert await emails.email_of("U0EXAMPLE1", "T0EXAMPLE1") == EMAIL
@@ -122,15 +120,19 @@ def test_provider_configured_for_gateway_lookup_resolves_email_without_a_slack_t
 @pytest.mark.parametrize(
     "user",
     [
-        _user(enterprise_user={"enterprise_id": "E0EXAMPLE1", "teams": ["T0EXAMPLE9"]},
-              team_id="T0EXAMPLE9"),
-        _user(enterprise_user={"enterprise_id": "E0EXAMPLE9", "teams": ["T0EXAMPLE1"]},
-              team_id="T0EXAMPLE9"),
+        _user(
+            enterprise_user={"enterprise_id": "E0EXAMPLE1", "teams": ["T0EXAMPLE9"]},
+            team_id="T0EXAMPLE9",
+        ),
+        _user(
+            enterprise_user={"enterprise_id": "E0EXAMPLE9", "teams": ["T0EXAMPLE1"]},
+            team_id="T0EXAMPLE9",
+        ),
     ],
 )
 def test_enterprise_membership_satisfies_the_workspace(monkeypatch, user):
-    workspace = "E0EXAMPLE1" if user["enterprise_user"]["enterprise_id"] == "E0EXAMPLE1" else (
-        "T0EXAMPLE1"
+    workspace = (
+        "E0EXAMPLE1" if user["enterprise_user"]["enterprise_id"] == "E0EXAMPLE1" else ("T0EXAMPLE1")
     )
 
     async def scenario(endpoint, _calls):
@@ -161,8 +163,15 @@ def test_settings_refuse_a_slack_token(monkeypatch):
         _ok(_user(profile={"email": ""})),
     ],
     ids=[
-        "not-found", "not-visible", "other-workspace", "other-user", "deleted", "bot",
-        "app-user", "no-email", "blank-email",
+        "not-found",
+        "not-visible",
+        "other-workspace",
+        "other-user",
+        "deleted",
+        "bot",
+        "app-user",
+        "no-email",
+        "blank-email",
     ],
 )
 def test_unknown_users_refuse(monkeypatch, answer):
@@ -217,7 +226,8 @@ def test_slow_slack_times_out_at_the_gateway(monkeypatch):
         body = b'{"user_id": "U0EXAMPLE1", "workspace": "T0EXAMPLE1"}'
         async with httpx.AsyncClient() as http:
             raw = await http.post(
-                url, content=body,
+                url,
+                content=body,
                 headers=request_headers(TOKENS["identity"], "POST", url, body),
             )
         assert raw.status_code == 504
@@ -247,9 +257,7 @@ def test_client_timeout_refuses(monkeypatch):
 
 def test_unknown_gateway_identity_refuses(monkeypatch):
     async def scenario(endpoint, calls):
-        settings = _settings(
-            monkeypatch, endpoint, CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY="missing"
-        )
+        settings = _settings(monkeypatch, endpoint, CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY="missing")
         async with GatewayUserEmails.from_settings(settings) as emails:
             with pytest.raises(UserEmailLookupError) as error:
                 await emails.email_of("U0EXAMPLE1", "T0EXAMPLE1")
@@ -268,13 +276,15 @@ def test_only_the_identity_caller_reaches_user_email(monkeypatch):
         async with httpx.AsyncClient() as http:
             for token in ("", "wrong", TOKENS["api"], TOKENS["worker"]):
                 response = await http.post(
-                    url, content=body, headers=request_headers(token, "POST", url, body)
-                    if token else {},
+                    url,
+                    content=body,
+                    headers=request_headers(token, "POST", url, body) if token else {},
                 )
                 assert response.status_code in (401, 403)
                 assert EMAIL not in response.text
             response = await http.post(
-                members, content=group,
+                members,
+                content=group,
                 headers=request_headers(TOKENS["identity"], "POST", members, group),
             )
             assert response.status_code == 403
@@ -322,10 +332,11 @@ def test_malformed_requests_refuse_without_echo(monkeypatch):
                 b'{"user_id": "U0EXAMPLE1"}',
                 b'{"user_id": "U0EXAMPLE1", "workspace": "T0EXAMPLE1", "group_id": "S1"}',
                 b'{"user_id": "", "workspace": "T0EXAMPLE1"}',
-                b'not json U0EXAMPLE1',
+                b"not json U0EXAMPLE1",
             ):
                 response = await http.post(
-                    url, content=body,
+                    url,
+                    content=body,
                     headers=request_headers(TOKENS["identity"], "POST", url, body),
                 )
                 assert response.status_code == 400
@@ -333,3 +344,17 @@ def test_malformed_requests_refuse_without_echo(monkeypatch):
         assert calls == []
 
     asyncio.run(_run(lambda _request: _ok(_user()), scenario))
+
+
+def test_gateway_process_adds_the_identity_caller_only_when_configured(monkeypatch):
+    from curie_channel_gateway.slack.read_server import GatewayConfig, gateway_callers
+
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_API_TOKEN", TOKENS["api"])
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_WORKER_TOKEN", TOKENS["worker"])
+    assert set(gateway_callers(GatewayConfig())) == {"api", "worker"}
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN", TOKENS["identity"])
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S", "2.5")
+    config = GatewayConfig()
+    assert gateway_callers(config) == TOKENS
+    assert config.user_email_timeout_s == 2.5
+    assert TOKENS["identity"] not in repr(config)
