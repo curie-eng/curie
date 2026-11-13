@@ -96,6 +96,7 @@ class _Call:
     stdin: bytes | None
     secret_stdin: bool
     sensitive_output: bool
+    timeout: float = 120.0
 
 
 Answer = Callable[
@@ -169,7 +170,7 @@ class _FakeShell(pp.Shell):
             secret_stdin=secret_stdin,
             clean_env=clean_env,
         )
-        call = _Call(list(argv), stdin, secret_stdin, sensitive_output)
+        call = _Call(list(argv), stdin, secret_stdin, sensitive_output, timeout)
         self.calls.append(call)
         result = pp.Completed(0, b"", b"")
         for match, answer in self.handlers:
@@ -1518,9 +1519,16 @@ class _Live(pt.TwoOwnerRun):
         super().__init__(**kwargs)
         self.trace: list[str] = []
         self.gates: list[_FakeGate] = []
+        # Which fence ran: the planned one or the stop path's.
+        self.fences: list[str] = []
 
     def fence_paid_starts(self) -> None:
         self.trace.append("fence")
+        self.fences.append("planned")
+
+    def emergency_fence(self) -> None:
+        self.trace.append("fence")
+        self.fences.append("emergency")
 
     def check_runner_image(self, attempt: pp.Attempt) -> None:
         self.trace.append(f"image-{attempt.number}")
@@ -4062,7 +4070,7 @@ def test_the_capture_audit_scans_every_capture_in_memory(tmp_path: Path) -> None
     cleanup = h.ledger.observations("cleanup")
     assert cleanup["traces_backend"] == "in_cluster"
     assert cleanup["capture_audit"] == {
-        "pod_logs": {"sources": 4, "failures": 0},
+        "pod_logs": {"sources": 4, "failures": 0, "before_deletion": [], "uncaptured": []},
         "events": {"sources": 2, "failures": 0},
         "api_captures": {"sources": 3, "failures": 0},
         "publication_captures": {"sources": 3, "failures": 0},
@@ -4108,7 +4116,12 @@ def test_a_failed_capture_fails_its_channel_never_passes(tmp_path: Path) -> None
     cleanup = h.ledger.observations("cleanup")
     assert cleanup["traces_backend"] == "external"
     receipts = cleanup["capture_audit"]
-    assert receipts["pod_logs"] == {"sources": 3, "failures": 1}
+    assert receipts["pod_logs"] == {
+        "sources": 3,
+        "failures": 1,
+        "before_deletion": [],
+        "uncaptured": [],
+    }
     assert receipts["traces"] == {"sources": 0, "failures": 1}
     assert receipts["api_captures"]["failures"] == 1
     assert receipts["publication_captures"]["failures"] == 1
@@ -4116,6 +4129,257 @@ def test_a_failed_capture_fails_its_channel_never_passes(tmp_path: Path) -> None
         h.runtime.scan.as_json(), receipts, rehearsal=False, traces_backend="external"
     )
     assert verdict["capture_audit_complete"] is False and verdict["traces_audited"] is False
+
+
+# -- the logs of the pods the driver removes, read before each removal ------------------
+
+WORKER_POD = f"{FULLNAME}-worker-5b6c7d8e9-q4w5e"
+
+
+def _removed(pod: str, workload: str, step: str) -> dict[str, str]:
+    """One pod_logs removal entry (``TwoOwnerRun.note_removal``)."""
+
+    return {"pod": pps.ref_digest(pod), "workload": workload, "step": step}
+
+
+def _removal_cluster(
+    h: _Harness, *, deleted: bytes = b"", draining: bool = False, failing: Sequence[str] = ()
+) -> list[str]:
+    """The worker pod and A1's runner pod, their logs, the scale-down and the deletes.
+
+    ``deleted`` is what ``kubectl delete pod -l ... -o name`` prints. With
+    ``draining`` the worker pod is still listed after its scale-down, as it is
+    while the worker shuts down gracefully. A log read named in ``failing``
+    raises as pp.Shell.run does when its timeout expires. The order of the
+    log reads, scale-downs and pod deletes.
+    """
+
+    selector = h.run.worker_selector()
+    state = {"replicas": 1}
+    worker: dict[str, Any] = {
+        "metadata": {
+            "name": WORKER_POD,
+            "uid": "uid-worker-1",
+            "labels": {"app.kubernetes.io/component": "worker"},
+        },
+        "status": {
+            "containerStatuses": [_status("worker", state="running", restarts=1, last=True)]
+        },
+    }
+    runner: dict[str, Any] = {
+        "metadata": {
+            "name": "pod-a1",
+            "uid": "uid-a1",
+            "labels": {pp.POD_CLAIM_LABEL: "claim-a1"},
+        },
+        "status": {
+            "initContainerStatuses": [_status("setup", state="terminated")],
+            "containerStatuses": [_status("runner", state="running")],
+        },
+    }
+    order: list[str] = []
+
+    def pods(argv: list[str], _stdin: bytes | None) -> dict[str, Any]:
+        if "-l" not in argv:
+            return {"items": [worker, runner]}
+        if argv[argv.index("-l") + 1] == selector and (state["replicas"] or draining):
+            return {"items": [worker]}
+        return {"items": []}
+
+    def logs(argv: list[str], _stdin: bytes | None) -> bytes:
+        pod, container = argv[argv.index("logs") + 1], argv[argv.index("-c") + 1]
+        key = f"{pod}/{container}" + ("/previous" if "--previous" in argv else "")
+        order.append(f"logs:{key}")
+        if key in failing:
+            raise pp.StepFailed("kubectl could not complete")
+        return f"{key} log line\n".encode()
+
+    def scale(argv: list[str], _stdin: bytes | None) -> bytes:
+        state["replicas"] = int(argv[-1].removeprefix("--replicas="))
+        order.append(f"scale-{state['replicas']}")
+        return b""
+
+    def delete(argv: list[str], _stdin: bytes | None) -> bytes:
+        if "-l" in argv:
+            order.append("delete-pods")
+            return deleted
+        order.append(f"delete-{argv[argv.index('pod') + 1]}")
+        return b""
+
+    answers: list[tuple[tuple[str, ...], Answer]] = [
+        (("get", "pods", "-o", "json"), pods),
+        (("logs",), logs),
+        (("scale",), scale),
+        (("delete", "pod"), delete),
+    ]
+    h.shell.handlers[:0] = answers
+    return order
+
+
+def _log_reads(h: _Harness) -> list[_Call]:
+    return [call for call in h.shell.calls if call.argv[0] == "kubectl" and "logs" in call.argv]
+
+
+def test_stop_worker_captures_every_worker_log_before_the_scale_down(tmp_path: Path) -> None:
+    h = _harness(tmp_path)
+    _connect(h)
+    order = _removal_cluster(h)
+    assert h.run.stop_worker() == ["uid-worker-1"]
+    # Every container instance, the previous one of the restarted container
+    # included, is read before the scale-down removes the pod.
+    assert order == [f"logs:{WORKER_POD}/worker", f"logs:{WORKER_POD}/worker/previous", "scale-0"]
+    reads = _log_reads(h)
+    assert [call.timeout for call in reads] == [pt.PRE_DELETE_READ_SECONDS] * 2
+    assert all(call.sensitive_output for call in reads)
+    receipt = h.run.capture_receipts["pod_logs"]
+    assert (receipt["sources"], receipt["failures"]) == (2, 0)
+    assert receipt["before_deletion"] == [_removed(WORKER_POD, "worker", "stop-worker")]
+    assert receipt["uncaptured"] == []
+    assert h.runtime.scan.as_json()["pod_logs"]["scanned_bytes"] > 0
+
+
+def test_a_failed_or_timed_out_log_read_never_holds_the_removal(tmp_path: Path) -> None:
+    h = _harness(tmp_path)
+    _connect(h)
+    order = _removal_cluster(h, failing=(f"{WORKER_POD}/worker", f"{WORKER_POD}/worker/previous"))
+    assert h.run.stop_worker() == ["uid-worker-1"]
+    # Each read is tried once, within its bound, and the scale-down follows.
+    assert order == [f"logs:{WORKER_POD}/worker", f"logs:{WORKER_POD}/worker/previous", "scale-0"]
+    assert [call.timeout for call in _log_reads(h)] == [pt.PRE_DELETE_READ_SECONDS] * 2
+    receipt = h.run.capture_receipts["pod_logs"]
+    assert (receipt["sources"], receipt["failures"]) == (0, 2)
+    assert receipt["before_deletion"] == []
+    assert receipt["uncaptured"] == [_removed(WORKER_POD, "worker", "stop-worker")]
+    # The failed reads fail the audit; they never pass as captured.
+    receipts = {**pto.capture_receipts(), "pod_logs": receipt}
+    for name in pto.CAPTURE_CHANNELS[1:]:
+        receipts[name]["sources"] = 1
+    scans = {
+        name: {"scanned_bytes": 1, "token_bytes_found": False} for name in pto.LIVE_SCAN_CHANNELS
+    }
+    verdict = pto.scan_checks(scans, receipts, rehearsal=False, traces_backend="in_cluster")
+    assert verdict["capture_audit_complete"] is False
+
+
+def test_remove_pod_captures_the_runner_pod_before_deleting_it(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    order = _removal_cluster(h)
+    h.run.pod_uid_present = lambda _name, _uid: "delete-pod-a1" not in order  # type: ignore[method-assign]
+    run.eof.set()
+    h.run.remove_pod(run)
+    assert order == ["logs:pod-a1/setup", "logs:pod-a1/runner", "delete-pod-a1"]
+    listing = next(call for call in h.shell.calls if "--field-selector" in call.argv)
+    assert "metadata.name=pod-a1" in listing.argv
+    assert listing.timeout == pt.PRE_DELETE_READ_SECONDS
+    assert [call.timeout for call in _log_reads(h)] == [pt.PRE_DELETE_READ_SECONDS] * 2
+    receipt = h.run.capture_receipts["pod_logs"]
+    assert (receipt["sources"], receipt["failures"]) == (2, 0)
+    assert receipt["before_deletion"] == [_removed("pod-a1", "runner", "remove-pod")]
+    assert receipt["uncaptured"] == []
+    assert run.stopped and run.closed and len(_pod_deletes(h, "pod-a1")) == 1
+
+
+def test_the_planned_fence_captures_each_pod_before_removing_it_and_names_the_rest(
+    tmp_path: Path,
+) -> None:
+    h = _harness(tmp_path)
+    _connect(h)
+    h.run.owners["a"].state = "inactive"
+    _claims_cluster(h)
+    # The delete also names a runner pod that started after the listing.
+    order = _removal_cluster(h, deleted=b"pod/pod-a1\npod/pod-late\n")
+    h.run.fence_paid_starts()
+    assert order == [
+        f"logs:{WORKER_POD}/worker",
+        f"logs:{WORKER_POD}/worker/previous",
+        "logs:pod-a1/setup",
+        "logs:pod-a1/runner",
+        "scale-0",
+        "delete-pods",
+    ]
+    listing = next(
+        call
+        for call in h.shell.calls
+        if "get" in call.argv and "pods" in call.argv and "-l" not in call.argv
+    )
+    assert listing.timeout == pt.PRE_DELETE_READ_SECONDS
+    assert [call.timeout for call in _log_reads(h)] == [pt.PRE_DELETE_READ_SECONDS] * 4
+    receipt = h.run.capture_receipts["pod_logs"]
+    assert receipt["before_deletion"] == [
+        _removed(WORKER_POD, "worker", "fence"),
+        _removed("pod-a1", "runner", "fence"),
+    ]
+    # The pod the capture missed is named and fails the channel.
+    assert receipt["uncaptured"] == [_removed("pod-late", "runner", "fence")]
+    assert (receipt["sources"], receipt["failures"]) == (4, 1)
+    assert h.ledger.observations("budget")["paid_starts_fenced"] is True
+
+
+def test_the_stop_path_fence_reads_no_log_and_names_every_pod_it_removed(
+    tmp_path: Path,
+) -> None:
+    h = _harness(tmp_path)
+    _connect(h)
+    h.run.owners["a"].state = "inactive"
+    _claims_cluster(h)
+    order = _removal_cluster(h, deleted=b"pod/pod-a1\n", draining=True)
+    h.run.emergency_fence()
+    assert order == ["scale-0", "delete-pods"] and _log_reads(h) == []
+    receipt = h.run.capture_receipts["pod_logs"]
+    assert (receipt["sources"], receipt["failures"]) == (0, 0)
+    assert receipt["before_deletion"] == []
+    assert receipt["uncaptured"] == [
+        _removed("pod-a1", "runner", "emergency-fence"),
+        _removed(WORKER_POD, "worker", "emergency-fence"),
+    ]
+    # The one listing that names the draining worker follows every protective step.
+    calls = [call.argv for call in h.shell.calls]
+    listing = next(
+        index
+        for index, argv in enumerate(calls)
+        if "get" in argv and "pods" in argv and h.run.worker_selector() in argv
+    )
+    protective = max(
+        index
+        for index, argv in enumerate(calls)
+        if "disconnect" in argv or ("delete" in argv and pp.CLAIM_RESOURCE in argv)
+    )
+    assert listing > protective
+    assert h.shell.calls[listing].timeout == pt.PRE_DELETE_READ_SECONDS
+    assert h.ledger.observations("budget")["paid_starts_fenced"] is True
+
+
+@pytest.mark.parametrize("path", ["watchdog", "gate-stop", "paid-failure", "watchdog-broken"])
+def test_every_stop_path_takes_the_uncaptured_fence_and_names_the_pod_it_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    if path == "watchdog":
+        h.run.trip(run, "session_seconds")
+    elif path == "gate-stop":
+        with pytest.raises(pp.StepFailed, match="gate_hold_expired"):
+            h.run.stop_session(run, "gate_hold_expired")
+    elif path == "paid-failure":
+        with pytest.raises(pp.StepFailed, match="paid work fenced"):
+            h.run.fail_paid("a1: a check failed")
+    else:
+
+        def broken(*_args: Any, **_kwargs: Any) -> pto.TwoOwnerLedger:
+            raise RuntimeError("the watchdog ledger is unreadable")
+
+        monkeypatch.setattr(pto.TwoOwnerLedger, "open", broken)
+        h.run.watch()
+    live = h.run
+    assert isinstance(live, _Live) and live.fences == ["emergency"]
+    assert _log_reads(h) == []
+    interrupted = path in {"watchdog", "gate-stop"}
+    uncaptured = [_removed("pod-a1", "runner", "emergency-stop")] if interrupted else []
+    assert h.run.capture_receipts["pod_logs"]["uncaptured"] == uncaptured
+    assert len(_pod_deletes(h, "pod-a1")) == int(interrupted)
 
 
 # -- approval-card residue ---------------------------------------------------------------

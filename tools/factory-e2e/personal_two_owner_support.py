@@ -2787,7 +2787,11 @@ _DONE_SOURCES = frozenset({"native", "not_started", "probe"})
 # of every container instance in the release and grant namespaces, both
 # namespaces' events, the API's final records of the run, its publications and
 # pull requests, and the install's traces. Each is scanned in memory on its own
-# channel and never written to disk or printed.
+# channel and never written to disk or printed. The pods the driver removes on
+# purpose (worker scale-downs, runner pod deletions, the planned fence) are gone
+# by then, so their logs are captured the same way right before each removal;
+# the stop path (watchdog, gate stop, paid failure) captures nothing, for speed,
+# and names each pod it removed in the pod_logs receipt instead.
 
 POD_LOGS_CHANNEL = "pod_logs"
 EVENTS_CHANNEL = "events"
@@ -2802,6 +2806,17 @@ CAPTURE_CHANNELS = (
     PUBLICATION_CAPTURES_CHANNEL,
     TRACES_CHANNEL,
 )
+#: The pod_logs receipt's per-pod record of every pod the driver removed:
+#: ``before_deletion`` (every log read before the removal succeeded) and
+#: ``uncaptured`` (removed with no complete capture).
+REMOVAL_RECORDS = ("before_deletion", "uncaptured")
+#: What a removed pod ran: the worker or a runner.
+POD_WORKLOADS = ("worker", "runner")
+#: The removals that capture first: a worker scale-down, a runner pod deletion
+#: and the planned fence (the live end, the rehearsal cut and finalize).
+CAPTURED_REMOVALS = ("stop-worker", "remove-pod", "fence")
+#: Every removal step; the stop path's two capture nothing.
+REMOVAL_STEPS = (*CAPTURED_REMOVALS, "emergency-stop", "emergency-fence")
 #: Forge file contents read at published heads (``TwoOwnerRun.forge_file``).
 FORGE_CHANNEL = "forge"
 #: Every channel a live ledger must show scanned, with at least one byte and no token.
@@ -2858,6 +2873,27 @@ def trace_query(table: str) -> str:
     if table not in TRACE_TABLES:
         raise ValueError("not a trace table")
     return f"SELECT * FROM {table} FORMAT JSON"
+
+
+def capture_receipts() -> dict[str, dict[str, Any]]:
+    """Empty receipts: per channel, sources read and failed reads; pod_logs' removals."""
+
+    receipts: dict[str, dict[str, Any]] = {
+        name: {"sources": 0, "failures": 0} for name in CAPTURE_CHANNELS
+    }
+    receipts[POD_LOGS_CHANNEL].update({record: [] for record in REMOVAL_RECORDS})
+    return receipts
+
+
+def deleted_pods(output: bytes) -> list[str]:
+    """The pod names ``kubectl delete pod -o name`` printed (one ``pod/<name>`` per line)."""
+
+    names = []
+    for line in output.decode(errors="replace").splitlines():
+        kind, _, name = line.strip().partition("/")
+        if kind == "pod" and name and "/" not in name:
+            names.append(name)
+    return names
 
 
 def required_scan_channels(*, rehearsal: bool, traces_backend: Any) -> tuple[str, ...]:
@@ -2919,6 +2955,38 @@ def _captured(entry: Any) -> bool:
     return type(sources) is int and sources > 0 and type(failures) is int and failures == 0
 
 
+def _removal(item: Any, steps: tuple[str, ...]) -> bool:
+    return (
+        isinstance(item, Mapping)
+        and isinstance(item.get("pod"), str)
+        and bool(item["pod"])
+        and item.get("workload") in POD_WORKLOADS
+        and item.get("step") in steps
+    )
+
+
+def removals_recorded(entry: Any) -> bool:
+    """The pod_logs receipt names each pod the driver removed, captured first or not.
+
+    Both lists must be present, even empty: an absent list is a silent gap.
+    A pod under ``before_deletion`` was removed by a step that captures
+    first; one under ``uncaptured`` by any step. A step that captures first
+    and missed a pod also counted a failed read, which fails the channel;
+    the stop path's uncaptured pods are an observation only, since that
+    path has already failed the run.
+    """
+
+    if not isinstance(entry, Mapping):
+        return False
+    before, uncaptured = (entry.get(record) for record in REMOVAL_RECORDS)
+    return (
+        isinstance(before, list)
+        and isinstance(uncaptured, list)
+        and all(_removal(item, CAPTURED_REMOVALS) for item in before)
+        and all(_removal(item, REMOVAL_STEPS) for item in uncaptured)
+    )
+
+
 def scan_checks(
     scans: Any, captures: Any, *, rehearsal: bool, traces_backend: Any
 ) -> dict[str, bool]:
@@ -2926,9 +2994,10 @@ def scan_checks(
 
     Every required channel must be present with a nonzero scanned byte count
     and no token bytes; every capture channel among them must have read at
-    least one source with no failed read; and the trace backend must be
-    recorded, with traces either captured from the install or explicitly
-    absent from it.
+    least one source with no failed read, and the pod_logs receipt must name
+    each pod the driver removed (``removals_recorded``); and the trace
+    backend must be recorded, with traces either captured from the install
+    or explicitly absent from it.
     """
 
     scans = scans if isinstance(scans, Mapping) else {}
@@ -2938,7 +3007,8 @@ def scan_checks(
         "token_scan_complete": all(_scanned(scans.get(name)) for name in required),
         "capture_audit_complete": all(
             _captured(captures.get(name)) for name in CAPTURE_CHANNELS if name in required
-        ),
+        )
+        and removals_recorded(captures.get(POD_LOGS_CHANNEL)),
         "traces_audited": traces_backend == "absent"
         or (
             traces_backend == "in_cluster"
@@ -3213,8 +3283,22 @@ def _judge_cleanup(ledger: TwoOwnerLedger) -> tuple[dict[str, bool], dict[str, i
         "inventory_queries": len(inventory),
         "residual_or_uncertain": sum(row["status"] != "absent" for row in inventory),
         "scanned_channels": len(scans),
+        **removal_counts(observed.get("capture_audit")),
     }
     return checks, counts
+
+
+def removal_counts(captures: Any) -> dict[str, int]:
+    """How many removed pods the pod_logs receipt names as captured first, and as not."""
+
+    captures = captures if isinstance(captures, Mapping) else {}
+    entry = captures.get(POD_LOGS_CHANNEL)
+    entry = entry if isinstance(entry, Mapping) else {}
+    counts: dict[str, int] = {}
+    for record in REMOVAL_RECORDS:
+        items = entry.get(record)
+        counts[f"pods_{record}"] = len(items) if isinstance(items, list) else 0
+    return counts
 
 
 def _judge_expected(

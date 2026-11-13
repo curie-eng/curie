@@ -2453,7 +2453,7 @@ def _record_complete(ledger: pto.TwoOwnerLedger) -> None:
     ledger.record(
         "cleanup",
         "capture_audit",
-        {name: {"sources": 2, "failures": 0} for name in pto.CAPTURE_CHANNELS},
+        {name: {**entry, "sources": 2} for name, entry in pto.capture_receipts().items()},
     )
     ledger.record("cleanup", "traces_backend", "in_cluster")
     for card in CARDS:
@@ -2812,7 +2812,35 @@ CLEANUP_BREAKS: list[tuple[str, Callable[[pto.TwoOwnerLedger], None], str]] = [
     ),
     (
         "capture read failed",
-        lambda led: _set_capture(led, "pod_logs", {"sources": 9, "failures": 1}),
+        lambda led: _set_capture(led, "pod_logs", _pod_logs(sources=9, failures=1)),
+        "capture_audit_complete",
+    ),
+    (
+        "pod removals unrecorded",
+        lambda led: _set_capture(led, "pod_logs", {"sources": 2, "failures": 0}),
+        "capture_audit_complete",
+    ),
+    (
+        "removed pod unnamed",
+        lambda led: _set_capture(
+            led, "pod_logs", _pod_logs(uncaptured=[_removal("", "runner", "emergency-stop")])
+        ),
+        "capture_audit_complete",
+    ),
+    (
+        "stop-path removal claimed captured",
+        lambda led: _set_capture(
+            led,
+            "pod_logs",
+            _pod_logs(before_deletion=[_removal("pod-a1", "runner", "emergency-fence")]),
+        ),
+        "capture_audit_complete",
+    ),
+    (
+        "removed pod of an unknown workload",
+        lambda led: _set_capture(
+            led, "pod_logs", _pod_logs(before_deletion=[_removal("api-0", "api", "fence")])
+        ),
         "capture_audit_complete",
     ),
     (
@@ -2872,6 +2900,16 @@ def _set_scan(ledger: pto.TwoOwnerLedger, channel: str, entry: Any) -> None:
     ledger.record("cleanup", "token_scan", scans)
 
 
+def _removal(pod: str, workload: str, step: str) -> dict[str, str]:
+    return {"pod": pps.ref_digest(pod) if pod else "", "workload": workload, "step": step}
+
+
+def _pod_logs(**fields: Any) -> dict[str, Any]:
+    """A pod_logs receipt read from two sources with no failure, ``fields`` overriding."""
+
+    return {**pto.capture_receipts()["pod_logs"], "sources": 2, **fields}
+
+
 def _set_capture(ledger: pto.TwoOwnerLedger, channel: str, entry: Any) -> None:
     receipts = dict(ledger.observations("cleanup")["capture_audit"])
     if entry is None:
@@ -2907,6 +2945,55 @@ def test_cleanup_judge_reads_the_inventory(
     corrupt(ledger)
     result = pto.judge(ledger, "cleanup")
     assert result["verdict"] == "fail" and result["checks"][check] is False
+
+
+def test_removals_recorded_requires_both_lists_and_each_pod_named() -> None:
+    captured = _removal("pod-a1", "runner", "remove-pod")
+    stopped = _removal("pod-a2", "runner", "emergency-stop")
+    worker = _removal("worker-0", "worker", "stop-worker")
+    assert pto.removals_recorded(_pod_logs())
+    both = _pod_logs(before_deletion=[captured, worker], uncaptured=[stopped])
+    assert pto.removals_recorded(both)
+    # A pod a planned step missed is named uncaptured under that step.
+    assert pto.removals_recorded(_pod_logs(uncaptured=[_removal("pod-a3", "runner", "fence")]))
+    for broken in (
+        {"sources": 2, "failures": 0},
+        _pod_logs(uncaptured=None),
+        _pod_logs(before_deletion={}),
+        _pod_logs(before_deletion=[stopped]),
+        _pod_logs(uncaptured=[{**stopped, "pod": ""}]),
+        _pod_logs(uncaptured=[{**stopped, "pod": 7}]),
+        _pod_logs(uncaptured=[{**stopped, "workload": "api"}]),
+        _pod_logs(uncaptured=[{**stopped, "step": "teardown"}]),
+        _pod_logs(uncaptured=["pod-a2"]),
+        None,
+    ):
+        assert pto.removals_recorded(broken) is False, broken
+
+
+def test_a_stop_path_removal_is_named_and_counted_without_failing_the_audit(
+    tmp_path: Path,
+) -> None:
+    ledger = _complete(tmp_path)
+    receipt = _pod_logs(
+        before_deletion=[_removal("worker-0", "worker", "stop-worker")],
+        uncaptured=[
+            _removal("pod-a1", "runner", "emergency-stop"),
+            _removal("worker-1", "worker", "emergency-fence"),
+        ],
+    )
+    _set_capture(ledger, "pod_logs", receipt)
+    result = pto.judge(ledger, "cleanup")
+    assert result["verdict"] == "pass", result["checks"]
+    assert result["checks"]["capture_audit_complete"] is True
+    assert result["counts"]["pods_before_deletion"] == 1
+    assert result["counts"]["pods_uncaptured"] == 2
+
+
+def test_deleted_pods_reads_the_names_kubectl_delete_printed() -> None:
+    printed = b"pod/pod-a1\npod/pod-b1\n\nclaim.x/claim-a1\npod/\npod/a/b\n"
+    assert pto.deleted_pods(printed) == ["pod-a1", "pod-b1"]
+    assert pto.deleted_pods(b"") == []
 
 
 def test_trace_backend_follows_the_rendered_values() -> None:
@@ -2983,7 +3070,7 @@ def _scan_entry(size: int = 10, found: bool = False) -> dict[str, Any]:
 
 def test_scan_checks_require_bytes_receipts_and_traces_on_every_channel() -> None:
     scans = {name: _scan_entry() for name in pto.LIVE_SCAN_CHANNELS}
-    receipts = {name: {"sources": 1, "failures": 0} for name in pto.CAPTURE_CHANNELS}
+    receipts = {name: {**entry, "sources": 1} for name, entry in pto.capture_receipts().items()}
     passing = pto.scan_checks(scans, receipts, rehearsal=False, traces_backend="in_cluster")
     assert passing == {
         "token_scan_complete": True,

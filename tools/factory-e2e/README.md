@@ -410,7 +410,8 @@ private inputs file instead.
 7. `budget` and `cleanup`: every start was reserved and settled from native
    usage inside the ceiling, and every owned resource is absent with no grant
    bytes in any scanned channel. Every required channel must show scanned bytes
-   and every capture a read source with no failed read; the card residue must
+   and every capture a read source with no failed read, and the pod_logs
+   receipt must name every pod the driver removed; the card residue must
    name every delivered card, drill cards included, as left in its channel.
    `rehearsal` judges the unpaid rehearsal ledger.
 
@@ -555,7 +556,9 @@ most 32,768 minus prior spend, and every production transition mapped.
 6. The fence (worker to zero, runner pods deleted without grace, their claims
    deleted, active owners disconnected), cleanup and inventory. On success,
    failure and signal the fence is the first action of finalize, before any
-   charge, observation or wait for the worker's graceful exit. Before teardown
+   charge, observation or wait for the worker's graceful exit; it first
+   captures the logs of the pods it removes, as every planned removal does
+   (see interpretation 9). Before teardown
    the capture audit reads, in memory, every container instance's log
    (previous instances included) in the release and grant namespaces, both
    namespaces' events, the run's WorkItems, approvals, audits, publications
@@ -619,7 +622,10 @@ classes, every observation each criterion judges, cleanup steps, inventories and
 the token scan over stdout, stderr, children, http, harvest, ledger, evidence,
 forge, pod_logs, events, api_captures, publication_captures and traces, with a
 capture receipt (sources read, failed reads) per capture channel and the trace
-backend the install values imply. A rehearsal has no harvest or forge channel.
+backend the install values imply. The pod_logs receipt also names, by digest,
+each pod the driver removed: `before_deletion` when every log read before the
+removal succeeded, `uncaptured` otherwise. A rehearsal has no harvest or forge
+channel.
 `traces_backend` `absent` (telemetry disabled) is the only way to pass without a
 trace capture; an external backend fails the audit.
 Public output is verdicts, booleans, counts and refusal codes: no identifier, no
@@ -656,9 +662,19 @@ CLI reads session files the driver writes 0600 and the finalizer removes.
    wake and the approved drill publication's push Job fails fetching its
    all-zero base, so the drill starts no native session and pushes nothing;
    the driver also checks both after the drill.
-9. The capture audit runs after the fence, so the worker and runner pods the
-   fence (or the scenario's restarts) deleted are not in it; runner
-   transcripts reach the token scan through the harvest instead.
+9. The capture audit runs after the fence, when the pods the driver removed
+   on purpose are gone, so each planned removal reads their logs first: the
+   worker pods before every worker scale-down, a runner pod before its
+   deletion at its park (A1's pod recreation included), and every worker and
+   runner pod before the planned fence (the live end, the rehearsal cut and
+   finalize). Each read is one `kubectl logs` per container instance, current
+   and previous, bounded at 10 s and scanned in memory on pod_logs; a read
+   that fails or times out fails that channel and the removal goes ahead. A
+   planned removal that missed a pod names it `uncaptured` and fails the
+   channel. The stop path (watchdog, gate stop, paid failure) reads no log, for
+   speed: it names each runner pod it deleted and each worker pod still
+   draining as `uncaptured`, counted (`pods_uncaptured`) but not failed, since
+   that path has already failed the run.
 
 ### Not met
 
