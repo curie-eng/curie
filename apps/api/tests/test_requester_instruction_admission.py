@@ -79,21 +79,35 @@ def test_trusted_admission_pins_selected_metadata_and_pending_reference(
 @pytest.fixture
 def links():
     namespaces: list[uuid.UUID] = []
+    link_ids: list[uuid.UUID] = []
+    previous_status: dict[uuid.UUID, str] = {}
 
     def link(tenant, principal, account, *, host="github.com", revoked=False, disabled=False):
-        namespace = uuid.uuid4()
-        namespaces.append(namespace)
-        _rows(
-            "INSERT INTO curie.identity_namespaces "
-            "(id, tenant_id, provider, kind, authority, key, status) "
-            "VALUES (:id, :t, 'github', 'github_host', :host, :host, :status)",
-            {
-                "id": namespace,
-                "t": tenant,
-                "host": host,
-                "status": "disabled" if disabled else "active",
-            },
+        existing = _rows(
+            "SELECT id, status FROM curie.identity_namespaces "
+            "WHERE tenant_id = :t AND provider = 'github' AND kind = 'github_host' "
+            "AND authority = :host AND key = :host",
+            {"t": tenant, "host": host},
         )
+        status = "disabled" if disabled else "active"
+        if existing:
+            namespace = existing[0]["id"]
+            previous_status.setdefault(namespace, existing[0]["status"])
+            _rows(
+                "UPDATE curie.identity_namespaces SET status = :status WHERE id = :id",
+                {"id": namespace, "status": status},
+            )
+        else:
+            namespace = uuid.uuid4()
+            namespaces.append(namespace)
+            _rows(
+                "INSERT INTO curie.identity_namespaces "
+                "(id, tenant_id, provider, kind, authority, key, status) "
+                "VALUES (:id, :t, 'github', 'github_host', :host, :host, :status)",
+                {"id": namespace, "t": tenant, "host": host, "status": status},
+            )
+        link_id = uuid.uuid4()
+        link_ids.append(link_id)
         _rows(
             "INSERT INTO curie.identity_links "
             "(id, tenant_id, identity_namespace_id, provider_native_id, principal_id, "
@@ -101,7 +115,7 @@ def links():
             "VALUES (:id, :t, :n, :account, :p, 'admin_mapped', :p, "
             "CASE WHEN :revoked THEN now() ELSE NULL END)",
             {
-                "id": uuid.uuid4(),
+                "id": link_id,
                 "t": tenant,
                 "n": namespace,
                 "account": str(account),
@@ -111,11 +125,15 @@ def links():
         )
 
     yield link
+    for link_id in link_ids:
+        _rows("DELETE FROM curie.identity_links WHERE id = :id", {"id": link_id})
     for namespace in namespaces:
-        _rows(
-            "DELETE FROM curie.identity_links WHERE identity_namespace_id = :id", {"id": namespace}
-        )
         _rows("DELETE FROM curie.identity_namespaces WHERE id = :id", {"id": namespace})
+    for namespace, status in previous_status.items():
+        _rows(
+            "UPDATE curie.identity_namespaces SET status = :status WHERE id = :id",
+            {"id": namespace, "status": status},
+        )
 
 
 def _stored(number: int):
