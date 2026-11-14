@@ -1402,9 +1402,8 @@ def _bench(tmp_path: Path) -> GateBench:
     hooks.mkdir(parents=True)
     hook = hooks / pto.GATE_FILE
     hook.write_text(pto.GATE_HOOK_PROGRAM)
-    shutil.copyfile(
-        REPO_ROOT / "examples/dark-factory/hooks/review_gate.py", hooks / "review_gate.py"
-    )
+    for name in ("review_gate.py", "decisions_section.py"):
+        shutil.copyfile(REPO_ROOT / "examples/dark-factory/hooks" / name, hooks / name)
     bin_dir = tmp_path / "fake-cli"
     bin_dir.mkdir()
     claude = bin_dir / "claude"
