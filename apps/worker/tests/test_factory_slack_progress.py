@@ -38,6 +38,7 @@ from typing import Any
 
 from curie_api.config import get_settings
 from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
+from curie_internal.factory_cause import cause_text
 from curie_worker.factory_slack_progress import (
     FactorySlackProgressLoop,
     PostgresFactorySlackStore,
@@ -164,7 +165,10 @@ async def _pass_as(lease_owner: str, slack_url: str, identity: str, token: str) 
     try:
         loop = FactorySlackProgressLoop(
             store=PostgresFactorySlackStore(
-                engine, schema=get_settings().db_schema, lease_owner=lease_owner
+                engine,
+                schema=get_settings().db_schema,
+                lease_owner=lease_owner,
+                phase_lines=True,
             ),
             replies=SlackReplyAdapter(
                 DEFAULT_TOKEN, identity_tokens={identity: token}, base_url=slack_url
@@ -186,7 +190,10 @@ async def _lease_and_crash(lease_owner: str) -> str | None:
     engine = create_async_engine(get_settings().database_url)
     try:
         store = PostgresFactorySlackStore(
-            engine, schema=get_settings().db_schema, lease_owner=lease_owner
+            engine,
+            schema=get_settings().db_schema,
+            lease_owner=lease_owner,
+            phase_lines=True,
         )
         await store.materialize()
         work = await store.claim_next()
@@ -287,7 +294,7 @@ def test_origin_delivery_when_the_configured_progress_channel_differs(stack: Sta
     sent = _chat_calls_since(stack, since)
     assert len(sent) == 1, sent
     assert sent[0].params["thread_ts"] == root_ts
-    assert "Run failed" in sent[0].text
+    assert f"Needs a person: {cause_text('runner_failed')}" in sent[0].text
     for call in stack.slack.calls:
         assert "Tracker implemented after clearing" not in call.haystack
 
@@ -328,7 +335,7 @@ def test_a_kickoff_thread_needs_no_configured_destination(stack: Stack) -> None:
     texts = _thread_texts(stack, root_ts)
     assert len(texts) == 2, texts
     assert "Kickoff run planned" in texts[0]
-    assert "Run failed" in texts[1]
+    assert f"Needs a person: {cause_text('runner_failed')}" in texts[1]
     for call in stack.slack.calls:
         assert "Older run planned" not in call.haystack
     assert stack.slack.roots(stack.factory_token) == []
