@@ -505,7 +505,7 @@ def test_module_invalid_bundle_exits_2_with_json(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(
     not _CLAUDE_ON_PATH,
-    reason="requires the real `claude` CLI on PATH to spawn MCP servers",
+    reason="requires the real Claude CLI the SDK spawns to spawn MCP servers",
 )
 def test_run_check_green_bundle_registers_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
