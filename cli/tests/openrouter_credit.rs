@@ -19,11 +19,12 @@
 use crate::support;
 
 use curie::factory_quickstart::{
-    credit_check_key, read_quickstart_openrouter_credit, ModelEndpoints, QuickstartCredit,
-    REVIEWER_MODEL, RUN_CREDIT_USD,
+    credit_check_key, deployment_model_endpoints, read_quickstart_openrouter_credit,
+    ModelEndpoints, QuickstartCredit, REVIEWER_MODEL, RUN_CREDIT_USD,
 };
 use curie::openrouter_credit::{remaining_credit_usd, remaining_from};
 use serde_json::{json, Value};
+use std::os::unix::fs::PermissionsExt;
 use support::{serve, MockServer, Response};
 
 const KEY: &str = "sk-or-v1-PLACEHOLDER-test-key";
@@ -225,7 +226,67 @@ fn no_key_is_checked_when_none_is_known() {
 fn endpoints(urls: &[&str]) -> ModelEndpoints {
     ModelEndpoints {
         urls: urls.iter().map(|url| (*url).to_string()).collect(),
-        unreadable: false,
+        ..ModelEndpoints::default()
+    }
+}
+
+/// Helm answers every read with a cluster error, never "release: not found".
+struct FailingHelm {
+    dir: std::path::PathBuf,
+    old_path: Option<std::ffi::OsString>,
+    old_model_base: Option<std::ffi::OsString>,
+}
+
+impl FailingHelm {
+    fn install(model_base_url: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "curie-helm-read-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("helm stub dir");
+        let helm = dir.join("helm");
+        std::fs::write(
+            &helm,
+            "#!/bin/sh\necho 'Error: kubernetes cluster unreachable' >&2\nexit 1\n",
+        )
+        .expect("helm stub");
+        let mut permissions = std::fs::metadata(&helm)
+            .expect("helm stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helm, permissions).expect("helm stub mode");
+        let old_path = std::env::var_os("PATH");
+        let mut path = std::ffi::OsString::from(&dir);
+        path.push(":");
+        if let Some(existing) = &old_path {
+            path.push(existing);
+        }
+        std::env::set_var("PATH", path);
+        let old_model_base = std::env::var_os("CURIE_MODEL_BASE_URL");
+        std::env::set_var("CURIE_MODEL_BASE_URL", model_base_url);
+        Self {
+            dir,
+            old_path,
+            old_model_base,
+        }
+    }
+}
+
+impl Drop for FailingHelm {
+    fn drop(&mut self) {
+        match self.old_path.take() {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        match self.old_model_base.take() {
+            Some(url) => std::env::set_var("CURIE_MODEL_BASE_URL", url),
+            None => std::env::remove_var("CURIE_MODEL_BASE_URL"),
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -273,6 +334,61 @@ async fn an_openrouter_key_aimed_at_another_host_makes_no_request() {
         server.recorded().is_empty(),
         "the credential was sent to the credit stub: {:?}",
         server.recorded()
+    );
+}
+
+/// A failed Helm read must not be treated as "no endpoint". With a local
+/// OpenRouter base URL and a credential that is not an OpenRouter key, the
+/// unread release could name another provider, so the probe is skipped.
+#[tokio::test]
+async fn a_failed_release_read_makes_no_credit_request() {
+    let _env = support::ENV_LOCK.lock().await;
+    let _helm = FailingHelm::install("https://openrouter.ai/api/v1");
+    let server = openrouter(200, credits_body(800.0, 599.85));
+    std::env::set_var(BASE_URL_ENV, &server.base_url);
+    let key = "team.secret-PLACEHOLDER";
+    let endpoints = deployment_model_endpoints("fixture-ns", "fixture-release").await;
+    let result = read_quickstart_openrouter_credit(key, &endpoints).await;
+    std::env::remove_var(BASE_URL_ENV);
+    match result.expect("a skipped read is not an error") {
+        QuickstartCredit::NotChecked(reason) => {
+            assert_eq!(
+                reason,
+                "the model endpoint is set but its host could not be read"
+            );
+            assert!(!reason.contains(key));
+            assert!(!reason.contains("openrouter.ai"));
+        }
+        other => panic!("expected no request, got {other:?}"),
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "a failed release read sent the credential to the credit stub: {:?}",
+        server.recorded()
+    );
+}
+
+/// An OpenRouter key is still probed when the release read fails and the only
+/// explicit host is OpenRouter. The failed read does not hide that key.
+#[tokio::test]
+async fn an_openrouter_key_still_probes_when_the_release_read_fails() {
+    let _env = support::ENV_LOCK.lock().await;
+    let _helm = FailingHelm::install("https://openrouter.ai/api/v1");
+    let server = openrouter(200, credits_body(800.0, 599.85));
+    std::env::set_var(BASE_URL_ENV, &server.base_url);
+    let endpoints = deployment_model_endpoints("fixture-ns", "fixture-release").await;
+    let result = read_quickstart_openrouter_credit(KEY, &endpoints).await;
+    std::env::remove_var(BASE_URL_ENV);
+    assert_close(
+        match result.expect("the probe succeeds") {
+            QuickstartCredit::Balance(left) => left,
+            QuickstartCredit::NotChecked(reason) => panic!("probe skipped: {reason}"),
+        },
+        73.49,
+    );
+    assert!(
+        !server.recorded().is_empty(),
+        "an OpenRouter key must still reach the credit stub when the release read fails"
     );
 }
 

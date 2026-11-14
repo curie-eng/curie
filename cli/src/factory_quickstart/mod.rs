@@ -2323,7 +2323,12 @@ const RELEASE_MODEL_BASE_POINTERS: [&str; 2] =
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelEndpoints {
     pub urls: Vec<String>,
+    /// A recorded name had no readable value, such as a valueFrom entry.
+    /// That skips the probe for every key.
     pub unreadable: bool,
+    /// Helm failed while reading the release. The recorded endpoint is then
+    /// unknown. An OpenRouter key may still be probed; every other key is not.
+    pub release_read_failed: bool,
 }
 
 /// The pre-deploy credit read, or a static reason it was not attempted.
@@ -2336,11 +2341,14 @@ pub enum QuickstartCredit {
 
 /// Reads OpenRouter credit for a quickstart deploy, or reports why it did not.
 ///
-/// A request is made only when every explicit model base URL has host
-/// `openrouter.ai`, or when no base URL is set and `key` starts with
-/// `sk-or-`. `CURIE_OPENROUTER_API_URL` redirects that request. It is not a
-/// model endpoint, and it never authorizes a probe on its own. Any other
-/// case returns [`QuickstartCredit::NotChecked`] and makes no request.
+/// A request is made only when `key` is not an Anthropic credential and every
+/// explicit model base URL has host `openrouter.ai`, or when no base URL is
+/// set and `key` starts with `sk-or-`. An Anthropic credential, including an
+/// OAuth token, is never sent, whatever host is recorded. A name whose value
+/// cannot be read skips every key. A failed release read skips every key that
+/// is not `sk-or-`. `CURIE_OPENROUTER_API_URL` redirects an allowed request.
+/// It is not a model endpoint, and it never authorizes a probe on its own.
+/// Any other case returns [`QuickstartCredit::NotChecked`] and makes no request.
 pub async fn read_quickstart_openrouter_credit(
     key: &str,
     endpoints: &ModelEndpoints,
@@ -2354,15 +2362,23 @@ pub async fn read_quickstart_openrouter_credit(
 }
 
 fn credit_skip_reason(key: &str, endpoints: &ModelEndpoints) -> Option<&'static str> {
+    // The runner refuses to forward an Anthropic credential, including an
+    // OAuth token, to a third-party endpoint. An OpenRouter host does not
+    // authorize sending that credential.
+    if key.starts_with("sk-ant-") {
+        return Some("the credential is for Anthropic");
+    }
     if endpoints.unreadable {
+        return Some("the model endpoint is set but its host could not be read");
+    }
+    // A failed release read hides the endpoint the install recorded. Only an
+    // OpenRouter key may still be probed, and only by the rules below.
+    if endpoints.release_read_failed && !key.starts_with("sk-or-") {
         return Some("the model endpoint is set but its host could not be read");
     }
     if endpoints.urls.is_empty() {
         if key.starts_with("sk-or-") {
             return None;
-        }
-        if key.starts_with("sk-ant-") {
-            return Some("the credential is for Anthropic");
         }
         return Some("the model endpoint is not known to be OpenRouter");
     }
@@ -2412,9 +2428,9 @@ fn collect_release_model_bases(endpoints: &mut ModelEndpoints, values: &serde_js
 }
 
 /// `CURIE_MODEL_BASE_URL` in this process, then the same name in the release
-/// the deploy targets. A failed or missing release read contributes nothing:
-/// with no other base URL, only an `sk-or-` key is probed.
-async fn deployment_model_endpoints(opts: &QuickstartOpts) -> ModelEndpoints {
+/// the deploy targets. A missing release contributes nothing. A failed release
+/// read is recorded so the probe is skipped unless the key is `sk-or-`.
+pub async fn deployment_model_endpoints(namespace: &str, release: &str) -> ModelEndpoints {
     let mut endpoints = ModelEndpoints::default();
     if let Ok(value) = std::env::var(MODEL_BASE_URL_ENV) {
         let trimmed = value.trim();
@@ -2423,12 +2439,14 @@ async fn deployment_model_endpoints(opts: &QuickstartOpts) -> ModelEndpoints {
         }
     }
     let common = CommonOpts {
-        namespace: opts.namespace.clone(),
-        release: opts.release.clone(),
+        namespace: namespace.to_string(),
+        release: release.to_string(),
         dry_run: false,
     };
-    if let Ok(Some(values)) = crate::ops::fetch_release_values(&common).await {
-        collect_release_model_bases(&mut endpoints, &values);
+    match crate::ops::fetch_release_values(&common).await {
+        Ok(Some(values)) => collect_release_model_bases(&mut endpoints, &values),
+        Ok(None) => {}
+        Err(_) => endpoints.release_read_failed = true,
     }
     endpoints
 }
@@ -2438,8 +2456,9 @@ async fn deployment_model_endpoints(opts: &QuickstartOpts) -> ModelEndpoints {
 /// run (#3935). Never fails the command; returns the credit left when known.
 ///
 /// The credential is sent only to OpenRouter, and only when the deployment
-/// endpoint is OpenRouter. Every other case prints why credit was not checked
-/// and makes no request.
+/// endpoint is OpenRouter and the credential is not an Anthropic key. A failed
+/// release read skips the probe unless the key is an OpenRouter key. Every
+/// other case prints why credit was not checked and makes no request.
 async fn check_credit(opts: &QuickstartOpts, release_has_real_model: bool) -> Option<f64> {
     let ui = crate::ui::ui();
     let key = match credit_check_key(
@@ -2457,7 +2476,7 @@ async fn check_credit(opts: &QuickstartOpts, release_has_real_model: bool) -> Op
             return None;
         }
     };
-    let endpoints = deployment_model_endpoints(opts).await;
+    let endpoints = deployment_model_endpoints(&opts.namespace, &opts.release).await;
     match read_quickstart_openrouter_credit(&key, &endpoints).await {
         Ok(QuickstartCredit::NotChecked(reason)) => {
             ui.note(&format!("OpenRouter credit not checked: {reason}"));

@@ -2800,6 +2800,29 @@ fn an_unreadable_release_model_base_url_makes_no_credit_request() {
     assert!(fixture.openrouter.recorded().is_empty(), "{shown}");
 }
 
+/// An Anthropic OAuth token stays off the credit probe even when the model
+/// base URL names OpenRouter. The runner refuses to forward that credential
+/// to a third-party endpoint.
+#[test]
+fn an_anthropic_oauth_credential_with_an_openrouter_base_url_makes_no_credit_request() {
+    let key = "sk-ant-oat01-PLACEHOLDER";
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .env("CURIE_CREDENTIALS", key)
+        .env("CURIE_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = shown_output(&output);
+    assert!(output.status.success(), "{shown}");
+    assert!(
+        shown.contains("OpenRouter credit not checked: the credential is for Anthropic"),
+        "{shown}"
+    );
+    assert_credit_not_sent(&fixture, &shown, key);
+}
+
 #[test]
 fn factory_quickstart_direct_anthropic_credentials_select_native_sonnet_and_skip_credit() {
     // The runner's sdk_auth.py accepts both synthetic Anthropic shapes.
