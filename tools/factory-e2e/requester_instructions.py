@@ -325,14 +325,14 @@ class LiveInputs:
         return [self.owner_token, self.second_token, self.model_url, self.model_key]
 
 
-def live_forges(app_id: str, private_key: str, label: str) -> dict[str, Any]:
+def live_forges(app_id: str, private_key_file: str, label: str) -> dict[str, Any]:
     """The live run's ``CURIE_FORGES``: one GitHub code host and its polled tracker.
 
     The tracker's mention must be a GitHub login. The run's own label is one no
     account uses, so only the label starts intake.
     """
 
-    credential = {"type": "github_app", "app_id": app_id, "private_key": private_key}
+    credential = {"type": "github_app", "app_id": app_id, "private_key_file": private_key_file}
     github = {"name": "github", "kind": "github", "host": GITHUB_HOST, "api_url": GITHUB_API}
     return {
         "code_hosts": [{**github, "credential": credential}],
@@ -417,7 +417,9 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 {
                     "FACTORY_ENABLED": "true",
                     "FACTORY_INTAKE": "poll",
-                    "CURIE_FORGES": json.dumps(live_forges(live.app["id"], pem, self.label)),
+                    "CURIE_FORGES": json.dumps(
+                        live_forges(live.app["id"], str(live.app_dir / "app.pem"), self.label)
+                    ),
                     "GITHUB_API_URL": GITHUB_API,
                     "GITHUB_CLONE_BASE": f"https://{GITHUB_HOST}",
                     "GITHUB_APP_ID": live.app["id"],
