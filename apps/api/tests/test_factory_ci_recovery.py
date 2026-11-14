@@ -65,6 +65,25 @@ def _snapshot(request_id: Any) -> str:
     )
 
 
+def _execution_at_0163(request_id: Any) -> str:
+    """The execution row without columns 0167 appends.
+
+    Revision 0163 owns every earlier execution_requests column. 0167 adds
+    completion_contract, result_policy_digest and model_session_reserved_at,
+    which a downgrade to 0162 drops, so the preservation check compares the
+    rest.
+    """
+
+    return str(
+        _rows(
+            "SELECT (to_jsonb(r) - 'completion_contract' - 'result_policy_digest' "
+            "- 'model_session_reserved_at')::text AS bytes "
+            "FROM curie.execution_requests r WHERE id = :id",
+            {"id": request_id},
+        )[0]["bytes"]
+    )
+
+
 def _view(client: Any, item_id: Any) -> dict[str, Any]:
     response = client.get(f"/work-items/{item_id}", headers={"X-API-Key": get_settings().api_key})
     assert response.status_code == 200, response.text
@@ -471,18 +490,18 @@ def test_additive_migration_preserves_existing_failed_execution(migration_admitt
     from alembic import command
 
     published = _failed(migration_admitted, 9822)
-    before = _snapshot(published["id"])
+    before = _execution_at_0163(published["id"])
     config = alembic_config()
     with pytest.raises(RuntimeError, match="factory_ci_observation_records_present"):
         command.downgrade(config, "0162")
-    assert _snapshot(published["id"]) == before
+    assert _execution_at_0163(published["id"]) == before
     _execute(
         "DELETE FROM curie.factory_ci_observations WHERE request_id = :id", {"id": published["id"]}
     )
     command.downgrade(config, "0162")
-    assert _snapshot(published["id"]) == before
+    assert _execution_at_0163(published["id"]) == before
     command.upgrade(config, "head")
-    assert _snapshot(published["id"]) == before
+    assert _execution_at_0163(published["id"]) == before
     assert _rows("SELECT request_id FROM curie.factory_ci_observations") == []
 
 

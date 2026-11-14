@@ -45,6 +45,7 @@ from curie_api.forges.types import (
     NoticePage,
     PullRequest,
     RepositoryRef,
+    SourceContent,
     TicketLabels,
     TrackerIssueRef,
 )
@@ -559,6 +560,17 @@ class GitLabTracker:
         if more:
             parts.append(LATER_COMMENTS)
         return "\n\n".join(parts) + "\n"
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's ``title`` and ``description`` fields from one issue read,
+        never its notes. A missing description is the empty text."""
+
+        payload = await self._read_issue(issue)
+        title = payload.get("title")
+        description = payload.get("description")
+        if not isinstance(title, str) or not isinstance(description, str | None):
+            raise Unavailable("issue")
+        return SourceContent(title=title, body=description or "")
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         return TicketLabels(labels=frozenset(_labels(await self._read_issue(issue))))

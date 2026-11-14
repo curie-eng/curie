@@ -149,6 +149,25 @@ async def _complete(
                     )
                 else:
                     run.held = True
+            elif (
+                outcome == "delivered"
+                and run.is_tracker_result
+                and parsed is not None
+                and parsed.kind == "execute"
+                and turn is not None
+            ):
+                # ADR 0277 (#5586): a tracker_result execution needs no pull
+                # request. The worker reports the session ended; the API
+                # completes it only against a verified delivery receipt and
+                # otherwise records it failed. A turn the worker could not
+                # start did no work, so it fails as a runner escalation.
+                await self._finish_or_settle(
+                    run,
+                    outcome="failed" if turn.start_failed else "completed",
+                    cause="runner_escalated" if turn.start_failed else "tracker_result",
+                    detail=None,
+                    ci_fix_round=None,
+                )
             elif outcome == "delivered":
                 ci_fix = parsed is not None and parsed.is_ci_fix
                 # Only an unpublished fix turn names its round (#4330).

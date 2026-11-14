@@ -879,6 +879,25 @@ mod channels_tests {
     }
 
     #[test]
+    fn every_factory_state_label_is_refused_as_a_trigger_label() {
+        // #5586: `curie-factory:triaged` joins the state labels; the reserved
+        // family covers it, as the API's does.
+        for state in [
+            "curie-factory:queued",
+            "curie-factory:running",
+            "curie-factory:pr-open",
+            "curie-factory:needs-human",
+            "curie-factory:triaged",
+        ] {
+            let err = super::valid_trigger_label(state).unwrap_err();
+            let (class, _fix) = crate::exit::classify(&err);
+            assert_eq!(class, crate::exit::ExitClass::Usage);
+            assert!(err.to_string().contains("curie-factory:"), "{err}");
+        }
+        assert!(super::valid_trigger_label("curie-factory-triage").is_ok());
+    }
+
+    #[test]
     fn channel_change_rejects_a_bare_address_with_no_kind() {
         // `--add C0EXAMPLE1` is the mistake this catches. Defaulting the kind
         // to "slack" would be the silent-wrong-thing: the operator learns the

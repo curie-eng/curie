@@ -99,11 +99,11 @@ async def _read_bounded_upload(file: UploadFile, max_bytes: int) -> bytes:
 
 
 async def _discard_upload_version(session: AsyncSession, version_id: uuid.UUID) -> None:
-    """Delete the version a refused tracker result upload was made for (#5585).
+    """Delete the version a refused tracker result upload was made for (#5585, #5586).
 
-    Acceptance criterion 2 says a refused tracker result deployment leaves no
-    agent version behind. Every REST client (the CLI's ``prepare_deploy``, the
-    UI's create-agent modal and its deploy action) creates a fresh version with
+    A refused tracker result deployment leaves no agent version behind. Every
+    REST client (the CLI's ``prepare_deploy``, the UI's create-agent modal and
+    its deploy action) creates a fresh version with
     ``POST /agents/{id}/versions`` and uploads into it at once, so a version
     with no bundle that no deployment references exists only for this upload,
     and nothing will ever upload into it again: a retry creates a new version.
@@ -154,7 +154,9 @@ async def upload_bundle(
         )
 
     try:
-        extension, content_type = await run_in_threadpool(deploy.validate_archive, data)
+        extension, content_type, declaration = await run_in_threadpool(
+            deploy.validate_archive, data
+        )
     except bundles.UnsupportedArchive as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except deploy.BundleInvalid as exc:
@@ -162,9 +164,15 @@ async def upload_bundle(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             {"detail": "bundle failed validation", "errors": exc.errors},
         ) from exc
-    except deploy.TrackerResultNotEnabled as exc:
+
+    agent = await crud_agents.get_agent(session, agent_id)
+    if agent is None:  # pragma: no cover -- the version lookup above proves it
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    try:
+        await deploy.check_tracker_result_admissible(session, agent, declaration)
+    except deploy.TrackerResultRefused as exc:
         # Before the route join, `store.put` and `attach_bundle`, so a refused
-        # bundle stores no object and leaves `bundle_ref` null (#5585).
+        # bundle stores no object and leaves `bundle_ref` null (#5586).
         await _discard_upload_version(session, version.id)
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
@@ -190,9 +198,6 @@ async def upload_bundle(
     # leaves `bundle_ref` null -- `crud.versions.attach_bundle` commits immediately, so a
     # check placed after it would already be live.
     if await crud_deployments.version_has_active_deployment(session, version_id):
-        agent = await crud_agents.get_agent(session, agent_id)
-        if agent is None:  # pragma: no cover -- the version lookup above proves it
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
         try:
             await deploy.check_routes_from_bytes(
                 data, agent.approval_routes, version_id, get_settings()
@@ -205,7 +210,7 @@ async def upload_bundle(
             ) from exc
 
     return await deploy.store_bundle(
-        store, session, agent_id, version, data, extension, content_type
+        store, session, agent_id, version, data, extension, content_type, declaration=declaration
     )
 
 

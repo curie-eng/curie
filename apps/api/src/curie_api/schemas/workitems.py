@@ -38,6 +38,41 @@ class IssueReadResult(BaseModel):
     execution_seconds: int
 
 
+class CompletionContractOut(BaseModel):
+    """How the execution completes (ADR 0277, #5586): by a pull request
+    (``implementation``) or by one delivered tracker result (``tracker_result``).
+
+    ``result_kinds`` are the kinds the deployed policy allows and
+    ``session_usd_allowance`` the per-session model allowance in USD (the
+    agent's dollar limit, else 5); both empty for ``implementation``.
+    """
+
+    completion_contract: Literal["implementation", "tracker_result"]
+    result_kinds: list[str]
+    session_usd_allowance: float | None
+
+
+class TrackerResultSubmission(BaseModel):
+    """The runner result tool's call: one typed proposal, validated by the API
+    (`curie_api.factory_tracker_results.parse_proposal`)."""
+
+    proposal: Any = Field(description="A ticket or findings proposal object.")
+
+
+class TrackerResultOut(BaseModel):
+    """The accepted result after one inline delivery attempt.
+
+    ``state`` ``owed`` means the platform keeps retrying until the delivery
+    deadline. ``result_comment_url`` is the source issue's marked result
+    comment and ``ticket_url`` the published ticket, each once delivered.
+    """
+
+    result_kind: Literal["ticket", "findings"]
+    state: Literal["owed", "delivered", "failed"]
+    result_comment_url: str | None
+    ticket_url: str | None
+
+
 WorkItemOutcomeState = Literal[
     "queued",
     "waiting",

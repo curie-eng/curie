@@ -47,11 +47,12 @@ async def create_deployment(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     # @spec ACTION-EXECUTOR-16: a bundle stored before intake refused a
     # non-SecretRef sealing key declaration is refused here too, before any row.
-    # So is a stored tracker result declaration (#5585), with the upload
-    # route's envelopes: a malformed one as a validation failure, a valid one
-    # as `tracker_result_not_enabled`.
+    # A stored tracker result declaration is read from the stored bytes
+    # (ADR 0277): a malformed one is a validation failure, and a valid one
+    # this agent could not run is refused with the upload route's envelope.
     try:
-        await deploy.check_stored_bundle_intake(store, version)
+        declaration = await deploy.check_stored_bundle_intake(store, version)
+        await deploy.check_tracker_result_admissible(session, agent, declaration)
     except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except deploy.BundleInvalid as exc:
@@ -59,7 +60,7 @@ async def create_deployment(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             {"detail": "bundle failed validation", "errors": exc.errors},
         ) from exc
-    except deploy.TrackerResultNotEnabled as exc:
+    except deploy.TrackerResultRefused as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
         ) from exc
@@ -80,6 +81,10 @@ async def create_deployment(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
         ) from exc
+    # Recorded from the stored bytes in the deployment's own commit, so the
+    # version that boots carries the policy its bundle declares (ADR 0277).
+    if version.bundle_ref is not None:
+        deploy.apply_result_policy(version, declaration)
     deployment = await crud_deployments.create_deployment(session, data)
     return DeploymentOut.model_validate(deployment)
 

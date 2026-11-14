@@ -29,6 +29,7 @@ set) is absorbed by the ``event_id`` keyed request id (ADR 0187).
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -53,6 +54,7 @@ from curie_api.forges.types import (
     NoticePage,
     PullRequest,
     RepositoryRef,
+    SourceContent,
     TicketLabels,
     TrackerIssueRef,
 )
@@ -735,6 +737,24 @@ class JiraTracker:
         if total > len(comments):
             parts.append(LATER_COMMENTS)
         return "\n\n".join(parts) + "\n"
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's ``summary`` and ``description`` fields from one issue read,
+        never its comments. The description is the stored document, as its
+        canonical JSON text (keys sorted, no insignificant whitespace), not
+        rendered markdown; a missing description is the empty text."""
+
+        fields = _fields(await self._read_issue(self._issue_id(issue), "summary,description"))
+        summary = fields.get("summary")
+        if not isinstance(summary, str):
+            raise Unavailable("issue")
+        description = fields.get("description")
+        body = (
+            ""
+            if description is None
+            else json.dumps(description, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        return SourceContent(title=summary, body=body)
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         issue_id = self._issue_id(issue)

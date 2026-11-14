@@ -534,6 +534,25 @@ class AgentVersion(Base):
             "AND result_policy_digest ~ '^[0-9a-f]{64}$')",
             name="agent_versions_result_policy_ck",
         ),
+        # Migration 0167 (#5586): the stored policy (sorted result kinds and the
+        # implementation label) requires its digest. A digest alone is allowed
+        # for a 0162 row whose declaration SQL could not backfill; admission
+        # refuses it as an unreadable policy until a deploy records both.
+        CheckConstraint(
+            "result_policy IS NULL OR result_policy_digest IS NOT NULL",
+            name="agent_versions_result_policy_presence_ck",
+        ),
+        CheckConstraint(
+            "result_policy IS NULL OR (CASE WHEN jsonb_typeof(result_policy) = 'object' THEN "
+            "(result_policy - 'results' - 'implementation_label' = '{}'::jsonb "
+            "AND ((result_policy -> 'results' = '[\"findings\"]'::jsonb "
+            "AND result_policy -> 'implementation_label' = 'null'::jsonb) "
+            "OR (result_policy -> 'results' = '[\"findings\", \"ticket\"]'::jsonb "
+            "AND jsonb_typeof(result_policy -> 'implementation_label') = 'string' "
+            "AND length(result_policy ->> 'implementation_label') BETWEEN 1 AND 50))) "
+            "ELSE false END) IS TRUE",
+            name="agent_versions_result_policy_shape_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -554,9 +573,15 @@ class AgentVersion(Base):
     created_by: Mapped[str]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     # The tracker result declaration's schema version and canonical SHA-256
-    # (ADR 0277). Nothing writes them yet: ingestion refuses every declaration.
+    # (ADR 0277), and the policy it declares: ``{"results": [sorted kinds],
+    # "implementation_label": str | None}``. Written when the bundle is
+    # attached (``deploy.apply_result_policy``); all NULL for a bundle without
+    # a declaration, which has the implementation contract.
     result_policy_schema_version: Mapped[int | None] = mapped_column(Integer, default=None)
     result_policy_digest: Mapped[str | None] = mapped_column(Text, default=None)
+    result_policy: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
 
     agent: Mapped[Agent] = relationship(back_populates="versions")
 
@@ -1260,6 +1285,25 @@ class ExecutionRequest(Base):
             "OR (status IN ('completed', 'failed', 'expired') AND started_at IS NOT NULL)",
             name="execution_requests_teardown_unconfirmed_ck",
         ),
+        # Migration 0167 (#5586, ADR 0277): the completion contract selected at
+        # admission, the deployed result policy digest a tracker result request
+        # runs under, and its one model session reservation.
+        CheckConstraint(
+            "completion_contract IN ('implementation', 'tracker_result')",
+            name="execution_requests_completion_contract_ck",
+        ),
+        CheckConstraint(
+            "(completion_contract = 'tracker_result') = (result_policy_digest IS NOT NULL)",
+            name="execution_requests_result_policy_digest_ck",
+        ),
+        CheckConstraint(
+            "result_policy_digest IS NULL OR result_policy_digest ~ '^[0-9a-f]{64}$'",
+            name="execution_requests_result_policy_digest_format_ck",
+        ),
+        CheckConstraint(
+            "model_session_reserved_at IS NULL OR completion_contract = 'tracker_result'",
+            name="execution_requests_model_session_reserved_at_ck",
+        ),
         CheckConstraint(
             "dispatch_generation >= 1",
             name="execution_requests_dispatch_generation_ck",
@@ -1467,6 +1511,18 @@ class ExecutionRequest(Base):
     reply_target_pr_number: Mapped[str | None] = mapped_column(Text, default=None)
     reply_target_comment_id: Mapped[str | None] = mapped_column(Text, default=None)
     reply_target_url: Mapped[str | None] = mapped_column(Text, default=None)
+    # How the request completes (ADR 0277): ``implementation`` by a pull
+    # request, ``tracker_result`` by one delivered tracker result under the
+    # deployed policy ``result_policy_digest`` names. Selected at admission
+    # from the binding's in-force version, never from issue text.
+    completion_contract: Mapped[str] = mapped_column(
+        Text, default="implementation", server_default="implementation"
+    )
+    result_policy_digest: Mapped[str | None] = mapped_column(Text, default=None)
+    # The one model session a tracker result request may start, stamped once.
+    model_session_reserved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
 
     work_item: Mapped[WorkItem] = relationship(
         back_populates="execution_requests", foreign_keys=[work_item_id]
@@ -1577,7 +1633,7 @@ class FactoryStatusComment(Base):
             "applied_label IS NULL OR applied_label IN "
             "('', 'curie:queued', 'curie:running', 'curie:pr-open', 'curie:needs-human', "
             "'curie-factory:queued', 'curie-factory:running', 'curie-factory:pr-open', "
-            "'curie-factory:needs-human')",
+            "'curie-factory:needs-human', 'curie-factory:triaged')",
             name="factory_terminal_notices_applied_label_ck",
         ),
         # Application N-1's delivery scan still reads this one.
@@ -1649,8 +1705,8 @@ class FactoryStatusComment(Base):
     )
 
 
-# Tracker result delivery (ADR 0277, #5585). Migration 0162 freezes the
-# CHECKs copied here. No column below except the artifact's ``content`` holds
+# Tracker result delivery (ADR 0277, #5585). Migrations 0162 and 0167 (#5586)
+# freeze the CHECKs copied here. No column below except the artifact's ``content`` holds
 # text a proposal submitted: codes are CHECK constrained to snake case, and
 # digests and revisions to lowercase hex.
 FACTORY_TRACKER_RESULT_KINDS = ("ticket", "findings")
@@ -1662,6 +1718,7 @@ FACTORY_TRACKER_RESULT_REASONS = (
     "budget_exhausted",
 )
 FACTORY_TRACKER_RESULT_STATES = ("owed", "delivered", "failed")
+FACTORY_TRACKER_RESULT_ORIGINS = ("submitted", "platform")
 _HEX64 = "'^[0-9a-f]{64}$'"
 _CODE = "'^[a-z][a-z0-9_]{0,63}$'"
 _FINDINGS_ONLY = "'[\"findings\"]'::jsonb"
@@ -1718,6 +1775,10 @@ class FactoryTrackerResultGrant(Base):
             "implementation_label IS NULL OR length(implementation_label) BETWEEN 1 AND 50",
             name="factory_tracker_result_grants_implementation_label_length_ck",
         ),
+        CheckConstraint(
+            f"source_content_sha256 IS NULL OR source_content_sha256 ~ {_HEX64}",
+            name="factory_tracker_result_grants_source_content_sha256_ck",
+        ),
         Index("ix_factory_tracker_result_grants_work_item_id", "work_item_id"),
     )
 
@@ -1735,6 +1796,9 @@ class FactoryTrackerResultGrant(Base):
     implementation_label: Mapped[str | None] = mapped_column(String(50), default=None)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # SHA-256 of the source issue's title and body as the platform read them
+    # when the grant was minted (#5586).
+    source_content_sha256: Mapped[str | None] = mapped_column(Text, default=None)
 
 
 class FactoryTrackerResultDelivery(Base):
@@ -1802,6 +1866,20 @@ class FactoryTrackerResultDelivery(Base):
             "deadline_at > submitted_at",
             name="factory_tracker_result_deliveries_deadline_ck",
         ),
+        # Migration 0167 (#5586): a platform delivery is the budget exhausted
+        # findings the platform composes, and only it carries that reason.
+        CheckConstraint(
+            f"origin IN ({_sql_values(FACTORY_TRACKER_RESULT_ORIGINS)})",
+            name="factory_tracker_result_deliveries_origin_ck",
+        ),
+        CheckConstraint(
+            "origin = 'submitted' OR (result_kind = 'findings' AND reason = 'budget_exhausted')",
+            name="factory_tracker_result_deliveries_platform_origin_ck",
+        ),
+        CheckConstraint(
+            "reason IS NULL OR reason <> 'budget_exhausted' OR origin = 'platform'",
+            name="factory_tracker_result_deliveries_budget_exhausted_origin_ck",
+        ),
         Index(
             "ix_factory_tracker_result_deliveries_owed",
             "next_attempt_at",
@@ -1856,6 +1934,7 @@ class FactoryTrackerResultDelivery(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    origin: Mapped[str] = mapped_column(Text, default="submitted", server_default="submitted")
 
 
 class FactoryTrackerResultReceipt(Base):
@@ -1916,6 +1995,8 @@ class FactoryTrackerResultReceipt(Base):
     delivered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # The web link to the marked result comment on the source issue (#5586).
+    result_comment_url: Mapped[str | None] = mapped_column(Text, default=None)
 
 
 class FactoryTrackerResultArtifact(Base):
@@ -2022,7 +2103,7 @@ class FactorySlackThread(Base):
     )
 
 
-FACTORY_SLACK_POST_KINDS = ("root", "phase", "pull_request", "terminal")
+FACTORY_SLACK_POST_KINDS = ("root", "phase", "pull_request", "terminal", "triage")
 
 
 class FactorySlackPost(Base):

@@ -1,10 +1,17 @@
 """Deliver one tracker result exactly once and record its receipt (ADR 0277 decision 4, #5585).
 
-Inactive in #5585: no router, lifespan task, reconciler, worker path or CLI
-imports this module, and only tests insert grants. #5586 mints grants, calls
-`submit_result` from the runner result tool and schedules `deliver` and
-`expire_overdue`; #5588 reads receipts. This docstring is the frozen contract
-those stages build on.
+#5586 activates it: the completion contract route mints grants
+(`curie_api.factory_tracker_result_runtime`), the runner result tool's route
+calls `submit_result` and one inline `deliver`, the lifecycle seals platform
+findings on exhaustion (`seal_platform_findings`), and the WorkItem reconciler
+schedules `deliver` and `expire_overdue`; #5588 reads receipts.
+
+Origins (``factory_tracker_result_deliveries.origin``). ``submitted``: a
+proposal the run submitted. ``platform``: the ``budget_exhausted`` findings the
+platform composes from facts alone when an investigation reaches its execution
+deadline or its model budget with no submission (`PlatformFindings`); its
+artifact is reloaded with that model, never with `parse_proposal`, which
+refuses that reason.
 
 Grant (`models.FactoryTrackerResultGrant`). The authority one execution
 request holds to deliver one result: ``work_item_id``,
@@ -41,10 +48,16 @@ tracker write of an attempt, and in the transaction that records delivery
    (``result_kind_not_allowed``).
 2. ``source_fingerprint`` still matches (``source_fingerprint_changed``).
 3. Neither the WorkItem nor the request is cancelled (``cancelled``).
-4. A live owner (``owner_not_live``): the request is running under the
-   presented runtime epoch (sealed on the delivery for attempts), with a
-   runtime owner, a current heartbeat lease and an unexpired execution
-   deadline.
+4. At submission, a live owner (``owner_not_live``): the request is a
+   tracker result request (``not_tracker_result``) running under the
+   presented runtime epoch, with a runtime owner, a current heartbeat lease
+   and an unexpired execution deadline. At attempt time (both origins,
+   #5586): the request must be a tracker result request
+   (``not_tracker_result``); a user cancellation is ``cancelled``; a running
+   request that fails any of the submission checks under the sealed epoch,
+   or a stop requested for a cause that is not a user's (``execution_deadline``,
+   ``owner_lost``), defers the attempt (`AttemptError` ``request_settling``,
+   the row stays owed); a completed, failed or expired request proceeds.
 5. The tracker is the WorkItem's (``tracker_mismatch``) and, for a ticket,
    supports `Operation.CREATE_LINKED_ISSUE` (``tracker_operation_unsupported``).
 6. Submission only: the ticket title or body carries no closing keyword
@@ -109,6 +122,15 @@ process death is held off the same way by the attempt lease
 appear for reconciliation. An empty listing after it proves nothing, so the
 mark still forbids a create.
 
+Source content. Immediately before each tracker write an attempt reads the
+source issue's own title and body (`Tracker.read_source_content`) and compares
+their digest with the grant's ``source_content_sha256``; a mismatch, or a
+grant with none, settles failed ``source_fingerprint_changed`` and writes
+nothing more. A ticket's linked issue carries the source's ``base:`` labels
+(`Tracker.ticket_labels`, read with that check) and never a trigger label;
+the read-back body digest equal to the composed body's proves the
+related-source line is present.
+
 Rechecks. Immediately before each tracker write (the linked issue call and the
 comment upsert) an attempt rechecks the deadline and fences 1 to 5 against the
 locked delivery row; a failure settles failed with that code and the write is
@@ -132,14 +154,18 @@ SQLAlchemy error, whose text carries bound parameters.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import hashlib
 import logging
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
 
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import ColumnElement, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -148,6 +174,8 @@ from curie_api.config import Settings
 from curie_api.factory_comment_text import redact_factory_comment
 from curie_api.factory_tracker_results import (
     FindingsProposal,
+    FindingsReason,
+    PlatformFindings,
     ProposalInvalid,
     ResultProposal,
     TicketProposal,
@@ -155,6 +183,7 @@ from curie_api.factory_tracker_results import (
     proposal_content,
     proposal_sha256,
 )
+from curie_api.factory_triage_status import on_tracker_result_settled
 from curie_api.forges.capabilities import Operation, supports
 from curie_api.forges.errors import (
     Ambiguous,
@@ -165,7 +194,9 @@ from curie_api.forges.errors import (
     Unsupported,
 )
 from curie_api.forges.ports import Tracker
+from curie_api.forges.trackers import comment_prefix
 from curie_api.forges.types import LinkedIssue, ReplyTarget, TrackerIssueRef
+from curie_api.github_factory_events import BASE_LABEL_PREFIX
 from curie_api.models import (
     ExecutionRequest,
     FactoryTrackerResultArtifact,
@@ -184,6 +215,13 @@ ATTEMPT_LEASE_SECONDS = 120
 # GitHub: seconds). A wait before reconciling, never proof of absence; see
 # "Listing lag" above.
 LISTING_SETTLE_SECONDS = 60
+# One source read before a tracker write; the attempt backs off past it.
+SOURCE_READ_TIMEOUT_SECONDS = 20.0
+# The request contract that may hold a grant (`execution_requests.completion_contract`).
+_TRACKER_RESULT_CONTRACT = "tracker_result"
+# Request causes a person's label action records; every other stop is the platform's.
+_USER_CANCELLATION_CAUSES = ("issue_cancelled", "issue_deleted")
+_TERMINAL_STATUSES = ("completed", "failed", "expired")
 
 
 def output_identity_for(execution_request_id: uuid.UUID) -> str:
@@ -235,6 +273,11 @@ class DeliveryState(enum.StrEnum):
     FAILED = "failed"
 
 
+class DeliveryOrigin(enum.StrEnum):
+    SUBMITTED = "submitted"
+    PLATFORM = "platform"
+
+
 class RefusalReason(enum.StrEnum):
     GRANT_NOT_FOUND = "grant_not_found"
     GRANT_REQUEST_MISMATCH = "grant_request_mismatch"
@@ -248,6 +291,7 @@ class RefusalReason(enum.StrEnum):
     OPERATION_UNSUPPORTED = "tracker_operation_unsupported"
     CLOSES_SOURCE = "closes_source"
     PROPOSAL_CONFLICT = "proposal_conflict"
+    NOT_TRACKER_RESULT = "not_tracker_result"
 
 
 class AttemptError(enum.StrEnum):
@@ -260,6 +304,8 @@ class AttemptError(enum.StrEnum):
     OUTPUT_MISMATCH = "output_mismatch"
     OUTPUT_MISSING = "output_missing"
     OUTPUT_UNCONFIRMED = "output_unconfirmed"
+    # The request is between its session and its terminus (#5586).
+    REQUEST_SETTLING = "request_settling"
 
 
 class FailureCode(enum.StrEnum):
@@ -355,6 +401,52 @@ def _source_references(tracker: Tracker, work_item: WorkItem) -> tuple[str, ...]
     return tuple(references)
 
 
+def _live_owner(request: ExecutionRequest, runtime_epoch: int, now: datetime) -> bool:
+    return (
+        request.status == "running"
+        and request.runtime_epoch == runtime_epoch
+        and bool(request.runtime_owner)
+        and request.runtime_heartbeat_expires_at is not None
+        and request.runtime_heartbeat_expires_at > now
+        and request.execution_deadline is not None
+        and request.execution_deadline > now
+    )
+
+
+def _user_cancelled(work_item: WorkItem, request: ExecutionRequest) -> bool:
+    return (
+        work_item.cancelled_at is not None
+        or request.status == "cancelled"
+        or (
+            request.cancellation_requested_at is not None
+            and request.terminal_cause in _USER_CANCELLATION_CAUSES
+        )
+    )
+
+
+def _attempt_owner_fence(
+    work_item: WorkItem, request: ExecutionRequest, runtime_epoch: int, now: datetime
+) -> RefusalReason | AttemptError | None:
+    """Fence 4 at attempt time (#5586): proceed, defer, or fail.
+
+    A tracker result is delivered while its session runs under a live owner,
+    or after the request ended on its own; never after a user cancellation,
+    and never for an implementation request.
+    """
+
+    if request.completion_contract != _TRACKER_RESULT_CONTRACT:
+        return RefusalReason.NOT_TRACKER_RESULT
+    if _user_cancelled(work_item, request):
+        return RefusalReason.CANCELLED
+    if request.status == "running":
+        return None if _live_owner(request, runtime_epoch, now) else AttemptError.REQUEST_SETTLING
+    if request.status == "cancellation_requested":
+        return AttemptError.REQUEST_SETTLING
+    if request.status in _TERMINAL_STATUSES:
+        return None
+    return RefusalReason.OWNER_NOT_LIVE
+
+
 def _refusal(
     facts: _Facts | None,
     *,
@@ -363,8 +455,12 @@ def _refusal(
     tracker: Tracker,
     result_kind: str,
     proposal: ResultProposal | None,
-) -> RefusalReason | None:
-    """The first fence that fails, or None. ``proposal`` is given at submission only."""
+) -> RefusalReason | AttemptError | None:
+    """The first fence that fails, or None. ``proposal`` is given at submission only.
+
+    An `AttemptError` (attempts only) defers the attempt: nothing is written
+    and the delivery stays owed.
+    """
 
     if facts is None:
         return RefusalReason.GRANT_NOT_FOUND
@@ -383,18 +479,17 @@ def _refusal(
             return RefusalReason.RESULT_KIND_NOT_ALLOWED
     if grant.source_fingerprint != source_fingerprint(work_item, request):
         return RefusalReason.SOURCE_FINGERPRINT_CHANGED
-    if work_item.cancelled_at is not None or request.cancellation_requested_at is not None:
-        return RefusalReason.CANCELLED
-    if (
-        request.status != "running"
-        or request.runtime_epoch != runtime_epoch
-        or not request.runtime_owner
-        or request.runtime_heartbeat_expires_at is None
-        or request.runtime_heartbeat_expires_at <= now
-        or request.execution_deadline is None
-        or request.execution_deadline <= now
-    ):
-        return RefusalReason.OWNER_NOT_LIVE
+    if proposal is None:
+        settling = _attempt_owner_fence(work_item, request, runtime_epoch, now)
+        if settling is not None:
+            return settling
+    else:
+        if work_item.cancelled_at is not None or request.cancellation_requested_at is not None:
+            return RefusalReason.CANCELLED
+        if request.completion_contract != _TRACKER_RESULT_CONTRACT:
+            return RefusalReason.NOT_TRACKER_RESULT
+        if not _live_owner(request, runtime_epoch, now):
+            return RefusalReason.OWNER_NOT_LIVE
     if tracker.kind != work_item.tracker_kind or tracker.host != work_item.tracker_host:
         return RefusalReason.TRACKER_MISMATCH
     if result_kind == ResultKind.TICKET and not supports(
@@ -448,7 +543,10 @@ async def submit_result(
             proposal.kind,
             refusal.value,
         )
-        raise TrackerResultRefused(refusal)
+        # Submission never defers: every fence there is a refusal.
+        raise TrackerResultRefused(
+            refusal if isinstance(refusal, RefusalReason) else RefusalReason.OWNER_NOT_LIVE
+        )
     assert facts is not None
     existing = await _existing(session, grant_id, digest)
     if existing is not None:
@@ -462,6 +560,7 @@ async def submit_result(
             id=delivery_id,
             grant_id=grant_id,
             execution_request_id=execution_request_id,
+            origin=DeliveryOrigin.SUBMITTED.value,
             result_kind=proposal.kind,
             reason=proposal.reason.value if isinstance(proposal, FindingsProposal) else None,
             proposal_sha256=digest,
@@ -542,23 +641,190 @@ async def _existing(session: AsyncSession, grant_id: uuid.UUID, digest: str) -> 
     return uuid.UUID(str(row.id))
 
 
+# Platform findings ------------------------------------------------------------
+
+ExhaustionLimit = Literal["execution_deadline", "budget"]
+
+_LIMIT_TRIED = {
+    "execution_deadline": (
+        "The investigation ran until it reached its execution deadline without submitting a result."
+    ),
+    "budget": (
+        "The investigation ran until it reached its model budget for the session "
+        "without submitting a result."
+    ),
+}
+_PLATFORM_MISSING = (
+    "No result was submitted, so this report makes no reproduction claim and names no cause."
+)
+_FULL_REVISION = re.compile(r"[0-9a-fA-F]{40}")
+
+
+async def _database_now(session: AsyncSession) -> datetime:
+    now = await session.scalar(select(func.clock_timestamp()))
+    assert isinstance(now, datetime)
+    return now
+
+
+def platform_findings(*, limit: ExhaustionLimit, base_commit: str | None) -> PlatformFindings:
+    """The ``budget_exhausted`` findings, from facts alone: which limit was
+    reached and the checked-out revision when it is a full commit id. No
+    model text."""
+
+    revision = (
+        base_commit.lower()
+        if base_commit is not None and _FULL_REVISION.fullmatch(base_commit)
+        else None
+    )
+    return PlatformFindings(
+        kind="findings",
+        reason=FindingsReason.BUDGET_EXHAUSTED,
+        tried=_LIMIT_TRIED[limit],
+        missing=_PLATFORM_MISSING,
+        revision=revision,
+    )
+
+
+async def seal_platform_findings(
+    session: AsyncSession,
+    *,
+    request: ExecutionRequest,
+    work_item: WorkItem,
+    limit: ExhaustionLimit,
+    settings: Settings,
+) -> uuid.UUID | None:
+    """Seal one owed platform findings delivery for an exhausted request.
+
+    Runs in the caller's terminalizing transaction and commits nothing. Seals
+    only a tracker result request whose WorkItem is not cancelled and whose
+    grant (locked here, as a first submission locks it) has no delivery yet:
+    one delivery per grant. A database error rolls back only its own
+    savepoint, so the terminal transition still commits. Returns the delivery
+    id, or None when nothing was sealed.
+    """
+
+    if request.completion_contract != _TRACKER_RESULT_CONTRACT or work_item.cancelled_at:
+        return None
+    grant = await session.scalar(
+        select(FactoryTrackerResultGrant)
+        .where(FactoryTrackerResultGrant.execution_request_id == request.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if grant is None:
+        return None
+    existing = await session.scalar(
+        select(FactoryTrackerResultDelivery.id).where(
+            FactoryTrackerResultDelivery.grant_id == grant.id
+        )
+    )
+    if existing is not None:
+        return None
+    findings = platform_findings(limit=limit, base_commit=work_item.base_commit)
+    now = await _database_now(session)
+    deadline = now + timedelta(seconds=settings.factory_tracker_result_delivery_deadline_seconds)
+    delivery_id = uuid.uuid4()
+    sealed = False
+    try:
+        async with session.begin_nested():
+            session.add(
+                FactoryTrackerResultDelivery(
+                    id=delivery_id,
+                    grant_id=grant.id,
+                    execution_request_id=request.id,
+                    origin=DeliveryOrigin.PLATFORM.value,
+                    result_kind=findings.kind,
+                    reason=findings.reason.value,
+                    proposal_sha256=_sealed_sha256(findings),
+                    runtime_epoch=request.runtime_epoch,
+                    state=DeliveryState.OWED.value,
+                    attempts=0,
+                    next_attempt_at=now,
+                    submitted_at=now,
+                    deadline_at=deadline,
+                )
+            )
+            await session.flush()
+            session.add(
+                FactoryTrackerResultArtifact(
+                    delivery_id=delivery_id,
+                    content=findings.model_dump(mode="json", exclude_none=True),
+                    expires_at=deadline,
+                )
+            )
+            await session.flush()
+        sealed = True
+    except SQLAlchemyError:
+        pass
+    if not sealed:
+        logger.warning(
+            "tracker result platform findings not sealed request=%s code=%s",
+            request.id,
+            "delivery_write_failed",
+        )
+        return None
+    logger.info(
+        "tracker result platform findings sealed delivery=%s grant=%s request=%s limit=%s",
+        delivery_id,
+        grant.id,
+        request.id,
+        limit,
+    )
+    return delivery_id
+
+
 # Rendering ------------------------------------------------------------------
 
 
-def _publishable(text: str) -> str:
-    """Redacted, with no HTML comment opener left to carry a marker, and no
-    live mention.
+def _without_controls(text: str) -> str:
+    """The text with no control or invisible format character.
 
-    The tracker posts this text under the App's identity, so a model-written
-    ``@login`` would notify that account. A U+200B after every ``@`` keeps the
-    text readable and stops the mention, as `factory_notices` does for the
-    agent's last message.
+    Drops C0 (newline and tab kept), DEL, C1, every format character
+    (category ``Cf``: the bidi embeddings, overrides and isolates, the
+    marks U+200E/U+200F/U+061C, zero-width joiners and spaces, the BOM, tag
+    characters) and lone surrogates. A line or paragraph separator becomes a
+    newline. A right-to-left override would otherwise reorder the App's own
+    lines a reader sees below the model's text.
     """
 
-    return redact_factory_comment(text).replace("<!--", "&lt;!--").replace("@", "@\u200b")
+    kept: list[str] = []
+    for char in text.replace("\r\n", "\n"):
+        category = unicodedata.category(char)
+        if char in "\n\t":
+            kept.append(char)
+        elif category in ("Zl", "Zp"):
+            kept.append("\n")
+        elif category not in ("Cc", "Cf", "Cs"):
+            kept.append(char)
+    return "".join(kept)
+
+
+def _publishable(text: str) -> str:
+    """Redacted, with no control character, no HTML comment opener left to
+    carry a marker, and no live mention.
+
+    Controls go first, so a zero-width character cannot split a secret past
+    redaction. The tracker posts this text under the App's identity, so a
+    model-written ``@login`` would notify that account. A U+200B after every
+    ``@`` (added after the strip) keeps the text readable and stops the
+    mention, as `factory_notices` does for the agent's last message.
+    """
+
+    return (
+        redact_factory_comment(_without_controls(text))
+        .replace("<!--", "&lt;!--")
+        .replace("@", "@\u200b")
+    )
 
 
 def _fenced(text: str) -> str:
+    """The text as one code block no line of it can close.
+
+    Model text in a comment is rendered inert this way: inside the fence no
+    link, image, autolink or raw HTML renders, and the fence is longer than
+    any backtick run in the text.
+    """
+
     longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
     fence = "`" * max(3, longest + 1)
     return f"{fence}\n{text}\n{fence}"
@@ -583,7 +849,7 @@ def _ticket_comment(proposal: TicketProposal, url: str) -> str:
     )
 
 
-def _findings_comment(proposal: FindingsProposal) -> str:
+def _findings_comment(proposal: FindingsProposal | PlatformFindings) -> str:
     lines = [
         "No implementation ticket was produced from this report.",
         "",
@@ -595,11 +861,11 @@ def _findings_comment(proposal: FindingsProposal) -> str:
         "",
         "What was tried:",
         "",
-        _publishable(proposal.tried),
+        _fenced(_publishable(proposal.tried)),
         "",
         "What is missing:",
         "",
-        _publishable(proposal.missing),
+        _fenced(_publishable(proposal.missing)),
     ]
     return "\n".join(lines)
 
@@ -621,6 +887,7 @@ class _Claim:
     runtime_epoch: int
     attempts: int
     owner: str
+    origin: str
     deadline_passed: bool
     # The output issue an earlier attempt recorded, or None.
     recorded: TrackerIssueRef | None
@@ -697,6 +964,7 @@ async def _claim(
                     delivery.proposal_sha256,
                     delivery.runtime_epoch,
                     delivery.attempts,
+                    delivery.origin,
                     (delivery.deadline_at <= func.clock_timestamp()).label("deadline_passed"),
                     delivery.output_tracker_kind,
                     delivery.output_tracker_host,
@@ -731,14 +999,18 @@ async def _claim(
         runtime_epoch=int(row.runtime_epoch),
         attempts=int(row.attempts),
         owner=owner,
+        origin=str(row.origin),
         deadline_passed=bool(row.deadline_passed),
         recorded=recorded,
         create_attempted=bool(row.create_attempted),
     )
 
 
-async def _verdict(session: AsyncSession, claim: _Claim, tracker: Tracker) -> str | None:
-    """None when this attempt may write now; else a failure code or `_LEASE_LOST`.
+async def _verdict(
+    session: AsyncSession, claim: _Claim, tracker: Tracker
+) -> str | AttemptError | None:
+    """None when this attempt may write now; else a failure code, `_LEASE_LOST`,
+    or an `AttemptError` that defers the attempt.
 
     Locks the delivery row, so in the caller's transaction neither the
     deadline sweep nor another attempt can settle it underneath.
@@ -761,7 +1033,9 @@ async def _verdict(session: AsyncSession, claim: _Claim, tracker: Tracker) -> st
         result_kind=claim.result_kind,
         proposal=None,
     )
-    return None if refusal is None else refusal.value
+    if refusal is None or isinstance(refusal, AttemptError):
+        return refusal
+    return refusal.value
 
 
 async def _fail_in(session: AsyncSession, claim: _Claim, code: str) -> bool:
@@ -787,6 +1061,8 @@ async def _fail_in(session: AsyncSession, claim: _Claim, code: str) -> bool:
             FactoryTrackerResultArtifact.delivery_id == claim.delivery_id
         )
     )
+    # The status comment renders the failed ending on its next sync.
+    await on_tracker_result_settled(session, claim.execution_request_id)
     return True
 
 
@@ -832,19 +1108,24 @@ async def _gate(
     sessionmaker: async_sessionmaker[AsyncSession],
     claim: _Claim,
     tracker: Tracker,
+    settings: Settings,
     *,
     mark_create: bool = False,
 ) -> DeliveryOutcome | None:
     """Recheck the deadline and every fence immediately before a tracker write.
 
     None lets the write go ahead. Otherwise the attempt has ended: failed with
-    the code, or nothing recorded when the row is no longer this attempt's.
-    ``mark_create`` also sets ``create_attempted_at`` in the same committed
-    transaction, before any create request is sent.
+    the code, deferred (owed, backed off) on an `AttemptError`, or nothing
+    recorded when the row is no longer this attempt's. ``mark_create`` also
+    sets ``create_attempted_at`` in the same committed transaction, before any
+    create request is sent.
     """
 
     async with sessionmaker() as session:
         verdict = await _verdict(session, claim, tracker)
+        if isinstance(verdict, AttemptError):
+            await session.rollback()
+            return await _record_error(sessionmaker, claim, verdict, settings)
         if verdict is None:
             if mark_create:
                 await session.execute(
@@ -959,23 +1240,39 @@ async def _record_output(
     return None
 
 
+def _comment_url(tracker: Tracker, source: TrackerIssueRef, comment_id: str) -> str | None:
+    """The marked result comment's web link, with no request; None when the
+    tracker cannot name the source."""
+
+    try:
+        return f"{tracker.issue_url(source)}{comment_prefix(tracker.kind)}{comment_id}"
+    except NotFound:
+        return None
+
+
 async def _settle_delivered(
     sessionmaker: async_sessionmaker[AsyncSession],
     claim: _Claim,
-    proposal: ResultProposal,
+    proposal: ResultProposal | PlatformFindings,
     *,
     tracker: Tracker,
+    settings: Settings,
+    source: TrackerIssueRef,
     comment_id: str,
     linked: LinkedIssue | None,
 ) -> DeliveryOutcome:
     """Receipt, ``delivered`` and artifact deletion in one transaction under the lease.
 
     The same transaction first rechecks the deadline and every fence on the
-    locked row (`_verdict`); a failure settles failed instead, never delivered.
+    locked row (`_verdict`); a failure settles failed instead, never delivered,
+    and a deferral leaves the delivery owed.
     """
 
     async with sessionmaker() as session:
         verdict = await _verdict(session, claim, tracker)
+        if isinstance(verdict, AttemptError):
+            await session.rollback()
+            return await _record_error(sessionmaker, claim, verdict, settings)
         if verdict is not None:
             return await _close(session, claim, verdict)
         await session.execute(
@@ -1007,6 +1304,7 @@ async def _settle_delivered(
                 proposal_sha256=claim.proposal_sha256,
                 revision=revision,
                 result_comment_id=comment_id,
+                result_comment_url=_comment_url(tracker, source, comment_id),
                 output_tracker_kind=output.kind if output else None,
                 output_tracker_host=output.host if output else None,
                 output_scope_id=output.scope_id if output else None,
@@ -1021,6 +1319,8 @@ async def _settle_delivered(
                 FactoryTrackerResultArtifact.delivery_id == claim.delivery_id
             )
         )
+        # The status comment renders the delivered ending on its next sync.
+        await on_tracker_result_settled(session, claim.execution_request_id)
         await session.commit()
     logger.info(
         "tracker result delivered delivery=%s request=%s kind=%s attempts=%d",
@@ -1040,9 +1340,33 @@ async def _settle_delivered(
 
 @dataclass(frozen=True)
 class _Sealed:
-    proposal: ResultProposal
+    proposal: ResultProposal | PlatformFindings
     source: TrackerIssueRef
     output_identity: str
+    # The grant's digest of the source title and body; None on a grant minted
+    # without one, which never delivers.
+    source_content_sha256: str | None
+
+
+def _sealed_sha256(model: BaseModel) -> str:
+    """`proposal_sha256` for any sealed shape, platform findings included."""
+
+    content = model.model_dump(mode="json", exclude_none=True)
+    return hashlib.sha256(canonical_json(content)).hexdigest()
+
+
+def _reload(origin: str, content: object) -> ResultProposal | PlatformFindings | None:
+    """The sealed artifact as its origin's model, or None when it is not one."""
+
+    if origin == DeliveryOrigin.PLATFORM:
+        try:
+            return PlatformFindings.model_validate(content)
+        except ValidationError:
+            return None
+    try:
+        return parse_proposal(content)
+    except ProposalInvalid:
+        return None
 
 
 async def _load_sealed(
@@ -1063,6 +1387,7 @@ async def _load_sealed(
             return RefusalReason.GRANT_NOT_FOUND.value
         source = facts.work_item.tracker_issue
         output_identity = facts.grant.output_identity
+        content_sha256 = facts.grant.source_content_sha256
         content: object = None
         try:
             content = await session.scalar(
@@ -1078,13 +1403,69 @@ async def _load_sealed(
         raise TrackerResultStorageError("artifact_read_failed")
     if content is None:
         return RefusalReason.PROPOSAL_CONFLICT.value
+    proposal = _reload(claim.origin, content)
+    if (
+        proposal is None
+        or _sealed_sha256(proposal) != claim.proposal_sha256
+        or proposal.kind != claim.result_kind
+    ):
+        return RefusalReason.PROPOSAL_CONFLICT.value
+    return _Sealed(
+        proposal=proposal,
+        source=source,
+        output_identity=output_identity,
+        source_content_sha256=content_sha256,
+    )
+
+
+async def _source_check(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    claim: _Claim,
+    tracker: Tracker,
+    sealed: _Sealed,
+    settings: Settings,
+    *,
+    labels: bool = False,
+) -> tuple[str, ...] | DeliveryOutcome:
+    """Read the source issue before a tracker write and compare its content.
+
+    Runs the deadline and fence recheck (`_gate`) before the read. The
+    source's ``base:`` labels when ``labels`` (else none); a
+    `DeliveryOutcome` when the attempt has ended: failed by a fence or
+    ``source_fingerprint_changed`` on a changed or unrecorded content digest,
+    or owed with the read's error. Fails closed: nothing but an equal digest
+    lets the write go ahead.
+    """
+
+    # Imported here: the runtime module imports this one.
+    from curie_api.factory_tracker_result_runtime import source_content_sha256
+
+    # The fences first: a grant naming another request or scope fails the
+    # delivery as it always has, before its (then foreign) source is read.
+    stopped = await _gate(sessionmaker, claim, tracker, settings)
+    if stopped is not None:
+        return stopped
+    error: AttemptError
     try:
-        proposal = parse_proposal(content)
-    except ProposalInvalid:
-        return RefusalReason.PROPOSAL_CONFLICT.value
-    if proposal_sha256(proposal) != claim.proposal_sha256 or proposal.kind != claim.result_kind:
-        return RefusalReason.PROPOSAL_CONFLICT.value
-    return _Sealed(proposal=proposal, source=source, output_identity=output_identity)
+        async with asyncio.timeout(SOURCE_READ_TIMEOUT_SECONDS):
+            content = await tracker.read_source_content(sealed.source)
+            names = (await tracker.ticket_labels(sealed.source)).labels if labels else frozenset()
+    except Unsupported:
+        return await _settle_failed(sessionmaker, claim, RefusalReason.OPERATION_UNSUPPORTED.value)
+    except NotFound:
+        error = AttemptError.TRACKER_NOT_FOUND
+    except Unauthorized:
+        error = AttemptError.TRACKER_UNAUTHORIZED
+    except (Unavailable, TimeoutError):
+        error = AttemptError.TRACKER_UNAVAILABLE
+    else:
+        recorded = sealed.source_content_sha256
+        if recorded is None or source_content_sha256(content) != recorded:
+            return await _settle_failed(
+                sessionmaker, claim, RefusalReason.SOURCE_FINGERPRINT_CHANGED.value
+            )
+        return tuple(sorted(name for name in names if name.startswith(BASE_LABEL_PREFIX)))
+    return await _record_error(sessionmaker, claim, error, settings)
 
 
 async def _linked_issue(
@@ -1109,7 +1490,10 @@ async def _linked_issue(
 
     reconcile_only = claim.recorded is None and claim.create_attempted
     first_create = claim.recorded is None and not claim.create_attempted
-    stopped = await _gate(sessionmaker, claim, tracker, mark_create=first_create)
+    base_labels = await _source_check(sessionmaker, claim, tracker, sealed, settings, labels=True)
+    if isinstance(base_labels, DeliveryOutcome):
+        return base_labels
+    stopped = await _gate(sessionmaker, claim, tracker, settings, mark_create=first_create)
     if stopped is not None:
         return stopped
     error: AttemptError
@@ -1121,8 +1505,9 @@ async def _linked_issue(
             output_identity=sealed.output_identity,
             title=_publishable(proposal.title),
             body=_publishable(proposal.body),
-            # The implementation label is the handoff's to apply (#5588).
-            labels=(),
+            # The source's base labels only (ADR 0277 decision 13). No trigger
+            # label: the implementation label is the handoff's to apply (#5588).
+            labels=base_labels,
             expected=claim.recorded,
             reconcile_only=reconcile_only,
         )
@@ -1196,7 +1581,10 @@ async def deliver(
             rendered = _ticket_comment(proposal, linked.url)
         else:
             rendered = _findings_comment(proposal)
-        stopped = await _gate(sessionmaker, claim, tracker)
+        checked = await _source_check(sessionmaker, claim, tracker, sealed, settings)
+        if isinstance(checked, DeliveryOutcome):
+            return checked
+        stopped = await _gate(sessionmaker, claim, tracker, settings)
         if stopped is not None:
             return stopped
         upserted = await tracker.marked_comments.upsert_marked(target, marker, rendered)
@@ -1218,7 +1606,14 @@ async def deliver(
     ):
         return await _record_error(sessionmaker, claim, AttemptError.READBACK_MISMATCH, settings)
     return await _settle_delivered(
-        sessionmaker, claim, proposal, tracker=tracker, comment_id=found.id, linked=linked
+        sessionmaker,
+        claim,
+        proposal,
+        tracker=tracker,
+        settings=settings,
+        source=sealed.source,
+        comment_id=found.id,
+        linked=linked,
     )
 
 
@@ -1231,8 +1626,8 @@ async def expire_overdue(sessionmaker: async_sessionmaker[AsyncSession], *, limi
     Each becomes failed ``delivery_deadline_exceeded`` and loses its artifact
     in the same transaction. An attempt still running on such a row then
     finds it settled and records nothing. Rows an attempt has locked for its
-    final recheck are skipped until the next sweep. Not scheduled by anything
-    in #5585.
+    final recheck are skipped until the next sweep. The WorkItem reconciler
+    runs it every pass (#5586).
     """
 
     delivery = FactoryTrackerResultDelivery
@@ -1248,9 +1643,9 @@ async def expire_overdue(sessionmaker: async_sessionmaker[AsyncSession], *, limi
             .with_for_update(skip_locked=True)
             .scalar_subquery()
         )
-        expired = list(
+        settled_rows = list(
             (
-                await session.scalars(
+                await session.execute(
                     update(delivery)
                     .where(delivery.id.in_(due))
                     .values(
@@ -1260,17 +1655,20 @@ async def expire_overdue(sessionmaker: async_sessionmaker[AsyncSession], *, limi
                         attempt_owner=None,
                         attempt_lease_expires_at=None,
                     )
-                    .returning(delivery.id)
+                    .returning(delivery.id, delivery.execution_request_id)
                     .execution_options(synchronize_session=False)
                 )
             ).all()
         )
+        expired = [row.id for row in settled_rows]
         if expired:
             await session.execute(
                 delete(FactoryTrackerResultArtifact).where(
                     FactoryTrackerResultArtifact.delivery_id.in_(expired)
                 )
             )
+        for row in settled_rows:
+            await on_tracker_result_settled(session, row.execution_request_id)
         await session.commit()
     for delivery_id in expired:
         logger.info(

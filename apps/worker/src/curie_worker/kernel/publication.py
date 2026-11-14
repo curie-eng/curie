@@ -104,6 +104,11 @@ async def _bind_publication_context(
     )
     if handle.workspace_repo is None or not (factory_execute or factory_resume):
         return event, remaining_s
+    if run is not None and run.event_id == queued_event_id and run.is_tracker_result:
+        # ADR 0277 (#5586): a tracker_result run publishes nothing, so it gets
+        # no publication authority and the API is not asked for any. A publish
+        # request it raises anyway is refused in the worker (lifecycle).
+        return event, remaining_s
     if (
         workspace_deployment_id is None
         or run is None
@@ -192,6 +197,10 @@ async def _continue_unpublished(
         return outcome
     run = self._work_item_runs.get(parsed.request_id)
     if run is None or run.event_id != qevent.event_id or not run.started or run.finished:
+        return outcome
+    if run.is_tracker_result:
+        # ADR 0277 (#5586): one model session. An investigation that ended
+        # without publishing is not re-prompted; it was never meant to publish.
         return outcome
     if (
         not outcome.terminal_ok

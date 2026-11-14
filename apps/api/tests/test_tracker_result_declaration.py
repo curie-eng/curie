@@ -4,7 +4,7 @@ Pure unit tests: no database, no object store. The parser runs against the
 shared vector file, and every expected digest is checked twice, once against
 the parser and once against an independent derivation, so a parser that
 hashed a non-canonical form fails here. The ``validate_archive`` tests at the
-end prove the ingestion refusal and its ordering without a database; the
+end prove what ingestion returns and its ordering without a database; the
 REST and git-flow paths that need Postgres live in ``test_bundles.py`` and
 ``test_gitflow_integration.py``.
 """
@@ -372,22 +372,30 @@ def _zip(files: dict[str, str]) -> bytes:
 
 
 @pytest.mark.parametrize("pack", [_tar_gz, _zip], ids=["wrapped_tar_gz", "flat_zip"])
-def test_validate_archive_refuses_a_valid_declaration(pack: Any) -> None:
+def test_validate_archive_returns_a_valid_declaration(pack: Any) -> None:
+    # #5586 removed the stage 1 refusal: a valid declaration is returned with
+    # its digest, and the agent-dependent refusals happen at deploy time.
     case = _valid("ticket_and_findings")
 
-    with pytest.raises(deploy.TrackerResultNotEnabled) as raised:
-        deploy.validate_archive(pack(_files(case["text"])), get_settings())
+    extension, _, declaration = deploy.validate_archive(pack(_files(case["text"])), get_settings())
 
-    assert raised.value.code == "tracker_result_not_enabled"
-    assert raised.value.digest == case["digest"]
-    assert raised.value.schema_version == 1
+    assert extension in {".tar.gz", ".zip"}
+    assert declaration is not None
+    assert declaration.digest == case["digest"]
+    assert declaration.schema_version == 1
+    assert deploy.result_policy(declaration) == {
+        "results": ["findings", "ticket"],
+        "implementation_label": declaration.implementation_label,
+    }
+    assert not hasattr(deploy, "TrackerResultNotEnabled")
 
 
 @pytest.mark.parametrize("pack", [_tar_gz, _zip], ids=["wrapped_tar_gz", "flat_zip"])
 def test_validate_archive_accepts_the_same_bundle_without_the_file(pack: Any) -> None:
-    extension, _ = deploy.validate_archive(pack(_files(None)), get_settings())
+    extension, _, declaration = deploy.validate_archive(pack(_files(None)), get_settings())
 
     assert extension in {".tar.gz", ".zip"}
+    assert declaration is None
 
 
 def test_a_lone_surrogate_label_is_a_validation_error_not_an_encode_error() -> None:

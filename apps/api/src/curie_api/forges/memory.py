@@ -71,6 +71,7 @@ from curie_api.forges.types import (
     RerunOutcome,
     RerunRecord,
     ReviewFeedback,
+    SourceContent,
     StoredEvidence,
     TicketLabels,
     TrackerComment,
@@ -483,6 +484,11 @@ class InMemoryTracker(_Declared):
 
         self._issue(issue).body = body
 
+    def edit_issue_title(self, issue: TrackerIssueRef, title: str) -> None:
+        """A person edits the issue's title. Not a port write: no ledger entry."""
+
+        self._issue(issue).title = title
+
     def hide_from_listing(self, issue: TrackerIssueRef) -> None:
         """Listing lag: ``issue`` is absent from the creator listing
         `create_linked_issue` reads, yet still readable directly, so an
@@ -650,6 +656,11 @@ class InMemoryTracker(_Declared):
         self._gate(Operation.READ_TICKET)
         found = self._issue(issue)
         return f"# {found.title}\n\n{found.body}"
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        self._gate(Operation.READ_TICKET)
+        found = self._issue(issue)
+        return SourceContent(title=found.title, body=found.body)
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         self._gate(Operation.TICKET_LABELS)

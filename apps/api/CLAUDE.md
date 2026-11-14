@@ -91,7 +91,20 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   (`Tracker.read_ticket`; a GitHub issue with an App installation token
   freshly minted only for the recorded installation) and returns it as
   markdown with its link. It stores nothing.
-  State and other scoped credentials do not authorize it, and `wir`
+  The same capability authorizes exactly two sibling routes (ADR 0277,
+  #5586), each repeating the issue check before and after any tracker call.
+  `POST /work-items/completion-contract` answers the execution's completion
+  contract; for a `tracker_result` request the first call reads the source
+  issue's title and body, mints the request's one grant
+  (`factory_tracker_result_grants`) and reserves its one model session
+  (`execution_requests.model_session_reserved_at`), and every later call is
+  409 `session_already_started`. `POST /work-items/tracker-result` seals the
+  request's one result under that grant's fences
+  (`factory_tracker_result_delivery`) and attempts its delivery once; it
+  refuses an implementation request (`not_tracker_result`), a second result
+  (`result_already_submitted`) and a source whose title or body changed
+  (`source_fingerprint_changed`), writing nothing.
+  State and other scoped credentials do not authorize these routes, and `wir`
   authorizes no other route.
 - **Channel read is a scoped credential exception (ADR 0100, #2877).**
   `POST /channel-read` accepts only the API issued `chr` capability in

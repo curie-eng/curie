@@ -37,6 +37,7 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
+from curie_internal.factory_triage import TRIAGED_LABEL, HandoffOutcome, status_comment_text
 from sqlalchemy import and_, case, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -47,6 +48,13 @@ from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment, status_marker
 from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
 from .factory_reply_target import stored_reply_target
+from .factory_triage_status import (
+    delivered_triage,
+    is_tracker_result,
+    triage_delivered_sql,
+    triage_label,
+    triage_label_sql,
+)
 from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
 from .forges.errors import ForgeError, NotFound, Unauthorized
@@ -195,6 +203,16 @@ _CAUSE_TEXT = {
     "pr_closed": "a person closed the pull request without merging it during the CI wait.",
     "ci_fix_unpublished": (
         "a CI fix round ended without pushing a fix. The pull request stays open."
+    ),
+    # Tracker-result (triage) runs (#5586).
+    "tracker_result": "the investigation delivered its triage result to the issue.",
+    "no_tracker_result": (
+        "the investigation ended without submitting a result, so nothing was delivered "
+        "to the issue."
+    ),
+    "tracker_result_undelivered": (
+        "the investigation submitted a result, but it was not delivered to the issue "
+        "before the run ended. Curie keeps trying until the delivery deadline."
     ),
 }
 
@@ -365,14 +383,15 @@ async def mark_lineage_status_comment_stale(session: AsyncSession, lineage_id: u
         await mark_status_comment_stale(session, work_item_id)
 
 
-# The four state labels the pass owns (#3077, #3221). A closed set, never a
-# prefix match: human labels, including other ``curie:`` labels, are never
-# touched.
+# The state labels the pass owns (#3077, #3221; triaged since #5586). A closed
+# set, never a prefix match: human labels, including other ``curie:`` labels,
+# are never touched.
 STATE_LABELS = (
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
+    TRIAGED_LABEL,
 )
 LEGACY_STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
 _DESIRED_LABEL = {
@@ -383,7 +402,7 @@ _DESIRED_LABEL = {
     "completed": "curie-factory:pr-open",
     "failed": "curie-factory:needs-human",
     "expired": "curie-factory:needs-human",
-    # Cancelled clears the current four and the legacy four; '' records that nothing is applied.
+    # Cancelled clears the current labels and the legacy four; '' records that nothing is applied.
     "cancelled": "",
 }
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
@@ -396,9 +415,27 @@ _PAUSED_FOR_UPGRADE_LINE = (
 )
 
 
-def desired_label(status: str, *, pr_state: str | None = None) -> str:
-    """The state label for a request status; '' means none of the four."""
+def desired_label(
+    status: str,
+    *,
+    pr_state: str | None = None,
+    tracker_result: bool = False,
+    result_delivered: bool = False,
+    work_item_cancelled: bool = False,
+) -> str:
+    """The state label for a request status; '' means none of the state labels.
 
+    A tracker-result request shows triaged once its result is delivered and
+    never pr-open (``factory_triage_status.triage_label``); an implementation
+    request's mapping is unchanged.
+    """
+
+    if tracker_result:
+        label = triage_label(
+            status, delivered=result_delivered, work_item_cancelled=work_item_cancelled
+        )
+        if label is not None:
+            return label
     if status in {"failed", "expired"} and pr_state == "merged":
         return ""
     return _DESIRED_LABEL.get(status, "")
@@ -675,6 +712,7 @@ def completed_proof() -> Any:
 
 def _desired_label_sql() -> Any:
     return case(
+        *triage_label_sql(),
         (
             and_(
                 ExecutionRequest.status.in_(("failed", "expired")),
@@ -782,6 +820,9 @@ class _StatusClaim:
     body: str
     latest: bool
     now: datetime
+    tracker_result: bool = False
+    result_delivered: bool = False
+    work_item_cancelled: bool = False
 
 
 async def _claim_next(
@@ -821,6 +862,7 @@ async def _claim_next(
                 ThreadPublicationLineage.pr_number,
                 ThreadPublicationLineage.status,
                 is_latest.label("is_latest"),
+                triage_delivered_sql().label("result_delivered"),
                 _desired_label_sql().label("desired_label"),
             )
             .join(WorkItem, WorkItem.id == FactoryStatusComment.work_item_id)
@@ -852,7 +894,7 @@ async def _claim_next(
     ).one_or_none()
     if selected is None:
         return None
-    row, work_item, request, pr_url, pr_number, pr_state, latest, label = selected
+    row, work_item, request, pr_url, pr_number, pr_state, latest, result_delivered, label = selected
     if pr_number is None or not pr_url:
         pr_state = None
     if pr_state == "merged" and request.status in {"failed", "expired"}:
@@ -912,6 +954,9 @@ async def _claim_next(
         body=body,
         latest=bool(latest),
         now=now,
+        tracker_result=is_tracker_result(request),
+        result_delivered=bool(result_delivered),
+        work_item_cancelled=work_item.cancelled_at is not None,
     )
     session.expunge(row)
     return claim
@@ -1197,11 +1242,18 @@ async def _render(
     pr_url: str | None,
     pr_state: str | None = None,
     paused_for_upgrade: bool = False,
+    handoff: HandoffOutcome | None = None,
 ) -> str:
+    """The status comment body. ``handoff`` is the implementation handoff of a
+    delivered ticket, which #5588 records; until then only tests pass one."""
+
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
     retrying = False
-    if request.terminal_at is not None and cause:
+    triage = await _terminal_triage_text(session, work_item, request, handoff)
+    if triage is not None:
+        result = triage
+    elif request.terminal_at is not None and cause:
         cause = cause.strip()
         if cause == "pull_request_not_adopted":
             selected_pr = (
@@ -1403,6 +1455,39 @@ async def _render(
     return body
 
 
+async def _terminal_triage_text(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    handoff: HandoffOutcome | None,
+) -> str | None:
+    """A finished tracker-result request's delivered ending, or None.
+
+    None leaves the existing terminal text: a request still live, cancelled,
+    an implementation request, or one whose result was not delivered (it
+    renders as failed or expired).
+    """
+
+    if (
+        request.terminal_at is None
+        or request.status == "cancelled"
+        or not is_tracker_result(request)
+    ):
+        return None
+    delivered = await delivered_triage(session, request.id)
+    if delivered is None:
+        return None
+    try:
+        text = status_comment_text(delivered, handoff)
+    except ValueError:
+        logger.warning("factory status comment: request %s has an unrenderable result", request.id)
+        return None
+    line = usage_line(await work_item_usage(session, work_item.id))
+    if line is not None:
+        text += line + "\n"
+    return text
+
+
 async def _superseded(
     session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
 ) -> bool:
@@ -1424,7 +1509,7 @@ async def _superseded(
 async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     """Add the desired state label and remove the others, on the issue.
 
-    Only the four state labels are ever written. Legacy deletes stay
+    Only the state labels are ever written. Legacy deletes stay
     unconditional: a new request starts with applied_label NULL, and the issue
     may still carry a legacy name. A refused write is logged and given up; any
     other failure is retried next pass.
@@ -1433,7 +1518,13 @@ async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     row = claim.row
     if row.applied_label == "":
         return 0
-    desired = desired_label(claim.status, pr_state=claim.pr_state)
+    desired = desired_label(
+        claim.status,
+        pr_state=claim.pr_state,
+        tracker_result=claim.tracker_result,
+        result_delivered=claim.result_delivered,
+        work_item_cancelled=claim.work_item_cancelled,
+    )
     if row.applied_label == desired:
         return 0
     issue = claim.tracker_issue

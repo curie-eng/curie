@@ -74,6 +74,7 @@ from curie_api.forges.types import (
     NoticePage,
     PullRequest,
     RepositoryRef,
+    SourceContent,
     TicketLabels,
     TrackerComment,
     TrackerIssueRef,
@@ -665,6 +666,21 @@ class GitHubTracker:
         if content.comments_truncated:
             parts.append("_Later comments were not read._")
         return "\n\n".join(parts) + "\n"
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's title and body from one issue read, never its comments.
+
+        https://docs.github.com/en/rest/issues/issues#get-an-issue
+        An empty body reads back as null and is the empty text.
+        """
+
+        found = await self._issue(self._number(issue))
+        if found is None:
+            raise NotFound("issue")
+        title = found.get("title")
+        if not isinstance(title, str):
+            raise Unavailable("issue")
+        return SourceContent(title=title, body=_text(found.get("body")))
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         """The issue's labels from one issue read; GitHub has no components."""

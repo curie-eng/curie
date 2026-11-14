@@ -1433,12 +1433,14 @@ def test_dev_push_of_a_bundle_with_a_result_declaration_is_rejected_until_remove
     clean_db: None,
     trusted_clone_base: Path,
 ) -> None:
-    """A valid tracker result declaration refuses the push (ADR 0277, #5585).
+    """A declaration the agent cannot run refuses the push (ADR 0277, #5586).
 
-    The refusal fires at the clone path's `validate_archive`, before any
-    version row, so the agent keeps no version, deployment or WorkItem. A
-    second commit on the same branch that only deletes `workflow/result.json`
-    then deploys, which proves the refusal is the declaration and nothing else.
+    The agent's publication policy is the default `approve`, so the clone
+    path refuses `tracker_result_needs_unattended_publication` once the target
+    agent is known and before any version row, so the agent keeps no version,
+    deployment or WorkItem. A second commit on the same branch that only
+    deletes `workflow/result.json` then deploys, which proves the refusal is
+    the declaration and nothing else.
     """
 
     agent_id = _register_agent(client, auth_headers)
@@ -1455,7 +1457,9 @@ def test_dev_push_of_a_bundle_with_a_result_declaration_is_rejected_until_remove
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["status"] == "rejected", body
-    assert [error["code"] for error in body["errors"]] == ["tracker_result_not_enabled"]
+    assert [error["code"] for error in body["errors"]] == [
+        "tracker_result_needs_unattended_publication"
+    ]
     assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
     assert (
         client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json()
@@ -1491,6 +1495,61 @@ def test_dev_push_of_a_bundle_with_a_result_declaration_is_rejected_until_remove
         "/deployments", params={"agent_id": agent_id}, headers=auth_headers
     ).json()
     assert len(deployments) == 1
+
+
+def test_dev_push_of_a_declared_bundle_under_auto_publication_records_its_policy(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """The clone path stores the policy the cloned bytes declare (#5586).
+
+    The same version row the upload route would write: the declaration's
+    schema version, its canonical digest and its sorted kinds and label.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    patched = client.patch(
+        f"/agents/{agent_id}", json={"publication_policy": "auto"}, headers=auth_headers
+    )
+    assert patched.status_code == 200, patched.text
+    declaration = '{"schema_version": 1, "contract": "tracker_result", "results": ["findings"]}'
+    clone_url, sha = _build_bare_repo(
+        trusted_clone_base, REPO, {**VALID_FILES, "workflow/result.json": declaration}
+    )
+
+    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "deployed", resp.json()
+    (version,) = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
+
+    async def _policy() -> dict[str, Any]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            "SELECT result_policy_schema_version, result_policy_digest, "
+                            "result_policy FROM curie.agent_versions WHERE id = :id"
+                        ),
+                        {"id": uuid.UUID(version["id"])},
+                    )
+                ).one()
+        finally:
+            await engine.dispose()
+        return dict(row._mapping)
+
+    digest = hashlib.sha256(
+        json.dumps(json.loads(declaration), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert asyncio.run(_policy()) == {
+        "result_policy_schema_version": 1,
+        "result_policy_digest": digest,
+        "result_policy": {"results": ["findings"], "implementation_label": None},
+    }
 
 
 def test_signed_push_with_a_foreign_clone_url_is_rejected(
@@ -3610,7 +3669,8 @@ def test_a_sibling_promote_of_a_stored_result_declaration_is_refused_before_any_
     """The sibling object is refused before the prod agent gets a version row.
 
     The dev agent's stored object is repointed at bytes that carry a valid
-    `workflow/result.json`, as a bundle stored before intake refused it would.
+    `workflow/result.json` the prod agent cannot run under its approval
+    publication policy.
     The main push resolves to the prod agent, which has no version for this
     sha, so it takes the bundle-once/bind-many branch and reads that object.
     """
@@ -3628,7 +3688,10 @@ def test_a_sibling_promote_of_a_stored_result_declaration_is_refused_before_any_
 
     assert prod["status"] == "rejected", prod
     assert prod["agent_id"] == prod_id, prod
-    assert [e["code"] for e in prod["errors"]] == ["tracker_result_not_enabled"], prod
+    # The prod agent's publication policy is the default `approve` (#5586).
+    assert [e["code"] for e in prod["errors"]] == [
+        "tracker_result_needs_unattended_publication"
+    ], prod
     _assert_prod_untouched(client, auth_headers, prod_id)
 
 

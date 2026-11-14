@@ -481,6 +481,8 @@ def test_two_install_databases_touch_only_their_label(
     import dataclasses
     import uuid
 
+    from _migration_support import alembic_config
+    from alembic import command
     from curie_api.config import get_settings
     from curie_api.models import Agent, AgentChannel
     from forge_fakes.github import REPO
@@ -489,6 +491,8 @@ def test_two_install_databases_touch_only_their_label(
 
     world = facts_world
     isolated_migration_db.at("0164")
+    # The exchange selects columns added after 0164. Reach head before it reads.
+    command.upgrade(alembic_config(), "head")
     other_engine = create_async_engine(get_settings().database_url, poolclass=NullPool)
     other_sessions = async_sessionmaker(other_engine, expire_on_commit=False)
     other_id = uuid.uuid4()

@@ -42,6 +42,7 @@ from .github_app import credentials_for
 from .models import GIT_FLOW_CREATED_BY, Agent, AgentVersion, Environment
 from .repo_full_name import InvalidRepoFullName, repo_url_path
 from .storage import ObjectStore
+from .tracker_result_declaration import ResultDeclaration
 
 logger = logging.getLogger(__name__)
 
@@ -411,7 +412,7 @@ def _rejected(
         deploy.ApprovalRoutesUnbound
         | deploy.BundleTooLarge
         | deploy.SealingKeyCustody
-        | deploy.TrackerResultNotEnabled
+        | deploy.TrackerResultRefused
         | approver_tickets.BundleGateMismatch
     ),
     agent_id: uuid.UUID | None = None,
@@ -428,9 +429,10 @@ def _rejected(
     there first. The message is the exception's own, identical to the one the
     API returns as a 422 detail. `approver_ticket.bundle_gate_mismatch` (ADR
     0271 decision 2) rides on the same three route gates.
-    `tracker_result_not_enabled` (#5585) fires at the clone path's
-    `validate_archive`, before any version row exists, and at the two stored
-    object checks (`check_stored_bundle_intake`).
+    The three tracker result refusals (`deploy.TrackerResultRefused`, #5586)
+    fire once the target agent is known: on the build path before any version
+    row of this agent exists, judged against the declaration of the object
+    being attached, and on the reuse path against the stored object's own.
     """
 
     return WebhookResult(
@@ -501,6 +503,9 @@ async def process_push(
     # came from the store (see the `assert` in the bundle_built block below).
     extension: str | None = None
     content_type: str | None = None
+    # The cloned archive's tracker result declaration (clone path only), read
+    # by the same `validate_archive` call that supplies the pair above.
+    declaration: ResultDeclaration | None = None
 
     try:
         # Unconditionally, before any database or object-store work: a forged
@@ -608,7 +613,7 @@ async def process_push(
                 repo_full_name=trusted_repo_full_name,
                 ref=ref,
             )
-            extension, content_type = await run_in_threadpool(
+            extension, content_type, declaration = await run_in_threadpool(
                 deploy.validate_archive, archive, settings
             )
             targets = await run_in_threadpool(_read_targets, archive, settings)
@@ -640,8 +645,6 @@ async def process_push(
         return _rejected(exc)
     except deploy.BundleInvalid as exc:
         return WebhookResult(status="rejected", errors=exc.errors)
-    except deploy.TrackerResultNotEnabled as exc:
-        return _rejected(exc)
 
     named = target_agent_name(targets, environment)
     named_elsewhere = (
@@ -683,25 +686,30 @@ async def process_push(
         if sibling is not None:
             # @spec ACTION-EXECUTOR-16: the sibling object is stored bytes too,
             # so it gets the intake re-check upload would give: sealing key
-            # custody and the tracker result refusal (#5585). It runs before
-            # the version row below and before the route join, so a refused
-            # object leaves no row for this agent, and a malformed declaration
-            # reports its own validation codes rather than a route error the
-            # join would raise first. Its extract is also this object's bounds
+            # custody and the tracker result declaration, read from the
+            # sibling object itself because that is what this version will
+            # point at (#5586). It runs before the version row below and
+            # before the route join, so a refused object leaves no row for
+            # this agent, and a malformed declaration reports its own
+            # validation codes rather than a route error the join would raise
+            # first. Its extract is also this object's bounds
             # check: nothing revalidates it later, because `bundle_built` is
             # true and the `revalidate_stored_bundle` block below is skipped,
             # so an over-cap legacy sibling is refused here as
             # `bundle.too_large` (ADR-0059 decision 3).
             try:
-                await deploy.check_stored_bundle_intake(store, sibling, settings)
+                declaration = await deploy.check_stored_bundle_intake(store, sibling, settings)
             except deploy.BundleInvalid as exc:
                 return WebhookResult(status="rejected", agent_id=agent.id, errors=exc.errors)
-            except (
-                deploy.BundleTooLarge,
-                deploy.SealingKeyCustody,
-                deploy.TrackerResultNotEnabled,
-            ) as exc:
+            except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
                 return _rejected(exc, agent.id)
+        # The tracker result refusals for the object this delivery attaches,
+        # judged against the resolved agent before any row of its own exists
+        # (#5586), so a refused push leaves no version behind.
+        try:
+            await deploy.check_tracker_result_admissible(session, agent, declaration, settings)
+        except deploy.TrackerResultRefused as exc:
+            return _rejected(exc, agent.id)
         if version is None:
             # The row, and only the row, precedes the refusal below: it is the
             # BUNDLE that must not be written yet (#2436). A bundleless row is
@@ -764,6 +772,7 @@ async def process_push(
                 # to this object, so `bundle.too_large` here would mean the
                 # caps moved mid-delivery; it keeps the same envelope.
                 return _rejected(exc, agent.id)
+            deploy.apply_result_policy(version, declaration)
             version = await crud_versions.attach_bundle(
                 session, version, str(sibling.bundle_ref), str(sibling.bundle_sha256)
             )
@@ -782,7 +791,14 @@ async def process_push(
             except (deploy.ApprovalRoutesUnbound, approver_tickets.BundleGateMismatch) as exc:
                 return _rejected(exc, agent.id)
             await deploy.store_bundle(
-                store, session, agent.id, version, archive, extension, content_type
+                store,
+                session,
+                agent.id,
+                version,
+                archive,
+                extension,
+                content_type,
+                declaration=declaration,
             )
 
     # Either the version pre-existed with a bundle, or the block above created
@@ -809,17 +825,23 @@ async def process_push(
             await deploy.revalidate_stored_bundle(store, version, settings)
             # @spec ACTION-EXECUTOR-16: a reused bundle stored before intake
             # refused a non-SecretRef sealing key declaration is refused here,
-            # as `POST /deployments` refuses it. So is one that carries a
-            # tracker result declaration (#5585).
-            await deploy.check_stored_bundle_intake(store, version, settings)
+            # as `POST /deployments` refuses it. Its tracker result
+            # declaration is read from the stored object, judged against the
+            # resolved agent, and recorded on the version with the
+            # deployment's commit (#5586).
+            stored_declaration = await deploy.check_stored_bundle_intake(store, version, settings)
+            await deploy.check_tracker_result_admissible(
+                session, agent, stored_declaration, settings
+            )
         except deploy.BundleInvalid as exc:
             return WebhookResult(status="rejected", agent_id=agent.id, errors=exc.errors)
         except (
             deploy.BundleTooLarge,
             deploy.SealingKeyCustody,
-            deploy.TrackerResultNotEnabled,
+            deploy.TrackerResultRefused,
         ) as exc:
             return _rejected(exc, agent.id)
+        deploy.apply_result_policy(version, stored_declaration)
 
     # The declared/bound approval-route join at the moment the version becomes
     # the thing that boots (#2436), the push-side twin of the 422 that

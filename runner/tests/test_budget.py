@@ -294,3 +294,99 @@ def test_deduplication_resets_each_turn() -> None:
 
     anyio.run(go)
     assert fake.interrupts == 1
+
+
+def test_a_tracker_result_session_at_its_dollar_allowance_ends_budget_exceeded_once(
+    tmp_path, monkeypatch
+) -> None:
+    # #5586: a tracker result session runs under the API's dollar allowance. When
+    # the SDK reports that allowance reached, the turn ends budget-exceeded, and
+    # the runner opens no second model session for the request: a reset (or any
+    # later session the runner asks for) answers offline.
+    import json
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from claude_agent_sdk import ResultMessage as Result
+    from curie_runner import RunnerConfig
+    from curie_runner import __main__ as boot
+    from curie_runner.__main__ import build_runner
+    from curie_runner.issue_read import (
+        CAPABILITY_HEADER,
+        ISSUE_READ_TOKEN_ENV,
+        ISSUE_READ_URL_ENV,
+    )
+
+    started: list[FakeModelSession] = []
+
+    class AllowanceReached(FakeModelSession):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            started.append(self)
+
+        def _default_script(self) -> list:
+            return [
+                Result(
+                    subtype="error_max_budget_usd",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=True,
+                    num_turns=3,
+                    session_id="s",
+                    result=None,
+                )
+            ]
+
+    contract_calls: list[str | None] = []
+
+    async def contract(request: web.Request) -> web.Response:
+        contract_calls.append(request.headers.get(CAPABILITY_HEADER))
+        return web.json_response(
+            {
+                "completion_contract": "tracker_result",
+                "result_kinds": ["findings"],
+                "session_usd_allowance": 0.5,
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/work-items/completion-contract", contract)
+    monkeypatch.setattr(boot, "FakeModelSession", AllowanceReached)
+    plugin = tmp_path / ".claude-plugin"
+    plugin.mkdir()
+    (plugin / "plugin.json").write_text(json.dumps({"name": "triage"}))
+    config = RunnerConfig.from_env(
+        {
+            "CURIE_PLUGIN_DIR": str(tmp_path),
+            "CURIE_SESSION_ID": "s-triage",
+            "CURIE_SANDBOX_ID": "b-triage",
+            "CURIE_BUDGET": '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}',
+        }
+    )
+    first: list = []
+    after_reset: list = []
+
+    async def go() -> None:
+        async with TestServer(app) as server:
+            monkeypatch.setenv(ISSUE_READ_URL_ENV, str(server.make_url("/work-items/issue-read")))
+            monkeypatch.setenv(ISSUE_READ_TOKEN_ENV, "wir.example-capability.signature")
+            runner = build_runner(config, fake_model=True)
+            try:
+                await runner.start()
+                first.extend([line async for line in runner.run_turn(_event())])
+                await runner.reset()
+                after_reset.extend([line async for line in runner.run_turn(_event())])
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    events = parse_ndjson("".join(first))
+    assert any(e.type == "error" and e.classification == BUDGET_CLASSIFICATION for e in events)
+    assert events[-1].type == "final"
+    assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
+    # One model session for the request, one contract call (the reservation).
+    assert len(started) == 1
+    assert contract_calls == ["wir.example-capability.signature"]
+    later = parse_ndjson("".join(after_reset))
+    assert not any(e.type == "error" and e.classification == BUDGET_CLASSIFICATION for e in later)
+    assert len(started) == 1

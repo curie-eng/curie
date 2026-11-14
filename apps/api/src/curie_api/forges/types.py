@@ -594,6 +594,21 @@ class MarkedNotice:
 
 
 @dataclass(frozen=True)
+class SourceContent:
+    """An issue's own title and description, as the tracker stores them now
+    (ADR 0277 decision 4, #5586).
+
+    Never comments, labels or rendered markdown: a new comment, including the
+    factory's own status and result comments, leaves it unchanged. A tracker
+    whose description is structured (Jira's document format) carries its
+    canonical JSON text in ``body``.
+    """
+
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
 class TicketLabels:
     """An issue's current label names and component names (#4358 decision 4).
 

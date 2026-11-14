@@ -7,6 +7,7 @@ Postgres from the compose stack (per B2 constraints).
 import asyncio
 import hashlib
 import io
+import json
 import tarfile
 import uuid
 import zipfile
@@ -130,7 +131,8 @@ def test_a_malformed_result_declaration_is_a_validation_issue(tmp_path: Path) ->
 
 
 def test_a_valid_result_declaration_passes_extraction_validation(tmp_path: Path) -> None:
-    # Intake validation accepts it; `deploy.validate_archive` refuses it after.
+    # Intake validation accepts it; whether the agent may run it is judged at
+    # deploy time (`deploy.check_tracker_result_admissible`).
     files = _valid_files()
     files["workflow/result.json"] = RESULT_DECLARATION
     _, _, result = bundles.extract_and_validate(_zip(files), tmp_path)
@@ -352,6 +354,39 @@ def _deploy(client: Any, headers: dict[str, str], agent_id: str, version_id: str
     )
 
 
+def _set_publication_policy(client: Any, headers: dict[str, str], agent_id: str) -> None:
+    resp = client.patch(f"/agents/{agent_id}", json={"publication_policy": "auto"}, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+
+def _version_policy(version_id: str) -> dict[str, Any]:
+    async def run() -> dict[str, Any]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            "SELECT result_policy_schema_version, result_policy_digest, "
+                            "result_policy FROM curie.agent_versions WHERE id = :id"
+                        ),
+                        {"id": uuid.UUID(version_id)},
+                    )
+                ).one()
+        finally:
+            await engine.dispose()
+        return dict(row._mapping)
+
+    return asyncio.run(run())
+
+
+# The canonical digest of RESULT_DECLARATION, computed independently of the parser.
+RESULT_DECLARATION_DIGEST = hashlib.sha256(
+    json.dumps(json.loads(RESULT_DECLARATION), sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+RESULT_POLICY = {"results": ["findings", "ticket"], "implementation_label": "curie-factory"}
+
+
 def test_upload_with_a_result_declaration_is_refused_and_leaves_nothing_behind(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
@@ -362,8 +397,9 @@ def test_upload_with_a_result_declaration_is_refused_and_leaves_nothing_behind(
 
     resp = client.put(url, files={"file": ("demo.tar.gz", _tar_gz(files))}, headers=auth_headers)
 
+    # The agent's publication policy is the default `approve` (#5586).
     assert resp.status_code == 422, resp.text
-    assert resp.json()["detail"]["code"] == "tracker_result_not_enabled"
+    assert resp.json()["detail"]["code"] == "tracker_result_needs_unattended_publication"
     # The version made for this upload is gone, no object was stored, and
     # nothing was deployed or queued for the agent.
     assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
@@ -390,7 +426,7 @@ def test_a_refused_upload_onto_a_deployed_version_keeps_the_version(
     )
 
     assert resp.status_code == 422, resp.text
-    assert resp.json()["detail"]["code"] == "tracker_result_not_enabled"
+    assert resp.json()["detail"]["code"] == "tracker_result_needs_unattended_publication"
     versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
     assert [(v["id"], v["bundle_ref"]) for v in versions] == [(version_id, None)]
     assert _count_rows("deployments", agent_id) == 1
@@ -434,7 +470,7 @@ def test_upload_with_a_malformed_result_declaration_reports_validation_first(
     detail = resp.json()["detail"]
     assert detail["detail"] == "bundle failed validation"
     assert [e["code"] for e in detail["errors"]] == ["tracker_result.schema_version"]
-    assert "tracker_result_not_enabled" not in resp.text
+    assert "tracker_result_needs_unattended_publication" not in resp.text
 
 
 def test_the_refusal_cleanup_waits_for_a_concurrent_deployment_and_keeps_both(
@@ -511,9 +547,57 @@ def test_deploying_a_stored_bundle_with_a_result_declaration_is_refused(
     resp = _deploy(client, auth_headers, agent_id, version_id)
 
     assert resp.status_code == 422, resp.text
-    assert resp.json()["detail"]["code"] == "tracker_result_not_enabled"
+    assert resp.json()["detail"]["code"] == "tracker_result_needs_unattended_publication"
     assert _count_rows("deployments", agent_id) == 0
     assert _count_rows("work_items", agent_id) == 0
+    assert _version_policy(version_id)["result_policy_digest"] is None
+
+
+def test_upload_with_a_result_declaration_under_auto_publication_records_its_policy(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id, version_id = _create_version(client, auth_headers)
+    _set_publication_policy(client, auth_headers, agent_id)
+    files = _valid_files()
+    files["workflow/result.json"] = RESULT_DECLARATION
+
+    resp = client.put(
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        files={"file": ("demo.tar.gz", _tar_gz(files))},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert _version_policy(version_id) == {
+        "result_policy_schema_version": 1,
+        "result_policy_digest": RESULT_DECLARATION_DIGEST,
+        "result_policy": RESULT_POLICY,
+    }
+    deployed = _deploy(client, auth_headers, agent_id, version_id)
+    assert deployed.status_code == 201, deployed.text
+    assert _version_policy(version_id)["result_policy_digest"] == RESULT_DECLARATION_DIGEST
+
+
+def test_deploying_a_stored_declared_bundle_records_the_policy_its_bytes_declare(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The stored-object path agrees with the upload route: the version that
+    # boots carries the policy read from its own stored bytes.
+    agent_id, version_id = _create_version(client, auth_headers)
+    _set_publication_policy(client, auth_headers, agent_id)
+    files = _valid_files()
+    files["workflow/result.json"] = RESULT_DECLARATION
+    _store_directly(agent_id, version_id, _tar_gz(files))
+    assert _version_policy(version_id)["result_policy"] is None
+
+    resp = _deploy(client, auth_headers, agent_id, version_id)
+
+    assert resp.status_code == 201, resp.text
+    assert _version_policy(version_id) == {
+        "result_policy_schema_version": 1,
+        "result_policy_digest": RESULT_DECLARATION_DIGEST,
+        "result_policy": RESULT_POLICY,
+    }
 
 
 def test_deploying_a_stored_bundle_with_a_malformed_result_declaration_reports_it(

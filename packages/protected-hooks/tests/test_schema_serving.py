@@ -98,7 +98,8 @@ def graph_payload() -> dict[str, Any]:
         # delivery require the 0164 tables, which stay below this floor.
         # Owner coding profiles and tenant policies require 0165, which stays
         # below this floor. Slack kickoff thread origin reads require 0166,
-        # which this candidate reads.
+        # which stays below this floor. 0167 adds the execution request
+        # completion contract columns this candidate reads.
         ("0157", False),
         ("0158", False),
         ("0159", False),
@@ -107,7 +108,8 @@ def graph_payload() -> dict[str, Any]:
         ("0163", False),
         ("0164", False),
         ("0165", False),
-        ("0166", True),
+        ("0166", False),
+        ("0167", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -130,7 +132,7 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
     )
 
 
-def test_candidate_window_raises_the_floor_to_0166() -> None:
+def test_candidate_window_raises_the_floor_to_0167() -> None:
     """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
 
     Approval ORM reads require the 0154 reminder cursor, and dynamic approval
@@ -142,11 +144,12 @@ def test_candidate_window_raises_the_floor_to_0166() -> None:
     table. Cached facts and request delivery require the 0164 tables, which
     stay below this floor. Owner coding profiles and tenant policies require
     0165, which stays below this floor. Slack kickoff thread origin reads
-    require 0166, which is the floor.
+    require 0166, which stays below this floor. Execution request reads select
+    the 0167 completion contract columns, which is the floor.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0166"
-    assert window.schema_head == "0166"
+    assert window.schema_min == "0167"
+    assert window.schema_head == "0167"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

@@ -35,6 +35,7 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    SourceContent,
     StoredEvidence,
     TicketLabels,
     TrackerComment,
@@ -154,6 +155,15 @@ class Tracker(Protocol):
 
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         """The ticket as markdown for the sandbox. Nothing is stored."""
+        ...
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's own title and description now (ADR 0277 decision 4).
+
+        Read from the issue's fields alone, never from its comments, so the
+        content fingerprint a tracker result run holds survives any comment.
+        Gated as `Operation.READ_TICKET`. Nothing is stored.
+        """
         ...
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:

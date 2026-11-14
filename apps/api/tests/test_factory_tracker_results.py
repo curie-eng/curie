@@ -3,11 +3,18 @@
 Criterion 3: the typed proposal against ``tests/vectors/tracker-result-proposal.json``.
 Criterion 5: delivery on real Postgres. The source WorkItem is admitted through
 a signed GitHub issues webhook against create_app() and made running through
-`workitem_dispatch.acquire` and `start`, as test_factory_terminus does. The
+`workitem_dispatch.acquire` and `start`, as test_factory_terminus does, then
+marked a tracker result request with its session reserved (#5586). The
 tracker is the in-memory adapter keyed to that WorkItem's issue. Grants are
-ORM inserts using the production `source_fingerprint` and `output_identity_for`;
-only tests create grants in #5585. Time moves only by SQL on this file's rows.
+ORM inserts using the production `source_fingerprint`, `output_identity_for`
+and `source_content_sha256`. Time moves only by SQL on this file's rows.
 Criterion 6: the storage boundary, by planted sentinels.
+
+#5586 criterion 2 drives the runner-facing routes over HTTP with the issue
+read capability the internal mint route issues, against a tracker result
+request whose deployed version carries a result policy; only the tracker is
+substituted (the in-memory adapter, through
+`factory_tracker_result_runtime.work_item_tracker`).
 """
 
 # ruff: noqa: F811  (the shared ``admitted`` fixture is imported, then requested)
@@ -32,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api.config import Settings, get_settings
 from curie_api.factory_tracker_result_delivery import (
     LISTING_SETTLE_SECONDS,
+    AttemptError,
     DeliveryOutcome,
     DeliveryState,
     RefusalReason,
@@ -45,6 +53,7 @@ from curie_api.factory_tracker_result_delivery import (
     source_fingerprint,
     submit_result,
 )
+from curie_api.factory_tracker_result_runtime import source_content_sha256
 from curie_api.factory_tracker_results import (
     FindingsReason,
     PlatformFindings,
@@ -57,7 +66,7 @@ from curie_api.factory_tracker_results import (
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
 from curie_api.forges.errors import Unauthorized, Unavailable
 from curie_api.forges.memory import InMemoryTracker, all_supported
-from curie_api.forges.types import ReplyTarget, TrackerIssueRef
+from curie_api.forges.types import ReplyTarget, SourceContent, TrackerIssueRef
 from curie_api.models import (
     ExecutionRequest,
     FactoryTrackerResultArtifact,
@@ -78,6 +87,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "tracker-result-proposal.json"
 REVISION = "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
+SOURCE_TITLE = "Export drops a row"
+SOURCE_BODY = "Reported symptom."
+POLICY_DIGEST = "ab" * 32
 
 
 # Criterion 3: the proposal ------------------------------------------------------
@@ -347,6 +359,9 @@ def _grant(request_id: uuid.UUID, kinds: tuple[str, ...] = ("findings", "ticket"
                 output_identity=output_identity_for(request.id),
                 implementation_label="factory-implement" if "ticket" in kinds else None,
                 expires_at=datetime.now(UTC) + timedelta(hours=1),
+                source_content_sha256=source_content_sha256(
+                    SourceContent(SOURCE_TITLE, SOURCE_BODY)
+                ),
             )
             session.add(grant)
             await session.commit()
@@ -368,12 +383,17 @@ def _source(
         {"scope": str(REPO_ID), "number": str(number)},
     )
     epoch = _start_running(client, row["request_id"])
+    # A tracker result request whose one session is reserved (#5586).
+    _exec(
+        "UPDATE curie.execution_requests SET completion_contract = 'tracker_result', "
+        "result_policy_digest = :digest, model_session_reserved_at = clock_timestamp() "
+        "WHERE id = :id",
+        {"id": row["request_id"], "digest": POLICY_DIGEST},
+    )
     tracker = InMemoryTracker(
         kind=row["tracker_kind"], host=row["tracker_host"], scope_id=row["tracker_scope_id"]
     )
-    issue = tracker.seed_issue(
-        "Export drops a row", "Reported symptom.", issue_id=row["tracker_issue_id"]
-    )
+    issue = tracker.seed_issue(SOURCE_TITLE, SOURCE_BODY, issue_id=row["tracker_issue_id"])
     return _Source(
         request_id=row["request_id"],
         work_item_id=row["work_item_id"],
@@ -611,6 +631,92 @@ def test_a_mention_in_submitted_text_never_reaches_the_tracker_live(
         assert mention not in posted
     # The text is still there for a reader, only the mention is broken.
     assert any("@\u200boctocat" in posted for posted in written)
+
+
+# Review finding: model text in the source comment rendered live Markdown and
+# reordered the App's own lines with bidi controls.
+_CONTROLS = ("\u202e", "\u200d", "\u0085", "\u2066", "\u200f", "\x1b")
+_ORDINARY = "Ordinary words stay verbatim."
+_HOSTILE = (
+    f"{_ORDINARY}\n"
+    "Override\u202e here, joiner\u200d here, C1\u0085 here, isolate\u2066 here, "
+    "mark\u200f here, escape\x1b[31m here.\n"
+    "[x](https://evil.example)\n"
+    "![i](https://evil.example/i.png)\n"
+    "<https://evil.example>\n"
+    '<a href="https://evil.example">a</a>\n'
+    "```\n"
+    "[y](https://evil.example/after-inner-fence)\n"
+    "```\n"
+    "````"
+)
+
+
+def _fenced_line_numbers(markdown: str) -> set[int]:
+    """The lines a CommonMark backtick fence holds; every fence must close."""
+
+    inside: set[int] = set()
+    opener = 0
+    for number, line in enumerate(markdown.split("\n")):
+        run = len(line) - len(line.lstrip("`"))
+        if opener == 0:
+            if run >= 3 and "`" not in line[run:]:
+                opener = run
+        elif run >= opener and not line[run:].strip():
+            opener = 0
+        else:
+            inside.add(number)
+    assert opener == 0, "a fence was left open"
+    return inside
+
+
+def _assert_inert(posted: str) -> None:
+    for control in _CONTROLS:
+        assert control not in posted
+    lines = posted.split("\n")
+    inside = _fenced_line_numbers(posted)
+    live = [
+        line
+        for number, line in enumerate(lines)
+        if ("evil.example" in line or line == "```") and number not in inside
+    ]
+    assert live == []
+    # Every hostile form still reached the comment, inside a fence.
+    for form in ("[x](", "![i](", "<https://evil", "<a href=", "after-inner-fence"):
+        assert any(form in lines[number] for number in inside)
+    assert any(lines[number] == _ORDINARY for number in inside)
+
+
+@pytest.mark.parametrize("kind", ["ticket", "findings"])
+def test_model_text_in_a_published_comment_is_inert(admitted: Any, kind: str) -> None:
+    src = _source(admitted, 9393)
+    if kind == "ticket":
+        proposal = _ticket(
+            title="Export\u202e drops\u200d the\u0085 row",
+            body=_HOSTILE,
+            reproduction={"command": _HOSTILE, "observed": _HOSTILE, "revision": REVISION},
+        )
+    else:
+        proposal = _findings(tried=_HOSTILE, missing=_HOSTILE)
+    delivery_id = _submit(src, proposal)
+    assert _deliver(src, delivery_id).state is DeliveryState.DELIVERED
+    (comment,) = _comments(src)
+    _assert_inert(comment)
+    inside = _fenced_line_numbers(comment)
+    fenced = [line for number, line in enumerate(comment.split("\n")) if number in inside]
+    # Both model fields, each wholly fenced.
+    assert fenced.count(_ORDINARY) == 2
+    if kind == "ticket":
+        # A ticket body is model Markdown by design: no control survives, and
+        # the title is plain text without them too.
+        (issue,) = _own_issues(src)
+        body = src.tracker.issue_body(issue)
+        title = asyncio.run(src.tracker.read_source_content(issue)).title
+        for control in _CONTROLS:
+            assert control not in body
+            assert control not in title
+        assert _ORDINARY in body
+        assert title == "Export drops the row"
 
 
 class _Restart(BaseException):
@@ -958,14 +1064,14 @@ def test_a_fence_failing_at_attempt_time_settles_failed_and_writes_nothing(
             params,
         )
     elif fence == "stale_epoch":
-        expected = "owner_not_live"
+        expected = AttemptError.REQUEST_SETTLING.value
         _exec(
             "UPDATE curie.execution_requests SET runtime_epoch = runtime_epoch + 1 "
             "WHERE id = :request",
             params,
         )
     elif fence == "lapsed_heartbeat":
-        expected = "owner_not_live"
+        expected = AttemptError.REQUEST_SETTLING.value
         _exec(
             "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
             "clock_timestamp() - interval '1 second' WHERE id = :request",
@@ -998,6 +1104,14 @@ def test_a_fence_failing_at_attempt_time_settles_failed_and_writes_nothing(
     if fence == "none":
         assert outcome.state is DeliveryState.DELIVERED
         _assert_delivered_once(src, delivery_id, "ticket")
+        return
+    if expected == AttemptError.REQUEST_SETTLING:
+        # A running request without its live owner is settling: the attempt
+        # defers, writes nothing and keeps the delivery owed (#5586).
+        assert (outcome.state, outcome.last_error_code) == (DeliveryState.OWED, expected)
+        assert src.tracker.ledger.writes == 0
+        assert _own_issues(src) == [] and _comments(src) == []
+        assert _count("factory_tracker_result_artifacts", delivery_id) == 1
         return
     assert (outcome.state, outcome.failure_code) == (DeliveryState.FAILED, expected)
     assert src.tracker.ledger.writes == 0
@@ -1313,13 +1427,13 @@ def _crossing(
             "UPDATE curie.execution_requests SET runtime_epoch = runtime_epoch + 1 "
             "WHERE id = :request"
         ]
-        return [(statement, params) for statement in sql], "owner_not_live"
+        return [(statement, params) for statement in sql], AttemptError.REQUEST_SETTLING.value
     if condition == "lapsed_heartbeat":
         sql = [
             "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
             "clock_timestamp() - interval '1 second' WHERE id = :request"
         ]
-        return [(statement, params) for statement in sql], "owner_not_live"
+        return [(statement, params) for statement in sql], AttemptError.REQUEST_SETTLING.value
     if condition == "cancelled":
         sql = ["UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :work_item"]
         return [(statement, params) for statement in sql], condition
@@ -1369,10 +1483,15 @@ def test_a_condition_crossed_between_the_issue_and_the_comment_posts_no_comment(
 
     _after(monkeypatch, src.tracker, "create_linked_issue", cross)
     outcome = _deliver(src, delivery_id)
-    assert (outcome.state, outcome.failure_code) == (DeliveryState.FAILED, code)
     assert len(_own_issues(src)) == 1
     assert _comments(src) == []
     assert _count("factory_tracker_result_receipts", delivery_id) == 0
+    if code == AttemptError.REQUEST_SETTLING:
+        # Deferred, not failed: the comment waits for the request to settle.
+        assert (outcome.state, outcome.last_error_code) == (DeliveryState.OWED, code)
+        assert _count("factory_tracker_result_artifacts", delivery_id) == 1
+        return
+    assert (outcome.state, outcome.failure_code) == (DeliveryState.FAILED, code)
     assert _count("factory_tracker_result_artifacts", delivery_id) == 0
 
 
@@ -1389,9 +1508,13 @@ def test_a_condition_crossed_after_the_comment_is_never_recorded_delivered(
 
     _after(monkeypatch, src.tracker.marked_comments, "upsert_marked", cross)
     outcome = _deliver(src, delivery_id)
-    assert (outcome.state, outcome.failure_code) == (DeliveryState.FAILED, code)
     assert len(_comments(src)) == 1
     assert _count("factory_tracker_result_receipts", delivery_id) == 0
+    if code == AttemptError.REQUEST_SETTLING:
+        assert (outcome.state, outcome.last_error_code) == (DeliveryState.OWED, code)
+        assert _count("factory_tracker_result_artifacts", delivery_id) == 1
+        return
+    assert (outcome.state, outcome.failure_code) == (DeliveryState.FAILED, code)
     assert _count("factory_tracker_result_artifacts", delivery_id) == 0
 
 
@@ -1472,3 +1595,756 @@ def test_a_recorded_output_whose_marker_is_gone_is_never_recreated(admitted: Any
         "delivery_deadline_exceeded",
     )
     assert _own_issues(src) == [issue]
+
+
+# #5586 criterion 2: the runner-facing routes over HTTP ------------------------------
+
+WORKER_HEADERS = {"X-Curie-Worker-Token": "factory-terminus-worker"}
+MINT_URL = "/v1/internal/work-items/issue-read/context"
+CONTRACT_URL = "/work-items/completion-contract"
+SUBMIT_URL = "/work-items/tracker-result"
+FINDINGS: dict[str, Any] = {
+    "kind": "findings",
+    "reason": "not_reproduced",
+    "tried": "Ran the export three times on the sample data.",
+    "missing": "A dataset that shows the dropped row.",
+    "revision": REVISION,
+}
+TICKET: dict[str, Any] = {
+    "kind": "ticket",
+    "title": "Export drops the last row",
+    "body": "## Problem\n\nThe export omits the final row.",
+    "reproduction": {
+        "command": "uv run pytest tests/test_export.py -q",
+        "observed": "1 failed: expected 3 rows, got 2",
+        "revision": REVISION,
+    },
+}
+
+
+@dataclass
+class _Triage:
+    client: Any
+    request_id: uuid.UUID
+    work_item_id: uuid.UUID
+    tracker: InMemoryTracker
+    issue: TrackerIssueRef
+    capability: str
+    context: Any
+    epoch: int = 0
+
+
+def _declare_policy(work_item_id: uuid.UUID, kinds: tuple[str, ...]) -> None:
+    """The agent's deployed version carries a result policy, and admission
+    selected the tracker result contract from it."""
+
+    policy = {
+        "results": sorted(kinds),
+        "implementation_label": "factory-implement" if "ticket" in kinds else None,
+    }
+    _exec(
+        "INSERT INTO curie.agent_versions (id, agent_id, version_label, created_by, "
+        "result_policy_schema_version, result_policy_digest, result_policy) "
+        "SELECT :id, agent_id, 'triage-v1', 'test', 1, :digest, CAST(:policy AS jsonb) "
+        "FROM curie.work_items WHERE id = :work_item",
+        {
+            "id": uuid.uuid4(),
+            "digest": POLICY_DIGEST,
+            "policy": json.dumps(policy),
+            "work_item": work_item_id,
+        },
+    )
+    _exec(
+        "UPDATE curie.execution_requests SET completion_contract = 'tracker_result', "
+        "result_policy_digest = :digest WHERE work_item_id = :work_item",
+        {"digest": POLICY_DIGEST, "work_item": work_item_id},
+    )
+
+
+def _triage(
+    admitted: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    number: int,
+    *,
+    tracker_result: bool = True,
+    kinds: tuple[str, ...] = ("findings", "ticket"),
+    labels: tuple[str, ...] = (),
+) -> _Triage:
+    """A labelled issue admitted through the webhook and acquired by a worker,
+    with the capability the worker mints for its sandbox. Not started yet."""
+
+    from curie_api import factory_tracker_result_runtime
+
+    client, github, _sink = admitted
+    _label(client, github, number)
+    (row,) = _rows(
+        "SELECT r.id AS request_id, w.id AS work_item_id, w.tracker_kind, w.tracker_host, "
+        "w.tracker_scope_id, w.tracker_issue_id FROM curie.execution_requests r "
+        "JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE w.tracker_scope_id = :scope AND w.tracker_issue_id = :number",
+        {"scope": str(REPO_ID), "number": str(number)},
+    )
+    if tracker_result:
+        _declare_policy(row["work_item_id"], kinds)
+    tracker = InMemoryTracker(
+        kind=row["tracker_kind"], host=row["tracker_host"], scope_id=row["tracker_scope_id"]
+    )
+    issue = tracker.seed_issue(
+        SOURCE_TITLE, SOURCE_BODY, issue_id=row["tracker_issue_id"], labels=labels
+    )
+    monkeypatch.setattr(
+        factory_tracker_result_runtime,
+        "work_item_tracker",
+        lambda _settings, _client, _work_item: tracker,
+    )
+    request_id = row["request_id"]
+
+    async def go() -> Any:
+        async with client.app.state.sessionmaker() as session:
+            acquired = await acquire(
+                session,
+                request_id,
+                owner="factory-owner",
+                generation=1,
+                wake=await factory_wake(session, request_id),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            assert not isinstance(acquired, DispatchConflict), acquired
+            return acquired.context
+
+    context = client.portal.call(go)
+    minted = client.post(
+        MINT_URL, headers=WORKER_HEADERS, json={"execution_request_id": str(request_id)}
+    )
+    assert minted.status_code == 200, minted.text
+    return _Triage(
+        client=client,
+        request_id=request_id,
+        work_item_id=row["work_item_id"],
+        tracker=tracker,
+        issue=issue,
+        capability=minted.json()["capability"],
+        context=context,
+    )
+
+
+def _begin(triage: _Triage) -> None:
+    async def go() -> int:
+        async with triage.client.app.state.sessionmaker() as session:
+            started = await start(
+                session,
+                triage.request_id,
+                owner="factory-owner",
+                generation=1,
+                claim_name=f"claim-{triage.request_id.hex[:12]}",
+                sandbox_name=f"sbx-{triage.request_id.hex[:12]}",
+                context=triage.context,
+            )
+            assert not isinstance(started, DispatchConflict), started
+            return int(started.runtime_epoch)
+
+    triage.epoch = int(triage.client.portal.call(go))
+
+
+def _contract(triage: _Triage) -> Any:
+    return triage.client.post(CONTRACT_URL, headers={"X-Curie-Issue-Read": triage.capability})
+
+
+def _post_result(triage: _Triage, proposal: Any) -> Any:
+    return triage.client.post(
+        SUBMIT_URL, headers={"X-Curie-Issue-Read": triage.capability}, json={"proposal": proposal}
+    )
+
+
+def _finish(triage: _Triage, outcome: str, cause: str) -> Any:
+    from curie_api.workitem_dispatch import finish
+
+    async def go() -> Any:
+        async with triage.client.app.state.sessionmaker() as session:
+            return await finish(
+                session,
+                triage.request_id,
+                runtime_epoch=triage.epoch,
+                outcome=outcome,  # type: ignore[arg-type]
+                cause=cause,
+                detail=None,
+                ci_fix_round=None,
+            )
+
+    return triage.client.portal.call(go)
+
+
+def _code_of(response: Any) -> str:
+    detail = response.json()["detail"]
+    assert isinstance(detail, dict), detail
+    return str(detail["code"])
+
+
+def _request(triage: _Triage) -> dict[str, Any]:
+    (row,) = _rows(
+        "SELECT status, terminal_cause, model_session_reserved_at, execution_deadline, "
+        "execution_attempts FROM curie.execution_requests WHERE id = :id",
+        {"id": triage.request_id},
+    )
+    return dict(row)
+
+
+def _tracker_result_rows(triage: _Triage) -> tuple[int, int, int]:
+    """Grants, deliveries and artifacts the request holds."""
+
+    params = {"id": triage.request_id}
+    (grants,) = _rows(
+        "SELECT count(*) AS n FROM curie.factory_tracker_result_grants "
+        "WHERE execution_request_id = :id",
+        params,
+    )
+    (deliveries,) = _rows(
+        "SELECT count(*) AS n FROM curie.factory_tracker_result_deliveries "
+        "WHERE execution_request_id = :id",
+        params,
+    )
+    (artifacts,) = _rows(
+        "SELECT count(*) AS n FROM curie.factory_tracker_result_artifacts a "
+        "JOIN curie.factory_tracker_result_deliveries d ON d.id = a.delivery_id "
+        "WHERE d.execution_request_id = :id",
+        params,
+    )
+    return int(grants["n"]), int(deliveries["n"]), int(artifacts["n"])
+
+
+def _triage_comments(triage: _Triage) -> list[str]:
+    target = ReplyTarget.on_issue(triage.issue)
+    return [body for _author, body in triage.tracker.marked_comments.comments(target)]
+
+
+def _running_triage(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> _Triage:
+    """Acquired, its session reserved through the route, then started."""
+
+    triage = _triage(admitted, monkeypatch, number)
+    reserved = _contract(triage)
+    assert reserved.status_code == 200, reserved.text
+    _begin(triage)
+    return triage
+
+
+def test_a_submission_is_delivered_once_and_completes_the_request_without_a_pull_request(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _triage(admitted, monkeypatch, 9501)
+    # The runner asks at session start, before the worker's start grant.
+    contract = _contract(triage)
+    assert contract.status_code == 200, contract.text
+    assert contract.headers["cache-control"] == "no-store"
+    assert contract.json() == {
+        "completion_contract": "tracker_result",
+        "result_kinds": ["findings", "ticket"],
+        "session_usd_allowance": 5.0,
+    }
+    assert _request(triage)["model_session_reserved_at"] is not None
+    _begin(triage)
+    deadline = _request(triage)["execution_deadline"]
+    (grant,) = _rows(
+        "SELECT expires_at, source_content_sha256, output_identity, allowed_result_kinds "
+        "FROM curie.factory_tracker_result_grants WHERE execution_request_id = :id",
+        {"id": triage.request_id},
+    )
+    # The start transition bounds the grant by the execution deadline.
+    assert grant["expires_at"] == deadline + timedelta(
+        seconds=get_settings().factory_tracker_result_delivery_deadline_seconds
+    )
+    assert grant["source_content_sha256"] == source_content_sha256(
+        SourceContent(SOURCE_TITLE, SOURCE_BODY)
+    )
+    assert grant["output_identity"] == output_identity_for(triage.request_id)
+    assert grant["allowed_result_kinds"] == ["findings", "ticket"]
+
+    submitted = _post_result(triage, FINDINGS)
+    assert submitted.status_code == 200, submitted.text
+    body = submitted.json()
+    assert (body["result_kind"], body["state"], body["ticket_url"]) == (
+        "findings",
+        "delivered",
+        None,
+    )
+    comments = _triage_comments(triage)
+    assert len(comments) == 1
+    assert result_marker(triage.request_id) in comments[0]
+    assert body["result_comment_url"].startswith(triage.tracker.issue_url(triage.issue))
+
+    # The worker finishes the delivered turn; no pull request exists.
+    finished = _finish(triage, "completed", "tracker_result")
+    assert not isinstance(finished, DispatchConflict), finished
+    request = _request(triage)
+    assert (request["status"], request["terminal_cause"]) == ("completed", "completed")
+    (publications,) = _rows(
+        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+        {"id": triage.request_id},
+    )
+    assert publications["n"] == 0
+    assert _own_issues_of(triage) == []
+
+
+def _own_issues_of(triage: _Triage) -> list[TrackerIssueRef]:
+    return triage.tracker.issues(author=triage.tracker.identity)
+
+
+def test_a_second_submission_is_refused_result_already_submitted(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _running_triage(admitted, monkeypatch, 9502)
+    assert _post_result(triage, FINDINGS).json()["state"] == "delivered"
+    for proposal in (FINDINGS, {**FINDINGS, "reason": "already_fixed"}):
+        again = _post_result(triage, proposal)
+        assert again.status_code == 409, again.text
+        assert _code_of(again) == "result_already_submitted"
+    assert _tracker_result_rows(triage) == (1, 1, 0)
+    assert len(_triage_comments(triage)) == 1
+
+
+def test_the_contract_route_reserves_exactly_one_session(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _running_triage(admitted, monkeypatch, 9503)
+    reserved_at = _request(triage)["model_session_reserved_at"]
+    # A second runner process for the same request starts no model.
+    second = _contract(triage)
+    assert second.status_code == 409, second.text
+    assert _code_of(second) == "session_already_started"
+    assert _request(triage)["model_session_reserved_at"] == reserved_at
+    assert _tracker_result_rows(triage)[0] == 1
+
+
+def test_an_implementation_capability_gets_its_contract_and_cannot_submit(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _triage(admitted, monkeypatch, 9504, tracker_result=False)
+    contract = _contract(triage)
+    assert contract.status_code == 200, contract.text
+    assert contract.json() == {
+        "completion_contract": "implementation",
+        "result_kinds": [],
+        "session_usd_allowance": None,
+    }
+    # Asking again changes nothing for an implementation request.
+    assert _contract(triage).status_code == 200
+    _begin(triage)
+    for proposal in (FINDINGS, TICKET):
+        refused = _post_result(triage, proposal)
+        assert refused.status_code == 409, refused.text
+        assert _code_of(refused) == "not_tracker_result"
+    assert _request(triage)["model_session_reserved_at"] is None
+    assert _tracker_result_rows(triage) == (0, 0, 0)
+    assert triage.tracker.ledger.writes == 0
+
+
+def test_a_submission_before_the_session_is_reserved_is_refused(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _triage(admitted, monkeypatch, 9505)
+    _begin(triage)
+    refused = _post_result(triage, FINDINGS)
+    assert refused.status_code == 409, refused.text
+    assert _code_of(refused) == "session_not_started"
+    assert _tracker_result_rows(triage) == (0, 0, 0)
+    # Liveness: once reserved, the same submission is delivered.
+    assert _contract(triage).status_code == 200
+    assert _post_result(triage, FINDINGS).json()["state"] == "delivered"
+
+
+@pytest.mark.parametrize("change", ["title", "body", "cancelled", "stale_owner"])
+def test_a_changed_source_a_cancelled_work_item_or_a_stale_owner_is_refused(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    from curie_api.workitem_dispatch import cancel
+
+    triage = _running_triage(admitted, monkeypatch, 9510)
+    params = {"id": triage.request_id, "work_item": triage.work_item_id}
+    expected = "source_fingerprint_changed"
+    if change == "title":
+        triage.tracker.edit_issue_title(triage.issue, "Export drops two rows")
+    elif change == "body":
+        triage.tracker.edit_issue_body(triage.issue, "Reported symptom, edited.")
+    elif change == "cancelled":
+        (row,) = _rows("SELECT version FROM curie.work_items WHERE id = :work_item", params)
+
+        async def go() -> Any:
+            async with triage.client.app.state.sessionmaker() as session:
+                return await cancel(
+                    session, work_item_id=triage.work_item_id, expected_version=row["version"]
+                )
+
+        triage.client.portal.call(go)
+        # Cancelling the WorkItem revoked its unused grant.
+        (grant,) = _rows(
+            "SELECT expires_at <= clock_timestamp() AS expired "
+            "FROM curie.factory_tracker_result_grants WHERE execution_request_id = :id",
+            params,
+        )
+        assert grant["expired"] is True
+        expected = "grant_expired"
+    else:
+        _exec(
+            "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+            "clock_timestamp() - interval '1 second' WHERE id = :id",
+            params,
+        )
+        expected = "owner_not_live"
+    refused = _post_result(triage, FINDINGS)
+    assert refused.status_code == 409, refused.text
+    assert _code_of(refused) == expected
+    assert _tracker_result_rows(triage) == (1, 0, 0)
+    assert triage.tracker.ledger.writes == 0
+    assert _triage_comments(triage) == []
+
+
+def test_a_new_comment_on_the_source_changes_nothing(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _running_triage(admitted, monkeypatch, 9511)
+    target = ReplyTarget.on_issue(triage.issue)
+    triage.tracker.marked_comments.seed_comment(target, triage.tracker.identity, "status")
+    submitted = _post_result(triage, FINDINGS)
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["state"] == "delivered"
+
+
+def test_an_invalid_proposal_is_422_with_codes_only_and_writes_nothing(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _running_triage(admitted, monkeypatch, 9512)
+    planted = "plantedinvalidwombat"
+    refused = _post_result(triage, {**FINDINGS, "reason": planted, planted: planted})
+    assert refused.status_code == 422, refused.text
+    detail = refused.json()["detail"]
+    assert detail["code"] == "proposal_invalid"
+    assert sorted((issue["field"], issue["code"]) for issue in detail["issues"]) == [
+        ("*", "unknown_field"),
+        ("reason", "value"),
+    ]
+    assert planted not in refused.text
+    assert _tracker_result_rows(triage) == (1, 0, 0)
+
+
+def test_a_tracker_read_failure_at_the_contract_route_writes_nothing(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _triage(admitted, monkeypatch, 9513)
+    real = triage.tracker.read_source_content
+
+    async def unavailable(issue: TrackerIssueRef) -> SourceContent:
+        raise Unavailable("issue")
+
+    monkeypatch.setattr(triage.tracker, "read_source_content", unavailable)
+    failed = _contract(triage)
+    assert failed.status_code == 503, failed.text
+    assert _code_of(failed) == "tracker_unavailable"
+    assert _request(triage)["model_session_reserved_at"] is None
+    assert _tracker_result_rows(triage) == (0, 0, 0)
+    # Liveness: the read answers again and the reservation goes through.
+    monkeypatch.setattr(triage.tracker, "read_source_content", real)
+    assert _contract(triage).status_code == 200
+    assert _tracker_result_rows(triage)[0] == 1
+
+
+def test_a_capability_for_another_issue_is_refused_on_both_routes(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api.issue_read_token import mint, verify_claims
+
+    triage = _triage(admitted, monkeypatch, 9514)
+    claims = verify_claims(triage.capability, get_settings().api_key)
+    assert claims is not None
+    forged = mint(get_settings().api_key, claims.model_copy(update={"tracker_issue_id": "999999"}))
+    for url, body in ((CONTRACT_URL, None), (SUBMIT_URL, {"proposal": FINDINGS})):
+        refused = triage.client.post(url, headers={"X-Curie-Issue-Read": forged}, json=body)
+        assert refused.status_code == 409, refused.text
+        assert _code_of(refused) == "invalid_context"
+    unauthenticated = triage.client.post(CONTRACT_URL)
+    assert unauthenticated.status_code == 401
+    assert _request(triage)["model_session_reserved_at"] is None
+    assert _tracker_result_rows(triage) == (0, 0, 0)
+
+
+# Revision 1 item 5: delivery after the session ends --------------------------------
+
+
+def test_an_owed_delivery_fails_the_request_and_a_later_delivery_keeps_it_failed(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api.workitem_reconciler import WorkItemReconciler
+
+    triage = _running_triage(admitted, monkeypatch, 9520)
+    triage.tracker.write_faults.lose_next_response(Operation.UPSERT_MARKED)
+    submitted = _post_result(triage, FINDINGS)
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["state"] == "owed"
+    finished = _finish(triage, "completed", "tracker_result")
+    assert not isinstance(finished, DispatchConflict), finished
+    assert (_request(triage)["status"], _request(triage)["terminal_cause"]) == (
+        "failed",
+        "tracker_result_undelivered",
+    )
+    (delivery,) = _rows(
+        "SELECT id FROM curie.factory_tracker_result_deliveries WHERE execution_request_id = :id",
+        {"id": triage.request_id},
+    )
+    _make_due(delivery["id"])
+    reconciler = WorkItemReconciler(
+        triage.client.app.state.sessionmaker, triage.client.app.state.valkey, get_settings()
+    )
+    triage.client.portal.call(reconciler._deliver_tracker_results)
+    assert _delivery(delivery["id"])["state"] == "delivered"
+    assert len(_triage_comments(triage)) == 1
+    # A later delivery records facts; it never rewrites the execution's history.
+    assert (_request(triage)["status"], _request(triage)["terminal_cause"]) == (
+        "failed",
+        "tracker_result_undelivered",
+    )
+
+
+# Revision 1 item 6: content fingerprint at every attempt --------------------------
+
+
+@pytest.mark.parametrize("when", ["before_first_attempt", "between_retries"])
+def test_a_source_edit_after_submission_fails_the_delivery_and_writes_nothing_more(
+    admitted: Any, when: str
+) -> None:
+    src = _source(admitted, 9530)
+    delivery_id = _submit(src, _findings())
+    if when == "between_retries":
+        src.tracker.write_faults.lose_next_response(Operation.UPSERT_MARKED)
+        assert _deliver(src, delivery_id).last_error_code == "tracker_unavailable"
+        _make_due(delivery_id)
+    writes = src.tracker.ledger.writes
+    src.tracker.edit_issue_title(src.issue, "Export drops every row")
+    outcome = _deliver(src, delivery_id)
+    assert (outcome.state, outcome.failure_code) == (
+        DeliveryState.FAILED,
+        "source_fingerprint_changed",
+    )
+    assert src.tracker.ledger.writes == writes
+    assert _count("factory_tracker_result_receipts", delivery_id) == 0
+    assert _count("factory_tracker_result_artifacts", delivery_id) == 0
+
+
+def test_a_grant_without_a_content_digest_never_delivers(admitted: Any) -> None:
+    src = _source(admitted, 9531)
+    delivery_id = _submit(src, _findings())
+    _exec(
+        "UPDATE curie.factory_tracker_result_grants SET source_content_sha256 = NULL "
+        "WHERE id = :grant",
+        {"grant": src.grant_id},
+    )
+    outcome = _deliver(src, delivery_id)
+    assert (outcome.state, outcome.failure_code) == (
+        DeliveryState.FAILED,
+        "source_fingerprint_changed",
+    )
+    assert src.tracker.ledger.writes == 0
+
+
+# Revision 1 item 7: the first submission is atomic --------------------------------
+
+
+@pytest.mark.parametrize("second", ["identical", "different", "exhaustion"])
+def test_racing_submissions_or_exhaustion_seal_exactly_one_delivery(
+    admitted: Any, second: str
+) -> None:
+    from curie_api import factory_tracker_result_runtime as runtime
+    from curie_api.factory_tracker_result_delivery import seal_platform_findings
+
+    src = _source(admitted, 9540)
+    target = runtime.SubmissionTarget(
+        grant_id=src.grant_id,
+        source_content_sha256=source_content_sha256(SourceContent(SOURCE_TITLE, SOURCE_BODY)),
+    )
+
+    async def work(maker: async_sessionmaker[AsyncSession]) -> list[object]:
+        async def submit(proposal: ResultProposal) -> object:
+            async with maker() as session:
+                try:
+                    return await runtime.seal_submission(
+                        session,
+                        request_id=src.request_id,
+                        target=target,
+                        proposal=proposal,
+                        tracker=src.tracker,
+                        settings=get_settings(),
+                    )
+                except runtime.RuntimeRefused as refused:
+                    return refused.code
+
+        async def exhaust() -> object:
+            async with maker() as session:
+                # The lifecycle holds the WorkItem and request locks when it seals.
+                work_item = await session.get(WorkItem, src.work_item_id, with_for_update=True)
+                request = await session.get(ExecutionRequest, src.request_id, with_for_update=True)
+                assert request is not None and work_item is not None
+                sealed = await seal_platform_findings(
+                    session,
+                    request=request,
+                    work_item=work_item,
+                    limit="budget",
+                    settings=get_settings(),
+                )
+                await session.commit()
+                return sealed
+
+        other = {
+            "identical": submit(_findings()),
+            "different": submit(_findings(reason="already_fixed")),
+            "exhaustion": exhaust(),
+        }[second]
+        return list(await asyncio.gather(submit(_findings()), other))
+
+    results = _run(work)
+    assert _deliveries() == 1
+    winners = [result for result in results if isinstance(result, uuid.UUID)]
+    assert len(winners) == 1
+    assert [result for result in results if not isinstance(result, uuid.UUID)] in (
+        ["result_already_submitted"],
+        [None],
+    )
+
+
+# Revision 1 item 8: base labels and the related-source line ---------------------------
+
+
+def test_a_published_ticket_carries_the_source_base_label_and_no_trigger_label(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _triage(admitted, monkeypatch, 9550, labels=("base:release-2", LABEL, "bug"))
+    assert _contract(triage).status_code == 200
+    _begin(triage)
+    submitted = _post_result(triage, TICKET)
+    assert submitted.status_code == 200, submitted.text
+    body = submitted.json()
+    assert body["state"] == "delivered"
+    (published,) = _own_issues_of(triage)
+    assert body["ticket_url"] == triage.tracker.issue_url(published)
+    assert triage.tracker.labels(published) == frozenset({"base:release-2"})
+    lines = [line for line in triage.tracker.issue_body(published).splitlines() if line.strip()]
+    assert lines[-2].startswith("Related to ")
+    (receipt,) = _rows(
+        "SELECT output_labels, result_comment_url FROM curie.factory_tracker_result_receipts "
+        "WHERE execution_request_id = :id",
+        {"id": triage.request_id},
+    )
+    assert receipt["output_labels"] == ["base:release-2"]
+    assert receipt["result_comment_url"] == body["result_comment_url"]
+
+
+# Revision 2 item 2: attempt-time fence 4 for both origins ----------------------------
+
+_SETTLING = {
+    "live_owner": ([], "delivered"),
+    "expired_heartbeat": (
+        [
+            "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+            "clock_timestamp() - interval '1 second' WHERE id = :id"
+        ],
+        "request_settling",
+    ),
+    "wrong_epoch": (
+        ["UPDATE curie.execution_requests SET runtime_epoch = runtime_epoch + 1 WHERE id = :id"],
+        "request_settling",
+    ),
+    "deadline_teardown": (
+        [
+            "UPDATE curie.execution_requests SET status = 'cancellation_requested', "
+            "terminal_cause = 'execution_deadline', "
+            "cancellation_requested_at = clock_timestamp() WHERE id = :id"
+        ],
+        "request_settling",
+    ),
+    "user_cancellation": (
+        [
+            "UPDATE curie.execution_requests SET status = 'cancellation_requested', "
+            "terminal_cause = 'issue_cancelled', "
+            "cancellation_requested_at = clock_timestamp() WHERE id = :id"
+        ],
+        "cancelled",
+    ),
+    "terminal_expired": (
+        [
+            "UPDATE curie.execution_requests SET status = 'cancellation_requested', "
+            "terminal_cause = 'execution_deadline', "
+            "cancellation_requested_at = clock_timestamp() WHERE id = :id",
+            "UPDATE curie.execution_requests SET status = 'expired', "
+            "terminal_at = clock_timestamp(), termination_observation = 'runtime gone' "
+            "WHERE id = :id",
+        ],
+        "delivered",
+    ),
+    "terminal_failed": (
+        [
+            "UPDATE curie.execution_requests SET status = 'failed', "
+            "terminal_at = clock_timestamp(), terminal_cause = 'budget_exceeded' "
+            "WHERE id = :id"
+        ],
+        "delivered",
+    ),
+}
+
+
+@pytest.mark.parametrize("origin", ["submitted", "platform"])
+@pytest.mark.parametrize("condition", list(_SETTLING))
+def test_attempt_time_owner_fence_proceeds_defers_or_fails(
+    admitted: Any, origin: str, condition: str
+) -> None:
+    from curie_api.factory_tracker_result_delivery import seal_platform_findings
+
+    src = _source(admitted, 9560)
+    if origin == "submitted":
+        delivery_id = _submit(src, _findings())
+    else:
+
+        async def seal(maker: async_sessionmaker[AsyncSession]) -> uuid.UUID | None:
+            async with maker() as session:
+                request = await session.get(ExecutionRequest, src.request_id)
+                work_item = await session.get(WorkItem, src.work_item_id)
+                assert request is not None and work_item is not None
+                sealed = await seal_platform_findings(
+                    session,
+                    request=request,
+                    work_item=work_item,
+                    limit="execution_deadline",
+                    settings=get_settings(),
+                )
+                await session.commit()
+                return sealed
+
+        sealed_id = _run(seal)
+        assert sealed_id is not None
+        delivery_id = sealed_id
+    statements, expected = _SETTLING[condition]
+    for statement in statements:
+        _exec(statement, {"id": src.request_id})
+    outcome = _deliver(src, delivery_id)
+    if expected == "delivered":
+        assert outcome.state is DeliveryState.DELIVERED
+        assert len(_comments(src)) == 1
+        return
+    assert src.tracker.ledger.writes == 0 and _comments(src) == []
+    if expected == "request_settling":
+        assert (outcome.state, outcome.last_error_code) == (DeliveryState.OWED, expected)
+        assert _count("factory_tracker_result_artifacts", delivery_id) == 1
+    else:
+        assert (outcome.state, outcome.failure_code) == (DeliveryState.FAILED, expected)
+        assert _count("factory_tracker_result_artifacts", delivery_id) == 0
+
+
+def test_an_implementation_request_never_delivers_even_with_a_planted_grant(
+    admitted: Any,
+) -> None:
+    src = _source(admitted, 9561)
+    delivery_id = _submit(src, _findings())
+    _exec(
+        "UPDATE curie.execution_requests SET completion_contract = 'implementation', "
+        "result_policy_digest = NULL, model_session_reserved_at = NULL WHERE id = :id",
+        {"id": src.request_id},
+    )
+    outcome = _deliver(src, delivery_id)
+    assert (outcome.state, outcome.failure_code) == (DeliveryState.FAILED, "not_tracker_result")
+    assert src.tracker.ledger.writes == 0

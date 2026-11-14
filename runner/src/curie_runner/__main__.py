@@ -23,7 +23,8 @@ from typing import Any
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, SdkMcpTool
+from claude_agent_sdk.types import McpSdkServerConfig
 from curie_internal.connector_endpoints import UPLOADS_ENV
 from curie_telemetry import bootstrap_service_telemetry
 from plugin_format import CHANNEL_READ_SERVER_NAME
@@ -89,6 +90,7 @@ from .harness.claude.approval import (
 from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
+from .harness.claude.tracker_result_tool import wrap_tracker_result_handler
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
     BUILTIN_HARNESS_CANONICAL_PATHS,
@@ -176,6 +178,17 @@ from .state import (
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
 from .tool_names import STATE_SERVER_NAME, platform_slack_tool_names
+from .tracker_result import (
+    CONTRACT_BLOCKED_EXPLANATION,
+    IMPLEMENTATION,
+    REASON_INTERNAL_ERROR,
+    SECOND_SESSION_EXPLANATION,
+    BoundContract,
+    ContractUnavailable,
+    SingleModelSession,
+    bind_completion_contract,
+    session_limits,
+)
 from .turn_progress import (
     PROGRESS_PREAMBLE,
     TurnProgress,
@@ -1177,7 +1190,10 @@ def build_runner(
     held_secrets = held_secrets | frozenset(route_tokens.values())
 
     real_options: ClaudeAgentOptions | None = None
-    build_real_options: Callable[[str | None], ClaudeAgentOptions] | None = None
+    build_real_options: Callable[[str | None, BoundContract], ClaudeAgentOptions] | None = None
+    # Set by ``initialize`` from the API's completion contract (ADR 0277,
+    # #5586); an implementation session until then, and with no capability.
+    bound_contract = BoundContract(IMPLEMENTATION)
     observed_readonly_tools: frozenset[str] = frozenset()
 
     def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
@@ -1307,8 +1323,10 @@ def build_runner(
         # without a mounted workspace; its implementation refuses safely until
         # the platform supplies one. The generic pager is independently omitted
         # when the observed surface has no actionable tools.
-        platform_servers = {
-            APPROVAL_SERVER_NAME: build_approval_server(
+        def curie_server(
+            tracker_result_tool: SdkMcpTool[Any] | None = None,
+        ) -> McpSdkServerConfig:
+            return build_approval_server(
                 approval_gate,
                 managed_workspace=mounted_workspace is not None,
                 include_request_approval=carries_request_approval,
@@ -1342,7 +1360,11 @@ def build_runner(
                     build_attachment_tools(attachment_access)
                     if attachment_access is not None else ()
                 ),
-            ),
+                tracker_result_tool=tracker_result_tool,
+            )
+
+        platform_servers: dict[str, Any] = {
+            APPROVAL_SERVER_NAME: curie_server(),
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
                 if state_client is not None
@@ -1359,8 +1381,26 @@ def build_runner(
             ),
         }
 
-        def options_for(system_prompt: str | None) -> ClaudeAgentOptions:
-            # Built by ``initialize`` once the preflight has shaped the prompt.
+        def options_for(system_prompt: str | None, bound: BoundContract) -> ClaudeAgentOptions:
+            # Built by ``initialize`` once the preflight has shaped the prompt
+            # and the API has answered the completion contract. A tracker
+            # result contract mounts ``submit_tracker_result`` on the ``curie``
+            # server, denies Task and Agent and spends at most its allowance.
+            limits = session_limits(
+                bound.contract,
+                disallowed_tools=config.catalogue_disallowed_tools,
+                max_budget_usd=config.max_usd_per_day,
+            )
+            session_platform_servers = (
+                platform_servers
+                if bound.result_handler is None
+                else {
+                    **platform_servers,
+                    APPROVAL_SERVER_NAME: curie_server(
+                        wrap_tracker_result_handler(bound.result_handler)
+                    ),
+                }
+            )
             structured_resume = build_structured_resume(
                 conversation_replay.messages,
                 curie_session_id=config.session.session_id,
@@ -1374,7 +1414,7 @@ def build_runner(
                 reviewer_model=config.reviewer_model,
                 system_prompt=system_prompt,
                 max_turns=config.max_turns,
-                max_budget_usd=config.max_usd_per_day,
+                max_budget_usd=limits.max_budget_usd,
                 # Curie's durable contract is ordered role/content messages. The
                 # Claude adapter prefers its optional opaque checkpoint to preserve
                 # native cache shape, and otherwise materializes a deterministic
@@ -1405,7 +1445,7 @@ def build_runner(
                     # plugin loader would have given them.
                     **bundle_servers,
                     **build_mcp_servers(
-                        platform=platform_servers,
+                        platform=session_platform_servers,
                         derived=cli_connector_servers,
                     ),
                 },
@@ -1420,7 +1460,7 @@ def build_runner(
                 cwd=workspace_cwd,
                 web_search_enabled=web_search_enabled,
                 policy_disallowed_tools=policy_hidden_tools,
-                disallowed_tools=config.catalogue_disallowed_tools,
+                disallowed_tools=limits.disallowed_tools,
                 hidden_restore_tools=hidden_restore_tools(
                     derived_mcp_servers,
                     capability.observed_tools,
@@ -1439,7 +1479,7 @@ def build_runner(
     async def initialize() -> None:
         # Runs in the runner's shared start task after the listener binds
         # (#4777): the preflight can take minutes, past the worker's claim.
-        nonlocal preflight_block, real_options
+        nonlocal preflight_block, real_options, bound_contract
         verification: dict[str, Any] | None = None
         if (
             mounted_workspace is not None
@@ -1464,12 +1504,48 @@ def build_runner(
                 ",".join(str(check.get("id")) for check in blocked_checks(verification)),
             )
             preflight_block = _preflight_blocked_explanation(verification)
+        if preflight_block is None:
+            # The completion contract (ADR 0277, #5586), only when the worker
+            # injected the issue read capability: no capability (local, eval,
+            # fake) makes no call. For a tracker result this call reserves the
+            # request's one model session, so it runs after the preflight,
+            # which could still block the model. Any failure blocks the model.
+            reason: str | None = None
+            try:
+                bound_contract = await bind_completion_contract(issue_read)
+            except ContractUnavailable as exc:
+                reason = exc.reason
+            except Exception:  # noqa: BLE001 - the contract gate fails closed
+                reason = REASON_INTERNAL_ERROR
+            if reason is not None:
+                logger.warning(
+                    "completion contract unavailable; the model will not start reason=%s",
+                    reason,
+                )
+                preflight_block = CONTRACT_BLOCKED_EXPLANATION
+            elif bound_contract.contract.tracker_result:
+                logger.info(
+                    "completion contract tracker_result result_kinds=%s",
+                    ",".join(bound_contract.contract.result_kinds),
+                )
         if build_real_options is not None:
-            real_options = build_real_options(compose_system_prompt(verification))
+            real_options = build_real_options(compose_system_prompt(verification), bound_contract)
 
     sdk_generation = 0
+    single_session = SingleModelSession()
 
     def factory() -> ModelSession:
+        # Every session the runner asks for passes here: boot, ``reset`` and
+        # the session replacement alike. A blocked boot answers offline, and a
+        # tracker result process gets exactly one model session (#5586).
+        if preflight_block is not None:
+            return PreflightBlockedSession(preflight_block, model=config.model)
+        if bound_contract.contract.tracker_result and not single_session.admit():
+            logger.warning("tracker result session already used; the model will not start")
+            return PreflightBlockedSession(SECOND_SESSION_EXPLANATION, model=config.model)
+        return model_session()
+
+    def model_session() -> ModelSession:
         if fake_model:
             # The offline fake honors the same permission gate (#245) the real
             # session does, using the shared approval_gate instance so a blocked
@@ -1488,7 +1564,11 @@ def build_runner(
                 # route through the real decision table on the offline tier (#561).
                 approval_gate=approval_gate,
                 replay_messages=conversation_replay.messages,
-                disallowed_tools=config.catalogue_disallowed_tools,
+                disallowed_tools=session_limits(
+                    bound_contract.contract,
+                    disallowed_tools=config.catalogue_disallowed_tools,
+                    max_budget_usd=None,
+                ).disallowed_tools,
                 # The same holder the SDK tool closes over, so the scripted
                 # progress demo runs the real handler (ADR 0130).
                 turn_progress=turn_progress,
@@ -1501,8 +1581,6 @@ def build_runner(
                     for name in proxied_connector_servers(derived_mcp_servers)
                 },
             )
-        if preflight_block is not None:
-            return PreflightBlockedSession(preflight_block, model=config.model)
         assert real_options is not None
         nonlocal sdk_generation
         generation = sdk_generation
