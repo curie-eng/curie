@@ -63,7 +63,7 @@ def required_text(value: Any, label: str) -> str:
 
 def git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "--no-optional-locks", "-C", str(cwd), *args],
+        ["git", "--no-optional-locks", "-c", f"safe.directory={cwd}", "-C", str(cwd), *args],
         capture_output=True,
         timeout=3,
         check=True,

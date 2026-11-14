@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -42,7 +43,9 @@ class Session:
     def event(self, event: str, tool: str, inputs: dict, **extra: object) -> dict:
         payload = dict(
             session_id="triage-session",
+            transcript_path=str(self.cwd / "transcript.jsonl"),
             cwd=str(self.cwd),
+            permission_mode="bypassPermissions",
             hook_event_name=event,
             tool_name=tool,
             tool_input=inputs,
@@ -75,7 +78,9 @@ class Session:
         call = f"call-{self.serial}"
         pre = self.event("PreToolUse", "Bash", {"command": command}, tool_use_id=call)
         assert not denied(pre), pre
-        done = subprocess.run(command, shell=True, cwd=self.cwd, capture_output=True, text=True)
+        done = subprocess.run(
+            command, shell=True, cwd=self.cwd, env=self.env, capture_output=True, text=True
+        )
         # The SDK Bash response has stdout/stderr/interrupted; failed calls expose
         # an Exit code prefix. See https://code.claude.com/docs/en/hooks#posttooluse-input
         response = {"stdout": done.stdout, "stderr": done.stderr, "interrupted": False}
@@ -117,6 +122,40 @@ def test_clean_recorded_probe_allows_ticket_and_untracked_test(session: Session)
     session.run(command)
     (session.cwd / "probe.py").write_text("assert False\n")
     assert not denied(session.submit(session.ticket(command, "Observed output:\n-1")))
+
+
+def test_mounted_checkout_ownership_allows_recorded_ticket(
+    session: Session, tmp_path: Path
+) -> None:
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    launcher = bin_dir / "git"
+    # Git's ownership tests use this switch to exercise the real trust check:
+    # https://github.com/git/git/blob/v2.39.5/t/t0033-safe-directory.sh
+    launcher.write_text(
+        "#!/bin/sh\nGIT_TEST_ASSUME_DIFFERENT_OWNER=1 exec " + shlex.quote(real_git) + ' "$@"\n'
+    )
+    launcher.chmod(0o755)
+    session.env.update(
+        PATH=str(bin_dir) + os.pathsep + session.env["PATH"],
+        GIT_CONFIG_COUNT="1",
+        GIT_CONFIG_KEY_0="safe.directory",
+        GIT_CONFIG_VALUE_0=str(session.cwd),
+    )
+    untrusted = subprocess.run(
+        [str(launcher), "-C", str(session.cwd), "rev-parse", "HEAD"],
+        env={**session.env, "GIT_CONFIG_COUNT": "0"},
+        capture_output=True,
+        text=True,
+    )
+    assert untrusted.returncode == 128
+    assert "detected dubious ownership" in untrusted.stderr
+    command = "python3 -c 'print(2 - 3)'"
+    session.run(command)
+    assert not denied(session.submit(session.ticket(command, "-1")))
+    assert denied(session.submit(session.ticket("echo invented", "invented")))
 
 
 @pytest.mark.parametrize("tool", ["ToolSearch", "WaitForMcpServers"])
