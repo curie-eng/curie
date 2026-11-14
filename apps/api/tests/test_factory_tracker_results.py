@@ -1840,6 +1840,8 @@ def test_a_submission_is_delivered_once_and_completes_the_request_without_a_pull
         "completion_contract": "tracker_result",
         "result_kinds": ["findings", "ticket"],
         "session_usd_allowance": 5.0,
+        # Asked before the start grant: no running execution to bind (ADR 0278).
+        "execution": None,
     }
     assert _request(triage)["model_session_reserved_at"] is not None
     _begin(triage)
@@ -1925,6 +1927,7 @@ def test_an_implementation_capability_gets_its_contract_and_cannot_submit(
         "completion_contract": "implementation",
         "result_kinds": [],
         "session_usd_allowance": None,
+        "execution": None,
     }
     # Asking again changes nothing for an implementation request.
     assert _contract(triage).status_code == 200
