@@ -770,8 +770,11 @@ class FakeRunner:
                 web.post("/v1/steer", self._steer),
                 web.post("/v1/interrupt", self._interrupt),
                 web.post("/v1/timeout", self._timeout),
+                web.post("/v1/requester-context", self._requester_context),
             ]
         )
+        # Envelopes posted before a first turn (ADR 0278), in order.
+        self.requester_contexts: list[dict[str, Any]] = []
         self.turn_active = False
         self.turn_epoch: str | None = None
         self._turn_lock = asyncio.Lock()
@@ -833,6 +836,23 @@ class FakeRunner:
         self.interrupt_headers: list[dict[str, str]] = []
         self.timeout_headers: list[dict[str, str]] = []
         self.status_headers: list[dict[str, str]] = []
+
+    async def _requester_context(self, request: web.Request) -> web.Response:
+        """Acknowledge like the real runner: the selection's digest, or none."""
+
+        envelope = await request.json()
+        self.requester_contexts.append(envelope)
+        selection = envelope.get("selection") or {}
+        ack: dict[str, Any] = {
+            "envelope_version": 1,
+            "work_item_id": envelope["work_item_id"],
+            "execution_request_id": envelope["execution_request_id"],
+            "execution_fence": envelope["execution_fence"],
+            "outcome": "applied" if selection.get("kind") == "selected" else "none",
+        }
+        if selection.get("kind") == "selected":
+            ack["sha256"] = selection["sha256"]
+        return web.json_response({"acknowledgment": ack})
 
     async def _status(self, request: web.Request) -> web.Response:
         self.status_headers.append(dict(request.headers))

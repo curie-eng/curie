@@ -1069,6 +1069,34 @@ class RunnerClient:
 
         return await self._rpc("status", token, request)
 
+    async def deliver_requester_context(
+        self,
+        base_url: str,
+        envelope: bytes,
+        *,
+        token: str | None,
+        timeout_s: float,
+    ) -> tuple[int, dict[str, object] | None]:
+        """POST the requester context envelope (ADR 0278); ``(status, JSON or None)``.
+
+        Never raises on an HTTP answer: the caller decides what a refusal means.
+        The envelope carries the pinned text, so nothing here logs a body.
+        """
+
+        headers = dict(_auth_headers(token) or {})
+        headers["Content-Type"] = "application/json"
+        async with self._session.post(
+            f"{base_url}/v1/requester-context",
+            data=envelope,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            try:
+                data = await resp.json(content_type=None)
+            except (ValueError, aiohttp.ContentTypeError):
+                data = None
+            return resp.status, data if isinstance(data, dict) else None
+
     async def capacity_status(
         self,
         base_url: str,

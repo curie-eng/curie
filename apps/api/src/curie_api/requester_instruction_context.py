@@ -135,19 +135,23 @@ async def read_envelope(
             )
         )
         try:
-            selection = SelectedCodingInstructions(
-                principal_id=str(item.requester_principal_id),
-                revision=item.coding_instructions_revision,
-                sha256=item.coding_instructions_sha256,
-                format_version=item.coding_instructions_format_version,
-                text=text,
+            # Validated, not trusted: a stored row that no longer matches its
+            # digest or bounds is refused below.
+            selection = SelectedCodingInstructions.model_validate(
+                {
+                    "principal_id": str(item.requester_principal_id),
+                    "revision": item.coding_instructions_revision,
+                    "sha256": item.coding_instructions_sha256,
+                    "format_version": item.coding_instructions_format_version,
+                    "text": text,
+                }
             )
         except (ValidationError, ValueError, TypeError):
             # A missing or tampered snapshot is a visible failure, never absence.
             return Refused("coding_instructions_unavailable")
     else:
-        selection = AbsentCodingInstructions(
-            reason=item.coding_instructions_absence_reason or "historical"
+        selection = AbsentCodingInstructions.model_validate(
+            {"reason": item.coding_instructions_absence_reason or "historical"}
         )
     envelope = CodingInstructionsContextV1(
         tenant_id=str(tenant),

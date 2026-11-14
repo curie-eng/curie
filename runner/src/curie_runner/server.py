@@ -548,7 +548,9 @@ async def _event(request: web.Request) -> web.StreamResponse:
     try:
         frame = _parse(await request.json())
     except Exception as exc:  # noqa: BLE001 - map any decode/validation error to 400
-        return web.json_response({"error": f"invalid event frame: {_frame_error(exc)}"}, status=400)
+        return web.json_response(
+            {"error": f"invalid event frame: {_frame_error(exc)}"}, status=400
+        )
     if not isinstance(frame, Event):
         return web.json_response(
             {"error": "expected an event frame; use /v1/interrupt for interrupts"},
@@ -579,9 +581,7 @@ async def _event(request: web.Request) -> web.StreamResponse:
     progress = ProgressCapability.from_headers(request.headers)
     async with contextlib.aclosing(
         runner.run_turn(
-            frame,
-            parent=parent,
-            turn_epoch=turn_epoch,
+            frame, parent=parent, turn_epoch=turn_epoch,
             admission_required=admission_header == "wait",
             progress=progress,
         )
@@ -597,7 +597,9 @@ async def _steer(request: web.Request) -> web.Response:
     try:
         frame = _parse(await request.json())
     except Exception as exc:  # noqa: BLE001
-        return web.json_response({"error": f"invalid steer frame: {_frame_error(exc)}"}, status=400)
+        return web.json_response(
+            {"error": f"invalid steer frame: {_frame_error(exc)}"}, status=400
+        )
     if not isinstance(frame, Event):
         return web.json_response({"error": "expected an event frame"}, status=400)
 
