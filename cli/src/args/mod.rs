@@ -1644,6 +1644,23 @@ pub(crate) enum ExampleAction {
         #[command(subcommand)]
         action: DarkFactoryAction,
     },
+    /// Work with the factory-triage example bundle.
+    FactoryTriage {
+        #[command(subcommand)]
+        action: FactoryTriageAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum FactoryTriageAction {
+    /// Render an offline investigation bundle into a new or empty directory.
+    Render {
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// Another agent's implementation trigger label on the same repository.
+        #[arg(long, value_name = "LABEL")]
+        implementation_label: String,
+    },
 }
 
 #[derive(Subcommand)]

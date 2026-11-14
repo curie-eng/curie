@@ -148,6 +148,12 @@
       "version": "2.0"
     },
     {
+      "result": "FactoryTriageRenderOutput",
+      "kind": "CliOutput",
+      "schema": "factory-triage-render.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "DeleteOutput",
       "kind": "CliOutput",
       "schema": "delete.schema.json",

@@ -11276,6 +11276,35 @@
               "name": "render"
             }
           ]
+        },
+        {
+          "about": "Work with the factory-triage example bundle",
+          "hidden": false,
+          "name": "factory-triage",
+          "subcommands": [
+            {
+              "about": "Render an offline investigation bundle into a new or empty directory",
+              "args": [
+                {
+                  "global": false,
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Another agent's implementation trigger label on the same repository",
+                  "id": "implementation_label",
+                  "long": "implementation-label",
+                  "positional": false,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "render"
+            }
+          ]
         }
       ]
     },
