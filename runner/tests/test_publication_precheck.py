@@ -747,6 +747,12 @@ def test_real_sdk_publication_call_shares_stream_hook_and_permission_identity(
     workspace: tuple[Path, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The scripted provider offers the publication call only once the tools array
+    # the CLI posts names the platform tool. The packaged CLI otherwise defers
+    # that tool behind ToolSearch, so the array omits it. ENABLE_TOOL_SEARCH=false
+    # lists it upfront for this observation only; production does not set it.
+    monkeypatch.setenv("ENABLE_TOOL_SEARCH", "false")
+
     class PublicationProvider(_ProviderCapture):
         def __init__(self) -> None:
             super().__init__()
