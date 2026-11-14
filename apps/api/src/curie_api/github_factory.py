@@ -425,6 +425,7 @@ async def _refuse_rediscovered(
     settings: Settings,
     client: httpx.AsyncClient,
     verified: VerifiedIssue,
+    publications: factory_rediscovery.PassPublications | None = None,
 ) -> str | None:
     """Refuse a label admission with no local WorkItem when the code host
     already has this issue's factory publication (#4629).
@@ -442,6 +443,7 @@ async def _refuse_rediscovered(
             issue,
             verified.repository,
             event_at=notice.label_event_at,
+            publications=publications,
         )
     except ForgeError:
         raise FeedbackUnavailable("publication_listing_unavailable") from None
@@ -473,6 +475,7 @@ async def admit_notice(
     *,
     client: httpx.AsyncClient,
     reconcile_only: bool = False,
+    publications: factory_rediscovery.PassPublications | None = None,
 ) -> WebhookResult:
     registry = forges_registry(settings)
     # Under the issue lock: the WorkItem decides whether the base is resolved
@@ -563,7 +566,7 @@ async def admit_notice(
     if existing is None and notice.disposition == "admit":
         # No local history: the code host's own publications decide (#4629).
         refused = await _refuse_rediscovered(
-            session, binding.agent_id, notice, settings, client, verified
+            session, binding.agent_id, notice, settings, client, verified, publications
         )
         if refused is not None:
             return ignored(refused)

@@ -34,11 +34,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from curie_telemetry import record_metric
 from sqlalchemy import desc, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
@@ -51,7 +53,8 @@ from curie_api.factory_label_reconcile import (
     tracker_work_item_repositories,
 )
 
-from . import factory_intake_notices, github_factory
+from . import factory_intake_notices, factory_notices, factory_rediscovery, github_factory
+from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_facts import FACTS_DEADLINE_SECONDS
 from .factory_facts_exchange import FactsExchange
@@ -88,7 +91,13 @@ from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice, mentions_login
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
 from .github_review_truth import VerifiedRepository
-from .models import ExecutionRequest, FactoryPollCursor, WorkItem
+from .models import (
+    ExecutionRequest,
+    FactoryIntakeNotice,
+    FactoryPollCursor,
+    FactoryStatusComment,
+    WorkItem,
+)
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name, repo_url_path
 from .workspace_policy import repository_is_allowed
 
@@ -97,6 +106,68 @@ logger = logging.getLogger(__name__)
 _LOCK = text("SELECT pg_try_advisory_lock(CAST(:classid AS integer), CAST(:objid AS integer))")
 _UNLOCK = text("SELECT pg_advisory_unlock(CAST(:classid AS integer), CAST(:objid AS integer))")
 _LOCK_ARGS = {"classid": 3745, "objid": 187}
+
+
+REPOSITORY_CONCURRENCY = 10
+ISSUE_CONCURRENCY = 10
+LABEL_PASS_AGE = "curie.factory.intake.label_pass.age_seconds"
+
+
+@dataclass
+class IntakeClock:
+    time: Callable[[], float]
+    wait: Callable[[float], Awaitable[None]]
+
+    @classmethod
+    def production(cls) -> IntakeClock:
+        return cls(asyncio.get_running_loop().time, asyncio.sleep)
+
+
+@dataclass
+class Cadence:
+    clock: IntakeClock
+    interval: float
+    due: float = 0.0
+    next_repository: str | None = None
+    last_clean: dict[str, float] = field(default_factory=dict)
+
+
+async def run_forever(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    *,
+    clock: IntakeClock | None = None,
+) -> None:
+    tracker = forges_registry(settings).github_tracker()
+    if not settings.factory_enabled or settings.factory_intake != "poll" or tracker is None:
+        return
+    interval = tracker.config.poll_interval_s
+    if interval <= 0:
+        return
+    cadence = Cadence(clock or IntakeClock.production(), interval)
+    async with httpx.AsyncClient(
+        timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+    ) as client:
+        while True:
+            cadence.due = cadence.clock.time() + interval
+            try:
+                await poll_once(sessionmaker, settings, client, cadence=cadence)
+            except Exception:
+                logger.exception("factory intake pass failed")
+            await cadence.clock.wait(max(0.0, cadence.due - cadence.clock.time()))
+
+
+async def _until_due(work: Awaitable[None], cadence: Cadence) -> None:
+    task = asyncio.ensure_future(work)
+    timer = asyncio.ensure_future(cadence.clock.wait(max(0.0, cadence.due - cadence.clock.time())))
+    try:
+        done, _ = await asyncio.wait((task, timer), return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            await task
+    finally:
+        for pending in (task, timer):
+            pending.cancel()
+        await asyncio.gather(task, timer, return_exceptions=True)
 
 
 def _engine(sessionmaker: async_sessionmaker[AsyncSession]) -> Any:
@@ -111,8 +182,14 @@ async def _label_already_admitted(
     issue: TrackerIssueRef,
     event: dict[str, Any],
     installation_id: int,
-) -> bool:
-    """True when this label event is not newer than the work item's latest request.
+    *,
+    label: str,
+    labels: set[str] | None,
+    repository: dict[str, Any],
+    agent_id: uuid.UUID | None,
+    settings: Settings,
+) -> tuple[bool, bool]:
+    """Return prior admission and whether its unchanged selection is answered.
 
     Requests admitted through a webhook use the delivery id, not the timeline
     event id. Treating that same label as a new admission would cancel the
@@ -121,27 +198,61 @@ async def _label_already_admitted(
 
     event_at = parse_time(event.get("created_at"))
     if event_at is None:
-        return False
+        return False, False
     async with sessionmaker() as session:
         item = await github_factory.work_item_for(session, issue)
         if (
-            item is None or item.cancelled_at is not None
+            item is None
+            or item.cancelled_at is not None
             or item.code_host_installation_id != installation_id
         ):
-            return False
-        latest = await session.scalar(
-            select(ExecutionRequest.created_at)
-            .where(ExecutionRequest.work_item_id == item.id)
-            .order_by(desc(ExecutionRequest.sequence))
-            .limit(1)
+            return False, False
+        latest = (
+            await session.execute(
+                select(
+                    ExecutionRequest.id,
+                    ExecutionRequest.created_at,
+                    FactoryStatusComment.posted_at,
+                )
+                .outerjoin(
+                    FactoryStatusComment,
+                    FactoryStatusComment.execution_request_id == ExecutionRequest.id,
+                )
+                .where(ExecutionRequest.work_item_id == item.id)
+                .order_by(desc(ExecutionRequest.sequence))
+                .limit(1)
+            )
+        ).one_or_none()
+        if latest is None or event_at > latest.created_at:
+            return False, False
+        if (
+            latest.posted_at is None
+            or agent_id != item.agent_id
+            or item.trigger_label != label
+            or labels is None
+            or label not in labels
+            or item.repository_path != repository.get("full_name")
+            or item.repository_project_id != str(repository.get("id"))
+            or item.base_resolved_request_id not in (None, latest.id)
+        ):
+            return True, False
+        from .factory_base_reconcile import base_selection_unchanged
+
+        return True, await base_selection_unchanged(
+            session,
+            item,
+            labels=labels,
+            default_branch=repository.get("default_branch"),
+            settings=settings,
         )
-    return latest is not None and event_at <= latest
 
 
 async def poll_once(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
+    *,
+    cadence: Cadence | None = None,
 ) -> None:
     """One locked poll pass. Returns without a GitHub read when the lock is held."""
 
@@ -152,7 +263,7 @@ async def poll_once(
         if not locked:
             return
         try:
-            await _poll_locked(sessionmaker, settings, client)
+            await _poll_locked(sessionmaker, settings, client, cadence=cadence)
         finally:
             await connection.execute(_UNLOCK, _LOCK_ARGS)
             await connection.commit()
@@ -162,6 +273,8 @@ async def _poll_locked(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
     client: httpx.AsyncClient,
+    *,
+    cadence: Cadence | None,
 ) -> None:
     async with sessionmaker() as session:
         bound = await bound_repositories(session)
@@ -184,18 +297,61 @@ async def _poll_locked(
             continue
         feedback_only.add(repo)
         served.setdefault(repo, False)
-    for repo, serves in served.items():
+    clock = cadence.clock if cadence else IntakeClock.production()
+    last_clean = cadence.last_clean if cadence else {}
+    limit = asyncio.Semaphore(REPOSITORY_CONCURRENCY)
+    traffic: dict[str, Callable[[], Awaitable[None]]] = {}
+
+    async def labels(repo: str, serves: bool) -> None:
         if not repository_is_allowed(repo, settings.github_repo_allowlist):
-            continue
+            return
+        last_clean.setdefault(repo, clock.time())
+        clean = False
+        async with limit:
+            try:
+                traffic[repo], clean = await _poll_repository(
+                    sessionmaker,
+                    settings,
+                    client,
+                    repo,
+                    serves=serves,
+                    feedback=serves or repo in feedback_only,
+                )
+            except (
+                Unavailable,
+                PollUnavailable,
+                FeedbackUnavailable,
+                GitHubAppError,
+                GitHubInstallationRefused,
+                ValueError,
+            ):
+                logger.info("factory poll for %s deferred", repo)
+            finally:
+                record_metric(
+                    LABEL_PASS_AGE,
+                    max(0.0, clock.time() - last_clean[repo]),
+                    attributes={"repository": repo},
+                )
+                if clean:
+                    last_clean[repo] = clock.time()
+
+    async with asyncio.TaskGroup() as tasks:
+        for repo, serves in served.items():
+            tasks.create_task(labels(repo, serves))
+    order = [repo for repo in served if repo in traffic]
+    if cadence and cadence.next_repository in order:
+        start = order.index(cadence.next_repository)
+        order = order[start:] + order[:start]
+    for index, repo in enumerate(order):
+        if cadence:
+            cadence.next_repository = order[(index + 1) % len(order)]
+            if clock.time() >= cadence.due:
+                break
         try:
-            await _poll_repository(
-                sessionmaker,
-                settings,
-                client,
-                repo,
-                serves=serves,
-                feedback=serves or repo in feedback_only,
-            )
+            if cadence:
+                await _until_due(traffic[repo](), cadence)
+            else:
+                await traffic[repo]()
         except (
             Unavailable,
             PollUnavailable,
@@ -204,7 +360,11 @@ async def _poll_locked(
             GitHubInstallationRefused,
             ValueError,
         ):
-            logger.info("factory poll for %s deferred", repo)
+            logger.info("factory feedback for %s deferred", repo)
+        if cadence:
+            if clock.time() >= cadence.due:
+                break
+            cadence.next_repository = order[(index + 1) % len(order)]
 
 
 async def _poll_repository(
@@ -215,7 +375,7 @@ async def _poll_repository(
     *,
     serves: bool,
     feedback: bool,
-) -> None:
+) -> tuple[Callable[[], Awaitable[None]], bool]:
     """One repository's pass. ``serves`` is False for a repository no surface
     binds any more: it gets the cancellation pass alone, plus the review
     feedback pass when ``feedback`` (it hosts another tracker's open pull
@@ -260,22 +420,78 @@ async def _poll_repository(
     for key in list(cursor.etags):
         if key == "issues" or (key.startswith("issues:") and key[7:] not in labels):
             del cursor.etags[key]
+    publications = factory_rediscovery.PassPublications()
+    issues = asyncio.Semaphore(ISSUE_CONCURRENCY)
+    clean = True
     for label in labels:
-        await _admit_labeled(
-            sessionmaker,
-            settings,
-            client,
-            cursor,
-            intake.for_repository(
+        clean = (
+            await _admit_labeled(
+                sessionmaker,
+                settings,
                 client,
-                repo_full_name=repo,
-                repository_id=repository_id,
-                token=static_token(token),
-                label=label,
-            ),
-            installation_id=installation_id,
-            repository=repository,
+                cursor,
+                intake.for_repository(
+                    client,
+                    repo_full_name=repo,
+                    repository_id=repository_id,
+                    token=static_token(token),
+                    label=label,
+                ),
+                installation_id=installation_id,
+                repository=repository,
+                publications=publications,
+                verified_repository=verified,
+                limit=issues,
+            )
+            and clean
         )
+    await _save_cursor(sessionmaker, scope, cursor, labels=True)
+
+    async def traffic() -> None:
+        try:
+            await _poll_traffic(
+                sessionmaker,
+                settings,
+                client,
+                cursor,
+                tracker,
+                now=now,
+                api=api,
+                token=token,
+                repo=repo,
+                repo_path=repo_path,
+                repository_id=repository_id,
+                installation_id=installation_id,
+                repository=repository,
+                verified=verified,
+                serves=serves,
+                feedback=feedback,
+            )
+        finally:
+            await _save_cursor(sessionmaker, scope, cursor, labels=False)
+
+    return traffic, clean
+
+
+async def _poll_traffic(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    client: httpx.AsyncClient,
+    cursor: Cursor,
+    tracker: GitHubTracker,
+    *,
+    now: datetime,
+    api: str,
+    token: str,
+    repo: str,
+    repo_path: str,
+    repository_id: int,
+    installation_id: int,
+    repository: dict[str, Any],
+    verified: VerifiedRepository,
+    serves: bool,
+    feedback: bool,
+) -> None:
     await _cancel_stale(
         sessionmaker,
         settings,
@@ -286,7 +502,6 @@ async def _poll_repository(
         repository=repository,
     )
     if not feedback:
-        await _save_cursor(sessionmaker, scope, cursor)
         return
     await _admit_mentions(
         sessionmaker,
@@ -335,7 +550,6 @@ async def _poll_repository(
         owned=owned,
         verified=verified,
     )
-    await _save_cursor(sessionmaker, scope, cursor)
 
 
 async def _admit_labeled(
@@ -347,20 +561,31 @@ async def _admit_labeled(
     *,
     installation_id: int,
     repository: dict[str, Any],
-) -> None:
+    publications: factory_rediscovery.PassPublications,
+    verified_repository: VerifiedRepository,
+    limit: asyncio.Semaphore,
+) -> bool:
     label = tracker.label
     key = f"issues:{label}"
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
     listed, etag = await tracker.labeled_open_issues(cursor.etags.get(key))
     if listed is None:
-        return
-    deferred = False
-    for issue in listed:
+        return True
+    async with sessionmaker() as session:
+        bindings = await bound_labels(session, forges_registry(settings), GITHUB_CHANNEL_KIND, repo)
+        matches = bindings.get(label, [])
+        agent_id = matches[0].agent_id if len(matches) == 1 else None
+
+    async def admit(issue: Any) -> bool:
         if not isinstance(issue, dict) or "pull_request" in issue:
-            continue
+            return True
         number = issue.get("number")
         if type(number) is not int or number <= 0:
-            continue
+            return True
+        async with limit:
+            return await apply(number, label_names(issue))
+
+    async def apply(number: int, labels: set[str] | None) -> bool:
         try:
             events = await tracker.issue_events(number)
             event = last_label_event(events, label)
@@ -381,21 +606,59 @@ async def _admit_labeled(
                 label=label,
             )
             notice = factory_intake_notices.observe_label(notice, event, app_id=tracker.app_id)
+            assert notice.label_event_id is not None
             if notice.actor_refusal is not None:
                 logger.info(
                     "factory label actor refused %s#%d: %s", repo, number, notice.actor_refusal
                 )
-            if await _label_already_admitted(
-                sessionmaker, tracker.issue(number), event, installation_id
-            ):
+            async with sessionmaker() as session:
+                answered = await session.scalar(
+                    select(FactoryIntakeNotice.posted_at).where(
+                        *factory_intake_notices.event_key(
+                            tracker.issue(number), notice.label_event_id
+                        )
+                    )
+                )
+            if answered is not None:
+                return True
+            admitted, unchanged = await _label_already_admitted(
+                sessionmaker,
+                tracker.issue(number),
+                event,
+                installation_id,
+                label=label,
+                labels=labels,
+                repository=repository,
+                agent_id=agent_id,
+                settings=settings,
+            )
+            if unchanged and notice.actor_refusal is None:
+                return True
+            if admitted:
                 # Reconcile an observed base edit on the existing work item.
                 notice = replace(notice, previously_admitted=True)
-            await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
+            await _apply_notice(
+                sessionmaker,
+                settings,
+                client,
+                notice,
+                tracker,
+                repository,
+                publications=publications,
+                verified_repository=verified_repository,
+            )
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
-            deferred = True
             logger.info("factory labeled issue poll for %s issue %s deferred", repo, number)
-    if etag and not deferred:
+            return False
+        return True
+
+    async with asyncio.TaskGroup() as group:
+        tasks = [group.create_task(admit(issue)) for issue in listed]
+    clean = all(task.result() for task in tasks)
+    if etag and clean:
         cursor.etags[key] = etag
+
+    return clean
 
 
 async def _cancel_stale(
@@ -650,6 +913,9 @@ async def _apply_notice(
     notice: FactoryNotice,
     tracker: GitHubTracker,
     repository: dict[str, Any],
+    *,
+    publications: factory_rediscovery.PassPublications | None = None,
+    verified_repository: VerifiedRepository | None = None,
 ) -> None:
     """Apply one polled notice, confirmed with the pass's token and against
     its one repository read (#4361 decision 14)."""
@@ -674,7 +940,7 @@ async def _apply_notice(
                 )
             else:
                 await github_factory.admit_notice(
-                    session, notice, settings, verified, client=client
+                    session, notice, settings, verified, client=client, publications=publications
                 )
         except FeedbackUnavailable:
             await session.rollback()
@@ -683,12 +949,36 @@ async def _apply_notice(
             await session.rollback()
             return
         await session.commit()
-    await factory_intake_notices.sync_intake_notices(
-        sessionmaker,
-        settings,
-        owner="poll-intake",
-        client=client,
-    )
+    if notice.disposition == "admit":
+        assert notice.label_event_id is not None
+        await factory_intake_notices.sync_intake_notices(
+            sessionmaker,
+            settings,
+            owner="poll-intake",
+            client=client,
+            issue=tracker.issue(notice.issue_number),
+        )
+        await factory_notices.sync_status_comments(
+            sessionmaker,
+            settings,
+            owner=f"poll-intake:{notice.request_id}",
+            request_ids={notice.request_id},
+            verified_repository=verified_repository,
+        )
+        async with sessionmaker() as session:
+            status = await session.get(FactoryStatusComment, notice.request_id)
+            owed = await session.scalar(
+                select(FactoryIntakeNotice.id).where(
+                    *factory_intake_notices.event_key(
+                        tracker.issue(notice.issue_number), notice.label_event_id
+                    ),
+                    FactoryIntakeNotice.posted_at.is_(None),
+                )
+            )
+            if owed is not None or (
+                status is not None and status.posted_at is None and status.refused_at is None
+            ):
+                raise FeedbackUnavailable("label_answer_unavailable")
 
 
 @dataclass(frozen=True)
@@ -721,7 +1011,7 @@ async def _load_cursor(sessionmaker: async_sessionmaker[AsyncSession], scope: _S
 
 
 async def _save_cursor(
-    sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope, cursor: Cursor
+    sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope, cursor: Cursor, *, labels: bool
 ) -> None:
     async with sessionmaker() as session:
         row = await session.get(FactoryPollCursor, scope.key)
@@ -740,9 +1030,18 @@ async def _save_cursor(
             session.add(row)
         else:
             row.scope_path = scope.path
-            row.comments_since = cursor.comments_since
-            row.review_comments_since = cursor.review_comments_since
-            row.reviews_since = cursor.reviews_since
-            row.etags = dict(cursor.etags)
+            if not labels:
+                row.comments_since = cursor.comments_since
+                row.review_comments_since = cursor.review_comments_since
+                row.reviews_since = cursor.reviews_since
+
+            def owned(key: str) -> bool:
+                return (key == "issues" or key.startswith("issues:")) == labels
+
+            previous = row.etags if isinstance(row.etags, dict) else {}
+            row.etags = {
+                **{key: value for key, value in previous.items() if not owned(key)},
+                **{key: value for key, value in cursor.etags.items() if owned(key)},
+            }
             row.updated_at = datetime.now(UTC)
         await session.commit()
