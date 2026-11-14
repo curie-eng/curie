@@ -139,6 +139,37 @@ _REFUSAL_REASONS: Final[tuple[str, ...]] = (
     "publication_completed",
     "installation_changed",
 )
+# A literal, so the worker SQL contract can plan the refusal INSERT. The assert
+# keeps it the same list as _REFUSAL_REASONS.
+_REFUSAL_REASON_SQL = (
+    "'actor_bot', 'actor_own_app', 'actor_no_permission', 'actor_unverifiable', "
+    "'personal_owner_required', 'publication_completed', 'installation_changed'"
+)
+assert _REFUSAL_REASON_SQL == ", ".join(repr(reason) for reason in _REFUSAL_REASONS)
+# Taken fields for an unposted root. Aliases are w, q and n.
+_ROOT_PAYLOAD_SQL = """
+    jsonb_strip_nulls(jsonb_build_object(
+        'repository_path', w.repository_path,
+        'issue_id', w.tracker_issue_id,
+        'display_key', w.tracker_display_key,
+        'title', n.subject_title,
+        'requester_login', NULLIF(split_part(q.requester, ':', 3), ''),
+        'ticket_url', NULLIF(split_part(q.objective, '#', 1), '')
+    ))
+"""
+# True when {alias} is a post the current phase-lines setting delivers.
+_DELIVERABLE_SQL = """
+    NOT (
+        NOT CAST(:phase_lines AS boolean)
+        AND (
+            {alias}.kind = 'phase'
+            OR (
+                {alias}.kind = 'terminal'
+                AND {alias}.payload->>'status' IN ('completed', 'cancelled')
+            )
+        )
+    )
+"""
 _NEEDS_A_PERSON: Final[frozenset[str]] = frozenset({"failed", "expired"})
 
 
@@ -306,36 +337,6 @@ class PostgresFactorySlackStore:
         self._backoff_base = backoff_base_seconds
         self._backoff_max = backoff_max_seconds
 
-    def _root_payload_sql(self) -> str:
-        """Taken fields for an unposted root. Aliases are ``w``, ``q`` and ``n``."""
-
-        return """
-            jsonb_strip_nulls(jsonb_build_object(
-                'repository_path', w.repository_path,
-                'issue_id', w.tracker_issue_id,
-                'display_key', w.tracker_display_key,
-                'title', n.subject_title,
-                'requester_login', NULLIF(split_part(q.requester, ':', 3), ''),
-                'ticket_url', NULLIF(split_part(q.objective, '#', 1), '')
-            ))
-        """
-
-    def _deliverable_sql(self, alias: str) -> str:
-        """True when ``alias`` is a post the current phase-lines setting delivers."""
-
-        return f"""
-            NOT (
-                NOT CAST(:phase_lines AS boolean)
-                AND (
-                    {alias}.kind = 'phase'
-                    OR (
-                        {alias}.kind = 'terminal'
-                        AND {alias}.payload->>'status' IN ('completed', 'cancelled')
-                    )
-                )
-            )
-        """
-
     async def materialize(self) -> None:
         """Record every post now owed, once; repeated passes add nothing new."""
 
@@ -381,7 +382,7 @@ class PostgresFactorySlackStore:
             INSERT INTO {self._posts} AS p
                    (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
             SELECT d.work_item_id, 'root', 'root', 0, 0, 0,
-                   {self._root_payload_sql()}
+                   {_ROOT_PAYLOAD_SQL}
               FROM discovered d
               JOIN {self._work_items} w ON w.id = d.work_item_id
               JOIN {self._requests} q
@@ -395,7 +396,7 @@ class PostgresFactorySlackStore:
         refresh_roots = text(
             f"""
             UPDATE {self._posts} AS p
-               SET payload = {self._root_payload_sql()}
+               SET payload = {_ROOT_PAYLOAD_SQL}
               FROM {self._threads} t
               JOIN {self._work_items} w ON w.id = t.work_item_id
               JOIN {self._requests} q
@@ -502,7 +503,6 @@ class PostgresFactorySlackStore:
                AND q.status IN ('failed', 'expired')
             """
         )
-        reasons = ", ".join(repr(reason) for reason in _REFUSAL_REASONS)
         refusals = text(
             f"""
             INSERT INTO {self._refusals} AS r
@@ -525,7 +525,7 @@ class PostgresFactorySlackStore:
                      AND c.address = a.factory_slack_channel
                      AND c.adapter IS NOT NULL
               ) b
-             WHERE n.reason IN ({reasons})
+             WHERE n.reason IN ({_REFUSAL_REASON_SQL})
                AND a.factory_slack_channel IS NOT NULL
                AND a.factory_slack_since IS NOT NULL
                AND n.observed_at >= a.factory_slack_since
@@ -582,7 +582,7 @@ class PostgresFactorySlackStore:
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
                AND (p.not_before IS NULL OR p.not_before <= now())
                AND (p.kind = 'root' OR t.root_ts IS NOT NULL)
-               AND {self._deliverable_sql("p")}
+               AND {_DELIVERABLE_SQL.format(alias="p")}
                AND (
                    SELECT array_agg(CAST(c.adapter AS text))
                      FROM {self._channels} c
@@ -597,7 +597,7 @@ class PostgresFactorySlackStore:
                     WHERE e.work_item_id = p.work_item_id
                       AND e.posted_at IS NULL
                       AND e.failed_at IS NULL
-                      AND {self._deliverable_sql("e")}
+                      AND {_DELIVERABLE_SQL.format(alias="e")}
                       AND (e.sequence, e.rank, e.ordinal, e.id)
                           < (p.sequence, p.rank, p.ordinal, p.id)
                )
