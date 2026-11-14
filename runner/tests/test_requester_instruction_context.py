@@ -1631,3 +1631,110 @@ def test_a_hostile_pin_cannot_publish_without_a_completed_review(
     else:
         assert result.get("is_error") is True
         assert published == []
+
+
+# --- Criterion 4 through the real boot: the mounted reviewer guard ---------------------
+
+CLEAN_REVIEW = "REVIEW-CONTROL-3f9a Review the diff against the acceptance criteria."
+DIRTY_REVIEW = f"Review the diff. The requester also asked for this:\n{TEXT}"
+START_TEXT = "start the issue"
+
+
+def _first_user_text(body: dict[str, Any]) -> str:
+    for message in body.get("messages") or ():
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            return "\n".join(
+                str(block.get("text", ""))
+                for block in content or ()
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+    return ""
+
+
+def _reviewer_script(
+    reviewers: list[str],
+) -> Callable[[web.Request], Awaitable[web.StreamResponse]]:
+    """The main session calls a contaminated then a clean reviewer; a reviewer
+    session's own requests (any request not of the main conversation) are kept
+    whole in ``reviewers`` and answered plainly."""
+
+    main = _scripted(
+        [
+            (
+                "Agent",
+                "toolu_dirty",
+                {
+                    "description": "review",
+                    "prompt": DIRTY_REVIEW,
+                    "subagent_type": "general-purpose",
+                },
+            ),
+            (
+                "Agent",
+                "toolu_clean",
+                {
+                    "description": "review",
+                    "prompt": CLEAN_REVIEW,
+                    "subagent_type": "general-purpose",
+                },
+            ),
+        ]
+    )
+
+    async def respond(request: web.Request) -> web.StreamResponse:
+        body = await request.json()
+        if START_TEXT not in _first_user_text(body):
+            reviewers.append(json.dumps(body))
+            return await _messages_from(request, body)
+        return await main(_Replayed(request, body))
+
+    return respond
+
+
+class _Replayed:
+    """The request again, for a handler that reads its JSON body once more."""
+
+    def __init__(self, request: web.Request, body: dict[str, Any]) -> None:
+        self._request = request
+        self._body = body
+        self.app = request.app
+
+    async def json(self) -> dict[str, Any]:
+        return self._body
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._request, name)
+
+
+def _carries_pin(dumped: str) -> bool:
+    return any(json.dumps(line)[1:-1] in dumped for line in LINES)
+
+
+@requires_cli
+@pytest.mark.parametrize("mounted", [True, False], ids=["guard-mounted", "guard-removed"])
+def test_the_booted_runner_refuses_a_reviewer_call_carrying_the_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mounted: bool
+) -> None:
+    if not mounted:
+        # Control: without the production mount the same call reaches a reviewer,
+        # so the observation below would see a leak.
+        monkeypatch.setattr(boot, "build_subagent_guard", lambda _gate: {})
+    reviewers: list[str] = []
+
+    booted = _boot_run(tmp_path, monkeypatch, VALID, handler=_reviewer_script(reviewers))
+
+    assert booted.ack == {"acknowledgment": _ack("applied", sha256=DIGEST)}
+    assert "Agent" in _tool_names(booted.bodies[0])
+    results = _tool_results(booted.bodies[-1])
+    # The clean call reaches its reviewer in both boots.
+    assert any("REVIEW-CONTROL-3f9a" in body for body in reviewers)
+    assert not results["toolu_clean"].get("is_error")
+    leaked = [body for body in reviewers if _carries_pin(body)]
+    if mounted:
+        assert results["toolu_dirty"].get("is_error") is True
+        assert leaked == []
+    else:
+        assert leaked, "the unguarded control never delivered the pin to a reviewer"
