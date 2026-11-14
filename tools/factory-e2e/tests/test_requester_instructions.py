@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import personal_owner_enforcement as pod
@@ -1010,6 +1012,181 @@ def test_reviewer_evidence_must_be_seen_and_clean() -> None:
 # --------------------------------------------------------------------------
 # Forge cleanup bookkeeping
 # --------------------------------------------------------------------------
+
+
+def _live_proof(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    args = _live_args(tmp_path)
+    ledger = _ledger(tmp_path)
+    flags = pod.flags_of(args)
+    inputs = poe.InputFile(str(tmp_path / "kubeconfig"), "/bin/true", "192.0.2.1")
+    env = poe.child_env(os.environ, flags=flags, inputs=inputs, evidence_dir=tmp_path / "evidence")
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "CURIE_CREDENTIALS", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    scrubber = pps.Scrubber()
+    scan = pps.TokenScan(scrubber, ("stdout", "stderr", "children", "http"))
+    runtime = pod.Runtime(env, pod.Output(scrubber, scan), scrubber, scan)
+    ctx = pod.ChildContext("rehearse", flags, inputs, "", "", ledger, runtime)
+    proof = driver.requester_proof_class(pod.load_enrollment())(ctx, driver.LiveInputs(args))
+    proof.retained_dir = tmp_path / "retained"
+    proof.retained_dir.mkdir(mode=0o700)
+    return proof
+
+
+def _pod_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, leak: bool) -> Any:
+    executable = tmp_path / "kubectl"
+    executable.write_text(
+        f"#!{sys.executable}\nimport os,sys\n"
+        "os.execv(sys.executable, [sys.executable, *sys.argv[sys.argv.index('--')+2:]])\n"
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    proof = _live_proof(tmp_path, monkeypatch)
+    document = ris.make_document("owner", NONCE)
+    proof.documents["owner"] = document
+    root = _transcripts(
+        tmp_path / "pod",
+        document,
+        leak=leak,
+        calls=tuple(_call("plan", "plan-reviewer") + _call("diff", "diff-reviewer")),
+    )
+    monkeypatch.setattr(driver, "TRANSCRIPT_ROOTS", (str(root),))
+    proof.namespace_uid = "owned-namespace"
+
+    class Core:
+        deleted = False
+
+        def read_namespace(self, *args: Any, **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                metadata=SimpleNamespace(
+                    uid=proof.namespace_uid, labels={"curie-proof-owner": proof.ownership}
+                )
+            )
+
+        def list_namespaced_pod(self, *args: Any, **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                items=[] if self.deleted else [{"metadata": {"name": "proof-runner"}}]
+            )
+
+        def delete_namespaced_pod(self, *args: Any, **kwargs: Any) -> None:
+            self.deleted = True
+            shutil.rmtree(root, ignore_errors=True)
+
+    from kubernetes.client import ApiClient
+
+    proof.api_client = ApiClient()
+    proof.core = Core()
+    proof.custom = SimpleNamespace(list_namespaced_custom_object=lambda *a, **kw: {"items": []})
+    return proof, root
+
+
+@pytest.mark.parametrize("leak", [False, True])
+def test_live_fence_retains_transcripts_that_can_be_regraded_after_pod_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leak: bool
+) -> None:
+    proof, root = _pod_fixture(tmp_path, monkeypatch, leak=leak)
+    originals = sorted(path.read_bytes() for path in root.rglob("*.jsonl"))
+    try:
+        proof.fence_step()
+        assert proof.core.deleted and not root.exists()
+        retained = proof.retained_dir / "transcripts"
+        files = list(retained.rglob("*.jsonl"))
+        assert sorted(path.read_bytes() for path in files) == originals
+        assert all(path.stat().st_mode & 0o077 == 0 for path in files)
+        assert all(
+            path.stat().st_mode & 0o077 == 0 for path in retained.rglob("*") if path.is_dir()
+        )
+        code, out = _run(
+            ris.REVIEWER_SCAN_PROGRAM,
+            "20",
+            str(retained),
+            stdin=json.dumps(proof.documents["owner"].needles()).encode(),
+        )
+        scan = ris.reviewer_scan_result(code, out)
+        assert scan.error is None and scan.hits == int(leak)
+        assert scan.roles == ("diff-reviewer", "plan-reviewer")
+    finally:
+        proof.api_client.close()
+        proof.ctx.ledger.close()
+
+
+def test_live_transcript_capture_failure_still_deletes_pods(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proof, root = _pod_fixture(tmp_path, monkeypatch, leak=False)
+    shutil.rmtree(root)
+    try:
+        with pytest.raises(poe.StepFailed, match="transcript"):
+            proof.fence_step()
+        assert proof.core.deleted
+    finally:
+        proof.api_client.close()
+        proof.ctx.ledger.close()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"transcripts": {"../escaped.jsonl": "e30K"}},
+        {"transcripts": {"0/session.jsonl": "not base64"}},
+    ],
+)
+def test_transcript_retention_refuses_unusable_or_escaping_capture(
+    tmp_path: Path, body: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError, match="could not be retained"):
+        ris.retain_transcripts(json.dumps(body).encode(), tmp_path / "retained")
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
+@pytest.mark.parametrize("failed_inventory", ["pulls", "branches"])
+def test_live_cleanup_inventory_failure_cannot_be_judged_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_inventory: str
+) -> None:
+    proof = _live_proof(tmp_path, monkeypatch)
+    actions: list[tuple[str, str]] = []
+
+    class Forge:
+        def owned_pulls(self, prefix: str) -> list[Any]:
+            if failed_inventory == "pulls":
+                raise OSError("fixture unavailable")
+            return []
+
+        def owned_branches(self, prefix: str) -> list[str]:
+            if failed_inventory == "branches":
+                raise OSError("fixture unavailable")
+            return ["refs/heads/rqp-owned"]
+
+        def repo_path(self, path: str) -> str:
+            return path
+
+        def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+            actions.append((method, path))
+            return (200, {"state": "closed"}) if "/issues/" in path else (404, None)
+
+        def revoke(self) -> None:
+            actions.append(("revoke", ""))
+
+    proof.forge = Forge()
+    proof.created_issues.append("7")
+    proof.ctx.ledger.finish("completed", T0 + 10)
+    try:
+        with pytest.raises(poe.StepFailed, match="inventory"):
+            proof.forge_step()
+        assert ("PATCH", "/issues/7") in actions
+        assert ("revoke", "") in actions
+        rows = proof.ctx.ledger.cleanup_rows()
+        assert any(
+            row["kind"] == f"forge_{failed_inventory}" and row["status"] == "present"
+            for row in rows
+        )
+        clean = _passing_record("10")
+        result = ris.judge([_passing_record("10", cleanup=[*clean.cleanup, *rows])], "10")
+        assert result["verdict"] == "fail"
+    finally:
+        proof.ctx.ledger.close()
 
 
 def test_forge_cleanup_rows_count_only_confirmed_removals() -> None:

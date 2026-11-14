@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import http.client
 import json
 import os
@@ -930,6 +931,7 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                     "-c",
                     ris.REVIEWER_SCAN_PROGRAM,
                     str(ris.GATE_DEADLINE_SECONDS),
+                    "--retain",
                     *TRANSCRIPT_ROOTS,
                 ),
                 data=json.dumps(ris.needles_of(self.documents.values())).encode(),
@@ -937,7 +939,32 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 check=False,
                 retain_output=False,
             )
+            assert self.retained_dir is not None
+            directory = self.retained_dir / "transcripts"
+            directory.mkdir(mode=0o700, exist_ok=True)
+            pod_directory = directory / hashlib.sha256(pod_name.encode()).hexdigest()[:16]
+            try:
+                ris.retain_transcripts(result.stdout, pod_directory)
+            except ValueError:
+                raise poe.StepFailed("session transcripts could not be retained") from None
             return ris.reviewer_scan_result(result.returncode, result.stdout)
+
+        def fence(self) -> None:
+            failures: list[str] = []
+            try:
+                self.stop_worker()
+                if self.live_inputs is not None and self.core is not None and self.owns_namespace():
+                    for pod_info in self.runner_pods():
+                        try:
+                            scan = self.scan_reviewers(pod_info["metadata"]["name"])
+                            if scan.error is not None:
+                                failures.append("incomplete")
+                        except Exception:  # noqa: BLE001 - capture all Pods before deleting any
+                            failures.append("unreadable")
+            finally:
+                super().fence()
+            if failures:
+                raise poe.StepFailed("session transcript capture was incomplete before teardown")
 
         def on_native_start(self, ref: str, now: float) -> None:
             if self.live_inputs is None:
@@ -1044,6 +1071,8 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 )
                 files = [row for row in listed or [] if isinstance(row, dict)]
             self.sweep()
+            for uid, state in self.pod_states.items():
+                self.slot_scans.setdefault(slot, {})[uid] = self.scan_reviewers(str(state["pod"]))
             self.slot = None
             row = self.work_item_row(item)
             recorded = next(r for r in self.ctx.ledger.slots() if r["slot"] == slot)
@@ -1083,21 +1112,30 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                     self.ctx.ledger.record_cleanup(kind, ref, status, "", now)
                 return
             branches: dict[str, bool | None] = {}
-            with contextlib.suppress(Exception):
-                for pull in self.forge.owned_pulls(self.branch_prefix):
+            unreadable: list[str] = []
+            try:
+                pulls = list(self.forge.owned_pulls(self.branch_prefix))
+                for pull in pulls:
                     number = int(pull["number"])
                     if number not in self.created_pulls:
                         self.created_pulls.append(number)
+            except Exception:  # noqa: BLE001 - retain a failed inventory and finish cleanup
+                unreadable.append("forge_pulls")
             for number in self.created_pulls:
                 with contextlib.suppress(Exception):
                     self.forge.request(
                         "PATCH", self.forge.repo_path(f"/pulls/{number}"), {"state": "closed"}
                     )
-            with contextlib.suppress(Exception):
-                for ref in self.forge.owned_branches(self.branch_prefix):
-                    name = ref.removeprefix("refs/heads/")
+            try:
+                branches = {
+                    ref.removeprefix("refs/heads/"): None
+                    for ref in self.forge.owned_branches(self.branch_prefix)
+                }
+            except Exception:  # noqa: BLE001 - retain a failed inventory and finish cleanup
+                unreadable.append("forge_branches")
+            for name in branches:
+                with contextlib.suppress(Exception):
                     self.forge.request("DELETE", self.forge.repo_path(f"/git/refs/heads/{name}"))
-                    branches[name] = None
             for issue in self.created_issues:
                 with contextlib.suppress(Exception):
                     self.forge.request(
@@ -1136,7 +1174,11 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
             )
             for kind, ref, status in rows:
                 self.ctx.ledger.record_cleanup(kind, ref, status, "", now)
+            for kind in unreadable:
+                self.ctx.ledger.record_cleanup(kind, "inventory", "present", "unreadable", now)
             self.forge.revoke()
+            if unreadable:
+                raise poe.StepFailed("the fixture cleanup inventory could not be read")
 
         def register_teardown(self, finalizer: poe.Finalizer) -> None:
             if self.live_inputs is not None:
