@@ -1702,6 +1702,19 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     None => bundle_dir(namespace, release, agent),
                     Some(dir) => dir.clone(),
                 };
+                lines.extend(
+                    agent_settings(
+                        agent,
+                        context,
+                        namespace,
+                        release,
+                        *deadline_seconds,
+                        *budget_usd,
+                        *output_tokens,
+                    )
+                    .into_iter()
+                    .map(|(args, _)| format!("curie {}", args.join(" "))),
+                );
                 for args in deploy_args(
                     context,
                     namespace,
@@ -1719,19 +1732,6 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 for repo in bound {
                     lines.push(skip_bound_line(agent, repo));
                 }
-                lines.extend(
-                    agent_settings(
-                        agent,
-                        context,
-                        namespace,
-                        release,
-                        *deadline_seconds,
-                        *budget_usd,
-                        *output_tokens,
-                    )
-                    .into_iter()
-                    .map(|(args, _)| format!("curie {}", args.join(" "))),
-                );
             }
         }
     }
@@ -1838,7 +1838,8 @@ fn bundle_line(bundle: Option<&Path>, runner_image: Option<&str>) -> String {
 }
 
 /// The `cluster overrides`, `publication-policy` and `budget` argvs that
-/// follow a deploy, each with its progress step.
+/// precede a bundle upload, each with its progress step. The upload refuses
+/// a tracker-result bundle while publication policy is still `approve`.
 fn agent_settings(
     agent: &str,
     context: &str,
@@ -2308,10 +2309,157 @@ pub fn credit_check_key(
     explicit.or(if release_has_real_model { None } else { saved })
 }
 
+/// The model base URL name the worker reads. Quickstart has no flag for it.
+const MODEL_BASE_URL_ENV: &str = "CURIE_MODEL_BASE_URL";
+/// Exact host the server treats as OpenRouter. A subdomain is a different host.
+const OPENROUTER_HOST: &str = "openrouter.ai";
+/// Where a release can record the model base URL. The chart has no
+/// first-class field; operators set this name in extraEnv.
+const RELEASE_MODEL_BASE_POINTERS: [&str; 2] =
+    ["/worker/extraEnv", "/agentSandbox/runner/extraEnv"];
+
+/// Explicit model base URLs quickstart could read, plus whether one was
+/// named without a value it could read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelEndpoints {
+    pub urls: Vec<String>,
+    /// A recorded name had no readable value, such as a valueFrom entry.
+    /// That skips the probe for every key.
+    pub unreadable: bool,
+    /// Helm failed while reading the release. The recorded endpoint is then
+    /// unknown. An OpenRouter key may still be probed; every other key is not.
+    pub release_read_failed: bool,
+}
+
+/// The pre-deploy credit read, or a static reason it was not attempted.
+/// The reason names no URL and no credential.
+#[derive(Debug, PartialEq)]
+pub enum QuickstartCredit {
+    Balance(Option<f64>),
+    NotChecked(&'static str),
+}
+
+/// Reads OpenRouter credit for a quickstart deploy, or reports why it did not.
+///
+/// A request is made only when `key` is not an Anthropic credential and every
+/// explicit model base URL has host `openrouter.ai`, or when no base URL is
+/// set and `key` starts with `sk-or-`. An Anthropic credential, including an
+/// OAuth token, is never sent, whatever host is recorded. A name whose value
+/// cannot be read skips every key. A failed release read skips every key that
+/// is not `sk-or-`. `CURIE_OPENROUTER_API_URL` redirects an allowed request.
+/// It is not a model endpoint, and it never authorizes a probe on its own.
+/// Any other case returns [`QuickstartCredit::NotChecked`] and makes no request.
+pub async fn read_quickstart_openrouter_credit(
+    key: &str,
+    endpoints: &ModelEndpoints,
+) -> Result<QuickstartCredit> {
+    if let Some(reason) = credit_skip_reason(key, endpoints) {
+        return Ok(QuickstartCredit::NotChecked(reason));
+    }
+    Ok(QuickstartCredit::Balance(
+        crate::openrouter_credit::remaining_credit_usd(key).await?,
+    ))
+}
+
+fn credit_skip_reason(key: &str, endpoints: &ModelEndpoints) -> Option<&'static str> {
+    // The runner refuses to forward an Anthropic credential, including an
+    // OAuth token, to a third-party endpoint. An OpenRouter host does not
+    // authorize sending that credential.
+    if key.starts_with("sk-ant-") {
+        return Some("the credential is for Anthropic");
+    }
+    if endpoints.unreadable {
+        return Some("the model endpoint is set but its host could not be read");
+    }
+    // A failed release read hides the endpoint the install recorded. Only an
+    // OpenRouter key may still be probed, and only by the rules below.
+    if endpoints.release_read_failed && !key.starts_with("sk-or-") {
+        return Some("the model endpoint is set but its host could not be read");
+    }
+    if endpoints.urls.is_empty() {
+        if key.starts_with("sk-or-") {
+            return None;
+        }
+        return Some("the model endpoint is not known to be OpenRouter");
+    }
+    for url in &endpoints.urls {
+        match model_base_host(url) {
+            Some(host) if host == OPENROUTER_HOST => {}
+            Some(_) => return Some("the model endpoint is not OpenRouter"),
+            None => return Some("the model endpoint is set but its host could not be read"),
+        }
+    }
+    None
+}
+
+fn model_base_host(raw: &str) -> Option<String> {
+    let host = reqwest::Url::parse(raw.trim())
+        .ok()?
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+fn collect_release_model_bases(endpoints: &mut ModelEndpoints, values: &serde_json::Value) {
+    for pointer in RELEASE_MODEL_BASE_POINTERS {
+        let Some(entries) = values
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for entry in entries {
+            if entry.get("name").and_then(serde_json::Value::as_str) != Some(MODEL_BASE_URL_ENV) {
+                continue;
+            }
+            match entry.get("value").and_then(serde_json::Value::as_str) {
+                Some(value) if !value.trim().is_empty() => {
+                    endpoints.urls.push(value.trim().to_string());
+                }
+                _ => endpoints.unreadable = true,
+            }
+        }
+    }
+}
+
+/// `CURIE_MODEL_BASE_URL` in this process, then the same name in the release
+/// the deploy targets. A missing release contributes nothing. A failed release
+/// read is recorded so the probe is skipped unless the key is `sk-or-`.
+pub async fn deployment_model_endpoints(namespace: &str, release: &str) -> ModelEndpoints {
+    let mut endpoints = ModelEndpoints::default();
+    if let Ok(value) = std::env::var(MODEL_BASE_URL_ENV) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            endpoints.urls.push(trimmed.to_string());
+        }
+    }
+    let common = CommonOpts {
+        namespace: namespace.to_string(),
+        release: release.to_string(),
+        dry_run: false,
+    };
+    match crate::ops::fetch_release_values(&common).await {
+        Ok(Some(values)) => collect_release_model_bases(&mut endpoints, &values),
+        Ok(None) => {}
+        Err(_) => endpoints.release_read_failed = true,
+    }
+    endpoints
+}
+
 /// Warns before deploy when the model credential has less OpenRouter credit
 /// than one factory run needs, because a reviewer refused for credit ends the
 /// run (#3935). Never fails the command; returns the credit left when known.
-async fn check_credit(release_has_real_model: bool) -> Option<f64> {
+///
+/// The credential is sent only to OpenRouter, and only when the deployment
+/// endpoint is OpenRouter and the credential is not an Anthropic key. A failed
+/// release read skips the probe unless the key is an OpenRouter key. Every
+/// other case prints why credit was not checked and makes no request.
+async fn check_credit(opts: &QuickstartOpts, release_has_real_model: bool) -> Option<f64> {
     let ui = crate::ui::ui();
     let key = match credit_check_key(
         crate::ops::explicit_model_credential_env(),
@@ -2328,11 +2476,13 @@ async fn check_credit(release_has_real_model: bool) -> Option<f64> {
             return None;
         }
     };
-    if key.starts_with("sk-ant-") {
-        return None;
-    }
-    match crate::openrouter_credit::remaining_credit_usd(&key).await {
-        Ok(Some(left)) => {
+    let endpoints = deployment_model_endpoints(&opts.namespace, &opts.release).await;
+    match read_quickstart_openrouter_credit(&key, &endpoints).await {
+        Ok(QuickstartCredit::NotChecked(reason)) => {
+            ui.note(&format!("OpenRouter credit not checked: {reason}"));
+            None
+        }
+        Ok(QuickstartCredit::Balance(Some(left))) => {
             if left < RUN_CREDIT_USD {
                 ui.warn(&format!(
                     "OpenRouter credit left: {left:.2} USD, below the {} USD one factory run needs. The reviewers run {REVIEWER_MODEL}. Add credit at https://openrouter.ai/settings/credits before labelling an issue.",
@@ -2341,7 +2491,7 @@ async fn check_credit(release_has_real_model: bool) -> Option<f64> {
             }
             Some(left)
         }
-        Ok(None) => {
+        Ok(QuickstartCredit::Balance(None)) => {
             ui.note("OpenRouter credit not checked: the key has no limit and the account balance is not readable");
             None
         }
@@ -3140,11 +3290,11 @@ mod tests {
             "configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
             "create agent dark-factory only if absent, with initial surface github=acme/widgets and the tracker default label; preserve an existing agent".to_string(),
-            format!("curie cluster deploy --context {KIND_CONTEXT} --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
-            format!("curie cluster surfaces dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --add github=acme/widgets"),
             format!("curie cluster overrides dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --execution-deadline 10800"),
             format!("curie cluster publication-policy dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --policy auto"),
             format!("curie cluster budget dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --limit 5 --output-tokens 250000"),
+            format!("curie cluster deploy --context {KIND_CONTEXT} --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
+            format!("curie cluster surfaces dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --add github=acme/widgets"),
         ];
         assert_eq!(lines, expected);
         let ready = QuickstartOutput::Ready {
@@ -3539,11 +3689,11 @@ mod tests {
         }
         let order: Vec<usize> = [
             "configure agentSandbox.runnerEnv.dark-factory-fast.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000",
-            "cluster deploy",
-            "cluster surfaces dark-factory-fast",
             "cluster overrides dark-factory-fast",
             "cluster publication-policy dark-factory-fast",
             "cluster budget dark-factory-fast",
+            "cluster deploy",
+            "cluster surfaces dark-factory-fast",
         ]
         .iter()
         .map(|needle| {
