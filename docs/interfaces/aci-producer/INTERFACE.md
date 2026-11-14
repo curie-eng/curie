@@ -102,7 +102,10 @@ NDJSON discriminated union `OutboundEvent` (`packages/aci-protocol/src/aci_proto
 `TextDelta` (`packages/aci-protocol/src/aci_protocol/events.py::TextDelta`, `text_delta`),
 `ToolNote` (`packages/aci-protocol/src/aci_protocol/events.py::ToolNote`, `tool_note`),
 `Final` (`packages/aci-protocol/src/aci_protocol/events.py::Final`, `final` + `status`),
-`ErrorEvent` (`packages/aci-protocol/src/aci_protocol/events.py::ErrorEvent`, `error` + `classification`),
+`ErrorEvent` (`packages/aci-protocol/src/aci_protocol/events.py::ErrorEvent`, `error` + `classification`
+and an optional `retry_condition`, the `RetryCondition` in
+`packages/aci-protocol/src/aci_protocol/events.py::RetryCondition` that carries provider-derived
+evidence for a wait; missing or null means no trusted retry condition),
 `SideEffectFlag` (`packages/aci-protocol/src/aci_protocol/events.py::SideEffectFlag`, `side_effect_flag`). Every
 outbound event carries `version` equal to the producer's exact build `PROTOCOL_VERSION`; a consumer
 accepts any `major.minor`-compatible version under 0.x (`major` after 1.0). Inbound frames are the

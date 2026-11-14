@@ -13,8 +13,9 @@ describingly. Outbound events are a discriminated union on ``type``; every
 outbound event carries a ``version`` equal to PROTOCOL_VERSION.
 """
 
+import re
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
@@ -388,12 +389,161 @@ class Final(_OutboundBase):
     text_mode: Literal["verbatim"] | None = None
 
 
+class RetryReason(StrEnum):
+    """Why a provider asked the platform to wait before another attempt.
+
+    Carried only inside ``RetryCondition``. Each value names the provider's
+    signal, not a platform decision: ``rate_limited`` is a request rate limit,
+    ``usage_reset`` is a usage allowance that resets at a provider time,
+    ``credit_exhausted`` is a spent credit balance, ``credential_rejected`` is
+    a credential the provider refused, and ``transient_service`` is a temporary
+    provider service failure. These are deliberately not the hyphenated
+    ``ErrorEvent.classification`` tokens, and neither vocabulary maps onto the
+    other.
+
+    A closed enum, not free text: an unknown value is refused on the wire,
+    never read as an absent condition. Adding a value is a breaking change
+    under ADR 0036.
+    """
+
+    RATE_LIMITED = "rate_limited"
+    USAGE_RESET = "usage_reset"
+    CREDIT_EXHAUSTED = "credit_exhausted"
+    CREDENTIAL_REJECTED = "credential_rejected"
+    TRANSIENT_SERVICE = "transient_service"
+
+
+#: The only wire spelling of ``RetryCondition.scope_key``: an opaque SHA-256
+#: digest of a credential scope. ``[0-9a-f]`` (not ``\w``) so the pattern means
+#: the same thing in Python, in the exported JSON Schema and in the Rust guard.
+RETRY_SCOPE_KEY_PATTERN: TypingFinal = r"^sha256:[0-9a-f]{64}$"
+
+#: The only wire spelling of ``RetryCondition.retry_at``: RFC 3339 with an
+#: uppercase ``T``, required seconds, at most six fractional digits and the
+#: ``Z`` designator. Matched with ``fullmatch`` so the trailing newline the
+#: ``$`` anchor would tolerate in Python is refused, as it is in the Rust guard.
+RETRY_AT_PATTERN: TypingFinal = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z$"
+)
+
+_RETRY_AT_RE = re.compile(RETRY_AT_PATTERN)
+
+# The exported schema branch is ``{"type": "string", "format": "date-time",
+# "pattern": RETRY_AT_PATTERN}``; the validators below enforce the same grammar.
+_UtcRetryAt = Annotated[datetime, Field(json_schema_extra={"pattern": RETRY_AT_PATTERN})]
+
+# Refusal texts name the rule and never quote the refused value.
+_RETRY_AT_GRAMMAR_ERROR = (
+    "retry_at must be an RFC 3339 UTC timestamp spelled YYYY-MM-DDTHH:MM:SS[.ffffff]Z"
+)
+_RETRY_AT_OFFSET_ERROR = "retry_at must be a timezone-aware datetime with a zero UTC offset"
+_RETRY_AT_CALENDAR_ERROR = "retry_at names an impossible calendar date or time"
+
+
+def _parse_retry_at(value: str) -> datetime:
+    """Build the UTC instant a grammar-checked ``retry_at`` string names.
+
+    The grammar has already fixed every character position, so plain slicing
+    is exact. ``datetime`` refuses impossible calendar values (year zero, a day
+    past the end of its month, hour 24, a leap second), which is the same
+    calendar check the generated Rust guard applies, so both lanes refuse the
+    same strings.
+    """
+
+    fraction = value[20:-1]
+    try:
+        return datetime(
+            int(value[0:4]),
+            int(value[5:7]),
+            int(value[8:10]),
+            int(value[11:13]),
+            int(value[14:16]),
+            int(value[17:19]),
+            int(fraction.ljust(6, "0")) if fraction else 0,
+            tzinfo=UTC,
+        )
+    except ValueError:
+        raise ValueError(_RETRY_AT_CALENDAR_ERROR) from None
+
+
+class RetryCondition(_AciModel):
+    """Provider-derived evidence that a failed turn should wait before a retry.
+
+    Carried as ``ErrorEvent.retry_condition``. A missing or null carrier means
+    no trusted retry condition, and a consumer must never read that as retry
+    now. A present carrier is evidence for a wait. It is never authorization,
+    an approval, an increased limit, or permission to replay an effect: the
+    no-retry-after-side-effects rule and every other gate still apply.
+
+    ``reason`` is the closed ``RetryReason`` the producer derived from the
+    provider's own signal. Nothing infers a reset from
+    ``ErrorEvent.classification``; a classification token alone never creates
+    a retry condition.
+
+    ``retry_at`` is optional. When present it is an absolute, provider-derived
+    UTC instant spelled as ``RETRY_AT_PATTERN`` describes. Naive values,
+    numeric offsets (``+00:00`` included), unix numbers and every other
+    spelling are refused rather than coerced, so every lane reads the same
+    instant. A past instant is valid; consumers judge time themselves. The
+    scheduler adds its own separate 60 second reset grace; the producer reports
+    the provider's time without it. A Python ``datetime`` is accepted only with
+    a zero UTC offset and is normalized to ``UTC``, so every Python producer
+    writes the ``Z`` form. Python also normalizes the fraction spelling on
+    re-encode (``.5Z`` becomes ``.500000Z`` and a zero fraction is dropped)
+    while the generated Rust keeps the received string; both name the same
+    instant.
+
+    ``scope_key`` is optional. When present it is an opaque digest of the
+    credential scope the condition applies to, ``sha256:`` followed by 64
+    lowercase hex digits (``RETRY_SCOPE_KEY_PATTERN``). It is never a
+    credential value, an account name or a provider message. The grammar check
+    is the only guard on it and is not a secret detector, so a producer must
+    derive the value from a digest rather than rely on validation to catch a
+    leak.
+    """
+
+    reason: RetryReason
+    retry_at: _UtcRetryAt | None = None
+    scope_key: str | None = Field(default=None, pattern=RETRY_SCOPE_KEY_PATTERN)
+
+    @field_validator("retry_at", mode="before")
+    @classmethod
+    def _require_utc_retry_at(cls, value: object) -> datetime | None:
+        # Runs before pydantic's lax datetime parsing, which would otherwise
+        # accept unix numbers, a space separator, lowercase designators,
+        # missing seconds, naive values and silently truncated fractions.
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.utcoffset() != timedelta(0):
+                raise ValueError(_RETRY_AT_OFFSET_ERROR)
+            return value
+        if isinstance(value, str) and _RETRY_AT_RE.fullmatch(value):
+            return _parse_retry_at(value)
+        raise ValueError(_RETRY_AT_GRAMMAR_ERROR)
+
+    @field_validator("retry_at")
+    @classmethod
+    def _normalize_retry_at_to_utc(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else value.astimezone(UTC)
+
+
 class ErrorEvent(_OutboundBase):
-    """A classified failure surfaced to the platform."""
+    """A classified failure surfaced to the platform.
+
+    ``message`` and ``classification`` keep their existing meaning, and the
+    classification token vocabulary is unchanged.
+
+    ``retry_condition`` is optional provider-derived evidence for a wait (see
+    ``RetryCondition``). Missing or null means no trusted retry condition, never
+    retry now. A malformed present carrier fails the whole frame on decode
+    rather than degrading to null. A reader that predates the field ignores it.
+    """
 
     type: Literal["error"] = "error"
     message: str
     classification: str | None = None
+    retry_condition: RetryCondition | None = None
 
 
 class SideEffectFlag(_OutboundBase):

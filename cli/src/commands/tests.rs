@@ -1768,6 +1768,7 @@ fn a_skill_trial_records_tools_in_order_and_why_an_incomplete_turn_failed() {
             version: PROTOCOL_VERSION.into(),
             message: "upstream timed out".into(),
             classification: None,
+            retry_condition: None,
         },
     ];
     let scored = crate::evals::score_turn(&case, &events, false, None);
