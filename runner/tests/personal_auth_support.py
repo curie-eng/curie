@@ -33,7 +33,6 @@ import datetime
 import hashlib
 import json
 import os
-import shutil
 import ssl
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -57,9 +56,10 @@ from curie_runner.sdk_auth import resolve_sdk_env
 from curie_runner.session import SessionRunner
 from curie_runner.side_effects import CLAUDE_READONLY_TOOLS
 from curie_runner.tool_access import TurnToolAccess, front_pre_tool_use_hooks
+from sdk_cli_support import sdk_cli_available
 
 BUNDLED_CLI = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
-CLI_AVAILABLE = BUNDLED_CLI.is_file() or shutil.which("claude") is not None
+CLI_AVAILABLE = sdk_cli_available()
 requires_cli = pytest.mark.skipif(
     not CLI_AVAILABLE, reason="requires the Claude Code CLI the SDK spawns"
 )
