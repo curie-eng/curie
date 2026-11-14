@@ -25,12 +25,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import anyio
-from claude_agent_sdk import HookMatcher
 from curie_internal.requester_coding_instructions import (
     ENVELOPE_VERSION,
     FORMAT_VERSION,
@@ -359,13 +358,17 @@ def _strings(value: Any) -> Iterator[str]:
         yield json.dumps(value, default=str)
 
 
-def build_subagent_guard(gate: RequesterContextGate) -> dict[str, list[HookMatcher]]:
-    """The in-process PreToolUse matcher for ``Agent`` and ``Task`` calls.
+SUBAGENT_TOOLS = "Agent|Task"
 
-    Fails closed: a guard that cannot decide refuses the call.
+
+def subagent_guard(gate: RequesterContextGate) -> Callable[..., Awaitable[dict[str, Any]]]:
+    """The PreToolUse callback for ``Agent`` and ``Task`` calls.
+
+    Fails closed: a guard that cannot decide refuses the call. The Claude
+    harness mounts it (``harness/claude/requester_guard.py``).
     """
 
-    async def guard(hook_input: Any, _tool_use_id: str | None, _ctx: Any) -> Any:
+    async def guard(hook_input: Any, _tool_use_id: str | None, _ctx: Any) -> dict[str, Any]:
         try:
             applied = gate.applied
             if applied is None:
@@ -378,7 +381,7 @@ def build_subagent_guard(gate: RequesterContextGate) -> dict[str, list[HookMatch
         except Exception:  # noqa: BLE001 - the guard denies on its own failure
             return _deny(_SUBAGENT_REFUSAL)
 
-    return {"PreToolUse": [HookMatcher(matcher="Agent|Task", hooks=[guard])]}
+    return guard
 
 
 def private_fragments(applied: Applied | None) -> tuple[str, ...]:

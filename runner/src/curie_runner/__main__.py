@@ -90,6 +90,7 @@ from .harness.claude.approval import (
 from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
+from .harness.claude.requester_guard import build_subagent_guard
 from .harness.claude.tracker_result_tool import wrap_tracker_result_handler
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
@@ -155,7 +156,7 @@ from .publication_precheck import PublicationPrecheck
 from .redact import collect_held_secrets, install_stdout_redaction, register_held_secrets
 from .requester_context import BLOCKED_EXPLANATION as REQUESTER_BLOCKED_EXPLANATION
 from .requester_context import Failed as RequesterFailed
-from .requester_context import RequesterContextGate, attach_gate, build_subagent_guard
+from .requester_context import RequesterContextGate, attach_gate
 from .route_callers import (
     connector_urls,
     mount_route_callers,

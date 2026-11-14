@@ -40,7 +40,7 @@ SDK imports. Its Claude permission callback and hook adapter live at
 `approval.py`, `translate.py`,
 `plugin.py`, `state.py`, `progress.py`, `turn_progress.py`, `issue_read.py`,
 `usage_report.py`, `tool_access.py`, `__main__.py`, `platform_slack.py`,
-`attachment_access.py`, `tracker_result_tool.py`, `requester_context.py`). In that
+`attachment_access.py`, `tracker_result_tool.py`, `requester_guard.py`). In that
 inventory, `approval.py` means `runner/src/curie_runner/harness/claude/approval.py`
 and `platform_slack.py` means
 `runner/src/curie_runner/harness/claude/platform_slack.py`, and
