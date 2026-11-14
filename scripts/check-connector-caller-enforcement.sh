@@ -19,6 +19,21 @@
 #   5. A token for an agent the connector does not admit gets the 403 that
 #      says `not_admitted`.
 #
+# Then, across the namespace, the grant store credential (#5550):
+#
+#   6. The Valkey password, read from the Secret behind the API's own
+#      VALKEY_PASSWORD and never printed, is not empty and appears in no
+#      Deployment, no Pod and no ReplicaSet with replicas above zero, and every
+#      connector's caller proxy reads it by secretKeyRef from that Secret and
+#      key. A superseded ReplicaSet at zero replicas that still holds the old
+#      literal is reported, not failed: only rotating the password clears it.
+#   7. Inside each connector's caller proxy container, the production config
+#      loader (ProxyConfig.from_env) spends one fresh grant id twice against
+#      the real Valkey: the first spend succeeds, the second is refused, and
+#      the grant key exists in the Valkey pod.
+#   8. The same spend with the password variable overridden to a wrong value,
+#      for that exec only, spends nothing and writes no key.
+#
 # A connector's direct Service (`<name>-direct`) fronts the same pods on the
 # server's port, which only an operator policy opens, so connectors are listed
 # by their name label and each is probed once.
@@ -235,5 +250,141 @@ done
 
 (( ADMITTED_LEGS > 0 )) \
   || fail "no connector admits an agent, so no admitted caller was proved to get through"
+
+# -- leg 6 --------------------------------------------------------------------
+# The password lives in a shell variable and reaches python3 only through its
+# environment. It is never echoed and never on an argv.
+API_DEPLOYMENT="$(kubectl -n "$NS" get deployment \
+  -l "app.kubernetes.io/component=api,app.kubernetes.io/instance=$RELEASE" \
+  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+[ -n "$API_DEPLOYMENT" ] && [ "${API_DEPLOYMENT// /}" = "$API_DEPLOYMENT" ] \
+  || fail "leg 6: expected one API Deployment for release $RELEASE in $NS, found '${API_DEPLOYMENT}'"
+VALKEY_REF="$(kubectl -n "$NS" get deployment "$API_DEPLOYMENT" \
+  -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].env[?(@.name=="VALKEY_PASSWORD")].valueFrom.secretKeyRef.name}{" "}{.spec.template.spec.containers[?(@.name=="api")].env[?(@.name=="VALKEY_PASSWORD")].valueFrom.secretKeyRef.key}' \
+  2>/dev/null || true)"
+read -r VALKEY_SECRET VALKEY_KEY <<<"$VALKEY_REF" || true
+[ -n "${VALKEY_SECRET:-}" ] && [ -n "${VALKEY_KEY:-}" ] \
+  || fail "leg 6: the API Deployment $API_DEPLOYMENT reads VALKEY_PASSWORD from no Secret"
+SECRET_JSON="$(kubectl -n "$NS" get secret "$VALKEY_SECRET" -o json 2>/dev/null)" \
+  || fail "leg 6: could not read Secret $VALKEY_SECRET"
+GRANT_STORE_PASSWORD="$(python3 -c '
+import base64, json, sys
+data = json.load(sys.stdin).get("data") or {}
+sys.stdout.write(base64.b64decode(data.get(sys.argv[1], "")).decode())
+' "$VALKEY_KEY" <<<"$SECRET_JSON")" \
+  || fail "leg 6: could not decode key $VALKEY_KEY of Secret $VALKEY_SECRET"
+unset SECRET_JSON
+[ -n "$GRANT_STORE_PASSWORD" ] \
+  || fail "leg 6: key $VALKEY_KEY of Secret $VALKEY_SECRET is empty, so no literal could be detected"
+WORKLOADS="$(kubectl -n "$NS" get deployments,pods,replicasets -o json 2>/dev/null)" \
+  || fail "leg 6: could not list the Deployments, Pods and ReplicaSets in $NS"
+LEG6="$(GRANT_STORE_PASSWORD="$GRANT_STORE_PASSWORD" python3 -c '
+import json, os, sys
+from urllib.parse import quote
+
+password = os.environ["GRANT_STORE_PASSWORD"]
+secret, key = sys.argv[1], sys.argv[2]
+needles = {password, json.dumps(password)[1:-1], quote(password, safe="")}
+proxies = 0
+for item in json.load(sys.stdin).get("items") or []:
+    kind = item.get("kind", "?")
+    name = item.get("metadata", {}).get("name", "?")
+    texts = (json.dumps(item), json.dumps(item, ensure_ascii=False))
+    if any(needle in text for needle in needles for text in texts):
+        replicas = (item.get("spec") or {}).get("replicas")
+        if kind == "ReplicaSet" and not replicas:
+            print(f"INFO {name}")
+        else:
+            print(f"FAIL {kind}/{name} holds the Valkey password")
+    if kind != "Deployment":
+        continue
+    containers = item["spec"]["template"]["spec"].get("containers") or []
+    for container in containers:
+        if container.get("name") != "caller-proxy":
+            continue
+        proxies += 1
+        entry = next(
+            (e for e in container.get("env") or []
+             if e.get("name") == "CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD"),
+            None,
+        )
+        ref = ((entry or {}).get("valueFrom") or {}).get("secretKeyRef") or {}
+        if ref.get("name") != secret or ref.get("key") != key:
+            print(f"FAIL Deployment/{name} caller-proxy does not read "
+                  f"CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD from Secret {secret} key {key}")
+        else:
+            print(f"OK Deployment/{name} caller-proxy reads the password from Secret {secret} key {key}")
+if not proxies:
+    print("FAIL no Deployment carries a caller-proxy container")
+' "$VALKEY_SECRET" "$VALKEY_KEY" <<<"$WORKLOADS")" \
+  || fail "leg 6: could not scan the workloads in $NS"
+unset WORKLOADS
+LEG6_FAILED=0
+while IFS= read -r line; do
+  case "$line" in
+    "FAIL "*) echo "FAIL: leg 6: ${line#FAIL }" >&2; LEG6_FAILED=1 ;;
+    "INFO "*) echo "  --  leg 6: superseded ReplicaSet ${line#INFO } still holds the old literal (replicas 0; rotate the Valkey password)" ;;
+    "OK "*) echo "  ok  leg 6: ${line#OK }" ;;
+  esac
+done <<<"$LEG6"
+(( LEG6_FAILED == 0 )) \
+  || fail "leg 6: the Valkey password is readable in a workload spec, or a caller proxy does not read it by reference"
+echo "  ok  leg 6: no Deployment, Pod or live ReplicaSet in $NS holds the Valkey password"
+
+# -- legs 7 and 8 -------------------------------------------------------------
+VALKEY_POD="$(kubectl -n "$NS" get pod \
+  -l "app.kubernetes.io/component=valkey,app.kubernetes.io/instance=$RELEASE" \
+  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+VALKEY_POD="${VALKEY_POD%% *}"
+[ -n "$VALKEY_POD" ] \
+  || fail "leg 7: found no Valkey pod for release $RELEASE in $NS, so a spent grant cannot be confirmed"
+
+# argv: the grant id, how many spends, then an optional password override that
+# applies to this exec only.
+SPEND_CODE='
+import os, sys
+from curie_connector_proxy.server import GRANT_STORE_PASSWORD_ENV, ProxyConfig
+
+env = dict(os.environ)
+if len(sys.argv) > 3:
+    env[GRANT_STORE_PASSWORD_ENV] = sys.argv[3]
+config = ProxyConfig.from_env(env)
+if config.grant_store is None:
+    raise SystemExit("no grant store is configured")
+for _ in range(int(sys.argv[2])):
+    print(config.grant_store.spend(sys.argv[1], 300))
+'
+
+grant_exists() {
+  kubectl -n "$NS" exec "$VALKEY_POD" -c valkey -- \
+    sh -c 'valkey-cli --no-auth-warning -a "$VALKEY_PASSWORD" exists "connector-grant:$1"' _ "$1" \
+    2>/dev/null || true
+}
+
+fresh_uuid() { python3 -c 'import uuid; print(uuid.uuid4())'; }
+
+for svc in "${CONNECTORS[@]}"; do
+  GRANT_ID="$(fresh_uuid)"
+  SPENT="$(kubectl -n "$NS" exec "deployment/$svc" -c caller-proxy -- \
+    python -c "$SPEND_CODE" "$GRANT_ID" 2 2>/dev/null || true)"
+  [ "$SPENT" = $'True\nFalse' ] \
+    || fail "leg 7: $svc's caller proxy spent a fresh grant as '${SPENT//$'\n'/,}', not True then False"
+  EXISTS="$(grant_exists "$GRANT_ID")"
+  [ "$EXISTS" = "1" ] \
+    || fail "leg 7: the grant $svc's caller proxy spent is not in Valkey pod $VALKEY_POD (exists answered '$EXISTS')"
+  echo "  ok  leg 7: $svc's caller proxy spends a fresh grant once against Valkey, and the key exists"
+
+  GRANT_ID="$(fresh_uuid)"
+  WRONG="wrong-$(fresh_uuid)"
+  SPENT="$(kubectl -n "$NS" exec "deployment/$svc" -c caller-proxy -- \
+    python -c "$SPEND_CODE" "$GRANT_ID" 1 "$WRONG" 2>/dev/null || true)"
+  [ "$SPENT" = "False" ] \
+    || fail "leg 8: $svc's caller proxy with a wrong password spent as '${SPENT//$'\n'/,}', not False"
+  EXISTS="$(grant_exists "$GRANT_ID")"
+  [ "$EXISTS" = "0" ] \
+    || fail "leg 8: a spend with a wrong password left a key in Valkey pod $VALKEY_POD (exists answered '$EXISTS')"
+  echo "  ok  leg 8: $svc's caller proxy with a wrong password spends nothing"
+done
+unset GRANT_STORE_PASSWORD
 
 echo "== every connector's caller proxy enforces =="
