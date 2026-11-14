@@ -965,9 +965,23 @@ record and find nothing.
 
 Spend is capped as precondition 5 requires: at most 3 slots, a 5 USD cap per
 model session (`DEFAULT_MAX_USD_PER_DAY`), and at most one continuation per
-slot (`CURIE_WORK_ITEM_MAX_TURNS=2`). The image's launch gate holds every
-native start until the driver releases it, and the driver releases at most two
-per labeled slot; any other start fences the run.
+slot. The image's launch gate holds every native start until the driver
+releases it, and the driver releases at most two per labeled slot; any other
+start fences the run. `CURIE_WORK_ITEM_MAX_TURNS=64` allows SDK tool calls
+within each session and does not set the continuation cap. The live template
+declares `ANTHROPIC_API_KEY` as its credential source and uses the live
+reviewer model. Before releasing a native start, the driver runs the SDK
+credential resolver inside that Pod and requires it to select the installed
+endpoint and key by comparing against digests of the supplied live inputs;
+personal-auth resolution is refused. Forge cleanup reads every page of a minimal
+pull request inventory and rejects unreadable or partial responses.
+
+Each native release records its PID and process start time. The runner's
+shutdown hook terminates those native writers and their descendants, waits
+for exit, and then archives their JSONL files to the owned object store before
+the Pod disappears. A writer that does not exit refuses the archive. The driver
+downloads the final bytes and scans them again, including reviewer completion records that a periodic
+scan can miss. A missing final archive refuses the slot.
 
 ### Judge
 

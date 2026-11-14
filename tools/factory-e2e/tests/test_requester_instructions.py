@@ -14,6 +14,7 @@ beyond a loopback socket, and every value is an obvious synthetic sentinel.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -861,6 +862,95 @@ def test_reviewer_scan_finds_a_leaked_preference(tmp_path: Path) -> None:
     assert scan.error is None and scan.hits == 1 and scan.records == 2
 
 
+@pytest.mark.parametrize("fault", ["no_roots", "empty", "symlink"])
+def test_transcript_upload_refuses_missing_or_escaping_inputs(tmp_path: Path, fault: str) -> None:
+    native = tmp_path / "native"
+    native.mkdir()
+    (native / "native-999999999-1").touch()
+    if fault == "symlink":
+        target = tmp_path / "private.txt"
+        target.write_text("private control")
+        (tmp_path / "session.jsonl").symlink_to(target)
+    args = [str(native)] if fault == "no_roots" else [str(native), str(tmp_path)]
+    policy = {"url": "https://store.example.com", "fields": {}}
+    code, stdout = _run(ris.TRANSCRIPT_UPLOAD_PROGRAM, json.dumps(policy), *args)
+    assert code == 2
+    assert json.loads(stdout)["capture_error"] == "AssertionError"
+
+
+def test_shutdown_capture_includes_a_native_writers_exit_flush(tmp_path: Path) -> None:
+    native = tmp_path / "native"
+    native.mkdir()
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    transcript = logs / "session.jsonl"
+    transcript.write_text('{"before_shutdown":true}\n')
+    writer = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            """
+import pathlib, signal, sys
+def finish(*_args):
+    with pathlib.Path(sys.argv[1]).open('a') as stream:
+        stream.write('{"shutdown_preference":"late needle"}\\n')
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, finish)
+print('ready', flush=True)
+signal.pause()
+""",
+            str(transcript),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert writer.stdout is not None and writer.stdout.readline().strip() == "ready"
+        stat = Path(f"/proc/{writer.pid}/stat").read_text().rsplit(")", 1)[1].split()
+        (native / f"native-{writer.pid}-{stat[19]}").touch()
+        upload = """
+import sys, urllib.request
+class Response:
+    status = 204
+    def __enter__(self): return self
+    def __exit__(self, *_args): pass
+def upload(request, **_kwargs):
+    sys.stdout.buffer.write(request.data)
+    return Response()
+urllib.request.urlopen = upload
+program = sys.argv.pop(1)
+exec(program, {'__name__': '__main__'})
+"""
+        policy = {"url": "https://store.example.com", "fields": {}}
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                upload,
+                ris.TRANSCRIPT_UPLOAD_PROGRAM,
+                json.dumps(policy),
+                str(native),
+                str(logs),
+            ],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        # The wrapper consumes its own first argument before running the hook.
+        payload = result.stdout.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0]
+        capture = json.loads(payload)
+        saved = next(iter(capture["transcripts"].values()))
+        assert b'"shutdown_preference":"late needle"' in base64.b64decode(saved)
+        assert capture["writers_stopped"] is True
+    finally:
+        if writer.poll() is None:
+            writer.terminate()
+        writer.wait(timeout=5)
+
+
 @pytest.mark.parametrize(
     ("argv", "stdin"),
     [
@@ -1107,8 +1197,239 @@ def test_live_worker_environment_is_accepted_by_the_worker(
         config = WorkerConfig(_env_file=None)
         assert config.runner_total_timeout_s == proof.live_inputs.slot_seconds
         assert config.delivery_budget_s >= config.runner_total_timeout_s
+        assert config.work_item_max_turns > ris.LAUNCHES_PER_SLOT
     finally:
         proof.ctx.ledger.close()
+
+
+def test_live_template_forwards_the_supplied_key_through_the_sdk_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_runner.sdk_auth import resolve_sdk_env
+
+    proof = _live_proof(tmp_path, monkeypatch)
+    proof.image = "registry.example.com/runner:proof"
+    try:
+        spec = proof.pod_spec()
+        runner = next(c for c in spec["containers"] if c["name"] == "runner")
+        env = {entry["name"]: entry["value"] for entry in runner["env"] if "value" in entry}
+        env.update(
+            ANTHROPIC_API_KEY="synthetic_endpoint_key",
+            ANTHROPIC_BASE_URL="https://model.example.com",
+            CURIE_CREDENTIALS="synthetic_inherited_key",
+            ACME_MODEL_TOKEN="synthetic_declared_key",
+        )
+        resolved = resolve_sdk_env(dict(env))
+        assert resolved is not None and resolved["ANTHROPIC_API_KEY"] == env["ANTHROPIC_API_KEY"]
+        env["CURIE_MODEL_ENV_KEY"] = "ACME_MODEL_TOKEN"
+        wrong = resolve_sdk_env(env)
+        assert wrong is not None and wrong["ANTHROPIC_API_KEY"] != env["ANTHROPIC_API_KEY"]
+    finally:
+        proof.ctx.ledger.close()
+
+
+def test_a_slot_without_final_capture_configuration_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proof = _live_proof(tmp_path, monkeypatch)
+    try:
+        with pytest.raises(poe.StepFailed, match="final native transcript capture"):
+            proof.collect_final_transcripts(1)
+    finally:
+        proof.ctx.ledger.close()
+
+
+def test_capture_configuration_refuses_a_replaced_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proof = _live_proof(tmp_path, monkeypatch)
+    proof.namespace_uid = "original"
+    proof.core = SimpleNamespace(
+        read_namespace=lambda *args, **kwargs: SimpleNamespace(
+            metadata=SimpleNamespace(
+                uid="replacement", labels={"curie-proof-owner": proof.ownership}
+            )
+        )
+    )
+    try:
+        with pytest.raises(poe.StepFailed, match="namespace ownership changed"):
+            proof.configure_transcript_capture()
+    finally:
+        proof.ctx.ledger.close()
+
+
+@pytest.mark.parametrize("fault", ["none", "declaration", "key", "endpoint", "personal"])
+def test_native_start_requires_the_sdk_to_select_the_live_endpoint_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    proof = _live_proof(tmp_path, monkeypatch)
+    proof.slot = 1
+    proof.ctx.ledger.record_slot(1, "owner", "1", T0)
+    proof.ctx.ledger.mark_labeled(1, T0 + 1)
+    ref = "probe:123:456"
+    proof.native[ref] = {"pod": "acme-pod"}
+    released = []
+
+    def pod_exec(_pod: str, program: str, *args: str, **kwargs: Any) -> tuple[int, bytes]:
+        if program == driver.NATIVE_RELEASE_PROGRAM:
+            released.append(True)
+            return 0, b""
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", program, *args],
+            env={
+                "PATH": os.environ["PATH"],
+                "HOME": str(tmp_path),
+                "CURIE_MODEL_ENV_KEY": "ACME_MODEL_TOKEN"
+                if fault == "declaration"
+                else "ANTHROPIC_API_KEY",
+                "ANTHROPIC_API_KEY": "wrong_inherited_key"
+                if fault == "key"
+                else proof.live_inputs.model_key.reveal(),
+                "ANTHROPIC_BASE_URL": "https://wrong.example.com"
+                if fault == "endpoint"
+                else proof.live_inputs.model_url.reveal(),
+                "CURIE_MODEL_AUTH_MODE": "personal" if fault == "personal" else "service",
+                "ACME_MODEL_TOKEN": "synthetic_declared_key",
+            },
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        return result.returncode, result.stdout
+
+    proof.pod_exec = pod_exec
+    try:
+        if fault == "none":
+            proof.on_native_start(ref, T0 + 2)
+            assert released and proof.ctx.ledger.launches(1) == 1
+        else:
+            with pytest.raises(poe.StepFailed, match="native SDK"):
+                proof.on_native_start(ref, T0 + 2)
+            assert not released and proof.ctx.ledger.launches(1) == 0
+    finally:
+        proof.ctx.ledger.close()
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_completed_log_stream_is_accepted_only_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    executable = tmp_path / "kubectl"
+    executable.write_text(
+        f"#!{sys.executable}\nimport sys\nprint('captured runner log')\nsys.exit({exit_code})\n"
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    proof = _live_proof(tmp_path, monkeypatch)
+    proof.private_dir = str(tmp_path)
+
+    def finished(predicate: Any, **_kwargs: Any) -> Any:
+        for process in proof.processes:
+            process.wait(timeout=5)
+        return predicate()
+
+    proof.wait_soft = finished
+    try:
+        if exit_code:
+            with pytest.raises(poe.StepFailed, match="pod_log_capture_not_ready"):
+                proof.start_log_capture("acme-pod", 1)
+        else:
+            assert proof.start_log_capture("acme-pod", 1).read_text() == "captured runner log\n"
+    finally:
+        proof.ctx.ledger.close()
+
+
+def _inventory_forge(tmp_path: Path, pages: list[dict[str, Any]]) -> tuple[Any, list[Any]]:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    app_dir = _app_dir(tmp_path)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    (app_dir / "app.pem").write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    calls: list[Any] = []
+
+    class Http:
+        def request(self, method: str, path: str, **kwargs: Any) -> tuple[int, Any]:
+            if path.endswith("/access_tokens"):
+                return 201, {
+                    "token": "synthetic_installation_token",
+                    "permissions": dict(pps.FORGE_PERMISSIONS),
+                }
+            if path == "/graphql":
+                calls.append(kwargs["body"]["variables"])
+                return 200, pages.pop(0)
+            if path.endswith("/pulls?state=all&per_page=100"):
+                return 200, [{"number": 1, "head": {"ref": "foreign"}}]
+            raise AssertionError((method, path))
+
+    scrubber = pps.Scrubber()
+    scan = pps.TokenScan(scrubber)
+    shell = driver.pp.Shell(
+        env={"PATH": os.environ["PATH"]}, scrubber=scrubber, scan=scan, cwd=tmp_path
+    )
+    forge = driver.RequesterForge(
+        shell, Http(), app_dir, ris.load_app_kit(app_dir), scrubber, driver.pp.Clock()
+    )
+    return forge, calls
+
+
+def _pull_page(
+    nodes: list[dict[str, Any]], more: bool = False, cursor: Any = None
+) -> dict[str, Any]:
+    # Observed with the test App; https://docs.github.com/en/graphql/reference/objects#pullrequestconnection
+    return {
+        "data": {
+            "repository": {
+                "pullRequests": {
+                    "nodes": nodes,
+                    "pageInfo": {"hasNextPage": more, "endCursor": cursor},
+                }
+            }
+        }
+    }
+
+
+def test_owned_pull_inventory_reads_later_pages(tmp_path: Path) -> None:
+    forge, calls = _inventory_forge(
+        tmp_path,
+        [
+            _pull_page([{"number": 1, "headRefName": "foreign"}], True, "next"),
+            _pull_page(
+                [
+                    {"number": 2, "headRefName": "proof/owned"},
+                    {"number": 3, "headRefName": "exact-branch"},
+                ]
+            ),
+        ],
+    )
+    assert forge.owned_pulls("proof/", ["exact-branch"]) == [
+        {"number": 2, "head": {"ref": "proof/owned"}},
+        {"number": 3, "head": {"ref": "exact-branch"}},
+    ]
+    assert [call["cursor"] for call in calls] == [None, "next"]
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        [{"errors": [{"type": "FORBIDDEN"}]}],
+        [_pull_page([], True, None)],
+        [_pull_page([], True, "same"), _pull_page([], True, "same")],
+        [_pull_page([{"number": None, "headRefName": "proof/owned"}])],
+    ],
+)
+def test_unreadable_pull_inventory_is_not_an_empty_inventory(
+    tmp_path: Path, pages: list[dict[str, Any]]
+) -> None:
+    forge, _calls = _inventory_forge(tmp_path, pages)
+    with pytest.raises(poe.StepFailed, match="inventory"):
+        forge.owned_pulls("proof/")
 
 
 def _pod_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, leak: bool) -> Any:

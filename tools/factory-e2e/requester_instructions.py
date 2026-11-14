@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import http.client
 import json
@@ -58,6 +59,7 @@ if str(HERE) not in sys.path:
 
 import personal_owner_enforcement as pod  # noqa: E402
 import personal_owner_enforcement_support as poe  # noqa: E402
+import personal_profile as pp  # noqa: E402
 import personal_profile_support as pps  # noqa: E402
 import requester_instructions_support as ris  # noqa: E402
 import tls_code_host as tch  # noqa: E402
@@ -78,6 +80,30 @@ REHEARSE_CONVERSATIONS = {
 }
 TRANSCRIPT_ROOTS = ("/home/runner", "/tmp")
 FACTORY_BUNDLE = REPO_ROOT / "examples" / "dark-factory"
+SDK_AUTH_CHECK_PROGRAM = """\
+import hashlib, json, os, sys
+from curie_runner.sdk_auth import resolve_sdk_env
+env = dict(os.environ)
+try:
+    selected = resolve_sdk_env(dict(env))
+    resolved = {**env, **selected} if isinstance(selected, dict) else {}
+    ok = isinstance(selected, dict) and not resolved.get('CLAUDE_CODE_OAUTH_TOKEN') and all(
+        resolved.get(name) and hashlib.sha256(resolved[name].encode()).hexdigest() == expected
+        for name, expected in zip(
+            ('ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'), sys.argv[1:], strict=True))
+except Exception:
+    ok = False
+print(json.dumps({'ok': ok}))
+sys.exit(0 if ok else 2)
+"""
+NATIVE_RELEASE_PROGRAM = (
+    f"""\
+import pathlib, sys
+root = pathlib.Path({pod.WORK_DIR!r})
+(root / f"native-{{sys.argv[1]}}-{{sys.argv[2]}}").touch()
+"""
+    + pod.LAUNCH_RELEASE_PROGRAM
+)
 # The production resolver, run against the owned database with the API's env.
 RESOLVE_PROGRAM = """\
 import asyncio, json, sys, uuid
@@ -374,6 +400,61 @@ def live_bundle(root: Path) -> dict[str, str]:
     return files
 
 
+class RequesterForge(pp.Forge):
+    def owned_pulls(self, prefix: str, branches: Sequence[str] = ()) -> list[dict[str, Any]]:
+        owner, name = self.repo.split("/", 1)
+        query = (
+            "query($owner:String!,$name:String!,$cursor:String){"
+            "repository(owner:$owner,name:$name){pullRequests(first:100,after:$cursor){"
+            "nodes{number headRefName} pageInfo{hasNextPage endCursor}}}}"
+        )
+        cursor: str | None = None
+        seen: set[str] = set()
+        found: list[dict[str, Any]] = []
+        exact = set(branches)
+        for _ in range(1000):
+            payload = self.call(
+                "POST",
+                "/graphql",
+                {"query": query, "variables": {"owner": owner, "name": name, "cursor": cursor}},
+            )
+            try:
+                if not isinstance(payload, dict) or payload.get("errors"):
+                    raise ValueError
+                connection = payload["data"]["repository"]["pullRequests"]
+                nodes, info = connection["nodes"], connection["pageInfo"]
+                if not isinstance(nodes, list) or type(info["hasNextPage"]) is not bool:
+                    raise ValueError
+                for pull in nodes:
+                    number, head = pull["number"], pull["headRefName"]
+                    if type(number) is not int or number < 1 or not isinstance(head, str):
+                        raise ValueError
+                    if head.startswith(prefix) or head in exact:
+                        found.append({"number": number, "head": {"ref": head}})
+                if not info["hasNextPage"]:
+                    return found
+                cursor = info["endCursor"]
+                if not isinstance(cursor, str) or not cursor or cursor in seen:
+                    raise ValueError
+                seen.add(cursor)
+            except (KeyError, TypeError, ValueError):
+                raise poe.StepFailed("forge pull inventory could not be read completely") from None
+        raise poe.StepFailed("forge pull inventory exceeded its page limit")
+
+
+def live_model_pod_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(spec)
+    settings = {
+        "CURIE_MODEL_ENV_KEY": "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096",
+        "CURIE_REVIEWER_MODEL": "claude-opus-5-5",
+    }
+    runner = next(container for container in result["containers"] if container["name"] == "runner")
+    runner["env"] = [entry for entry in runner.get("env", []) if entry["name"] not in settings]
+    runner["env"].extend({"name": name, "value": value} for name, value in settings.items())
+    return result
+
+
 def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one class
     """``RequesterProof`` over the owner enforcement harness (loaded at runtime)."""
 
@@ -406,6 +487,9 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
             self.items: dict[str, str] = {}
             self.accounts: dict[str, dict[str, Any]] = {}
             self.locked_bundle: dict[str, str] | None = None
+            self.capture_client: Any = None
+            self.capture_pods: dict[int, dict[str, str]] = {}
+            self.capture_prefix = f"{ctx.flags.run_id}/transcripts/"
             if live is not None:
                 for held in live.held():
                     ctx.rt.scrubber.hold(held)
@@ -456,7 +540,7 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 {
                     "CURIE_MODEL": self.live_inputs.model,
                     "DEFAULT_MAX_USD_PER_DAY": str(ris.SESSION_USD),
-                    "CURIE_WORK_ITEM_MAX_TURNS": str(1 + ris.MAX_CONTINUATIONS),
+                    "CURIE_WORK_ITEM_MAX_TURNS": "64",
                     "DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN": "32000",
                     "CURIE_RUNNER_TOTAL_TIMEOUT_S": str(self.live_inputs.slot_seconds),
                     "CURIE_DELIVERY_BUDGET_S": str(self.live_inputs.slot_seconds),
@@ -465,6 +549,118 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 }
             )
             return env
+
+        def pod_spec(self) -> dict[str, Any]:
+            spec = super().pod_spec()
+            return live_model_pod_spec(spec) if self.live_inputs is not None else spec
+
+        def setup(self) -> None:
+            super().setup()
+            if self.live_inputs is not None:
+                self.configure_transcript_capture()
+
+        def configure_transcript_capture(self) -> None:
+            if not self.owns_namespace():
+                raise poe.StepFailed("transcript capture namespace ownership changed")
+            import boto3
+            from botocore.config import Config
+
+            assert self.s3_relay is not None
+            if self.capture_client is None:
+                self.capture_client = boto3.client(
+                    "s3",
+                    endpoint_url=f"http://{self.runner_host}:{self.s3_relay.port}",
+                    aws_access_key_id=self.s3_access,
+                    aws_secret_access_key=self.s3_secret.reveal(),
+                    region_name="us-east-1",
+                    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+                )
+            policy = self.capture_client.generate_presigned_post(
+                Bucket=self.service_env()["BUNDLE_BUCKET"],
+                Key=self.capture_prefix + "${filename}",
+                ExpiresIn=3600,
+            )
+            template = self.custom.get_namespaced_custom_object(
+                cluster.GROUP, cluster.VERSION, self.namespace, "sandboxtemplates", "custody-source"
+            )
+            spec = template["spec"]["podTemplate"]["spec"]
+            runner = next(c for c in spec["containers"] if c["name"] == "runner")
+            runner.setdefault("lifecycle", {})["preStop"] = {
+                "exec": {
+                    "command": [
+                        "python3",
+                        "-I",
+                        "-c",
+                        ris.TRANSCRIPT_UPLOAD_PROGRAM,
+                        json.dumps(policy),
+                        pod.WORK_DIR,
+                        *TRANSCRIPT_ROOTS,
+                    ]
+                }
+            }
+            self.custom.patch_namespaced_custom_object(
+                cluster.GROUP,
+                cluster.VERSION,
+                self.namespace,
+                "sandboxtemplates",
+                "custody-source",
+                {
+                    "metadata": {"resourceVersion": template["metadata"]["resourceVersion"]},
+                    "spec": {
+                        "podTemplate": {
+                            "spec": {
+                                "containers": spec["containers"],
+                                "terminationGracePeriodSeconds": 30,
+                            }
+                        }
+                    },
+                },
+            )
+
+        def collect_final_transcripts(self, slot: int) -> None:
+            if self.capture_client is None or not self.capture_pods.get(slot):
+                raise poe.StepFailed("no final native transcript capture was configured")
+            for pod_name, uid in self.capture_pods[slot].items():
+
+                def captured(pod_name: str = pod_name) -> bytes | None:
+                    try:
+                        response = self.capture_client.get_object(
+                            Bucket=self.service_env()["BUNDLE_BUCKET"],
+                            Key=self.capture_prefix + pod_name + ".json",
+                        )
+                    except self.capture_client.exceptions.NoSuchKey:
+                        return None
+                    return response["Body"].read()
+
+                raw = self.wait(
+                    captured, timeout=45, failure="final native transcript capture missing"
+                )
+                capture = json.loads(raw)
+                if (
+                    capture.get("pod") != pod_name
+                    or capture.get("writers_stopped") is not True
+                    or not capture.get("transcripts")
+                ):
+                    raise poe.StepFailed("final native transcript capture was invalid")
+                assert self.retained_dir is not None
+                directory = (
+                    self.retained_dir
+                    / "transcripts"
+                    / hashlib.sha256(pod_name.encode()).hexdigest()[:16]
+                )
+                ris.retain_transcripts(raw, directory)
+                roots = [directory / str(i) for i in range(len(TRANSCRIPT_ROOTS))]
+                for root in roots:
+                    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+                result = self.command(
+                    [sys.executable, "-I", "-c", ris.REVIEWER_SCAN_PROGRAM, "30", *map(str, roots)],
+                    data=json.dumps(ris.needles_of(self.documents.values())).encode(),
+                    timeout=40,
+                    check=False,
+                )
+                self.slot_scans.setdefault(slot, {})[uid] = ris.reviewer_scan_result(
+                    result.returncode, result.stdout
+                )
 
         def bundle(self) -> dict[str, str]:
             # The rehearse runs the offline fake model, which loads no plugin
@@ -877,7 +1073,7 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
             model = ris.model_probe_result(result.returncode, result.stdout)
             self.observe("10", "probe.model", model["ok"])
             self.observe("10", "probe.model_outcome", model)
-            self.forge = pp.Forge(
+            self.forge = RequesterForge(
                 pp.Shell(
                     env={"PATH": os.environ.get("PATH", "")},
                     scrubber=self.ctx.rt.scrubber,
@@ -1058,9 +1254,23 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 self.fence()
                 raise poe.StepFailed("a native launch exceeded the slot's cap; starts are fenced")
             assert slot is not None
+            self.capture_pods.setdefault(slot, {})[pod_name] = ref.split(":", 1)[0]
+            assert self.live_inputs is not None
+            expected = (
+                hashlib.sha256(value.reveal().encode()).hexdigest()
+                for value in (self.live_inputs.model_key, self.live_inputs.model_url)
+            )
+            code, raw = self.pod_exec(pod_name, SDK_AUTH_CHECK_PROGRAM, *expected, timeout=30)
+            try:
+                sdk_auth_ok = code == 0 and json.loads(raw).get("ok") is True
+            except (ValueError, TypeError, AttributeError):
+                sdk_auth_ok = False
+            self.observe("10", f"prestart.slot{slot}.sdk_auth_config", sdk_auth_ok)
+            if not sdk_auth_ok:
+                raise poe.StepFailed("the native SDK does not select the live endpoint credential")
             self.ctx.ledger.count_launch(slot)
             pid, start = ref.split(":")[1:]
-            self.pod_exec(pod_name, pod.LAUNCH_RELEASE_PROGRAM, pid, start)
+            self.pod_exec(pod_name, NATIVE_RELEASE_PROGRAM, pid, start)
 
         def live_slots(self) -> None:
             assert self.live_inputs is not None
@@ -1077,6 +1287,7 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
         def run_slot(self, slot: int, actor: str, role: str | None) -> None:
             live = self.live_inputs
             assert live is not None
+            self.configure_transcript_capture()
             if role is None:
                 status, body = self.console(
                     "owner",
@@ -1152,6 +1363,7 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
             self.sweep()
             for uid, state in self.pod_states.items():
                 self.slot_scans.setdefault(slot, {})[uid] = self.scan_reviewers(str(state["pod"]))
+            self.collect_final_transcripts(slot)
             self.slot = None
             row = self.work_item_row(item)
             recorded = next(r for r in self.ctx.ledger.slots() if r["slot"] == slot)

@@ -530,6 +530,103 @@ def factory_bundle_files(root: Path) -> dict[str, str]:
     return files
 
 
+TRANSCRIPT_UPLOAD_PROGRAM = """\
+import base64, json, os, pathlib, re, signal, socket, sys, time, urllib.request, uuid
+try:
+    assert len(sys.argv) > 3
+    policy = json.loads(sys.argv[1])
+    native = pathlib.Path(sys.argv[2])
+    roots = sys.argv[3:]
+    assert roots and isinstance(policy['fields'], dict)
+    receipts = list(native.glob('native-*'))
+    assert receipts
+    def process(pid):
+        try:
+            fields = pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+            return fields[0], int(fields[1]), int(fields[19])
+        except FileNotFoundError:
+            return None
+    targets = {}
+    for receipt in receipts:
+        match = re.fullmatch(r'native-([0-9]+)-([0-9]+)', receipt.name)
+        assert match
+        pid, start = map(int, match.groups())
+        assert pid > 1 and pid != os.getpid()
+        state = process(pid)
+        if state and state[2] == start:
+            targets[pid] = start
+    children = {}
+    for entry in pathlib.Path('/proc').iterdir():
+        if entry.name.isdigit():
+            state = process(entry.name)
+            if state:
+                children[int(entry.name)] = state
+    pending = list(targets)
+    while pending:
+        parent = pending.pop()
+        for pid, state in children.items():
+            if state[1] == parent and pid not in targets:
+                targets[pid] = state[2]
+                pending.append(pid)
+    for pid, start in targets.items():
+        state = process(pid)
+        if state and state[2] == start and state[0] != 'Z':
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + 8
+    while targets:
+        targets = {pid: start for pid, start in targets.items()
+                   if (state := process(pid)) and state[2] == start and state[0] != 'Z'}
+        if not targets:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError('native transcript writers did not exit')
+        time.sleep(0.02)
+    name = socket.gethostname()
+    assert re.fullmatch(r'[a-zA-Z0-9_.-]{1,253}', name)
+    files = {}
+    total = 0
+    for index, root in enumerate(roots):
+        assert os.path.isdir(root)
+        def unreadable(error):
+            raise error
+        for base, dirs, names in os.walk(root, onerror=unreadable):
+            for leaf in names:
+                if not leaf.endswith('.jsonl'):
+                    continue
+                path = pathlib.Path(base) / leaf
+                assert not path.is_symlink()
+                data = path.read_bytes()
+                total += len(data)
+                assert len(data) <= 64 << 20 and total <= 128 << 20
+                relative = str(index) + '/' + os.path.relpath(path, root)
+                files[relative] = base64.b64encode(data).decode('ascii')
+    assert files
+    payload = json.dumps({'pod': name, 'writers_stopped': True, 'transcripts': files}).encode()
+    boundary = uuid.uuid4().hex
+    body = bytearray()
+    for key, value in policy['fields'].items():
+        value = value.replace('${filename}', name + '.json')
+        body.extend(('--' + boundary + '\\r\\nContent-Disposition: form-data; name="' + key
+                     + '"\\r\\n\\r\\n' + value + '\\r\\n').encode())
+    body.extend(('--' + boundary + '\\r\\nContent-Disposition: form-data; name="file"; '
+                 'filename="' + name + '.json"\\r\\n'
+                 'Content-Type: application/json\\r\\n\\r\\n').encode())
+    body.extend(payload)
+    body.extend(('\\r\\n--' + boundary + '--\\r\\n').encode())
+    request = urllib.request.Request(policy['url'], data=bytes(body), method='POST',
+        headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        assert response.status in (200, 201, 204)
+except Exception as failure:
+    print(json.dumps({'capture_error': type(failure).__name__,
+                      'status': getattr(failure, 'code', None)}))
+    raise SystemExit(2)
+"""
+
+
 REVIEWER_SCAN_PROGRAM = """\
 import base64, json, os, signal, sys
 retain = False
