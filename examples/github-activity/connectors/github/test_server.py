@@ -1586,6 +1586,144 @@ def test_read_with_rate_limit_headers_on_a_200_succeeds(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Malformed collection items. Each collection endpoint documents an array of
+# JSON objects:
+#   https://docs.github.com/en/rest/issues/issues#list-repository-issues
+#   https://docs.github.com/en/rest/issues/events#list-issue-events-for-a-repository
+#   https://docs.github.com/en/rest/issues/milestones#list-milestones
+# A page holding any other kind of item is not that shape. Dropping the item
+# would hand the agent a plausible report built from a page it only partly
+# understood, so the whole read is refused instead.
+# --------------------------------------------------------------------------- #
+_UPSTREAM_SENTINEL = "UPSTREAM-BODY-SENTINEL"
+
+_MALFORMED_ITEMS = {
+    "integer": 7,
+    "boolean": True,
+    "null": None,
+    "string": f"{_UPSTREAM_SENTINEL} {TOKEN}",
+    "list": [_UPSTREAM_SENTINEL, TOKEN],
+}
+
+
+def _valid_row(repo, endpoint):
+    if endpoint == "issues":
+        return _issue(
+            repo,
+            501,
+            "Valid issue",
+            user="ann",
+            created_at="2026-09-03T00:00:00Z",
+            updated_at="2026-09-03T00:00:00Z",
+        )
+    if endpoint == "issues/events":
+        return _event(
+            repo,
+            8001,
+            "milestoned",
+            actor="ann",
+            created_at="2026-09-03T00:00:00Z",
+            issue=_valid_row(repo, "issues"),
+            milestone_title="v1",
+        )
+    return _milestone(repo, 21, "v2.1", created_at="2026-09-03T00:00:00Z")
+
+
+def _serve_one_collection(fake, repo, endpoint, pages):
+    """Serve `pages` for one endpoint and a valid empty list for the others."""
+
+    for other in ("issues", "issues/events", "milestones"):
+        fake.serve_pages(repo, other, pages if other == endpoint else [[]])
+
+
+def _assert_refused_without_echo(srv, repo, endpoint):
+    with pytest.raises(ToolError) as excinfo:
+        srv.repository_activity(SINCE, UNTIL)
+    message = str(excinfo.value)
+    assert repo in message
+    assert endpoint in message
+    assert "unexpected item shape" in message
+    assert TOKEN not in message
+    assert _UPSTREAM_SENTINEL not in message
+    assert TOKEN not in repr(excinfo.value.args)
+
+
+@pytest.mark.parametrize("endpoint", ["issues", "issues/events", "milestones"])
+@pytest.mark.parametrize("kind", sorted(_MALFORMED_ITEMS))
+@pytest.mark.parametrize("position", ["alone", "mixed"])
+def test_malformed_collection_items_refuse_activity_report(monkeypatch, endpoint, kind, position):
+    srv = _load(monkeypatch, GITHUB_REPOSITORIES="acme/api")
+    fake = FakeGitHub()
+    repo = "acme/api"
+    bad = _MALFORMED_ITEMS[kind]
+    page = [bad] if position == "alone" else [_valid_row(repo, endpoint), bad]
+    _serve_one_collection(fake, repo, endpoint, [page])
+    _install(monkeypatch, srv, fake)
+
+    _assert_refused_without_echo(srv, repo, endpoint)
+
+
+@pytest.mark.parametrize("kind", sorted(_MALFORMED_ITEMS))
+def test_malformed_collection_items_refuse_on_a_later_page(monkeypatch, kind):
+    # A bad member on page two must not leave page one standing as a report.
+    srv = _load(monkeypatch, GITHUB_REPOSITORIES="acme/api")
+    fake = FakeGitHub()
+    repo = "acme/api"
+    pages = [[_valid_row(repo, "issues")], [_MALFORMED_ITEMS[kind]]]
+    _serve_one_collection(fake, repo, "issues", pages)
+    _install(monkeypatch, srv, fake)
+
+    _assert_refused_without_echo(srv, repo, "issues")
+
+
+@pytest.mark.parametrize("kind", sorted(_MALFORMED_ITEMS))
+def test_malformed_collection_items_refuse_before_the_early_stop(monkeypatch, kind):
+    # The events feed stops paging once a page reaches back past `since`. This
+    # page covers the window, so a valid-looking read would end right here; the
+    # malformed member must still refuse it rather than be skipped by the stop.
+    srv = _load(monkeypatch, GITHUB_REPOSITORIES="acme/api")
+    fake = FakeGitHub()
+    repo = "acme/api"
+    older = _event(
+        repo,
+        8000,
+        "milestoned",
+        actor="ann",
+        created_at="2026-08-01T00:00:00Z",
+        issue=_valid_row(repo, "issues"),
+        milestone_title="v0",
+    )
+    _serve_one_collection(fake, repo, "issues/events", [[older, _MALFORMED_ITEMS[kind]]])
+    _install(monkeypatch, srv, fake)
+
+    _assert_refused_without_echo(srv, repo, "issues/events")
+
+
+def test_valid_empty_and_sparse_collections_still_report(monkeypatch):
+    # The liveness pair to the refusals: an empty list and pages of sparse
+    # objects (missing fields, extra fields) are still valid collections and
+    # produce a normal report.
+    srv = _load(monkeypatch, GITHUB_REPOSITORIES="acme/api,acme/web")
+    fake = FakeGitHub()
+    _empty_repo(fake, "acme/web")
+    fake.serve_pages("acme/api", "issues", [[{}, {"number": 9, "unexpected_extra": [1, 2]}]])
+    fake.serve_pages("acme/api", "issues/events", [[{"event": "closed"}, {}]])
+    fake.serve_pages("acme/api", "milestones", [[{}, {"title": "bare"}]])
+    _install(monkeypatch, srv, fake)
+
+    result = _by_repo(srv.repository_activity(SINCE, UNTIL))
+
+    for repo in ("acme/api", "acme/web"):
+        entry = result[repo]
+        assert entry["merged_pull_requests"] == []
+        assert entry["opened_issues"] == []
+        assert entry["closed_issues"] == []
+        assert entry["milestone_changes"] == []
+        assert entry["milestones"] == []
+        assert entry["truncated"] == []
+
+
+# --------------------------------------------------------------------------- #
 # Startup. A connector that answers "not configured" to every call looks healthy
 # to Kubernetes and is useless to the agent, so main() exits non-zero.
 # --------------------------------------------------------------------------- #
