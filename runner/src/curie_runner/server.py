@@ -252,7 +252,7 @@ def create_app(
             web.post("/v1/checkpoint", _checkpoint),
             web.post("/v1/ui-evidence/index", _ui_evidence_index),
             web.post("/v1/ui-evidence/image", _ui_evidence_image),
-            web.post(CONTEXT_PATH, _requester_context),
+            web.post("/v1/requester-context", _requester_context),
         ]
     )
     app.on_startup.append(_on_startup)
