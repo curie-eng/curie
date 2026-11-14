@@ -1700,7 +1700,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     helm_index = _single_step_index(
         steps,
         lambda step: (
-            _string(step, "uses") == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
+            _string(step, "uses") == "azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e"
             and (step.get("with") or {}).get("version") == "v3.16.4"
         ),
         "pinned Helm setup",
@@ -2027,7 +2027,7 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
         (
             "pinned Helm setup",
             lambda step: (
-                _string(step, "uses") == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
+                _string(step, "uses") == "azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e"
             ),
         ),
     ):
