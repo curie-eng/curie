@@ -32,9 +32,98 @@ TICKET_TRANSCRIPT = REPO_ROOT / "tools/model-script/transcripts/triage-ticket.js
 FINDINGS_TRANSCRIPT = REPO_ROOT / "tools/model-script/transcripts/triage-findings.json"
 TRIAGE_AGENT = "factory-triage"
 RECORDED_ISSUE = 3815
-# Intake polls every 5 seconds in this install; replay checks wait several polls.
-REPLAY_SETTLE_SECONDS = 30
+REPOSITORY = "acme-corp/acme-bot"
+# The intake's open-issue list read, once per served label per pass. Both
+# agents on the fixture repository serve one label each.
+INTAKE_LIST_PATH = f"/repos/{REPOSITORY}/issues"
+INTAKE_LABELS = (ts.IMPLEMENTATION_LABEL, ts.TRIAGE_LABEL)
+# Replay is judged quiet only after this many intake passes have read the
+# tracker since the replay.
+REPLAY_POLLS = 3
 RUNTIME_SETTLE_SECONDS = 180
+
+# Run inside the API pod with the source request id as its only argument. It
+# replays the internal selection event of that request's delivered ticket:
+# open_handoff again for the same receipt in a committed session, then one
+# hand_off attempt on the handoff, built from the API's own settings, engine
+# and code host trust. It prints one JSON line.
+REPLAY_SELECTION_SNIPPET = """
+import asyncio
+import json
+import sys
+import uuid
+
+import httpx
+from sqlalchemy import select
+
+from curie_api.code_host_trust import code_host_verify
+from curie_api.config import get_settings
+from curie_api.db import create_engine, create_sessionmaker
+from curie_api.factory_triage_handoff import hand_off, open_handoff
+from curie_api.forges.types import TrackerIssueRef
+from curie_api.models import FactoryTrackerResultReceipt, FactoryTriageHandoff
+
+
+async def replay(request_id):
+    settings = get_settings()
+    engine = create_engine()
+    sessionmaker = create_sessionmaker(engine)
+    try:
+        async with sessionmaker() as session:
+            receipts = (await session.scalars(select(FactoryTrackerResultReceipt).where(
+                FactoryTrackerResultReceipt.execution_request_id == request_id
+            ))).all()
+            handoffs = (await session.scalars(select(FactoryTriageHandoff).where(
+                FactoryTriageHandoff.source_execution_request_id == request_id
+            ))).all()
+            if len(receipts) != 1 or len(handoffs) != 1:
+                raise SystemExit("expected one receipt and one handoff for the source request")
+            receipt, handoff = receipts[0], handoffs[0]
+            if receipt.output_issue_id is None or receipt.output_url is None:
+                raise SystemExit("the source receipt names no output issue")
+            handoff_id, before = handoff.id, handoff.outcome
+            output = TrackerIssueRef(
+                kind=receipt.output_tracker_kind,
+                host=receipt.output_tracker_host,
+                scope_id=receipt.output_scope_id,
+                issue_id=receipt.output_issue_id,
+            )
+            reopened = await open_handoff(
+                session,
+                delivery_id=receipt.delivery_id,
+                execution_request_id=request_id,
+                output=output,
+                output_url=receipt.output_url,
+                output_body_sha256=receipt.output_body_sha256,
+            )
+            await session.commit()
+        async with httpx.AsyncClient(
+            timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+        ) as client:
+            attempt = await hand_off(
+                sessionmaker,
+                handoff_id,
+                settings=settings,
+                client=client,
+                owner=f"scripted-replay-{uuid.uuid4().hex}",
+            )
+        async with sessionmaker() as session:
+            after = await session.scalar(
+                select(FactoryTriageHandoff.outcome).where(FactoryTriageHandoff.id == handoff_id)
+            )
+    finally:
+        await engine.dispose()
+    print(json.dumps({
+        "handoff_id": str(handoff_id),
+        "reopened": None if reopened is None else str(reopened),
+        "attempt": attempt,
+        "outcome_before": before,
+        "outcome_after": after,
+    }))
+
+
+asyncio.run(replay(uuid.UUID(sys.argv[1])))
+"""
 
 SOURCES = (
     (
@@ -314,8 +403,27 @@ class TriageToPr:
         return {
             **{key: int(value) for key, value in totals.items()},
             "issues": len(self.stub._rows("issue")),
+            "comments": len(self.stub._rows("comment")),
             "pulls": len(self.stub._rows("pull")),
         }
+
+    def checks_by_head(self, pulls: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        """The check runs the stub reports on each pull request head, as the factory reads them."""
+
+        checks: dict[str, list[dict[str, Any]]] = {}
+        for pull in pulls:
+            head = str(pull["head"]["sha"])
+            status, answer = self.stub._rest(
+                "GET",
+                f"/repos/{REPOSITORY}/commits/{head}/check-runs",
+                {"per_page": ["100"]},
+                {},
+            )
+            runs = answer.get("check_runs") if isinstance(answer, dict) else None
+            if status != 200 or not isinstance(runs, list) or answer["total_count"] != len(runs):
+                raise TriageScenarioError("the pull request check runs were unavailable")
+            checks[head] = runs
+        return checks
 
     def assert_outcome(self, github: Any) -> None:
         observed = self.observe()
@@ -370,7 +478,7 @@ class TriageToPr:
             if c["issue_number"] == output_number and fe._NOTICE_FINAL in c["body"]
         ]
         pull = ts.assert_implementation_terminus(
-            implementation, request, pulls, final, output_number
+            implementation, request, pulls, final, output_number, self.checks_by_head(pulls)
         )
         statuses = [
             c for c in comments
@@ -410,8 +518,67 @@ class TriageToPr:
             slack_posts=posts,
         )
 
+    def replay_selection(self) -> dict[str, Any]:
+        """Replay the internal selection event of the admitted handoff on the live API."""
+
+        request_id = str(uuid.UUID(str(self.evidence["source_request_id"])))
+        output = self.driver.kubectl(
+            "-n",
+            self.driver.namespace,
+            "exec",
+            "deployment/curie-api",
+            "--",
+            "python",
+            "-c",
+            REPLAY_SELECTION_SNIPPET,
+            request_id,
+        )
+        lines = [line for line in output.splitlines() if line.strip()]
+        if not lines:
+            raise TriageScenarioError("the selection replay printed no observation")
+        replay: dict[str, Any] = json.loads(lines[-1])
+        if replay.get("outcome_before") != "admitted" or replay.get("outcome_after") != "admitted":
+            raise TriageScenarioError(
+                f"the replayed handoff was {replay.get('outcome_before')!r} and became "
+                f"{replay.get('outcome_after')!r}, expected admitted throughout"
+            )
+        if replay.get("reopened") not in {None, replay.get("handoff_id")}:
+            raise TriageScenarioError("the replay opened another selection event")
+        return replay
+
+    def intake_reads(self) -> int:
+        return sum(
+            1
+            for entry in self.stub.request_log
+            if entry["method"] == "GET" and entry["path"].endswith(INTAKE_LIST_PATH)
+        )
+
+    def wait_for_intake_passes(self, since: int) -> None:
+        """Wait until the intake has read the tracker REPLAY_POLLS times since ``since``.
+
+        Nothing happening is only evidence once the intake has looked. Each
+        pass lists open issues once per served label, so the wait counts those
+        reads. REPLAY_POLLS passes take REPLAY_POLLS poll intervals; the wait
+        allows four times that before it fails, so a slow pass after the API
+        restart is not mistaken for a missing one.
+        """
+
+        poll = float(self.driver.tracker_poll_seconds)
+        wanted = REPLAY_POLLS * len(INTAKE_LABELS)
+        bound = time.monotonic() + 4 * REPLAY_POLLS * poll
+        if self.driver.deadline is not None:
+            bound = min(bound, self.driver.deadline)
+        while self.intake_reads() - since < wanted:
+            self.check_boundaries()
+            if time.monotonic() >= bound:
+                raise TriageScenarioError(
+                    f"the intake read the tracker {self.intake_reads() - since} times after "
+                    f"the replay, expected {wanted}"
+                )
+            time.sleep(poll / 5)
+
     def assert_replay(self, github: Any) -> None:
-        """Point 7: an API restart and bot label events create nothing more."""
+        """Point 7: an API restart, the internal event and bot label events create nothing."""
 
         assert self.output is not None
         before = self.counts()
@@ -422,18 +589,17 @@ class TriageToPr:
             "-n", self.driver.namespace, "rollout", "status", "deployment/curie-api",
             "--timeout=300s",
         )
+        replay = self.replay_selection()
+        since = self.intake_reads()
         # The factory's own label again on its output, and an App label event on
         # the source: neither is a human selection.
         self.stub._label_event(self.output, ts.IMPLEMENTATION_LABEL, "labeled", github.BOT)
         self.stub._label_event(ts.SOURCE_TICKET, ts.TRIAGE_LABEL, "labeled", github.BOT)
-        settle = time.monotonic() + REPLAY_SETTLE_SECONDS
-        while time.monotonic() < settle:
-            self.check_boundaries()
-            time.sleep(2)
+        self.wait_for_intake_passes(since)
         after = self.counts()
         comments = [c for c in self.stub._rows("comment") if c["issue_number"] == self.output]
         ts.assert_no_replay_effects(before, after, comments)
-        self.evidence.update(replay_counts=after)
+        self.evidence.update(replay_counts=after, selection_replay=replay)
 
     def assert_runtime_drained(self) -> None:
         """Point 10, in-cluster half: no sandbox or publication resource remains."""

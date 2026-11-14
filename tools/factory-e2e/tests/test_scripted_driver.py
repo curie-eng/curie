@@ -1637,7 +1637,11 @@ def _image_check_commands(
     return calls, mutating
 
 
-@pytest.mark.parametrize("missing", sk.IMAGES)
+# A replay run enables the channel gateway, so it also needs the dispatcher image.
+REPLAY_IMAGES = (*sk.IMAGES, sk.GATEWAY_IMAGE)
+
+
+@pytest.mark.parametrize("missing", REPLAY_IMAGES)
 def test_missing_local_image_refuses_as_configuration_before_resource_creation(
     missing: str,
     tmp_path: Path,
@@ -1667,12 +1671,13 @@ def test_present_local_images_pass_the_check_and_reach_resource_creation(
         image for argv in calls if argv[:3] == ("docker", "image", "inspect")
         for image in argv[3:]
     }
-    assert sorted(inspected) == sorted(sk.IMAGES)
+    assert sorted(inspected) == sorted(REPLAY_IMAGES)
     assert mutating, "the run must proceed past the image check"
     assert mutating[0][:2] in {("docker", "run"), ("kind", "create")}
     first_mutation = calls.index(mutating[0])
     assert all(
-        calls.index(("docker", "image", "inspect", image)) < first_mutation for image in sk.IMAGES
+        calls.index(("docker", "image", "inspect", image)) < first_mutation
+        for image in REPLAY_IMAGES
     )
     assert "stop at first resource command" in _evidence(tmp_path)["error"]
 
@@ -1841,7 +1846,14 @@ def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
 
 
 # Observed Docker image inspect Size values from a fresh main candidate build.
-_CANDIDATE_IMAGE_BYTES = (716245847, 708133868, 74690291, 1065367629)
+# The dispatcher figure is an estimate of the same order as the API image.
+_CANDIDATE_IMAGE_BYTES = {
+    "curie-api:local": 716245847,
+    "curie-worker:local": 708133868,
+    "curie-ui:local": 74690291,
+    "curie-runner:latest": 1065367629,
+    sk.GATEWAY_IMAGE: 700 * 1024**2,
+}
 
 
 @pytest.mark.parametrize("free_gib", [20, 8])
@@ -1860,7 +1872,7 @@ def test_runtime_disk_budget_reserves_candidate_import_and_workloads(
             return "kind v0.24.0"
         if argv[:3] == ("docker", "image", "inspect"):
             return json.dumps([
-                {"Size": _CANDIDATE_IMAGE_BYTES[sk.IMAGES.index(image)]}
+                {"Size": _CANDIDATE_IMAGE_BYTES[image]}
                 for image in argv[3:]
             ])
         assert argv[:2] in _READ_ONLY_PREREQUISITES
@@ -1897,6 +1909,7 @@ _LAYER_STAGE_IMAGE_BYTES = {
     "curie-api:local": 150 * 1024**2,
     "curie-worker:local": 150 * 1024**2,
     "curie-ui:local": 150 * 1024**2,
+    sk.GATEWAY_IMAGE: 150 * 1024**2,
     "curie-runner:latest": 745 * 1024**2,
 }
 _OBSERVED_HOSTED_FREE_BYTES = 26525540352
@@ -2284,6 +2297,12 @@ REFUSED_ID = "00000000-0000-0000-0000-00000000a002"
 OUTPUT_URL = "https://192.0.2.1:8443/acme-corp/acme-bot/issues/3904"
 REFUSED_URL = "https://192.0.2.1:8443/acme-corp/acme-bot/issues/3905"
 PR_URL = "https://192.0.2.1:8443/acme-corp/acme-bot/pull/2"
+PR_HEAD = "fedcba9876543210fedcba9876543210fedcba98"
+
+
+def _check_run(name: str, conclusion: str | None, head: str = PR_HEAD) -> dict[str, Any]:
+    status = "in_progress" if conclusion is None else "completed"
+    return {"name": name, "head_sha": head, "status": status, "conclusion": conclusion}
 
 
 def _happy() -> dict[str, Any]:
@@ -2320,6 +2339,7 @@ def _happy() -> dict[str, Any]:
         "output_items": [{"id": "w2", "agent_id": "agent-impl",
                           "trigger_label": ts.IMPLEMENTATION_LABEL}],
         "output_requests": [{"id": IMPL_ID, "completion_contract": "implementation",
+                             "status": ts.IMPLEMENTATION_SUCCESS_STATUS,
                              "requester": "octocat", "created_at": "2026-11-14T01:05:00",
                              "execution_deadline": "2026-11-14T03:05:00"}],
         "events": [
@@ -2328,8 +2348,9 @@ def _happy() -> dict[str, Any]:
         ],
         "pulls": [{"head": {"ref": "curie/request-1"}, "body": "Closes #3815",
                    "html_url": "https://x/pull/1"},
-                  {"head": {"ref": "curie/request-2"}, "body": "Closes #3904",
+                  {"head": {"ref": "curie/request-2", "sha": PR_HEAD}, "body": "Closes #3904",
                    "html_url": PR_URL}],
+        "checks": {PR_HEAD: [_check_run("Python", "success"), _check_run("Docs", "skipped")]},
         "branches": ["curie/request-1", "curie/request-2", "main"],
         "posts": [
             {"method": "chat.postMessage", "channel": ts.SLACK_CHANNEL, "text": "root",
@@ -2359,10 +2380,10 @@ def _check(point: str, o: dict[str, Any]) -> None:
     elif point == "5":
         ts.assert_handoff_admitted(o["output_items"], o["output_requests"], "agent-impl",
                                    o["source_requests"][0], o["events"])
-    elif point == "6":
+    elif point.startswith("6"):
         final = [c for c in o["comments"] if c["issue_number"] == 3904]
         ts.assert_implementation_terminus(o["output_requests"][0], o["source_requests"][0],
-                                          o["pulls"], final, 3904)
+                                          o["pulls"], final, 3904, o["checks"])
     elif point == "7":
         ts.assert_no_replay_effects({"work_items": 3}, {"work_items": 3},
                                     [c for c in o["comments"] if c["issue_number"] == 3904])
@@ -2380,7 +2401,13 @@ def _check(point: str, o: dict[str, Any]) -> None:
                                   {"result_kind": "findings", "reason": "not_reproduced"}, 0)
 
 
-POINTS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "refused", "findings"]
+# Point 6 also refuses a failed implementation request and every way its pull
+# request's checks fall short, each with the final comment still naming the PR.
+POINT_6_BREAKS = ("6-failed-request", "6-failed-checks", "6-pending-checks", "6-no-checks")
+POINTS = [
+    *("1", "2", "3", "4", "5", "6", *POINT_6_BREAKS, "6-checks-on-another-head"),
+    *("7", "8", "9", "10", "refused", "findings"),
+]
 
 
 @pytest.mark.parametrize("point", POINTS)
@@ -2403,6 +2430,16 @@ def _break(point: str, o: dict[str, Any]) -> None:
     elif point == "6":
         o["output_requests"][0]["execution_deadline"] = o["source_requests"][0][
             "execution_deadline"]
+    elif point == "6-failed-request":
+        o["output_requests"][0]["status"] = "failed"
+    elif point == "6-failed-checks":
+        o["checks"][PR_HEAD].append(_check_run("E2E", "failure"))
+    elif point == "6-pending-checks":
+        o["checks"][PR_HEAD].append(_check_run("E2E", None))
+    elif point == "6-no-checks":
+        o["checks"] = {}
+    elif point == "6-checks-on-another-head":
+        o["checks"] = {PR_HEAD: [_check_run("Python", "success", head="0" * 40)]}
     elif point == "7":
         o["comments"].append({"id": 15, "issue_number": 3904,
                               "body": f"<!-- {ts.INTAKE_NOTICE_PREFIX}actor_bot -->"})
@@ -2462,3 +2499,233 @@ def test_triage_verdict_follows_the_verified_teardown(
     run.evidence.update(sandbox_claims=0 if drained else 2, publication_resources=0)
     assert run.finish(cleanup, error) is passed
     assert run.evidence["result"] == ("passed" if passed else "failed")
+
+
+# The channel gateway runs on the dispatcher image, so a run that enables it
+# builds, inspects and imports that image into its cluster.
+
+
+def test_enabled_gateway_builds_and_imports_the_dispatcher_image_the_chart_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _replay_args(tmp_path)
+    args.build_images = True
+    run = sk.ScriptedRun(args)
+    assert run.gateway_enabled()
+    values = sk.scripted_values(
+        model_base_url="http://192.0.2.1:9",
+        github_api="https://192.0.2.1:8443/api/v3",
+        clone_base="https://192.0.2.1:8443",
+        ca_configmap="ca",
+        runner_image="localhost:5000/curie-runner",
+        slack_api_base_url="http://192.0.2.1:7/api/",
+    )
+    assert values["dispatcher"]["slack"]["botToken"], "the gateway is enabled"
+    image = values["dispatcher"]["image"]
+    chart_image = f"{image['repository']}:{image['tag']}"
+    assert chart_image == sk.GATEWAY_IMAGE
+
+    monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(sk.ScriptedRun, "check_disk", lambda _self, _stage, **_kwargs: None)
+    monkeypatch.setattr(sk.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path / "work"))
+    monkeypatch.setattr(run, "start_registry", lambda: (5000, "localhost:5000"))
+    (tmp_path / "work").mkdir()
+    builds: dict[str, str] = {}
+    inspected: set[str] = set()
+    imported: list[str] = []
+
+    def command(*argv: str, **_kwargs: Any) -> str:
+        if argv[:2] == ("kind", "version"):
+            return "kind v0.24.0"
+        if argv[:3] == ("docker", "image", "inspect"):
+            inspected.update(argv[3:])
+            return json.dumps([{"Size": 1024} for _ in argv[3:]])
+        if argv[:2] == ("docker", "build"):
+            builds[argv[argv.index("-t") + 1]] = argv[argv.index("-f") + 1]
+        if argv[:2] == ("docker", "inspect"):
+            return json.dumps(
+                [{"NetworkSettings": {"Networks": {"kind": {"Gateway": "172.18.0.1"}}}}]
+            )
+        return ""
+
+    def load_images(_command: Any, cluster: str, images: Any) -> None:
+        assert cluster == run.cluster
+        imported.extend(images)
+        raise sk.ScriptedScenarioError("imported")
+
+    monkeypatch.setattr(run, "command", command)
+    monkeypatch.setattr(sk.kind_images, "load_images", load_images)
+    with pytest.raises(sk.ScriptedScenarioError, match="imported"):
+        run.execute()
+    assert builds[chart_image] == "apps/dispatcher/Dockerfile"
+    assert chart_image in inspected
+    assert chart_image in imported
+
+
+def test_runs_without_the_gateway_leave_the_dispatcher_image_out(tmp_path: Path) -> None:
+    recording = fe.parse_args(["scripted", "--record"])
+    facts = fe.parse_args(["scripted", "--scenario", "facts"])
+
+    class OwnScenario(sk.ScriptedRun):
+        TRIAGE_TO_PR = False
+
+    for run in (
+        sk.ScriptedRun(recording),
+        sk.ScriptedRun(facts),
+        OwnScenario(_replay_args(tmp_path)),
+    ):
+        assert not run.gateway_enabled()
+        assert sk.GATEWAY_IMAGE not in run.image_refs
+
+
+# Point 7: the internal selection event is replayed on the live API, and the
+# quiet window is measured in observed intake reads.
+
+
+class _ReplayStub:
+    def __init__(self, *, polls: bool) -> None:
+        self.polls = polls
+        self.log: list[dict[str, str]] = []
+        self.events: list[tuple[int, str]] = []
+        self.unknown_requests: list[str] = []
+
+    @property
+    def request_log(self) -> list[dict[str, str]]:
+        # Each look sees one more intake list read once the replay has begun.
+        if self.polls and self.events:
+            self.log.append({"method": "GET", "path": "/api/v3" + triage_run.INTAKE_LIST_PATH})
+        return list(self.log)
+
+    def _rows(self, kind: str) -> list[dict[str, Any]]:
+        return []
+
+    def _label_event(self, number: int, label: str, _event: str, _actor: Any) -> None:
+        self.events.append((number, label))
+
+
+class _ReplayDriver:
+    namespace = "curie"
+    deadline = None
+    tracker_poll_seconds = sk.TRACKER_POLL_SECONDS
+
+    def __init__(self, stub: _ReplayStub, replay: dict[str, Any], grow: bool) -> None:
+        self.stub = stub
+        self.replay = replay
+        self.grow = grow
+        self.model = type("Model", (), {"unexpected": []})()
+        self.calls: list[tuple[str, ...]] = []
+        self.work_items = 3
+
+    def kubectl(self, *argv: str, **_kwargs: Any) -> str:
+        self.calls.append(argv)
+        if "exec" in argv:
+            if self.grow:
+                self.work_items += 1
+            return "log line\n" + json.dumps(self.replay) + "\n"
+        return ""
+
+    def sql(self, _query: str) -> dict[str, Any]:
+        return {"totals": {"work_items": self.work_items, "execution_requests": 4, "receipts": 3}}
+
+
+ADMITTED_REPLAY = {
+    "handoff_id": "h1",
+    "reopened": None,
+    "attempt": None,
+    "outcome_before": "admitted",
+    "outcome_after": "admitted",
+}
+
+
+def _replay_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    polls: bool = True,
+    replay: dict[str, Any] | None = None,
+    grow: bool = False,
+) -> tuple[triage_run.TriageToPr, _ReplayDriver]:
+    monkeypatch.setattr(triage_run.time, "sleep", lambda _seconds: None)
+    driver = _ReplayDriver(_ReplayStub(polls=polls), replay or ADMITTED_REPLAY, grow)
+    run = triage_run.TriageToPr(
+        driver,
+        lanes.LaneRouter({"triage": "x"}),
+        _ClosedRecorder(),  # type: ignore[arg-type]
+    )
+    run.output = 3904
+    run.evidence["source_request_id"] = SOURCE_ID
+    return run, driver
+
+
+def test_selection_replay_snippet_compiles_and_calls_both_entry_points() -> None:
+    compile(triage_run.REPLAY_SELECTION_SNIPPET, "replay", "exec")
+    assert "await open_handoff(" in triage_run.REPLAY_SELECTION_SNIPPET
+    assert "await hand_off(" in triage_run.REPLAY_SELECTION_SNIPPET
+    assert "await session.commit()" in triage_run.REPLAY_SELECTION_SNIPPET
+
+
+def test_replay_runs_the_internal_selection_event_in_the_api_pod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, driver = _replay_run(monkeypatch)
+    run.assert_replay(type("GitHub", (), {"BOT": {"login": "app[bot]", "type": "Bot"}})())
+    execs = [argv for argv in driver.calls if "exec" in argv]
+    assert execs == [
+        (
+            "-n",
+            "curie",
+            "exec",
+            "deployment/curie-api",
+            "--",
+            "python",
+            "-c",
+            triage_run.REPLAY_SELECTION_SNIPPET,
+            SOURCE_ID,
+        )
+    ]
+    restart = driver.calls.index(
+        ("-n", "curie", "rollout", "status", "deployment/curie-api", "--timeout=300s")
+    )
+    assert driver.calls.index(execs[0]) > restart
+    assert run.evidence["selection_replay"] == ADMITTED_REPLAY
+    assert len(driver.stub.events) == 2
+
+
+def test_replay_that_creates_a_work_item_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    run, _ = _replay_run(monkeypatch, grow=True)
+    with pytest.raises(ts.TriageAssertionError, match="replay changed the outcome"):
+        run.assert_replay(type("GitHub", (), {"BOT": {"login": "app[bot]", "type": "Bot"}})())
+
+
+def test_replay_that_changes_the_handoff_outcome_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, _ = _replay_run(monkeypatch, replay={**ADMITTED_REPLAY, "outcome_after": "refused"})
+    with pytest.raises(triage_run.TriageScenarioError, match="expected admitted"):
+        run.assert_replay(type("GitHub", (), {"BOT": {"login": "app[bot]", "type": "Bot"}})())
+
+
+def test_replay_quiet_window_needs_observed_intake_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    run, _ = _replay_run(monkeypatch, polls=False)
+    clock = iter(range(0, 10_000, 7))
+    monkeypatch.setattr(triage_run.time, "monotonic", lambda: float(next(clock)))
+    with pytest.raises(triage_run.TriageScenarioError, match="intake read the tracker 0 times"):
+        run.assert_replay(type("GitHub", (), {"BOT": {"login": "app[bot]", "type": "Bot"}})())
+
+
+def test_replay_quiet_window_is_bounded_by_the_install_poll_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, driver = _replay_run(monkeypatch, polls=False)
+    now = [0.0]
+    monkeypatch.setattr(triage_run.time, "monotonic", lambda: now[0])
+
+    def sleep(seconds: float) -> None:
+        assert seconds == driver.tracker_poll_seconds / 5
+        now[0] += seconds
+
+    monkeypatch.setattr(triage_run.time, "sleep", sleep)
+    with pytest.raises(triage_run.TriageScenarioError):
+        run.wait_for_intake_passes(0)
+    expected = 4 * triage_run.REPLAY_POLLS * driver.tracker_poll_seconds
+    assert expected <= now[0] < expected + driver.tracker_poll_seconds
