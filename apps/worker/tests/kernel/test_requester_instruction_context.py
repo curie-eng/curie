@@ -51,6 +51,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import claude_agent_sdk
@@ -81,12 +82,14 @@ from curie_runner.session import SessionRunner
 from curie_runner.tracker_result import fetch_completion_contract, sibling_urls
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import FactoryWake
+from curie_worker.kernel.workspace import _workspace_candidate_ready
 from curie_worker.requester_context import (
     PREFLIGHT_BLOCKED_EVIDENCE,
     RequesterContextRefused,
     deliver,
 )
 from curie_worker.runner_client import RunnerClient
+from curie_worker.sandbox import SandboxHandle
 from curie_worker.workitem_dispatch import WorkItemDispatchClient, WorkItemRun
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -871,11 +874,32 @@ def _joined(
                 },
                 mcp_capability=_PROBE,
             )
+            bind_status_attestation(
+                runner,
+                session_id=JOINED_SESSION,
+                sandbox_id="sandbox-acme-requester-joined",
+                cwd="/workspace",
+            )
             # The runner boots (and reads its execution) after the acquire...
             server = TestServer(create_runner_app(runner, token=RUNNER_TOKEN), host="127.0.0.1")
             await server.start_server()
             stage.servers.append(server)
             base_url = str(server.make_url("")).rstrip("/")
+            handle = SandboxHandle(
+                thread_key="requester-readiness",
+                claim_name="requester-readiness",
+                sandbox_name="sandbox-acme-requester-joined",
+                namespace="acme-test",
+                service_fqdn="127.0.0.1",
+                port=server.port,
+                session_id=JOINED_SESSION,
+                token=RUNNER_TOKEN,
+            )
+            candidate = SimpleNamespace(
+                _runner=client, _config=SimpleNamespace(runner_total_timeout_s=5)
+            )
+            assert await _workspace_candidate_ready(candidate, handle)
+            assert model.evidence == [], "readiness sent a model request before delivery"
             # ...and the worker starts the request, then delivers the envelope.
             await stage.begin(run)
             sender: Any = client if rewrite is None else _Rewriting(client, rewrite)

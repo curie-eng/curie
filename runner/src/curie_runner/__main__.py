@@ -1497,6 +1497,8 @@ def build_runner(
     verification_url = os.environ.get(PROGRESS_URL_ENV)
     verification_token = os.environ.get(PROGRESS_TOKEN_ENV)
 
+    verification: dict[str, Any] | None = None
+
     async def initialize() -> None:
         try:
             await _initialize()
@@ -1508,8 +1510,7 @@ def build_runner(
     async def _initialize() -> None:
         # Runs in the runner's shared start task after the listener binds
         # (#4777): the preflight can take minutes, past the worker's claim.
-        nonlocal preflight_block, real_options, bound_contract
-        verification: dict[str, Any] | None = None
+        nonlocal preflight_block, bound_contract, verification
         if (
             mounted_workspace is not None
             and not fake_model
@@ -1557,9 +1558,6 @@ def build_runner(
                     "completion contract tracker_result result_kinds=%s",
                     ",".join(bound_contract.contract.result_kinds),
                 )
-        # ADR 0278 (#5592): an execution the API bound waits for the worker's
-        # envelope and builds no model session until it is validated; a
-        # refused, missing or unsupported one answers offline.
         if preflight_block is not None:
             # Blocked before any model session: the start answers offline with
             # its explanation, and the worker leaves the request's evidence.
@@ -1568,7 +1566,12 @@ def build_runner(
         else:
             execution = bound_contract.contract.execution
             requester_gate.bind(execution)
-        if execution is not None:
+        if issue_read is None:
+            await initialize_session()
+
+    async def initialize_session() -> None:
+        nonlocal preflight_block, real_options
+        if preflight_block is None and bound_contract.contract.execution is not None:
             outcome = await requester_gate.wait()
             if isinstance(outcome, RequesterFailed):
                 preflight_block = REQUESTER_BLOCKED_EXPLANATION
@@ -1701,6 +1704,7 @@ def build_runner(
             ),
             channel_kind=config.channel_kind,
             initializer=initialize,
+            session_initializer=initialize_session if issue_read is not None else None,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,

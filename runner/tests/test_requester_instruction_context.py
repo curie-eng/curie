@@ -990,6 +990,7 @@ def _boot_run(
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]] = _messages,
     contract_refused: bool = False,
     delivered_status: int = 200,
+    readiness_before_delivery: bool = False,
 ) -> _Boot:
     """``_boot_turn`` with an operator config and a scripted stand-in, keeping the runner."""
 
@@ -1023,6 +1024,15 @@ def _boot_run(
             )
             async with TestClient(TestServer(create_app(runner, token=TOKEN))) as client:
                 with anyio.fail_after(120):
+                    if readiness_before_delivery:
+                        with anyio.fail_after(5):
+                            while True:
+                                status = await client.get("/v1/status", headers=BEARER)
+                                assert status.status == 200
+                                if (await status.json())["ready"] is True:
+                                    break
+                        assert provider[_BODIES] == []
+                        assert provider[_OTHER] == []
                     delivered = await client.post(CONTEXT_PATH, data=raw, headers=BEARER)
                     assert delivered.status == delivered_status
                     ack: dict[str, Any] = await delivered.json()
@@ -1044,6 +1054,17 @@ def _boot_run(
             return _Boot(ack, finals[0], list(provider[_BODIES]), list(provider[_OTHER]), runner)
 
     return anyio.run(go)
+
+
+@requires_cli
+def test_readiness_precedes_envelope_delivery_and_the_first_model_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    booted = _boot_run(tmp_path, monkeypatch, VALID, readiness_before_delivery=True)
+    assert booted.ack == {"acknowledgment": _ack("applied", sha256=DIGEST)}
+    assert booted.bodies
+    assert requester_section(WORK_ITEM, DIGEST, TEXT) in _system_text(booted.bodies[0])
+    assert booted.final.text == "ok"
 
 
 @requires_cli
