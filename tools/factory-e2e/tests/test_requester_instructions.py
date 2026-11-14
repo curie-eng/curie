@@ -781,17 +781,55 @@ def test_the_live_forges_config_is_one_the_api_accepts(tmp_path: Path) -> None:
         load_forges_json(json.dumps(forges))
 
 
-def test_the_live_run_installs_the_factory_bundle() -> None:
-    files = driver.live_bundle()
+def _locked_factory_bundle(root: Path) -> Path:
+    import yaml
+    from plugin_format.connector_lock import ConnectorLockFile, RunnerLockEntry, source_digest_of
+    from plugin_format.connectors import ConnectorsFile
+
+    shutil.copytree(driver.FACTORY_BUNDLE, root)
+    declaration = ConnectorsFile.model_validate(
+        yaml.safe_load((root / "connectors.yaml").read_text())
+    )
+    assert declaration.runner is not None
+    lock = ConnectorLockFile(
+        version=1,
+        runner=RunnerLockEntry(
+            image="registry.example.com/acme/factory@sha256:" + "a" * 64,
+            base="registry.example.com/acme/runner@sha256:" + "b" * 64,
+            delivery="registry",
+            platforms=["linux/amd64"],
+            source_digest=source_digest_of(root, declaration.runner.build),
+        ),
+    )
+    (root / "connectors.lock.yaml").write_text(yaml.safe_dump(lock.model_dump()))
+    return root
+
+
+def test_the_live_run_installs_the_factory_bundle(tmp_path: Path) -> None:
+    root = _locked_factory_bundle(tmp_path / "locked")
+    files = driver.live_bundle(root)
     assert set(ris.FACTORY_BUNDLE_REQUIRED) <= set(files)
     assert json.loads(files[".claude-plugin/plugin.json"])["name"] == "dark-factory"
-    # Every file of the checked-in bundle, byte for byte.
     on_disk = {
-        path.relative_to(driver.FACTORY_BUNDLE).as_posix(): path.read_text(encoding="utf-8")
-        for path in driver.FACTORY_BUNDLE.rglob("*")
+        path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
+        for path in root.rglob("*")
         if path.is_file() and "__pycache__" not in path.parts
     }
     assert files == on_disk
+
+
+def test_the_live_bundle_refuses_a_missing_runner_lock(tmp_path: Path) -> None:
+    root = _locked_factory_bundle(tmp_path / "locked")
+    (root / "connectors.lock.yaml").unlink()
+    with pytest.raises(poe.StepFailed, match="runner loader"):
+        driver.live_bundle(root)
+
+
+def test_the_live_bundle_refuses_a_lock_without_a_runner(tmp_path: Path) -> None:
+    root = _locked_factory_bundle(tmp_path / "locked")
+    (root / "connectors.lock.yaml").write_text("version: 1\nconnectors: {}\n")
+    with pytest.raises(poe.StepFailed, match="runner loader"):
+        driver.live_bundle(root)
 
 
 @pytest.mark.parametrize("fault", ["missing_reviewer", "symlink", "binary", "oversize"])

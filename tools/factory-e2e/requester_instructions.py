@@ -40,6 +40,7 @@ import http.client
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -349,13 +350,28 @@ def live_forges(app_id: str, private_key_file: str, label: str) -> dict[str, Any
     }
 
 
-def live_bundle() -> dict[str, str]:
+def live_bundle(root: Path) -> dict[str, str]:
     """The bundle a live run installs: the real factory bundle, or a refusal."""
 
     try:
-        return ris.factory_bundle_files(FACTORY_BUNDLE)
+        files = ris.factory_bundle_files(root)
     except ValueError as failure:
         raise poe.StepFailed(str(failure)) from None
+    from curie_runner.harness.claude import get_contribution
+    from curie_runner.plugin import PluginBundleError
+
+    with tempfile.TemporaryDirectory(prefix="rqp-bundle-check-") as directory:
+        staged = Path(directory)
+        for name, text in files.items():
+            path = staged / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o644)
+        try:
+            get_contribution().compile_bundle(str(staged))
+        except PluginBundleError:
+            raise poe.StepFailed("factory bundle was refused by the runner loader") from None
+    return files
 
 
 def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one class
@@ -389,6 +405,7 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
             self.resolved: dict[str, str | None] = {}
             self.items: dict[str, str] = {}
             self.accounts: dict[str, dict[str, Any]] = {}
+            self.locked_bundle: dict[str, str] | None = None
             if live is not None:
                 for held in live.held():
                     ctx.rt.scrubber.hold(held)
@@ -456,7 +473,62 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
             # implementation skill and the review gate.
             if self.live_inputs is None:
                 return dict(cluster.bundle_files())
-            return live_bundle()
+            if self.locked_bundle is None:
+                raise poe.StepFailed("the live factory bundle has not been built and locked")
+            return dict(self.locked_bundle)
+
+        def build_image(self) -> None:
+            super().build_image()
+            if self.live_inputs is None:
+                return
+            import yaml
+            from plugin_format.connector_lock import ConnectorLockFile
+
+            directory = Path(self.private_dir) / "factory-bundle"
+            shutil.copytree(FACTORY_BUNDLE, directory)
+            registry = f"127.0.0.1:{self.ctx.flags.registry_port}"
+            base = f"{registry}/{pod.REPOSITORY}@{self.digest}"
+            self.command(
+                [
+                    self.cli,
+                    "build",
+                    "--plugin-dir",
+                    str(directory),
+                    "--runner-image",
+                    base,
+                    "--registry",
+                    registry,
+                    "--platform",
+                    "linux/amd64",
+                    "--json",
+                ],
+                timeout=1800,
+            )
+            lock = ConnectorLockFile.model_validate(
+                yaml.safe_load((directory / "connectors.lock.yaml").read_text())
+            )
+            if lock.runner is None or lock.runner.base != base:
+                raise poe.StepFailed("factory runner lock does not match the candidate base")
+            repository, digest = lock.runner.image.removeprefix(registry + "/").split("@", 1)
+            if lock.runner.delivery != "registry" or not digest.startswith("sha256:"):
+                raise poe.StepFailed("factory runner lock does not identify a registry image")
+            self.pushed.append((repository, digest))
+            local = self.docker(
+                "image", "inspect", lock.runner.image, "--format", "{{json .RepoTags}}", check=False
+            )
+            if local.returncode == 0:
+                for tag in json.loads(local.stdout) or []:
+                    if tag.startswith(registry + "/") and tag not in self.tags:
+                        self.tags.append(tag)
+            self.image = f"localhost:{self.ctx.flags.registry_port}/{repository}@{digest}"
+            self.digest = digest
+            self.evidence["manifest_digest"] = digest
+            self.locked_bundle = live_bundle(directory)
+            self.record_private_output(
+                "locked-factory-bundle", json.dumps(self.locked_bundle).encode()
+            )
+            self.observe("10", "setup.locked_bundle_runner_loader_accepted", True)
+            self.say("locked factory bundle accepted by runner loader before namespace creation")
 
         def create_inputs(self) -> None:
             super().create_inputs()

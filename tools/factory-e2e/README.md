@@ -853,7 +853,11 @@ both named reviewers, the implementation skill and the review gate) and refuses
 to start when any of those files is missing. Each slot's transcript scan
 records which named reviewers the session actually ran, and criterion 10 passes
 only when both the plan reviewer and the diff reviewer ran in every slot. The
-rehearse runs the offline fake model, which loads no plugin hooks or
+live driver builds the factory's declared runner layer on the candidate image
+with `curie build --plugin-dir`, retains its generated connectors lock, and
+compiles the exact serialized bundle through the production Claude harness
+before creating either namespace. A missing or invalid lock refuses setup.
+The rehearse runs the offline fake model, which loads no plugin hooks or
 subagents, so it keeps the owner proof's small fixture bundle.
 
 ### Inputs
