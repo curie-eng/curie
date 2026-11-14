@@ -2670,6 +2670,8 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS",
     "CURIE_PUBLICATION_RETENTION_SECONDS",
     "CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
+    // Requester coding instructions (ADR 0278) arrived as a chart value, never extraEnv.
+    "CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY",
     "CURIE_RUNNER_IMAGE",
     "CURIE_RUNNER_PORT",
     // Sandbox admission is generated chart policy from introduction, never an extraEnv input.
