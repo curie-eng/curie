@@ -398,14 +398,14 @@ fn describe(plan: &Plan) -> Vec<String> {
             plan.label.as_deref(),
         ),
     ));
+    for (args, _) in settings(plan) {
+        lines.push(format!("curie {}", args.join(" ")));
+    }
     for args in deploy_argvs(plan, &bundle_path(plan)) {
         lines.push(format!("curie {}", args.join(" ")));
     }
     if plan.label.is_none() {
         lines.push(keep_surface_plan_line("jira", &plan.jira.binding_name));
-    }
-    for (args, _) in settings(plan) {
-        lines.push(format!("curie {}", args.join(" ")));
     }
     lines
 }
@@ -767,6 +767,10 @@ async fn execute_jira_bitbucket(mut plan: Plan, opts: &QuickstartOpts) -> Result
         &plan.jira.binding_name,
         plan.label.as_deref(),
     );
+    // Publication policy must be `auto` before a tracker-result upload.
+    for (args, step) in settings(plan) {
+        run_self(&args, step, None, None).await?;
+    }
     for (index, args) in deploy_argvs(plan, &dir).into_iter().enumerate() {
         if index > 0 && kept.is_some() {
             crate::ui::ui().note(&kept_surface_line(
@@ -782,9 +786,6 @@ async fn execute_jira_bitbucket(mut plan: Plan, opts: &QuickstartOpts) -> Result
             _ => "Binding the Jira tracker".to_string(),
         };
         run_self(&args, &step, None, None).await?;
-    }
-    for (args, step) in settings(plan) {
-        run_self(&args, step, None, None).await?;
     }
     Ok(QuickstartOutput::AgentAdded {
         context: plan.native.install.context.clone(),

@@ -1702,6 +1702,19 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     None => bundle_dir(namespace, release, agent),
                     Some(dir) => dir.clone(),
                 };
+                lines.extend(
+                    agent_settings(
+                        agent,
+                        context,
+                        namespace,
+                        release,
+                        *deadline_seconds,
+                        *budget_usd,
+                        *output_tokens,
+                    )
+                    .into_iter()
+                    .map(|(args, _)| format!("curie {}", args.join(" "))),
+                );
                 for args in deploy_args(
                     context,
                     namespace,
@@ -1719,19 +1732,6 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 for repo in bound {
                     lines.push(skip_bound_line(agent, repo));
                 }
-                lines.extend(
-                    agent_settings(
-                        agent,
-                        context,
-                        namespace,
-                        release,
-                        *deadline_seconds,
-                        *budget_usd,
-                        *output_tokens,
-                    )
-                    .into_iter()
-                    .map(|(args, _)| format!("curie {}", args.join(" "))),
-                );
             }
         }
     }
@@ -1838,7 +1838,8 @@ fn bundle_line(bundle: Option<&Path>, runner_image: Option<&str>) -> String {
 }
 
 /// The `cluster overrides`, `publication-policy` and `budget` argvs that
-/// follow a deploy, each with its progress step.
+/// precede a bundle upload, each with its progress step. The upload refuses
+/// a tracker-result bundle while publication policy is still `approve`.
 fn agent_settings(
     agent: &str,
     context: &str,
@@ -3140,11 +3141,11 @@ mod tests {
             "configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
             "create agent dark-factory only if absent, with initial surface github=acme/widgets and the tracker default label; preserve an existing agent".to_string(),
-            format!("curie cluster deploy --context {KIND_CONTEXT} --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
-            format!("curie cluster surfaces dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --add github=acme/widgets"),
             format!("curie cluster overrides dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --execution-deadline 10800"),
             format!("curie cluster publication-policy dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --policy auto"),
             format!("curie cluster budget dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --limit 5 --output-tokens 250000"),
+            format!("curie cluster deploy --context {KIND_CONTEXT} --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
+            format!("curie cluster surfaces dark-factory --context {KIND_CONTEXT} --namespace curie --release curie --add github=acme/widgets"),
         ];
         assert_eq!(lines, expected);
         let ready = QuickstartOutput::Ready {
@@ -3539,11 +3540,11 @@ mod tests {
         }
         let order: Vec<usize> = [
             "configure agentSandbox.runnerEnv.dark-factory-fast.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000",
-            "cluster deploy",
-            "cluster surfaces dark-factory-fast",
             "cluster overrides dark-factory-fast",
             "cluster publication-policy dark-factory-fast",
             "cluster budget dark-factory-fast",
+            "cluster deploy",
+            "cluster surfaces dark-factory-fast",
         ]
         .iter()
         .map(|needle| {

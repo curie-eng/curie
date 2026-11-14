@@ -333,7 +333,11 @@ fn agent() -> Value {
     json!({"id":"agent-fixture","name":"dark-factory","channels":[],"created_at":"2026-10-04T00:00:00Z","memory":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
 }
 
-fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
+fn platform(
+    req: &Request,
+    state: &std::sync::Mutex<Value>,
+    enforce_tracker_rule: bool,
+) -> Response {
     let path = req.path.split('?').next().unwrap();
     let mut saved = state.lock().unwrap();
     let result = match (req.method.as_str(), path) {
@@ -350,6 +354,10 @@ fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
                 "AgentCreate needs an initial binding"
             );
             *saved = agent();
+            if enforce_tracker_rule {
+                // A real create leaves publication policy at approve.
+                saved["publication_policy"] = json!("approve");
+            }
             saved["name"] = created["name"].clone();
             saved["channels"] = json!([created["channel"].clone()]);
             if let Some(repo) = created.get("repo_full_name") {
@@ -387,6 +395,17 @@ fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
             json!({"id":"version-fixture","agent_id":"agent-fixture","version_label":"fixture","created_by":"fixture","created_at":"2026-10-04T00:00:00Z"})
         }
         ("PUT", "/agents/agent-fixture/versions/version-fixture/bundle") => {
+            if enforce_tracker_rule && archive_declares_tracker_result(&req.body) {
+                if saved.get("publication_policy").and_then(Value::as_str) != Some("auto") {
+                    return Response::json(
+                        422,
+                        r#"{"detail":{"code":"tracker_result_needs_unattended_publication","message":"tracker result runs are unattended"}}"#,
+                    );
+                }
+                // The next quickstart must set auto again. A rerun that skips
+                // settings uploads while the agent is back at approve.
+                saved["publication_policy"] = json!("approve");
+            }
             json!({"version_id":"version-fixture","bundle_ref":"bundles/fixture.tar.gz","bundle_sha256":"fixture","size_bytes":100})
         }
         ("GET", "/agents/agent-fixture/versions/version-fixture/connectors") => {
@@ -448,7 +467,22 @@ impl Fixture {
         Self::with_bot_lookup(account_left, 200, r#"{"id":123}"#)
     }
 
+    /// The platform stub creates agents at `approve` and refuses a
+    /// tracker-result upload until publication policy is `auto`.
+    fn enforcing_tracker_publication() -> Self {
+        Self::open(AMPLE_ACCOUNT_LEFT, 200, r#"{"id":123}"#, true)
+    }
+
     fn with_bot_lookup(account_left: f64, bot_status: u16, bot_body: &'static str) -> Self {
+        Self::open(account_left, bot_status, bot_body, false)
+    }
+
+    fn open(
+        account_left: f64,
+        bot_status: u16,
+        bot_body: &'static str,
+        enforce_tracker_rule: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("bin")).unwrap();
         for tool in ["helm", "kubectl", "kind", "docker"] {
@@ -554,7 +588,7 @@ impl Fixture {
         Self {
             dir,
             github,
-            platform: serve(move |request| platform(request, &agent_state)),
+            platform: serve(move |request| platform(request, &agent_state, enforce_tracker_rule)),
             registry,
             openrouter: openrouter(account_left),
         }
@@ -3078,5 +3112,188 @@ fn the_ready_path_puts_the_factory_output_allowance_and_reports_it() {
     assert_eq!(
         puts[0],
         json!({"max_output_tokens_per_run": 250000, "max_usd_per_day": 5.0})
+    );
+}
+
+/// Gzip bytes inside a raw body or a multipart part. The real upload is
+/// multipart, so the declaration is read from the first gzip member.
+fn archive_declares_tracker_result(body: &[u8]) -> bool {
+    let Some(start) = body
+        .windows(3)
+        .position(|window| window == [0x1f, 0x8b, 0x08])
+    else {
+        return false;
+    };
+    let decoder = flate2::read::GzDecoder::new(&body[start..]);
+    let mut archive = tar::Archive::new(decoder);
+    let Ok(entries) = archive.entries() else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(mut entry) = entry else {
+            continue;
+        };
+        let Ok(path) = entry.path() else {
+            continue;
+        };
+        if !path.ends_with("workflow/result.json") {
+            continue;
+        }
+        let mut text = String::new();
+        if entry.read_to_string(&mut text).is_ok()
+            && text.contains("\"contract\"")
+            && text.contains("tracker_result")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn gzip_tar(files: &[(&str, &str)]) -> Vec<u8> {
+    let mut stored = Vec::new();
+    {
+        let encoder = flate2::write::GzEncoder::new(&mut stored, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (name, text) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(text.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, text.as_bytes())
+                .unwrap();
+        }
+        archive.finish().unwrap();
+    }
+    stored
+}
+
+#[test]
+fn tracker_result_archive_bytes_are_the_refusal_input() {
+    let declaring = gzip_tar(&[(
+        "workflow/result.json",
+        r#"{"contract":"tracker_result","results":["ticket","findings"]}"#,
+    )]);
+    let plain = gzip_tar(&[(".claude-plugin/plugin.json", r#"{"name":"plain"}"#)]);
+    assert!(archive_declares_tracker_result(&declaring));
+    assert!(!archive_declares_tracker_result(&plain));
+    let mut wrapped = b"--boundary\r\n\r\n".to_vec();
+    wrapped.extend_from_slice(&declaring);
+    assert!(archive_declares_tracker_result(&wrapped));
+    assert!(!archive_declares_tracker_result(b"not an archive"));
+}
+
+fn tracker_result_bundle(dir: &std::path::Path) {
+    fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+    fs::write(
+        dir.join(".claude-plugin/plugin.json"),
+        json!({"name":"factory-triage","version":"1.0.0"}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("workflow")).unwrap();
+    fs::write(
+        dir.join("workflow/result.json"),
+        json!({
+            "schema_version": 1,
+            "contract": "tracker_result",
+            "results": ["ticket", "findings"],
+            "implementation_label": "ready"
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// Each tracker-result upload follows a publication-policy `auto` write that
+/// is newer than the previous upload.
+fn policy_before_each_tracker_upload(requests: &[Request]) -> bool {
+    let mut previous_upload = None;
+    let mut uploads = 0usize;
+    for (index, request) in requests.iter().enumerate() {
+        if request.method != "PUT" || !request.path.ends_with("/bundle") {
+            continue;
+        }
+        uploads += 1;
+        if !archive_declares_tracker_result(&request.body) {
+            return false;
+        }
+        let policy = requests[..index].iter().rposition(|earlier| {
+            earlier.method == "PATCH"
+                && earlier.path == "/agents/agent-fixture"
+                && serde_json::from_slice::<Value>(&earlier.body)
+                    .ok()
+                    .and_then(|body| body.get("publication_policy").cloned())
+                    == Some(json!("auto"))
+        });
+        let Some(policy) = policy else {
+            return false;
+        };
+        if previous_upload.is_some_and(|prior| policy < prior) {
+            return false;
+        }
+        previous_upload = Some(index);
+    }
+    uploads == 2
+}
+
+#[test]
+fn quickstart_sets_publication_policy_before_a_tracker_result_upload() {
+    let fixture = Fixture::enforcing_tracker_publication();
+    record_factory_intake(&fixture, None);
+    let bundle = fixture.dir.path().join("triage-bundle");
+    tracker_result_bundle(&bundle);
+    let args = [
+        "--color",
+        "never",
+        "--context",
+        "kind-curie-factory",
+        "--agent",
+        "triage",
+        "--label",
+        "curie-factory",
+        "--plugin-dir",
+        bundle.to_str().unwrap(),
+    ];
+    for pass in 1..=2 {
+        let output = fixture
+            .command(false, &args)
+            .env("QUICKSTART_APP_SECRET", "factory-app")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "pass {pass}: {shown}");
+        let policy = shown
+            .lines()
+            .position(|line| line == "Setting publication policy")
+            .unwrap_or_else(|| panic!("pass {pass}: no publication step: {shown}"));
+        let deploy = shown
+            .lines()
+            .position(|line| line == "Deploying triage")
+            .unwrap_or_else(|| panic!("pass {pass}: no deploy step: {shown}"));
+        assert!(policy < deploy, "pass {pass}: {shown}");
+    }
+    let requests = fixture.platform.recorded();
+    assert!(
+        policy_before_each_tracker_upload(&requests),
+        "publication policy auto must precede each tracker-result upload:\n{}",
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == "/agents")
+            .count(),
+        1,
+        "a rerun must keep the existing agent"
     );
 }
