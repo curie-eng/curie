@@ -14,6 +14,9 @@ import io
 import json
 import sys
 import tarfile
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -454,3 +457,159 @@ def test_no_version_is_still_refused() -> None:
 
 def test_a_fully_known_version_deploys_normally() -> None:
     assert upgrade_disposition("c" * 40, "a-version-id") == "deploy"
+
+
+# --- the main entry, against a real platform read API -------------------------
+#
+# `main` is driven end to end with env vars. The platform is a real local HTTP
+# server serving the read routes `deployed_commit` calls, and it records every
+# request so a write is visible. Only the GitHub tip lookup is replaced, at its
+# external boundary; `main`, `deployed_commit`, `upgrade_disposition` and
+# `deploy` all run as shipped.
+
+_TIP = "f" * 40
+
+
+class _Platform:
+    def __init__(self) -> None:
+        self.deployments: list[dict] = []
+        self.versions: list[dict] = []
+        self.requests: list[tuple[str, str]] = []
+        self.url = ""
+
+    def writes(self) -> list[tuple[str, str]]:
+        return [(m, p) for m, p in self.requests if m != "GET"]
+
+
+@pytest.fixture
+def platform(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Platform]:
+    state = _Platform()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def _answer(self) -> None:
+            state.requests.append((self.command, self.path))
+            path = self.path.split("?", 1)[0]
+            routes = {
+                "/agents": [{"id": "agent-1", "name": "sre-bot"}],
+                "/deployments": state.deployments,
+                "/agents/agent-1/versions": state.versions,
+            }
+            if self.command != "GET" or path not in routes:
+                self.send_response(405)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            raw = json.dumps(routes[path]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        do_GET = do_POST = do_PUT = _answer  # noqa: N815
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    state.url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    import redeploy
+
+    for key in (
+        "CURIE_SELF_UPGRADE_REPO",
+        "CURIE_SELF_UPGRADE_BRANCH",
+        "CURIE_SELF_UPGRADE_AGENT",
+        "CURIE_SELF_UPGRADE_DRY_RUN",
+        "GITHUB_TOKEN",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CURIE_API_URL", state.url)
+    monkeypatch.setenv("CURIE_API_KEY", "platform-key")
+    # The external boundary: the GitHub tip lookup. The tarball and registry
+    # fetches go through `_get`, which a dry run or a refusal must never reach.
+    monkeypatch.setattr(redeploy, "latest_commit", lambda repo, branch, token: _TIP)
+
+    def no_download(url: str, token: str | None, accept: str) -> bytes:
+        raise AssertionError(f"unexpected download of {url}")
+
+    monkeypatch.setattr(redeploy, "_get", no_download)
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _serve(state: _Platform, *, version: str | None, commit: str | None) -> None:
+    if version is None:
+        return
+    state.deployments = [
+        {
+            "agent_id": "agent-1",
+            "version_id": version,
+            "status": "active",
+            "environment": "prod",
+            "deployed_at": "2026-01-01T00:00:00",
+        }
+    ]
+    state.versions = [{"id": version, "commit_sha": commit}]
+
+
+@pytest.mark.parametrize("dry_run", ["1", ""], ids=["dry-run", "real"])
+def test_dry_run_without_deployed_version_refuses(
+    platform: _Platform,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dry_run: str,
+) -> None:
+    import redeploy
+
+    # The agent exists and nothing is deployed, so there is no version.
+    _serve(platform, version=None, commit=None)
+    monkeypatch.setenv("CURIE_SELF_UPGRADE_DRY_RUN", dry_run)
+
+    assert redeploy.main() == 1
+
+    out = capsys.readouterr().out
+    assert "Refusing." in out
+    assert "would deploy" not in out
+    assert platform.writes() == []
+
+
+def test_dry_run_with_unknown_commit_reports_a_prospective_deploy(
+    platform: _Platform, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import redeploy
+
+    _serve(platform, version="v1", commit=None)
+    monkeypatch.setenv("CURIE_SELF_UPGRADE_DRY_RUN", "1")
+
+    assert redeploy.main() == 0
+
+    out = capsys.readouterr().out
+    assert "would deploy" in out
+    assert "Refusing." not in out
+    assert platform.writes() == []
+
+
+@pytest.mark.parametrize("dry_run", ["1", ""], ids=["dry-run", "real"])
+def test_already_at_the_tip_is_a_no_op(
+    platform: _Platform,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dry_run: str,
+) -> None:
+    import redeploy
+
+    _serve(platform, version="v1", commit=_TIP)
+    monkeypatch.setenv("CURIE_SELF_UPGRADE_DRY_RUN", dry_run)
+
+    assert redeploy.main() == 0
+
+    out = capsys.readouterr().out
+    assert "nothing to do" in out
+    assert platform.writes() == []
