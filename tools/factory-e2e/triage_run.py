@@ -295,6 +295,7 @@ class TriageToPr:
             {
                 "name": TRIAGE_AGENT,
                 "repo_full_name": "acme-corp/acme-bot",
+                "publication_policy": "auto",
                 "channel": {
                     "kind": "github",
                     "address": "acme-corp/acme-bot",

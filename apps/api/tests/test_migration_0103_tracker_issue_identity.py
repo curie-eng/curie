@@ -230,7 +230,9 @@ def _replay_label_notice() -> tuple[str, int, int]:
                     select(AgentChannel).where(AgentChannel.address == REPO)
                 )
                 assert binding is not None
-                facts = github_factory._facts(notice, binding, forges_registry(settings))
+                facts = github_factory._facts(
+                    github_factory.selection_of(notice), binding, forges_registry(settings)
+                )
                 result = await workitem_dispatch.readmit(session, facts)
                 assert isinstance(result, WorkItemOutcome), result
                 await session.commit()

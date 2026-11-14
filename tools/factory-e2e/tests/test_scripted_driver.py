@@ -2039,6 +2039,41 @@ RECORDED = REPO_ROOT / "tools/model-script/transcripts/unitconv-issue.json"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
+def test_triage_setup_requests_unattended_publication_before_deploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = sk.ScriptedRun(_replay_args(tmp_path))
+    driver.workdir = tmp_path / "work"
+    driver.workdir.mkdir()
+    driver.env.update(CURIE_API_URL="http://api.example.com", CURIE_API_KEY="example-key")
+    driver.stub = type("Stub", (), {"set_permission": lambda *_args, **_kwargs: None})()
+    events: list[tuple[str, Any]] = []
+
+    def http_json(method: str, url: str, **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        if method == "POST" and url.endswith("/agents"):
+            events.append(("create", kwargs["body"]))
+            return 201, {"id": "triage-agent-example"}
+        return 200, {}
+
+    def command(*argv: str, **_kwargs: Any) -> str:
+        if argv[1] == "example":
+            sk.shutil.copytree(triage_run.TRIAGE_BUNDLE, driver.workdir / "triage-bundle")
+        else:
+            events.append(("deploy", argv))
+        return ""
+
+    monkeypatch.setattr(fe, "http_json", http_json)
+    monkeypatch.setattr(driver, "command", command)
+    monkeypatch.setattr(driver, "kubectl", lambda *_args, **_kwargs: "")
+    router = lanes.LaneRouter({"triage": lanes.bundle_system_prompt(triage_run.TRIAGE_BUNDLE)})
+    run = triage_run.TriageToPr(driver, router, None)  # type: ignore[arg-type]
+
+    run.setup()
+
+    assert [event for event, _ in events] == ["create", "deploy"]
+    assert events[0][1].get("publication_policy") == "auto"
+
+
 @pytest.fixture
 def model_module() -> Any:
     return sk._module("factory_model_script_lanes", MODEL_SCRIPT)
