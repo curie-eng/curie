@@ -586,19 +586,26 @@ for root in roots:
             if len(data) > LIMIT:
                 incomplete.append(1)
                 continue
+            if data and not data.endswith(b"\\n"):
+                # A truncated final record: the read is incomplete.
+                incomplete.append(1)
+                continue
             seen = False
             for line in data.splitlines():
-                if not side:
-                    if not line.strip():
-                        continue
-                    try:
-                        record = json.loads(line)
-                        if record.get("isSidechain") is not True:
-                            reviewer_calls(record)
-                            continue
-                    except (ValueError, AttributeError):
-                        incomplete.append(1)
-                        continue
+                if not line.strip():
+                    continue
+                # Every record, reviewer or parent, must be one whole JSON object.
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    incomplete.append(1)
+                    continue
+                if not isinstance(record, dict):
+                    incomplete.append(1)
+                    continue
+                if not side and record.get("isSidechain") is not True:
+                    reviewer_calls(record)
+                    continue
                 seen = True
                 records += 1
                 for index, (raw, escaped) in enumerate(forms):

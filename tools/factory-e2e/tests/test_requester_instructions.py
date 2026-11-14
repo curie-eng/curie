@@ -670,6 +670,34 @@ def test_reviewer_scan_fails_closed_on_an_unparsable_parent_line(tmp_path: Path)
     assert ris.reviewer_scan_result(code, out).error == "incomplete"
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        # A torn record between whole ones.
+        pytest.param(b'{"type": "user", "isSidechain": true, "mess\n{"type": "user"}\n', id="torn"),
+        # A final record cut off mid-write.
+        pytest.param(b'{"type": "user", "isSidechain": true, "message": "Rev', id="truncated"),
+        # A whole final record with no line end: the write may not be finished.
+        pytest.param(b'{"type": "user", "isSidechain": true}', id="unterminated"),
+        # A line that parses but is not a record.
+        pytest.param(b'["not", "a", "record"]\n', id="not_an_object"),
+    ],
+)
+def test_reviewer_scan_fails_closed_on_a_torn_reviewer_transcript(
+    tmp_path: Path, tail: bytes
+) -> None:
+    document = ris.make_document("first", NONCE)
+    root = _transcripts(tmp_path / "torn", document, leak=False)
+    reviewer = next(path for path in root.rglob("*.jsonl") if "subagents" in path.parts)
+    with reviewer.open("ab") as stream:
+        stream.write(tail)
+    code, out = _run(
+        ris.REVIEWER_SCAN_PROGRAM, "20", str(root), stdin=json.dumps(document.needles()).encode()
+    )
+    assert code == 4
+    assert ris.reviewer_scan_result(code, out).error == "incomplete"
+
+
 def test_reviewer_scan_reports_only_the_named_reviewers_that_ran(tmp_path: Path) -> None:
     document = ris.make_document("first", NONCE)
     calls = (
