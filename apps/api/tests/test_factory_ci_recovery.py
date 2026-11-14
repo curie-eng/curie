@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from curie_api.config import get_settings
@@ -481,7 +482,19 @@ def test_stale_metadata_cannot_recover_until_fresh_checks_exist(
 
 @pytest.fixture
 def migration_admitted(isolated_migration_db: Any, request: pytest.FixtureRequest) -> Any:
-    isolated_migration_db.at("head")
+    from _migration_support import alembic_config
+    from alembic import command
+
+    isolated_migration_db.at("0163")
+    agent_id = uuid4()
+    _execute(
+        "INSERT INTO curie.agents (id, name) VALUES (:id, 'acme-ci-migration')",
+        {"id": agent_id},
+    )
+    query = "SELECT * FROM curie.agents WHERE id = :id"
+    before = _rows(query, {"id": agent_id})
+    command.upgrade(alembic_config(), "head")
+    assert _rows(query, {"id": agent_id}) == before
     return request.getfixturevalue("admitted")
 
 

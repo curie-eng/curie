@@ -53,7 +53,7 @@ from curie_api.forges.errors import (
 )
 from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
 from curie_api.forges.github.marked_comments import REFUSED_STATUSES, github_request
-from curie_api.forges.github.review_polling import human_actor, label_actor, trailing_id
+from curie_api.forges.github.review_polling import human_actor, trailing_id
 from curie_api.forges.github.transport import (
     PollUnavailable,
     get_all,
@@ -86,7 +86,7 @@ from curie_api.forges.types import (
     valid_output_identity,
 )
 from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_login
-from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable
+from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from curie_api.github_review_truth import verify_sender_write_permission
 from curie_api.repo_full_name import repo_url_path
 
