@@ -1423,14 +1423,21 @@ class TwoOwnerRun(pp.LiveRun):
                 run.deferred.append(dict(record))
                 return
         if mode in pto.FINAL_MODES:
-            self.owner_ledger.record_timing(
-                run.group,
-                self.session_stem(run, record),
-                "stop" if mode == "stop" else "subagent_stop",
-                key,
-                record.get("written_at"),
-                observed_at=self.clock.now(),
-            )
+            if (
+                self.safe(
+                    lambda: self.owner_ledger.record_timing(
+                        run.group,
+                        self.session_stem(run, record),
+                        "stop" if mode == "stop" else "subagent_stop",
+                        key,
+                        record.get("written_at"),
+                        observed_at=self.clock.now(),
+                    ),
+                    False,
+                )
+                is False
+            ):
+                self.stop_session(run, "timing_write_failed", record=record)
         initial = self.initial_prompt(run, record)
         if not self.await_coverage(run, record, allow_missing=initial):
             self.stop_session(run, "capture_incomplete", record=record)
@@ -2467,13 +2474,22 @@ class TwoOwnerRun(pp.LiveRun):
             try:
                 for line in process.stdout if process.stdout is not None else []:
                     with run.harvest_lock:
-                        state.feed(line)
+                        try:
+                            state.feed(line)
+                        except Exception:  # noqa: BLE001
+                            state.bad_lines += 1
+                            self.safe(
+                                lambda: ledger.record(
+                                    "diagnostics", f"timing_failure_{run.group}", True
+                                ),
+                                None,
+                            )
+                eof.set()
             except Exception:  # noqa: BLE001
                 with run.harvest_lock:
                     state.bad_lines += 1
             finally:
                 ledger.close()
-                eof.set()
 
         def drain() -> None:
             for line in process.stderr if process.stderr is not None else []:
@@ -2615,7 +2631,7 @@ class TwoOwnerRun(pp.LiveRun):
                         "",
                         "approval_requested",
                         "publication",
-                        run.parked_at,
+                        run.parked_at or None,
                         observed_at=self.clock.now(),
                     )
                     return item.get("state") == "awaiting_approval"
@@ -2688,7 +2704,7 @@ class TwoOwnerRun(pp.LiveRun):
 
         def terminal() -> bool:
             with run.harvest_lock:
-                return harvest.terminal_after(run.parked_at)
+                return bool(run.parked_at) and harvest.terminal_after(run.parked_at)
 
         with contextlib.suppress(StepFailed):
             self.wait_until(
@@ -2698,7 +2714,12 @@ class TwoOwnerRun(pp.LiveRun):
             run.reviewed = pps.workspace_record(harvest.workspace)
         self.remove_pod(run)
         with run.harvest_lock:
-            complete = run.eof.is_set() and harvest.terminal_after(run.parked_at)
+            complete = (
+                run.eof.is_set()
+                and not harvest.bad_lines
+                and bool(run.parked_at)
+                and harvest.terminal_after(run.parked_at)
+            )
             process_max = harvest.process_max
             credential = harvest.credential_evidence()
         self.note("owners", "one_native_session", run.owner, process_max <= 1)
@@ -5310,16 +5331,20 @@ class TwoOwnerRun(pp.LiveRun):
 
         self.card_publications[key] = publication_id
         self.cards[key] = pps.ref_digest(publication_id)
-        publication = self.publication(publication_id)
-        approval = self.approval(str(publication.get("approval_id") or ""))
-        self.owner_ledger.record_timing(
-            key,
-            "",
-            "approval_requested",
-            "created",
-            pps.iso_epoch(approval.get("created_at")),
-            observed_at=self.clock.now(),
-        )
+
+        def requested() -> None:
+            publication = self.publication(publication_id)
+            approval = self.approval(str(publication.get("approval_id") or ""))
+            self.owner_ledger.record_timing(
+                key,
+                "",
+                "approval_requested",
+                "created",
+                pps.iso_epoch(approval.get("created_at")) or None,
+                observed_at=self.clock.now(),
+            )
+
+        self.safe(requested, None)
         super().await_card(publication_id, key)
         self.owner_ledger.record_timing(
             key, "", "card_delivered", "card", self.clock.now(), observed_at=self.clock.now()

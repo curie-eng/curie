@@ -26,6 +26,7 @@ import io
 import json
 import signal
 import tarfile
+import threading
 import urllib.parse
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -3958,6 +3959,163 @@ def test_runner_capture_writes_timing_through_the_production_reader(tmp_path: Pa
         ("assistant", T0 + 1),
     ]
     reader.close()
+
+
+def test_timing_write_failure_keeps_reading_until_real_stream_eof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1")
+    first = _jsonl([_reply("msg-one", 1, 2, [])])
+    second = _jsonl([_reply("msg-two", 2, 3, [])])
+    resumed, finish = threading.Event(), threading.Event()
+
+    def line(data: bytes, offset: int) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "kind": "file",
+                    "path": MAIN,
+                    "offset": offset,
+                    "data": base64.b64encode(data).decode(),
+                }
+            ).encode()
+            + b"\n"
+        )
+
+    def stream():  # type: ignore[no-untyped-def]
+        yield line(first, 0)
+        resumed.set()
+        if not finish.wait(timeout=5):
+            raise RuntimeError("test stream was not released")
+        yield line(second, len(first))
+        yield (
+            json.dumps(
+                {"kind": "sync", "sizes": {MAIN: len(first + second)}, "at": T0 + 3}
+            ).encode()
+            + b"\n"
+        )
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("timing storage unavailable")
+
+    monkeypatch.setattr(pto.TwoOwnerLedger, "record_timing", unavailable)
+    process = _FakeProcess(43001)
+    process.stdout, process.stderr = stream(), io.BytesIO()  # type: ignore[assignment]
+    h.shell.spawn = lambda _argv: process  # type: ignore[method-assign]
+    pt.TwoOwnerRun.open_harvest(h.run, run)
+    try:
+        assert resumed.wait(timeout=5), "transcript reader stopped at the timing failure"
+        assert not run.eof.is_set(), "timing failure was mistaken for stream EOF"
+    finally:
+        finish.set()
+    assert run.eof.wait(timeout=5)
+    assert run.harvest is not None
+    assert run.harvest.transcript_files()[MAIN] == first + second
+    assert run.harvest.synced_at == T0 + 3
+    assert run.harvest.bad_lines > 0 and not run.harvest.complete
+    assert h.ledger.observations("diagnostics")["timing_failure_a1"] is True
+
+
+def test_stop_timing_write_failure_fences_the_held_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1")
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("timing storage unavailable")
+
+    monkeypatch.setattr(h.ledger, "record_timing", unavailable)
+    with pytest.raises(pp.StepFailed, match="timing_write_failed"):
+        h.run.gate_event(run, _hold("stop", 1, size=100, written=T0))
+    assert run.stopped and h.run.paid_failure is not None
+    assert all(row["source"] == "unknown" for row in _rows(h, "a1"))
+    assert len(_pod_deletes(h, "pod-a1")) == 1
+    assert not any("release" in command for command in _gate(run).sent)
+
+
+@pytest.mark.parametrize("read", ["publication", "approval"])
+def test_card_delivery_survives_the_optional_timing_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read: str
+) -> None:
+    h = _live(tmp_path, begin=False)
+    _drill_setup(h)
+
+    def unavailable(_id: str) -> dict[str, Any]:
+        raise pp.StepFailed("timing read unavailable")
+
+    monkeypatch.setattr(h.run, read, unavailable)
+    h.run.await_card(DRILL_PUBLICATION["reject"], "drill_reject")
+    assert h.ledger.observations("approval")["drill_reject_card"]["delivered"] is True
+    assert any(row["event"] == "card_delivered" for row in h.ledger.timing_rows())
+
+
+@pytest.mark.parametrize("created_at", [None, "unreadable"])
+def test_missing_approval_times_are_null_in_card_and_park_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, created_at: Any
+) -> None:
+    h = _live(tmp_path)
+    _drill_setup(h)
+    monkeypatch.setattr(
+        h.run,
+        "approval",
+        lambda _id: {
+            "conversation_id": "issue-11",
+            "created_at": created_at,
+        },
+    )
+    h.run.await_card(DRILL_PUBLICATION["reject"], "drill_reject")
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    run.conversation_id = "issue-11"
+    h.run.work_item_of = lambda _id: {"state": "running", "requests": []}  # type: ignore[method-assign]
+    h.run.pending_publication_approvals = lambda: [{"id": DRILL_APPROVAL["reject"]}]  # type: ignore[method-assign]
+
+    def wait(condition: Callable[[], bool], **_kwargs: Any) -> None:
+        assert condition() is False
+        raise pp.StepFailed("park was not observed")
+
+    h.run.wait_until = wait  # type: ignore[method-assign]
+    with pytest.raises(pp.StepFailed, match="park was not observed"):
+        h.run.await_park(run)
+    times = [row["at"] for row in h.ledger.timing_rows() if row["event"] == "approval_requested"]
+    assert len(times) == 2 and times == [None, None]
+
+
+@pytest.mark.parametrize("parked_at", [None, 0.0, T0 + 2])
+def test_capture_needs_a_known_park_time_after_its_size_report(
+    tmp_path: Path, parked_at: float | None
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1")
+    _feed(run, {MAIN: _jsonl([_reply("msg-one", 1, 2, [])])}, at=T0 + 1)
+    run.parked_at = parked_at  # type: ignore[assignment]
+
+    def wait(condition: Callable[[], bool], **_kwargs: Any) -> None:
+        assert condition() is False
+        raise pp.StepFailed("terminal capture was not observed")
+
+    h.run.wait_until = wait  # type: ignore[method-assign]
+    h.run.remove_pod = lambda _run: run.eof.set()  # type: ignore[method-assign]
+    with pytest.raises(pp.StepFailed, match="usage unknown or unmapped"):
+        h.run.finish_park(run)
+    assert all(row["source"] == "unknown" for row in _rows(h, "a1"))
+
+
+def test_known_park_time_accepts_a_later_complete_size_report(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1")
+    _feed(run, {MAIN: _jsonl([_reply("msg-one", 1, 2, [])])}, at=T0 + 2)
+    run.parked_at = T0 + 1
+    h.run.wait_until = lambda condition, **_kwargs: condition()  # type: ignore[method-assign]
+    h.run.remove_pod = lambda _run: run.eof.set()  # type: ignore[method-assign]
+    h.run.finish_park(run)
+    assert h.run.settled_known("a1")
 
 
 def test_observed_stop_is_saved_even_when_usage_capture_cannot_complete(tmp_path: Path) -> None:
