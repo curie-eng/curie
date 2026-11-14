@@ -83,6 +83,7 @@ from .routers import (
     channel_read,
     channels,
     cluster_message_replies,
+    coding_instructions,
     config,
     console,
     control,
@@ -90,6 +91,7 @@ from .routers import (
     deployments,
     directory,
     evals,
+    factory_facts,
     factory_slack,
     factory_status,
     forge_credential_health,
@@ -758,6 +760,7 @@ def create_app(
     app.include_router(channel_read.router)
     app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
+    app.include_router(factory_facts.router)
     app.include_router(factory_status.router)
     app.include_router(forge_credential_health.router)
     app.include_router(turn_progress.router)
@@ -773,6 +776,7 @@ def create_app(
     app.include_router(identity_admin.router)
     app.include_router(identity_operator.router)
     app.include_router(personal_enrollments.router)
+    app.include_router(coding_instructions.router)
     app.include_router(identity_authority.router)
     app.include_router(identity_authority.grant_router)
     app.include_router(identity_authority.classification_router)

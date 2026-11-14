@@ -5,7 +5,10 @@ The worker hands over a threaded ``app_mention`` whose root it found in
 module decides, in order, and refuses with a named outcome at the first check
 that fails:
 
-1. The receipt names the same delivery, route and sender as the turn.
+1. The receipt names the same delivery, route and sender as the turn, and
+   is a person's version 1 receipt for a thread reply: a root mention's
+   receipt and a declared test driver's version 2 receipt, which kickoff
+   reads (#5380), never steer.
 2. The root is a factory run's root.
 3. The sender resolves to an active principal in the receiving channel
    identity (`identity.service.resolve_principal`).
@@ -80,11 +83,14 @@ from .identity.service import Resolution, resolve_principal
 from .identity.slack import SlackEvidence
 from .models import (
     DEFAULT_TENANT_ID,
+    Agent,
     ExecutionRequest,
     FactorySlackThread,
     IdentityLink,
     IdentityNamespace,
     PersonalClaudeEnrollment,
+    Principal,
+    Tenant,
     ThreadPublicationLineage,
     WorkItem,
 )
@@ -185,6 +191,10 @@ def _receipt(data: FactorySlackSteerIn) -> tuple[SlackMentionReceipt, SlackEvide
         or evidence.user_id != receipt.user_id
     ):
         return None
+    # Cross-consumer controls (#5380): kickoff also reads root and declared
+    # driver receipts; steering judges a person's thread reply only.
+    if receipt.version != 1 or receipt.message_ts == receipt.root_ts:
+        return None
     return receipt, evidence
 
 
@@ -225,6 +235,39 @@ async def _links(
         )
     ).all()
     return [_Link(row[0], row[1]) for row in rows]
+
+
+async def resolve_github_requester(
+    session: AsyncSession, *, agent_id: uuid.UUID, tracker_host: str, account_id: int
+) -> uuid.UUID | None:
+    """Resolve only the verified label actor, using the trusted tracker host."""
+
+    if type(account_id) is not int or account_id <= 0:
+        return None
+    await identity_fence.lock_identity_reader(session)
+    host = tracker_host.lower()
+    principal: uuid.UUID | None = await session.scalar(
+        select(Principal.id)
+        .join(Tenant, Tenant.id == Principal.tenant_id)
+        .join(Agent, Agent.tenant_id == Tenant.id)
+        .join(IdentityLink, IdentityLink.principal_id == Principal.id)
+        .join(IdentityNamespace, IdentityNamespace.id == IdentityLink.identity_namespace_id)
+        .where(
+            Agent.id == agent_id,
+            Tenant.status == "active",
+            Principal.status == "active",
+            IdentityLink.tenant_id == Tenant.id,
+            IdentityLink.provider_native_id == str(account_id),
+            IdentityLink.revoked_at.is_(None),
+            IdentityNamespace.tenant_id == Tenant.id,
+            IdentityNamespace.provider == "github",
+            IdentityNamespace.kind == GITHUB_HOST_KIND,
+            IdentityNamespace.authority == host,
+            IdentityNamespace.key == host,
+            IdentityNamespace.status == "active",
+        )
+    )
+    return principal
 
 
 def _canonical_host(host: str) -> str:

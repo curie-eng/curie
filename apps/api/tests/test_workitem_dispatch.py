@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import replace
@@ -3413,3 +3414,463 @@ def test_held_cancel_termination_claimant_is_not_displaced(
         )
 
     with_session(body)
+
+
+# Tracker result requests (ADR 0277, #5586): criteria 5 and 6 ----------------------
+#
+# The request is admitted through the real dispatch path, then marked a tracker
+# result request the way admission marks one whose deployed version carries a
+# result policy. The session is reserved and its grant minted by the same
+# `reserve_session` the runner's completion contract route calls. The tracker is
+# the in-memory adapter, substituted at `factory_tracker_result_runtime.work_item_tracker`.
+
+TRIAGE_DIGEST = "cd" * 32
+TRIAGE_TITLE = "Export drops a row"
+TRIAGE_BODY = "Reported symptom."
+
+
+def with_maker[T](
+    body: Callable[[AsyncSession, async_sessionmaker[AsyncSession]], Awaitable[T]],
+) -> T:
+    async def go() -> T:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as session:
+                return await body(session, maker)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+@pytest.fixture
+def triage_tracker(monkeypatch: pytest.MonkeyPatch) -> Any:
+    from curie_api import factory_tracker_result_runtime
+    from curie_api.forges.memory import InMemoryTracker
+
+    tracker = InMemoryTracker(kind=GITHUB, host="github.com", scope_id="101")
+    monkeypatch.setattr(
+        factory_tracker_result_runtime,
+        "work_item_tracker",
+        lambda _settings, _client, _work_item: tracker,
+    )
+    return tracker
+
+
+async def _mark_tracker_result(
+    session: AsyncSession, agent_id: uuid.UUID, request_id: uuid.UUID
+) -> None:
+    await session.execute(
+        text(
+            "INSERT INTO curie.agent_versions (id, agent_id, version_label, created_by, "
+            "result_policy_schema_version, result_policy_digest, result_policy) "
+            "VALUES (:id, :agent, 'triage-v1', 'test', 1, :digest, CAST(:policy AS jsonb))"
+        ),
+        {
+            "id": uuid.uuid4(),
+            "agent": agent_id,
+            "digest": TRIAGE_DIGEST,
+            "policy": '{"results": ["findings"], "implementation_label": null}',
+        },
+    )
+    await session.execute(
+        text(
+            "UPDATE curie.execution_requests SET completion_contract = 'tracker_result', "
+            "result_policy_digest = :digest WHERE id = :id"
+        ),
+        {"id": request_id, "digest": TRIAGE_DIGEST},
+    )
+    await session.commit()
+
+
+async def _running_with_contract(
+    session: AsyncSession,
+    agent_id: uuid.UUID,
+    tracker: Any,
+    *,
+    tracker_result: bool,
+    issue: int = 2573,
+) -> Admission:
+    """Admitted, acquired, (reserved when tracker result) and started."""
+
+    from curie_api import factory_tracker_result_runtime as runtime
+    from curie_api.factory_tracker_result_runtime import source_content_sha256
+    from curie_api.forges.types import SourceContent
+
+    facts = _facts(agent_id, issue_number=issue)
+    await admit(session, facts)
+    tracker.seed_issue(TRIAGE_TITLE, TRIAGE_BODY, issue_id=str(issue))
+    if tracker_result:
+        await _mark_tracker_result(session, agent_id, facts.request_id)
+    async with no_external_calls() as http_client:
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+            client=http_client,
+        )
+    assert isinstance(acquired, AcquireGrant), acquired
+    if tracker_result:
+        view = await runtime.reserve_session(
+            session,
+            request_id=facts.request_id,
+            content_sha256=source_content_sha256(SourceContent(TRIAGE_TITLE, TRIAGE_BODY)),
+            settings=get_settings(),
+        )
+        assert view.completion_contract == "tracker_result"
+    await start(
+        session,
+        facts.request_id,
+        owner=OWNER,
+        generation=1,
+        claim_name=CLAIM_NAME,
+        sandbox_name=SANDBOX_NAME,
+        context=acquired.context,
+    )
+    return facts
+
+
+async def _submit_findings(
+    session: AsyncSession,
+    maker: async_sessionmaker[AsyncSession],
+    request_id: uuid.UUID,
+    tracker: Any,
+) -> uuid.UUID:
+    from curie_api import factory_tracker_result_runtime as runtime
+    from curie_api.factory_tracker_result_delivery import deliver
+    from curie_api.factory_tracker_results import parse_proposal
+
+    pair = await runtime.load_pair(session, request_id)
+    assert pair is not None
+    target = await runtime.submission_precheck(session, pair)
+    await session.rollback()
+    delivery_id = await runtime.seal_submission(
+        session,
+        request_id=request_id,
+        target=target,
+        proposal=parse_proposal(
+            {
+                "kind": "findings",
+                "reason": "not_reproduced",
+                "tried": "Ran the export three times.",
+                "missing": "A dataset that shows the dropped row.",
+            }
+        ),
+        tracker=tracker,
+        settings=get_settings(),
+    )
+    await deliver(maker, delivery_id, tracker=tracker, settings=get_settings(), owner="route")
+    return delivery_id
+
+
+async def _finish_as_worker(
+    session: AsyncSession, request_id: uuid.UUID, outcome: str, cause: str
+) -> Any:
+    return await finish(
+        session,
+        request_id,
+        runtime_epoch=1,
+        outcome=outcome,  # type: ignore[arg-type]
+        cause=cause,
+        detail=None,
+        ci_fix_round=None,
+    )
+
+
+async def _deliveries_of(session: AsyncSession, request_id: uuid.UUID) -> list[Any]:
+    await session.rollback()
+    rows = await session.execute(
+        text(
+            "SELECT d.id, d.origin, d.result_kind, d.reason, d.state, d.failure_code, "
+            "r.result_comment_url, r.revision FROM curie.factory_tracker_result_deliveries d "
+            "LEFT JOIN curie.factory_tracker_result_receipts r ON r.delivery_id = d.id "
+            "WHERE d.execution_request_id = :id ORDER BY d.submitted_at"
+        ),
+        {"id": request_id},
+    )
+    return list(rows.mappings())
+
+
+async def _requests_on(session: AsyncSession, work_item_id: uuid.UUID) -> list[Any]:
+    await session.rollback()
+    rows = await session.execute(
+        text(
+            "SELECT id, status, terminal_cause, owner_lost_retry, execution_attempts, "
+            "model_session_reserved_at FROM curie.execution_requests "
+            "WHERE work_item_id = :id ORDER BY sequence"
+        ),
+        {"id": work_item_id},
+    )
+    return list(rows.mappings())
+
+
+async def _reconcile_deliveries(maker: async_sessionmaker[AsyncSession]) -> None:
+    from curie_api.workitem_reconciler import WorkItemReconciler
+
+    valkey: Any = None
+    reconciler = WorkItemReconciler(maker, valkey, get_settings())
+    await reconciler._deliver_tracker_results()
+
+
+def _marked(tracker: Any, issue: int) -> list[str]:
+    from curie_api.forges.types import ReplyTarget
+
+    target = ReplyTarget.on_issue(TrackerIssueRef(GITHUB, "github.com", "101", str(issue)))
+    return [body for _author, body in tracker.marked_comments.comments(target)]
+
+
+async def _expire_by_deadline(session: AsyncSession, request_id: uuid.UUID) -> Any:
+    """The execution deadline passes; the reconciler asks the run to stop and a
+    worker records the runtime gone."""
+
+    # Move the whole window into the past, as the other deadline tests here do:
+    # a trigger makes the deadline write once, so lift it for this seed only.
+    past = (await _now(session)) - timedelta(seconds=1)
+    await session.execute(text("ALTER TABLE curie.execution_requests DISABLE TRIGGER USER"))
+    await session.execute(
+        text(
+            "UPDATE curie.execution_requests SET started_at = :started, "
+            "execution_deadline = :past WHERE id = :id"
+        ),
+        {"started": past - timedelta(seconds=1800), "past": past, "id": request_id},
+    )
+    await session.execute(text("ALTER TABLE curie.execution_requests ENABLE TRIGGER USER"))
+    await session.commit()
+    row = await _request_row(session, request_id)
+    stopping = await workitems.request_execution_deadline_cancellation(
+        session,
+        work_item_id=row.work_item_id,
+        request_id=request_id,
+        expected_work_item_version=row.work_item_version,
+        expected_request_version=row.version,
+    )
+    assert isinstance(stopping, workitems.WorkItemOutcome), stopping
+    return stopping
+
+
+async def _record_gone(session: AsyncSession, request_id: uuid.UUID) -> None:
+    # The run's own worker tears it down (a lapsed owner is taken over).
+    claimed = await claim_termination(session, request_id, owner=OWNER)
+    assert not isinstance(claimed, workitem_dispatch.DispatchConflict), claimed
+    recorded = await record_termination(
+        session,
+        request_id,
+        runtime_epoch=claimed.runtime_epoch,
+        expected_request_version=claimed.request_version,
+        observation=TERMINATION_OBSERVATION,
+    )
+    assert not isinstance(recorded, workitem_dispatch.DispatchConflict), recorded
+
+
+def test_a_tracker_result_request_completes_with_its_receipt_and_no_pull_request(
+    clean_db: None, allowlisted: None, triage_tracker: Any
+) -> None:
+    async def body(session: AsyncSession, maker: async_sessionmaker[AsyncSession]) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _running_with_contract(session, agent_id, triage_tracker, tracker_result=True)
+        delivery_id = await _submit_findings(session, maker, facts.request_id, triage_tracker)
+        finished = await _finish_as_worker(session, facts.request_id, "completed", "tracker_result")
+        assert isinstance(finished, workitems.WorkItemOutcome), finished
+        row = await _request_row(session, facts.request_id)
+        assert (row.status, row.terminal_cause) == ("completed", "completed")
+        (delivery,) = await _deliveries_of(session, facts.request_id)
+        assert (delivery.id, delivery.origin, delivery.state) == (
+            delivery_id,
+            "submitted",
+            "delivered",
+        )
+        publications = await session.scalar(
+            text("SELECT count(*) FROM curie.publications WHERE execution_request_id = :id"),
+            {"id": facts.request_id},
+        )
+        assert publications == 0
+        assert len(_marked(triage_tracker, 2573)) == 1
+
+    with_maker(body)
+
+
+def test_a_delivered_turn_with_no_submission_fails_no_tracker_result(
+    clean_db: None, allowlisted: None, triage_tracker: Any
+) -> None:
+    async def body(session: AsyncSession, maker: async_sessionmaker[AsyncSession]) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _running_with_contract(session, agent_id, triage_tracker, tracker_result=True)
+        finished = await _finish_as_worker(session, facts.request_id, "completed", "tracker_result")
+        assert isinstance(finished, workitems.WorkItemOutcome), finished
+        row = await _request_row(session, facts.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "no_tracker_result")
+        assert await _deliveries_of(session, facts.request_id) == []
+        assert len(await _requests_on(session, row.work_item_id)) == 1
+
+    with_maker(body)
+
+
+def test_an_implementation_request_without_a_pull_request_still_fails(
+    clean_db: None, allowlisted: None, triage_tracker: Any
+) -> None:
+    async def body(session: AsyncSession, maker: async_sessionmaker[AsyncSession]) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _running_with_contract(
+            session, agent_id, triage_tracker, tracker_result=False
+        )
+        for cause in ("completed", "tracker_result"):
+            refused = await _finish_as_worker(session, facts.request_id, "completed", cause)
+            assert isinstance(refused, workitem_dispatch.DispatchConflict), refused
+            assert (await _request_row(session, facts.request_id)).status == "running"
+        failed = await _finish_as_worker(session, facts.request_id, "failed", "no_pull_request")
+        assert isinstance(failed, workitems.WorkItemOutcome), failed
+        row = await _request_row(session, facts.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "no_pull_request")
+        assert await _deliveries_of(session, facts.request_id) == []
+
+    with_maker(body)
+
+
+@pytest.mark.parametrize("contract", ["tracker_result", "implementation"])
+def test_deadline_expiry_keeps_expired_and_delivers_one_platform_findings(
+    clean_db: None, allowlisted: None, triage_tracker: Any, contract: str
+) -> None:
+    async def body(session: AsyncSession, maker: async_sessionmaker[AsyncSession]) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _running_with_contract(
+            session, agent_id, triage_tracker, tracker_result=contract == "tracker_result"
+        )
+        await _expire_by_deadline(session, facts.request_id)
+        await _record_gone(session, facts.request_id)
+        row = await _request_row(session, facts.request_id)
+        # The execution status is the one every request gets at its deadline.
+        assert (row.status, row.terminal_cause) == ("expired", "execution_deadline")
+        (only,) = await _requests_on(session, row.work_item_id)
+        assert only.execution_attempts == 1
+        if contract == "implementation":
+            assert only.model_session_reserved_at is None
+            assert await _deliveries_of(session, facts.request_id) == []
+            return
+        assert only.model_session_reserved_at is not None
+        (sealed,) = await _deliveries_of(session, facts.request_id)
+        assert (sealed.origin, sealed.result_kind, sealed.reason, sealed.state) == (
+            "platform",
+            "findings",
+            "budget_exhausted",
+            "owed",
+        )
+        await _reconcile_deliveries(maker)
+        await _reconcile_deliveries(maker)
+        (delivered,) = await _deliveries_of(session, facts.request_id)
+        assert delivered.state == "delivered"
+        # No reproduction claim: a revision only when a full commit was checked out.
+        base_commit = await session.scalar(
+            text("SELECT base_commit FROM curie.work_items WHERE id = :id"),
+            {"id": row.work_item_id},
+        )
+        full = base_commit is not None and re.fullmatch(r"[0-9a-fA-F]{40}", base_commit)
+        assert delivered.revision == (base_commit.lower() if full else None)
+        assert delivered.result_comment_url is not None
+        (comment,) = _marked(triage_tracker, 2573)
+        assert "budget_exhausted" in comment
+        assert len(await _requests_on(session, row.work_item_id)) == 1
+
+    with_maker(body)
+
+
+@pytest.mark.parametrize("submitted_first", [False, True], ids=["no_submission", "submitted"])
+def test_budget_exhaustion_keeps_failed_and_delivers_exactly_one_result(
+    clean_db: None, allowlisted: None, triage_tracker: Any, submitted_first: bool
+) -> None:
+    async def body(session: AsyncSession, maker: async_sessionmaker[AsyncSession]) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _running_with_contract(session, agent_id, triage_tracker, tracker_result=True)
+        if submitted_first:
+            await _submit_findings(session, maker, facts.request_id, triage_tracker)
+        failed = await _finish_as_worker(session, facts.request_id, "failed", "budget_exceeded")
+        assert isinstance(failed, workitems.WorkItemOutcome), failed
+        row = await _request_row(session, facts.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "budget_exceeded")
+        assert len(await _requests_on(session, row.work_item_id)) == 1
+        await _reconcile_deliveries(maker)
+        (delivery,) = await _deliveries_of(session, facts.request_id)
+        assert delivery.state == "delivered"
+        (comment,) = _marked(triage_tracker, 2573)
+        if submitted_first:
+            # An accepted submission is the one result; nothing is sealed after it.
+            assert delivery.origin == "submitted"
+            assert "not_reproduced" in comment
+        else:
+            assert (delivery.origin, delivery.reason) == ("platform", "budget_exhausted")
+            assert "budget_exhausted" in comment
+
+    with_maker(body)
+
+
+@pytest.mark.parametrize("when", ["during_teardown", "after_sealing"])
+def test_cancellation_during_exhaustion_delivers_nothing(
+    clean_db: None, allowlisted: None, triage_tracker: Any, when: str
+) -> None:
+    async def body(session: AsyncSession, maker: async_sessionmaker[AsyncSession]) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _running_with_contract(session, agent_id, triage_tracker, tracker_result=True)
+        await _expire_by_deadline(session, facts.request_id)
+        if when == "after_sealing":
+            await _record_gone(session, facts.request_id)
+            assert len(await _deliveries_of(session, facts.request_id)) == 1
+        row = await _request_row(session, facts.request_id)
+        cancelled = await cancel(
+            session, work_item_id=row.work_item_id, expected_version=row.work_item_version
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        if when == "during_teardown":
+            await _record_gone(session, facts.request_id)
+            row = await _request_row(session, facts.request_id)
+            assert (row.status, row.terminal_cause) == ("cancelled", "issue_cancelled")
+            assert await _deliveries_of(session, facts.request_id) == []
+        else:
+            await _reconcile_deliveries(maker)
+            (delivery,) = await _deliveries_of(session, facts.request_id)
+            assert (delivery.state, delivery.failure_code) == ("failed", "cancelled")
+        assert _marked(triage_tracker, 2573) == []
+        assert triage_tracker.ledger.writes == 0
+
+    with_maker(body)
+
+
+@pytest.mark.parametrize("contract", ["tracker_result", "implementation"])
+def test_owner_loss_admits_a_successor_only_for_an_implementation_request(
+    clean_db: None, allowlisted: None, triage_tracker: Any, contract: str
+) -> None:
+    async def body(session: AsyncSession, maker: async_sessionmaker[AsyncSession]) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _running_with_contract(
+            session, agent_id, triage_tracker, tracker_result=contract == "tracker_result"
+        )
+        await workitem_dispatch.declare_owner_lost(
+            session, facts.request_id, owner=OWNER, runtime_epoch=1
+        )
+        await _record_gone(session, facts.request_id)
+        row = await _request_row(session, facts.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "owner_lost")
+        requests = await _requests_on(session, row.work_item_id)
+        if contract == "tracker_result":
+            assert [request.id for request in requests] == [facts.request_id]
+            assert await _deliveries_of(session, facts.request_id) == []
+        else:
+            assert len(requests) == 2
+            assert requests[1].owner_lost_retry is True
+            assert requests[1].status == "waiting"
+
+    with_maker(body)
+
+
+def test_platform_findings_hold_only_the_limit_and_a_full_revision() -> None:
+    from curie_api.factory_tracker_result_delivery import platform_findings
+
+    commit = "0123456789ABCDEF0123456789abcdef01234567"
+    by_deadline = platform_findings(limit="execution_deadline", base_commit=commit)
+    by_budget = platform_findings(limit="budget", base_commit="0123abc")
+    assert (by_deadline.reason, by_deadline.revision) == ("budget_exhausted", commit.lower())
+    assert (by_budget.reason, by_budget.revision) == ("budget_exhausted", None)
+    assert platform_findings(limit="budget", base_commit=None).revision is None
+    assert by_deadline.tried != by_budget.tried

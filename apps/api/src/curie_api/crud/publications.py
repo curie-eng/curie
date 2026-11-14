@@ -14,6 +14,7 @@ from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
 from curie_api.schemas.publications import PublicationCreate
 
 from ..config import get_settings
+from ..factory_tracker_result_runtime import CONTRACT_TRACKER_RESULT
 from ..identity.http_invocation import HttpInvocationRuntime
 from ..identity.writer_selection import http_selected_scope
 from ..models import (
@@ -316,6 +317,13 @@ async def _refuse_fenced_work_item(
                 "the publication has no active work item request",
             )
         return None
+    if active.completion_contract == CONTRACT_TRACKER_RESULT:
+        # A tracker result request ends in a tracker result, never a branch or
+        # pull request (ADR 0277 decision 7): refused before anything is created.
+        raise PublicationLineageConflict(
+            "publication.tracker_result_request",
+            "this work item request completes with a tracker result, not a publication",
+        )
     if active.status == "cancellation_requested":
         raise PublicationLineageConflict(
             "publication.work_item_cancelled",

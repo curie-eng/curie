@@ -40,10 +40,12 @@ from curie_api.forges.gitlab.transport import (
 from curie_api.forges.types import (
     Actor,
     Disposition,
+    LinkedIssue,
     MarkedNotice,
     NoticePage,
     PullRequest,
     RepositoryRef,
+    SourceContent,
     TicketLabels,
     TrackerIssueRef,
 )
@@ -55,6 +57,9 @@ TRACKER_CAPABILITIES: Mapping[Operation, Support] = {
     Operation.LINK_PULL_REQUEST: Support.NOOP,
     Operation.DEPENDENCIES: Support.NOOP,
     Operation.GROUP_MEMBERSHIP: Support.UNSUPPORTED,
+    # Linked output issues are GitHub only (ADR 0277); no fallback path.
+    Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
+    Operation.FACTS_EXCHANGE: Support.UNSUPPORTED,
 }
 # The overlap between poll windows (decision 8): it absorbs clock skew and
 # issues committed late.
@@ -172,6 +177,7 @@ class GitLabTracker:
     """The factory's tracker on one GitLab project, for one binding."""
 
     kind = types.GITLAB
+    facts = None
     capabilities: Mapping[Operation, Support] = TRACKER_CAPABILITIES
 
     def __init__(
@@ -501,6 +507,21 @@ class GitLabTracker:
     async def in_group(self, actor: Actor, group_id: str) -> bool:
         raise Unsupported(Operation.GROUP_MEMBERSHIP)
 
+    async def create_linked_issue(
+        self,
+        source: TrackerIssueRef,
+        *,
+        output_identity: str,
+        title: str,
+        body: str,
+        labels: Collection[str],
+        expected: TrackerIssueRef | None = None,
+        reconcile_only: bool = False,
+    ) -> LinkedIssue:
+        """Declared unsupported: linked output issues are GitHub only (ADR 0277)."""
+
+        raise Unsupported(Operation.CREATE_LINKED_ISSUE)
+
     # Tickets and labels -----------------------------------------------------------
 
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
@@ -539,6 +560,17 @@ class GitLabTracker:
         if more:
             parts.append(LATER_COMMENTS)
         return "\n\n".join(parts) + "\n"
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's ``title`` and ``description`` fields from one issue read,
+        never its notes. A missing description is the empty text."""
+
+        payload = await self._read_issue(issue)
+        title = payload.get("title")
+        description = payload.get("description")
+        if not isinstance(title, str) or not isinstance(description, str | None):
+            raise Unavailable("issue")
+        return SourceContent(title=title, body=description or "")
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         return TicketLabels(labels=frozenset(_labels(await self._read_issue(issue))))

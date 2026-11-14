@@ -48,6 +48,11 @@ class WorkItemTransportError(Exception):
     """5xx or unreachable API; the wake must stay pending for retry."""
 
 
+CompletionContract = Literal["implementation", "tracker_result"]
+CONTRACT_IMPLEMENTATION: CompletionContract = "implementation"
+CONTRACT_TRACKER_RESULT: CompletionContract = "tracker_result"
+
+
 @dataclass(frozen=True)
 class WorkItemEvent:
     """Parsed work-item wake identity."""
@@ -78,6 +83,10 @@ class WorkItemAcquireGrant:
     wait_deadline: datetime
     repository_path: str
     context: FactoryContext
+    # How the request completes (ADR 0277, #5586): an implementation request
+    # ends in a pull request, a tracker_result request in one tracker result.
+    # An API that predates the field sends none, which means implementation.
+    completion_contract: CompletionContract = CONTRACT_IMPLEMENTATION
 
     @property
     def agent_id(self) -> uuid.UUID:
@@ -90,6 +99,7 @@ class WorkItemStartGrant:
     execution_deadline: datetime
     remaining_s: float
     heartbeat_interval_s: float
+    completion_contract: CompletionContract = CONTRACT_IMPLEMENTATION
 
 
 @dataclass(frozen=True)
@@ -106,6 +116,7 @@ class WorkItemRunning:
     execution_deadline: datetime
     context: FactoryContext | None
     refusal: str | None
+    completion_contract: CompletionContract = CONTRACT_IMPLEMENTATION
 
 
 @dataclass(frozen=True)
@@ -221,6 +232,24 @@ def _required_positive_int(value: object) -> int:
     return value
 
 
+def _completion_contract(body: dict[str, Any]) -> CompletionContract:
+    """The request's completion contract; absent means implementation.
+
+    Any value other than the two known contracts is an unusable body, never
+    read as implementation: a tracker_result run must not lose its limits to
+    a misspelled field.
+    """
+
+    value = body.get("completion_contract")
+    if value is None:
+        return CONTRACT_IMPLEMENTATION
+    if value == CONTRACT_IMPLEMENTATION:
+        return CONTRACT_IMPLEMENTATION
+    if value == CONTRACT_TRACKER_RESULT:
+        return CONTRACT_TRACKER_RESULT
+    raise ValueError("unknown completion contract")
+
+
 def _parse_datetime(value: object) -> datetime:
     if not isinstance(value, str) or not value:
         raise WorkItemTransportError("work-item dispatch returned an unusable timestamp")
@@ -272,6 +301,7 @@ class WorkItemDispatchClient:
                 wait_deadline=_parse_datetime(body["wait_deadline"]),
                 repository_path=_required_string(body["repository_path"]),
                 context=FactoryContext.model_validate(body["context"]),
+                completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -345,6 +375,7 @@ class WorkItemDispatchClient:
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
                 remaining_s=float(body["remaining_s"]),
                 heartbeat_interval_s=float(body["heartbeat_interval_s"]),
+                completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -428,6 +459,7 @@ class WorkItemDispatchClient:
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
                 context=context,
                 refusal=refusal,
+                completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -696,6 +728,10 @@ class WorkItemRun:
         self.conversation_id = grant.conversation_id
         self.wait_deadline = grant.wait_deadline
         self.context = grant.context
+        # Learned at acquire (or from the running row of an adopted run),
+        # before the capability mint and the sandbox claim. Only ever widened
+        # to tracker_result afterwards, never narrowed (see ``start``).
+        self.completion_contract: CompletionContract = grant.completion_contract
         self.event_id = event_id
         self.thread_key = thread_key
         self.started = False
@@ -775,12 +811,23 @@ class WorkItemRun:
             self.started = True
             self.runtime_epoch = grant.runtime_epoch
             self.execution_deadline = grant.execution_deadline
+            if grant.completion_contract == CONTRACT_TRACKER_RESULT:
+                # The contract is fixed at admission, so the two answers
+                # agree. Should they not, the stricter one governs: a
+                # tracker_result run is never continued, retried or published.
+                self.completion_contract = CONTRACT_TRACKER_RESULT
         interval = max(_MIN_HEARTBEAT_INTERVAL_S, grant.heartbeat_interval_s)
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(interval),
             name=f"work-item-heartbeat-{self.request_id}",
         )
         return grant
+
+    @property
+    def is_tracker_result(self) -> bool:
+        """One investigation session that ends in a tracker result (ADR 0277)."""
+
+        return self.completion_contract == CONTRACT_TRACKER_RESULT
 
     def bound_remaining_s(self, remaining_s: float | None) -> float | None:
         if self.execution_deadline is None:

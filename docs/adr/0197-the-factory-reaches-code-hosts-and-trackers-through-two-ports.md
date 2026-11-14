@@ -4,6 +4,11 @@ Date: 2026-10-04
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Adds optional scoped linked-issue creation and reconciliation and verified
+publication receipts.
+
 Accepted 2026-10-05 with explicit maintainer approval from Brian Conn
 (TheConnMan), given after review of the publishing pull request
 ([#3980](https://github.com/curie-eng/curie/pull/3980)), including its

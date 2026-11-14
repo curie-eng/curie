@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import socket
 from collections import deque
@@ -475,6 +476,44 @@ def gated_connector_tool_turn(name: str, args: dict[str, Any]) -> list[Any]:
     ]
 
 
+# ``[fake:write-file <name> <content>]`` emits one built-in ``Write`` call for
+# ``<name>`` in the session's working directory, with the absolute path the
+# real CLI would put in its arguments, and performs that write only when the
+# permission gate let the call run. It is the offline proof that an approved
+# file write runs exactly once after resume (#5571). Nothing outside the
+# working directory is ever written: ``<name>`` is a single path component.
+WRITE_FILE_MARKER = "[fake:write-file"
+_WRITE_FILE_RE = re.compile(r"\[fake:write-file ([A-Za-z0-9._-]+) (\S+)\]")
+
+
+@dataclass(frozen=True)
+class _FileWrite:
+    """A scripted built-in write, performed only if the gate let it run."""
+
+    tool_use_id: str
+    path: str
+    content: str
+
+
+def write_file_turn(last: str) -> list[Any]:
+    """A turn that writes one file in the working directory, then answers."""
+
+    match = _WRITE_FILE_RE.search(last)
+    if match is None or match.group(1) in {".", ".."}:
+        return default_turn()
+    path = os.path.join(os.getcwd(), match.group(1))
+    content = match.group(2)
+    return [
+        _assistant(TextBlock(text="Writing the file")),
+        _assistant(
+            ToolUseBlock(id="w1", name="Write", input={"file_path": path, "content": content})
+        ),
+        _FileWrite(tool_use_id="w1", path=path, content=content),
+        _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8}),
+        _result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}),
+    ]
+
+
 async def _dial_connector_tool(
     config: Mapping[str, Any], tool: str, args: Mapping[str, Any], timeout: float
 ) -> tuple[bool, str]:
@@ -617,6 +656,9 @@ class FakeModelSession:
         # replaced, and the refusal results not yet delivered.
         self._refused_ids: set[str] = set()
         self._pending_refusals: list[UserMessage] = []
+        # Per turn: the calls the permission gate or a hook denied, which a
+        # scripted built-in write must not perform.
+        self._denied_ids: set[str] = set()
         self._truncate_on_interrupt = truncate_on_interrupt
         self._can_use_tool = can_use_tool
         self._pre_tool_use_hook = pre_tool_use_hook
@@ -656,6 +698,8 @@ class FakeModelSession:
             return reversible_turn()
         if PROGRESS_DEMO_MARKER in last:
             return progress_demo_turn()
+        if WRITE_FILE_MARKER in last:
+            return write_file_turn(last)
         if GATED_CONNECTOR_TOOL_MARKER in last:
             gated = _parse_gated_connector_tool(last)
             return gated_connector_tool_turn(*gated) if gated else default_turn()
@@ -674,6 +718,7 @@ class FakeModelSession:
         self._halted = False
         self._refused_ids = set()
         self._pending_refusals = []
+        self._denied_ids = set()
 
     async def interrupt(self) -> None:
         self.interrupts += 1
@@ -703,6 +748,9 @@ class FakeModelSession:
                 # Read at call time, so a test can shorten the demo's waits.
                 await anyio.sleep(PROGRESS_DEMO_PAUSE_S)
                 continue
+            if isinstance(message, _FileWrite):
+                yield self._perform_write(message)
+                continue
             if isinstance(message, _ProgressCall):
                 # A refused call already got its refusal from the gate; the
                 # handler's answer would be a second result for it.
@@ -728,6 +776,15 @@ class FakeModelSession:
                 # separate mechanism from the ``_interrupted`` truncation above,
                 # which models an OPERATOR stop and must keep working on its own.
                 return
+
+    def _perform_write(self, call: _FileWrite) -> UserMessage:
+        """Write the file the way the built-in tool would, unless the call was stopped."""
+
+        if call.tool_use_id in self._refused_ids or call.tool_use_id in self._denied_ids:
+            return _tool_result(call.tool_use_id, "The tool use was not run.", is_error=True)
+        with open(call.path, "w", encoding="utf-8") as stream:
+            stream.write(call.content)
+        return _tool_result(call.tool_use_id, f"File created successfully at: {call.path}")
 
     async def _answer_progress(self, call: _ProgressCall) -> UserMessage:
         """The offline fake acknowledges the marker without any network I/O."""
@@ -795,6 +852,8 @@ class FakeModelSession:
                     {"signal": None},
                 )
                 specific = hook_output.get("hookSpecificOutput", {})
+                if specific.get("permissionDecision") == "deny":
+                    self._denied_ids.add(block.id)
                 if (
                     specific.get("permissionDecision") == "deny"
                     and hook_output.get("continue_") is False
@@ -818,6 +877,8 @@ class FakeModelSession:
                 decision = await self._can_use_tool(
                     block.name, block.input, ToolPermissionContext(tool_use_id=block.id)
                 )
+                if isinstance(decision, PermissionResultDeny):
+                    self._denied_ids.add(block.id)
                 if isinstance(decision, PermissionResultDeny) and decision.interrupt:
                     return (
                         _tool_result(

@@ -53,6 +53,29 @@ def _app_key() -> str:
     )
 
 
+def test_seeded_comments_keep_author_and_app_provenance_and_log_reads(
+    stub: Any, github: httpx.Client
+) -> None:
+    writer = {"id": 6601, "login": "octocat", "type": "User"}
+    first = stub.add_issue_comment(3815, "request", author=writer, app={"id": 8001})
+    second = stub.add_issue_comment(
+        3815, "ordinary", author={"id": 6602, "login": "reader", "type": "User"}
+    )
+    response = github.get(f"/repos/{REPO}/issues/comments/{first['id']}")
+    assert response.status_code == 200
+    assert response.json()["user"] == writer
+    assert response.json()["performed_via_github_app"] == {"id": 8001}
+    response = github.get(f"/repos/{REPO}/issues/comments/{second['id']}")
+    assert response.json()["performed_via_github_app"] is None
+    assert {
+        "method": "GET",
+        "path": f"/repos/{REPO}/issues/comments/{first['id']}",
+    } in stub.request_log
+    assert (
+        github.get(f"/repos/{REPO}/collaborators/reader/permission").json()["permission"] == "read"
+    )
+
+
 @pytest.fixture
 def recording() -> dict[str, Any]:
     return json.loads(RECORDING.read_text())  # type: ignore[no-any-return]
@@ -478,3 +501,19 @@ def test_existing_branch_lookups_still_resolve_main_and_pushed_branches(
         {"ref": "refs/heads/factory/probe", "object": {"sha": pushed_sha, "type": "commit"}}
     ]
     assert stub.unknown_requests == []
+
+
+def test_label_actor_user_app_provenance_on_issue_events(stub: Any, github: httpx.Client) -> None:
+    # User tokens act for a person, independently of issue-event App provenance:
+    # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-on-behalf-of-a-user
+    # https://docs.github.com/en/rest/issues/events#list-issue-events
+    # Observed on #5510 (event 35610976470) and #4485 on 2026-11-12.
+    actor = {"id": 6601, "login": "octocat", "type": "User"}
+    stub._label_event(3815, "factory", "labeled", actor, performed_via_github_app={"id": 52})
+    events = _ok(github.get(f"/repos/{REPO}/issues/3815/events"))
+    assert events[-1]["actor"] == actor
+    assert events[-1]["performed_via_github_app"] == {"id": 52}
+    _ok(github.post(f"/repos/{REPO}/issues/3815/labels", json={"labels": ["fixture-label"]}))
+    events = _ok(github.get(f"/repos/{REPO}/issues/3815/events"))
+    assert events[-1]["actor"]["type"] == "Bot"
+    assert events[-1]["performed_via_github_app"] == {"id": 51}

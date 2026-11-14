@@ -60,6 +60,10 @@ def _module(name: str, path: Path) -> Any:
 def validate_configuration(args: argparse.Namespace) -> None:
     """Refuse malformed inputs before any external resource is created."""
 
+    if args.scenario == "facts":
+        if args.record:
+            raise fe.ConfigError("the facts scenario never records or calls a model")
+        return
     if args.record:
         if not os.environ.get("CURIE_FACTORY_RECORD_KEY"):
             raise fe.ConfigError("recording requires CURIE_FACTORY_RECORD_KEY")
@@ -172,12 +176,84 @@ def assert_observed(preflight_outcome: str, publication_paths: list[str]) -> Non
     scenario.assert_publication_paths(publication_paths)
 
 
+def assert_pull_request_decisions(bundle: Path, pull: dict[str, Any]) -> int:
+    rules = _module("factory_decisions_section", bundle / "hooks/decisions_section.py")
+    try:
+        return len(rules.parse_decisions_section(pull.get("body")))
+    except ValueError as exc:
+        raise ScriptedScenarioError(
+            f"stub pull request has an invalid Decisions section: {exc}"
+        ) from None
+
+
+def assert_facts_scenario(answer: dict[str, Any], request_id: str) -> None:
+    """Independent outcome assertions; a violating answer makes the driver fail."""
+    if (
+        answer.get("schema_version") != 1
+        or answer.get("kind") != "factory_facts"
+        or answer.get("request", {}).get("comment_id") != request_id
+        or answer.get("admission") != "not_requested"
+        or answer.get("deployment_readiness") != "unvalidated"
+        or answer.get("label_route", {}).get("route") != "github_user_via_app"
+        or answer.get("binding", {}).get("state") != "bound"
+    ):
+        raise ScriptedScenarioError("facts answer violated the exchange contract")
+    groups = [*answer["executables"], *answer["services"], answer["model_credit"]]
+    if not groups or any(
+        f.get("state") != "unknown" or f.get("reason") != "observation_missing" for f in groups
+    ):
+        raise ScriptedScenarioError("unobserved facts were not unknown")
+
+
 def verdict(preflight_outcome: str, publication_paths: list[str]) -> int:
     try:
         assert_observed(preflight_outcome, publication_paths)
     except scenario.ScenarioAssertionError:
         return fe.EXIT_FAILED
     return 0
+
+
+def docker_command_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Use one caller-selected endpoint for Docker, kind and buildx."""
+
+    env = dict(environment)
+    context = env.get("DOCKER_CONTEXT") or "default"
+    if not env.get("DOCKER_HOST") and context != "default":
+        try:
+            result = subprocess.run(
+                (
+                    "docker", "context", "inspect", context,
+                    "--format", "{{json .Endpoints.docker.Host}}",
+                ),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            if result.returncode:
+                raise ValueError("context inspect failed")
+            endpoint = json.loads(result.stdout)
+            if not isinstance(endpoint, str) or any(char.isspace() for char in endpoint):
+                raise ValueError("invalid Docker endpoint")
+            address = urlsplit(endpoint)
+            if address.scheme in {"unix", "npipe"}:
+                valid = address.path.startswith("/")
+            else:
+                valid = (
+                    address.scheme in {"ssh", "tcp"}
+                    and bool(address.hostname)
+                    and (address.port is None or address.port > 0)
+                )
+            if not valid:
+                raise ValueError("invalid Docker endpoint")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise fe.ConfigError(
+                f"Docker context {context!r} endpoint could not be resolved"
+            ) from None
+        env["DOCKER_HOST"] = endpoint
+    env["DOCKER_CONTEXT"] = "default"
+    return env
 
 
 def docker_engine_is_local(docker_host: str | None) -> bool:
@@ -244,6 +320,15 @@ class ScriptedRun:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.run_id = uuid.uuid4().hex[:8]
+        self.image_refs = (
+            IMAGES
+            if args.scenario != "facts"
+            else tuple(
+                f"curie-{component}:facts-{self.run_id}" for component in ("api", "worker", "ui")
+            )
+        )
+        self.created_images: list[str] = []
+        self.facts_runner_images: dict[str, str] = {}
         self.cluster = f"curie-factory-scripted-{self.run_id}"
         self.context = f"kind-{self.cluster}"
         self.registry = f"{self.cluster}-registry"
@@ -275,9 +360,7 @@ class ScriptedRun:
         # Only the in-process recording proxy receives the upstream credential.
         self.env.pop("CURIE_FACTORY_RECORD_KEY", None)
         self.env["BUILDX_BUILDER"] = "default"
-        # An inherited remote context would split kind, docker and buildx
-        # across engines. The default context honours an inherited DOCKER_HOST.
-        self.env["DOCKER_CONTEXT"] = "default"
+        self.env = docker_command_environment(self.env)
         self.curie = os.environ.get("CURIE_BIN", "curie")
         self.record_start_remaining: float | None = None
         self.record_budget_start: float | None = None
@@ -506,15 +589,20 @@ class ScriptedRun:
                     "-f",
                     f"apps/{component}/Dockerfile",
                     "-t",
-                    f"curie-{component}:local",
+                    f"curie-{component}:facts-{self.run_id}"
+                    if self.args.scenario == "facts"
+                    else f"curie-{component}:local",
                     ".",
                     timeout=1800,
                 )
+                if self.args.scenario == "facts":
+                    self.created_images.append(f"curie-{component}:facts-{self.run_id}")
                 self.check_disk(f"built {component}")
-            self.check_disk("building runner")
-            self.command(self.curie, "build", "--tag", "curie-runner:latest", timeout=1800)
-            self.check_disk("built runner")
-        for image in IMAGES:
+            if self.args.scenario != "facts":
+                self.check_disk("building runner")
+                self.command(self.curie, "build", "--tag", "curie-runner:latest", timeout=1800)
+                self.check_disk("built runner")
+        for image in self.image_refs:
             try:
                 self.command("docker", "image", "inspect", image, timeout=30)
             except ScriptedScenarioError:
@@ -522,7 +610,8 @@ class ScriptedRun:
                     f"local image {image} is missing; pass --build-images to build it"
                 ) from None
         self.check_disk(
-            "scripted factory", required_bytes=kind_images.import_budget(self.command, IMAGES)
+            "scripted factory",
+            required_bytes=kind_images.import_budget(self.command, self.image_refs),
         )
 
     def execute(self) -> None:
@@ -562,11 +651,12 @@ class ScriptedRun:
             "120s",
             timeout=300,
         )
-        self.command("docker", "network", "connect", "kind", self.registry)
+        network_name = self.env.get("KIND_EXPERIMENTAL_DOCKER_NETWORK", "kind")
+        self.command("docker", "network", "connect", network_name, self.registry)
         node = json.loads(self.command("docker", "inspect", f"{self.cluster}-control-plane"))[0]
-        gateway = node["NetworkSettings"]["Networks"]["kind"].get("Gateway", "")
+        gateway = node["NetworkSettings"]["Networks"][network_name].get("Gateway", "")
         if not gateway or ipaddress.ip_address(gateway).version != 4:
-            network = json.loads(self.command("docker", "network", "inspect", "kind"))[0]
+            network = json.loads(self.command("docker", "network", "inspect", network_name))[0]
             gateway = next(
                 item["Gateway"]
                 for item in network["IPAM"]["Config"]
@@ -577,16 +667,19 @@ class ScriptedRun:
             stub_host=self.env.get("CURIE_LOCAL_STUB_HOST"),
             gateway=gateway,
         )
-        required = kind_images.import_budget(self.command, IMAGES)
+        required = kind_images.import_budget(self.command, self.image_refs)
         self.check_disk("loading candidate images", required_bytes=required)
-        kind_images.load_images(self.command, self.cluster, IMAGES)
+        kind_images.load_images(self.command, self.cluster, self.image_refs)
         self.check_disk("loaded candidate images", required_bytes=kind_images.RUNTIME_RESERVE_BYTES)
         # curie build resolves the runner base with buildx imagetools, which
         # reads a registry and never the local daemon, so the base goes to the
         # run's own registry before the chart names it.
         runner_image = f"{registry_ref}/curie-runner"
-        self.command("docker", "tag", "curie-runner:latest", f"{runner_image}:latest")
-        self.command("docker", "push", f"{runner_image}:latest", timeout=900)
+        if self.args.scenario != "facts":
+            self.command("docker", "tag", "curie-runner:latest", f"{runner_image}:latest")
+            self.command("docker", "push", f"{runner_image}:latest", timeout=900)
+        else:
+            self.build_facts_runner_images(registry_ref)
         github = _module("factory_github_stub", REPO_ROOT / "tools/github-stub/github_stub.py")
         model = _module("factory_model_script", REPO_ROOT / "tools/model-script/model_script.py")
         recording = json.loads(
@@ -605,13 +698,16 @@ class ScriptedRun:
         issue = self.stub._get("issue", 3815)
         issue["labels"] = []
         self.stub._put("issue", 3815, issue)
-        self.model = model.ModelScript(
-            Path(self.args.transcript), record=self.args.record, host=callback
+        if self.args.scenario != "facts":
+            self.model = model.ModelScript(
+                Path(self.args.transcript), record=self.args.record, host=callback
+            )
+            if self.args.record:
+                self.count_recording_requests(model)
+            self.model.start()
+        self.evidence.update(
+            stub_port=self.stub.port, model_port=None if self.model is None else self.model.port
         )
-        if self.args.record:
-            self.count_recording_requests(model)
-        self.model.start()
-        self.evidence.update(stub_port=self.stub.port, model_port=self.model.port)
         self.kubectl("apply", "-f", str(REPO_ROOT / "charts/curie/crds"))
         self.kubectl("create", "namespace", self.namespace)
         self.kubectl(
@@ -635,12 +731,22 @@ class ScriptedRun:
             f"--from-file=privateKey={app_key}",
         )
         values = scripted_values(
-            model_base_url=self.model.base_url,
+            model_base_url=self.stub.base_url if self.model is None else self.model.base_url,
             github_api=self.stub.base_url + "/api/v3",
             clone_base=self.stub.base_url,
             ca_configmap="github-stub-ca",
             runner_image=runner_image,
         )
+        if self.args.scenario == "facts":
+            for component in ("api", "worker", "ui"):
+                values[component]["image"]["tag"] = f"facts-{self.run_id}"
+            values["agentSandbox"]["runner"]["prewarm"]["enabled"] = False
+            values["agentSandbox"]["runner"].update(
+                image=f"{registry_ref}/curie-facts-runner", tag="present", digest="",
+                imagePullPolicy="IfNotPresent",
+            )
+            values["agentSandbox"]["runnerImages"] = self.facts_runner_images
+            values["worker"]["replicas"] = 0
         # Direct Helm installation follows the existing factory preflight.
         # Generate the same sealed credential/caller inputs as cluster up,
         # without exposing their values in argv or build logs.
@@ -661,7 +767,7 @@ class ScriptedRun:
                 key_container,
                 "--label",
                 f"curie.factory-scripted={self.run_id}",
-                "curie-worker:local",
+                self.image_refs[1],
                 "python",
                 "-c",
                 key_code,
@@ -702,6 +808,9 @@ class ScriptedRun:
                 f"deployment/{deployment}",
                 "--timeout=300s",
             )
+        if self.args.scenario == "facts":
+            self.run_facts(github)
+            return
         self.provision_publication_trust()
         # kind enforces NetworkPolicy, and the chart lets publication Jobs
         # reach only TCP 443 on GitHub's ranges. The stub listens on an
@@ -747,6 +856,138 @@ class ScriptedRun:
         if not namespace:
             raise ScriptedScenarioError("worker publication namespace is absent")
         return namespace
+
+    def facts_api(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        """Drive the installed API with its operator key without printing that key."""
+        code = (
+            "import json,os,urllib.request; "
+            f"body={json.dumps(body)!r}; "
+            f"request=urllib.request.Request('http://127.0.0.1:8000'+{path!r}, "
+            f"method={method!r}, data=None if body=='null' else body.encode(), "
+            "headers={'X-API-Key':os.environ['API_KEY'],'Content-Type':'application/json'}); "
+            "print(json.dumps(json.load(urllib.request.urlopen(request,timeout=30))))"
+        )
+        return json.loads(
+            self.kubectl(
+                "-n", self.namespace, "exec", "deployment/curie-api", "--", "python", "-c", code
+            )
+        )
+
+    def run_facts(self, github: Any) -> None:
+        """Prove the exchange before starting worker-owned image observations."""
+        self.facts_api(
+            "POST",
+            "/agents",
+            {
+                "name": "acme-facts",
+                "repo_full_name": "acme-corp/acme-bot",
+                "channel": {"kind": "github", "address": "acme-corp/acme-bot"},
+            },
+        )
+        body = (
+            "<!-- curie-factory-facts-request:v1 -->\n```json\n"
+            '{"schema_version":1,"trigger_label":"factory","executables":["uv"],"services":["postgres"]}'
+            "\n```"
+        )
+        writer = self.stub.add_issue_comment(3815, body, author=github.HUMAN)
+        self.stub.add_issue_comment(3815, body, author=github.BOT)
+        self.stub.add_issue_comment(
+            3815, body, author={"id": 6602, "login": "reader", "type": "User"}
+        )
+        self.wait_facts(str(writer["id"]))
+        self.kubectl("-n", self.namespace, "rollout", "restart", "deployment/curie-api")
+        self.kubectl(
+            "-n", self.namespace, "rollout", "status", "deployment/curie-api", "--timeout=300s"
+        )
+        # A fresh request forces a completed post-restart poll, so this is not
+        # an instantaneous count of a pre-restart comment.
+        changed = body.replace('["uv"]', '["jq"]')
+        newer = self.stub.add_issue_comment(3815, changed, author=github.HUMAN, app={"id": 8001})
+        answer = self.wait_facts(str(newer["id"]))
+        assert_facts_scenario(answer, str(newer["id"]))
+        items = self.facts_api("GET", "/work-items")
+        counts = self.sql(
+            "SELECT json_build_object('work_items',(SELECT count(*) FROM curie.work_items),"
+            "'execution_requests',(SELECT count(*) FROM curie.execution_requests),"
+            "'deliveries',(SELECT count(*) FROM curie.factory_facts_requests))"
+        )
+        claims = json.loads(self.kubectl("get", "sandboxclaims", "-A", "-o", "json"))
+        if items["items"] or counts["work_items"] or counts["execution_requests"]:
+            raise ScriptedScenarioError("facts scenario created work")
+        if counts["deliveries"] != 2 or claims["items"] or self.model is not None:
+            raise ScriptedScenarioError("facts scenario crossed its no-execution boundary")
+        self.evidence.update(
+            scenario="facts",
+            answer_count=1,
+            api_work_items=0,
+            api_execution_requests=0,
+            sandbox_claims=0,
+            model_requests=[],
+            facts=answer,
+            github_requests=self.stub.request_log,
+        )
+        self.run_tool_facts()
+
+    def build_facts_runner_images(self, registry_ref: str) -> None:
+        assert self.workdir is not None
+        context = self.workdir / "probe-images"
+        context.mkdir()
+        base = f"{registry_ref}/curie-facts-runner:present"
+        removed = f"{registry_ref}/curie-facts-runner:absent"
+        dockerfile = context / "Dockerfile"
+        dockerfile.write_text(
+            "FROM python:3.13.15-slim-bookworm@sha256:"
+            "ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e\n"
+            "RUN apt-get update && apt-get install -y --no-install-recommends jq "
+            "&& rm -rf /var/lib/apt/lists/* && mkdir -p /etc/curie "
+            '&& printf \'%s\\n\' \'{"schema_version":1,"tools":{"jq":true}}\' '
+            "> /etc/curie/tool-manifest.json\nUSER 1000:1000\n"
+        )
+        self.command("docker", "build", "-t", base, str(context), timeout=600)
+        self.command("docker", "push", base, timeout=600)
+        dockerfile.write_text(f"FROM {base}\nUSER 0\nRUN rm /usr/bin/jq\nUSER 1000:1000\n")
+        self.command("docker", "build", "-t", removed, str(context), timeout=600)
+        self.command("docker", "push", removed, timeout=600)
+        for name, image in (("acme-facts-present", base), ("acme-facts-absent", removed)):
+            identities = json.loads(
+                self.command(
+                    "docker", "image", "inspect", image, "--format", "{{json .RepoDigests}}"
+                )
+            )
+            matches = [
+                identity
+                for identity in identities
+                if identity.startswith(f"{registry_ref}/curie-facts-runner@sha256:")
+            ]
+            if len(matches) != 1:
+                raise ScriptedScenarioError("runner image did not report one immutable identity")
+            self.facts_runner_images[name] = matches[0]
+
+    def run_tool_facts(self) -> None:
+        from tool_facts_scenario import run_observations
+
+        run_observations(self)
+
+    def wait_facts(self, request_id: str) -> dict[str, Any]:
+        assert self.deadline is not None
+        while time.monotonic() < self.deadline:
+            comments = [
+                c
+                for c in self.stub._rows("comment")
+                if c.get("performed_via_github_app") == {"id": 51}
+                and "<!-- curie-factory-facts:v1 " in c["body"]
+            ]
+            if len(comments) > 1:
+                raise ScriptedScenarioError("facts scenario produced duplicate answers")
+            if comments and f" request={request_id} " in comments[0]["body"]:
+                match = re.search(r"(`{3,})json\n(.*?)\n\1", comments[0]["body"], re.DOTALL)
+                if match is None:
+                    raise ScriptedScenarioError("facts answer omitted JSON fold")
+                return dict(json.loads(match[2]))
+            if self.stub.unknown_requests:
+                raise ScriptedScenarioError("facts scenario made an unsupported GitHub request")
+            time.sleep(1)
+        raise ScriptedScenarioError("facts answer timed out")
 
     def provision_publication_trust(self) -> None:
         # ConfigMap volume references resolve in the Pod's namespace. Helm
@@ -1122,6 +1363,11 @@ class ScriptedRun:
         if len(pulls) != 1:
             raise ScriptedScenarioError("expected exactly one stub pull request")
         pull = self.stub._fresh_pull(pulls[0])
+        if self.workdir is None:
+            raise ScriptedScenarioError("scripted bundle is unavailable")
+        self.evidence["decision_count"] = assert_pull_request_decisions(
+            self.workdir / "bundle", pull
+        )
         status, files = self.stub._rest(
             "GET", f"/repos/acme-corp/acme-bot/pulls/{pull['number']}/files", {}, {}
         )
@@ -1398,6 +1644,11 @@ class ScriptedRun:
                 sqlite3.Error,
             ) as exc:
                 errors.append(str(exc))
+        if self.created_images:
+            try:
+                self.command("docker", "image", "rm", *self.created_images)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                errors.append(str(exc))
         # A killed key-generation docker client can leave its --rm container
         # running. Select only this execution's remaining labelled resources.
         if self.registry_attempted:
@@ -1459,10 +1710,10 @@ def main(args: argparse.Namespace) -> int:
     try:
         validate_configuration(args)
         curie_bin, curie_version = fe.resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+        run = ScriptedRun(args)
     except fe.ConfigError as exc:
         print(f"factory-e2e: {exc}", file=sys.stderr)
         return fe.EXIT_CONFIG
-    run = ScriptedRun(args)
     run.curie = curie_bin
     run.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
     result = fe.EXIT_FAILED

@@ -2,6 +2,9 @@
 
 Payload shapes follow GitHub's webhook catalog:
 https://docs.github.com/en/webhooks/webhook-events-and-payloads
+
+Combined status responses follow GitHub's REST documentation:
+https://docs.github.com/rest/commits/statuses#get-the-combined-status-for-a-specific-reference
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import itertools
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -39,6 +43,26 @@ SENDER_ID = 6601
 SENDER = "octocat"
 LABEL = "factory"
 MENTION = "curie"
+
+LABEL_ACTOR_PERMISSIONS = ["write", "maintain", "admin", "read", "triage", "none"]
+LABEL_ACTOR_REFUSALS = [
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, {"id": 51}, "actor_own_app"),
+    ({"id": 42, "login": "fixture[bot]", "type": "Bot"}, None, "actor_bot"),
+    ({"id": 42, "login": "fixture[bot]", "type": "Bot"}, {"id": 52}, "actor_bot"),
+    ({"id": 42, "login": "ghost", "type": "User"}, None, "actor_unverifiable"),
+    (None, None, "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, "invalid", "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, [], "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": SENDER, "type": "User"}, {}, "actor_unverifiable"),
+    ({"login": "fixture[bot]", "type": "Bot"}, None, "actor_unverifiable"),
+    ({"id": 42, "login": "ghost", "type": "Bot"}, None, "actor_unverifiable"),
+    ({"id": True, "login": SENDER, "type": "User"}, None, "actor_unverifiable"),
+    ({"id": SENDER_ID, "login": "", "type": "User"}, None, "actor_unverifiable"),
+]
+
+LABEL_ACTOR_REFUSAL_IDS = [
+    f"label_{reason}-{index}" for index, (_, _, reason) in enumerate(LABEL_ACTOR_REFUSALS)
+]
 
 BASE_SHA = "0" * 39 + "1"
 
@@ -243,6 +267,69 @@ def fake_installation_tokens(monkeypatch: Any, credentials: Any = None) -> None:
     monkeypatch.setattr(GitHubCredentials, "app_slug", lambda _self: APP_SLUG)
 
 
+# The repository-wide listings a poll pass reads, answered empty when
+# ``GitHubAPI.answer_listings`` is set.
+_POLL_LISTINGS = frozenset(
+    {f"/repos/{REPO}/issues", f"/repos/{REPO}/issues/comments", f"/repos/{REPO}/pulls/comments"}
+)
+
+
+@dataclass
+class PlantedIssue:
+    """One issue's own answers (#5380), in place of the shared ``issue_state``
+    and ``labels``.
+
+    GET an issue (https://docs.github.com/en/rest/issues/issues#get-an-issue)
+    answers ``number``, ``state`` and ``labels``; every pull request is also an
+    issue, and its issue payload carries a ``pull_request`` key. An issue the
+    installation cannot see answers 404 with GitHub's ``message``. ``events``,
+    when set, is the issue's event list
+    (https://docs.github.com/en/rest/issues/events#list-issue-events).
+    """
+
+    state: str = "open"
+    labels: tuple[str, ...] = ()
+    pull_request: bool = False
+    missing: bool = False
+    events: list[dict[str, Any]] | None = None
+
+
+def issue_event(event: str, *, event_id: int, label: str | None = None) -> dict[str, Any]:
+    """One human event on an issue, in the list-issue-events shape
+    (https://docs.github.com/en/rest/issues/events#list-issue-events)."""
+
+    found: dict[str, Any] = {
+        "id": event_id,
+        "event": event,
+        "actor": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+        "created_at": "2026-09-01T00:00:00Z",
+    }
+    if label is not None:
+        found["label"] = {"name": label}
+    return found
+
+
+def listed_publication(number: int, *, pull: int, state: str = "open") -> dict[str, Any]:
+    """A factory publication of issue ``number`` as the repository's pull request
+    listing returns it (https://docs.github.com/en/rest/pulls/pulls#list-pull-requests):
+    opened by the App's bot user from a publication branch of the repository
+    itself, closing the issue."""
+
+    repo = {"id": REPO_ID, "full_name": REPO}
+    return {
+        "number": pull,
+        "state": state,
+        "html_url": f"https://github.com/{REPO}/pull/{pull}",
+        "node_id": f"PR_acme_{pull}",
+        "user": dict(APP_BOT_USER),
+        "body": f"Closes #{number}",
+        "merged_at": None,
+        "closed_at": None if state == "open" else "2026-09-02T00:00:00Z",
+        "head": {"sha": BASE_SHA, "ref": f"curie/publication-{pull:032x}", "repo": dict(repo)},
+        "base": {"ref": "main", "repo": dict(repo)},
+    }
+
+
 class GitHubAPI:
     """In-process stand-in for the GitHub REST reads the intake verifier makes."""
 
@@ -252,6 +339,10 @@ class GitHubAPI:
         self.permission = "write"
         self.permission_requests: list[httpx.Request] = []
         self.permission_user_id = SENDER_ID
+        self.label_actor: Any = {"id": SENDER_ID, "login": SENDER, "type": "User"}
+        self.label_app: Any = None
+        self.permission_status = 200
+        self.role_name = "write"
         self.comment_body: str | None = None
         self.comment_app: dict[str, Any] | None = None
         self.repository_id = REPO_ID
@@ -264,6 +355,21 @@ class GitHubAPI:
         # Issue number -> its comments, for the marked label refusal comment.
         self.issue_comments: dict[int, list[dict[str, Any]]] = {}
         self._comment_ids = itertools.count(9000)
+        # Additive answers (#5380); each default leaves the answers above as
+        # they were. Issues with their own answers, by number.
+        self.planted_issues: dict[int, PlantedIssue] = {}
+        # Branches GET a reference answers 404 for
+        # (https://docs.github.com/en/rest/git/refs#get-a-reference).
+        self.missing_branches: set[str] = set()
+        # What the repository's pull request listing returns.
+        self.listed_pulls: list[dict[str, Any]] = []
+        # Answer the repository-wide listings a poll pass reads (open issues
+        # by label, issue comments and review comments since a time) with one
+        # empty page:
+        # https://docs.github.com/en/rest/issues/issues#list-repository-issues,
+        # https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository,
+        # https://docs.github.com/en/rest/pulls/comments#list-review-comments-in-a-repository.
+        self.answer_listings = False
 
     def advance_label_event(self, number: int) -> None:
         """Record a newer labeled timeline event. A relabel webhook reads it."""
@@ -280,17 +386,32 @@ class GitHubAPI:
                 200,
                 json={"id": self.repository_id, "full_name": REPO, "default_branch": "main"},
             )
+        if self.answer_listings and request.method == "GET" and path in _POLL_LISTINGS:
+            return httpx.Response(200, json=[])
         if path == f"/repos/{REPO}/pulls" and request.method == "GET":
             # The repository-wide listing rediscovery reads (#4629): no factory
-            # publication exists in this stand-in.
-            return httpx.Response(200, json=[])
+            # publication exists in this stand-in unless one is listed.
+            return httpx.Response(200, json=list(self.listed_pulls))
         if path.startswith(f"/repos/{REPO}/git/ref/heads/"):
             # Admission resolves the base and reads its commit through the
             # code host (#3095).
             # https://docs.github.com/en/rest/git/refs#get-a-reference
             name = path.removeprefix(f"/repos/{REPO}/git/ref/heads/")
+            if name in self.missing_branches:
+                return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(
                 200, json={"ref": f"refs/heads/{name}", "object": {"sha": BASE_SHA}}
+            )
+        if path.startswith(f"/repos/{REPO}/git/matching-refs/heads/"):
+            # The code host reads this listing after a 404 on the reference;
+            # GitHub answers 200 with an empty array when no branch matches
+            # (https://docs.github.com/en/rest/git/refs#list-matching-references).
+            name = path.removeprefix(f"/repos/{REPO}/git/matching-refs/heads/")
+            if name in self.missing_branches:
+                return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json=[{"ref": f"refs/heads/{name}", "object": {"sha": BASE_SHA, "type": "commit"}}],
             )
         if path.startswith(f"/repos/{REPO}/issues/comments/"):
             comment_id = int(path.rsplit("/", 1)[1])
@@ -323,6 +444,9 @@ class GitHubAPI:
             return httpx.Response(200, json=listed)
         if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/events"):
             number = int(path.split("/")[-2])
+            planted = self.planted_issues.get(number)
+            if planted is not None and planted.events is not None:
+                return httpx.Response(200, json=list(planted.events))
             event_id = self.label_event_ids.get(number, self.label_event_base + number)
             return httpx.Response(
                 200,
@@ -331,13 +455,17 @@ class GitHubAPI:
                         "id": event_id,
                         "event": "labeled",
                         "label": {"name": LABEL},
-                        "actor": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+                        "actor": self.label_actor,
+                        "performed_via_github_app": self.label_app,
                         "created_at": "2026-09-01T00:00:00Z",
                     }
                 ],
             )
         if path.startswith(f"/repos/{REPO}/issues/"):
             number = int(path.rsplit("/", 1)[1])
+            planted = self.planted_issues.get(number)
+            if planted is not None:
+                return self._planted_issue(number, planted)
             return httpx.Response(
                 200,
                 json={
@@ -349,13 +477,27 @@ class GitHubAPI:
         if path == f"/repos/{REPO}/collaborators/{SENDER}/permission":
             self.permission_requests.append(request)
             return httpx.Response(
-                200,
+                self.permission_status,
                 json={
                     "permission": self.permission,
+                    "role_name": self.role_name,
                     "user": {"id": self.permission_user_id, "login": SENDER},
                 },
             )
         return httpx.Response(404, json={"message": "missing fixture"})
+
+    def _planted_issue(self, number: int, planted: PlantedIssue) -> httpx.Response:
+        # https://docs.github.com/en/rest/issues/issues#get-an-issue
+        if planted.missing:
+            return httpx.Response(404, json={"message": "Not Found"})
+        issue: dict[str, Any] = {
+            "number": number,
+            "state": planted.state,
+            "labels": [{"name": name} for name in planted.labels],
+        }
+        if planted.pull_request:
+            issue["pull_request"] = {"url": f"https://api.github.com/repos/{REPO}/pulls/{number}"}
+        return httpx.Response(200, json=issue)
 
 
 class _Credentials:
@@ -481,6 +623,17 @@ def _comment_event(number: int, body: str, comment_id: int) -> dict[str, Any]:
 # https://docs.github.com/en/rest/git/trees#create-a-tree
 # https://docs.github.com/en/rest/git/commits#create-a-commit
 # https://docs.github.com/en/rest/git/refs#create-a-reference
+# https://docs.github.com/en/rest/issues/issues#list-repository-issues
+# https://docs.github.com/en/rest/issues/issues#create-an-issue
+# https://docs.github.com/en/rest/issues/issues#get-an-issue
+#
+# Issues follow the REST issue object: ``number``, ``title``, ``body``,
+# ``state``, ``labels`` as objects with a ``name``, ``user`` with ``id``,
+# ``login`` and ``type``, and ``html_url``. A pull request is an issue too: the
+# repository issue listing returns it with a ``pull_request`` key, and its
+# ``creator`` filter matches the opening account's login. An issue the
+# adapter's installation token creates is authored by ``bot_user`` with
+# ``performed_via_github_app``.
 #
 # The Git Data API shapes below (blobs, trees, parentless commits, and refs
 # outside refs/heads) replay what was observed against api.github.com with a
@@ -502,6 +655,7 @@ def _comment_event(number: int, body: str, comment_id: int) -> dict[str, Any]:
 CONTRACT_APP_ID = 51
 CONTRACT_BOT = {"id": 1000, "login": "curie-factory", "type": "Bot"}
 _LISTINGS = (
+    re.compile(rf"^/repos/{REPO}/issues$"),
     re.compile(rf"^/repos/{REPO}/issues/events$"),
     re.compile(rf"^/repos/{REPO}/issues/comments$"),
     re.compile(rf"^/repos/{REPO}/issues/\d+/events$"),
@@ -581,6 +735,10 @@ def _stamp(second: int) -> str:
     )
 
 
+def _person() -> dict[str, Any]:
+    return {"id": SENDER_ID, "login": SENDER, "type": "User"}
+
+
 class GitHubRepositoryFake:
     """In-process GitHub REST state for one repository's issues and code."""
 
@@ -613,6 +771,25 @@ class GitHubRepositoryFake:
         self.evidence_refs: dict[str, str] = {}
         self.raw_requests: list[httpx.Request] = []
         self._write_faults: list[list[Any]] = []
+        # Writes applied whose answer is then lost: [pattern, status, count].
+        self._lost_writes: list[list[Any]] = []
+        # Every request the fake answered, in order.
+        self.http_requests: list[httpx.Request] = []
+        # The JSON body of every `POST /repos/{REPO}/issues`, in order.
+        self.issue_posts: list[dict[str, Any]] = []
+        # Who an issue or pull request the adapter's token opens is authored by.
+        self.bot_user: dict[str, Any] = dict(CONTRACT_BOT)
+        # False models a listing that ignores ``creator``, so an adapter's own
+        # owner check is all that keeps another account's issue out.
+        self.honour_creator = True
+        # Listing lag: issue numbers absent from the repository issue listing,
+        # yet readable directly, as a fresh issue is for a few seconds on
+        # GitHub. While ``hide_new_from_listing`` is set every issue the
+        # adapter creates starts hidden.
+        self.hidden_from_listing: set[int] = set()
+        self.hide_new_from_listing = False
+        # Reads that answer an injected status: [pattern, status, count].
+        self._read_faults: list[list[Any]] = []
         self.label_requests: list[httpx.Request] = []
         self._event_ids = itertools.count(70001)
         self._comment_ids = itertools.count(80001)
@@ -633,7 +810,9 @@ class GitHubRepositoryFake:
     def _number(self) -> int:
         return len(self.issues) + 1
 
-    def seed_issue(self, title: str, body: str) -> int:
+    def seed_issue(self, title: str, body: str, *, user: dict[str, Any] | None = None) -> int:
+        """An issue opened from outside the adapters, by ``user`` (a person by default)."""
+
         number = self._number()
         self.issues[number] = {
             "number": number,
@@ -641,11 +820,33 @@ class GitHubRepositoryFake:
             "body": body,
             "state": "open",
             "labels": [],
-            "user": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+            "user": dict(user) if user is not None else _person(),
+            "html_url": f"https://github.com/{REPO}/issues/{number}",
+            "performed_via_github_app": None,
         }
         return number
 
-    def label_event(self, number: int, kind: str, label: str, actor: dict[str, Any]) -> None:
+    def _pull_issue(self, number: int) -> dict[str, Any]:
+        """The issue side of pull request ``number``, as the issue listing shows it."""
+
+        return {
+            "number": number,
+            "state": "open",
+            "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/{number}"},
+            "labels": [],
+            "user": dict(self.bot_user),
+            "html_url": f"https://github.com/{REPO}/pull/{number}",
+        }
+
+    def label_event(
+        self,
+        number: int,
+        kind: str,
+        label: str,
+        actor: dict[str, Any],
+        *,
+        performed_via_github_app: dict[str, Any] | None = None,
+    ) -> None:
         names = [entry["name"] for entry in self.issues[number]["labels"]]
         if kind == "labeled" and label not in names:
             names.append(label)
@@ -658,7 +859,7 @@ class GitHubRepositoryFake:
                 "event": kind,
                 "label": {"name": label},
                 "actor": actor,
-                "performed_via_github_app": None,
+                "performed_via_github_app": performed_via_github_app,
                 "issue": {"number": number},
                 "created_at": "2026-09-01T00:00:00Z",
             }
@@ -759,7 +960,7 @@ class GitHubRepositoryFake:
         the adapters (the publication push Job's half); returns its number."""
 
         number = self._number()
-        self.issues[number] = {"number": number, "state": "open", "pull_request": {}, "labels": []}
+        self.issues[number] = self._pull_issue(number)
         self.pulls[number] = {
             "head": head,
             "base": base,
@@ -777,6 +978,33 @@ class GitHubRepositoryFake:
         Each refused write still counts in ``writes``: it reached GitHub."""
 
         self._write_faults.append([re.compile(pattern), status, count])
+
+    def lose_write_responses(
+        self, pattern: str, count: int = 1, *, status: int | None = 502
+    ) -> None:
+        """The next ``count`` writes whose ``"<METHOD> <path>"`` matches
+        ``pattern`` are applied, then their answer is lost: ``status`` with a
+        body that is not JSON (502 a server error, 201 an unreadable success),
+        or a transport error when ``status`` is None."""
+
+        self._lost_writes.append([re.compile(pattern), status, count])
+
+    def fail_reads(self, pattern: str, status: int, count: int = 1) -> None:
+        """The next ``count`` GET requests whose ``"GET <path>"`` matches
+        ``pattern`` answer ``status`` (``{"message": "injected"}``)."""
+
+        self._read_faults.append([re.compile(pattern), status, count])
+
+    def _lost_answer(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        subject = f"{request.method} {path}"
+        for fault in self._lost_writes:
+            pattern, status, remaining = fault
+            if remaining > 0 and pattern.search(subject):
+                fault[2] = remaining - 1
+                if status is None:
+                    raise httpx.ReadError("connection lost", request=request)
+                return httpx.Response(status, content=b"<html>lost</html>")
+        return None
 
     def raw(self, commit_sha: str, path: str) -> bytes | None:
         """The bytes ``path`` names in ``commit_sha``'s tree, or None."""
@@ -917,14 +1145,54 @@ class GitHubRepositoryFake:
         return httpx.Response(200, json={"status": status})
 
     def handle(self, request: httpx.Request) -> httpx.Response:
+        self.http_requests.append(request)
         path = request.url.path
         if request.url.host == "github.com":
             return self._raw(request, path)
-        if self._listing_fails(path):
+        # Creating an issue shares the issue listing's path but is no listing.
+        creates_issue = request.method == "POST" and path == f"/repos/{REPO}/issues"
+        if not creates_issue and self._listing_fails(path):
             return httpx.Response(502, json={"message": "injected"})
         if request.method != "GET":
-            return self._write(request, path)
+            answer = self._write(request, path)
+            return self._lost_answer(request, path) or answer
+        injected = self._injected_read(request, path)
+        if injected is not None:
+            return injected
         return self._read(request, path) or self._read_code(request, path)
+
+    def _injected_read(self, request: httpx.Request, path: str) -> httpx.Response | None:
+        subject = f"GET {path}"
+        for fault in self._read_faults:
+            pattern, status, remaining = fault
+            if remaining > 0 and pattern.search(subject):
+                fault[2] = remaining - 1
+                return httpx.Response(status, json={"message": "injected"})
+        return None
+
+    def _issue_listing(self, request: httpx.Request) -> httpx.Response:
+        """List repository issues, pull requests included, oldest or newest first.
+
+        https://docs.github.com/en/rest/issues/issues#list-repository-issues
+        Honours ``creator`` (a login), ``state`` (open by default) and
+        ``direction`` (desc by default) over ``sort=created``, then pages.
+        """
+
+        params = request.url.params
+        state = params.get("state", "open")
+        creator = params.get("creator")
+        listed = [
+            issue
+            for _, issue in sorted(self.issues.items(), reverse=params.get("direction") != "asc")
+            if (state == "all" or issue.get("state") == state)
+            and issue["number"] not in self.hidden_from_listing
+            and (
+                creator is None
+                or not self.honour_creator
+                or issue.get("user", {}).get("login", "").casefold() == creator.casefold()
+            )
+        ]
+        return self._page(request, listed)
 
     def _read(self, request: httpx.Request, path: str) -> httpx.Response | None:
         account = re.fullmatch(r"/user/(\d+)", path)
@@ -933,6 +1201,8 @@ class GitHubRepositoryFake:
             if payload is None:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json=payload)
+        if path == f"/repos/{REPO}/issues":
+            return self._issue_listing(request)
         if path == f"/repos/{REPO}/issues/events":
             return self._page(request, sorted(self.events, key=lambda e: -e["id"]))
         if path == f"/repos/{REPO}/issues/comments":
@@ -1032,7 +1302,8 @@ class GitHubRepositoryFake:
             if matched[2] == "status":
                 statuses = list(self.statuses.get(matched[1], {}).values())
                 return httpx.Response(
-                    200, json={"state": "pending", "statuses": statuses, "total_count": 0}
+                    200,
+                    json={"state": "pending", "statuses": statuses, "total_count": len(statuses)},
                 )
             runs = [self._visible(run) for run in self.check_runs.get(matched[1], {}).values()]
             return httpx.Response(200, json={"total_count": len(runs), "check_runs": runs})
@@ -1079,6 +1350,8 @@ class GitHubRepositoryFake:
         if injected is not None:
             return injected
         body = json.loads(request.content) if request.content else {}
+        if request.method == "POST" and path == f"/repos/{REPO}/issues":
+            return self._create_issue(body)
         matched = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/comments", path)
         if request.method == "POST" and matched:
             comment = self.add_comment(int(matched[1]), CONTRACT_BOT, body["body"], app=True)
@@ -1108,6 +1381,30 @@ class GitHubRepositoryFake:
             return httpx.Response(200, json=issue["labels"])
         return self._write_code(request, path, body)
 
+    def _create_issue(self, body: dict[str, Any]) -> httpx.Response:
+        """Create an issue as the installation token's bot user.
+
+        https://docs.github.com/en/rest/issues/issues#create-an-issue
+        201 with the full issue object.
+        """
+
+        self.issue_posts.append(body)
+        number = self._number()
+        issue = {
+            "number": number,
+            "title": body["title"],
+            "body": body.get("body"),
+            "state": "open",
+            "labels": [{"name": name} for name in body.get("labels", [])],
+            "user": dict(self.bot_user),
+            "html_url": f"https://github.com/{REPO}/issues/{number}",
+            "performed_via_github_app": {"id": CONTRACT_APP_ID},
+        }
+        self.issues[number] = issue
+        if self.hide_new_from_listing:
+            self.hidden_from_listing.add(number)
+        return httpx.Response(201, json=issue)
+
     def _write_code(
         self, request: httpx.Request, path: str, body: dict[str, Any]
     ) -> httpx.Response:
@@ -1116,12 +1413,7 @@ class GitHubRepositoryFake:
             if body["head"] not in self.branches or body["base"] not in self.branches:
                 return httpx.Response(422, json={"message": "Validation Failed"})
             number = self._number()
-            self.issues[number] = {
-                "number": number,
-                "state": "open",
-                "pull_request": {},
-                "labels": [],
-            }
+            self.issues[number] = self._pull_issue(number)
             self.pulls[number] = {
                 "head": body["head"],
                 "base": body["base"],

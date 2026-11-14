@@ -3,6 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
+from curie_internal.requester_coding_instructions import AbsenceReason
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
@@ -38,6 +39,41 @@ class IssueReadResult(BaseModel):
     execution_seconds: int
 
 
+class CompletionContractOut(BaseModel):
+    """How the execution completes (ADR 0277, #5586): by a pull request
+    (``implementation``) or by one delivered tracker result (``tracker_result``).
+
+    ``result_kinds`` are the kinds the deployed policy allows and
+    ``session_usd_allowance`` the per-session model allowance in USD (the
+    agent's dollar limit, else 5); both empty for ``implementation``.
+    """
+
+    completion_contract: Literal["implementation", "tracker_result"]
+    result_kinds: list[str]
+    session_usd_allowance: float | None
+
+
+class TrackerResultSubmission(BaseModel):
+    """The runner result tool's call: one typed proposal, validated by the API
+    (`curie_api.factory_tracker_results.parse_proposal`)."""
+
+    proposal: Any = Field(description="A ticket or findings proposal object.")
+
+
+class TrackerResultOut(BaseModel):
+    """The accepted result after one inline delivery attempt.
+
+    ``state`` ``owed`` means the platform keeps retrying until the delivery
+    deadline. ``result_comment_url`` is the source issue's marked result
+    comment and ``ticket_url`` the published ticket, each once delivered.
+    """
+
+    result_kind: Literal["ticket", "findings"]
+    state: Literal["owed", "delivered", "failed"]
+    result_comment_url: str | None
+    ticket_url: str | None
+
+
 WorkItemOutcomeState = Literal[
     "queued",
     "waiting",
@@ -54,6 +90,16 @@ WorkItemOutcomeState = Literal[
 WorkItemCiState = Literal["passing", "failing", "pending", "none", "unavailable", "not_applicable"]
 # Who an execution's model calls are billed to (#5376, ADR 0268).
 ModelAuthMode = Literal["service", "personal"]
+
+
+class CodingInstructionsMetadata(BaseModel):
+    """Public selection metadata; the private snapshot text is never serialized."""
+
+    state: Literal["absent", "selected"]
+    absence_reason: AbsenceReason | None = None
+    revision: int | None = None
+    sha256: str | None = None
+    format_version: Literal[1] | None = None
 
 
 class WorkItemRequestOut(BaseModel):
@@ -77,6 +123,8 @@ class WorkItemRequestOut(BaseModel):
     model_auth_mode: ModelAuthMode = "service"
     owner_principal_id: uuid.UUID | None = None
     enrollment_generation: int | None = None
+    coding_instructions_selection_id: uuid.UUID | None = None
+    coding_instructions_evidence: Literal["none", "pending", "applied", "failed"] = "none"
 
 
 class WorkItemPrOut(BaseModel):
@@ -202,6 +250,17 @@ class WorkItemRepositoryOut(BaseModel):
     path: str
 
 
+class WorkItemCiObservationOut(BaseModel):
+    """Item-level observation; the failed execution remains historical truth."""
+
+    status: Literal["observing", "completed", "expired", "invalidated"]
+    head_sha: str
+    reason: str | None
+    created_at: datetime
+    expires_at: datetime
+    observed_at: datetime | None
+
+
 class WorkItemOutcomeOut(BaseModel):
     id: uuid.UUID
     agent_id: uuid.UUID
@@ -220,6 +279,7 @@ class WorkItemOutcomeOut(BaseModel):
     correctness: WorkItemCorrectnessOut
     # Null on the list route: CI is observed live on the detail route only.
     ci: WorkItemCiOut | None
+    ci_observation: WorkItemCiObservationOut | None = None
     requests: list[WorkItemRequestOut]
     # ``derive_outcome`` stays pure and leaves these null; ``_views`` fills
     # them from the factory status comment rows and phase reports.
@@ -232,6 +292,8 @@ class WorkItemOutcomeOut(BaseModel):
     model_auth_mode: ModelAuthMode = "service"
     owner_principal_id: uuid.UUID | None = None
     enrollment_generation: int | None = None
+    requester_principal_id: uuid.UUID | None = None
+    coding_instructions: CodingInstructionsMetadata
 
 
 class WorkItemOutcomeList(BaseModel):
@@ -290,4 +352,68 @@ class FactorySlackSteerOut(BaseModel):
     request_status: str | None = None
     replayed: bool = False
     pull_request_url: str | None = None
+    reason: str | None = None
+
+
+# Every answer the factory Slack kickoff route gives (#5380). ``not_factory``
+# sends the mention down the ordinary chat path; every other refusal is final
+# for its delivery and is replied in its thread. Only an unavailable code host
+# or store answers 503.
+FactorySlackKickoffOutcome = Literal[
+    "admitted",
+    "not_factory",
+    "receipt_mismatch",
+    "test_driver_refused",
+    "binding_missing",
+    "binding_ambiguous",
+    "link_missing",
+    "link_multiple",
+    "link_malformed",
+    "link_host_unsupported",
+    "link_pull_request",
+    "sender_unverified",
+    "enrollment_inactive",
+    "issue_inaccessible",
+    "issue_closed",
+    "publication_exists",
+    "base_refused",
+    "thread_conflict",
+    "authority_changed",
+    "admission_refused",
+]
+
+
+class FactorySlackKickoffIn(BaseModel):
+    """One Slack mention linking an issue, at a channel root or in a thread no
+    factory run owns, as the worker consumed it.
+
+    ``receipt`` is the dispatcher's verified mention receipt
+    (``curie_internal.slack_mention_receipt.SlackMentionReceipt``, version 1
+    for a person, 2 for a declared test driver), validated by the route so a
+    malformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or
+    the message's own at root. ``author`` is the turn's Slack user id; the
+    receipt must name the same delivery, route and sender.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    delivery_id: str = Field(min_length=1, max_length=256)
+    channel_identity: str = Field(min_length=1, max_length=256)
+    channel: str = Field(min_length=1, max_length=64)
+    root_ts: str = Field(min_length=1, max_length=64)
+    author: str = Field(min_length=1, max_length=64)
+    receipt: dict[str, Any]
+
+
+class FactorySlackKickoffOut(BaseModel):
+    """The kickoff decision. ``reason`` is the resolver's reason for
+    ``sender_unverified``, the base refusal code for ``base_refused`` and the
+    admission refusal code for ``admission_refused``."""
+
+    outcome: FactorySlackKickoffOutcome
+    request_id: str | None = None
+    request_status: str | None = None
+    work_item_id: str | None = None
+    issue_url: str | None = None
+    replayed: bool = False
     reason: str | None = None

@@ -4,6 +4,10 @@ Date: 2026-08-22
 
 Status: Accepted
 
+**Partially amended by [ADR 0278](0278-requester-coding-instructions.md)** in decisions
+1 and 2: an execution prefix additionally contains a requester scoped instruction
+section, stable for its WorkItem and absent from reviewer context.
+
 **Maintainer approval:** @TheConnMan explicitly approved coordinated acceptance
 and implementation on 2026-08-30 for [issue #1902](https://github.com/curie-eng/curie/issues/1902).
 The realizing code path is the conversation-history loader and SDK session

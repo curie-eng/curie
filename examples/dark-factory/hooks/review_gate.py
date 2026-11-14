@@ -234,6 +234,13 @@ One script handles every hook event the bundle registers:
     requires a fresh diff review. The round counter is kept. This hook
     decision is not atomic with the later publication snapshot. A write after
     the hook allows publish can still reach that snapshot.
+    After those checks, the body must contain one valid ``## Decisions``
+    section. A malformed or missing section refuses publication without
+    stopping the run or changing its review approval or round counters.
+    The runner allows a call whose hook times out or exits with anything but
+    0 or 2, so the publish decision exits 2 (deny) on its own exception, on
+    hook input that is not UTF-8 JSON, and when it has not finished within
+    ``PUBLISH_DEADLINE_SECONDS``.
 
 ``PreToolUse`` on ``report_progress``
     Never decided. Writes a ``curie_reported`` line with the reported phase,
@@ -306,6 +313,7 @@ import contextlib
 import datetime
 import fnmatch
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -314,9 +322,25 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeGuard
+
+_DECISIONS_PATH = Path(__file__).with_name("decisions_section.py")
+_DECISIONS_SPEC = importlib.util.spec_from_file_location(
+    "factory_decisions_section", _DECISIONS_PATH
+)
+try:
+    if _DECISIONS_SPEC is None or _DECISIONS_SPEC.loader is None:
+        raise ImportError("the bundle Decisions parser could not be loaded")
+    _DECISIONS_MODULE = importlib.util.module_from_spec(_DECISIONS_SPEC)
+    _DECISIONS_SPEC.loader.exec_module(_DECISIONS_MODULE)
+except (ImportError, OSError, SyntaxError):
+    print("dark factory review gate: Decisions parser unavailable; refusing", file=sys.stderr)
+    sys.exit(2)
+parse_decisions_section = _DECISIONS_MODULE.parse_decisions_section
+_DECISIONS_NONE = _DECISIONS_MODULE.NONE_DECLARATION
 
 try:
     from curie_runner.workspace_snapshot import (
@@ -1813,7 +1837,7 @@ def _post_diff(
     )
 
 
-def pre_publish(state: dict[str, Any]) -> dict[str, Any]:
+def pre_publish(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
     if state["stopped"]:
         return _deny(_stop_text(state["stopped"], state))
     if (refused := _timing_check(state, "publish")) is not None:
@@ -1829,6 +1853,15 @@ def pre_publish(state: dict[str, Any]) -> dict[str, Any]:
         state.pop("diff_approved_fingerprint", None)
         emit_gate(state, "diff_approval_refused", cause="checkout_changed_or_unverifiable")
         return _deny("Fresh diff review required: checkout changed or is unverifiable.")
+    try:
+        parse_decisions_section(tool_input.get("body"))
+    except ValueError as exc:
+        return _deny(
+            f"Invalid Decisions section: {exc}. Use exactly one ## Decisions heading, followed "
+            "by 1 to 7 contiguous entries: n. <choice>. Rejected: <alternative>, because "
+            "<reason>. (<source>) Evidence: <evidence>. Source must be plan, plan review or "
+            f"diff review. Or use only: {_DECISIONS_NONE} Correct the body and publish again."
+        )
     return _allow("diff review approved")
 
 
@@ -2020,13 +2053,68 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
     elif event == "PreToolUse" and tool.endswith("report_progress"):
         pre_report(state, tool_input)
     elif event == "PreToolUse" and tool.endswith("publish_changes"):
-        out = pre_publish(state)
+        out = pre_publish(state, tool_input)
     save(path, state)
     return out
 
 
+# The runner lets a tool call through when its hook times out (60 seconds) or
+# exits with anything but 0 or 2, so a publication decision that cannot finish
+# denies itself first. Kept below the 10 second hook timeout in hooks.json.
+PUBLISH_DEADLINE_SECONDS = 9.0
+
+
+def _is_publish(data: dict[str, Any]) -> bool:
+    return data.get("hook_event_name") == "PreToolUse" and str(
+        data.get("tool_name") or ""
+    ).endswith("publish_changes")
+
+
+def _refuse(reason: str) -> int:
+    print(f"dark factory review gate: {reason}; refusing", file=sys.stderr)
+    return 2
+
+
 def main() -> int:
-    out = handle(json.load(sys.stdin))
+    """Exit 2 on every failure that is not a deliberate exit, since any other
+    nonzero exit lets the tool call through."""
+    try:
+        return _decide()
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - any failure denies the call
+        return _refuse(f"the hook failed ({type(exc).__name__})")
+
+
+def _decide() -> int:
+    try:
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return _refuse("the hook input is not UTF-8 JSON")
+    if not isinstance(data, dict):
+        return _refuse("the hook input is not a JSON object")
+    if not _is_publish(data):
+        out = handle(data)
+        if out is not None:
+            print(json.dumps(out))
+        return 0
+    result: dict[str, Any] = {}
+
+    def decide() -> None:
+        try:
+            result["out"] = handle(data)
+        except BaseException as exc:  # noqa: BLE001 - any failure denies publication
+            result["error"] = exc
+
+    worker = threading.Thread(target=decide, daemon=True)
+    worker.start()
+    worker.join(PUBLISH_DEADLINE_SECONDS)
+    if worker.is_alive():
+        return _refuse(f"the publication check did not finish in {PUBLISH_DEADLINE_SECONDS}s")
+    if "error" in result:
+        error = result["error"]
+        return _refuse(f"the publication check failed ({type(error).__name__})")
+    out = result.get("out")
     if out is not None:
         print(json.dumps(out))
     return 0

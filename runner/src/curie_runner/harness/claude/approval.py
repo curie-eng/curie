@@ -131,6 +131,7 @@ def build_approval_server(
     memory_tools: Sequence[SdkMcpTool[Any]] = (),
     issue_tool: SdkMcpTool[Any] | None = None,
     attachment_tools: Sequence[SdkMcpTool[Any]] = (),
+    tracker_result_tool: SdkMcpTool[Any] | None = None,
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -162,6 +163,9 @@ def build_approval_server(
 
     ``issue_tool`` (ADR 0187) is the ``get_issue`` tool, appended only for an
     execution with a WorkItem, when the worker injected its read capability.
+
+    ``tracker_result_tool`` (ADR 0277) is ``submit_tracker_result``, appended
+    only when the API answered this execution's contract as tracker_result.
     """
 
     @tool(_TOOL_NAME, _TOOL_DESCRIPTION, _TOOL_SCHEMA)
@@ -198,6 +202,8 @@ def build_approval_server(
     tools.extend(attachment_tools)
     if issue_tool is not None:
         tools.append(issue_tool)
+    if tracker_result_tool is not None:
+        tools.append(tracker_result_tool)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,

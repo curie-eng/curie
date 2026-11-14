@@ -15,7 +15,8 @@ decides which cookies it carries. Checks run in phases, one API restart each:
    without its state cookie and then completed with it, a replay refused,
    logout refusing a foreign or missing Origin and revoking with a matching
    one, the retired cookie name refused, and a console session refused on a
-   platform-key route.
+   platform-key route. The built owner CLI then stores, reads and clears coding
+   instructions with that session and proves a second Dex principal is isolated.
 2. Required claims {"groups": "authors"} with the groups scope: Dex's mock
    connector (groups: authors) is admitted, and the password user (no groups)
    is refused without a principal being written.
@@ -47,6 +48,7 @@ Images missing locally are built from this checkout; `--build` always builds.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -264,7 +266,6 @@ class Stack:
                 "OIDC_E2E_UI_PORT": str(self.s.ui_port),
                 "OIDC_E2E_DEX_PORT": str(self.s.dex_port),
                 "OIDC_E2E_DEX_IMAGE": DEX_IMAGE,
-                "OIDC_E2E_DEX_CONFIG": str(self.s.dex_config),
                 # The worker is off; keep compose from resolving an endpoint
                 # that only the full profile would serve.
                 "OTEL_EXPORTER_OTLP_ENDPOINT": "",
@@ -299,11 +300,46 @@ class Stack:
         )
 
     def up(self, oidc: dict[str, str], *services: str) -> None:
-        self.compose("up", "-d", "--wait", *services, oidc=oidc)
+        application_services = tuple(service for service in services if service != "dex") or (
+            "postgres",
+            "valkey",
+            "rustfs",
+            "curie-api",
+            "curie-channel-gateway",
+            "curie-ui",
+        )
+        self.compose("up", "-d", "--wait", *application_services, oidc=oidc)
+        self.compose("create", "dex", oidc=oidc)
+        container = self.compose(
+            "ps", "--all", "--quiet", "dex", oidc=oidc, capture=True
+        ).stdout.strip()
+        if not container or "\n" in container:
+            raise CheckFailed("expected one Dex fixture container")
+        subprocess.run(
+            ["docker", "cp", str(self.s.dex_config), f"{container}:/etc/dex/config.yaml"],
+            check=True,
+        )
+        self.compose("start", "dex", oidc=oidc)
         wait_for(f"{self.s.api}/health", 200, timeout=120)
+        wait_for(f"{self.s.issuer}/.well-known/openid-configuration", 200, timeout=120)
 
     def down(self) -> None:
         self.compose("down", "-v", "--remove-orphans", oidc=oidc_off(self.s))
+        remaining = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                f"label=com.docker.compose.project={self.s.project}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if remaining:
+            raise CheckFailed("OIDC fixture containers remain after cleanup")
 
     def sql(self, query: str) -> str:
         out = self.compose(
@@ -573,6 +609,94 @@ def phase_default(s: Settings, stack: Stack, ev: Evidence) -> str:
         f"{machine.status}/{control.status}/{mint.status}",
     )
     return token
+
+
+def phase_coding_instructions(s: Settings, ev: Evidence, token: str) -> None:
+    """Drive the owner CLI with two independently authenticated Dex principals."""
+
+    ev.check("coding instructions has a built CLI", s.curie_bin is not None)
+    assert s.curie_bin is not None
+    session_file = s.workdir / "coding-owner-session"
+    content_file = s.workdir / "coding-instructions.txt"
+    with os.fdopen(os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as out:
+        out.write(token)
+    content = b"Use explicit names.  \r\nPreserve the repository style.\r\n"
+    content_file.write_bytes(content)
+    normalized = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    ev.check("coding session file is private", session_file.stat().st_mode & 0o777 == 0o600)
+
+    def cli(*arguments: str, expected_exit: int = 0) -> dict[str, Any]:
+        proc = subprocess.run(
+            [
+                s.curie_bin,
+                "--json",
+                "cluster",
+                "coding-instructions",
+                *arguments,
+                "--session-file",
+                str(session_file),
+                "--api-url",
+                s.api,
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        ev.check(
+            f"coding instructions {arguments[0]} exits {expected_exit}",
+            proc.returncode == expected_exit,
+            {"exit": proc.returncode},
+        )
+        try:
+            result = json.loads(proc.stdout)
+        except (ValueError, UnicodeError):
+            raise CheckFailed("coding instructions CLI did not emit one JSON object") from None
+        ev.check("coding instructions CLI emits one JSON object", isinstance(result, dict))
+        return result
+
+    empty = cli("get")
+    ev.check(
+        "new owner has no coding instructions", empty["revision"] == 0 and empty["text"] is None
+    )
+    written = cli("set", "--file", str(content_file), "--expected-revision", "0")
+    ev.check(
+        "coding instructions set normalizes line endings and preserves whitespace",
+        written["text"] == normalized
+        and written["revision"] == 1
+        and written["sha256"] == digest
+        and written["byte_length"] == len(normalized.encode("utf-8"))
+        and written["format_version"] == 1
+        and written["application"] == "unavailable",
+    )
+    found = cli("get")
+    ev.check("coding instructions get returns the stored revision and digest", found == written)
+
+    other_token = session_token(finish(begin_login(s, "mock")))
+    other = request(
+        "GET", f"{s.api}/coding-instructions", headers=cookie(SESSION_COOKIE, other_token)
+    )
+    ev.check(
+        "a second Dex principal cannot read the owner's coding instructions",
+        other.status == 200
+        and other.json()["revision"] == 0
+        and other.json()["text"] is None
+        and other.json()["sha256"] is None,
+    )
+    stale = cli("set", "--file", str(content_file), "--expected-revision", "0", expected_exit=1)
+    ev.check(
+        "stale coding instructions revision is a structured conflict",
+        bool(stale.get("error")) and bool(stale.get("fix")),
+    )
+    ev.check("a stale coding instructions write changes nothing", cli("get") == written)
+    cleared = cli("clear", "--expected-revision", "1")
+    ev.check(
+        "coding instructions clear retains the advanced revision without text",
+        cleared["revision"] == 2 and cleared["text"] is None and cleared["sha256"] is None
+        and cleared["byte_length"] == 0 and cleared["application"] == "unavailable",
+    )
+    ev.check("cleared coding instructions remain cleared", cli("get") == cleared)
 
 
 def phase_required_claims(s: Settings, stack: Stack, ev: Evidence) -> None:
@@ -852,6 +976,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         stack.up(oidc_on(s))
         token = phase_default(s, stack, ev)
+        phase_coding_instructions(s, ev, token)
         phase_required_claims(s, stack, ev)
         phase_issuer_binding(s, stack, ev, token)
         phase_rate_limit(s, ev)

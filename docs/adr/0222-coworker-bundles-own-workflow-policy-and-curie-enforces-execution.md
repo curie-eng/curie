@@ -4,6 +4,11 @@ Date: 2026-10-13
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Permits the narrow immutable result declaration while isolated input evaluation
+remains deferred; bundle ownership of semantic policy is preserved.
+
 Accepted 2026-10-14 with explicit maintainer approval, following Brian Conn's
 approval of [#4555](https://github.com/curie-eng/curie/pull/4555) and the
 maintainer's confirmation that this ADR is accepted.

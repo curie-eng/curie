@@ -1141,6 +1141,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     .await?;
             emit(commands::console_login(&api_url, &api_key, &subject, dry_run).await?)
         }
+        ClusterAction::CodingInstructions { action } => coding_instructions::run(action).await,
         ClusterAction::Subscription { action } => {
             emit(commands::subscription(subscription_opts(action)).await?)
         }

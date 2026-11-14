@@ -1568,21 +1568,39 @@ def error_class(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _assistant_key(path: str, message_id: Any, ordinal: int) -> str:
+    """The guard key of one assistant record.
+
+    A non-empty string id is the key. A record without one gets a synthetic key
+    from the file and its index among assistant records, so an append-only
+    re-parse keeps every earlier key and two sessions never share one.
+    """
+
+    if isinstance(message_id, str) and message_id:
+        return message_id
+    digest = hashlib.sha256(f"{path}\0{ordinal}".encode()).hexdigest()[:16]
+    return f"noid:{digest}"
+
+
 def _session_facts(
     path: str, role: str, parent: str, records: Sequence[Mapping[str, Any]]
 ) -> SessionFacts:
     by_id: dict[str, int | None] = {}
+    responses: set[str] = set()
     models: set[str] = set()
     synthetic = 0
     aci = 0
     errors: list[dict[str, Any]] = []
     stamps: list[float] = []
+    assistant_ordinal = 0
     for record in records:
         stamp = _timestamp(record.get("timestamp"))
         if stamp is not None:
             stamps.append(stamp)
         if record.get("type") != "assistant":
             continue
+        ordinal = assistant_ordinal
+        assistant_ordinal += 1
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
         assert isinstance(message, dict)
         model = message.get("model")
@@ -1595,17 +1613,21 @@ def _session_facts(
             continue
         if isinstance(model, str):
             models.add(model)
-        message_id = message.get("id")
-        if not isinstance(message_id, str):
-            message_id = f"<no id {len(by_id)}>"
-            by_id[message_id] = None
+        raw_id = message.get("id")
+        key = _assistant_key(path, raw_id, ordinal)
+        identified = isinstance(raw_id, str) and bool(raw_id)
         usage = message.get("usage")
         tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
-        previous = by_id.get(message_id)
-        if type(tokens) is int and tokens >= 0:
-            by_id[message_id] = tokens if previous is None else max(previous, tokens)
+        previous = by_id.get(key)
+        carries_usage = type(tokens) is int and tokens >= 0
+        if carries_usage:
+            by_id[key] = tokens if previous is None else max(previous, tokens)
         else:
-            by_id.setdefault(message_id, None)
+            by_id.setdefault(key, None)
+        # Every usage-bearing record is a response, id or not. An identified
+        # record with no usage stays one too, so a later usage line can join it.
+        if carries_usage or identified:
+            responses.add(key)
         aci += sum(
             1
             for item in _content(record)
@@ -1628,7 +1650,7 @@ def _session_facts(
         aci_tool_calls=aci,
         # A session with no assistant usage at all (only user records) is not known.
         usage_known=bool(by_id) and all(value is not None for value in by_id.values()),
-        message_ids=frozenset(key for key in by_id if not key.startswith("<no id")),
+        message_ids=frozenset(responses),
         errors=tuple(errors),
     )
 

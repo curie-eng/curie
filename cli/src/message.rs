@@ -4011,6 +4011,200 @@ enum EvalReplyTransport<'a> {
     Relay(&'a ApiClient),
 }
 
+/// The local/cluster tier's raw record of one trial, built from what the
+/// reply transport observed. These tiers see only the delivered reply, never
+/// the runner's tool frames, so `tool_calls` is `None` (not observable) rather
+/// than an empty list that would claim the turn called no tool. `output` is the
+/// case-row text this trial produced; on a timeout it is the diagnostic, which
+/// belongs in `error`, not in the reply.
+fn relay_trial(
+    index: u32,
+    outcome: &Outcome,
+    passed: bool,
+    seconds: f64,
+    output: &str,
+) -> crate::commands::EvalTrial {
+    let (reply, status, error) = match outcome {
+        Outcome::Replied(reply) => (reply.clone(), "replied", None),
+        Outcome::Failed { reply, class } => (
+            reply.clone(),
+            "failed",
+            Some(format!("runner turn failed: {class}")),
+        ),
+        Outcome::AwaitingApproval { reply, .. } => {
+            (reply.clone().unwrap_or_default(), "awaiting_approval", None)
+        }
+        Outcome::CompletedNoEdit => (String::new(), "completed_no_edit", None),
+        Outcome::TimedOut => (String::new(), "timed_out", Some(output.to_string())),
+    };
+    crate::commands::EvalTrial {
+        index,
+        outcome: if passed {
+            crate::evals::CaseOutcome::Pass
+        } else {
+            crate::evals::CaseOutcome::Fail
+        },
+        seconds,
+        reply,
+        tool_calls: None,
+        status: Some(status.to_string()),
+        detail: None,
+        error,
+    }
+}
+
+/// The agent the worker routes this eval's turns to: the one bound to the
+/// exact Slack route the turns are sent on, `("slack", channel, identity)`,
+/// where `identity` `None` is the installation's default identity (an omitted
+/// adapter or `default`). Matching the address alone is not enough: two agents
+/// may share one channel under different identities, and only one of them
+/// answers the turns this eval sends. When `agent` was named, the route must
+/// be that agent's. Zero or several agents on the route is an error, so the
+/// revision is reported as unknown rather than guessed.
+fn eval_route_agent_id(
+    agents: &[Agent],
+    agent: Option<&str>,
+    channel: &str,
+    identity: Option<&str>,
+) -> Result<String> {
+    let on_route: Vec<&Agent> = agents
+        .iter()
+        .filter(|a| {
+            a.channels.iter().any(|binding| {
+                binding.kind == "slack"
+                    && binding.address == channel
+                    && binding.named_adapter() == identity
+            })
+        })
+        .collect();
+    let route = match identity {
+        Some(identity) => format!("{channel} as {identity}"),
+        None => format!("{channel} as the default identity"),
+    };
+    match on_route.as_slice() {
+        [only] => match agent {
+            Some(named) if only.name != named && only.id != named => {
+                bail!(
+                    "the Slack route {route} is bound to {}, not {named}",
+                    only.name
+                )
+            }
+            _ => Ok(only.id.clone()),
+        },
+        [] => bail!("no agent is bound to the Slack route {route}"),
+        many => bail!(
+            "several agents are bound to the Slack route {route} ({})",
+            many.iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The bundle revision this eval is routed to: the agent bound to the exact
+/// Slack route the turns are sent on, its in-force deployment, and that
+/// deployment's version, read from the platform API.
+async fn eval_route_revision(
+    api: &ApiClient,
+    agent: Option<&str>,
+    channel: &str,
+    identity: Option<&str>,
+) -> Result<Option<crate::commands::EvalBundleRevision>> {
+    let agents = api
+        .list_agents()
+        .await
+        .context("listing agents to resolve the evaluated bundle revision")?;
+    let agent_id = eval_route_agent_id(&agents, agent, channel, identity)?;
+    let deployments = api
+        .list_deployments(&agent_id)
+        .await
+        .context("listing deployments to resolve the evaluated bundle revision")?;
+    let versions = api
+        .list_versions(&agent_id)
+        .await
+        .context("listing versions to resolve the evaluated bundle revision")?;
+    Ok(crate::commands::eval_bundle_revision(
+        &agent_id,
+        &deployments,
+        &versions,
+    ))
+}
+
+/// Wall-clock bound on one whole revision lookup (three API reads).
+/// `ApiClient` has a connect timeout but no read timeout, so this is the only
+/// thing stopping a stalled API from holding the eval before its first case or
+/// after its last.
+const EVAL_REVISION_LOOKUP_BUDGET: Duration = Duration::from_secs(10);
+
+/// Best-effort revision lookup: an API hiccup or stall must not fail or hang
+/// an eval, so it is reported on stderr and the revision stays unknown. The
+/// whole lookup, not each request, is bounded by `budget`.
+async fn eval_route_revision_or_warn(
+    api: &ApiClient,
+    agent: Option<&str>,
+    channel: &str,
+    identity: Option<&str>,
+    budget: Duration,
+) -> Option<crate::commands::EvalBundleRevision> {
+    let warn = |reason: String| {
+        crate::ui::ui().warn(&format!(
+            "could not resolve the evaluated bundle revision, so bundle_revision is null: \
+             {reason}"
+        ));
+    };
+    match tokio::time::timeout(budget, eval_route_revision(api, agent, channel, identity)).await {
+        Ok(Ok(revision)) => revision,
+        Ok(Err(err)) => {
+            warn(format!("{err:#}"));
+            None
+        }
+        Err(_) => {
+            warn(format!(
+                "the platform API did not answer within {}s",
+                budget.as_secs_f64()
+            ));
+            None
+        }
+    }
+}
+
+/// The revision to report for a run bracketed by two lookups. Every sample
+/// binds the in-force deployment when its fresh thread is claimed, so a run
+/// names a revision only when the lookup before the first sample and the
+/// lookup after the last agree. A changed revision means the samples may have
+/// run on different bundles and is reported as unknown. Agreement is weaker
+/// than it looks: a deploy and a rollback inside the run leave both ends equal,
+/// so the value means "in force at the start and at the end, unchanged", not
+/// "served every sample". Neither the relay nor the reply exposes the version a
+/// sample's sandbox booted, so a per-sample revision is not observable here.
+fn stable_eval_revision(
+    before: Option<crate::commands::EvalBundleRevision>,
+    after: Option<crate::commands::EvalBundleRevision>,
+) -> Option<crate::commands::EvalBundleRevision> {
+    match (before, after) {
+        (Some(before), Some(after)) if before == after => Some(before),
+        _ => None,
+    }
+}
+
+/// Attach the bracketed revision to `report`, warning when a deploy moved the
+/// in-force version during the run.
+fn attach_eval_revision(
+    report: &mut crate::commands::EvalReport,
+    before: Option<crate::commands::EvalBundleRevision>,
+    after: Option<crate::commands::EvalBundleRevision>,
+) {
+    let moved = matches!((&before, &after), (Some(b), Some(a)) if b != a);
+    if moved {
+        crate::ui::ui().warn(
+            "the in-force deployment changed during the eval run, so its samples may have run \
+             on different bundles; bundle_revision is null",
+        );
+    }
+    report.bundle_revision = stable_eval_revision(before, after);
+}
+
 /// The shared per-tier eval engine: enqueue one synthetic `QueuedTurn` per case
 /// through the caller's reply transport + Valkey, grade the captured reply, and
 /// collect `(id, passed, seconds, output)` rows for `report_eval`.
@@ -4032,11 +4226,13 @@ async fn run_eval_turns(
     let mut results: Vec<crate::commands::EvalRow> = Vec::with_capacity(total);
     let mut sample_passes = std::collections::BTreeMap::new();
     let mut details = std::collections::BTreeMap::new();
+    let mut trials = std::collections::BTreeMap::new();
     let mut eval_threads: Vec<String> = Vec::with_capacity(total * sampling.n as usize);
     let run = async {
         for case in &suite.cases {
             let mut samples = Vec::with_capacity(sampling.n as usize);
-            for _ in 0..sampling.n {
+            let mut case_trials = Vec::with_capacity(sampling.n as usize);
+            for index in 0..sampling.n {
                 // Each sample is its own thread so draws never inherit prior
                 // turns (#550). Prefix the conversation_id so the worker omits
                 // ambient agent memory from that sandbox (#1909): durable memory
@@ -4141,6 +4337,7 @@ async fn run_eval_turns(
                     },
                 };
                 let passed = reply_passes(case, &outcome);
+                case_trials.push(relay_trial(index, &outcome, passed, elapsed, &output));
                 let completed = matches!(
                     outcome,
                     Outcome::Replied(_)
@@ -4169,6 +4366,7 @@ async fn run_eval_turns(
             if let Some(variance) = &agg.variance {
                 details.insert(case.id.clone(), variance.clone());
             }
+            trials.insert(case.id.clone(), case_trials);
             results.push((case.id.clone(), agg.outcome, agg.seconds, agg.output));
         }
         anyhow::Ok(crate::commands::EvalReport {
@@ -4176,6 +4374,9 @@ async fn run_eval_turns(
             details,
             sampling,
             sample_passes,
+            trials,
+            // The caller attaches the revision it resolved around the run.
+            bundle_revision: None,
         })
     };
     let result = run.await;
@@ -5129,7 +5330,16 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     };
     ui.note(&format!("routing to channel {channel}"));
 
-    let results = run_eval_turns(
+    let api = ApiClient::new(&api_base, &opts.api_key)?;
+    let revision_before = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        identity.as_deref(),
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
+    let mut results = run_eval_turns(
         &opts,
         &channel,
         identity.as_deref(),
@@ -5138,6 +5348,15 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         EvalReplyTransport::Stub(&mut stub),
     )
     .await?;
+    let revision_after = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        identity.as_deref(),
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
+    attach_eval_revision(&mut results, revision_before, revision_after);
     crate::commands::report_eval(&results, None, stub)
 }
 
@@ -5252,7 +5471,15 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let valkey_url = local_valkey_url(&opts.valkey_password, "127.0.0.1", valkey_local_port);
     let mut conn = connect(&valkey_url).await?;
 
-    let results = match run_eval_turns(
+    let revision_before = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        identity.as_deref(),
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
+    let mut results = match run_eval_turns(
         &opts,
         &channel,
         identity.as_deref(),
@@ -5265,6 +5492,15 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         Ok(results) => results,
         Err(err) => return Err(enrich_cluster_enqueue_timeout(err).await),
     };
+    let revision_after = eval_route_revision_or_warn(
+        &api,
+        opts.agent.as_deref(),
+        &channel,
+        identity.as_deref(),
+        EVAL_REVISION_LOOKUP_BUDGET,
+    )
+    .await;
+    attach_eval_revision(&mut results, revision_before, revision_after);
     // report_eval process::exits on a red suite without unwinding, so both
     // port-forwards must move in as guards (#1908). There is no stub guard.
     crate::commands::report_eval(&results, None, (valkey_pf, api_pf))
@@ -5826,6 +6062,180 @@ mod tests {
     #[test]
     fn an_empty_thread_normalizes_to_no_thread() {
         assert_eq!(normalize_thread(Some(String::new())), None);
+    }
+
+    /// The local/cluster tiers see only the delivered reply, so a trial says
+    /// its tool calls are NOT observable (null) rather than claiming none were
+    /// made, and a timeout's diagnostic lands in `error`, never in `reply`.
+    #[test]
+    fn a_relay_trial_records_the_reply_and_never_claims_tool_calls() {
+        let replied = relay_trial(0, &Outcome::Replied("sunny".into()), true, 2.0, "sunny");
+        assert_eq!(replied.index, 0);
+        assert_eq!(replied.outcome, crate::evals::CaseOutcome::Pass);
+        assert_eq!(replied.reply, "sunny");
+        assert_eq!(replied.status.as_deref(), Some("replied"));
+        assert_eq!(replied.tool_calls, None, "this tier cannot see tool frames");
+        assert_eq!(replied.error, None);
+
+        let timed_out = relay_trial(1, &Outcome::TimedOut, false, 30.0, "no reply within 30s");
+        assert_eq!(timed_out.outcome, crate::evals::CaseOutcome::Fail);
+        assert_eq!(timed_out.reply, "", "a diagnostic is not a reply");
+        assert_eq!(timed_out.status.as_deref(), Some("timed_out"));
+        assert_eq!(timed_out.error.as_deref(), Some("no reply within 30s"));
+
+        let failed = relay_trial(
+            2,
+            &Outcome::Failed {
+                reply: "something went wrong".into(),
+                class: "runner_error".into(),
+            },
+            false,
+            1.0,
+            "something went wrong",
+        );
+        assert_eq!(failed.reply, "something went wrong");
+        assert_eq!(failed.status.as_deref(), Some("failed"));
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("runner turn failed: runner_error")
+        );
+    }
+
+    /// Review finding on #5553: two agents share one Slack address under
+    /// different identities. A channel-only eval speaks as the default
+    /// identity, so its revision must come from the default binding's agent
+    /// even when the named-identity agent is listed first; picking by address
+    /// alone reported the other agent's bundle.
+    #[test]
+    fn the_eval_revision_agent_is_the_one_bound_to_the_exact_route() {
+        let agents = [
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+            agent_on("sre-bot", &[("C0EXAMPLE1", Some("default"))]),
+        ];
+        let sre = &agents[1].id;
+        let ops = &agents[0].id;
+        // Channel only: the turn speaks as the default identity.
+        assert_eq!(
+            &eval_route_agent_id(&agents, None, "C0EXAMPLE1", None).unwrap(),
+            sre
+        );
+        // `--agent ops` resolves the named identity, which is what is sent.
+        assert_eq!(
+            &eval_route_agent_id(&agents, Some("ops"), "C0EXAMPLE1", Some("ops-bot")).unwrap(),
+            ops
+        );
+        // An omitted adapter is the default identity too.
+        let implicit = [
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+            agent_on("sre-bot", &[("C0EXAMPLE1", None)]),
+        ];
+        assert_eq!(
+            eval_route_agent_id(&implicit, None, "C0EXAMPLE1", None).unwrap(),
+            implicit[1].id
+        );
+    }
+
+    /// No binding, or more than one agent on the exact route, is an unknown
+    /// revision rather than a guess; a non-Slack binding on the same address
+    /// is a different route.
+    #[test]
+    fn the_eval_revision_agent_is_unknown_when_the_route_is_not_unique() {
+        let none = [agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))])];
+        assert!(eval_route_agent_id(&none, None, "C0EXAMPLE1", None).is_err());
+        let twice = [
+            agent_on("a", &[("C0EXAMPLE1", None)]),
+            agent_on("b", &[("C0EXAMPLE1", Some("default"))]),
+        ];
+        assert!(eval_route_agent_id(&twice, None, "C0EXAMPLE1", None).is_err());
+        let mut other_kind = agent_on("mail", &[("C0EXAMPLE1", None)]);
+        other_kind.channels[0].kind = "email".into();
+        assert!(eval_route_agent_id(&[other_kind], None, "C0EXAMPLE1", None).is_err());
+        // A named agent that is not the route's agent is refused, not swapped.
+        let agents = [
+            agent_on("ops", &[("C0EXAMPLE1", Some("ops-bot"))]),
+            agent_on("sre-bot", &[("C0EXAMPLE1", None)]),
+        ];
+        assert!(eval_route_agent_id(&agents, Some("ops"), "C0EXAMPLE1", None).is_err());
+    }
+
+    /// The revision lookup is best effort, so a platform API that accepts the
+    /// connection and never answers must cost at most the budget, then degrade
+    /// to an unknown revision. `ApiClient` has a connect timeout but no read
+    /// timeout, so without the wrapping bound this would block the eval before
+    /// its first case or after its last one indefinitely.
+    #[tokio::test]
+    async fn a_stalled_api_cuts_the_revision_lookup_off_at_its_budget() {
+        let (base, stall) = hint_stalling_peer().await;
+        let api = ApiClient::new(&base, HINT_API_KEY).unwrap();
+        let budget = Duration::from_millis(500);
+        let started = Instant::now();
+        let revision = tokio::time::timeout(
+            budget * 20,
+            eval_route_revision_or_warn(&api, None, "C0EXAMPLE1", None, budget),
+        )
+        .await
+        .expect("nothing bounded the lookup against a stalled API");
+        let elapsed = started.elapsed();
+        stall.abort();
+        assert_eq!(revision, None, "an expired budget is an unknown revision");
+        assert!(
+            elapsed >= budget,
+            "the stall was never reached; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < budget * 4,
+            "not cut off at its budget; took {elapsed:?}"
+        );
+    }
+
+    /// The limit of a before/after bracket, pinned so nobody reads more into
+    /// the field than it proves: a deploy of B and a redeploy of A inside one
+    /// run leaves both lookups on A, so the run still reports A even though
+    /// some samples may have run on B. The field means "the revision in force
+    /// at the start and at the end, unchanged", not "every sample's revision".
+    #[test]
+    fn an_a_to_b_to_a_run_still_reports_a_because_only_the_ends_are_observed() {
+        let revision = |version: &str| crate::commands::EvalBundleRevision {
+            agent_id: "agent-1".into(),
+            deployment_id: format!("dep-{version}"),
+            environment: "prod".into(),
+            version_id: version.into(),
+            version_label: version.into(),
+            commit_sha: None,
+            bundle_sha256: None,
+        };
+        // Observed: A before the first sample, A after the last. The B that
+        // served samples in between never reaches this function.
+        assert_eq!(
+            stable_eval_revision(Some(revision("A")), Some(revision("A"))),
+            Some(revision("A"))
+        );
+    }
+
+    /// A run names one revision only when the lookups before and after it
+    /// agree; a deploy mid-run, or a failed lookup on either side, is unknown.
+    #[test]
+    fn an_eval_names_a_revision_only_when_it_held_for_the_whole_run() {
+        let revision = |version: &str| crate::commands::EvalBundleRevision {
+            agent_id: "agent-1".into(),
+            deployment_id: format!("dep-{version}"),
+            environment: "prod".into(),
+            version_id: version.into(),
+            version_label: version.into(),
+            commit_sha: None,
+            bundle_sha256: Some(format!("sha-{version}")),
+        };
+        assert_eq!(
+            stable_eval_revision(Some(revision("v1")), Some(revision("v1"))),
+            Some(revision("v1"))
+        );
+        assert_eq!(
+            stable_eval_revision(Some(revision("v1")), Some(revision("v2"))),
+            None,
+            "a deploy landed mid-run, so the samples may span two bundles"
+        );
+        assert_eq!(stable_eval_revision(None, Some(revision("v1"))), None);
+        assert_eq!(stable_eval_revision(Some(revision("v1")), None), None);
     }
 
     #[test]

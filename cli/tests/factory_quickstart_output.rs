@@ -333,7 +333,11 @@ fn agent() -> Value {
     json!({"id":"agent-fixture","name":"dark-factory","channels":[],"created_at":"2026-10-04T00:00:00Z","memory":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
 }
 
-fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
+fn platform(
+    req: &Request,
+    state: &std::sync::Mutex<Value>,
+    enforce_tracker_rule: bool,
+) -> Response {
     let path = req.path.split('?').next().unwrap();
     let mut saved = state.lock().unwrap();
     let result = match (req.method.as_str(), path) {
@@ -350,6 +354,10 @@ fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
                 "AgentCreate needs an initial binding"
             );
             *saved = agent();
+            if enforce_tracker_rule {
+                // A real create leaves publication policy at approve.
+                saved["publication_policy"] = json!("approve");
+            }
             saved["name"] = created["name"].clone();
             saved["channels"] = json!([created["channel"].clone()]);
             if let Some(repo) = created.get("repo_full_name") {
@@ -387,6 +395,17 @@ fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
             json!({"id":"version-fixture","agent_id":"agent-fixture","version_label":"fixture","created_by":"fixture","created_at":"2026-10-04T00:00:00Z"})
         }
         ("PUT", "/agents/agent-fixture/versions/version-fixture/bundle") => {
+            if enforce_tracker_rule && archive_declares_tracker_result(&req.body) {
+                if saved.get("publication_policy").and_then(Value::as_str) != Some("auto") {
+                    return Response::json(
+                        422,
+                        r#"{"detail":{"code":"tracker_result_needs_unattended_publication","message":"tracker result runs are unattended"}}"#,
+                    );
+                }
+                // The next quickstart must set auto again. A rerun that skips
+                // settings uploads while the agent is back at approve.
+                saved["publication_policy"] = json!("approve");
+            }
             json!({"version_id":"version-fixture","bundle_ref":"bundles/fixture.tar.gz","bundle_sha256":"fixture","size_bytes":100})
         }
         ("GET", "/agents/agent-fixture/versions/version-fixture/connectors") => {
@@ -448,7 +467,22 @@ impl Fixture {
         Self::with_bot_lookup(account_left, 200, r#"{"id":123}"#)
     }
 
+    /// The platform stub creates agents at `approve` and refuses a
+    /// tracker-result upload until publication policy is `auto`.
+    fn enforcing_tracker_publication() -> Self {
+        Self::open(AMPLE_ACCOUNT_LEFT, 200, r#"{"id":123}"#, true)
+    }
+
     fn with_bot_lookup(account_left: f64, bot_status: u16, bot_body: &'static str) -> Self {
+        Self::open(account_left, bot_status, bot_body, false)
+    }
+
+    fn open(
+        account_left: f64,
+        bot_status: u16,
+        bot_body: &'static str,
+        enforce_tracker_rule: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("bin")).unwrap();
         for tool in ["helm", "kubectl", "kind", "docker"] {
@@ -554,7 +588,7 @@ impl Fixture {
         Self {
             dir,
             github,
-            platform: serve(move |request| platform(request, &agent_state)),
+            platform: serve(move |request| platform(request, &agent_state, enforce_tracker_rule)),
             registry,
             openrouter: openrouter(account_left),
         }
@@ -576,6 +610,7 @@ impl Fixture {
             .env_remove("XDG_CACHE_HOME")
             .env("TMPDIR", self.dir.path())
             .env("CURIE_CREDENTIALS", "sk-or-fixture")
+            .env_remove("CURIE_MODEL_BASE_URL")
             .env("CURIE_GITHUB_API_URL", &self.github.base_url)
             .env("CURIE_OPENROUTER_API_URL", &self.openrouter.base_url)
             .env("CURIE_API_URL", &self.platform.base_url)
@@ -2632,6 +2667,162 @@ fn ample_openrouter_credit_prints_no_credit_line() {
     );
 }
 
+fn shown_output(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// An explicit OpenRouter model endpoint still probes. The probe goes to
+/// `CURIE_OPENROUTER_API_URL` (the local stub), which is not itself the
+/// model endpoint.
+#[test]
+fn an_explicit_openrouter_base_url_still_checks_credit() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .env("CURIE_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = shown_output(&output);
+    assert!(output.status.success(), "{shown}");
+    assert!(!shown.contains("OpenRouter credit not checked"), "{shown}");
+    assert!(
+        !fixture.openrouter.recorded().is_empty(),
+        "an OpenRouter model endpoint must still reach the credit probe"
+    );
+}
+
+fn assert_credit_not_sent(fixture: &Fixture, shown: &str, secret: &str) {
+    assert!(shown.contains("OpenRouter credit not checked"), "{shown}");
+    assert!(
+        !shown.contains(secret),
+        "the skip reason must not repeat the endpoint or credential: {shown}"
+    );
+    assert!(
+        fixture.openrouter.recorded().is_empty(),
+        "credit was requested from the OpenRouter stub: {:?}",
+        fixture.openrouter.recorded()
+    );
+}
+
+/// A model base URL on any other host must not be offered to the OpenRouter
+/// credit API, including a host that only looks related.
+#[test]
+fn an_explicit_non_openrouter_base_url_makes_no_credit_request() {
+    for url in [
+        "https://models.example.test/v1",
+        "https://api.openrouter.ai/api/v1",
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture
+            .command(true, &["--color", "never"])
+            .env("CURIE_MODEL_BASE_URL", url)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let shown = shown_output(&output);
+        assert!(output.status.success(), "{url}: {shown}");
+        assert!(
+            shown.contains("OpenRouter credit not checked: the model endpoint is not OpenRouter"),
+            "{url}: {shown}"
+        );
+        assert_credit_not_sent(&fixture, &shown, url);
+    }
+}
+
+fn record_release_model_base(fixture: &Fixture, path: &[&str], value: Option<&str>) {
+    let mut values: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.dir.path().join("values")).unwrap())
+            .unwrap();
+    let mut cursor = &mut values;
+    for key in &path[..path.len() - 1] {
+        if !cursor.get(*key).map(Value::is_object).unwrap_or(false) {
+            cursor[*key] = json!({});
+        }
+        cursor = cursor.get_mut(*key).unwrap();
+    }
+    let entry = match value {
+        Some(url) => json!({"name": "CURIE_MODEL_BASE_URL", "value": url}),
+        None => json!({
+            "name": "CURIE_MODEL_BASE_URL",
+            "valueFrom": {"secretKeyRef": {"name": "model", "key": "url"}}
+        }),
+    };
+    cursor[path[path.len() - 1]] = json!([entry]);
+    fixture.record_values(values);
+}
+
+#[test]
+fn a_release_model_base_url_on_another_host_makes_no_credit_request() {
+    let url = "https://models.example.test/v1";
+    for path in [
+        ["worker", "extraEnv"].as_slice(),
+        ["agentSandbox", "runner", "extraEnv"].as_slice(),
+    ] {
+        let fixture = Fixture::new();
+        record_release_model_base(&fixture, path, Some(url));
+        let output = fixture
+            .command(true, &["--color", "never"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let shown = shown_output(&output);
+        assert!(output.status.success(), "{path:?}: {shown}");
+        assert!(
+            shown.contains("OpenRouter credit not checked: the model endpoint is not OpenRouter"),
+            "{path:?}: {shown}"
+        );
+        assert_credit_not_sent(&fixture, &shown, url);
+    }
+}
+
+#[test]
+fn an_unreadable_release_model_base_url_makes_no_credit_request() {
+    let fixture = Fixture::new();
+    record_release_model_base(&fixture, &["worker", "extraEnv"], None);
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = shown_output(&output);
+    assert!(output.status.success(), "{shown}");
+    assert!(
+        shown.contains(
+            "OpenRouter credit not checked: the model endpoint is set but its host could not be read"
+        ),
+        "{shown}"
+    );
+    assert!(fixture.openrouter.recorded().is_empty(), "{shown}");
+}
+
+/// An Anthropic OAuth token stays off the credit probe even when the model
+/// base URL names OpenRouter. The runner refuses to forward that credential
+/// to a third-party endpoint.
+#[test]
+fn an_anthropic_oauth_credential_with_an_openrouter_base_url_makes_no_credit_request() {
+    let key = "sk-ant-oat01-PLACEHOLDER";
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .env("CURIE_CREDENTIALS", key)
+        .env("CURIE_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = shown_output(&output);
+    assert!(output.status.success(), "{shown}");
+    assert!(
+        shown.contains("OpenRouter credit not checked: the credential is for Anthropic"),
+        "{shown}"
+    );
+    assert_credit_not_sent(&fixture, &shown, key);
+}
+
 #[test]
 fn factory_quickstart_direct_anthropic_credentials_select_native_sonnet_and_skip_credit() {
     // The runner's sdk_auth.py accepts both synthetic Anthropic shapes.
@@ -3078,5 +3269,188 @@ fn the_ready_path_puts_the_factory_output_allowance_and_reports_it() {
     assert_eq!(
         puts[0],
         json!({"max_output_tokens_per_run": 250000, "max_usd_per_day": 5.0})
+    );
+}
+
+/// Gzip bytes inside a raw body or a multipart part. The real upload is
+/// multipart, so the declaration is read from the first gzip member.
+fn archive_declares_tracker_result(body: &[u8]) -> bool {
+    let Some(start) = body
+        .windows(3)
+        .position(|window| window == [0x1f, 0x8b, 0x08])
+    else {
+        return false;
+    };
+    let decoder = flate2::read::GzDecoder::new(&body[start..]);
+    let mut archive = tar::Archive::new(decoder);
+    let Ok(entries) = archive.entries() else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(mut entry) = entry else {
+            continue;
+        };
+        let Ok(path) = entry.path() else {
+            continue;
+        };
+        if !path.ends_with("workflow/result.json") {
+            continue;
+        }
+        let mut text = String::new();
+        if entry.read_to_string(&mut text).is_ok()
+            && text.contains("\"contract\"")
+            && text.contains("tracker_result")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn gzip_tar(files: &[(&str, &str)]) -> Vec<u8> {
+    let mut stored = Vec::new();
+    {
+        let encoder = flate2::write::GzEncoder::new(&mut stored, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (name, text) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(text.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, text.as_bytes())
+                .unwrap();
+        }
+        archive.finish().unwrap();
+    }
+    stored
+}
+
+#[test]
+fn tracker_result_archive_bytes_are_the_refusal_input() {
+    let declaring = gzip_tar(&[(
+        "workflow/result.json",
+        r#"{"contract":"tracker_result","results":["ticket","findings"]}"#,
+    )]);
+    let plain = gzip_tar(&[(".claude-plugin/plugin.json", r#"{"name":"plain"}"#)]);
+    assert!(archive_declares_tracker_result(&declaring));
+    assert!(!archive_declares_tracker_result(&plain));
+    let mut wrapped = b"--boundary\r\n\r\n".to_vec();
+    wrapped.extend_from_slice(&declaring);
+    assert!(archive_declares_tracker_result(&wrapped));
+    assert!(!archive_declares_tracker_result(b"not an archive"));
+}
+
+fn tracker_result_bundle(dir: &std::path::Path) {
+    fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+    fs::write(
+        dir.join(".claude-plugin/plugin.json"),
+        json!({"name":"factory-triage","version":"1.0.0"}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("workflow")).unwrap();
+    fs::write(
+        dir.join("workflow/result.json"),
+        json!({
+            "schema_version": 1,
+            "contract": "tracker_result",
+            "results": ["ticket", "findings"],
+            "implementation_label": "ready"
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// Each tracker-result upload follows a publication-policy `auto` write that
+/// is newer than the previous upload.
+fn policy_before_each_tracker_upload(requests: &[Request]) -> bool {
+    let mut previous_upload = None;
+    let mut uploads = 0usize;
+    for (index, request) in requests.iter().enumerate() {
+        if request.method != "PUT" || !request.path.ends_with("/bundle") {
+            continue;
+        }
+        uploads += 1;
+        if !archive_declares_tracker_result(&request.body) {
+            return false;
+        }
+        let policy = requests[..index].iter().rposition(|earlier| {
+            earlier.method == "PATCH"
+                && earlier.path == "/agents/agent-fixture"
+                && serde_json::from_slice::<Value>(&earlier.body)
+                    .ok()
+                    .and_then(|body| body.get("publication_policy").cloned())
+                    == Some(json!("auto"))
+        });
+        let Some(policy) = policy else {
+            return false;
+        };
+        if previous_upload.is_some_and(|prior| policy < prior) {
+            return false;
+        }
+        previous_upload = Some(index);
+    }
+    uploads == 2
+}
+
+#[test]
+fn quickstart_sets_publication_policy_before_a_tracker_result_upload() {
+    let fixture = Fixture::enforcing_tracker_publication();
+    record_factory_intake(&fixture, None);
+    let bundle = fixture.dir.path().join("triage-bundle");
+    tracker_result_bundle(&bundle);
+    let args = [
+        "--color",
+        "never",
+        "--context",
+        "kind-curie-factory",
+        "--agent",
+        "triage",
+        "--label",
+        "curie-factory",
+        "--plugin-dir",
+        bundle.to_str().unwrap(),
+    ];
+    for pass in 1..=2 {
+        let output = fixture
+            .command(false, &args)
+            .env("QUICKSTART_APP_SECRET", "factory-app")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "pass {pass}: {shown}");
+        let policy = shown
+            .lines()
+            .position(|line| line == "Setting publication policy")
+            .unwrap_or_else(|| panic!("pass {pass}: no publication step: {shown}"));
+        let deploy = shown
+            .lines()
+            .position(|line| line == "Deploying triage")
+            .unwrap_or_else(|| panic!("pass {pass}: no deploy step: {shown}"));
+        assert!(policy < deploy, "pass {pass}: {shown}");
+    }
+    let requests = fixture.platform.recorded();
+    assert!(
+        policy_before_each_tracker_upload(&requests),
+        "publication policy auto must precede each tracker-result upload:\n{}",
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST" && request.path == "/agents")
+            .count(),
+        1,
+        "a rerun must keep the existing agent"
     );
 }

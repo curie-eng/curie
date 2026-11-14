@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from curie_internal.requester_coding_instructions import EvidenceState
 from curie_telemetry.redact import redact_text
 from sqlalchemy import and_, case, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -24,6 +25,14 @@ from sqlalchemy.sql.elements import ColumnElement
 from .. import transcripts
 from ..config import get_settings
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
+from ..factory_tracker_result_delivery import DeliveryOrigin, DeliveryState, seal_platform_findings
+from ..factory_tracker_result_runtime import (
+    CONTRACT_IMPLEMENTATION,
+    CONTRACT_TRACKER_RESULT,
+    CompletionContractName,
+    ContractRefused,
+    select_completion_contract,
+)
 from ..forges.errors import ForgeError
 from ..forges.registry import forges_registry
 from ..forges.trackers import comment_prefix, issue_link, reply_route
@@ -35,6 +44,9 @@ from ..models import (
     ExecutionRequest,
     FactoryBaseTransition,
     FactoryStatusComment,
+    FactoryTrackerResultDelivery,
+    FactoryTrackerResultGrant,
+    FactoryTrackerResultReceipt,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
@@ -49,6 +61,14 @@ from ..personal_execution import (
     mode_of,
     snapshot_columns,
 )
+from ..requester_instruction_admission import (
+    add_snapshot,
+    evidence,
+    metadata,
+    request_selection_columns,
+    selection_columns,
+)
+from ..schemas.workitems import CodingInstructionsMetadata
 
 if TYPE_CHECKING:
     # factory_base reaches this module through factory_notices at import time.
@@ -324,6 +344,8 @@ class WorkItemSnapshot:
     model_auth_mode: ModelAuthMode
     owner_principal_id: uuid.UUID | None
     enrollment_generation: int | None
+    requester_principal_id: uuid.UUID | None
+    coding_instructions: CodingInstructionsMetadata
 
 
 @dataclass(frozen=True)
@@ -344,6 +366,8 @@ class ExecutionRequestSnapshot:
     model_auth_mode: ModelAuthMode
     owner_principal_id: uuid.UUID | None
     enrollment_generation: int | None
+    coding_instructions_selection_id: uuid.UUID | None
+    coding_instructions_evidence: EvidenceState
 
 
 @dataclass(frozen=True)
@@ -381,6 +405,8 @@ def _work_item_snapshot(row: WorkItem) -> WorkItemSnapshot:
         model_auth_mode=mode_of(row.model_auth_mode),
         owner_principal_id=row.owner_principal_id,
         enrollment_generation=row.enrollment_generation,
+        requester_principal_id=row.requester_principal_id,
+        coding_instructions=metadata(row),
     )
 
 
@@ -401,6 +427,8 @@ def _request_snapshot(row: ExecutionRequest) -> ExecutionRequestSnapshot:
         model_auth_mode=mode_of(row.model_auth_mode),
         owner_principal_id=row.owner_principal_id,
         enrollment_generation=row.enrollment_generation,
+        coding_instructions_selection_id=row.coding_instructions_selection_id,
+        coding_instructions_evidence=evidence(row.coding_instructions_evidence),
     )
 
 
@@ -691,6 +719,7 @@ async def create_or_get_work_item(
     base: ResolvedBase | None = None,
     trigger_label: str | None,
     owner: OwnerTuple | None = None,
+    requester_principal_id: uuid.UUID | None = None,
 ) -> WorkItemResult:
     """Insert the WorkItem, or return the existing one for the same issue.
 
@@ -717,12 +746,20 @@ async def create_or_get_work_item(
             "enrollment_generation": None,
         }
     )
+    current = await session.scalar(select(WorkItem.id).where(*for_tracker_issue(issue)))
+    coding_values: dict[str, Any] = {}
+    selected = None
+    if current is None:
+        coding_values, selected = await selection_columns(
+            session, agent_id=agent_id, principal_id=requester_principal_id
+        )
     new_id = uuid.uuid4()
     statement = (
         insert(WorkItem)
         .values(
             id=new_id,
             **owner_values,
+            **coding_values,
             **work_item_identity_values(issue, repository),
             code_host_installation_id=code_host_installation_id,
             agent_id=agent_id,
@@ -747,6 +784,9 @@ async def create_or_get_work_item(
     try:
         async with session.begin_nested():
             inserted_id = await session.scalar(statement)
+            if inserted_id is not None:
+                await add_snapshot(session, work_item_id=inserted_id, selection=selected)
+                await session.flush()
     except IntegrityError:
         return await _conflict(session, "identity_mismatch")
 
@@ -782,13 +822,17 @@ async def _insert_waiting_request(
     expected_work_item_version: int,
     columns: Mapping[str, Any] | None = None,
     base_settle_until: datetime | None = None,
+    completion_contract: CompletionContractName = CONTRACT_IMPLEMENTATION,
+    result_policy_digest: str | None = None,
 ) -> bool:
     """Allocate the next sequence and insert a waiting request; the caller commits.
 
     False when the WorkItem moved past ``expected_work_item_version`` or was
     cancelled. An ``IntegrityError`` leaves the savepoint rolled back. The
     request snapshots ``work_item``'s owner tuple, so ``work_item`` is the
-    locked row and ``columns`` never names an owner fact (#5376).
+    locked row and ``columns`` never names an owner fact (#5376). The
+    completion contract and its policy digest are admission's selection
+    (ADR 0277, #5586).
     """
 
     assert_no_owner_columns(columns or {})
@@ -819,7 +863,10 @@ async def _insert_waiting_request(
                 wait_deadline=wait_deadline,
                 base_settle_until=base_settle_until,
                 version=1,
+                completion_contract=completion_contract,
+                result_policy_digest=result_policy_digest,
                 **snapshot_columns(work_item),
+                **request_selection_columns(work_item),
                 **(columns or {}),
             )
         )
@@ -843,6 +890,8 @@ async def create_execution_request(
     wait_deadline: datetime,
     expected_work_item_version: int,
     base_settle_until: datetime | None = None,
+    completion_contract: CompletionContractName = CONTRACT_IMPLEMENTATION,
+    result_policy_digest: str | None = None,
 ) -> WorkItemResult:
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
@@ -872,6 +921,8 @@ async def create_execution_request(
             wait_deadline=wait_deadline,
             base_settle_until=base_settle_until,
             expected_work_item_version=expected_work_item_version,
+            completion_contract=completion_contract,
+            result_policy_digest=result_policy_digest,
         )
     except IntegrityError:
         work_item = await reload_work_item(session, work_item_id)
@@ -964,6 +1015,7 @@ async def create_revision_request(
                     wait_deadline=None,
                     version=1,
                     **snapshot_columns(work_item),
+                    **request_selection_columns(work_item),
                     **snapshot,
                 )
             )
@@ -1219,7 +1271,74 @@ async def start_execution_where(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
+    await _bound_grant_to_deadline(session, request)
     return await outcome(session, work_item, request)
+
+
+async def _bound_grant_to_deadline(session: AsyncSession, request: ExecutionRequest) -> None:
+    """A started tracker result request's grant expires at its execution
+    deadline plus the delivery deadline (ADR 0277 decision 4). The
+    reservation minted it with a provisional expiry; the caller commits."""
+
+    if request.completion_contract != CONTRACT_TRACKER_RESULT or request.execution_deadline is None:
+        return
+    delivery = timedelta(seconds=get_settings().factory_tracker_result_delivery_deadline_seconds)
+    await session.execute(
+        update(FactoryTrackerResultGrant)
+        .where(FactoryTrackerResultGrant.execution_request_id == request.id)
+        .values(expires_at=request.execution_deadline + delivery)
+    )
+
+
+async def _expire_unused_grants(session: AsyncSession, work_item_id: uuid.UUID) -> None:
+    """Revoke the WorkItem's grants that delivered nothing: they expire now
+    (ADR 0277 decision 4). The caller commits."""
+
+    await session.execute(
+        update(FactoryTrackerResultGrant)
+        .where(
+            FactoryTrackerResultGrant.work_item_id == work_item_id,
+            FactoryTrackerResultGrant.expires_at > func.clock_timestamp(),
+            ~exists().where(FactoryTrackerResultDelivery.grant_id == FactoryTrackerResultGrant.id),
+        )
+        .values(expires_at=func.clock_timestamp())
+    )
+
+
+TrackerResultSettlement = Literal["delivered", "none", "undelivered"]
+
+
+async def _tracker_result_settlement(
+    session: AsyncSession, request_id: uuid.UUID
+) -> TrackerResultSettlement:
+    """Whether the request's own submitted result is delivered with a receipt
+    (``delivered``), was never submitted (``none``), or is owed, failed or not
+    the run's own (``undelivered``)."""
+
+    row = (
+        await session.execute(
+            select(
+                FactoryTrackerResultDelivery.state,
+                FactoryTrackerResultDelivery.origin,
+                FactoryTrackerResultReceipt.delivery_id,
+            )
+            .outerjoin(
+                FactoryTrackerResultReceipt,
+                FactoryTrackerResultReceipt.delivery_id == FactoryTrackerResultDelivery.id,
+            )
+            .where(FactoryTrackerResultDelivery.execution_request_id == request_id)
+            .limit(1)
+        )
+    ).one_or_none()
+    if row is None:
+        return "none"
+    if (
+        row.state == DeliveryState.DELIVERED.value
+        and row.origin == DeliveryOrigin.SUBMITTED.value
+        and row.delivery_id is not None
+    ):
+        return "delivered"
+    return "undelivered"
 
 
 async def start_execution(
@@ -1566,6 +1685,9 @@ async def link_publication_lineage(
                 session, "lineage_already_owned", work_item=work_item, request=request
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
+    from ..factory_notices import mark_status_comment_stale
+
+    await mark_status_comment_stale(session, work_item_id)
     work_item = await reload_work_item(session, work_item_id)
     return await outcome(session, work_item, request)
 
@@ -1603,7 +1725,21 @@ async def terminalize_execution(
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     if cause.strip() == "ci_fix_unpublished" and ci_fix_round is None:
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
+    tracker_result = request.completion_contract == CONTRACT_TRACKER_RESULT
+    if not tracker_result and cause.strip() == CONTRACT_TRACKER_RESULT:
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     now = await database_now(session)
+    # A tracker result request completes only with its own delivered result's
+    # receipt, never with a pull request (ADR 0277 decision 9). Without one it
+    # fails: nothing was submitted, or the submission is still owed or failed.
+    delivered = False
+    if tracker_result and status == "completed":
+        settlement = await _tracker_result_settlement(session, request.id)
+        if settlement == "delivered":
+            delivered, cause = True, "completed"
+        else:
+            status = "failed"
+            cause = "no_tracker_result" if settlement == "none" else "tracker_result_undelivered"
     # The CI gate's causes (#3097) end a request whose pull request already
     # opened, so they share the opened-PR deadline exception. Keep this literal
     # equal to ``factory_ci.CI_CAUSES`` (importing it here would be circular).
@@ -1614,8 +1750,12 @@ async def terminalize_execution(
         "merge_conflict",
         "pr_closed",
     }
-    opened = (status == "completed" or ci_cause) and await _opened_pull_request(
-        session, work_item, request
+    # A delivered tracker result is the terminus the way an opened pull
+    # request is, including after the deadline.
+    opened = delivered or (
+        not tracker_result
+        and (status == "completed" or ci_cause)
+        and await _opened_pull_request(session, work_item, request)
     )
     deadline_elapsed = request.execution_deadline is None or now >= request.execution_deadline
     # A pull request that already opened is the terminus even if reconciliation
@@ -1681,7 +1821,7 @@ async def terminalize_execution(
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
-    if status == "failed" and cause.strip() in _UNPUBLISHED_CAUSES:
+    if status == "failed" and cause.strip() in _UNPUBLISHED_CAUSES and not tracker_result:
         if await _publication_owns_terminus(session, work_item, request):
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
@@ -1741,6 +1881,12 @@ async def terminalize_execution(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
+    if tracker_result and status == "failed" and cause.strip() == "budget_exceeded":
+        # The session's dollar allowance ran out: the status stays failed
+        # budget_exceeded, and the platform owes its findings (decision 10).
+        await seal_platform_findings(
+            session, request=request, work_item=work_item, limit="budget", settings=get_settings()
+        )
     await settle_terminal(session, work_item, request, detail=detail)
     return await outcome(session, work_item, request)
 
@@ -2048,6 +2194,7 @@ async def request_cancellation(
         return await _conflict(session, "stale_version", work_item=work_item)
 
     await _cancel_queued_requests(session, work_item_id, now, cause)
+    await _expire_unused_grants(session, work_item_id)
 
     active = await lock_active_request(session, work_item_id)
     if active is not None and active.status == "waiting":
@@ -2129,6 +2276,10 @@ async def readmit(
     base_settle_until: datetime | None = None,
 ) -> WorkItemResult:
     """Start a new run on an existing WorkItem because the label was added again.
+
+    A request created now gets its completion contract from admission's
+    snapshot write; a relabel deferred behind a stopping run selects its
+    contract when `admit_pending_readmit` creates it (ADR 0277, #5586).
 
     A waiting request is superseded in the same transaction. A running request
     is asked to stop, and the relabel is stored on the WorkItem until that
@@ -2347,6 +2498,24 @@ async def admit_pending_readmit(
         # Never commit a request that cannot be dispatched.
         await session.rollback()
         return None
+    # The contract is selected now, from the binding's in-force version, as
+    # admission selects it (ADR 0277, #5586). A refusal is a label no binding
+    # serves: the stored relabel is dropped.
+    contract = await select_completion_contract(
+        session,
+        agent_id=work_item.agent_id,
+        tracker_kind=work_item.tracker_kind,
+        tracker_host=work_item.tracker_host,
+        registry=forges_registry(get_settings()),
+    )
+    if isinstance(contract, ContractRefused):
+        await session.execute(
+            update(WorkItem)
+            .where(WorkItem.id == work_item_id)
+            .values(**_NO_READMIT, version=WorkItem.version + 1, updated_at=func.clock_timestamp())
+        )
+        await session.commit()
+        return None
     if active is not None:
         active.status, active.terminal_cause = "cancelled", "issue_cancelled"
         active.terminal_at = await database_now(session)
@@ -2378,6 +2547,8 @@ async def admit_pending_readmit(
         wait_deadline=wait_deadline,
         expected_work_item_version=version,
         base_settle_until=snapshot["base_settle_until"],
+        completion_contract=contract.contract,
+        result_policy_digest=contract.result_policy_digest,
     )
     if isinstance(result, WorkItemOutcome):
         await session.execute(
@@ -2773,6 +2944,16 @@ async def record_runtime_termination_where(
         request = await reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
+    if terminal_status == "expired":
+        # The execution deadline ended the session: the status stays expired,
+        # and the platform owes its findings (ADR 0277 decision 10).
+        await seal_platform_findings(
+            session,
+            request=request,
+            work_item=work_item,
+            limit="execution_deadline",
+            settings=get_settings(),
+        )
     # Before settlement, so the successor keeps the transcript (ADR 0206).
     if await _admit_owner_lost_successor(session, work_item, request):
         work_item = await reload_work_item(session, work_item_id)
@@ -2842,12 +3023,14 @@ async def _admit_owner_lost_successor(
     in the same transaction. The successor re-runs the lost request's snapshot
     on the WorkItem's recorded base. A cancelled WorkItem, a pending relabel, a
     closed pull request lineage, a request waiting on its publication, or the
-    third loss in a row admits nothing.
+    third loss in a row admits nothing. Nor does a tracker result request: it
+    starts exactly one model session (ADR 0277 decision 8).
     """
 
     if (
         lost.status != "failed"
         or lost.terminal_cause != "owner_lost"
+        or lost.completion_contract == CONTRACT_TRACKER_RESULT
         or work_item.cancelled_at is not None
         or work_item.readmit_request_id is not None
         or await _publication_owns_terminus(session, work_item, lost)

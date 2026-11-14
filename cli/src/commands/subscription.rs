@@ -272,7 +272,7 @@ fn usage_with_fix(message: String, fix: String) -> anyhow::Error {
         .into()
 }
 
-fn read_session_cookie(path: &Path) -> Result<SessionCookie> {
+pub(super) fn read_session_cookie(path: &Path) -> Result<SessionCookie> {
     let content = read_private_file(path, "session file", SESSION_COOKIE_MAX_LEN)?;
     SessionCookie::parse(&content).map_err(|reason| refused("session file", path, reason))
 }

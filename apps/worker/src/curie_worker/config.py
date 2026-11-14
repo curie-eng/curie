@@ -284,6 +284,14 @@ class WorkerConfig(BaseSettings):
     # Local model demo path: the worker can point the runner at an
     # Anthropic-compatible local endpoint without changing the fake-model default.
     model_base_url: str = Field(default="", validation_alias="CURIE_MODEL_BASE_URL")
+    # Minimum remaining model credit in USD for a sufficient model_credit fact
+    # (issue 5581). The worker observer reads it. Zero still contacts the
+    # provider. A negative value is refused at startup.
+    factory_min_model_credit_usd: float = Field(
+        default=10,
+        ge=0,
+        validation_alias="CURIE_FACTORY_MIN_MODEL_CREDIT_USD",
+    )
     # The endpoint's wire protocol and the env var(s) carrying the credential
     # (#514), both declared rather than inferred. Operator scope like
     # model_base_url: they select which env var a credential is read from and
@@ -1498,6 +1506,14 @@ class WorkerConfig(BaseSettings):
     )
     factory_slack_interval_s: float = Field(
         default=2.0, gt=0, validation_alias="CURIE_FACTORY_SLACK_INTERVAL_S"
+    )
+    # Off (the default), the progress lane posts taken, refused, needs a person
+    # and PR open only. On, it also posts one line per phase report and a
+    # Run completed or Run cancelled line. Failed and expired runs still post
+    # needs a person either way. Turning it on later materializes what live
+    # threads owe, as a destination enabled mid-run does.
+    factory_slack_phase_lines: bool = Field(
+        default=False, validation_alias="CURIE_FACTORY_SLACK_PHASE_LINES"
     )
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.

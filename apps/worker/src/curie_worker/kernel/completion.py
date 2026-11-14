@@ -19,6 +19,7 @@ from curie_channel_gateway.reply_errors import (
     DeletedReplyTargetError,
     ProviderEgressRefusedError,
 )
+from curie_telemetry import agent_metric_label
 
 from .. import sweep
 from ..behaviorpacks import (
@@ -148,6 +149,25 @@ async def _complete(
                     )
                 else:
                     run.held = True
+            elif (
+                outcome == "delivered"
+                and run.is_tracker_result
+                and parsed is not None
+                and parsed.kind == "execute"
+                and turn is not None
+            ):
+                # ADR 0277 (#5586): a tracker_result execution needs no pull
+                # request. The worker reports the session ended; the API
+                # completes it only against a verified delivery receipt and
+                # otherwise records it failed. A turn the worker could not
+                # start did no work, so it fails as a runner escalation.
+                await self._finish_or_settle(
+                    run,
+                    outcome="failed" if turn.start_failed else "completed",
+                    cause="runner_escalated" if turn.start_failed else "tracker_result",
+                    detail=None,
+                    ci_fix_round=None,
+                )
             elif outcome == "delivered":
                 ci_fix = parsed is not None and parsed.is_ci_fix
                 # Only an unpublished fix turn names its round (#4330).
@@ -175,7 +195,7 @@ async def _complete(
                         cause=cause,
                         detail=(
                             None
-                            if ci_fix or turn is None
+                            if turn is None or (ci_fix and cause != "ci_fix_unpublished")
                             else failures._finish_detail(turn.assistant_text)
                         ),
                         ci_fix_round=ci_fix_round,
@@ -407,7 +427,7 @@ async def _complete(
         "outcome": telemetry_outcome,
     }
     log.record_metric("curie.turn.completed", attributes=attributes)
-    self._record_agent_turn(telemetry_outcome)
+    agent_label = self._record_agent_turn(telemetry_outcome)
     try:
         received = datetime.fromisoformat(qevent.received_at)
         if received.tzinfo is None:
@@ -418,7 +438,9 @@ async def _complete(
         )
     except ValueError:
         duration = 0.0
-    log.record_metric("curie.turn.duration", duration, attributes=attributes)
+    log.record_metric(
+        "curie.turn.duration", duration, attributes={**attributes, "agent": agent_label}
+    )
 
 
 async def _settle_and_publish(
@@ -524,22 +546,10 @@ async def _settle_targetless(
     self._record_agent_turn(telemetry_outcome)
 
 
-def _record_agent_turn(self: Kernel, telemetry_outcome: str) -> None:
-    """Count the terminal turn under the resolved agent, or ``unbound``.
+def _record_agent_turn(self: Kernel, telemetry_outcome: str) -> str:
+    """Count the terminal turn and return its shared agent metric label."""
 
-    The fleet counter stays unlabeled. This series is the one a per-agent
-    silence alarm can group on, and the label is capped in ``record_metric``.
-    """
-
-    raw = constants._TURN_AGENT.get()
-    # Only a missing agent is ``unbound``. A real agent whose name is a
-    # reserved label shares ``other`` so it cannot inflate the unresolved series.
-    if not raw:
-        label = "unbound"
-    elif raw in {"other", "unbound"}:
-        label = "other"
-    else:
-        label = raw
+    label = agent_metric_label(constants._TURN_AGENT.get())
     log.record_metric(
         "curie.agent.turn.completed",
         attributes={
@@ -549,6 +559,7 @@ def _record_agent_turn(self: Kernel, telemetry_outcome: str) -> None:
             "agent": label,
         },
     )
+    return label
 
 
 async def _deliver_completion(self: Kernel, record: CompletionRecord, *, generation: str) -> bool:

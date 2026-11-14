@@ -4,6 +4,11 @@ Date: 2026-09-10
 
 Status: Accepted
 
+**Partially amended by [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+Selected work may produce a tracker result; one human selection may authorize
+its explicitly bounded implementation handoff.
+
 Partially amended by
 [ADR 0162](0162-work-items-own-durable-execution-identity.md). The tracker
 remains the backlog and Curie still does not copy tracker content. The stream no

@@ -147,7 +147,9 @@ def _first_binding(registry: ForgeRegistry, tracker: str) -> BindingConfig | Non
     )
 
 
-async def _code_host(registry: ForgeRegistry, config: CodeHostConfig) -> ForgeCredentialHealth:
+async def code_host_health(
+    registry: ForgeRegistry, config: CodeHostConfig
+) -> ForgeCredentialHealth:
     if config.credential.type != STATIC_TOKEN:
         return _entry("code_host", config, "unknown", "not_probed")
     connection = registry.code_host(config.name)
@@ -191,7 +193,7 @@ async def _tracker(registry: ForgeRegistry, config: TrackerConfig) -> ForgeCrede
 async def credential_health(registry: ForgeRegistry) -> ForgeCredentialHealthReport:
     """Every configured entry's credential health, probed concurrently."""
 
-    probes = [_code_host(registry, entry) for entry in registry.config.code_hosts]
+    probes = [code_host_health(registry, entry) for entry in registry.config.code_hosts]
     probes += [_tracker(registry, entry) for entry in registry.config.trackers]
     entries = list(await asyncio.gather(*probes))
     return ForgeCredentialHealthReport(observed_at=_now(), entries=entries)

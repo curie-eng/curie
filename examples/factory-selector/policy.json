@@ -1,0 +1,6 @@
+{
+  "repository": "acme-corp/acme-bot",
+  "query": "is:issue is:open label:\"good first issue\" -label:curie-factory",
+  "label": "curie-factory",
+  "cap": 3
+}

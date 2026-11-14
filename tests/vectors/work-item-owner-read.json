@@ -10,6 +10,14 @@
       "reason": "no_pull_request",
       "state": "not_applicable"
     },
+    "ci_observation": null,
+    "coding_instructions": {
+      "absence_reason": "application_unavailable",
+      "format_version": null,
+      "revision": null,
+      "sha256": null,
+      "state": "absent"
+    },
     "correctness": {
       "asserted": false,
       "owner": "bundle"
@@ -35,9 +43,12 @@
       "project_id": "101"
     },
     "requester": "U0REQUEST2",
+    "requester_principal_id": "00000000-0000-4000-8000-000000000003",
     "requests": [
       {
         "capacity_deferrals": 0,
+        "coding_instructions_evidence": "none",
+        "coding_instructions_selection_id": "00000000-0000-4000-8000-000000000002",
         "created_at": "2026-01-01T00:00:00Z",
         "enrollment_generation": 1,
         "execution_deadline": "2026-01-01T00:00:00Z",
@@ -56,6 +67,8 @@
       },
       {
         "capacity_deferrals": 0,
+        "coding_instructions_evidence": "none",
+        "coding_instructions_selection_id": "00000000-0000-4000-8000-000000000002",
         "created_at": "2026-01-01T00:00:00Z",
         "enrollment_generation": 2,
         "execution_deadline": null,
@@ -96,6 +109,14 @@
       "reason": "no_pull_request",
       "state": "not_applicable"
     },
+    "ci_observation": null,
+    "coding_instructions": {
+      "absence_reason": "application_unavailable",
+      "format_version": null,
+      "revision": null,
+      "sha256": null,
+      "state": "absent"
+    },
     "correctness": {
       "asserted": false,
       "owner": "bundle"
@@ -121,9 +142,12 @@
       "project_id": "101"
     },
     "requester": "U0REQUEST1",
+    "requester_principal_id": null,
     "requests": [
       {
         "capacity_deferrals": 0,
+        "coding_instructions_evidence": "none",
+        "coding_instructions_selection_id": "00000000-0000-4000-8000-000000000005",
         "created_at": "2026-01-01T00:00:00Z",
         "enrollment_generation": null,
         "execution_deadline": null,
@@ -161,6 +185,14 @@
         "agent_id": "00000000-0000-4000-8000-000000000001",
         "cancelled_at": null,
         "ci": null,
+        "ci_observation": null,
+        "coding_instructions": {
+          "absence_reason": "application_unavailable",
+          "format_version": null,
+          "revision": null,
+          "sha256": null,
+          "state": "absent"
+        },
         "correctness": {
           "asserted": false,
           "owner": "bundle"
@@ -186,9 +218,12 @@
           "project_id": "101"
         },
         "requester": "U0REQUEST2",
+        "requester_principal_id": "00000000-0000-4000-8000-000000000003",
         "requests": [
           {
             "capacity_deferrals": 0,
+            "coding_instructions_evidence": "none",
+            "coding_instructions_selection_id": "00000000-0000-4000-8000-000000000002",
             "created_at": "2026-01-01T00:00:00Z",
             "enrollment_generation": 1,
             "execution_deadline": "2026-01-01T00:00:00Z",
@@ -207,6 +242,8 @@
           },
           {
             "capacity_deferrals": 0,
+            "coding_instructions_evidence": "none",
+            "coding_instructions_selection_id": "00000000-0000-4000-8000-000000000002",
             "created_at": "2026-01-01T00:00:00Z",
             "enrollment_generation": 2,
             "execution_deadline": null,
@@ -242,6 +279,14 @@
         "agent_id": "00000000-0000-4000-8000-000000000001",
         "cancelled_at": null,
         "ci": null,
+        "ci_observation": null,
+        "coding_instructions": {
+          "absence_reason": "application_unavailable",
+          "format_version": null,
+          "revision": null,
+          "sha256": null,
+          "state": "absent"
+        },
         "correctness": {
           "asserted": false,
           "owner": "bundle"
@@ -267,9 +312,12 @@
           "project_id": "101"
         },
         "requester": "U0REQUEST1",
+        "requester_principal_id": null,
         "requests": [
           {
             "capacity_deferrals": 0,
+            "coding_instructions_evidence": "none",
+            "coding_instructions_selection_id": "00000000-0000-4000-8000-000000000005",
             "created_at": "2026-01-01T00:00:00Z",
             "enrollment_generation": null,
             "execution_deadline": null,

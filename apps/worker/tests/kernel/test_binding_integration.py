@@ -85,6 +85,9 @@ class StubBinding:
     async def undeployed_binding(self, kind: str, adapter: str | None, address: str) -> Any | None:
         return self._undeployed.get((kind, address))
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return None
+
     def boot_env(
         self,
         resolved: ResolvedDeployment,

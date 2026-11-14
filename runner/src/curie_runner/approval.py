@@ -73,7 +73,7 @@ from .approval_wording import describe_approval, presentation_text
 from .caller_feedback import action_label
 from .memory_facts import MEMORY_TOOL_NAMES
 from .publication_precheck import PublicationPrecheck
-from .tool_names import PROGRESS_TOOL, STATE_TOOL_NAMES, TURN_PROGRESS_TOOL
+from .tool_names import PROGRESS_TOOL, STATE_TOOL_NAMES, TRACKER_RESULT_TOOL, TURN_PROGRESS_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +238,10 @@ TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
 # The GitHub factory's platform issue read (ADR 0187), mounted on the same
 # server only when the worker injected the issue read route and capability.
 ISSUE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__get_issue"
+# The tracker result submission (ADR 0277, #5586), mounted on the same server
+# only for an execution whose API contract is tracker_result. It writes, so it
+# is never in ``side_effects.PLATFORM_IDEMPOTENT_TOOLS``.
+TRACKER_RESULT_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TRACKER_RESULT_TOOL}"
 
 # The existing platform MCP servers ``curie`` and ``curie-state`` retain their
 # exemption under #2286 and ADR 0139. Only their exact published platform tool
@@ -267,6 +271,9 @@ ISSUE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__get_issue"
 # execution: it reports a phase and never acts, so it is never gated.
 # This also covers ``progress`` (ADR 0130), mounted only for eligible human
 # turns, and ``get_issue`` (ADR 0187), which reads only the execution's own issue.
+# ``submit_tracker_result`` (ADR 0277) is the run's one platform result: the
+# API, not toolPolicy, decides whether it is accepted, from the request bound
+# capability, and only the platform's own ``curie`` server publishes the name.
 _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
     {
         APPROVAL_TOOL_NAME,
@@ -274,6 +281,7 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
         PROGRESS_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
+        TRACKER_RESULT_TOOL_NAME,
     }
 )
 
@@ -286,6 +294,7 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
 MEMORY_TOOL_LIVE_NAMES: frozenset[str] = frozenset(
     f"mcp__{APPROVAL_SERVER_NAME}__{name}" for name in MEMORY_TOOL_NAMES
 )
+
 
 def _approval_error(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "is_error": True}
@@ -1039,9 +1048,7 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
     return classify_tool(gate.tool_policy, canonical)
 
 
-def policy_disallowed_tools(
-    gate: ApprovalGate, observed_tools: Iterable[str]
-) -> tuple[str, ...]:
+def policy_disallowed_tools(gate: ApprovalGate, observed_tools: Iterable[str]) -> tuple[str, ...]:
     """Project observed policy refusals into exact SDK-visible tool names.
 
     Catalog visibility is not authorization. This projection therefore uses
@@ -1094,9 +1101,7 @@ async def _decide_gate(
     if tool_name == PLATFORM_PUBLISH_TOOL_NAME:
         refusal = await gate.check_publication(tool_use_id, tool_input)
         if refusal is not None:
-            return _GateDecision(
-                blocked=False, ungated=False, refusal=refusal, continue_turn=True
-            )
+            return _GateDecision(blocked=False, ungated=False, refusal=refusal, continue_turn=True)
     outcome = _tool_policy_outcome(gate, tool_name)
     if outcome is ToolPolicyDecision.DENY:
         if tool_use_id is not None:
@@ -1266,9 +1271,7 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
     if isinstance(raw, dict) and raw.get("toolPolicy") is not None:
         try:
             manifest_for_policy = PluginManifest.model_validate(raw)
-            tool_policy = load_tool_policy(
-                manifest_for_policy, enforces=TOOL_POLICY_ENFORCEMENT
-            )
+            tool_policy = load_tool_policy(manifest_for_policy, enforces=TOOL_POLICY_ENFORCEMENT)
         except (ValueError, TypeError, ToolPolicyUnenforceable, ToolPolicyInvalid) as exc:
             raise ApprovalPolicyError(
                 f"the bundle at {root} declares a toolPolicy this build cannot apply"

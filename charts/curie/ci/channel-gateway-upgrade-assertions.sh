@@ -93,5 +93,33 @@ for malformed in (None, "resources: [invalid"):
     assert result.returncode != 0, "missing or malformed gateway defaults were accepted"
     assert "restore the chart defaults file" in result.stderr
 
+
+def gateway_env(*sets):
+    args = ["helm", "template", "acme", sys.argv[2], "-f", sys.argv[3]]
+    for value in sets:
+        args += ["--set", value]
+    rendered = subprocess.run(args, capture_output=True, text=True, check=True).stdout
+    gateway = next(item for item in yaml.safe_load_all(rendered)
+                   if item and item["kind"] == "Deployment"
+                   and item["metadata"]["name"] == "acme-curie-channel-gateway")
+    return {entry["name"]: entry for entry in gateway["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+
+# @spec GATEWAY-USER-EMAIL-6: the identity caller exists only when an operator Secret is named.
+off = gateway_env()
+assert "CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN" not in off
+assert "CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S" not in off
+on = gateway_env("channelGateway.identityLookup.existingSecret=idp-gateway",
+                 "channelGateway.identityLookup.tokenKey=caller")
+assert on["CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN"]["valueFrom"] == {
+    "secretKeyRef": {"name": "idp-gateway", "key": "caller"}}
+assert on["CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S"]["value"] == "5"
+for bad in ("channelGateway.identityLookup.timeoutSeconds=0",
+            "channelGateway.identityLookup.tokenKey="):
+    result = subprocess.run(["helm", "template", "acme", sys.argv[2], "-f", sys.argv[3],
+                             "--set", "channelGateway.identityLookup.existingSecret=idp-gateway",
+                             "--set", bad], capture_output=True, text=True)
+    assert result.returncode != 0, bad + " was accepted"
+
 print("PASS: unchanged pre-gateway Slack values render on install and upgrade; TLS, token custody and retained defaults are wired")
 PYTHON

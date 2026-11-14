@@ -1671,6 +1671,19 @@ refused (`github_forbidden_list_check_runs`, `github_forbidden_get_combined_stat
 reason names the operation and does not claim which App permission is missing:
 a 403 alone cannot say that (#5222).
 
+A latest request that ended `ci_timeout` or `ci_unverified` with an open recorded
+pull request keeps a separate, read-only CI observation for 24 hours from its
+creation. It polls every 20 seconds and survives API restarts without extending
+the window or the execution deadline. The work item exposes `ci_observation`;
+a later verified green on its authorized recorded head reports item-level
+observed completion while the original request stays failed. Observation
+creates no execution request, model turn, publication or workflow rerun and
+uses no repair allowance. The status comment retains the failure and adds the
+watch deadline. Observed completion adds the head and observation time and moves
+the state label from `curie-factory:needs-human` to `curie-factory:pr-open`.
+Expiry says the checks were not verified within 24 hours and keeps the human
+handoff label. Other terminal causes do not start this observation.
+
 Per-repository factory settings live under `factory.bindings[].repos[]`. A
 binding joins one tracker (`tracker`) to its repositories, and each `repos`
 entry names a `codeHost`, a `projectId`, a `path` (`owner/name`) and an `alias`.
@@ -1797,6 +1810,18 @@ and the restoration exception in
 When a publication request is refused, the issue's `Could not complete:`
 notice (cause `approval_create_failed`) carries the refusal code and message
 on its `Details:` line.
+
+### Model credit facts
+
+The worker reads model credit with its own model credential and records one model_credit fact per factory agent. A factory agent is an agent with a GitHub channel binding. The worker ticks when it starts and then every 300 seconds. One replica holds a Postgres advisory lock for the tick, so only one replica reads the provider at a time. Each row expires 900 seconds after it was observed. A later tick refreshes the row even when the comparison is unchanged.
+
+The minimum is factory.admission.minModelCreditUsd, rendered into the worker as CURIE_FACTORY_MIN_MODEL_CREDIT_USD. The default is 10 USD and the chart rejects a negative value. Zero still reads the provider. Any key the provider accepts is sufficient at that minimum.
+
+The worker treats the provider as OpenRouter when the model base URL host is openrouter.ai. It does the same when no base URL is set and the credential is one the runner would send to OpenRouter, because that is the host the runner selects from the env the worker builds for a claim. Any other explicit host is recorded as unknown with reason provider_unsupported, and the worker makes no request. OpenRouter is read with GET /key and GET /credits only. The worker never sends a model request for this fact, and it never stores, logs, or returns an amount or the key.
+
+Both halves at or above the minimum record sufficient. A null key limit counts as satisfied on the key half. Either readable half below the minimum records insufficient. A 401 from /key records unknown with reason credential_rejected. A half that cannot be read (a timeout, a 429, a 5xx response, or a 401 or 403 from /credits), when no readable half is below the minimum, records unknown with reason unreadable. The facts answer reports unknown with observation_expired when the row is older than 900 seconds, and unknown with observation_missing when no row exists.
+
+This observation does not admit or refuse a factory run. Admission remains the separate hold described by issue 4451.
 
 ### The default factory agent
 
@@ -2456,6 +2481,10 @@ is unreachable. The skill tier has no work items and exits 4.
 
 ### Personal Claude enrollment
 
+Developers follow the [personal subscription guide](guides/personal-subscription.md)
+to enroll and start a run. This section is the operator configuration that
+guide links to.
+
 A personal WorkItem runs on its owner's own Claude subscription. The owner
 enrolls once, and Curie keeps the resulting credential in custody for that
 owner alone.
@@ -2788,9 +2817,11 @@ For the `local`-target equivalent (`curie local comms --slack`), see
 
 An agent opts in with `PATCH /agents/{agent_id}` and `{"factory_slack_channel": "C0EXAMPLE1"}` (`null` clears), described in the [Software Factory guide](software-factory.md#follow-a-runs-progress-in-slack). The channel must have exactly one Slack binding on that agent, whose app identity posts; otherwise the API answers 409 `factory_slack_channel_unbound`. Only runs live at or after the moment the channel was set are posted. Changing the channel keeps each existing WorkItem in its original thread while that channel keeps its binding; clearing it stops all posting.
 
-The worker's progress lane derives what is owed from existing run records on each pass and keeps it in a durable outbox (`factory_slack_threads` binds each WorkItem to one Slack root for its whole life, `factory_slack_posts` holds the owed posts). Two settings govern it: `CURIE_FACTORY_SLACK_PROGRESS_ENABLED` (default true) and `CURIE_FACTORY_SLACK_INTERVAL_S` (default 2 seconds). With the switch off a worker posts nothing; a worker with it on later still finds and posts what is owed.
+The worker's progress lane derives what is owed from existing run records on each pass and keeps it in a durable outbox (`factory_slack_threads` binds each WorkItem to one Slack root for its whole life, `factory_slack_posts` holds the owed posts). Each thread records its origin. A `configured` thread is one this lane roots in `factory_slack_channel`, as above. A `kickoff` thread is the message that started the run from Slack ([Factory Slack kickoff](#factory-slack-kickoff)): no root post is owed, and it needs no `factory_slack_channel`, so setting, changing or clearing the channel neither stops nor moves it. Either origin is delivered only while its channel holds exactly one Slack binding of the agent and that binding names the thread's identity. Three settings govern it: `CURIE_FACTORY_SLACK_PROGRESS_ENABLED` (default true), `CURIE_FACTORY_SLACK_INTERVAL_S` (default 2 seconds) and `CURIE_FACTORY_SLACK_PHASE_LINES` (default false). With the progress switch off a worker posts nothing; a worker with it on later still finds and posts what is owed.
 
-Delivery is at least once and ordered per WorkItem: the root first, then each post only after every earlier one. A rejected send, including one for an identity whose token this worker lacks, stays owed and retries with backoff; only an invalid target fails permanently. A worker that stops mid-send posts that message again after a restart, and a worker restarted after a long outage posts everything owed since. A phase report that commits late is still posted when a later pass finds it, so it can land out of order.
+By default the lane posts a taken root, a needs a person reply when a run ends failed or expired, and a PR open reply. A refused trigger label posts once in the channel, outside any thread, from its intake notice (`factory_slack_refusal_posts`). Phase lines, and a `Run completed` or `Run cancelled` line, are posted only when `CURIE_FACTORY_SLACK_PHASE_LINES` is on. Turning that setting on later materializes those lines for threads that are still live, the same way a destination enabled mid-run posts what is already owed. A failed or expired run still posts needs a person when the setting is off.
+
+Delivery is at least once and ordered per WorkItem: the root first, then each post only after every earlier post that the current settings still deliver. Phase rows left unposted while phase lines are off do not hold back a later PR open or needs a person post. A rejected send, including one for an identity whose token this worker lacks, stays owed and retries with backoff; only an invalid target fails permanently. A worker that stops mid-send posts that message again after a restart, and a worker restarted after a long outage posts everything owed since. A phase report that commits late is still posted when a later pass finds it, so it can land out of order.
 
 ### Factory Slack steering
 
@@ -2801,11 +2832,29 @@ A person steers a run by explicitly mentioning the app in that run's Slack threa
 
 A personal WorkItem (one bound to an owner's [personal Claude enrollment](#personal-claude-enrollment)) is steered only by its owner. The mention must resolve to the WorkItem's owner, whose enrollment is active at the generation the WorkItem is bound to; write access to the repository is not enough. Anyone else is refused `admission_refused` with `owner_mismatch`, an owner whose enrollment moved past the WorkItem's generation with `enrollment_generation_mismatch` until the WorkItem is revalidated, a disconnected enrollment with `enrollment_inactive`, and a WorkItem of another tenant with `owner_tenant_mismatch`. An admitted revision runs as the WorkItem's owner at its bound generation. On an installation with `FACTORY_MODEL_AUTH_MODE=personal`, a service WorkItem refuses steering with `personal_owner_required`, as tracker mentions do.
 
-The dispatcher stores a short-lived receipt for each threaded human app mention it receives over Socket Mode, before its dedupe claim, so the worker can verify the sender and the exact message. `CURIE_MENTION_RECEIPT_TTL_SECONDS` (default 604800) sets how long it is kept; a mention whose receipt has expired is refused in a mapped root. Turns selected through the HTTP receiver stay outside native steering and are refused in a mapped root.
+The dispatcher stores a short-lived receipt for each threaded human app mention it receives over Socket Mode, and for each top-level human mention whose text links an issue, before its dedupe claim, so the worker can verify the sender and the exact message. On a test installation it also stores one for a declared test driver's marked action in that driver's channel, at root or in a thread; that receipt is version 2 and names the declared bot user and bot id, never the event's user. Steering reads only a person's thread receipt and refuses any other; root receipts and version 2 receipts serve kickoff. `CURIE_MENTION_RECEIPT_TTL_SECONDS` (default 604800) sets how long it is kept; a mention whose receipt has expired is refused in a mapped root. Turns selected through the HTTP receiver stay outside native steering and are refused in a mapped root.
 
 Every worker intercepts a mention in a mapped run root before any sandbox starts. A worker without its internal worker token refuses it with `steering_unconfigured`; a delivery with too little budget left is refused with `steering_budget_expired`. When the worker cannot read a decision, the delivery stays pending under its usual lease and delivery cap, and a request whose answer was lost is replied to as unconfirmed rather than with an invitation to send it again. Each reply names its outcome code.
 
 Live Slack Socket Mode delivery and the runner's checkout of the revised branch are not covered by the automated verification of this feature.
+
+### Factory Slack kickoff
+
+A person starts a personal factory run from Slack by mentioning the app with a link to one GitHub issue, either at a channel's root or in a thread no factory run owns: `@curie https://github.com/acme-corp/acme-fixture/issues/7`. Slack's `<URL>` and `<URL|label>` forms both count, and a label that names another issue reads as a second link. The channel must be a public or private channel where the agent has its Slack binding and a `github` surface that serves the issue's repository; a direct message stays ordinary chat.
+
+The sender must resolve through an operator-managed Slack identity link to an active principal in the binding's tenant, and that principal's [personal Claude enrollment](#personal-claude-enrollment) must be active. Trusted admission then records one personal WorkItem owned by the sender at the enrollment's current generation, with the issue link as its objective and no trigger label, under a request id derived from the Slack delivery, so a redelivered mention finds the run it already admitted. The mention's message becomes the run's thread: the admitted reply posts there, and the progress lane posts PR open and needs a person replies there (see [Factory Slack progress](#factory-slack-progress)). Phase lines and a `Run completed` or `Run cancelled` line post there only when `CURIE_FACTORY_SLACK_PHASE_LINES` is on. The progress lane posts no taken root, because the mention already rooted the thread. This holds whether or not the agent has a `factory_slack_channel`.
+
+Exactly one link to an issue on the factory's GitHub code host is accepted. Every refusal is final for its delivery and is replied in the mention's thread, and each reply ends with `Outcome: <code>`:
+
+1. The link: `link_missing` (no issue link), `link_multiple` (more than one), `link_malformed` (an issue-shaped link that is not exactly `/{owner}/{repo}/issues/{number}`), `link_host_unsupported` (another host) and `link_pull_request` (a pull request).
+2. The sender: `sender_unverified` when the Slack account does not resolve to an active principal, and `enrollment_inactive` when the principal has no active enrollment, including one disconnected or replaced while the mention was decided.
+3. The issue: `issue_inaccessible`, `issue_closed`, `publication_exists` when the code host already holds a factory publication for it, and `base_refused` when no base branch can be chosen.
+4. The binding and the thread: `binding_missing`, `binding_ambiguous`, `thread_conflict` (the issue or the thread already belongs to another run) and `authority_changed` (the sender or binding changed while the mention was decided).
+5. The evidence: `receipt_mismatch`, `test_driver_refused`, `admission_refused` with its reason, and the worker's own `kickoff_evidence_missing` (no matching mention receipt, as for a turn that arrived through the HTTP receiver) and `kickoff_budget_expired`.
+
+An installation that does not run factory work keeps ordinary chat. When the factory is off, no GitHub tracker or code host is configured, the agent holds no `github` surface, or none of its surfaces serves the linked repository, the API answers `not_factory` and the worker runs the mention as an ordinary turn. A worker without its internal worker token does the same without asking. When the code host cannot answer, the API returns 503 and the worker keeps the delivery pending.
+
+A bot never starts a run on a production installation. On a test installation (`testInstallation.enabled`, [ADR 0202](adr/0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md)), a declared test driver's marked action in its own channel, `<@APP_USER> [test action] <issue URL>`, is a kickoff from the driver's bot user, which needs its own identity link and enrollment like a person. Any other bot's mention writes no receipt and is not a kickoff, and the API refuses a version 2 receipt naming a driver its own test installation does not declare with `test_driver_refused`. The live acceptance proof for kickoff is `tools/factory-e2e/personal_slack_kickoff.py`; see its section in `tools/factory-e2e/README.md`.
 
 ### Connecting email
 
@@ -4116,6 +4165,54 @@ If the fence cannot be taken inside `CURIE_MIGRATION_FENCE_LOCK_TIMEOUT_MS`
 database is exactly as it was. Stop that writer, or raise the bound, and
 re-run.
 
+## Factory tool observations
+
+The Kubernetes worker observes the runner selected for each GitHub factory
+agent and repository. Selection uses the same repository, agent and platform
+pool routing as a factory claim. The loop starts with the worker and ticks
+every 300 seconds under a Postgres advisory lock. One subject's failure does
+not stop the remaining subjects or the worker.
+
+Tool facts require an immutable digest declared by the deployment: a repository
+runner entry, an agent runner image digest, or the worker's platform runner
+digest. A deployment whose runner is a mutable tag with no declared digest gets
+`unknown` with reason `unreadable` for tools. A probe whose cluster-reported
+runner digest differs from its declaration also produces `unknown` with reason
+`unreadable`. Missing repository pools and stale runner bases produce `unknown`
+with reason `runner_unavailable`.
+
+The probe uses a separate short-lived claim with no workspace, bundle fetch,
+model credential or connector secret. It looks up the fixed catalog in PATH
+as the sandbox user with the image's default environment, without executing
+catalog programs. It releases its claim and confirms removal within its
+120-second budget. Capacity refusal defers the subject until another tick.
+
+The same probe records `uname -s` and `uname -m` for its process platform.
+Linux on `x86_64` or `aarch64` becomes `linux/amd64` or `linux/arm64` in the
+observation digest. Missing or unsupported platform answers produce `unknown`
+with reason `unreadable`. The observer needs no cluster-scoped permission.
+
+Catalog version 1 contains `bash`, `sh`, `git`, `curl`, `wget`, `jq`, `make`,
+`gcc`, `cc`, `python3`, `pip`, `uv`, `pytest`, `ruff`, `node`, `npm`, `npx`,
+`pnpm`, `yarn`, `tsc`, `cargo`, `rustc`, `rustfmt`, `go`, `java`, `mvn`,
+`gradle`, `ruby`, `bundle`, `php`, `composer`, `dotnet`, `docker`, `kubectl`,
+`helm`, `terraform`, `psql`, `sqlite3`, `redis-cli`, `valkey-cli`, `gh` and
+`shellcheck`. Versions and subcommands are outside this catalog.
+
+Observations expire 900 seconds after their original observation time. Reading
+facts or ticking an unchanged subject never extends a positive observation;
+renewal requires another successful probe. Unchanged subjects reprobe when
+300 seconds or less remain, keeping the old rows readable until replacement.
+A changed selection, configuration or catalog deletes old rows before
+replacement. The API reads these cached rows without starting a run or
+accepting uploaded observations. A name outside
+the current catalog answers `unknown` with reason `outside_catalog`; missing or
+expired observations remain `unknown`.
+
+The separate `docker` service fact is `configured` only when the selected
+repository runner enables per-claim daemon provisioning. It never claims the
+daemon has been observed healthy. Other services remain `unknown`.
+
 ## Which claim env reaches which sandbox container
 
 Almost nobody writes a `SandboxClaim` by hand -- the worker creates them. But
@@ -4183,6 +4280,31 @@ bundle. Two things now name the real cause:
 - the runner refuses to boot with `CURIE_BUNDLE_REF` set over an empty plugin
   dir, and says so in those terms instead of blaming the bundle.
 
+## Langfuse v4 read APIs
+
+For a Langfuse v4 backend, set `LANGFUSE_API_VERSION=v4` on the API process.
+The default is `v3`, which keeps the legacy reads used by the bundled v3 server.
+With Helm, set this through `api.extraEnv`; for a local Compose override, add it
+under the API service's `environment`.
+
+The setting switches trace and observation reads to Observations API v2 and
+aggregate reads to Metrics API v2. It does not migrate trace ingestion. The
+worker evaluation recorder still uses legacy ingestion and needs a separate
+migration before running it against a v4 backend in `events_only` mode.
+
+In v4, run counts and latency aggregates use logical root observations rather
+than trace rows. If a trace contains several application roots, each root
+contributes to these aggregates. Do not compare the v3 and v4 aggregate counts
+as if their units were identical.
+
+The Runs list scans up to 5,000 matching observations to find the most
+recently active trace IDs. Each listed trace and each exact read use the
+earliest logical root for the summary, or the earliest exported observation
+if the project has no logical root. The summary timestamp is that observation's
+start time. The eval matrix groups matching tagged observations by trace ID and
+uses the same root preference within its scan. A read that requires complete
+results returns an upstream error when it exceeds the pagination bound.
+
 ## Known gotchas
 
 Notes from the first installs of the chart on fresh clusters, kept for the
@@ -4226,3 +4348,13 @@ unreadable controller data blocks reuse.
   lands. This is functionally irrelevant for runners (the first model call
   comes later) but worth knowing when reading probe output from the first
   seconds of a pod's life.
+
+
+## Refused factory trigger labels
+
+`curie.factory.intake.notice.oldest_owed_age_seconds` is the age of the oldest
+refusal notice still awaiting its App-owned issue comment, zero when none is
+owed. The API records refusals in `factory_intake_notices` independently of
+work items and retries delivery with capped backoff beside status-comment
+synchronization. A growing age means issue-visible answers are delayed;
+check GitHub availability and the factory App's comment permissions.

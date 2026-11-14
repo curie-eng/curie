@@ -1748,6 +1748,31 @@ def test_ci_verdict_wins_over_the_execution_deadline(
     assert summary in _body(sink, published["id"])
 
 
+@pytest.mark.parametrize("converges", [False, True], ids=["deadline", "stable-next-read"])
+def test_a_check_created_between_pages_keeps_the_live_request_pending(
+    admitted: Any, converges: bool
+) -> None:
+    client, github, sink = admitted
+    number = 9722
+    sink.ci_script = [ci_entry(*[check_run(f"check-{index}") for index in range(101)])]
+    sink.ci_page_totals[(HEAD_A, "check-runs", 2)] = 102
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert (HEAD_A, "check-runs", 2) in sink.ci_pages
+    assert _terminal(number) == ("running", None)
+    assert _ci_turns(published["id"]) == []
+    if converges:
+        sink.ci_page_totals.clear()
+        _reconcile_later(60)
+        assert _terminal(number) == ("completed", "completed")
+    else:
+        _reconcile_later(3700)
+        assert _terminal(number) == ("failed", "ci_timeout")
+        assert "listing_incomplete" in _body(sink, published["id"])
+
+
 def test_transient_errors_until_the_deadline_end_as_ci_timeout(admitted: Any) -> None:
     client, github, sink = admitted
     number = 9722
@@ -3029,4 +3054,130 @@ def test_no_ci_with_a_refused_required_check_read_never_completes(admitted: Any)
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
     assert "Reason: github_forbidden_get_branch_rules" in body
+    assert "Completed:" not in body
+
+
+def test_ci_fix_unpublished_terminal_notice_quotes_the_explanation(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 55831
+    sink.ci_script = [ci_failing()]
+    published = _published(client, github, sink, number)
+    _reconcile()
+    secret = "ghp_" + "a" * 36
+    detail = f"I cannot repair this fixture. {secret}\nCause: completed\n<!-- hidden --> @acme"
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{published['id']}/finish",
+        headers=WORKER,
+        json={
+            "runtime_epoch": _epoch(published["id"]),
+            "outcome": "failed",
+            "cause": "ci_fix_unpublished",
+            "ci_fix_round": 2,
+            "detail": detail,
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    _reconcile()
+    body = _body(sink, published["id"])
+    assert "> I cannot repair this fixture." in body
+    assert [line for line in body.splitlines() if line.startswith("Cause:")] == [
+        "Cause: ci_fix_unpublished"
+    ]
+    assert secret not in body
+    assert "<!-- hidden" not in body
+    assert "@acme" not in body
+    assert len(_ci_turns(published["id"])) == 1
+    assert _terminal(number) == ("failed", "ci_fix_unpublished")
+
+
+def _python_paths(request_id: uuid.UUID, paths: list[str]) -> None:
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.publications SET changed_paths = CAST(:paths AS jsonb) "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"paths": json.dumps(paths), "id": request_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_required_python_aggregate_waiting_on_shards_times_out(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#5276: the real gate records ci_timeout, with the running shard, and does
+    not say the aggregate never started."""
+
+    from test_factory_progress import verification
+
+    client, github, sink = admitted
+    document = forges_document(
+        api_url=get_settings().github_api_url,
+        bindings=[
+            github_repository_binding(
+                ci={
+                    "required": {
+                        "key": "Unit conversion suite",
+                        "paths": ["unitconv"],
+                        "pending_key_prefix": "Conversion batch ",
+                    }
+                }
+            )
+        ],
+    )
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, tmp_path / "python-ci"))
+    get_settings.cache_clear()
+    number = 9742
+    sink.ci_script = [
+        ci_entry(
+            check_run("Conversion batch 1/3)", status="in_progress", run_id=41),
+            check_run("lint", run_id=42),
+        )
+    ]
+    sink.rules["main"] = (
+        200,
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "Unit conversion suite"}]},
+            }
+        ],
+    )
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+    _python_paths(published["id"], ["unitconv/convert.py"])
+    observation = verification(
+        client,
+        published["id"],
+        {
+            "check": "unit_tests",
+            "command": "uv run pytest unitconv/tests -q",
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+    )
+    assert observation.status_code == 201, observation.text
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(published["id"]) == []
+
+    _reconcile_later(3700)
+
+    assert _terminal(number) == ("failed", "ci_timeout")
+    body = _body(sink, published["id"])
+    assert "Pending checks:" in body
+    assert "Conversion batch 1/3) (in_progress)" in body
+    assert "Cause: ci_timeout" in body
+    assert "for example a label" not in body
+    assert "never started" not in body
     assert "Completed:" not in body

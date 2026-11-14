@@ -62,11 +62,18 @@ from curie_channel_gateway.slack.slack_sink import (
     UnconfiguredSlackIdentityError,
 )
 from curie_internal import sandbox_token
+from curie_internal.factory_cause import cause_text
 from curie_test_support.valkey import connect_or_skip
+from curie_worker import factory_slack_progress
+from curie_worker.config import WorkerConfig
 from curie_worker.factory_slack_progress import (
+    FactorySlackProgressError,
     FactorySlackProgressLoop,
     PostgresFactorySlackStore,
+    refusal_delivery_id,
+    render_post,
 )
+from curie_worker.factory_slack_triage import render_triage
 from curie_worker.reply_sink import build_reply_sink
 from curie_worker.run import _build_factory_slack_progress
 from fastapi.testclient import TestClient
@@ -334,7 +341,10 @@ async def _worker(
     def progress_factory(progress_engine: Any) -> FactorySlackProgressLoop:
         return FactorySlackProgressLoop(
             store=PostgresFactorySlackStore(
-                progress_engine, schema=schema, lease_owner=lease_owner
+                progress_engine,
+                schema=schema,
+                lease_owner=lease_owner,
+                phase_lines=True,
             ),
             replies=SlackReplyAdapter(
                 DEFAULT_TOKEN, identity_tokens={identity: factory_token}, base_url=slack_url
@@ -355,6 +365,8 @@ async def _drain_progress(worker: Worker, fresh: bool) -> None:
     """One progress pass, then deliver whatever is still due.
 
     ``fresh`` models a restarted process: a new engine, store and loop.
+    The stack worker keeps phase lines on, so these passes still post the
+    per-phase stream the older cases count.
     """
 
     engine = create_async_engine(get_settings().database_url) if fresh else None
@@ -366,6 +378,31 @@ async def _drain_progress(worker: Worker, fresh: bool) -> None:
                 break
     finally:
         if engine is not None:
+            worker.retired.append(asyncio.create_task(engine.dispose()))
+
+
+async def _drain_with(worker: Worker, phase_lines: bool, fresh: bool) -> None:
+    """One pass on a store whose phase-lines flag is the caller's."""
+
+    engine = create_async_engine(get_settings().database_url) if fresh else worker.engine
+    loop = FactorySlackProgressLoop(
+        store=PostgresFactorySlackStore(
+            engine,
+            schema=get_settings().db_schema,
+            lease_owner=f"key-events-{phase_lines}-{fresh}",
+            phase_lines=phase_lines,
+        ),
+        replies=worker.progress._replies,
+        interval_seconds=0.05,
+        batch_limit=50,
+    )
+    try:
+        await loop.run_pass()
+        for _ in range(100):
+            if not await loop.deliver_once():
+                break
+    finally:
+        if fresh:
             worker.retired.append(asyncio.create_task(engine.dispose()))
 
 
@@ -464,11 +501,13 @@ class Stack:
         *,
         requester: str | None = None,
         owner: dict[str, Any] | None = None,
+        objective: str | None = None,
     ) -> tuple[uuid.UUID, uuid.UUID]:
         """A service WorkItem, or with ``owner`` a personal one bound to that owner.
 
         ``owner`` is the trusted owner-bearing admission's context (#5376):
         ``tenant_id``, ``principal_id`` and ``enrollment_generation``.
+        ``objective`` is write-once on the request, so a ticket URL is set here.
         """
 
         personal = {} if owner is None else {"model_auth_mode": "personal", "owner": owner}
@@ -494,7 +533,7 @@ class Stack:
                     "path": REPO,
                 },
                 "code_host_installation_id": INSTALLATION_ID,
-                "objective": f"Resolve acme-corp/acme-bot#{number}",
+                "objective": objective or f"Resolve acme-corp/acme-bot#{number}",
                 "requester": requester or f"github:{SENDER_ID}:{SENDER}",
                 "request_id": str(uuid.uuid4()),
             },
@@ -653,6 +692,9 @@ class Stack:
 
     def drain(self, *, fresh: bool = False) -> None:
         self.client.portal.call(_drain_progress, self.worker, fresh)
+
+    def drain_as(self, *, phase_lines: bool, fresh: bool = False) -> None:
+        self.client.portal.call(_drain_with, self.worker, phase_lines, fresh)
 
     # Reads -----------------------------------------------------------------
 
@@ -1279,7 +1321,10 @@ async def _tokenless_progress_pass(worker: Worker, slack_url: str, lease_owner: 
 
     loop = FactorySlackProgressLoop(
         store=PostgresFactorySlackStore(
-            worker.engine, schema=get_settings().db_schema, lease_owner=lease_owner
+            worker.engine,
+            schema=get_settings().db_schema,
+            lease_owner=lease_owner,
+            phase_lines=True,
         ),
         replies=SlackReplyAdapter(DEFAULT_TOKEN, identity_tokens={}, base_url=slack_url),
         interval_seconds=0.05,
@@ -1418,9 +1463,7 @@ def test_a_ci_report_on_an_ended_request_does_not_hide_the_running_revisions_pha
 
 
 @contextlib.asynccontextmanager
-async def _factory_gateway(
-    slack_url: str, identity: str, factory_token: str
-) -> AsyncIterator[str]:
+async def _factory_gateway(slack_url: str, identity: str, factory_token: str) -> AsyncIterator[str]:
     from curie_channel_gateway.slack.read_server import GatewayConfig, application
     from curie_channel_gateway.slack.tokens import SlackProviderConfig
 
@@ -1497,7 +1540,8 @@ def test_the_switch_off_posts_nothing_and_a_worker_with_it_on_posts_what_is_owed
     A worker with ``CURIE_FACTORY_SLACK_PROGRESS_ENABLED`` off builds no loop,
     so a run that reports, publishes and ends meanwhile records nothing owed.
     A worker built with it on, through the production wiring and reply sink,
-    still finds that run and posts its root, phase, pull request and terminal.
+    still finds that run and posts its taken root and PR open reply. Phase
+    lines stay off, so the phase and ``Run completed`` are absent.
     """
 
     number = next(_ISSUES)
@@ -1538,10 +1582,12 @@ def test_the_switch_off_posts_nothing_and_a_worker_with_it_on_posts_what_is_owed
     (root,) = stack.slack.roots(stack.factory_token)
     assert f"#{number}" in root.haystack
     texts = _thread_texts(stack, root.response["ts"])
-    assert len(texts) == 3, texts
-    assert sum("Planned while the switch was off" in text_ for text_ in texts) == 1, texts
-    assert sum(f"https://github.com/{REPO}/pull/{pr}" in text_ for text_ in texts) == 1, texts
-    assert "Run completed" in texts[-1], texts
+    assert len(texts) == 1, texts
+    assert texts[0].startswith("PR open:"), texts
+    assert f"https://github.com/{REPO}/pull/{pr}" in texts[0]
+    assert "Planned while the switch was off" not in root.haystack
+    assert all("Run completed" not in call.haystack for call in stack.slack.calls)
+    assert "Taken:" in root.haystack
     assert stack.slack.delivered_posts(DEFAULT_TOKEN) == []
 
 
@@ -1768,7 +1814,7 @@ def test_the_production_worker_runtime_posts_owed_progress_only_with_the_switch_
 
     With ``CURIE_FACTORY_SLACK_PROGRESS_ENABLED`` false the runtime runs every
     other lane for many progress intervals and posts nothing. With it true the
-    same composition posts the owed root and its thread on its own.
+    same composition posts the owed taken root and no phase line.
 
     Falsifiable: a ``build`` that stopped assembling the progress loop, or a
     ``_run_runtime`` that stopped launching its lane, posts nothing here.
@@ -1783,7 +1829,7 @@ def test_the_production_worker_runtime_posts_owed_progress_only_with_the_switch_
 
     def rooted() -> bool:
         roots = stack.slack.roots(stack.factory_token)
-        return bool(roots) and bool(_thread_texts_of(stack, roots[0]))
+        return bool(roots) and roots[0].text.startswith("Taken:")
 
     monkeypatch.setenv("CURIE_FACTORY_SLACK_PROGRESS_ENABLED", "false")
     # Any chat call ends the wait early; with the switch off none may arrive in
@@ -1806,13 +1852,14 @@ def test_the_production_worker_runtime_posts_owed_progress_only_with_the_switch_
     assert stack.threads() == []
 
     monkeypatch.setenv("CURIE_FACTORY_SLACK_PROGRESS_ENABLED", "true")
-    # The first reply posted in a thread means the root was posted before it.
+    # The taken root is the only post a running request owes when phase lines
+    # are off, so the first chat call is the done signal.
     on = asyncio.run(
         _run_production_worker(
             stack,
             monkeypatch,
             tmp_path / "heartbeat-on",
-            signal=stack.slack.thread_replied,
+            signal=stack.slack.chat_called,
             within_s=10,
         )
     )
@@ -1825,7 +1872,8 @@ def test_the_production_worker_runtime_posts_owed_progress_only_with_the_switch_
     (thread,) = stack.threads(work_item_id)
     assert thread["root_ts"] == root.response["ts"]
     texts = _thread_texts(stack, root.response["ts"])
-    assert sum("Planned before the worker started" in text_ for text_ in texts) == 1, texts
+    assert texts == [], texts
+    assert "Planned before the worker started" not in root.haystack
     assert stack.slack.delivered_posts(DEFAULT_TOKEN) == []
 
 
@@ -4998,3 +5046,1017 @@ def test_a_persistence_failure_at_admission_answers_503_and_never_logs_the_slack
 def _detail_code(answer: Any) -> str | None:
     detail = answer.get("detail") if isinstance(answer, dict) else None
     return detail.get("code") if isinstance(detail, dict) else None
+
+
+# --- #5380: steering reads only a person's thread reply receipt ------------------------
+
+
+def test_steering_refuses_a_root_receipt_and_a_driver_receipt(steering: SteeringStack) -> None:
+    """Kickoff reads root and declared driver receipts (#5380); steering never does.
+
+    Through the steer route, a version 1 receipt whose message is the root
+    itself, and a version 2 driver receipt for a reply in the run's root, are
+    each ``receipt_mismatch`` and admit nothing, although both name a sender
+    with write access. A person's version 1 reply receipt there still admits
+    (liveness). Fails with the route's two cross-consumer refusals reverted:
+    both receipts would admit. The worker's own refusal of a version 2 receipt
+    is ``apps/worker/tests/test_factory_steering.py``'s.
+    """
+
+    from curie_channel_gateway.slack.identities import delivery_key
+    from curie_channel_gateway.slack.identity import driver_evidence, slack_evidence
+    from curie_internal.slack_mention_receipt import SlackMentionReceipt
+
+    stack = steering
+    writer = stack.person()
+    run = stack.open_steered_run()
+    known = {row["id"] for row in stack.requests()}
+
+    def steer_with(*, message_ts: str, driver: bool = False) -> dict[str, Any]:
+        event_id = f"Ev0{stack.tag.upper()}{uuid.uuid4().hex[:8].upper()}"
+        event = {
+            "type": "app_mention",
+            "channel": CHANNEL,
+            "text": f"<@{FACTORY_BOT_USER}> Please also update the changelog.",
+            "ts": message_ts,
+            "thread_ts": run.root_ts,
+            "team": TEAM,
+            "user": writer.slack_user,
+            "user_team": TEAM,
+        }
+        body = {"type": "event_callback", "event_id": event_id, "team_id": TEAM, "event": event}
+        evidence = driver_evidence(body, writer.slack_user) if driver else slack_evidence(body)
+        assert evidence is not None
+        delivery_id = delivery_key(event_id, stack.identity)
+        receipt = SlackMentionReceipt(
+            version=2 if driver else 1,
+            delivery_id=delivery_id,
+            channel_identity=stack.identity,
+            channel=CHANNEL,
+            root_ts=run.root_ts,
+            message_ts=message_ts,
+            user_id=writer.slack_user,
+            body=str(event["text"]),
+            evidence=evidence,
+            driver_bot_id="B0EXAMPLE5" if driver else None,
+        )
+        response = stack.client.post(
+            STEER_PATH,
+            headers=stack.internal,
+            json={
+                "delivery_id": delivery_id,
+                "channel_identity": stack.identity,
+                "channel": CHANNEL,
+                "root_ts": run.root_ts,
+                "author": writer.slack_user,
+                "receipt": receipt.model_dump(mode="json"),
+            },
+        )
+        assert response.status_code == 200, response.text
+        answer: dict[str, Any] = response.json()
+        return answer
+
+    assert steer_with(message_ts=run.root_ts)["outcome"] == "receipt_mismatch"
+    assert steer_with(message_ts="1800000900.000001", driver=True)["outcome"] == "receipt_mismatch"
+    assert [row for row in stack.requests() if row["id"] not in known] == []
+
+    live = steer_with(message_ts="1800000900.000002")
+    assert live["outcome"] == "admitted", live
+    assert len([row for row in stack.requests() if row["id"] not in known]) == 1
+
+
+# --- #5586 AC8: one triage line per ending -----------------------------------------
+#
+# The completion contract, grant, delivery and receipt rows are written with plain
+# SQL in the shapes migration 0167 and the stage 1 delivery service store; the
+# routes and lifecycle transitions that write them are covered by
+# test_factory_tracker_results.py and test_workitem_dispatch.py. Here the
+# production progress loop materializes and posts from those rows.
+
+_TRIAGE_REVISION = "0123456789abcdef0123456789abcdef01234567"
+_TRIAGE_HEX = "ab" * 32
+
+
+@dataclass
+class _TriageRun:
+    number: int
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    epoch: int
+    root_ts: str
+    ticket_url: str
+    comment_url: str
+
+
+def _triage_run(stack: Stack, *, contract: str = "tracker_result") -> _TriageRun:
+    """A started request with its posted Slack root, under ``contract``."""
+
+    number = next(_ISSUES)
+    request_id, work_item_id = stack.admit(number)
+    epoch = stack.start(request_id)
+    if contract == "tracker_result":
+        _rows(
+            "UPDATE curie.execution_requests SET completion_contract = 'tracker_result', "
+            "result_policy_digest = :digest WHERE id = :id",
+            {"id": request_id, "digest": "cd" * 32},
+        )
+    enabled = stack.enable_destination()
+    assert enabled.status_code == 200, enabled.text
+    stack.drain()
+    (thread,) = stack.threads(work_item_id)
+    assert thread["root_ts"], thread
+    return _TriageRun(
+        number,
+        work_item_id,
+        request_id,
+        epoch,
+        thread["root_ts"],
+        f"https://github.com/{REPO}/issues/{number + 1000}",
+        f"https://github.com/{REPO}/issues/{number}#issuecomment-{number}01",
+    )
+
+
+def _triage_delivery(
+    run: _TriageRun,
+    *,
+    kind: str,
+    reason: str | None = None,
+    state: str = "delivered",
+    origin: str = "submitted",
+) -> uuid.UUID:
+    """The run's grant and its one delivery in ``state``; a delivered one gets its receipt.
+
+    An owed delivery's next attempt is a day away, so nothing attempts it here.
+    """
+
+    delivery_id = uuid.uuid4()
+    grant_id = uuid.uuid4()
+    output = kind == "ticket" and state == "delivered"
+    params: dict[str, Any] = {
+        "grant": grant_id,
+        "delivery": delivery_id,
+        "request": run.request_id,
+        "identity": f"curie-result-{run.request_id}",
+        "kind": kind,
+        "reason": reason,
+        "hex": _TRIAGE_HEX,
+        "epoch": run.epoch,
+        "state": state,
+        "origin": origin,
+        "output": output,
+        "issue": str(run.number + 1000),
+        "url": run.ticket_url,
+    }
+    _rows(
+        "INSERT INTO curie.factory_tracker_result_grants (id, work_item_id, "
+        "execution_request_id, source_fingerprint, repository_id, allowed_result_kinds, "
+        "output_identity, implementation_label, expires_at) "
+        "SELECT CAST(:grant AS uuid), w.id, r.id, :hex, w.repository_project_id, "
+        "CAST('[\"findings\", \"ticket\"]' AS jsonb), :identity, 'factory-implement', "
+        "now() + interval '1 hour' "
+        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE r.id = CAST(:request AS uuid)",
+        params,
+    )
+    _rows(
+        "INSERT INTO curie.factory_tracker_result_deliveries (id, grant_id, "
+        "execution_request_id, result_kind, reason, proposal_sha256, runtime_epoch, state, "
+        "origin, next_attempt_at, failure_code, settled_at, deadline_at, output_tracker_kind, "
+        "output_tracker_host, output_scope_id, output_issue_id, output_url, output_body_sha256) "
+        "SELECT CAST(:delivery AS uuid), CAST(:grant AS uuid), r.id, :kind, "
+        "CAST(:reason AS text), :hex, CAST(:epoch AS bigint), CAST(:state AS text), :origin, "
+        "now() + interval '1 day', "
+        "CASE WHEN CAST(:state AS text) = 'failed' THEN 'delivery_deadline_exceeded' END, "
+        "CASE WHEN CAST(:state AS text) <> 'owed' THEN now() END, "
+        "now() + interval '1 hour', "
+        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_kind END, "
+        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_host END, "
+        "CASE WHEN CAST(:output AS boolean) THEN w.tracker_scope_id END, "
+        "CASE WHEN CAST(:output AS boolean) THEN CAST(:issue AS text) END, "
+        "CASE WHEN CAST(:output AS boolean) THEN CAST(:url AS text) END, "
+        "CASE WHEN CAST(:output AS boolean) THEN :hex END "
+        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE r.id = CAST(:request AS uuid)",
+        params,
+    )
+    if state == "delivered":
+        _triage_receipt(run, delivery_id)
+    return delivery_id
+
+
+def _triage_receipt(run: _TriageRun, delivery_id: uuid.UUID) -> None:
+    _rows(
+        "INSERT INTO curie.factory_tracker_result_receipts (delivery_id, grant_id, "
+        "execution_request_id, result_kind, reason, proposal_sha256, revision, "
+        "result_comment_id, result_comment_url, output_tracker_kind, output_tracker_host, "
+        "output_scope_id, output_issue_id, output_url, output_body_sha256, output_labels) "
+        "SELECT d.id, d.grant_id, d.execution_request_id, d.result_kind, d.reason, "
+        "d.proposal_sha256, :revision, '4401', :comment_url, d.output_tracker_kind, "
+        "d.output_tracker_host, d.output_scope_id, d.output_issue_id, d.output_url, "
+        "d.output_body_sha256, CASE WHEN d.result_kind = 'ticket' THEN '[]'::jsonb END "
+        "FROM curie.factory_tracker_result_deliveries d WHERE d.id = CAST(:id AS uuid)",
+        {"id": delivery_id, "revision": _TRIAGE_REVISION, "comment_url": run.comment_url},
+    )
+
+
+def _settle_delivery(run: _TriageRun, delivery_id: uuid.UUID, state: str) -> None:
+    """An owed delivery settles later: delivered with its receipt, or failed."""
+
+    _rows(
+        "UPDATE curie.factory_tracker_result_deliveries SET state = CAST(:state AS text), "
+        "settled_at = now(), failure_code = CASE WHEN CAST(:state AS text) = 'failed' "
+        "THEN 'delivery_deadline_exceeded' END WHERE id = CAST(:id AS uuid)",
+        {"id": delivery_id, "state": state},
+    )
+    if state == "delivered":
+        _triage_receipt(run, delivery_id)
+
+
+def _end_request(run: _TriageRun, status: str, cause: str) -> None:
+    """The terminal transition, in the shape the lifecycle writes it."""
+
+    _rows(
+        "UPDATE curie.execution_requests SET status = :status, terminal_at = now(), "
+        "terminal_cause = :cause, termination_observation = CASE WHEN :observed "
+        "THEN 'fixture runtime termination observed' END WHERE id = :id",
+        {
+            "id": run.request_id,
+            "status": status,
+            "cause": cause,
+            "observed": status in {"expired", "cancelled"},
+        },
+    )
+
+
+def _result_lines(stack: Stack, root_ts: str) -> list[str]:
+    """The message text of every result line posted in the root's thread."""
+
+    texts = [call.text for call in stack.slack.thread_posts(stack.factory_token, root_ts)]
+    return [
+        t
+        for t in texts
+        if t.startswith(("Triage ", "Investigation stopped:", "Run ", "Needs a person"))
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason", "status", "line"),
+    [
+        ("ticket", None, "completed", "Triage published a ticket: {ticket}."),
+        ("findings", "not_reproduced", "completed", "Triage reported: not reproduced. {comment}"),
+        ("findings", "already_fixed", "completed", "Triage reported: already fixed. {comment}"),
+        (
+            "findings",
+            "product_decision_needed",
+            "completed",
+            "Triage reported: product decision needed. {comment}",
+        ),
+        (
+            "findings",
+            "capability_unavailable",
+            "completed",
+            "Triage reported: capability unavailable. {comment}",
+        ),
+        (
+            "findings",
+            "budget_exhausted",
+            "expired",
+            "Investigation stopped: budget exhausted; findings delivered. {comment}",
+        ),
+    ],
+)
+def test_each_triage_ending_posts_one_result_line_in_the_tickets_thread(
+    stack: Stack, kind: str, reason: str | None, status: str, line: str
+) -> None:
+    """AC8: the ending's line carries the ticket or result comment URL, once, in
+    the WorkItem's thread, and the generic terminal line is not posted."""
+
+    run = _triage_run(stack)
+    if status == "expired":
+        # Exhaustion: the platform findings are sealed as the request expires.
+        _end_request(run, "expired", "execution_deadline")
+        _triage_delivery(run, kind=kind, reason=reason, origin="platform")
+    else:
+        _triage_delivery(run, kind=kind, reason=reason)
+        _end_request(run, "completed", "completed")
+    stack.drain()
+    stack.drain(fresh=True)
+
+    expected = line.format(ticket=run.ticket_url, comment=run.comment_url)
+    lines = _result_lines(stack, run.root_ts)
+    assert len(lines) == 1 and lines[0].strip() == expected, lines
+    assert len(stack.slack.roots(stack.factory_token)) == 1
+    (post,) = _rows(
+        "SELECT kind, post_key, posted_at FROM curie.factory_slack_posts "
+        "WHERE work_item_id = :id AND kind IN ('triage', 'terminal')",
+        {"id": run.work_item_id},
+    )
+    assert (post["kind"], post["post_key"]) == ("triage", f"triage:{run.request_id}")
+    assert post["posted_at"] is not None
+
+
+_HANDOFFS: dict[str, tuple[dict[str, object], str]] = {
+    "admitted": (
+        {"handoff_admitted": True},
+        "Triage published a ticket: {ticket}. Implementation admitted.",
+    ),
+    "refused": (
+        {"handoff_admitted": False, "refusal_reason": "the repository is paused"},
+        "Triage published a ticket: {ticket}. Implementation not started: "
+        "the repository is paused.",
+    ),
+}
+_HANDOFF_KEYS = ("handoff_admitted", "implementation_status_url", "refusal_reason")
+
+
+def _handoff_triage_post(run: _TriageRun, handoff: dict[str, object]) -> None:
+    """The run's ``triage`` post record as it stands once its handoff is recorded.
+
+    #5588 records the handoff; until then the record is constructed here, in the
+    shape the progress loop's own insert writes plus the handoff keys. The
+    loop's insert then conflicts on the post key and leaves this record alone.
+    """
+
+    payload = {
+        "result_kind": "ticket",
+        "reason": None,
+        "revision": _TRIAGE_REVISION,
+        "ticket_url": run.ticket_url,
+        "result_comment_url": run.comment_url,
+        **handoff,
+    }
+    _rows(
+        "INSERT INTO curie.factory_slack_posts (work_item_id, post_key, kind, sequence, "
+        "rank, ordinal, payload) SELECT q.work_item_id, 'triage:' || q.id, 'triage', "
+        "q.sequence, 3, 0, CAST(:payload AS jsonb) FROM curie.execution_requests q "
+        "WHERE q.id = :id",
+        {"id": run.request_id, "payload": json.dumps(payload)},
+    )
+
+
+def _drive_handoff_ending(stack: Stack, handoff: dict[str, object]) -> _TriageRun:
+    run = _triage_run(stack)
+    _triage_delivery(run, kind="ticket")
+    _end_request(run, "completed", "completed")
+    _handoff_triage_post(run, handoff)
+    stack.drain()
+    stack.drain(fresh=True)
+    return run
+
+
+@pytest.mark.parametrize("ending", sorted(_HANDOFFS))
+def test_a_handoff_ending_posts_one_result_line_through_the_progress_loop(
+    stack: Stack, ending: str
+) -> None:
+    """AC8: the admitted and refused handoff endings travel from the stored post
+    record through the progress loop to the Slack stub as one line, with the
+    ticket URL, in the ticket's thread."""
+
+    handoff, line = _HANDOFFS[ending]
+    run = _drive_handoff_ending(stack, handoff)
+
+    lines = _result_lines(stack, run.root_ts)
+    assert [text.strip() for text in lines] == [line.format(ticket=run.ticket_url)], lines
+    assert len(stack.slack.roots(stack.factory_token)) == 1
+    (post,) = _rows(
+        "SELECT kind, post_key, posted_at FROM curie.factory_slack_posts "
+        "WHERE work_item_id = :id AND kind IN ('triage', 'terminal')",
+        {"id": run.work_item_id},
+    )
+    assert (post["kind"], post["post_key"]) == ("triage", f"triage:{run.request_id}")
+    assert post["posted_at"] is not None
+
+
+@pytest.mark.parametrize("ending", sorted(_HANDOFFS))
+def test_a_handoff_dropped_before_rendering_does_not_post_the_handoff_line(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    """Negative control: a loop that drops the handoff before rendering posts the
+    plain published line, which the positive test above rejects."""
+
+    def dropping(payload: dict[str, Any]) -> str:
+        return render_triage({k: v for k, v in payload.items() if k not in _HANDOFF_KEYS})
+
+    monkeypatch.setattr(factory_slack_progress, "render_triage", dropping)
+    handoff, line = _HANDOFFS[ending]
+    run = _drive_handoff_ending(stack, handoff)
+
+    lines = [text.strip() for text in _result_lines(stack, run.root_ts)]
+    assert lines == [f"Triage published a ticket: {run.ticket_url}."], lines
+    assert line.format(ticket=run.ticket_url) not in lines
+
+
+_RENDER_TICKET = "https://tracker.example/acme/app/issues/7"
+_RENDER_COMMENT = "https://tracker.example/acme/app/issues/3#comment-1"
+
+
+def test_all_seven_triage_endings_render_distinct_lines_through_render_triage() -> None:
+    """AC8: the handoff endings reach Slack rendering through the payload's handoff keys."""
+
+    ticket = {"result_kind": "ticket", "ticket_url": _RENDER_TICKET}
+    payloads: dict[str, dict[str, object]] = {
+        "published": ticket,
+        "admitted": {**ticket, "handoff_admitted": True},
+        "refused": {
+            **ticket,
+            "handoff_admitted": False,
+            "refusal_reason": "the repository is paused",
+        },
+    }
+    for reason in (
+        "not_reproduced",
+        "already_fixed",
+        "product_decision_needed",
+        "capability_unavailable",
+        "budget_exhausted",
+    ):
+        payloads[reason] = {
+            "result_kind": "findings",
+            "reason": reason,
+            "result_comment_url": _RENDER_COMMENT,
+        }
+    lines = {name: render_triage(payload) for name, payload in payloads.items()}
+    # The seven endings plus a delivered ticket with no handoff recorded yet.
+    assert len(lines) == 8
+    assert len(set(lines.values())) == len(lines), lines
+    assert "admitted" in lines["admitted"].lower()
+    assert "not started" in lines["refused"].lower()
+    assert "the repository is paused" in lines["refused"]
+    assert "admitted" not in lines["published"].lower()
+    assert "not started" not in lines["published"].lower()
+    assert "admitted" not in lines["refused"].lower()
+    for name in ("admitted", "refused", "published"):
+        assert _RENDER_TICKET in lines[name]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"handoff_admitted": "yes"},
+        {"handoff_admitted": 1},
+        {"handoff_admitted": False, "refusal_reason": 5},
+        {"handoff_admitted": True, "implementation_status_url": ["x"]},
+    ],
+)
+def test_a_wrong_typed_handoff_value_is_refused_by_render_triage(bad: dict[str, object]) -> None:
+    payload = {"result_kind": "ticket", "ticket_url": _RENDER_TICKET, **bad}
+    with pytest.raises(ValueError):
+        render_triage(payload)
+
+
+def test_an_owed_delivery_withholds_the_terminal_line_until_it_fails(stack: Stack) -> None:
+    """A failed delivery never resumes, so its run gets the generic terminal line."""
+
+    run = _triage_run(stack)
+    delivery_id = _triage_delivery(run, kind="ticket", state="owed")
+    _end_request(run, "failed", "tracker_result_undelivered")
+    stack.drain()
+    assert _result_lines(stack, run.root_ts) == []
+
+    _settle_delivery(run, delivery_id, "failed")
+    stack.drain()
+    stack.drain(fresh=True)
+    lines = _result_lines(stack, run.root_ts)
+    assert len(lines) == 1, lines
+    sentence = cause_text("tracker_result_undelivered")
+    assert lines[0].startswith(f"Needs a person: {sentence}"), lines
+    assert "tracker_result_undelivered" not in lines[0].split("\n", 1)[0]
+
+
+def test_a_delivery_owed_past_the_run_posts_the_triage_line_once_delivered(
+    stack: Stack,
+) -> None:
+    """Reading 5: delivered after the run failed undelivered; one triage line,
+    and never the generic terminal line."""
+
+    run = _triage_run(stack)
+    delivery_id = _triage_delivery(run, kind="findings", reason="not_reproduced", state="owed")
+    _end_request(run, "failed", "tracker_result_undelivered")
+    stack.drain()
+    assert _result_lines(stack, run.root_ts) == []
+
+    _settle_delivery(run, delivery_id, "delivered")
+    stack.drain()
+    stack.drain(fresh=True)
+    lines = _result_lines(stack, run.root_ts)
+    assert [line.strip() for line in lines] == [
+        f"Triage reported: not reproduced. {run.comment_url}"
+    ], lines
+
+
+def test_a_tracker_result_run_with_no_delivery_posts_the_terminal_line(stack: Stack) -> None:
+    run = _triage_run(stack)
+    _end_request(run, "failed", "no_tracker_result")
+    stack.drain()
+    lines = _result_lines(stack, run.root_ts)
+    assert len(lines) == 1, lines
+    sentence = cause_text("no_tracker_result")
+    assert lines[0].startswith(f"Needs a person: {sentence}"), lines
+    assert "no_tracker_result" not in lines[0].split("\n", 1)[0]
+
+
+def test_an_implementation_runs_posts_are_unchanged(stack: Stack) -> None:
+    """The triage post keys on the request's contract: even a receipt row on an
+    implementation request (which no route can write) posts no triage line, and
+    its terminal line still posts."""
+
+    run = _triage_run(stack, contract="implementation")
+    _triage_delivery(run, kind="findings", reason="not_reproduced")
+    stack.finish(run.request_id, run.epoch)
+    stack.drain()
+    stack.drain(fresh=True)
+
+    lines = _result_lines(stack, run.root_ts)
+    assert lines[0].startswith(f"Needs a person: {cause_text('runner_failed')}"), lines
+    assert "runner_failed" not in lines[0].split("\n", 1)[0]
+    kinds = {
+        row["kind"]
+        for row in _rows(
+            "SELECT kind FROM curie.factory_slack_posts WHERE work_item_id = :id",
+            {"id": run.work_item_id},
+        )
+    }
+    assert kinds == {"root", "terminal"}, kinds
+
+
+# --- key events (#5589) ---------------------------------------------------------------
+
+
+def _ticket_objective(number: int) -> tuple[str, str]:
+    """Issue URL plus the admitting objective, which keeps a fragment to strip."""
+
+    url = f"https://github.com/{REPO}/issues/{number}"
+    return url, f"{url}#discussion"
+
+
+def _stamp_title(request_id: uuid.UUID, title: str) -> None:
+    updated = _rows(
+        "UPDATE curie.factory_terminal_notices SET subject_title = :title "
+        "WHERE execution_request_id = :id RETURNING execution_request_id",
+        {"id": request_id, "title": title},
+    )
+    assert updated, "admission records a status comment"
+
+
+def _end_plain(request_id: uuid.UUID, status: str, cause: str) -> None:
+    _rows(
+        "UPDATE curie.execution_requests SET status = :status, terminal_at = now(), "
+        "terminal_cause = :cause, termination_observation = CASE WHEN :observed "
+        "THEN 'fixture runtime termination observed' END WHERE id = :id",
+        {
+            "id": request_id,
+            "status": status,
+            "cause": cause,
+            "observed": status in {"expired", "cancelled"},
+        },
+    )
+
+
+def _chat(stack: Stack) -> list[SlackCall]:
+    return stack.slack.delivered_posts(stack.factory_token)
+
+
+def _kinds(work_item_id: uuid.UUID) -> list[str]:
+    return [
+        str(row["kind"])
+        for row in _rows(
+            "SELECT kind FROM curie.factory_slack_posts WHERE work_item_id = :id "
+            "ORDER BY sequence, rank, ordinal, id",
+            {"id": work_item_id},
+        )
+    ]
+
+
+def _intake_notice(
+    *,
+    number: int,
+    reason: str,
+    agent_id: str | None,
+    login: str | None = None,
+    stale: bool = False,
+) -> int:
+    """One intake notice. ``stale`` is observed before a destination's since."""
+
+    url = f"https://github.com/{REPO}/issues/{number}#discussion"
+    (row,) = _rows(
+        "INSERT INTO curie.factory_intake_notices "
+        "(tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, label_event_id, "
+        "repository_path, issue_url, label, reason, agent_id, actor_login, observed_at) "
+        "VALUES ('github', 'github.com', :scope, :issue, :event, :repo, :url, 'factory', "
+        ":reason, :agent, :login, CASE WHEN :stale THEN now() - interval '2 days' ELSE now() END) "
+        "RETURNING id",
+        {
+            "scope": str(REPO_ID),
+            "issue": str(number),
+            "event": number,
+            "repo": REPO,
+            "url": url,
+            "reason": reason,
+            "agent": uuid.UUID(agent_id) if agent_id else None,
+            "login": login,
+            "stale": stale,
+        },
+    )
+    return int(row["id"])
+
+
+def _refused_line(number: int, sentence: str) -> str:
+    url = f"https://github.com/{REPO}/issues/{number}"
+    return f"Refused: {REPO} #{number} · {sentence}\n{url}"
+
+
+# Sentences the Slack post uses. They are not the GitHub comment body.
+_REFUSAL_SENTENCE = {
+    "actor_bot": (
+        "the label was applied by a bot account. A person with write access applies it again."
+    ),
+    "actor_own_app": (
+        "the label was applied through Curie's own GitHub App. Apply it directly or through "
+        "another tool."
+    ),
+    "actor_unverifiable": (
+        "Curie could not verify who applied the label. A person with write access applies it again."
+    ),
+    "publication_completed": (
+        "a factory pull request for this issue already completed. Remove the label and apply it "
+        "again to rerun."
+    ),
+    "installation_changed": (
+        "earlier factory work on this issue was recorded under a previous installation of the "
+        "GitHub App. The operator recovers or closes it, then the label is applied again."
+    ),
+}
+
+
+def test_key_events_taken_root_and_pr_open_only(stack: Stack) -> None:
+    """Default settings: one taken root and one PR open reply. Nothing else."""
+
+    assert render_post("root", {"repository_path": REPO, "issue_id": "9"}) == f"Taken: {REPO} #9"
+    assert (
+        render_post(
+            "root",
+            {"repository_path": REPO, "display_key": "BOT-9", "issue_id": "9", "title": "T"},
+        )
+        == f"Taken: {REPO} BOT-9 T"
+    )
+
+    number = next(_ISSUES)
+    url, objective = _ticket_objective(number)
+    request_id, work_item_id = stack.admit(number, objective=objective)
+    _stamp_title(request_id, "Totals <are> off & late")
+    epoch = stack.start(request_id)
+    stack.report(request_id, "plan", "Drafting the plan")
+    stack.report(request_id, "implement", "phase should stay quiet")
+    pr = next(_PULLS)
+    stack.own_pull_request(work_item_id, pr)
+    pr_url = f"https://github.com/{REPO}/pull/{pr}"
+    enabled = stack.enable_destination()
+    assert enabled.status_code == 200, enabled.text
+    stack.finish(request_id, epoch, published=True)
+    stack.drain_as(phase_lines=False)
+
+    posts = _chat(stack)
+    assert len(posts) == 2, [post.text for post in posts]
+    root, reply = posts
+    assert not root.params.get("thread_ts")
+    assert root.text == (
+        f"Taken: {REPO} #{number} Totals &lt;are&gt; off &amp; late · started by {SENDER}\n{url}"
+    )
+    assert reply.text == f"PR open: {pr_url}"
+    assert reply.params["thread_ts"] == root.response["ts"]
+    assert reply.params["channel"] == CHANNEL
+    haystack = "\n".join(post.haystack for post in posts)
+    assert "Drafting the plan" not in haystack
+    assert "phase should stay quiet" not in haystack
+    assert "Run completed" not in haystack
+    assert _kinds(work_item_id) == ["root", "pull_request"]
+    stack.drain_as(phase_lines=False, fresh=True)
+    assert len(_chat(stack)) == 2
+
+
+def _running(stack: Stack) -> tuple[uuid.UUID, uuid.UUID, int, int, str]:
+    number = next(_ISSUES)
+    url, objective = _ticket_objective(number)
+    request_id, work_item_id = stack.admit(number, objective=objective)
+    epoch = stack.start(request_id)
+    return request_id, work_item_id, number, epoch, url
+
+
+def _needs_lines(stack: Stack, work_item_id: uuid.UUID) -> list[str]:
+    (thread,) = stack.threads(work_item_id)
+    return [
+        call.text
+        for call in stack.slack.thread_posts(stack.factory_token, thread["root_ts"])
+        if call.text.startswith("Needs a person")
+    ]
+
+
+def test_key_events_needs_a_person_for_failed_and_expired(stack: Stack) -> None:
+    """Failed and expired reply with cause_text. Completed and cancelled do not."""
+
+    assert stack.enable_destination().status_code == 200
+
+    failed_id, failed_item, _number, failed_epoch, failed_url = _running(stack)
+    stack.finish(failed_id, failed_epoch, published=False)
+    sand_id, sand_item, _number, _epoch, sand_url = _running(stack)
+    _end_plain(sand_id, "failed", "sandbox_terminated")
+    expired_id, expired_item, _number, _epoch, expired_url = _running(stack)
+    _end_plain(expired_id, "expired", "execution_deadline")
+    cancelled_id, cancelled_item, _number, _epoch, _url = _running(stack)
+    _end_plain(cancelled_id, "cancelled", "issue_cancelled")
+    done_id, done_item, _number, done_epoch, _url = _running(stack)
+    pr = next(_PULLS)
+    stack.own_pull_request(done_item, pr)
+    pr_url = f"https://github.com/{REPO}/pull/{pr}"
+    stack.finish(done_id, done_epoch, published=True)
+
+    stack.drain_as(phase_lines=False)
+
+    def expect(item: uuid.UUID, cause: str, url: str) -> None:
+        sentence = cause_text(cause)
+        assert _needs_lines(stack, item) == [f"Needs a person: {sentence}\n{url}"]
+        assert cause not in _needs_lines(stack, item)[0].split("\n", 1)[0]
+
+    expect(failed_item, "runner_failed", failed_url)
+    expect(sand_item, "sandbox_terminated", sand_url)
+    expect(expired_item, "execution_deadline", expired_url)
+    assert _needs_lines(stack, cancelled_item) == []
+    assert _needs_lines(stack, done_item) == []
+    (done_thread,) = stack.threads(done_item)
+    assert [
+        call.text for call in stack.slack.thread_posts(stack.factory_token, done_thread["root_ts"])
+    ] == [f"PR open: {pr_url}"]
+    (cancelled_thread,) = stack.threads(cancelled_item)
+    assert stack.slack.thread_posts(stack.factory_token, cancelled_thread["root_ts"]) == []
+    assert _kinds(failed_item) == ["root", "terminal"]
+    assert _kinds(sand_item) == ["root", "terminal"]
+    assert _kinds(expired_item) == ["root", "terminal"]
+    assert _kinds(cancelled_item) == ["root"]
+    assert _kinds(done_item) == ["root", "pull_request"]
+    haystack = "\n".join(call.text for call in _chat(stack))
+    assert "Run completed" not in haystack
+    assert "Run cancelled" not in haystack
+    assert "Run failed" not in haystack
+
+
+def test_key_events_refused_posts_once_per_notice(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each owed intake notice posts once, in the channel, with no WorkItem."""
+
+    assert stack.enable_destination().status_code == 200
+    quiet_repo = f"acme-corp/acme-quiet-{stack.tag}"
+    quiet = stack.client.post(
+        "/agents",
+        headers=stack.platform,
+        json={
+            "name": f"acme-quiet-{stack.tag}",
+            "repo_full_name": quiet_repo,
+            "channel": {"kind": "github", "address": quiet_repo},
+        },
+    )
+    assert quiet.status_code == 201, quiet.text
+    quiet_id = str(quiet.json()["id"])
+    bound = stack.client.post(
+        f"/agents/{quiet_id}/channels",
+        headers=stack.platform,
+        json={"kind": "slack", "address": OTHER_CHANNEL, "adapter": stack.identity},
+    )
+    assert bound.status_code == 201, bound.text
+
+    expected: dict[int, str] = {}
+    notice_ids: dict[int, int] = {}
+    number = 91001
+    for reason, sentence in _REFUSAL_SENTENCE.items():
+        notice_ids[number] = _intake_notice(number=number, reason=reason, agent_id=stack.agent_id)
+        expected[number] = _refused_line(number, sentence)
+        number += 1
+    notice_ids[number] = _intake_notice(
+        number=number, reason="actor_no_permission", agent_id=stack.agent_id, login="a<b"
+    )
+    expected[number] = _refused_line(
+        number, "a&lt;b does not have write access. Ask a maintainer to apply it."
+    )
+    number += 1
+    notice_ids[number] = _intake_notice(
+        number=number, reason="personal_owner_required", agent_id=stack.agent_id, login="pat"
+    )
+    expected[number] = _refused_line(
+        number,
+        "pat is not linked to a personal model account. The operator links them, "
+        "or a linked person applies the label.",
+    )
+    number += 1
+    quiet_number = number
+    _intake_notice(number=quiet_number, reason="actor_bot", agent_id=quiet_id)
+    number += 1
+    stale_number = number
+    _intake_notice(number=stale_number, reason="actor_bot", agent_id=stack.agent_id, stale=True)
+    number += 1
+    ambiguous_number = number
+    _intake_notice(number=ambiguous_number, reason="binding_ambiguous", agent_id=None)
+
+    stack.drain_as(phase_lines=False)
+    refused = [call for call in _chat(stack) if call.text.startswith("Refused:")]
+    assert sorted(call.text for call in refused) == sorted(expected.values())
+    assert all(not call.params.get("thread_ts") for call in refused)
+    assert {call.params["channel"] for call in refused} == {CHANNEL}
+    for call in refused:
+        issue = int(call.text.split(" #", 1)[1].split(" ·", 1)[0])
+        assert call.params["client_msg_id"] == refusal_delivery_id(notice_ids[issue])
+    assert (
+        _rows("SELECT tracker_issue_id FROM curie.work_items WHERE tracker_issue_id LIKE '91%'")
+        == []
+    )
+    assert _rows("SELECT count(*) AS n FROM curie.factory_slack_refusal_posts") == [{"n": 7}]
+    stack.drain_as(phase_lines=False)
+    stack.drain_as(phase_lines=False, fresh=True)
+    assert len([call for call in _chat(stack) if call.text.startswith("Refused:")]) == 7
+
+    lost_number = number + 1
+    lost_id = _intake_notice(number=lost_number, reason="actor_bot", agent_id=stack.agent_id)
+    original = PostgresFactorySlackStore.mark_refusal_posted
+
+    async def lost(self: PostgresFactorySlackStore, work: object, ref: str | None) -> None:
+        raise FactorySlackProgressError("factory Slack refusal acknowledgement was lost")
+
+    monkeypatch.setattr(PostgresFactorySlackStore, "mark_refusal_posted", lost)
+    with pytest.raises(FactorySlackProgressError):
+        stack.drain_as(phase_lines=False)
+    monkeypatch.setattr(PostgresFactorySlackStore, "mark_refusal_posted", original)
+    (owed,) = _rows(
+        "SELECT posted_at FROM curie.factory_slack_refusal_posts WHERE notice_id = :id",
+        {"id": lost_id},
+    )
+    assert owed["posted_at"] is None
+    _rows(
+        "UPDATE curie.factory_slack_refusal_posts SET lease_owner = NULL, "
+        "lease_expires_at = NULL, not_before = NULL WHERE posted_at IS NULL"
+    )
+    stack.drain_as(phase_lines=False)
+    refused = [call for call in _chat(stack) if call.text.startswith("Refused:")]
+    dupes = [call for call in refused if f"#{lost_number} ·" in call.text]
+    assert len(dupes) == 2
+    assert dupes[0].params["client_msg_id"] == refusal_delivery_id(lost_id)
+    assert dupes[1].params["client_msg_id"] == refusal_delivery_id(lost_id)
+    assert _rows("SELECT count(*) AS n FROM curie.factory_slack_refusal_posts") == [{"n": 8}]
+    stack.drain_as(phase_lines=False, fresh=True)
+    assert len([call for call in _chat(stack) if call.text.startswith("Refused:")]) == len(refused)
+    haystack = "\n".join(call.text for call in _chat(stack))
+    assert f"#{quiet_number}" not in haystack
+    assert f"#{stale_number}" not in haystack
+    assert f"#{ambiguous_number}" not in haystack
+
+
+def test_key_events_phase_lines_on_posts_phases_and_run_completed(stack: Stack) -> None:
+    """The setting is off by default. On, phase lines and Run completed post, in order."""
+
+    assert WorkerConfig.model_fields["factory_slack_phase_lines"].default is False
+    number = next(_ISSUES)
+    url, objective = _ticket_objective(number)
+    request_id, work_item_id = stack.admit(number, objective=objective)
+    epoch = stack.start(request_id)
+    stack.report(request_id, "plan", "Drafting the plan")
+    stack.report(request_id, "implement", "Writing the change")
+    pr = next(_PULLS)
+    stack.own_pull_request(work_item_id, pr)
+    pr_url = f"https://github.com/{REPO}/pull/{pr}"
+    assert stack.enable_destination().status_code == 200
+    stack.finish(request_id, epoch, published=True)
+    stack.drain_as(phase_lines=True)
+
+    (thread,) = stack.threads(work_item_id)
+    texts = [call.text for call in stack.slack.thread_posts(stack.factory_token, thread["root_ts"])]
+    phase_at = [index for index, text in enumerate(texts) if text.startswith("Phase ")]
+    assert len(phase_at) == 2, texts
+    assert any("Drafting the plan" in text for text in texts)
+    assert any("Writing the change" in text for text in texts)
+    pr_at = texts.index(f"PR open: {pr_url}")
+    done = [index for index, text in enumerate(texts) if text.startswith("Run completed")]
+    assert done == [pr_at + 1], texts
+    assert max(phase_at) < pr_at
+    assert _kinds(work_item_id) == ["root", "phase", "phase", "pull_request", "terminal"]
+    (root,) = stack.slack.roots(stack.factory_token)
+    assert root.text.startswith(f"Taken: {REPO} #{number}")
+    assert root.text.endswith(url)
+
+
+def test_key_events_phase_lines_off_does_not_block_on_unposted_phases(stack: Stack) -> None:
+    """An unposted phase row from before the change does not hold back PR open."""
+
+    number = next(_ISSUES)
+    url, objective = _ticket_objective(number)
+    request_id, work_item_id = stack.admit(number, objective=objective)
+    stack.start(request_id)
+    assert stack.enable_destination().status_code == 200
+    stack.drain_as(phase_lines=False)
+    (root,) = _chat(stack)
+    assert root.text.startswith(f"Taken: {REPO} #{number}")
+    assert url in root.text
+    stack.report(request_id, "implement", "owed before the change")
+    pr = next(_PULLS)
+    stack.own_pull_request(work_item_id, pr)
+    pr_url = f"https://github.com/{REPO}/pull/{pr}"
+    _rows(
+        "INSERT INTO curie.factory_slack_posts "
+        "(work_item_id, post_key, kind, sequence, rank, ordinal, payload) "
+        "SELECT :item, 'phase:legacy', 'phase', q.sequence, 1, 0, "
+        "jsonb_build_object('phase', 'implement', 'note', 'owed before the change') "
+        "FROM curie.execution_requests q WHERE q.id = :request",
+        {"item": work_item_id, "request": request_id},
+    )
+    stack.drain_as(phase_lines=False)
+    (thread,) = stack.threads(work_item_id)
+    texts = [call.text for call in stack.slack.thread_posts(stack.factory_token, thread["root_ts"])]
+    assert texts == [f"PR open: {pr_url}"], texts
+    (phase,) = _rows(
+        "SELECT posted_at FROM curie.factory_slack_posts "
+        "WHERE work_item_id = :id AND post_key = 'phase:legacy'",
+        {"id": work_item_id},
+    )
+    assert phase["posted_at"] is None
+    assert "owed before the change" not in "\n".join(call.haystack for call in _chat(stack))
+
+
+def _production_phase_pass(stack: Stack) -> bool:
+    """One pass through the production builder. The phase flag is not an argument.
+
+    ``make_config`` leaves ``factory_slack_phase_lines`` unset, so ``WorkerConfig``
+    reads ``CURIE_FACTORY_SLACK_PHASE_LINES`` the same way the worker process does,
+    and ``_build_factory_slack_progress`` is what forwards that field to the store.
+    """
+
+    return bool(
+        stack.client.portal.call(
+            functools.partial(
+                _switched_progress_pass,
+                stack.worker,
+                stack.slack.base_url,
+                stack.identity,
+                stack.factory_token,
+                enabled=True,
+            )
+        )
+    )
+
+
+def _phased_finish(stack: Stack, note: str) -> tuple[uuid.UUID, str, str]:
+    number = next(_ISSUES)
+    url, objective = _ticket_objective(number)
+    request_id, work_item_id = stack.admit(number, objective=objective)
+    epoch = stack.start(request_id)
+    stack.report(request_id, "plan", note)
+    pr = next(_PULLS)
+    stack.own_pull_request(work_item_id, pr)
+    pr_url = f"https://github.com/{REPO}/pull/{pr}"
+    stack.finish(request_id, epoch, published=True)
+    return work_item_id, pr_url, url
+
+
+def test_key_events_phase_lines_follow_the_environment(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC4: the phase-lines opt-in is the worker environment, forwarded by production.
+
+    Unset, a finished run posts the taken root and the PR open reply only. Set
+    to true, the same shape of run also posts its phase line and Run completed.
+    Neither pass hands a phase-lines value to the store. Removing
+    ``phase_lines=config.factory_slack_phase_lines`` from the builder leaves the
+    store at its default, so the opted-in run posts no phase line.
+    """
+
+    monkeypatch.delenv("CURIE_FACTORY_SLACK_PHASE_LINES", raising=False)
+    probe = {"stream": "probe-phase", "group": "probe-phase", "prefix": "probe-phase"}
+    assert make_config(probe).factory_slack_phase_lines is False
+    assert stack.enable_destination().status_code == 200
+    quiet_id, quiet_pr, quiet_url = _phased_finish(stack, "quiet under the default")
+    assert _production_phase_pass(stack) is True
+    (quiet_thread,) = stack.threads(quiet_id)
+    quiet_texts = [
+        call.text
+        for call in stack.slack.thread_posts(stack.factory_token, quiet_thread["root_ts"])
+    ]
+    assert quiet_texts == [f"PR open: {quiet_pr}"], quiet_texts
+    (quiet_root,) = [
+        call
+        for call in stack.slack.roots(stack.factory_token)
+        if quiet_url in call.text
+    ]
+    assert quiet_root.text.startswith("Taken:")
+    assert _kinds(quiet_id) == ["root", "pull_request"]
+    assert "quiet under the default" not in "\n".join(call.haystack for call in _chat(stack))
+    assert "Run completed" not in "\n".join(call.text for call in _chat(stack))
+
+    monkeypatch.setenv("CURIE_FACTORY_SLACK_PHASE_LINES", "true")
+    assert make_config(probe).factory_slack_phase_lines is True
+    opted_id, opted_pr, _opted_url = _phased_finish(stack, "posted because the setting is on")
+    assert _production_phase_pass(stack) is True
+    (opted_thread,) = stack.threads(opted_id)
+    opted_texts = [
+        call.text
+        for call in stack.slack.thread_posts(stack.factory_token, opted_thread["root_ts"])
+    ]
+    assert opted_texts[0] == "Phase plan: posted because the setting is on", opted_texts
+    assert opted_texts[1] == f"PR open: {opted_pr}"
+    assert opted_texts[2].startswith("Run completed"), opted_texts
+    assert _kinds(opted_id) == ["root", "phase", "pull_request", "terminal"]

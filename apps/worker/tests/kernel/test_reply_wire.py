@@ -92,6 +92,9 @@ class StubBinding:
         self.resolve_calls.append((kind, address))
         return self._by_route.get((kind, address))
 
+    async def approval_agent_name(self, event_id: str) -> str | None:
+        return None
+
     def boot_env(
         self,
         resolved: ResolvedDeployment,

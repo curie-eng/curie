@@ -1547,6 +1547,8 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         created_at=now,
         updated_at=now,
         model_auth_mode="service",
+        coding_instructions_state="absent",
+        coding_instructions_absence_reason="historical",
     )
     request = ExecutionRequest(
         id=uuid.uuid4(),
@@ -1566,6 +1568,7 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         objective=OBJECTIVE,
         requester=REQUESTER,
         model_auth_mode="service",
+        coding_instructions_evidence="none",
     )
     outcome = derive_outcome(
         item,
@@ -1606,6 +1609,8 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         created_at=now,
         updated_at=now,
         model_auth_mode="service",
+        coding_instructions_state="absent",
+        coding_instructions_absence_reason="historical",
     )
     request = ExecutionRequest(
         id=uuid.uuid4(),
@@ -1624,6 +1629,7 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         objective=f"{PR_URL}#issuecomment-1\nRevise after review feedback",
         requester=REQUESTER,
         model_auth_mode="service",
+        coding_instructions_evidence="none",
     )
 
     outcome = derive_outcome(
@@ -1958,7 +1964,7 @@ def _runs(
 ) -> Callable[[httpx.Request], httpx.Response]:
     def handle(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith(f"/commits/{HEAD_SHA}/status"):
-            return httpx.Response(200, json={"state": "pending", "statuses": []})
+            return httpx.Response(200, json={"state": "pending", "statuses": [], "total_count": 0})
         return httpx.Response(
             200,
             json={

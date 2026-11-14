@@ -28,7 +28,7 @@
 //!    `access level <n>`; (f) `GET /api/v4/projects/<id>/labels`, then one
 //!    `POST /api/v4/projects/<id>/labels` (numeric id, JSON body with `name` and
 //!    a `#rrggbb` `color`) per missing label among the trigger label (default
-//!    `curie-factory`) and the four `curie-factory:*` state labels. A label that
+//!    `curie-factory`) and the five `curie-factory:*` state labels. A label that
 //!    exists is never posted. Every request carries the `PRIVATE-TOKEN` header.
 //! 3. `--dry-run` runs (a) to (e), sends no request other than a GET, makes no
 //!    `helm`/`kubectl` call that writes, and under `--json` its plan lines
@@ -102,11 +102,12 @@ const NO_ISSUES_ID: u64 = 1235;
 const MISSING_PATH: &str = "factory-fixture/nested/missing";
 
 const TRIGGER_LABEL: &str = "curie-factory";
-const STATE_LABELS: [&str; 4] = [
+const STATE_LABELS: [&str; 5] = [
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
+    "curie-factory:triaged",
 ];
 
 const BOT_USER: u64 = 42;
@@ -1258,7 +1259,7 @@ fn factory_quickstart_gitlab_creates_every_label_on_the_first_run_and_none_on_th
     );
     assert_no_token(&second.all(), "the second run");
 
-    // A project that already holds two of them gets only the missing three.
+    // A project that already holds two of them gets only the missing four.
     let cli = Cli::new(1);
     cli.serve_release_snapshot();
     let labels = Labels::with(&[TRIGGER_LABEL, "curie-factory:running"]);
@@ -1282,6 +1283,7 @@ fn factory_quickstart_gitlab_creates_every_label_on_the_first_run_and_none_on_th
             "curie-factory:needs-human".to_string(),
             "curie-factory:pr-open".to_string(),
             "curie-factory:queued".to_string(),
+            "curie-factory:triaged".to_string(),
         ],
         "only the missing labels are created: {}",
         run.all()

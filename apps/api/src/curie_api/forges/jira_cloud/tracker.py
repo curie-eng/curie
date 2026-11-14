@@ -29,6 +29,7 @@ set) is absorbed by the ``event_id`` keyed request id (ADR 0187).
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -39,7 +40,7 @@ from zoneinfo import ZoneInfo
 
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
 from curie_api.forges.config import AccountAllowlist, GroupAuthority, StartAuthority
-from curie_api.forges.errors import NotFound, Unavailable
+from curie_api.forges.errors import NotFound, Unavailable, Unsupported
 from curie_api.forges.jira_cloud import adf
 from curie_api.forges.jira_cloud.comments import JiraMarkedComments
 from curie_api.forges.jira_cloud.identity import IdentityCache, verify_identity
@@ -48,10 +49,12 @@ from curie_api.forges.types import (
     JIRA_CLOUD,
     Actor,
     Disposition,
+    LinkedIssue,
     MarkedNotice,
     NoticePage,
     PullRequest,
     RepositoryRef,
+    SourceContent,
     TicketLabels,
     TrackerIssueRef,
 )
@@ -242,10 +245,14 @@ class JiraTracker:
     """The factory's tracker on one Jira Cloud site scope, for one binding."""
 
     kind = JIRA_CLOUD
+    facts = None
     capabilities: Mapping[Operation, Support] = {
         **dict.fromkeys(TRACKER_OPERATIONS, Support.SUPPORTED),
         # No core caller reads dependencies yet (ADR 0165 is a Draft, decision 19).
         Operation.DEPENDENCIES: Support.NOOP,
+        # Linked output issues are GitHub only (ADR 0277); no fallback path.
+        Operation.CREATE_LINKED_ISSUE: Support.UNSUPPORTED,
+        Operation.FACTS_EXCHANGE: Support.UNSUPPORTED,
     }
 
     def __init__(
@@ -731,6 +738,24 @@ class JiraTracker:
             parts.append(LATER_COMMENTS)
         return "\n\n".join(parts) + "\n"
 
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's ``summary`` and ``description`` fields from one issue read,
+        never its comments. The description is the stored document, as its
+        canonical JSON text (keys sorted, no insignificant whitespace), not
+        rendered markdown; a missing description is the empty text."""
+
+        fields = _fields(await self._read_issue(self._issue_id(issue), "summary,description"))
+        summary = fields.get("summary")
+        if not isinstance(summary, str):
+            raise Unavailable("issue")
+        description = fields.get("description")
+        body = (
+            ""
+            if description is None
+            else json.dumps(description, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        return SourceContent(title=summary, body=body)
+
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         issue_id = self._issue_id(issue)
         fields = _fields(await self._read_issue(issue_id, "labels,components"))
@@ -828,3 +853,18 @@ class JiraTracker:
 
     async def dependencies(self, issue: TrackerIssueRef) -> tuple[TrackerIssueRef, ...]:
         return ()
+
+    async def create_linked_issue(
+        self,
+        source: TrackerIssueRef,
+        *,
+        output_identity: str,
+        title: str,
+        body: str,
+        labels: Collection[str],
+        expected: TrackerIssueRef | None = None,
+        reconcile_only: bool = False,
+    ) -> LinkedIssue:
+        """Declared unsupported: linked output issues are GitHub only (ADR 0277)."""
+
+        raise Unsupported(Operation.CREATE_LINKED_ISSUE)

@@ -1168,6 +1168,7 @@ class _FakeRuntime:
         self.eval_consumer = _FakeSupervisedTask(events, "evals")
         self.deploy_notice_consumer = _FakeSupervisedTask(events, "deploy-notices")
         self.connector_loop = None
+        self.factory_tool_observer = None
         self.cron_loop = _FakeCronLoop(events)
         self.runner = _FakeTransport()
         self.sink = _FakeTransport()

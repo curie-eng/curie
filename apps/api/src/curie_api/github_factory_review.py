@@ -27,6 +27,7 @@ from curie_api.schemas.deployments import WebhookResult
 from . import workitem_dispatch
 from .config import Settings
 from .factory_reply_target import feedback_url
+from .factory_review_context import pull_request_body_context
 from .forges.hosts import factory_code_host_entry, factory_tracker, github_host
 from .forges.registry import forges_registry
 from .forges.trackers import reply_route
@@ -148,14 +149,19 @@ def _reply_target(feedback: UnverifiedFeedback, work_item: WorkItem) -> ReplyTar
     return ReplyTarget.on_pull_request(pull_request)
 
 
-def _objective(feedback: UnverifiedFeedback, url: str) -> str:
+def _objective(
+    feedback: UnverifiedFeedback, url: str, publication_context: dict[str, str | bool]
+) -> str:
     # The feedback URL opens the objective for the agent's benefit only; the
     # reply target is stored typed on the request.
     provenance = feedback_provenance(feedback)
+    provenance.update(publication_context)
     return (
         f"{url}\n\n"
         "Human GitHub review feedback on this work item's pull request follows as JSON. "
-        "Use its body as the reviewer's requested changes and revise the same pull request.\n"
+        "The feedback may ask a question or request a change. Answer questions directly and "
+        "revise the same pull request when a change is needed. The pull_request_body, when "
+        "present, records the last successfully published description.\n"
         + json.dumps(provenance, ensure_ascii=False)
     )
 
@@ -267,7 +273,7 @@ async def admit_parsed_feedback(
         raise FeedbackIgnored("work_item_cancelled")
     work_item = current_item
     url = _feedback_url(feedback, settings, work_item.repository_path)
-    objective = _objective(feedback, url)
+    objective = _objective(feedback, url, await pull_request_body_context(session, work_item))
     if len(objective) > _MAX_OBJECTIVE:
         raise FeedbackIgnored("feedback_too_large")
     kind, address, conversation = reply_route(

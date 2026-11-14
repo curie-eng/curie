@@ -220,15 +220,19 @@ def test_retire_stops_the_process_group_and_leaves_nothing_behind(
     assert _retire(supervisor, "claim-a", 1)[1]["outcome"] == "cleaned"
 
 
-def test_a_new_claim_gets_a_fresh_directory_and_home(
+def test_a_new_claim_gets_a_fresh_home_at_the_same_path(
     supervisor: SupervisorProcess, records: Path
 ) -> None:
+    # The path is stable so an approved call naming it can run after a resume
+    # (#5571); its contents never outlive the claim that wrote them.
     _start(supervisor, records)
     first_home = json.loads((records / "env.json").read_text())["HOME"]
+    (Path(first_home) / "from-the-first-claim").write_text("x")
     _retire(supervisor, "claim-a", 1)
+    assert not Path(first_home).exists()
     _start(supervisor, records, claim="claim-b", generation=2, bearer=SECOND_BEARER)
     second_home = json.loads((records / "env.json").read_text())["HOME"]
-    assert first_home != second_home
+    assert first_home == second_home
     assert sorted(path.name for path in Path(second_home).iterdir()) == [
         "escape-dir",
         "escape-file",

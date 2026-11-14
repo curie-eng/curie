@@ -26,6 +26,8 @@ https://docs.github.com/en/rest/issues/issues#list-repository-issues
 https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
 https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue
 https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+https://docs.github.com/en/rest/issues/issues#create-an-issue
+https://docs.github.com/en/rest/issues/issues#get-an-issue
 """
 
 from __future__ import annotations
@@ -40,10 +42,18 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
-from curie_api.forges.errors import NotFound, Unauthorized, Unavailable, Unsupported
+from curie_api.forges.errors import (
+    Ambiguous,
+    ForgeError,
+    LinkedIssueUnconfirmed,
+    NotFound,
+    Unauthorized,
+    Unavailable,
+    Unsupported,
+)
 from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
 from curie_api.forges.github.marked_comments import REFUSED_STATUSES, github_request
-from curie_api.forges.github.review_polling import human_actor
+from curie_api.forges.github.review_polling import human_actor, trailing_id
 from curie_api.forges.github.transport import (
     PollUnavailable,
     get_all,
@@ -54,18 +64,29 @@ from curie_api.forges.github.transport import (
     repository_identity_matches,
 )
 from curie_api.forges.github.transport import Unavailable as TransportUnavailable
+from curie_api.forges.ports import TrackerFacts
 from curie_api.forges.types import (
     GITHUB,
     Actor,
     Disposition,
+    LinkedIssue,
     MarkedNotice,
     NoticePage,
     PullRequest,
     RepositoryRef,
+    SourceContent,
     TicketLabels,
+    TrackerComment,
     TrackerIssueRef,
+    body_sha256,
+    ends_with_marker,
+    linked_issue_body,
+    linked_issue_marker,
+    publication_url,
+    valid_output_identity,
 )
 from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_login
+from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from curie_api.github_review_truth import verify_sender_write_permission
 from curie_api.repo_full_name import repo_url_path
 
@@ -105,6 +126,16 @@ class IssueFacts:
 
     labels: set[str]
     default_branch: str | None
+
+
+@dataclass(frozen=True)
+class IssueState:
+    """One issue as GitHub answers it now (#5380): its state, its label names,
+    and whether the number is a pull request's."""
+
+    state: str | None
+    labels: frozenset[str]
+    pull_request: bool
 
 
 def last_label_event(events: list[Any], label: str) -> dict[str, Any] | None:
@@ -170,7 +201,7 @@ async def read_repository(
 def _status_error(status: int, what: str) -> Exception:
     if status == 401:
         return Unauthorized(what)
-    if status == 404:
+    if status in {404, 410}:
         return NotFound(what)
     return Unavailable(what)
 
@@ -194,6 +225,32 @@ def issue_url(html_base: str, repo_full_name: str, issue: TrackerIssueRef) -> st
     if issue.kind != GITHUB or not issue.issue_id.isascii() or not issue.issue_id.isdigit():
         raise NotFound("issue")
     return f"{html_base.rstrip('/')}/{repo_full_name}/issues/{issue.issue_id}"
+
+
+def linked_listing_params(own: str) -> dict[str, str]:
+    """The query of the linked issue lookup: every issue ``own`` created, in
+    any state, oldest first
+    (https://docs.github.com/en/rest/issues/issues#list-repository-issues).
+    ``per_page`` and ``page`` are added by the pager."""
+
+    return {"creator": own, "state": "all", "sort": "created", "direction": "asc"}
+
+
+def created_by(item: Mapping[str, Any], own: str) -> bool:
+    """Whether the listed issue's author is ``own``, the App's bot user.
+
+    The login is compared case-insensitively and the account type must be
+    ``Bot``, so a person's issue never counts even if a listing ignored the
+    ``creator`` filter.
+    """
+
+    user = item.get("user")
+    if not isinstance(user, dict):
+        return False
+    login = user.get("login")
+    return (
+        isinstance(login, str) and login.casefold() == own.casefold() and user.get("type") == "Bot"
+    )
 
 
 class GitHubTracker:
@@ -222,8 +279,14 @@ class GitHubTracker:
         label: str,
         mention: str,
         app_id: str,
+        own_login: TokenSource,
         page_size: int = 100,
     ) -> None:
+        """``own_login`` answers the login this adapter's token writes as: the
+        App's bot user ``<slug>[bot]`` (`GitHubTrackerConnection` reads the slug
+        under the App JWT). ``create_linked_issue`` counts only issues that
+        login created."""
+
         if page_size < 1:
             raise ValueError("page_size must be positive")
         self._client = client
@@ -234,8 +297,10 @@ class GitHubTracker:
         self.repository_id = repository_id
         self._repo_path = f"/repos/{repo_url_path(repo_full_name)}"
         self._token = token
+        self._own_login = own_login
         self.label = label
         self.mention = mention
+        self.app_id = app_id
         self._page_size = page_size
         self._comments = GitHubMarkedComments(
             client,
@@ -250,6 +315,89 @@ class GitHubTracker:
     @property
     def marked_comments(self) -> GitHubMarkedComments:
         return self._comments
+
+    @property
+    def facts(self) -> TrackerFacts:
+        return self
+
+    @property
+    def repository(self) -> RepositoryRef:
+        return RepositoryRef(self.kind, self.host, str(self.repository_id), self.repo_full_name)
+
+    def facts_comment(self, value: Mapping[str, Any]) -> TrackerComment | None:
+        number = trailing_id(value.get("issue_url"))
+        comment_id, body = value.get("id"), value.get("body")
+        if (
+            number is None
+            or type(comment_id) is not int
+            or comment_id <= 0
+            or not isinstance(body, str)
+        ):
+            return None
+        try:
+            actor_id, login = label_actor(
+                {
+                    "actor": value.get("user"),
+                    "performed_via_github_app": value.get("performed_via_github_app"),
+                },
+                app_id=self.app_id,
+            )
+            actor = Actor(str(actor_id), login)
+        except FeedbackIgnored:
+            actor = None
+        return TrackerComment(
+            comment_id,
+            self.issue(number),
+            body,
+            actor,
+            value.get("performed_via_github_app") is not None,
+            parse_time(value.get("updated_at")),
+        )
+
+    async def read_comment(self, comment_id: int) -> TrackerComment:
+        """Re-read request content and provenance through the installation credential."""
+        value = await self._get(f"{self._repo_path}/issues/comments/{comment_id}")
+        if not isinstance(value, dict) or value.get("id") != comment_id:
+            raise Unavailable("comment")
+        comment = self.facts_comment(value)
+        if comment is None:
+            raise Unavailable("comment")
+        return comment
+
+    async def facts_issue_is_plain(self, ref: TrackerIssueRef) -> bool:
+        number = self._number(ref)
+        try:
+            issue = await self._get(f"{self._repo_path}/issues/{number}")
+        except (NotFound, Unauthorized):
+            raise Unavailable("issue") from None
+        if (
+            not isinstance(issue, dict)
+            or type(issue.get("number")) is not int
+            or issue["number"] != number
+        ):
+            raise Unavailable("issue")
+        return "pull_request" not in issue
+
+    async def facts_writer(self, comment: TrackerComment) -> Actor | None:
+        """Reuse admission's immutable-user effective write permission check."""
+        actor = comment.actor
+        if actor is None:
+            return None
+        self._number(comment.issue)
+        try:
+            await verify_sender_write_permission(
+                self._client,
+                api=self._api,
+                token=await self._token(),
+                repo_path=self._repo_path,
+                sender_id=int(actor.id),
+                sender_login=actor.login,
+            )
+        except FeedbackIgnored as exc:
+            if exc.code == "sender_permission_unavailable":
+                raise Unavailable("actor_unreadable") from None
+            return None
+        return actor
 
     def issue(self, number: int) -> TrackerIssueRef:
         return TrackerIssueRef(GITHUB, self.host, str(self.repository_id), str(number))
@@ -453,10 +601,12 @@ class GitHubTracker:
         number = self._number(notice.issue)
         issue = await self._issue(number)
         if issue is None:
-            return False
+            return notice.disposition is Disposition.CANCEL
         names = label_names(issue) or set()
         state = issue.get("state")
         if notice.disposition is Disposition.CANCEL:
+            if state not in {"open", "closed"} or label_names(issue) is None:
+                raise Unavailable("issue_state")
             return state == "closed" or self.label not in names
         if state != "open":
             return False
@@ -516,6 +666,21 @@ class GitHubTracker:
         if content.comments_truncated:
             parts.append("_Later comments were not read._")
         return "\n\n".join(parts) + "\n"
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's title and body from one issue read, never its comments.
+
+        https://docs.github.com/en/rest/issues/issues#get-an-issue
+        An empty body reads back as null and is the empty text.
+        """
+
+        found = await self._issue(self._number(issue))
+        if found is None:
+            raise NotFound("issue")
+        title = found.get("title")
+        if not isinstance(title, str):
+            raise Unavailable("issue")
+        return SourceContent(title=title, body=_text(found.get("body")))
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
         """The issue's labels from one issue read; GitHub has no components."""
@@ -666,6 +831,201 @@ class GitHubTracker:
         ``Closes #n`` only in the issue's own repository, else ``owner/repo#n``."""
 
         return (await self.closing_reference(issue, repository),)
+
+    # Linked output issues (ADR 0277) ------------------------------------
+
+    @staticmethod
+    def embed_linked_marker(output_identity: str) -> str:
+        """How GitHub carries the linked issue marker: a hidden HTML comment."""
+
+        return f"<!-- {linked_issue_marker(output_identity)} -->"
+
+    async def _linked_matches(self, own: str, embedded: str) -> list[int]:
+        """Numbers of the repository's issues ``own`` created whose last
+        non-empty body line is ``embedded``, oldest first.
+
+        Lists repository issues filtered by creator, never the search API,
+        whose index lags a create
+        (https://docs.github.com/en/rest/issues/issues#list-repository-issues).
+        That listing returns pull requests too, marked by a ``pull_request``
+        key; they are skipped. The creator filter is the server's; the owner
+        check (`created_by`) is ours. A listing past the page bound, an own
+        item whose body is not text, or a matching item without a usable
+        number is `Unavailable`: absence is proven only by a readable listing.
+        """
+
+        items = await self._pages(f"{self._repo_path}/issues", linked_listing_params(own))
+        matches: list[int] = []
+        for item in items:
+            if (
+                not isinstance(item, dict)
+                or "pull_request" in item
+                or not created_by(item, own)
+                or not ends_with_marker(_text(item.get("body")), embedded)
+            ):
+                continue
+            number = _positive_int(item.get("number"))
+            if number is None:
+                raise Unavailable("linked_issue")
+            matches.append(number)
+        return matches
+
+    async def _create_issue(self, title: str, body: str, labels: Collection[str]) -> int | None:
+        """POST the issue; its number, or None when the answer is uncertain.
+
+        https://docs.github.com/en/rest/issues/issues#create-an-issue
+        The token is read before anything is sent, so its failure keeps its
+        type. A transport error, a 5xx, a 2xx other than 201 or an unreadable
+        201 may have created it, so it is None and the caller relists. A
+        definite refusal, which created nothing, raises: 401 or 403
+        `Unauthorized`, 404 `NotFound`, 422 ``Unavailable("unprocessable")``,
+        and any other 3xx or 4xx ``Unavailable("linked_issue")``.
+        """
+
+        template = "/repos/{owner}/{repo}/issues"
+        headers = github_headers(await self._token())
+        try:
+            response = await github_request(
+                self._client,
+                "POST",
+                f"{self._api}{self._repo_path}/issues",
+                path_template=template,
+                headers=headers,
+                json={"title": title, "body": body, "labels": sorted(set(labels))},
+                follow_redirects=False,
+            )
+        except httpx.HTTPError:
+            return None
+        status = response.status_code
+        if status in {401, 403}:
+            raise Unauthorized("linked_issue")
+        if status == 404:
+            raise NotFound("linked_issue")
+        if status == 422:
+            raise Unavailable("unprocessable")
+        if 300 <= status < 500:
+            raise Unavailable("linked_issue")
+        if status != 201:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        return _positive_int(payload.get("number")) if isinstance(payload, dict) else None
+
+    async def _single(self, own: str, embedded: str) -> int | None:
+        matches = await self._linked_matches(own, embedded)
+        if len(matches) > 1:
+            raise Ambiguous("linked_issue")
+        return matches[0] if matches else None
+
+    async def create_linked_issue(
+        self,
+        source: TrackerIssueRef,
+        *,
+        output_identity: str,
+        title: str,
+        body: str,
+        labels: Collection[str],
+        expected: TrackerIssueRef | None = None,
+        reconcile_only: bool = False,
+    ) -> LinkedIssue:
+        """One issue in this repository linked to ``source`` (ADR 0277).
+
+        The body ends with ``Related to #<source>.``, a bare same-repository
+        reference that makes GitHub's cross-reference and neither closes the
+        source nor records a dependency, then `embed_linked_marker`. The
+        modes and the error contract are the port's. The lookup is
+        `_linked_matches`; the create is `_create_issue`; every result is read
+        back (https://docs.github.com/en/rest/issues/issues#get-an-issue) for
+        its body digest, labels and ``html_url``. With ``expected`` nothing is
+        listed or created: `_recorded_issue` reads that issue directly.
+
+        Everything before `_create_issue` sends its request keeps its error
+        type. Once the request may have reached GitHub, every failure except
+        `Ambiguous` (a relist that found two) is `LinkedIssueUnconfirmed`.
+        """
+
+        if expected is not None and reconcile_only:
+            raise ValueError("expected and reconcile_only are exclusive")
+        valid_output_identity(output_identity)
+        source_number = self._number(source)
+        embedded = self.embed_linked_marker(output_identity)
+        text = linked_issue_body(body, related=f"Related to #{source_number}.", embedded=embedded)
+        own = await self._own_login()
+        if expected is not None:
+            return await self._recorded_issue(expected, own, embedded, text)
+        number = await self._single(own, embedded)
+        if number is not None:
+            return await self._linked_issue(number, text, created=False)
+        if reconcile_only:
+            raise NotFound("linked_issue")
+        written = await self._create_issue(title, text, labels)
+        # From here the create may have been written: nothing proves it absent.
+        try:
+            if written is not None:
+                return await self._linked_issue(written, text, created=True)
+            confirmed = await self._single(own, embedded)
+            if confirmed is None:
+                raise LinkedIssueUnconfirmed("linked_issue_unconfirmed")
+            return await self._linked_issue(confirmed, text, created=False)
+        except (Ambiguous, LinkedIssueUnconfirmed):
+            raise
+        except (ForgeError, httpx.HTTPError, ValueError):
+            raise LinkedIssueUnconfirmed("linked_issue_unconfirmed") from None
+
+    async def _recorded_issue(
+        self, expected: TrackerIssueRef, own: str, embedded: str, sent: str
+    ) -> LinkedIssue:
+        """The recorded output issue read directly, with no listing
+        (https://docs.github.com/en/rest/issues/issues#get-an-issue).
+
+        ``NotFound("linked_issue")`` unless it is in this repository, is not a
+        pull request, `created_by` ``own``, and its last non-empty line is
+        ``embedded``.
+        """
+
+        try:
+            number = self._number(expected)
+        except NotFound:
+            raise NotFound("linked_issue") from None
+        found = await self._issue(number)
+        if (
+            found is None
+            or not created_by(found, own)
+            or not ends_with_marker(_text(found.get("body")), embedded)
+        ):
+            raise NotFound("linked_issue")
+        return self._linked_result(number, found, sent, created=False)
+
+    async def _linked_issue(self, number: int, sent: str, *, created: bool) -> LinkedIssue:
+        found = await self._issue(number)
+        if found is None:
+            raise Unavailable("linked_issue")
+        return self._linked_result(number, found, sent, created=created)
+
+    def _linked_result(
+        self, number: int, found: dict[str, Any], sent: str, *, created: bool
+    ) -> LinkedIssue:
+        # An empty body reads back as null; anything else that is not text
+        # cannot be digested and is `Unavailable`.
+        body = _text(found.get("body"))
+        names = label_names(found)
+        if names is None:
+            raise Unavailable("linked_issue")
+        ref = self.issue(number)
+        try:
+            url = publication_url(found.get("html_url"), self._html_base)
+        except Unavailable:
+            url = issue_url(self._html_base, self.repo_full_name, ref)
+        return LinkedIssue(
+            issue=ref,
+            url=url,
+            labels=frozenset(names),
+            body_sha256=body_sha256(body),
+            sent_body_sha256=body_sha256(sent),
+            created=created,
+        )
 
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         self._number(issue)
@@ -821,19 +1181,29 @@ class GitHubTracker:
                 if issue.get("state") != "open":
                     raise FactoryRefused("issue_not_open")
                 await self._verify_mention(notice, token)
-        await verify_sender_write_permission(
-            self._client,
-            api=self._api,
-            token=token,
-            repo_path=self._repo_path,
-            sender_id=notice.sender_id,
-            sender_login=notice.sender_login,
-        )
+        if notice.disposition != "admit":
+            await verify_sender_write_permission(
+                self._client, api=self._api, token=token, repo_path=self._repo_path,
+                sender_id=notice.sender_id, sender_login=notice.sender_login,
+            )
         default_branch = repository.get("default_branch")
         return IssueFacts(
             labels=names,
             default_branch=default_branch if isinstance(default_branch, str) else None,
         )
+
+    async def label_permission(self, notice: FactoryNotice) -> str | None:
+        """Authorize a canonical actor after duplicate and delegated-output checks."""
+        try:
+            await verify_sender_write_permission(
+                self._client, api=self._api, token=await self._token(), repo_path=self._repo_path,
+                sender_id=notice.sender_id, sender_login=notice.sender_login,
+            )
+        except FeedbackIgnored as exc:
+            if exc.code == "sender_permission_refused":
+                return "actor_no_permission"
+            raise FeedbackUnavailable(exc.code) from None
+        return None
 
     async def _verify_mention(self, notice: FactoryNotice, token: str) -> None:
         comment = await get_github_json(
@@ -859,6 +1229,33 @@ class GitHubTracker:
         body = comment.get("body")
         if not isinstance(body, str) or not mentions_login(body, self.mention):
             raise FactoryRefused("ordinary_comment")
+
+    async def issue_state(self, number: int) -> IssueState:
+        """The issue's state and labels now, and whether it is a pull request (#5380).
+
+        https://docs.github.com/en/rest/issues/issues#get-an-issue: every pull
+        request is also an issue, and its issue payload carries a
+        ``pull_request`` key. A 404 is `NotFound`, which no retry changes; any
+        other failure, or a payload that does not name this issue or lists
+        malformed labels, is `Unavailable`.
+        """
+
+        issue = await self._get(f"{self._repo_path}/issues/{number}")
+        if (
+            not isinstance(issue, dict)
+            or type(issue.get("number")) is not int
+            or issue["number"] != number
+        ):
+            raise Unavailable("issue")
+        names = label_names(issue)
+        if names is None:
+            raise Unavailable("issue")
+        state = issue.get("state")
+        return IssueState(
+            state=state if isinstance(state, str) else None,
+            labels=frozenset(names),
+            pull_request="pull_request" in issue,
+        )
 
     async def issue_events(self, number: int) -> list[Any]:
         """Every event on one issue, in GitHub's order, or `Unavailable`."""

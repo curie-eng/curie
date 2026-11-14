@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/eval/v1.3.json",
+  "$id": "https://schemas.curietech.ai/cli/eval/v1.4.json",
   "title": "curie skill eval --json",
   "description": "The agent-facing payload of `curie skill eval --json`: the outcome roll-up plus one row per eval case.",
   "type": "object",
@@ -34,6 +34,38 @@
     "bundle_digest": {
       "type": ["string", "null"],
       "description": "sha256 of the tar.gz snapshot the evaluated runner mounted (#1087). Always present; null at the local/cluster tiers, which grade a deployed version rather than a locally snapshotted bundle, and on a skill run against a runner this checkout never recorded. Read it against `skill status --json`'s bundle_digest to confirm messaging and eval executed the same bundle."
+    },
+    "bundle_revision": {
+      "type": ["object", "null"],
+      "description": "The deployed bundle revision a local/cluster in-CLI run was routed to: the in-force deployment of the agent bound to the exact Slack route the turns were sent on (channel and identity), chosen with the worker's binding order (active only, then prod first, newest deployed_at, highest id), and the version it serves, read from the platform API once before the first sample and once after the last. Reported only when both reads agree, so it means the revision in force at the start and at the end, unchanged; it does not prove every sample ran on it, since a deploy and a rollback inside the run are invisible to the two reads. Null at the skill tier, which names its bundle through bundle_digest; null on a local/cluster trajectory eval, which runs on the platform eval plane; null when a lookup failed or timed out; and null when the two reads disagree. Optional: a payload from an earlier revision omits it.",
+      "additionalProperties": false,
+      "required": ["agent_id", "deployment_id", "environment", "version_id", "version_label", "commit_sha", "bundle_sha256"],
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "deployment_id": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "string",
+          "description": "The deployment environment, for example prod or dev."
+        },
+        "version_id": {
+          "type": "string"
+        },
+        "version_label": {
+          "type": "string"
+        },
+        "commit_sha": {
+          "type": ["string", "null"],
+          "description": "The commit the version was built from, when the platform recorded one."
+        },
+        "bundle_sha256": {
+          "type": ["string", "null"],
+          "description": "sha256 of the bundle archive the platform stored for this version. The same computation as the skill tier's bundle_digest, so the two match for the same packed archive."
+        }
+      }
     },
     "samples": {
       "type": "integer",
@@ -108,6 +140,64 @@
           "variance": {
             "type": "string",
             "description": "Pass count over N when n>1, e.g. '2/3 samples passed (majority)'. Omitted at n=1."
+          },
+          "trials": {
+            "type": "array",
+            "description": "The raw record of every trial (independent sample) of this case, in run order, before aggregation reduced them to `outcome`. Present when the CLI drove the trials itself (skill, and the local/cluster in-CLI path); absent when the trials ran on the platform eval plane, which reports only the reduced verdict. Absence is not zero trials.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["index", "outcome", "passed", "seconds", "reply", "tool_calls"],
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Zero-based position of this trial within its case."
+                },
+                "outcome": {
+                  "enum": ["pass", "fail", "plumbing_ok"],
+                  "description": "This trial's own verdict, before aggregation."
+                },
+                "passed": {
+                  "type": ["boolean", "null"],
+                  "description": "Tri-state view of this trial's outcome, as on the case row."
+                },
+                "seconds": {
+                  "type": "number",
+                  "description": "Wall-clock seconds for this trial alone."
+                },
+                "reply": {
+                  "type": "string",
+                  "description": "The reply text the grader judged. Empty when the turn produced none."
+                },
+                "tool_calls": {
+                  "type": ["array", "null"],
+                  "description": "The tools this trial called, in emission order. Null when the tier cannot observe tool calls: local and cluster see only the delivered reply. An empty array is an observed turn that called no tool. Only names cross the runner wire, so arguments are not reported.",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name"],
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "status": {
+                  "type": "string",
+                  "description": "How the turn ended as the tier observed it: the runner's terminal session status at the skill tier (for example done or awaiting-approval), or the reply relay's outcome at local/cluster (replied, failed, awaiting_approval, completed_no_edit, timed_out). Omitted when no terminal frame arrived."
+                },
+                "detail": {
+                  "type": "string",
+                  "description": "Scorer explanation for this trial's verdict, when the scorer has one."
+                },
+                "error": {
+                  "type": "string",
+                  "description": "Why the turn did not complete or failed in the runner, when known."
+                }
+              }
+            }
           }
         }
       }

@@ -32,11 +32,13 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 import httpx
+from curie_internal.factory_cause import cause_text as cause_text
+from curie_internal.factory_triage import TRIAGED_LABEL, HandoffOutcome, status_comment_text
 from sqlalchemy import and_, case, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -47,6 +49,13 @@ from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment, status_marker
 from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
 from .factory_reply_target import stored_reply_target
+from .factory_triage_status import (
+    delivered_triage,
+    is_tracker_result,
+    triage_delivered_sql,
+    triage_label,
+    triage_label_sql,
+)
 from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
 from .forges.errors import ForgeError, NotFound, Unauthorized
@@ -70,6 +79,7 @@ from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
     FactoryBaseTransition,
+    FactoryCiObservation,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -86,116 +96,8 @@ from .workitems.lifecycle import (
 logger = logging.getLogger(__name__)
 
 
-# The operator-facing sentence for each terminus cause (#3073). The raw code
-# still appears on the comment, but never as its headline.
-_CAUSE_TEXT = {
-    "model_credit_exhausted": (
-        "the model provider refused the request because the account has run "
-        "out of credits. Add credits or raise the key's limit, then retry."
-    ),
-    "model_usage_limited": (
-        "the model provider's usage limit for this credential was reached; "
-        "re-add the label after the limit resets."
-    ),
-    "model_credential_rejected": (
-        "the model provider rejected the configured API key. Check the model "
-        "credential, then retry."
-    ),
-    "model_rate_limited": (
-        "the model provider kept rate limiting the request. Retry later or raise "
-        "the provider limit."
-    ),
-    "model_error": "the model provider returned an error the run could not recover from.",
-    "model_unreachable": (
-        "the model provider could not be reached. Check the runner's network path "
-        "to the model endpoint, then retry."
-    ),
-    "budget_exceeded": "the run reached a budget limit before it finished.",
-    "runner_timeout": "the run took longer than its time limit.",
-    "sandbox_terminated": (
-        "the sandbox terminated before the run finished. Check the Kubernetes "
-        "reason below, then retry after addressing the sandbox failure."
-    ),
-    "workspace_error": "the repository workspace could not be prepared for the run.",
-    "history_capacity": (
-        "conversation history capacity exceeded. Work may have happened. "
-        "Inspect the result and retry."
-    ),
-    "runner_escalated": "the run stopped on an error and was handed to a person.",
-    "pull_request_not_adopted": (
-        "an earlier pull request on this issue could not be continued. "
-        "A person should close or merge it, then re-add the label."
-    ),
-    "unclassified": (
-        "the run failed and Curie could not name a more specific cause. "
-        "Read the worker log for the provider message, then retry or hand it to a person."
-    ),
-    "max_turns": (
-        "the run used its whole turn budget. Raise worker.workItemMaxTurns "
-        "(CURIE_WORK_ITEM_MAX_TURNS) to allow more turns, then retry."
-    ),
-    "runner_failed": "the run ended without a result.",
-    "approval_create_failed": (
-        "the publication request was refused, so no pull request was opened. "
-        "Read the details for the reason, fix it, then retry."
-    ),
-    "early_stop": "the agent stopped before doing any work on the issue.",
-    "no_pull_request": "the run ended without publishing a pull request.",
-    "revision_unchanged": (
-        "the existing pull request is unchanged because this revision published nothing."
-    ),
-    "execution_deadline": "the run did not finish before its deadline.",
-    "capacity_wait_expired": "sandbox admission did not complete before the wait expired.",
-    "start_failed": "the sandbox did not start.",
-    "owner_lost": "the worker running this request stopped responding.",
-    # Personal Claude execution (#5377, ADR 0268 section 3).
-    "enrollment_fenced": (
-        "the run was stopped because its owner replaced or disconnected their personal "
-        "Claude enrollment. The work is kept; the owner reconnects or replaces the "
-        "enrollment, then resumes it."
-    ),
-    "authentication_required": (
-        "the owner's personal Claude grant was missing or refused by the model provider. "
-        "The work is kept; the owner reconnects or replaces the personal Claude "
-        "enrollment, then resumes it."
-    ),
-    "issue_cancelled": "the request was cancelled.",
-    "issue_deleted": "the tracker issue no longer exists.",
-    "publication_denied": "a person denied the request to open the pull request.",
-    "publication_expired": (
-        "the request to open the pull request expired before anyone approved it."
-    ),
-    "publication_failed": (
-        "publishing the pull request failed. A branch or pull request from this run may still "
-        "exist; check the repository before retrying."
-    ),
-    "publication_unrecorded": (
-        "the agent tried to publish its change, but no valid publication was recorded. "
-        "The Details line below gives the reason; the pull request, if any, is unchanged."
-    ),
-    "ci_failed": (
-        "the pull request's checks still failed after 3 rounds of fixes. The pull "
-        "request stays open for a person."
-    ),
-    "ci_timeout": (
-        "the pull request's checks did not finish before the CI wait ran out. The "
-        "pull request stays open."
-    ),
-    "ci_unverified": (
-        "the pull request's CI could not be verified, so the run did not complete. "
-        "The Reason line below says why. The pull "
-        "request stays open; check it yourself."
-    ),
-    "merge_conflict": (
-        "the pull request has merge conflicts with its base branch, so GitHub ran "
-        "no pull request checks. The pull request stays open; resolve the conflicts "
-        "to continue."
-    ),
-    "pr_closed": "a person closed the pull request without merging it during the CI wait.",
-    "ci_fix_unpublished": (
-        "a CI fix round ended without pushing a fix. The pull request stays open."
-    ),
-}
+# Cause sentences live in curie_internal.factory_cause. cause_text is
+# re-exported above so existing callers keep importing it from this module.
 
 # The detail of these causes is text returned by the model service; every other
 # cause that prints a detail labels it "Details".
@@ -211,7 +113,9 @@ _PROVIDER_MESSAGE_CAUSES = frozenset(
 )
 # A run that ended without publishing carries the agent's own last message
 # (#3128). Quote each line and neutralize HTML, image syntax and mentions.
-_AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request", "revision_unchanged"})
+_AGENT_MESSAGE_CAUSES = frozenset(
+    {"early_stop", "no_pull_request", "revision_unchanged", "ci_fix_unpublished"}
+)
 # Wire classification a text-only consumer reads off the status comment (#3401).
 # Same tokens as the channel reply's ``curie-turn-failure:`` line. Causes with
 # no entry stay unlabeled rather than inventing a class.
@@ -249,12 +153,6 @@ _USD_BUDGET_DETAIL = re.compile(
 # phrase (``Acme Research Team``) is. A slug still matches in any case.
 # ``workspace=acme`` is an assignment, not diagnostic prose, so the value may
 # be a plain word. The colon form stays on ``_PROVIDER_WORKSPACE``.
-
-
-def cause_text(cause: str) -> str:
-    """A plain sentence for a terminus cause; unknown codes get a generic one."""
-
-    return _CAUSE_TEXT.get(cause, "the run stopped for a reason Curie did not recognize.")
 
 
 def start_failed_sentence(attempts: int, reason: str) -> str:
@@ -324,7 +222,7 @@ def render_base_line(
 async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UUID) -> None:
     """Let the reconciler edit the latest status comment once more.
 
-    A selected or requested base change must reach a comment that was already
+    A base or publication change must reach a comment that was already
     finalized. A sync holding the lease is flagged so its writeback leaves the
     row due. The comment re-finalizes after the edit.
     """
@@ -354,14 +252,23 @@ async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UU
     )
 
 
-# The four state labels the pass owns (#3077, #3221). A closed set, never a
-# prefix match: human labels, including other ``curie:`` labels, are never
-# touched.
+async def mark_lineage_status_comment_stale(session: AsyncSession, lineage_id: uuid.UUID) -> None:
+    work_item_id = await session.scalar(
+        select(WorkItem.id).where(WorkItem.publication_lineage_id == lineage_id)
+    )
+    if work_item_id is not None:
+        await mark_status_comment_stale(session, work_item_id)
+
+
+# The state labels the pass owns (#3077, #3221; triaged since #5586). A closed
+# set, never a prefix match: human labels, including other ``curie:`` labels,
+# are never touched.
 STATE_LABELS = (
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
+    TRIAGED_LABEL,
 )
 LEGACY_STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
 _DESIRED_LABEL = {
@@ -372,7 +279,7 @@ _DESIRED_LABEL = {
     "completed": "curie-factory:pr-open",
     "failed": "curie-factory:needs-human",
     "expired": "curie-factory:needs-human",
-    # Cancelled clears the current four and the legacy four; '' records that nothing is applied.
+    # Cancelled clears the current labels and the legacy four; '' records that nothing is applied.
     "cancelled": "",
 }
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
@@ -385,9 +292,29 @@ _PAUSED_FOR_UPGRADE_LINE = (
 )
 
 
-def desired_label(status: str) -> str:
-    """The state label for a request status; '' means none of the four."""
+def desired_label(
+    status: str,
+    *,
+    pr_state: str | None = None,
+    tracker_result: bool = False,
+    result_delivered: bool = False,
+    work_item_cancelled: bool = False,
+) -> str:
+    """The state label for a request status; '' means none of the state labels.
 
+    A tracker-result request shows triaged once its result is delivered and
+    never pr-open (``factory_triage_status.triage_label``); an implementation
+    request's mapping is unchanged.
+    """
+
+    if tracker_result:
+        label = triage_label(
+            status, delivered=result_delivered, work_item_cancelled=work_item_cancelled
+        )
+        if label is not None:
+            return label
+    if status in {"failed", "expired"} and pr_state == "merged":
+        return ""
     return _DESIRED_LABEL.get(status, "")
 
 
@@ -414,9 +341,7 @@ def result_section(
     if cause == "completed":
         if unchanged:
             if feedback_url is not None:
-                text = (
-                    "No changes needed: this pull request already covers the requested revision.\n"
-                )
+                text = "No changes needed: this pull request is unchanged.\n"
             elif isinstance(pr_url, str) and pr_url.strip():
                 text = (
                     "No changes needed: the open pull request already covers this request: "
@@ -581,14 +506,14 @@ def _agent_message_block(message: str) -> str:
     return f"Agent's last message:\n{quoted}\n\n"
 
 
-def _escape_markdown(value: str) -> str:
+def escape_markdown(value: str) -> str:
     return "".join(f"\\{char}" if char in _MARKDOWN_SPECIAL else char for char in value)
 
 
 def _checklist(view: PhaseView, *, final: bool) -> list[str]:
     lines: list[str] = []
     for slot in view.phases:
-        label = _escape_markdown(slot.label)
+        label = escape_markdown(slot.label)
         if slot.state == "done":
             lines.append(f"- [x] {label}")
         elif slot.state == "current":
@@ -645,12 +570,40 @@ def status_body(
     return redact_factory_comment("\n\n".join(parts) + "\n")
 
 
-def _digest(body: str) -> str:
+def lease_available(owner: Any, expires_at: Any) -> Any:
+    return or_(owner.is_(None), expires_at <= func.clock_timestamp())
+
+
+def body_digest(body: str) -> str:
     return hashlib.sha256(body.encode()).hexdigest()
+
+
+def completed_proof() -> Any:
+    """SQL predicate shared by status selection and item projections."""
+
+    return exists().where(
+        FactoryCiObservation.request_id == ExecutionRequest.id,
+        FactoryCiObservation.status == "completed",
+        FactoryCiObservation.lineage_id == WorkItem.publication_lineage_id,
+        FactoryCiObservation.head_sha == ThreadPublicationLineage.head_sha,
+        ThreadPublicationLineage.status == "open",
+        WorkItem.cancelled_at.is_(None),
+    )
 
 
 def _desired_label_sql() -> Any:
     return case(
+        *triage_label_sql(),
+        (
+            and_(
+                ExecutionRequest.status.in_(("failed", "expired")),
+                ThreadPublicationLineage.status == "merged",
+                ThreadPublicationLineage.pr_number.is_not(None),
+                ThreadPublicationLineage.pr_url.is_not(None),
+            ),
+            literal(""),
+        ),
+        (completed_proof(), literal("curie-factory:pr-open")),
         *[
             (ExecutionRequest.status == status, literal(label))
             for status, label in _DESIRED_LABEL.items()
@@ -743,10 +696,14 @@ class _StatusClaim:
     opened_pr: int | None
     work_item_id: uuid.UUID
     status: str
+    pr_state: str | None
     target: ReplyTarget
     body: str
     latest: bool
     now: datetime
+    tracker_result: bool = False
+    result_delivered: bool = False
+    work_item_cancelled: bool = False
 
 
 async def _claim_next(
@@ -784,7 +741,10 @@ async def _claim_next(
                 ExecutionRequest,
                 ThreadPublicationLineage.pr_url,
                 ThreadPublicationLineage.pr_number,
+                ThreadPublicationLineage.status,
                 is_latest.label("is_latest"),
+                triage_delivered_sql().label("result_delivered"),
+                _desired_label_sql().label("desired_label"),
             )
             .join(WorkItem, WorkItem.id == FactoryStatusComment.work_item_id)
             .join(
@@ -799,9 +759,8 @@ async def _claim_next(
                 FactoryStatusComment.refused_at.is_(None),
                 ExecutionRequest.objective.is_not(None),
                 or_(FactoryStatusComment.finalized_at.is_(None), label_due),
-                or_(
-                    FactoryStatusComment.sync_owner.is_(None),
-                    FactoryStatusComment.sync_lease_expires_at <= func.clock_timestamp(),
+                lease_available(
+                    FactoryStatusComment.sync_owner, FactoryStatusComment.sync_lease_expires_at
                 ),
                 FactoryStatusComment.execution_request_id.not_in(attempted_ids),
             )
@@ -815,7 +774,11 @@ async def _claim_next(
     ).one_or_none()
     if selected is None:
         return None
-    row, work_item, request, pr_url, pr_number, latest = selected
+    row, work_item, request, pr_url, pr_number, pr_state, latest, result_delivered, label = selected
+    if pr_number is None or not pr_url:
+        pr_state = None
+    if pr_state == "merged" and request.status in {"failed", "expired"}:
+        row.finalized_at = None
     now = await _clock(session)
     await session.execute(
         update(FactoryStatusComment)
@@ -854,6 +817,7 @@ async def _claim_next(
         request,
         target,
         pr_url=pr_url,
+        pr_state=pr_state,
         paused_for_upgrade=paused_for_upgrade,
     )
     claim = _StatusClaim(
@@ -864,11 +828,15 @@ async def _claim_next(
         tracker_issue=work_item.tracker_issue,
         opened_pr=opened_pr,
         work_item_id=work_item.id,
-        status=request.status,
+        status="completed" if label == "curie-factory:pr-open" else request.status,
+        pr_state=pr_state,
         target=target,
         body=body,
         latest=bool(latest),
         now=now,
+        tracker_result=is_tracker_result(request),
+        result_delivered=bool(result_delivered),
+        work_item_cancelled=work_item.cancelled_at is not None,
     )
     session.expunge(row)
     return claim
@@ -1024,7 +992,7 @@ async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _Stat
     """
 
     row, target, body, now = claim.row, claim.target, claim.body, claim.now
-    digest = _digest(body)
+    digest = body_digest(body)
     pr = claim.opened_pr
     link = pr is not None and (
         tracker.capabilities.get(Operation.LINK_PULL_REQUEST) == Support.SUPPORTED
@@ -1032,6 +1000,8 @@ async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _Stat
     linked = f"{digest}:{pr}"
     stored = row.rendered_digest
     if stored == (linked if link else digest):
+        if FINAL_MARKER in body:
+            row.finalized_at = now
         return 0
     already = link and stored is not None and stored.endswith(f":{pr}")
     try:
@@ -1091,12 +1061,12 @@ async def _sync_comment(
         row.comment_list = comment_list
         row.posted_at = now
         # A comment found by its marker carries an unknown body: edit it below.
-        row.rendered_digest = _digest(body) if created else None
+        row.rendered_digest = body_digest(body) if created else None
         writes += int(created)
-    if row.rendered_digest != _digest(body):
+    if row.rendered_digest != body_digest(body):
         edited = await patch_comment(github, row, body)
         if edited == "edited":
-            row.rendered_digest = _digest(body)
+            row.rendered_digest = body_digest(body)
             writes += 1
         elif edited == "gone":
             # A person deleted the comment: re-create it next pass, marker scan first.
@@ -1150,12 +1120,20 @@ async def _render(
     target: ReplyTarget,
     *,
     pr_url: str | None,
+    pr_state: str | None = None,
     paused_for_upgrade: bool = False,
+    handoff: HandoffOutcome | None = None,
 ) -> str:
+    """The status comment body. ``handoff`` is the implementation handoff of a
+    delivered ticket, which #5588 records; until then only tests pass one."""
+
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
     retrying = False
-    if request.terminal_at is not None and cause:
+    triage = await _terminal_triage_text(session, work_item, request, handoff)
+    if triage is not None:
+        result = triage
+    elif request.terminal_at is not None and cause:
         cause = cause.strip()
         if cause == "pull_request_not_adopted":
             selected_pr = (
@@ -1233,6 +1211,13 @@ async def _render(
                 lost_retried=retrying,
                 run_cost_usd=run_cost_usd,
             )
+            if (
+                request.status in {"failed", "expired", "cancelled"}
+                and pr_url
+                and pr_state in {"open", "merged", "closed"}
+            ):
+                state = "closed without merging" if pr_state == "closed" else pr_state
+                result += f"Pull request: {pr_url} ({state})\n"
             # Tokens and estimated cost over every round of the work item
             # (#3223), after the Cause line so its parse is unchanged.
             line = usage_line(usage)
@@ -1331,7 +1316,56 @@ async def _render(
         body = redact_factory_comment(
             f"Continuing on the existing pull request: {pr_url}\n\n{body}"
         )
+    observation = await session.get(FactoryCiObservation, request.id)
+    if observation is not None:
+        until = observation.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if observation.status == "observing":
+            line = f"Checks are still being watched until {until}."
+        elif observation.status == "completed" and observation.observed_at is not None:
+            when = observation.observed_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+            line = (
+                f"Checks passed on head {code_span(observation.head_sha)}, "
+                f"observed at {when} after the run ended."
+            )
+        elif observation.status == "expired":
+            line = "Checks were not verified within 24 hours."
+        else:
+            line = f"Checks were not verified: {code_span(observation.reason or 'invalidated')}."
+        body += f"\n\n{line}"
     return body
+
+
+async def _terminal_triage_text(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    handoff: HandoffOutcome | None,
+) -> str | None:
+    """A finished tracker-result request's delivered ending, or None.
+
+    None leaves the existing terminal text: a request still live, cancelled,
+    an implementation request, or one whose result was not delivered (it
+    renders as failed or expired).
+    """
+
+    if (
+        request.terminal_at is None
+        or request.status == "cancelled"
+        or not is_tracker_result(request)
+    ):
+        return None
+    delivered = await delivered_triage(session, request.id)
+    if delivered is None:
+        return None
+    try:
+        text = status_comment_text(delivered, handoff)
+    except ValueError:
+        logger.warning("factory status comment: request %s has an unrenderable result", request.id)
+        return None
+    line = usage_line(await work_item_usage(session, work_item.id))
+    if line is not None:
+        text += line + "\n"
+    return text
 
 
 async def _superseded(
@@ -1355,7 +1389,7 @@ async def _superseded(
 async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     """Add the desired state label and remove the others, on the issue.
 
-    Only the four state labels are ever written. Legacy deletes stay
+    Only the state labels are ever written. Legacy deletes stay
     unconditional: a new request starts with applied_label NULL, and the issue
     may still carry a legacy name. A refused write is logged and given up; any
     other failure is retried next pass.
@@ -1364,7 +1398,13 @@ async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     row = claim.row
     if row.applied_label == "":
         return 0
-    desired = desired_label(claim.status)
+    desired = desired_label(
+        claim.status,
+        pr_state=claim.pr_state,
+        tracker_result=claim.tracker_result,
+        result_delivered=claim.result_delivered,
+        work_item_cancelled=claim.work_item_cancelled,
+    )
     if row.applied_label == desired:
         return 0
     issue = claim.tracker_issue

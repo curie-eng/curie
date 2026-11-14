@@ -76,7 +76,7 @@ from curie_api.forges.types import (
     publication_body,
     status_key,
 )
-from curie_api.github_app import GitHubAppError
+from curie_api.github_app import GitHubAppError, GitHubInstallationRefused
 from curie_api.publication_policy import is_publication_branch
 from curie_api.repo_full_name import repo_url_path
 from curie_api.repository_auth import resolve_repository_credential
@@ -219,20 +219,6 @@ def _check_id(item: Mapping[str, Any]) -> str | None:
     return str(value) if type(value) is int and value > 0 else None
 
 
-def _later_run(candidate: NormalizedCheck, earlier: NormalizedCheck) -> bool:
-    if candidate.key != earlier.key or candidate.head_sha != earlier.head_sha:
-        return False
-    if candidate.started_at is None or earlier.started_at is None:
-        return False
-    if candidate.started_at != earlier.started_at:
-        return candidate.started_at > earlier.started_at
-    return (
-        candidate.check_id is not None
-        and earlier.check_id is not None
-        and int(candidate.check_id) > int(earlier.check_id)
-    )
-
-
 def base_rollup(detail: ci.CiDetail) -> CiRollup | None:
     """The checks read on the base branch head (#4105), or None when not read."""
 
@@ -240,6 +226,58 @@ def base_rollup(detail: ci.CiDetail) -> CiRollup | None:
         return None
     base = replace(detail, check_runs=detail.base_check_runs, statuses=detail.base_statuses)
     return CiRollup.on_head(detail.base_sha, normalize_checks(base, detail.base_sha))
+
+
+def _latest_ci_entries(
+    entries: list[dict[str, Any]], head_sha: str, *, statuses: bool = False
+) -> list[dict[str, Any]]:
+    """Retain ambiguous ordering rather than guessing which evidence is newest.
+
+    Failed checks require the same suite to prove replacement. Pending runs
+    remain evidence; cancelled runs retain their existing supersession rule.
+    https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+    https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference
+    """
+
+    def identity(entry: dict[str, Any]) -> tuple[Any, ...]:
+        if statuses:
+            return (entry.get("context"),)
+        app = entry.get("app")
+        app_id = (app.get("id") or app.get("slug")) if isinstance(app, dict) else None
+        if app_id is None:
+            app_id = ("unidentified", id(entry))
+        return app_id, entry.get("name"), entry.get("head_sha") or head_sha
+
+    def later(candidate: dict[str, Any], earlier: dict[str, Any]) -> bool:
+        key = "created_at" if statuses else "started_at"
+        left, right = _timestamp(candidate.get(key)), _timestamp(earlier.get(key))
+        if left is None or right is None:
+            return False
+        if left != right:
+            return left > right
+        left_id, right_id = _check_id(candidate), _check_id(earlier)
+        return left_id is not None and right_id is not None and int(left_id) > int(right_id)
+
+    def supersedes(candidate: dict[str, Any], earlier: dict[str, Any]) -> bool:
+        if identity(candidate) != identity(earlier):
+            return False
+        if not statuses:
+            state = _run_state(earlier)
+            if state is CheckState.PENDING:
+                return False
+            if state is not CheckState.CANCELLED:
+                suite, replacement = earlier.get("check_suite"), candidate.get("check_suite")
+                suite_id = _check_id(suite) if isinstance(suite, dict) else None
+                replacement_id = _check_id(replacement) if isinstance(replacement, dict) else None
+                if suite_id is None or suite_id != replacement_id:
+                    return False
+        return later(candidate, earlier)
+
+    return [
+        entry
+        for entry in entries
+        if not any(supersedes(other, entry) for other in entries)
+    ]
 
 
 def normalize_checks(detail: ci.CiDetail, head_sha: str) -> tuple[NormalizedCheck, ...]:
@@ -250,7 +288,7 @@ def normalize_checks(detail: ci.CiDetail, head_sha: str) -> tuple[NormalizedChec
     """
 
     checks: list[NormalizedCheck] = []
-    for run in detail.check_runs:
+    for run in _latest_ci_entries(detail.check_runs, head_sha):
         name = _text(run.get("name"))
         reported = run.get("head_sha")
         url = run.get("details_url") or run.get("html_url")
@@ -270,13 +308,7 @@ def normalize_checks(detail: ci.CiDetail, head_sha: str) -> tuple[NormalizedChec
                 native=isinstance(app, dict) and app.get("slug") == ACTIONS_APP_SLUG,
             )
         )
-    checks = [
-        check
-        for check in checks
-        if check.state is not CheckState.CANCELLED
-        or not any(_later_run(candidate, check) for candidate in checks)
-    ]
-    for item in detail.statuses:
+    for item in _latest_ci_entries(detail.statuses, head_sha, statuses=True):
         context = _text(item.get("context"))
         url = item.get("target_url")
         checks.append(
@@ -406,7 +438,7 @@ def _log_refusal(
     """Keep GitHub's diagnostics for an operator (#4159) without carrying them
     across the port: the status, request id and a clipped ``message``.
 
-    ``diagnostics`` is false for a CI read whose refusal must not put a response
+    ``diagnostics`` is false for a read whose refusal must not put a response
     body or request header into a log (#5222); only the method, the named
     operation and the status are then recorded, and neither the repository path
     nor any response text can reach an operator-facing log.
@@ -651,7 +683,13 @@ class GitHubCodeHost:
             if not hint:
                 raise NotFound("repository_not_bound")
             path = f"/repositories/{project_id}"
-        payload = await self._json("GET", path, token=await self._token(hint))
+        payload = await self._json(
+            "GET",
+            path,
+            token=await self._token(hint),
+            operation="resolve_repository",
+            diagnostics=False,
+        )
         if not isinstance(payload, dict):
             raise Unavailable("malformed_response")
         repository_id, full_name = payload.get("id"), payload.get("full_name")
@@ -668,6 +706,26 @@ class GitHubCodeHost:
             raise NotFound("repository_mismatch")
         return RepositoryRef(
             self.kind, self.host, str(repository_id), full_name, default_branch=default_branch
+        )
+
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        if repository.kind != self.kind or repository.host != self.host:
+            raise NotFound("repository")
+        try:
+            _, token = await run_in_threadpool(
+                self._credentials.fresh_installation_token, repository.path, None
+            )
+        except GitHubInstallationRefused:
+            raise Unauthorized("installation_credential_refused") from None
+        except GitHubAppError:
+            raise Unavailable("installation_credential_unavailable") from None
+        return Credential(
+            origin=self._html,
+            header=CredentialHeader.AUTHORIZATION_BASIC,
+            secret=token,
+            scope=CredentialScope.PUSH,
+            expiry=CredentialExpiry.UNKNOWN,
+            username="x-access-token",
         )
 
     async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:

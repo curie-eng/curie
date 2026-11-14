@@ -1397,7 +1397,8 @@ def test_missing_execution_relation_cannot_use_repository_default(
     query = (
         "UPDATE curie.publications SET execution_request_id = :missing WHERE id = :id"
         if missing == "execution-request"
-        else "UPDATE curie.execution_requests SET work_item_id = :missing WHERE id = :request"
+        else "UPDATE curie.execution_requests SET work_item_id = :missing, "
+        "coding_instructions_selection_id = :missing WHERE id = :request"
     )
     work_item_id = with_session(
         lambda session: session.scalar(
@@ -1434,7 +1435,8 @@ def test_missing_execution_relation_cannot_use_repository_default(
                 await session.execute(text("SET LOCAL session_replication_role = replica"))
                 await session.execute(
                     text(
-                        "UPDATE curie.execution_requests SET work_item_id = :item "
+                        "UPDATE curie.execution_requests SET work_item_id = :item, "
+                        "coding_instructions_selection_id = :item "
                         "WHERE id = :request"
                     ),
                     {"item": work_item_id, "request": original},

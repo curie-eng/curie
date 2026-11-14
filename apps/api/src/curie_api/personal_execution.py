@@ -6,12 +6,13 @@ ExecutionRequest snapshots it at insertion.
 
 1. The tuple is fixed when the WorkItem is created, from validated admission
    facts. A service tuple names the agent's tenant and no owner. A personal
-   tuple names an owner the trusted internal admission supplied, verified in
+   tuple names an owner the trusted admission supplied, verified in
    the inserting transaction: the owner's tenant is the agent's and active,
    the principal is active in it, and its ``personal_claude_enrollments`` row
    is active at exactly the named generation. Personal mode is never inferred
-   from an enrollment, and no requester text, issue text or event author is
-   read to choose an owner.
+   from an enrollment, and no requester text or issue text is read to choose
+   an owner. GitHub label admission resolves the verified label actor through
+   an existing account link before supplying this context.
 2. Every request copies the locked WorkItem's tuple (``snapshot_columns``).
 3. Facts arriving for an existing WorkItem never change its tuple. Service
    facts reuse it; personal facts without an owner reuse it only when it is

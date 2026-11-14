@@ -31,6 +31,7 @@ https://docs.github.com/en/rest/using-the-rest-api/getting-started-with-the-rest
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, replace
@@ -50,9 +51,12 @@ from curie_api.factory_label_reconcile import (
     tracker_work_item_repositories,
 )
 
-from . import github_factory
+from . import factory_intake_notices, github_factory
 from .config import Settings
-from .forges.errors import Unavailable
+from .factory_facts import FACTS_DEADLINE_SECONDS
+from .factory_facts_exchange import FactsExchange
+from .factory_facts_schema import REQUEST_MARKER
+from .forges.errors import NotFound, Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND
 from .forges.github.comments import static_token
 from .forges.github.review_polling import (
@@ -106,6 +110,7 @@ async def _label_already_admitted(
     sessionmaker: async_sessionmaker[AsyncSession],
     issue: TrackerIssueRef,
     event: dict[str, Any],
+    installation_id: int,
 ) -> bool:
     """True when this label event is not newer than the work item's latest request.
 
@@ -119,7 +124,10 @@ async def _label_already_admitted(
         return False
     async with sessionmaker() as session:
         item = await github_factory.work_item_for(session, issue)
-        if item is None or item.cancelled_at is not None:
+        if (
+            item is None or item.cancelled_at is not None
+            or item.code_host_installation_id != installation_id
+        ):
             return False
         latest = await session.scalar(
             select(ExecutionRequest.created_at)
@@ -356,12 +364,8 @@ async def _admit_labeled(
         try:
             events = await tracker.issue_events(number)
             event = last_label_event(events, label)
-            if event is None or type(event.get("id")) is not int:
-                continue
-            sender = human_actor(event)
-            if sender is None:
-                continue
-            sender_id, sender_login = sender
+            if event is None:
+                raise FeedbackUnavailable("label_events_unavailable")
             notice = FactoryNotice(
                 uuid.uuid4(),
                 "issues",
@@ -371,15 +375,21 @@ async def _admit_labeled(
                 repository_id,
                 repo,
                 number,
-                sender_id,
-                sender_login,
+                0,
+                "",
                 label_event_at=parse_time(event.get("created_at")),
                 label=label,
-                label_event_id=event["id"],
             )
-            if await _label_already_admitted(sessionmaker, tracker.issue(number), event):
+            notice = factory_intake_notices.observe_label(notice, event, app_id=tracker.app_id)
+            if notice.actor_refusal is not None:
+                logger.info(
+                    "factory label actor refused %s#%d: %s", repo, number, notice.actor_refusal
+                )
+            if await _label_already_admitted(
+                sessionmaker, tracker.issue(number), event, installation_id
+            ):
                 # Reconcile an observed base edit on the existing work item.
-                notice = replace(notice, disposition="base_label")
+                notice = replace(notice, previously_admitted=True)
             await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             deferred = True
@@ -409,18 +419,22 @@ async def _cancel_stale(
                 )
             )
         )
+        kickoff = await github_factory.kickoff_work_items(session, [item.id for item in items])
         # Each WorkItem against the label that admitted it (#4361 decision 10).
-        admitting: dict[int, str] = {}
+        # A Slack kickoff's WorkItem has none (#5380): it is watched for its
+        # issue closing alone, so no label removal, earlier or later, cancels it.
+        watched: dict[int, str | None] = {}
         for item in items:
-            label = github_factory.admitting_label(registry, item)
-            if label is not None:
-                admitting[int(item.tracker_issue_id)] = label
-    keys = {f"issue:{number}:{label}" for number, label in admitting.items()}
+            label = github_factory.admitting_label(registry, item, kickoff_items=kickoff)
+            if label is not None or item.id in kickoff:
+                watched[int(item.tracker_issue_id)] = label
+    keys = {_etag_key(number, label) for number, label in watched.items()}
     for key in list(cursor.etags):
         if key.startswith("issue:") and key not in keys:
             del cursor.etags[key]
-    for number, label in sorted(admitting.items()):
-        key = f"issue:{number}:{label}"
+    for number in sorted(watched):
+        label = watched[number]
+        key = _etag_key(number, label)
         try:
             issue, etag = await tracker.conditional_issue(number, cursor.etags.get(key))
             if issue is None or "pull_request" in issue:
@@ -430,7 +444,7 @@ async def _cancel_stale(
                 raise Unavailable(f"issue {number}")
             if issue.get("state") == "closed":
                 action, kind = "closed", "closed"
-            elif label not in names:
+            elif label is not None and label not in names:
                 action, kind = "unlabeled", "unlabeled"
             else:
                 if etag:
@@ -464,6 +478,12 @@ async def _cancel_stale(
             await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             logger.info("factory stale issue poll for %s issue %s deferred", repo, number)
+
+
+def _etag_key(number: int, label: str | None) -> str:
+    """The ETag key of one watched issue; a kickoff's carries no label (#5380)."""
+
+    return f"issue:{number}" if label is None else f"issue:{number}:{label}"
 
 
 def _in_scope(tracker: GitHubTracker) -> tuple[ColumnElement[bool], ...]:
@@ -506,10 +526,34 @@ async def _admit_mentions(
     repository."""
 
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
+    facts = FactsExchange(sessionmaker, settings, tracker.facts)
+    if serves:
+        await facts.recover_owed()
+    retried: set[int] = set()
+    for key in list(cursor.etags):
+        if not key.startswith("facts-retry:"):
+            continue
+        retry_id = trailing_id(key.replace(":", "/"))
+        if retry_id is None:
+            cursor.etags.pop(key, None)
+            continue
+        retried.add(retry_id)
+        try:
+            async with asyncio.timeout(FACTS_DEADLINE_SECONDS):
+                comment = await tracker.read_comment(retry_id)
+                if not await facts.observe(comment, serves=serves):
+                    retried.discard(retry_id)
+        except NotFound:
+            cursor.etags.pop(key, None)
+        except Exception:  # noqa: BLE001 - retry one facts comment without replaying feedback
+            logger.info("factory facts observation deferred reason=unreadable")
+        else:
+            cursor.etags.pop(key, None)
     listed, etag = await tracker.issue_comments_since(
         since_param(cursor.comments_since, now), cursor.etags.get("issue-comments")
     )
     if listed is None:
+        await facts.deliver_owed()
         return
     factory_issues = await _issue_numbers(sessionmaker, tracker) if serves else set()
     owned_pulls = set(
@@ -520,6 +564,23 @@ async def _admit_mentions(
     for comment in listed:
         if not isinstance(comment, dict):
             continue
+        body = comment.get("body")
+        if comment.get("id") in retried:
+            continue
+        if (
+            isinstance(body, str)
+            and REQUEST_MARKER in body
+            and trailing_id(comment.get("issue_url")) not in owned_pulls
+        ):
+            try:
+                if await facts.observe(tracker.facts_comment(comment), serves=serves):
+                    continue
+            except (Unavailable, FeedbackUnavailable):
+                comment_id = comment.get("id")
+                if type(comment_id) is int and comment_id > 0:
+                    cursor.etags[f"facts-retry:{comment_id}"] = "pending"
+                logger.info("factory facts observation deferred reason=unreadable")
+                continue
         if comment.get("performed_via_github_app") is not None:
             continue
         sender = human_actor({"user": comment.get("user")})
@@ -576,6 +637,7 @@ async def _admit_mentions(
             comment_body=body,
         )
         await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
+    await facts.deliver_owed()
     cursor.comments_since = advance(cursor.comments_since, listed, "created_at", "updated_at")
     if etag:
         cursor.etags["issue-comments"] = etag
@@ -621,6 +683,12 @@ async def _apply_notice(
             await session.rollback()
             return
         await session.commit()
+    await factory_intake_notices.sync_intake_notices(
+        sessionmaker,
+        settings,
+        owner="poll-intake",
+        client=client,
+    )
 
 
 @dataclass(frozen=True)

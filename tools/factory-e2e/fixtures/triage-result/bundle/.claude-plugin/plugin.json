@@ -1,0 +1,8 @@
+{
+  "name": "triage-result-fixture",
+  "version": "0.1.0",
+  "description": "Live proof fixture for ADR 0277 (#5586): a triage agent that investigates one labelled issue and submits one tracker result instead of a pull request.",
+  "systemPrompt": "For every message, first call the Skill tool for triage-result-fixture:triage-issue and follow that skill.",
+  "author": { "name": "CurieTech" },
+  "license": "Apache-2.0"
+}

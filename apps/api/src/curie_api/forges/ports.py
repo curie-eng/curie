@@ -23,6 +23,7 @@ from curie_api.forges.types import (
     EvidenceFile,
     FactoryPublication,
     FeedbackPage,
+    LinkedIssue,
     MarkedComment,
     MarkedNotice,
     NoticePage,
@@ -34,8 +35,10 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    SourceContent,
     StoredEvidence,
     TicketLabels,
+    TrackerComment,
     TrackerIssueRef,
     UpsertResult,
 )
@@ -75,6 +78,34 @@ class MarkedComments(Protocol):
         ...
 
 
+class FactsComments(MarkedComments, Protocol):
+    """Optional label-scoped comments whose request attributes change in place."""
+
+    async def find_facts(self, target: ReplyTarget, prefix: str) -> MarkedComment | None: ...
+
+    async def upsert_facts(
+        self, target: ReplyTarget, *, prefix: str, marker: str, body: str
+    ) -> UpsertResult: ...
+
+
+class TrackerFacts(Protocol):
+    """Optional tracker capability for the advisory facts exchange (ADR 0280)."""
+
+    @property
+    def repository(self) -> RepositoryRef: ...
+
+    @property
+    def marked_comments(self) -> FactsComments: ...
+
+    async def read_comment(self, comment_id: int) -> TrackerComment: ...
+
+    async def facts_issue_is_plain(self, issue: TrackerIssueRef) -> bool: ...
+
+    async def facts_writer(self, comment: TrackerComment) -> Actor | None:
+        """A current writer, or None; an unreadable permission raises Unavailable."""
+        ...
+
+
 class Tracker(Protocol):
     """Where work is marked and described (ADR 0197, "Two ports" item 1)."""
 
@@ -86,6 +117,11 @@ class Tracker(Protocol):
 
     @property
     def capabilities(self) -> Mapping[Operation, Support]: ...
+
+    @property
+    def facts(self) -> TrackerFacts | None:
+        """Optional facts exchange; absent where FACTS_EXCHANGE is unsupported."""
+        ...
 
     @property
     def marked_comments(self) -> MarkedComments:
@@ -119,6 +155,15 @@ class Tracker(Protocol):
 
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         """The ticket as markdown for the sandbox. Nothing is stored."""
+        ...
+
+    async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
+        """The issue's own title and description now (ADR 0277 decision 4).
+
+        Read from the issue's fields alone, never from its comments, so the
+        content fingerprint a tracker result run holds survives any comment.
+        Gated as `Operation.READ_TICKET`. Nothing is stored.
+        """
         ...
 
     async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
@@ -155,6 +200,73 @@ class Tracker(Protocol):
         returned. A tracker whose issues can move returns the reference for
         every key the issue held. A reference that cannot be read raises
         `Unavailable`; nothing is guessed.
+        """
+        ...
+
+    async def create_linked_issue(
+        self,
+        source: TrackerIssueRef,
+        *,
+        output_identity: str,
+        title: str,
+        body: str,
+        labels: Collection[str],
+        expected: TrackerIssueRef | None = None,
+        reconcile_only: bool = False,
+    ) -> LinkedIssue:
+        """Optional: one new issue in ``source``'s own scope, linked to it (ADR 0277).
+
+        The body is ``body``, then a related-source line naming ``source``, then the
+        hidden marker ``linked_issue_marker(output_identity)`` as the last line
+        (`curie_api.forges.types.linked_issue_body`). It carries no closing
+        keyword and creates no blocked-by relation. ``labels`` are applied at
+        creation and never edited on a reconciled issue. Callers compare the
+        returned `LinkedIssue.body_sha256` with `LinkedIssue.sent_body_sha256`
+        before recording delivery.
+
+        The lookup lists the scope's issues created by the adapter's own
+        identity (never a search API) and matches the one whose last non-empty
+        line is the marker (`curie_api.forges.types.ends_with_marker`); a
+        marker in an issue another identity created counts for nothing. More
+        than one match raises `Ambiguous` and writes nothing. That
+        creator-filtered listing can lag a create by seconds (observed on
+        GitHub, as its search index does), so neither a listing nor elapsed
+        time proves a create absent.
+
+        Three modes, chosen by the keywords:
+
+        1. Default (create or reconcile). The lookup runs first; one match is
+           returned with a read-back (``created`` False). With none the
+           adapter sends one create request. A definite refusal of it keeps
+           its type and proves nothing was created: `Unauthorized` (401, 403),
+           `NotFound` (404), ``Unavailable("unprocessable")`` (422). Any
+           failure after the request may have reached the tracker (a
+           transport error, a 5xx, an unreadable success, a success whose
+           read-back fails, or a relist after an uncertain answer that finds
+           nothing or cannot be read) raises `LinkedIssueUnconfirmed`; a
+           caller that gets it must never create again for this output
+           identity and reconciles with ``reconcile_only=True`` instead. An
+           uncertain answer the in-call relist does confirm returns that issue
+           (``created`` False). ``created`` is True only when the create was
+           answered and read back.
+        2. ``reconcile_only=True``. Never creates: the same lookup; one match is
+           returned with a read-back (``created`` False), none raises
+           ``NotFound("linked_issue")``, two raise `Ambiguous`.
+        3. ``expected=<recorded issue>``, for a caller that has recorded the
+           output. Never creates and never lists: it reads that one issue
+           directly and returns it with that read-back (``created`` False) only
+           when it is in this scope, is not a pull request, was created by the
+           adapter's own identity, and its last non-empty line is the marker.
+           Anything else (missing, a pull request, another author, the marker
+           gone) raises ``NotFound("linked_issue")``. `Ambiguous` is not raised.
+
+        Errors raised before any create request is sent keep their types and
+        write nothing: ValueError for an invalid ``output_identity``
+        (`curie_api.forges.types.valid_output_identity`) or for ``expected``
+        together with ``reconcile_only``; `NotFound` for a source outside this
+        tracker; `Unavailable` for a lookup listing that cannot be read to its
+        end; `Unsupported` where the adapter declares
+        `Operation.CREATE_LINKED_ISSUE` unsupported (GitLab and Jira Cloud).
         """
         ...
 
@@ -198,6 +310,15 @@ class CodeHost(Protocol):
 
     async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:
         """A clone- or push-scoped credential with its origin and git header."""
+        ...
+
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        """Optional: a platform write credential for the currently installed App.
+
+        Rediscover the installation on every call, including when a cached
+        token is usable. Refuse missing App authority instead of using an
+        operator token. Only GitHub currently supports App installations.
+        """
         ...
 
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:

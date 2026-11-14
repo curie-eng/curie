@@ -65,6 +65,14 @@ oauth_config:
       # is refused by name (channel_read.provider_scope_missing). ADDING A
       # SCOPE REQUIRES REINSTALLING THE APP to the workspace.
       - groups:read
+      # Required only for the gateway's Slack user email lookup
+      # (channelGateway.identityLookup): an external HTTP identity provider asks
+      # the gateway which email belongs to a Slack user, and the gateway calls
+      # users.info with this same bot token. Without them that lookup refuses
+      # and the provider answers unresolved or unavailable. ADDING A SCOPE
+      # REQUIRES REINSTALLING THE APP to the workspace.
+      - users:read
+      - users:read.email
 settings:
   socket_mode_enabled: true
   event_subscriptions:

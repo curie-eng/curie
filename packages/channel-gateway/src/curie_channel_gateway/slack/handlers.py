@@ -63,10 +63,12 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from queue import Full, Queue
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import DEFAULT_IDENTITY
+from curie_internal.driver_declaration import DeclaredDriver
+from curie_internal.issue_links import find_issue_links
 from curie_internal.slack_mention_receipt import SlackMentionReceipt, write_receipt
 from curie_internal.turn_queue import claim_event, enqueue
 from curie_telemetry import operation_span, record_metric
@@ -114,6 +116,7 @@ from .identities import delivery_key, minted_adapter
 from .identity import (
     IdentityResolver,
     build_identity_client,
+    driver_evidence,
     principal_observer_middleware,
     slack_evidence,
 )
@@ -650,52 +653,77 @@ def _write_mention_receipt(
     body: dict[str, Any],
     event: dict[str, Any],
     lane: Lane,
-    driver_declared: bool,
+    driver: DeclaredDriver | None,
     delivery_id: str,
     channel: str,
     slack_identity: str,
     text: str,
 ) -> None:
-    """Record a threaded human mention's receipt; every other delivery writes none.
+    """Record the receipt a factory steering or kickoff decision reads (#5414, #5380).
 
-    Only the native Socket Mode lane calls this. A root mention, a direct
-    message, a bot or marked test action, and a subtyped message cannot steer a
-    factory run, so they leave no receipt for the worker to find.
+    Only the native Socket Mode mention lane calls this, and a direct message
+    or a subtyped message never writes one. Three senders write a receipt:
+
+    1. A person replying in a channel thread: version 1, as before.
+    2. A person's top-level channel mention whose text links an issue:
+       version 1 with ``root_ts == message_ts``. A top-level mention without
+       one writes none, since nothing would read it.
+    3. A declared ADR 0202 driver's marked action, on a test installation and
+       in the driver's own channel, at root or in a thread: version 2 naming
+       the declared bot user and bot id. The event's ``user`` and its text are
+       never read as identity.
+
+    Every other bot (undeclared, a sibling identity, an allowlisted pair, or a
+    declared driver off its installation or channel) writes none. A person who
+    types the mark is a person.
     """
 
-    if lane != "mention" or driver_declared:
+    if lane != "mention" or event.get("subtype") or event.get("channel_type") == "im":
         return
-    user = event.get("user")
     thread_ts = event.get("thread_ts")
     message_ts = event.get("ts")
-    if (
-        not isinstance(user, str)
-        or not user
-        or event.get("bot_id")
-        or event.get("subtype")
-        or event.get("channel_type") == "im"
-        or not isinstance(thread_ts, str)
-        or not thread_ts
-        or not isinstance(message_ts, str)
-        or not message_ts
-        or thread_ts == message_ts
-    ):
+    if not isinstance(message_ts, str) or not message_ts:
         return
-    evidence = slack_evidence(body)
+    if thread_ts is not None and (not isinstance(thread_ts, str) or not thread_ts):
+        return
+    # Slack echoes thread_ts equal to ts on a thread's parent message.
+    root_ts = thread_ts if thread_ts is not None and thread_ts != message_ts else message_ts
+    sender_bot = event.get("bot_id")
+    if sender_bot:
+        if (
+            driver is None
+            or not config.test_installation_enabled
+            or driver.bot_id != sender_bot
+            or driver.channel_id != channel
+        ):
+            return
+        version: Literal[1, 2] = 2
+        user_id = driver.bot_user_id
+        driver_bot_id: str | None = driver.bot_id
+        evidence = driver_evidence(body, driver.bot_user_id)
+    else:
+        user = event.get("user")
+        if not isinstance(user, str) or not user:
+            return
+        if root_ts == message_ts and not find_issue_links(text):
+            return
+        version, user_id, driver_bot_id = 1, user, None
+        evidence = slack_evidence(body)
     if evidence is None:
         return
     write_receipt(
         redis_client,
         SlackMentionReceipt(
-            version=1,
+            version=version,
             delivery_id=delivery_id,
             channel_identity=minted_adapter(slack_identity),
             channel=channel,
-            root_ts=thread_ts,
+            root_ts=root_ts,
             message_ts=message_ts,
-            user_id=user,
+            user_id=user_id,
             body=text,
             evidence=evidence,
+            driver_bot_id=driver_bot_id,
         ),
         ttl_s=config.mention_receipt_ttl_seconds,
     )
@@ -834,9 +862,10 @@ def process_event(
             web_client=web_client,
         ):
             return None
-        # Factory steering evidence (#5414): a human's mention replying in a
-        # channel thread records what was said, and who said it, under the
-        # delivery id. Before the claim, so a crash between the two leaves a
+        # Factory steering and kickoff evidence (#5414, #5380): a person's
+        # thread reply or issue-linking top-level mention, or a declared
+        # driver's marked action, records what was said, and who said it, under
+        # the delivery id. Before the claim, so a crash between the two leaves a
         # redelivery that still finds it; NX, so a redelivery never rewrites
         # it. The body is the derived event text exactly as Slack delivered it,
         # before the self-mention strip and any thread context or DM continuity
@@ -847,7 +876,7 @@ def process_event(
             body=body,
             event=event,
             lane=lane,
-            driver_declared=driver is not None,
+            driver=driver,
             delivery_id=delivery_id,
             channel=channel,
             slack_identity=slack_identity,

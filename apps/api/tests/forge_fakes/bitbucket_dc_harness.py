@@ -44,6 +44,7 @@ def jira_like_tracker(ledger: WriteLedger, faults: PageFaults) -> InMemoryTracke
     caps[Operation.LINK_PULL_REQUEST] = Support.NOOP
     caps[Operation.DEPENDENCIES] = Support.NOOP
     caps[Operation.GROUP_MEMBERSHIP] = Support.UNSUPPORTED
+    caps[Operation.CREATE_LINKED_ISSUE] = Support.UNSUPPORTED
     return InMemoryTracker(
         kind=types.JIRA_CLOUD, label=LABEL, capabilities=caps, ledger=ledger, faults=faults
     )

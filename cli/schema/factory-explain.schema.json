@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/factory-explain/v1.json",
+  "title": "curie factory explain --json",
+  "description": "The factory pull requests that record why one GitHub issue changed. pull_requests is empty when none match, and message is present only then. decisions.status is recorded, none, not recorded, or unparsed. entries is present only for recorded. lines is present only for unparsed.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "issue": {
+      "type": "string",
+      "description": "The requested issue as owner/repo#number."
+    },
+    "message": {
+      "type": "string",
+      "const": "no factory pull request"
+    },
+    "pull_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "number": { "type": "integer", "minimum": 1 },
+          "url": { "type": "string" },
+          "title": { "type": "string" },
+          "state": { "type": "string", "enum": ["open", "merged", "closed"] },
+          "head_sha": { "type": "string" },
+          "created_at": { "type": "string" },
+          "summary": { "type": "string" },
+          "decisions": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": ["recorded", "none", "not recorded", "unparsed"]
+              },
+              "entries": {
+                "type": "array",
+                "maxItems": 7,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "n": { "type": "integer", "minimum": 1, "maximum": 7 },
+                    "choice": { "type": "string", "minLength": 1 },
+                    "rejected": { "type": "string", "minLength": 1 },
+                    "reason": { "type": "string", "minLength": 1 },
+                    "source": {
+                      "type": "string",
+                      "enum": ["plan", "plan review", "diff review"]
+                    },
+                    "evidence": { "type": "string", "minLength": 1 }
+                  },
+                  "required": ["n", "choice", "rejected", "reason", "source", "evidence"]
+                }
+              },
+              "lines": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "required": ["status"]
+          },
+          "verification": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "status": { "type": "string", "enum": ["recorded", "not recorded"] },
+              "checked": { "type": "integer", "minimum": 0 },
+              "unchecked": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["status"]
+          },
+          "review_section": { "type": "string" },
+          "forge_reviews": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "reviewer": { "type": "string" },
+                "state": { "type": "string" }
+              },
+              "required": ["reviewer", "state"]
+            }
+          },
+          "checks": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "passing": { "type": "integer", "minimum": 0 },
+              "failing": { "type": "integer", "minimum": 0 },
+              "pending": { "type": "integer", "minimum": 0 },
+              "failing_names": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "required": ["passing", "failing", "pending", "failing_names"]
+          }
+        },
+        "required": [
+          "number",
+          "url",
+          "title",
+          "state",
+          "head_sha",
+          "created_at",
+          "summary",
+          "decisions",
+          "verification",
+          "review_section",
+          "forge_reviews",
+          "checks"
+        ]
+      }
+    }
+  },
+  "required": ["issue", "pull_requests"]
+}

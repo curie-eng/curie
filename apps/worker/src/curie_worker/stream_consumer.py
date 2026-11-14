@@ -273,6 +273,7 @@ class StreamConsumer:
     async def _consume(self, spec: ReadLoopSpec, handler: EntryHandler) -> None:
         """Blocking-read loop: read the group, dispatch each entry to ``handler``,
         and survive transient transport faults until stop is requested."""
+        recover_pending = False
         while not self._should_stop():
             if await self._claims_paused():
                 # Take nothing new while an upgrade drains. The in-flight
@@ -281,6 +282,11 @@ class StreamConsumer:
                 await self._sleep_or_stop(_QUIESCE_POLL_S)
                 continue
             try:
+                if recover_pending:
+                    await self._recover_local_pending_once()
+                    recover_pending = False
+                    if self._should_stop():
+                        return
                 resp = await self._redis.xreadgroup(
                     spec.group,
                     spec.consumer,
@@ -289,6 +295,7 @@ class StreamConsumer:
                     block=spec.block_ms,
                 )
             except RedisTimeoutError as exc:
+                recover_pending = self._delivery is not None and self._liveness_store is not None
                 # A blocking-read timeout is the routine idle case (no entries
                 # arrived within block_ms plus the socket timeout margin), not a
                 # fault -- log at DEBUG so an idle worker doesn't flood WARNING.
@@ -299,6 +306,7 @@ class StreamConsumer:
             except (RedisConnectionError, ResponseError) as exc:
                 if not is_failover_error(exc):
                     raise
+                recover_pending = self._delivery is not None and self._liveness_store is not None
                 # The shared client invalidates stale pooled sockets. Keep the
                 # read loop alive while the primary endpoint converges.
                 spec.logger.warning(spec.connection_msg, exc)
@@ -1552,7 +1560,7 @@ class StreamConsumer:
         return selected
 
     async def _recover_local_pending_once(self) -> None:
-        """Recover rows canceled by an earlier generation with this same name."""
+        """Recover pending rows owned by this consumer name."""
 
         if self._liveness_store is None:
             raise RuntimeError("consumer liveness store is required")

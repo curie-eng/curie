@@ -299,6 +299,47 @@ def test_an_unreachable_shell_keeps_its_slot_until_a_new_incarnation_answers(
     assert _slot(valkey, prefix, "s0")["state"] == "free"
 
 
+def test_the_reap_tick_frees_slots_whose_idle_routes_outlived_the_shells(
+    valkey: redis.Redis, prefix: str, tls: ShellTls, shells: ShellFactory, records: Path
+) -> None:
+    """Replaced shells never saw the leased claims: the reap tick ends them (#5569)."""
+
+    old = [shells("s0"), shells("s1")]
+    client = _client(valkey, prefix, tls, old)
+    pressure = AsyncRedis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW)
+    substrate = SandboxSubstrate(
+        client,
+        AffinityStore(valkey, pressure_client=pressure, key_prefix=prefix),
+        SubstrateConfig(namespace="default", warm_pool=POOL, key_prefix=prefix),
+    )
+    # Every slot is held by an idle route.
+    handles = {}
+    for thread in ("thread-a", "thread-b"):
+        handles[thread] = substrate.claim(thread, env=_env(records))
+        _await_ready(client, handles[thread].claim_name)
+    assert {_slot(valkey, prefix, s)["state"] for s in ("s0", "s1")} == {"leased"}
+    with pytest.raises(CapacityExhaustedError):
+        substrate.claim("thread-c", env=_env(records))
+    # Replace every shell: each supervisor answers with a new incarnation.
+    incarnations = {shell.slot: shell.shell()["incarnation"] for shell in old}
+    for shell in old:
+        shell.stop()
+        replacement = shells(shell.slot, port=shell.port)
+        assert replacement.shell()["incarnation"] != incarnations[shell.slot]
+
+    substrate.reap_orphans()  # the periodic tick; no manual step
+
+    assert {_slot(valkey, prefix, s)["state"] for s in ("s0", "s1")} == {"free"}
+    handle = substrate.claim("thread-c", env=_env(records))
+    _await_ready(client, handle.claim_name)
+    # A thread whose stale lease ended gets a fresh shell on its next turn.
+    stale = handles["thread-a"]
+    renewed = substrate.claim("thread-a", env=_env(records))
+    assert renewed.claim_name != stale.claim_name
+    _await_ready(client, renewed.claim_name)
+    asyncio.run(pressure.aclose())
+
+
 def test_an_unsettled_retire_quarantines_until_the_task_is_replaced(
     valkey: redis.Redis, prefix: str, tls: ShellTls, shells: ShellFactory, records: Path
 ) -> None:
@@ -552,9 +593,13 @@ def test_two_agents_with_secrets_alternate_on_the_generic_shell(
             assert child["CURIE_CONNECTOR_AGENT"] == agent
             assert "CURIE_SHELL_CLAIM_ENV_FILE" not in child
             if previous_root is not None:
-                assert not previous_root.exists()
+                # Every claim stages at the same path (#5571), recreated empty:
+                # nothing the previous claim left there survives.
+                assert root == previous_root
+                assert not (root / "home" / "left-by-previous-claim").exists()
                 assert not (set(child.values()) & previous_secrets)
             previous_secrets = {secret}
+            (root / "home" / "left-by-previous-claim").write_text("x")
             assert substrate.release(f"thread-{index}")
             assert not root.exists()
             previous_root = root

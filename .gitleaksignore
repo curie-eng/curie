@@ -234,3 +234,22 @@ d3383d0cbcd7b0ff5f3d1fcdf2744e12fbd2fb2f:runner/tests/test_redact.py:generic-api
 6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:102
 6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:119
 6d845405a80b66c845075cb11c085283ab73c434:tests/vectors/hook-wake-signing.json:generic-api-key:136
+
+# Sequential test signing key in static qualification history.
+# Both commits assign the base64 of bytes 0x00 through 0x1f, 32 bytes in
+# counting order, to a connector signing field in
+# apps/worker/tests/sandbox/test_static_qualification.py. The value is that
+# counting sequence, not a generated credential. The commits remain on
+# unmerged static-pool branches, so the weekly full-history scan still reads
+# them. A later real key is a different fingerprint.
+1e5c3a64d066465b6dffad650038a31ead6385e2:apps/worker/tests/sandbox/test_static_qualification.py:generic-api-key:508
+60af3dd605ad19885456950b71454a3031143664:apps/worker/tests/sandbox/test_static_qualification.py:generic-api-key:504
+
+# Placeholder tracker reference in the factory phone spike at d2c8b08a.
+# The matched line is an assertion on an example direct message. It counts one
+# start for the documented public placeholder owner and fixture repository,
+# issue 42, the same placeholder family as the factory-e2e fingerprints above.
+# It does not name a customer or downstream organization. The commit is spike
+# history. A fingerprint keeps the weekly scan quiet if that commit is reachable
+# again.
+d2c8b08a9eafce9e9b43505642bdc8f83821e5ce:spikes/factory-slack-subscription/prove.py:cross-repo-issue-ref:228

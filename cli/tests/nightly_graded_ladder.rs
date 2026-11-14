@@ -6635,3 +6635,76 @@ classify_product_observability_owner
         assert!(!String::from_utf8_lossy(&output.stdout).contains("curie-clear:"));
     }
 }
+
+/// Every workflow step that drives the cluster rung of `e2e-ladder.sh` must
+/// hand it an explicit kube context. The ladder refuses to guess one and
+/// exits 2 before any rung runs, so a step that omits it reds the whole job
+/// with "cluster rung requires CURIE_E2E_KUBE_CONTEXT" (#5621).
+#[test]
+fn every_cluster_rung_ladder_step_passes_an_explicit_kube_context() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows");
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        .map(|entry| entry.expect("workflow dir entry").path())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("yaml" | "yml")
+            )
+        })
+        .collect();
+    entries.sort();
+    let mut cluster_steps = 0usize;
+    let mut missing = Vec::new();
+    for path in &entries {
+        let text = repo_text(path);
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("bash cli/scripts/e2e-ladder.sh") {
+                continue;
+            }
+            let start = (0..=index)
+                .rev()
+                .find(|&i| lines[i].trim_start().starts_with("- name:"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}:{} ladder call outside a named step",
+                        path.display(),
+                        index + 1
+                    )
+                });
+            let indent = lines[start].len() - lines[start].trim_start().len();
+            let end = (index + 1..lines.len())
+                .find(|&i| {
+                    let candidate = lines[i];
+                    let trimmed = candidate.trim_start();
+                    !trimmed.is_empty()
+                        && candidate.len() - trimmed.len() <= indent
+                        && !trimmed.starts_with('#')
+                })
+                .unwrap_or(lines.len());
+            let step = lines[start..end].join("\n");
+            let tiers = step
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("CURIE_E2E_TIERS:"))
+                .map(str::trim)
+                .unwrap_or("");
+            if !tiers.split(',').any(|tier| tier.trim() == "cluster") {
+                continue;
+            }
+            cluster_steps += 1;
+            if !step.contains("CURIE_E2E_KUBE_CONTEXT") {
+                missing.push(format!("{}: {}", path.display(), lines[start].trim()));
+            }
+        }
+    }
+    assert!(
+        cluster_steps >= 2,
+        "expected the ci.yaml and nightly cluster rung steps, found {cluster_steps}"
+    );
+    assert!(
+        missing.is_empty(),
+        "cluster rung ladder steps without CURIE_E2E_KUBE_CONTEXT:\n{}",
+        missing.join("\n")
+    );
+}

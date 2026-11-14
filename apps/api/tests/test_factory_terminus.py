@@ -38,10 +38,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
-from curie_api.factory_notices import FINAL_MARKER, cause_text, result_section
+from curie_api.factory_notices import (
+    FINAL_MARKER,
+    STATE_LABELS,
+    cause_text,
+    result_section,
+    status_body,
+)
 from curie_api.forges.registry import forges_registry
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_internal.factory_triage import HandoffOutcome, TriageResult, status_comment_text
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from forge_fakes import factory_wake
 from forge_fakes.github import INSTALLATION_ID, LABEL, REPO, REPO_ID, GitHubAPI, _issue_event, _post
@@ -115,11 +122,121 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "merge_conflict",
         "pr_closed",
         "ci_fix_unpublished",
+        "tracker_result",
+        "no_tracker_result",
+        "tracker_result_undelivered",
     ],
 )
 def test_every_terminus_cause_has_its_own_plain_sentence(cause: str) -> None:
     assert cause_text(cause) != cause_text("not-a-cause")
     assert cause not in cause_text(cause)
+
+
+def test_tracker_result_causes_have_distinct_sentences_without_em_dashes() -> None:
+    sentences = [
+        cause_text(cause)
+        for cause in ("tracker_result", "no_tracker_result", "tracker_result_undelivered")
+    ]
+    assert len(set(sentences)) == 3
+    assert all("\u2014" not in sentence for sentence in sentences)
+    body = result_section("tracker_result_undelivered", pr_url=None)
+    assert body.splitlines()[0] == f"Could not complete: {sentences[2]}"
+    assert "Cause: tracker_result_undelivered" in body
+
+
+# --- #5586 decision 12: the seven triage endings in the status comment ------------
+
+_TRIAGE_REVISION = "0123456789abcdef0123456789abcdef01234567"
+_TICKET_URL = f"https://github.com/{REPO}/issues/9302"
+_RESULT_COMMENT_URL = f"https://github.com/{REPO}/issues/9301#issuecomment-4401"
+_RUN_URL = f"https://github.com/{REPO}/issues/9302#issuecomment-4402"
+
+
+def _ticket_result() -> TriageResult:
+    return TriageResult("ticket", None, _TRIAGE_REVISION, _TICKET_URL, _RESULT_COMMENT_URL)
+
+
+def _findings_result(reason: str) -> TriageResult:
+    return TriageResult("findings", reason, _TRIAGE_REVISION, None, _RESULT_COMMENT_URL)
+
+
+_ENDINGS = [
+    pytest.param(
+        _ticket_result(),
+        HandoffOutcome(admitted=True, implementation_status_url=_RUN_URL, refusal_reason=None),
+        [f"Ticket published: {_TICKET_URL}.", f"Implementation admitted: {_RUN_URL}"],
+        id="1-ticket-implementation-admitted",
+    ),
+    pytest.param(
+        _ticket_result(),
+        HandoffOutcome(
+            admitted=False,
+            implementation_status_url=None,
+            refusal_reason="the implementation agent has no capacity",
+        ),
+        [
+            f"Ticket published: {_TICKET_URL}.",
+            "Implementation not started: the implementation agent has no capacity.",
+        ],
+        id="2-ticket-implementation-refused",
+    ),
+    pytest.param(
+        _ticket_result(),
+        None,
+        [f"Ticket published: {_TICKET_URL}."],
+        id="ticket-without-handoff",
+    ),
+    pytest.param(
+        _findings_result("not_reproduced"), None, ["not reproduced"], id="3-not-reproduced"
+    ),
+    pytest.param(_findings_result("already_fixed"), None, ["already fixed"], id="4-already-fixed"),
+    pytest.param(
+        _findings_result("product_decision_needed"),
+        None,
+        ["product decision needed"],
+        id="5-product-decision-needed",
+    ),
+    pytest.param(
+        _findings_result("capability_unavailable"),
+        None,
+        ["capability unavailable"],
+        id="6-capability-unavailable",
+    ),
+    pytest.param(
+        _findings_result("budget_exhausted"),
+        None,
+        ["Investigation stopped: budget exhausted; findings delivered."],
+        id="7-budget-exhausted",
+    ),
+]
+
+
+@pytest.mark.parametrize(("result", "handoff", "expected"), _ENDINGS)
+def test_each_triage_ending_renders_its_status_comment(
+    result: TriageResult, handoff: HandoffOutcome | None, expected: list[str]
+) -> None:
+    request_id = uuid.uuid4()
+    body = status_body(
+        request_id=request_id,
+        card_url=None,
+        pill_label="COMPLETED",
+        phase_view=None,
+        result=status_comment_text(result, handoff),
+        base_line=None,
+    )
+    for line in expected:
+        assert line in body, body
+    assert _TRIAGE_REVISION in body
+    # The marked result comment carries the command, observed result, tried and missing.
+    assert _RESULT_COMMENT_URL in body
+    assert FINAL_MARKER in body and marker_for(request_id) in body
+    assert "\u2014" not in body
+    if result.result_kind == "ticket":
+        assert _TICKET_URL in body
+    if handoff is None:
+        assert "Implementation" not in body
+    if result.reason == "budget_exhausted":
+        assert "reproduc" not in body.lower()
 
 
 _MODEL_UNREACHABLE_SENTENCE = (
@@ -1282,7 +1399,12 @@ def test_failure_and_opened_pull_request_each_post_one_final_comment(
 
 
 def _attach_publication(
-    work_item_id: uuid.UUID, *, status: str, pr: int | None, head_sha: str = HEAD_A
+    work_item_id: uuid.UUID,
+    *,
+    status: str,
+    pr: int | None,
+    head_sha: str = HEAD_A,
+    bind_lineage: bool = True,
 ) -> None:
     async def go() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -1423,7 +1545,7 @@ def _attach_publication(
                         "result": pr_url,
                     },
                 )
-                if pr is not None:
+                if pr is not None and bind_lineage:
                     changed = await conn.execute(
                         text(
                             "UPDATE curie.work_items SET publication_lineage_id = :lineage, "
@@ -1894,7 +2016,7 @@ def test_a_review_revision_with_no_changes_completes_in_its_thread(
     assert [posted_path for posted_path, _body in posts] == [path]
     body = posts[0][1] or ""
     assert "Status: SUCCEEDED" in body
-    assert "No changes needed: this pull request already covers the requested revision." in body
+    assert "No changes needed: this pull request is unchanged." in body
     assert f"In response to https://github.com/{REPO}/pull/{pr}#discussion_r88121" in body
     assert "Agent's last message:" in body
     assert detail in body
@@ -2005,8 +2127,12 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
     assert "Status: NEEDS HUMAN" in body
     assert "Could not complete:" in body
     assert f"Cause: {cause}" in body
-    assert "curie-factory:needs-human" in sink.issue_labels[number]
-    assert "curie-factory:pr-open" not in sink.issue_labels[number]
+    if case == "merged":
+        assert not set(STATE_LABELS) & sink.issue_labels.get(number, set())
+        assert f"Pull request: https://github.com/{REPO}/pull/{pr} (merged)" in body
+    else:
+        assert "curie-factory:needs-human" in sink.issue_labels[number]
+        assert "curie-factory:pr-open" not in sink.issue_labels[number]
 
 
 @pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
@@ -2120,7 +2246,11 @@ def test_a_relabel_outside_an_adopted_pull_request_still_fails(admitted: Any, ca
         [comment["body"] for comment in sink.lists[path]], second["id"]
     )
     assert "Status: NEEDS HUMAN" in body
-    assert "curie-factory:needs-human" in sink.issue_labels[number]
+    if case == "merged":
+        assert not set(STATE_LABELS) & sink.issue_labels.get(number, set())
+        assert f"Pull request: https://github.com/{REPO}/pull/{number} (merged)" in body
+    else:
+        assert "curie-factory:needs-human" in sink.issue_labels[number]
 
 
 def test_a_relabel_revision_on_an_adopted_pull_request_settles_through_the_ci_gate(

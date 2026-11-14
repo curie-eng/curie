@@ -1910,6 +1910,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/coding-instructions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read */
+        get: operations["read_coding_instructions_get"];
+        /** Write */
+        put: operations["write_coding_instructions_put"];
+        post?: never;
+        /** Clear */
+        delete: operations["clear_coding_instructions_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/config": {
         parameters: {
             query?: never;
@@ -2430,6 +2449,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/factory/facts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Factory Facts */
+        get: operations["get_factory_facts_factory_facts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/forges/credentials/health": {
         parameters: {
             query?: never;
@@ -2638,6 +2674,24 @@ export interface paths {
          *     person may hold several accounts; one account belongs to one active link.
          */
         post: operations["create_code_host_link_identity_admin__tenant_id__code_host_links_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/admin/{tenant_id}/coding-instructions-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Coding Instructions Policy */
+        get: operations["coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_get"];
+        /** Set Coding Instructions Policy */
+        put: operations["set_coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_put"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3400,6 +3454,32 @@ export interface paths {
         put?: never;
         /** Append Cluster Message Reply */
         post: operations["append_cluster_message_reply_v1_internal_cluster_message_replies__reply_ref__post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/factory-slack/kickoff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Kickoff Factory Run
+         * @description Admit a personal factory run for the one issue a mention links, or name why not.
+         *
+         *     ``not_factory`` sends the mention down the ordinary path; every other
+         *     refusal is final for the delivery. Both answer 200. A code host that
+         *     cannot answer now is 503, so the worker keeps the delivery pending, and so
+         *     is a database failure, raised without its exception chain: the driver's
+         *     error may carry bound parameters that hold the Slack body.
+         */
+        post: operations["kickoff_factory_run_v1_internal_factory_slack_kickoff_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4529,6 +4609,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/completion-contract": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Completion Contract
+         * @description The execution's completion contract; for a tracker result request, the
+         *     reservation of its one model session.
+         *
+         *     The first call for a tracker result request reads the source issue's
+         *     title and body, mints the request's grant and reserves the session; any
+         *     later call is 409 ``session_already_started``, so a second runner starts
+         *     no model. An implementation request reserves nothing and gets no grant.
+         */
+        post: operations["read_completion_contract_work_items_completion_contract_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/issue-read": {
         parameters: {
             query?: never;
@@ -4540,6 +4646,33 @@ export interface paths {
         put?: never;
         /** Read Work Item Issue */
         post: operations["read_work_item_issue_work_items_issue_read_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/tracker-result": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Tracker Result
+         * @description Seal the execution's one tracker result and attempt its delivery once.
+         *
+         *     Refuses (409, nothing written) an implementation request, a request
+         *     whose session was never reserved, a second submission, a source issue
+         *     whose title or body changed since the reservation, and every grant fence
+         *     (`RefusalReason`); an invalid proposal is 422 with field paths and codes
+         *     only. An accepted result is answered with its delivery state after one
+         *     inline attempt; the WorkItem reconciler retries an owed one.
+         */
+        post: operations["submit_tracker_result_work_items_tracker_result_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4963,6 +5096,8 @@ export interface components {
             request_id: string;
             /** Requester */
             requester: string;
+            /** Requester Principal Id */
+            requester_principal_id?: string | null;
             tracker: components["schemas"]["TrackerIssueIn"];
         };
         /**
@@ -6370,6 +6505,16 @@ export interface components {
             schema_version: 1;
             scope: components["schemas"]["TurnAuthorityScopeV1"];
         };
+        /** BindingFact */
+        BindingFact: {
+            /** Reason */
+            reason: ("unbound" | "label_not_served" | "ambiguous") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "bound" | "unbound" | "label_not_served" | "ambiguous";
+        };
         /** Body_confirm_connection_identity_connect__token__confirm_post */
         Body_confirm_connection_identity_connect__token__confirm_post: {
             /** Csrf */
@@ -6949,6 +7094,67 @@ export interface components {
              */
             link_id: string;
         };
+        /**
+         * CodingInstructionsMetadata
+         * @description Public selection metadata; the private snapshot text is never serialized.
+         */
+        CodingInstructionsMetadata: {
+            /** Absence Reason */
+            absence_reason?: ("no_profile" | "no_verified_requester" | "tenant_disabled" | "application_unavailable" | "historical") | null;
+            /** Format Version */
+            format_version?: 1 | null;
+            /** Revision */
+            revision?: number | null;
+            /** Sha256 */
+            sha256?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "absent" | "selected";
+        };
+        /** CodingInstructionsOut */
+        CodingInstructionsOut: {
+            /**
+             * Application
+             * @constant
+             */
+            application: "unavailable";
+            /** Byte Length */
+            byte_length: number;
+            /**
+             * Format Version
+             * @constant
+             */
+            format_version: 1;
+            /** Revision */
+            revision: number;
+            /** Sha256 */
+            sha256: string | null;
+            /** Tenant Enabled */
+            tenant_enabled: boolean;
+            /** Text */
+            text: string | null;
+            /** Updated At */
+            updated_at: string | null;
+        };
+        /** CodingInstructionsPolicyOut */
+        CodingInstructionsPolicyOut: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** CodingInstructionsPolicyWrite */
+        CodingInstructionsPolicyWrite: {
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** CodingInstructionsWrite */
+        CodingInstructionsWrite: {
+            /** Expected Revision */
+            expected_revision: number;
+            /** Text */
+            text: string;
+        };
         /** Completed */
         Completed: {
             /** Sha256 */
@@ -6972,6 +7178,26 @@ export interface components {
              * @constant
              */
             status?: "complete";
+        };
+        /**
+         * CompletionContractOut
+         * @description How the execution completes (ADR 0277, #5586): by a pull request
+         *     (``implementation``) or by one delivered tracker result (``tracker_result``).
+         *
+         *     ``result_kinds`` are the kinds the deployed policy allows and
+         *     ``session_usd_allowance`` the per-session model allowance in USD (the
+         *     agent's dollar limit, else 5); both empty for ``implementation``.
+         */
+        CompletionContractOut: {
+            /**
+             * Completion Contract
+             * @enum {string}
+             */
+            completion_contract: "implementation" | "tracker_result";
+            /** Result Kinds */
+            result_kinds: string[];
+            /** Session Usd Allowance */
+            session_usd_allowance: number | null;
         };
         /**
          * ConnectorManifests
@@ -7108,6 +7334,18 @@ export interface components {
             /** Total Usd */
             total_usd: number;
         };
+        /** CredentialFact */
+        CredentialFact: {
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "healthy" | "unhealthy" | "unknown";
+        };
         /**
          * CredentialHeader
          * @description The header form git accepts on a forge. GitLab refuses a Bearer header.
@@ -7123,6 +7361,20 @@ export interface components {
             generation: number;
             /** Id */
             id: string;
+        };
+        /** CreditFact */
+        CreditFact: {
+            /** Expires At */
+            expires_at: string | null;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "sufficient" | "insufficient" | "unknown";
         };
         /** Declaration */
         Declaration: {
@@ -7761,6 +8013,22 @@ export interface components {
              */
             version_id: string;
         };
+        /** ExecutableFact */
+        ExecutableFact: {
+            /** Basis */
+            basis: "selected_image_probe" | null;
+            /** Name */
+            name: string;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "present" | "absent" | "unknown";
+        };
         /**
          * ExecutionArguments
          * @description A claimed forward execution's bound call, read by its holder only.
@@ -7954,6 +8222,123 @@ export interface components {
              */
             tenant_id: string;
         };
+        /** FactoryFact */
+        FactoryFact: {
+            code_host_credential: components["schemas"]["CredentialFact"];
+            /** Enabled */
+            enabled: boolean;
+            /**
+             * Kill Switch
+             * @enum {string}
+             */
+            kill_switch: "clear" | "engaged" | "unknown";
+            /**
+             * Upgrade Pause
+             * @enum {string}
+             */
+            upgrade_pause: "clear" | "paused" | "unknown";
+        };
+        /** FactoryFacts */
+        FactoryFacts: {
+            /**
+             * Admission
+             * @constant
+             */
+            admission: "not_requested";
+            binding: components["schemas"]["BindingFact"];
+            /** Context Digest */
+            context_digest: string;
+            /**
+             * Deployment Readiness
+             * @constant
+             */
+            deployment_readiness: "unvalidated";
+            /** Executables */
+            executables: components["schemas"]["ExecutableFact"][];
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            factory: components["schemas"]["FactoryFact"];
+            /**
+             * Kind
+             * @constant
+             */
+            kind: "factory_facts";
+            label_route: components["schemas"]["LabelRoute"] | null;
+            model_credit: components["schemas"]["CreditFact"];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            request: components["schemas"]["RequestIdentity"] | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /** Services */
+            services: components["schemas"]["ServiceFact"][];
+            subject: components["schemas"]["FactsSubject"];
+        };
+        /**
+         * FactorySlackKickoffIn
+         * @description One Slack mention linking an issue, at a channel root or in a thread no
+         *     factory run owns, as the worker consumed it.
+         *
+         *     ``receipt`` is the dispatcher's verified mention receipt
+         *     (``curie_internal.slack_mention_receipt.SlackMentionReceipt``, version 1
+         *     for a person, 2 for a declared test driver), validated by the route so a
+         *     malformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or
+         *     the message's own at root. ``author`` is the turn's Slack user id; the
+         *     receipt must name the same delivery, route and sender.
+         */
+        FactorySlackKickoffIn: {
+            /** Author */
+            author: string;
+            /** Channel */
+            channel: string;
+            /** Channel Identity */
+            channel_identity: string;
+            /** Delivery Id */
+            delivery_id: string;
+            /** Receipt */
+            receipt: {
+                [key: string]: unknown;
+            };
+            /** Root Ts */
+            root_ts: string;
+        };
+        /**
+         * FactorySlackKickoffOut
+         * @description The kickoff decision. ``reason`` is the resolver's reason for
+         *     ``sender_unverified``, the base refusal code for ``base_refused`` and the
+         *     admission refusal code for ``admission_refused``.
+         */
+        FactorySlackKickoffOut: {
+            /** Issue Url */
+            issue_url?: string | null;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "admitted" | "not_factory" | "receipt_mismatch" | "test_driver_refused" | "binding_missing" | "binding_ambiguous" | "link_missing" | "link_multiple" | "link_malformed" | "link_host_unsupported" | "link_pull_request" | "sender_unverified" | "enrollment_inactive" | "issue_inaccessible" | "issue_closed" | "publication_exists" | "base_refused" | "thread_conflict" | "authority_changed" | "admission_refused";
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Replayed
+             * @default false
+             */
+            replayed?: boolean;
+            /** Request Id */
+            request_id?: string | null;
+            /** Request Status */
+            request_status?: string | null;
+            /** Work Item Id */
+            work_item_id?: string | null;
+        };
         /**
          * FactorySlackSteerIn
          * @description One threaded Slack mention in a factory run's root, as the worker consumed it.
@@ -8011,6 +8396,15 @@ export interface components {
             conversation_id: string;
             /** Kind */
             kind: string;
+        };
+        /** FactsSubject */
+        FactsSubject: {
+            /** Issue Number */
+            issue_number: number | null;
+            /** Repository Id */
+            repository_id: string;
+            /** Trigger Label */
+            trigger_label: string;
         };
         /** FileDescriptor */
         FileDescriptor: {
@@ -8604,6 +8998,28 @@ export interface components {
         KillState: {
             /** Killed */
             killed: boolean;
+        };
+        /** LabelRoute */
+        LabelRoute: {
+            /** Actor Id */
+            actor_id: string;
+            /**
+             * Actor Kind
+             * @constant
+             */
+            actor_kind: "human";
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * Route
+             * @enum {string}
+             */
+            route: "github_user" | "github_user_via_app";
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "eligible" | "ineligible" | "unknown";
         };
         /**
          * ListedTargets
@@ -10755,6 +11171,13 @@ export interface components {
             /** Project Id */
             project_id: string;
         };
+        /** RequestIdentity */
+        RequestIdentity: {
+            /** Comment Id */
+            comment_id: string;
+            /** Digest */
+            digest: string;
+        };
         /**
          * ResolveTargetRequest
          * @description A bundle's ``deploy.yaml`` text plus the target to resolve (ADR-0089).
@@ -11055,6 +11478,11 @@ export interface components {
              * Format: uuid
              */
             agent_id: string;
+            /**
+             * Completion Contract
+             * @enum {string}
+             */
+            completion_contract: "implementation" | "tracker_result";
             context: components["schemas"]["FactoryContext"] | null;
             /** Conversation Id */
             conversation_id: string;
@@ -11068,7 +11496,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
+            refusal: ("not_found" | "requester_principal_invalid" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "tracker_result_no_revision" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -11176,6 +11604,20 @@ export interface components {
              * Format: uuid
              */
             id: string;
+        };
+        /** ServiceFact */
+        ServiceFact: {
+            /** Name */
+            name: string;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: ("observation_missing" | "observation_expired" | "outside_catalog" | "runner_unavailable" | "provider_unsupported" | "credential_rejected" | "not_probed" | "unreadable" | "personal_owner_required") | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "configured" | "observed" | "unknown";
         };
         /**
          * SettingConfig
@@ -11660,6 +12102,42 @@ export interface components {
             /** Scope Id */
             scope_id: string;
         };
+        /**
+         * TrackerResultOut
+         * @description The accepted result after one inline delivery attempt.
+         *
+         *     ``state`` ``owed`` means the platform keeps retrying until the delivery
+         *     deadline. ``result_comment_url`` is the source issue's marked result
+         *     comment and ``ticket_url`` the published ticket, each once delivered.
+         */
+        TrackerResultOut: {
+            /** Result Comment Url */
+            result_comment_url: string | null;
+            /**
+             * Result Kind
+             * @enum {string}
+             */
+            result_kind: "ticket" | "findings";
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "owed" | "delivered" | "failed";
+            /** Ticket Url */
+            ticket_url: string | null;
+        };
+        /**
+         * TrackerResultSubmission
+         * @description The runner result tool's call: one typed proposal, validated by the API
+         *     (`curie_api.factory_tracker_results.parse_proposal`).
+         */
+        TrackerResultSubmission: {
+            /**
+             * Proposal
+             * @description A ticket or findings proposal object.
+             */
+            proposal: unknown;
+        };
         /** Transfer */
         Transfer: {
             /** Transfer Id */
@@ -12001,6 +12479,33 @@ export interface components {
             version_id?: string | null;
         };
         /**
+         * WorkItemCiObservationOut
+         * @description Item-level observation; the failed execution remains historical truth.
+         */
+        WorkItemCiObservationOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Head Sha */
+            head_sha: string;
+            /** Observed At */
+            observed_at: string | null;
+            /** Reason */
+            reason: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "observing" | "completed" | "expired" | "invalidated";
+        };
+        /**
          * WorkItemCiOut
          * @description A live, unpersisted CI observation of the published head.
          */
@@ -12056,6 +12561,8 @@ export interface components {
             /** Cancelled At */
             cancelled_at: string | null;
             ci: components["schemas"]["WorkItemCiOut"] | null;
+            ci_observation?: components["schemas"]["WorkItemCiObservationOut"] | null;
+            coding_instructions: components["schemas"]["CodingInstructionsMetadata"];
             correctness: components["schemas"]["WorkItemCorrectnessOut"];
             /**
              * Created At
@@ -12087,6 +12594,8 @@ export interface components {
             repository: components["schemas"]["WorkItemRepositoryOut"];
             /** Requester */
             requester: string | null;
+            /** Requester Principal Id */
+            requester_principal_id?: string | null;
             /** Requests */
             requests: components["schemas"]["WorkItemRequestOut"][];
             /**
@@ -12157,6 +12666,14 @@ export interface components {
         WorkItemRequestOut: {
             /** Capacity Deferrals */
             capacity_deferrals: number;
+            /**
+             * Coding Instructions Evidence
+             * @default none
+             * @enum {string}
+             */
+            coding_instructions_evidence?: "none" | "pending" | "applied" | "failed";
+            /** Coding Instructions Selection Id */
+            coding_instructions_selection_id?: string | null;
             /**
              * Created At
              * Format: date-time
@@ -16720,6 +17237,105 @@ export interface operations {
             };
         };
     };
+    read_coding_instructions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    write_coding_instructions_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodingInstructionsWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    clear_coding_instructions_delete: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_config_config_get: {
         parameters: {
             query?: never;
@@ -17684,6 +18300,42 @@ export interface operations {
             };
         };
     };
+    get_factory_facts_factory_facts_get: {
+        parameters: {
+            query: {
+                repository: string;
+                trigger_label: string;
+                executables?: string;
+                services?: string;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactoryFacts"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_forge_credential_health_forges_credentials_health_get: {
         parameters: {
             query?: never;
@@ -18027,6 +18679,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CodeHostLinkOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsPolicyOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_coding_instructions_policy_identity_admin__tenant_id__coding_instructions_policy_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodingInstructionsPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CodingInstructionsPolicyOut"];
                 };
             };
             /** @description Validation Error */
@@ -19827,6 +20549,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ClusterMessageReplyAck"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    kickoff_factory_run_v1_internal_factory_slack_kickoff_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FactorySlackKickoffIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FactorySlackKickoffOut"];
                 };
             };
             /** @description Validation Error */
@@ -22071,6 +22828,37 @@ export interface operations {
             };
         };
     };
+    read_completion_contract_work_items_completion_contract_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Issue-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CompletionContractOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     read_work_item_issue_work_items_issue_read_post: {
         parameters: {
             query?: never;
@@ -22089,6 +22877,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["IssueReadResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_tracker_result_work_items_tracker_result_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Issue-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrackerResultSubmission"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrackerResultOut"];
                 };
             };
             /** @description Validation Error */

@@ -7,7 +7,14 @@ extracted the bundle with its bounded extractor; this side only unpacks the
 transfer archive it authenticated, bounded by size and member count, through
 the standard library's ``data`` filter (no links out, no devices, no setuid).
 
-Layout under ``<state_root>/claims/<random>/``::
+Every claim is staged at the same path, ``<state_root>/claims/active/``, so a
+claim resumed after an approval pause works in the directory its approved
+arguments name (#5571). A shell holds one lease at a time and admits the next
+only after retirement removed the previous tree and stopped every process the
+child left, so no two claims ever share it. The directory is created
+exclusively: a leftover tree refuses the stage instead of being reused.
+
+Layout under ``<state_root>/claims/active/``::
 
     stage/bundle       root owned, read only   -> CURIE_PLUGIN_DIR
     stage/workspace    child owned             <- /workspace symlink
@@ -215,14 +222,20 @@ def _read_only(path: Path) -> None:
     os.chmod(path, 0o555)
 
 
+CLAIM_DIR = "active"
+
+
 def prepare(
     archive: Path, *, claim: str, generation: int, config: SupervisorConfig
 ) -> tuple[StagedClaim, Manifest]:
-    """Create a fresh claim directory and stage ``archive`` into it."""
+    """Create the claim directory afresh and stage ``archive`` into it.
+
+    Raises ``FileExistsError`` when a previous claim's tree is still there.
+    """
 
     claims = config.state_root / "claims"
     claims.mkdir(parents=True, exist_ok=True, mode=0o711)
-    root = claims / secrets.token_hex(16)
+    root = claims / CLAIM_DIR
     root.mkdir(mode=0o711)
     try:
         stage = root / "stage"

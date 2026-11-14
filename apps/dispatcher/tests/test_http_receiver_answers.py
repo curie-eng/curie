@@ -13,8 +13,14 @@ import threading
 from typing import Any
 
 import httpx
+import pytest
 import redis
-from curie_channel_gateway.slack.approval_actions import APPROVE_ACTION_ID, APPROVE_NOTE_ACTION_ID
+from curie_channel_gateway.slack.approval_actions import (
+    APPROVE_ACTION_ID,
+    APPROVE_NOTE_ACTION_ID,
+    REJECT_ACTION_ID,
+    REJECT_NOTE_ACTION_ID,
+)
 from curie_channel_gateway.slack.config import DispatcherConfig
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
@@ -46,9 +52,9 @@ def _click(envelope: str, *, action_id: str = APPROVE_ACTION_ID, team: str | Non
     return request
 
 
-def _submission(envelope: str) -> Any:
+def _submission(envelope: str, *, decision: str = "approved") -> Any:
     """@spec HTTP-APPROVAL-CONTINUITY-7: a note dialog submission with actual user.team_id."""
-    request = _note_submit(envelope, note="Synthetic note", user=SENDER)
+    request = _note_submit(envelope, note="Synthetic note", decision=decision, user=SENDER)
     request.payload["user"] = {"id": SENDER, "team_id": "T1"}
     meta = json.loads(request.payload["view"]["private_metadata"])
     meta.update(approval_id=APPROVAL, channel=CHANNEL)
@@ -211,10 +217,26 @@ def test_selected_click_without_interaction_team_refuses_before_http(
     _no_queue_or_legacy(redis_client, config, legacy)
 
 
+# #5515: the conditional guidance appended to 401/403 refusal feedback. A
+# copied or forwarded card keeps its buttons, and those are the refusals its
+# clicks produce; the sentence stays conditional because the API does not
+# classify the refusal and the surface must not -- an unauthorized clicker in
+# the right channel gets the same reason, and the sentence must stay true for
+# them too. It names no person and echoes no API code.
+_DM_GUIDANCE = (
+    " If this card was copied or forwarded, the selected approver must answer "
+    "the original card in their DM."
+)
+
 _REFUSAL_TEXTS = (
-    (403, "caller_not_allowed", "You are not allowed to answer this approval."),
-    (403, "unsupported_approval", "This approval can't be answered here."),
-    (403, "some_new_internal_code", "This click was refused and the platform gave no reason."),
+    (401, "missing or invalid approval principal",
+     "Resolving failed; try again shortly." + _DM_GUIDANCE),
+    (403, "caller_not_allowed",
+     "You are not allowed to answer this approval." + _DM_GUIDANCE),
+    (403, "unsupported_approval",
+     "This approval can't be answered here." + _DM_GUIDANCE),
+    (403, "some_new_internal_code",
+     "This click was refused and the platform gave no reason." + _DM_GUIDANCE),
     (
         503, "authority_unavailable",
         "Couldn't confirm your permission right now. Try again in a moment.",
@@ -268,3 +290,162 @@ def test_selected_submission_refusal_shows_plain_text_never_the_api_code(
         assert expected in shown
         assert all(code not in text for text in shown if status_code != 410)
         rig.closed()
+
+
+# #5515: Approve and Reject, each refused with 401 and 403. The rows carry the
+# decision the click replays, the action id that selects the listener, the
+# synthetic API's refusal shape, and the plain reason the guidance is
+# appended to.
+_REFUSED_CLICK_REPLAYS = (
+    ("approved", APPROVE_ACTION_ID, 401, "missing or invalid approval principal",
+     "Resolving failed; try again shortly."),
+    ("rejected", REJECT_ACTION_ID, 401, "missing or invalid approval principal",
+     "Resolving failed; try again shortly."),
+    ("approved", APPROVE_ACTION_ID, 403, "caller_not_allowed",
+     "You are not allowed to answer this approval."),
+    ("rejected", REJECT_ACTION_ID, 403, "caller_not_allowed",
+     "You are not allowed to answer this approval."),
+)
+
+
+@pytest.mark.parametrize(
+    ("decision", "action_id", "status_code", "detail", "reason"), _REFUSED_CLICK_REPLAYS,
+)
+def test_selected_refused_click_replays_the_decision_and_guides_to_the_original_dm(
+    config: DispatcherConfig, redis_client: redis.Redis, decision: str, action_id: str,
+    status_code: int, detail: str, reason: str,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-7: a 401/403 refusal keeps its reason, plus
+    the #5515 guidance for a copied card's clicker.
+
+    Approve and Reject each replay exactly the decision they carry; the refusal
+    ephemeral reaches the clicker's actual interaction channel, neither the
+    original nor a copied card is stamped, and no ordinary turn is queued.
+    """
+    api()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": detail})
+
+    rig = HttpRig(handler)
+    app, legacy = _selected(config, redis_client, rig)
+    sock = _handle(app, _click("env-refused-click", action_id=action_id))
+    assert sock.acked_envelope_ids == ["env-refused-click"]
+    assert len(rig.requests) == 1
+    request = rig.requests[0]
+    assert str(request.url) == f"{BASE}/approvals/{APPROVAL}/resolve"
+    assert json.loads(request.content) == {"decision": decision}
+    proof = _proof(request)
+    assert proof.operation == "resolve" and proof.approval_id == APPROVAL
+    assert proof.slack.user_id == SENDER and proof.native_channel_id == CHANNEL
+    rig.web.chat_update.assert_not_called()
+    assert rig.web.chat_postEphemeral.call_count == 1
+    assert rig.web.chat_postEphemeral.call_args.kwargs == {
+        "channel": CHANNEL, "user": SENDER, "text": reason + _DM_GUIDANCE,
+    }
+    rig.closed()
+    _no_queue_or_legacy(redis_client, config, legacy)
+
+
+_REFUSED_SUBMISSION_REPLAYS = (
+    ("approved", 401, "missing or invalid approval principal",
+     "Resolving failed; try again shortly."),
+    ("approved", 403, "caller_not_allowed",
+     "You are not allowed to answer this approval."),
+    ("rejected", 401, "missing or invalid approval principal",
+     "Resolving failed; try again shortly."),
+    ("rejected", 403, "caller_not_allowed",
+     "You are not allowed to answer this approval."),
+)
+
+
+@pytest.mark.parametrize(
+    ("decision", "status_code", "detail", "reason"), _REFUSED_SUBMISSION_REPLAYS,
+)
+def test_selected_refused_submission_replays_the_decision_and_guides_to_the_original_dm(
+    config: DispatcherConfig, redis_client: redis.Redis, decision: str, status_code: int,
+    detail: str, reason: str,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-7: the note dialog's refused submission keeps
+    its reason, plus the #5515 guidance.
+
+    Both note decisions replay what the dialog carried, the refusal ephemeral
+    reaches the clicker behind the closed dialog, and no card is stamped.
+    """
+    api()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": detail})
+
+    rig = HttpRig(handler)
+    app, legacy = _selected(config, redis_client, rig)
+    sock = _handle(app, _submission("env-refused-submit", decision=decision))
+    assert sock.acked_envelope_ids == ["env-refused-submit"]
+    assert not sock.ack_payloads.get("env-refused-submit")
+    assert len(rig.requests) == 1
+    request = rig.requests[0]
+    assert str(request.url) == f"{BASE}/approvals/{APPROVAL}/resolve"
+    assert json.loads(request.content) == {"decision": decision, "note": "Synthetic note"}
+    proof = _proof(request)
+    assert proof.slack.delivery == "view_submission"
+    assert proof.slack.user_id == SENDER
+    rig.web.chat_update.assert_not_called()
+    assert rig.web.chat_postEphemeral.call_count == 1
+    assert rig.web.chat_postEphemeral.call_args.kwargs == {
+        "channel": CHANNEL, "user": SENDER, "text": reason + _DM_GUIDANCE,
+    }
+    rig.closed()
+    _no_queue_or_legacy(redis_client, config, legacy)
+
+
+_REFUSED_DIALOG_REPLAYS = (
+    ("approved", APPROVE_NOTE_ACTION_ID, 401, "missing or invalid approval principal",
+     "Resolving failed; try again shortly."),
+    ("approved", APPROVE_NOTE_ACTION_ID, 403, "caller_not_allowed",
+     "You are not allowed to answer this approval."),
+    ("rejected", REJECT_NOTE_ACTION_ID, 401, "missing or invalid approval principal",
+     "Resolving failed; try again shortly."),
+    ("rejected", REJECT_NOTE_ACTION_ID, 403, "caller_not_allowed",
+     "You are not allowed to answer this approval."),
+)
+
+
+@pytest.mark.parametrize(
+    ("decision", "action_id", "status_code", "detail", "reason"), _REFUSED_DIALOG_REPLAYS,
+)
+def test_selected_refused_dialog_open_failure_guides_to_the_original_dm(
+    config: DispatcherConfig, redis_client: redis.Redis, decision: str, action_id: str,
+    status_code: int, detail: str, reason: str,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-7: a dialog that cannot open still resolves, and
+    a 401/403 refusal keeps its reason plus the #5515 guidance.
+
+    Both note buttons are covered: the fall-forward resolves with the clicked
+    decision and no note, and the only surface left for the refusal is the
+    ephemeral.
+    """
+    api()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": detail})
+
+    rig = HttpRig(handler)
+    app, legacy = _selected(config, redis_client, rig)
+    rig.web.views_open.side_effect = RuntimeError("synthetic views.open failure")
+    sock = _handle(app, _click("env-refused-dialog", action_id=action_id))
+    assert sock.acked_envelope_ids == ["env-refused-dialog"]
+    rig.web.views_open.assert_called_once()
+    assert len(rig.requests) == 1
+    request = rig.requests[0]
+    assert str(request.url) == f"{BASE}/approvals/{APPROVAL}/resolve"
+    assert json.loads(request.content) == {"decision": decision}
+    proof = _proof(request)
+    assert proof.slack.delivery == "block_actions"
+    assert proof.slack.user_id == SENDER
+    rig.web.chat_update.assert_not_called()
+    assert rig.web.chat_postEphemeral.call_count == 1
+    assert rig.web.chat_postEphemeral.call_args.kwargs == {
+        "channel": CHANNEL, "user": SENDER, "text": reason + _DM_GUIDANCE,
+    }
+    rig.closed()
+    _no_queue_or_legacy(redis_client, config, legacy)

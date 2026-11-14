@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import workitem_dispatch
 from .config import Settings
+from .factory_review_context import pull_request_body_context
 from .factory_tracker_intake import take_due
 from .forges.authority import feedback_actionable, feedback_allowlist
 from .forges.config import BindingConfig, TrackerConfig
@@ -161,21 +162,29 @@ async def _poll_lineage(
     await valkey.set(key, page.cursor, ex=_CURSOR_TTL_SECONDS)
 
 
-def _objective(feedback: ReviewFeedback, url: str, code_host: CodeHost) -> str:
+def _objective(
+    feedback: ReviewFeedback,
+    url: str,
+    code_host: CodeHost,
+    publication_context: dict[str, str | bool],
+) -> str:
     # The pull request URL opens the objective for the agent's benefit only;
     # the reply target is stored typed on the request.
-    provenance = {
+    provenance: dict[str, str | bool | None] = {
         "kind": feedback.kind.value,
         "url": url,
         "sender": feedback.author.login,
         "body": feedback.body,
         "head_sha": feedback.head_sha,
     }
+    provenance.update(publication_context)
     return (
         f"{url}\n\n"
         f"Human {code_host.kind} review feedback on this work item's pull request follows as "
-        "JSON. Use its body as the reviewer's requested changes and revise the same pull "
-        "request.\n" + json.dumps(provenance, ensure_ascii=False)
+        "JSON. The feedback may ask a question or request a change. Answer questions directly "
+        "and revise the same pull request when a change is needed. The pull_request_body, when "
+        "present, records the last successfully published description.\n"
+        + json.dumps(provenance, ensure_ascii=False)
     )
 
 
@@ -238,7 +247,9 @@ async def _admit(
     ):
         await session.rollback()
         return
-    objective = _objective(feedback, lineage.pr_url, code_host)
+    objective = _objective(
+        feedback, lineage.pr_url, code_host, await pull_request_body_context(session, work_item)
+    )
     if len(objective) > _MAX_OBJECTIVE:
         await session.rollback()
         logger.info("review feedback %s on lineage %s is too large", feedback.id, lineage.id)

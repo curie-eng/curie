@@ -26,10 +26,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import itertools
+import json
 import sys
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -448,6 +450,83 @@ def test_authorized_mention_admits_the_next_request_on_the_same_work_item(
         "reply_target_comment_id": None,
         "reply_target_url": None,
     }
+
+
+def _review_publication(work_item_id: uuid.UUID, revision: int, status: str, body: str) -> None:
+    stamp = datetime(2026, 1, 1) + timedelta(minutes=revision)
+    _execute(
+        "WITH approval AS ("
+        "INSERT INTO curie.approvals "
+        "(id, agent_id, conversation_id, author, summary, reply_kind, reply_channel, "
+        "dedupe_key, status, purpose) "
+        "SELECT :approval, agent_id, conversation_id, 'fixture', 'Publish changes', "
+        "'github', repository_path, :dedupe, 'approved', 'publication' "
+        "FROM curie.work_items WHERE id = :work_item RETURNING id) "
+        "INSERT INTO curie.publications "
+        "(id, approval_id, deployment_id, lineage_id, revision_number, repo_full_name, "
+        "status, base_sha, changed_paths, title, body, reply_kind, reply_channel, "
+        "created_at, terminal_at) "
+        "SELECT :id, approval.id, lineage.deployment_id, lineage.id, :revision, "
+        "lineage.repo_full_name, :status, lineage.base_sha, CAST('[]' AS jsonb), "
+        "'Update parser', :body, 'github', lineage.repo_full_name, "
+        ":created_at, :terminal_at "
+        "FROM curie.thread_publication_lineages lineage "
+        "JOIN curie.work_items item ON item.publication_lineage_id = lineage.id "
+        "CROSS JOIN approval "
+        "WHERE item.id = :work_item",
+        {
+            "id": uuid.uuid4(),
+            "approval": uuid.uuid4(),
+            "dedupe": f"review-body-{uuid.uuid4().hex}",
+            "work_item": work_item_id,
+            "revision": revision,
+            "status": status,
+            "body": body,
+            "created_at": stamp,
+            "terminal_at": None if status == "pending" else stamp,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "publication_body",
+    ["The parser accepts quoted fields.", "é" * 20000, "é" * 20001, None],
+    ids=["latest-succeeded", "at-limit", "clipped", "no-succeeded"],
+)
+def test_review_objective_carries_latest_succeeded_pull_request_body(
+    factory: tuple[TestClient, ReviewGitHubAPI], publication_body: str | None
+) -> None:
+    client, api = factory
+    number, pr, first = _owned(client, api)
+    api.pulls[pr]["body"] = "Provider description differs from the stored publication."
+    if publication_body is not None:
+        _review_publication(first["work_item_id"], 1, "succeeded", "Earlier description")
+        _review_publication(first["work_item_id"], 2, "succeeded", publication_body)
+    _review_publication(first["work_item_id"], 3, "failed", "Unpublished failed description")
+    _review_publication(first["work_item_id"], 4, "pending", "Unpublished pending description")
+    question = f"@{MENTION} why does the parser need this check?"
+    payload, fid = _feedback_event(api, "pull_request_review_comment", pr, question)
+
+    response = _post(client, "pull_request_review_comment", payload)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_admitted", response.text
+    revision = _requests(number)[1]
+    provenance = json.loads(revision["objective"].splitlines()[-1])
+    assert provenance["body"] == question
+    assert provenance["sender"] == SENDER
+    assert provenance["path"] == "src/acme/helper.py"
+    assert revision["requester"] == f"github:{SENDER_ID}:{SENDER}"
+    assert _stored_reply_target(revision) == _reply_target("pull_request_review_comment", pr, fid)
+    if publication_body is None:
+        assert "pull_request_body" not in provenance
+        assert "pull_request_body_truncated" not in provenance
+    else:
+        assert provenance["pull_request_body"] == publication_body[:20000]
+        if len(publication_body) > 20000:
+            assert provenance["pull_request_body_truncated"] is True
+        else:
+            assert "pull_request_body_truncated" not in provenance
 
 
 def test_review_admission_retains_issue_lock_until_caller_commit(

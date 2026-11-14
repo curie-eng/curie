@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 
 CODE_HOST_CAPABILITIES: Mapping[Operation, Support] = {
     **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
+    Operation.CURRENT_INSTALLATION_CREDENTIAL: Support.UNSUPPORTED,
     # Account ids map to logins only on GitHub (ADR 0198, #5414).
     Operation.ACCOUNT_LOGIN: Support.UNSUPPORTED,
     Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
@@ -190,6 +191,9 @@ class GitLabCodeHost:
             path,
             default_branch=_text(project.get("default_branch")) or None,
         )
+
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        raise Unsupported(Operation.CURRENT_INSTALLATION_CREDENTIAL)
 
     async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:
         """Decision 16: refused when the project was renamed since it was stored,

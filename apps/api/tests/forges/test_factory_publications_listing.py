@@ -1430,6 +1430,9 @@ def _github_tracker(client: httpx.AsyncClient) -> GitHubTracker:
     async def token() -> str:
         return "fixture-installation-token"
 
+    async def own_login() -> str:
+        return "curie-fixture[bot]"
+
     return GitHubTracker(
         client,
         api=GH_API,
@@ -1440,6 +1443,7 @@ def _github_tracker(client: httpx.AsyncClient) -> GitHubTracker:
         label="factory",
         mention="curie",
         app_id="51",
+        own_login=own_login,
     )
 
 

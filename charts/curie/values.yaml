@@ -1319,6 +1319,12 @@ factory:
   trackers: []
   bindings: []
   sandboxEgress: {}
+  # Minimum remaining model credit, in USD, for a sufficient model credit fact.
+  # The worker reads the provider with its own credential and records only the
+  # comparison. Zero still reads the provider and treats an accepted key as
+  # sufficient. A negative value is refused.
+  admission:
+    minModelCreditUsd: 10
   # Per-run Docker daemons (ADR 0217). Read only when a bindings[].repos[]
   # entry with a runner block sets docker.enabled: true and worker.deploy is
   # true; otherwise templates/docker-daemon.yaml renders nothing. See the
@@ -1746,6 +1752,17 @@ channelGateway:
   apiToken: null
   workerToken: null
   groupCacheTtlSeconds: 60
+  # Optional Slack user email lookup for an external HTTP identity provider, so
+  # the provider can map Slack senders to directory accounts without its own
+  # Slack token. existingSecret names an operator-supplied Secret whose tokenKey
+  # holds the identity caller credential; give the provider the same value as
+  # CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN. Empty (the default) leaves the lookup
+  # off. timeoutSeconds bounds each Slack users.info call. Restart the gateway
+  # after rotating the Secret.
+  identityLookup:
+    existingSecret: ""
+    tokenKey: token
+    timeoutSeconds: 5
   readinessProbe:
     initialDelaySeconds: 1
     periodSeconds: 5
