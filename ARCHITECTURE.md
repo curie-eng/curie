@@ -1255,8 +1255,9 @@ OTel Collector (OTLP gRPC 4317 / HTTP 4318)
   replies, and API/background work. Trace IDs, users, sessions, sandbox names,
   arbitrary paths, and error text are prohibited metric attributes.
 - **Langfuse OTLP ingest is HTTP-only.** The collector adapts trace traffic to
-  Langfuse over HTTP; no application speaks to it directly. Logs and metrics
-  remain explicit collector pipelines, whose production destinations are
+  Langfuse over HTTP. Eval results use their own authenticated write to
+  Langfuse. Logs and metrics remain explicit collector pipelines, whose
+  production destinations are
   supplied through supported collector values rather than application code.
   Collector config is at [`otel/collector-config.yaml`](otel/collector-config.yaml).
 - The API still reconstructs the Langfuse tool-call tree via `parentObservationId`
