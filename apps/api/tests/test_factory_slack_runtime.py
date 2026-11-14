@@ -5976,3 +5976,87 @@ def test_key_events_phase_lines_off_does_not_block_on_unposted_phases(stack: Sta
     )
     assert phase["posted_at"] is None
     assert "owed before the change" not in "\n".join(call.haystack for call in _chat(stack))
+
+
+def _production_phase_pass(stack: Stack) -> bool:
+    """One pass through the production builder. The phase flag is not an argument.
+
+    ``make_config`` leaves ``factory_slack_phase_lines`` unset, so ``WorkerConfig``
+    reads ``CURIE_FACTORY_SLACK_PHASE_LINES`` the same way the worker process does,
+    and ``_build_factory_slack_progress`` is what forwards that field to the store.
+    """
+
+    return bool(
+        stack.client.portal.call(
+            functools.partial(
+                _switched_progress_pass,
+                stack.worker,
+                stack.slack.base_url,
+                stack.identity,
+                stack.factory_token,
+                enabled=True,
+            )
+        )
+    )
+
+
+def _phased_finish(stack: Stack, note: str) -> tuple[uuid.UUID, str, str]:
+    number = next(_ISSUES)
+    url, objective = _ticket_objective(number)
+    request_id, work_item_id = stack.admit(number, objective=objective)
+    epoch = stack.start(request_id)
+    stack.report(request_id, "plan", note)
+    pr = next(_PULLS)
+    stack.own_pull_request(work_item_id, pr)
+    pr_url = f"https://github.com/{REPO}/pull/{pr}"
+    stack.finish(request_id, epoch, published=True)
+    return work_item_id, pr_url, url
+
+
+def test_key_events_phase_lines_follow_the_environment(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC4: the phase-lines opt-in is the worker environment, forwarded by production.
+
+    Unset, a finished run posts the taken root and the PR open reply only. Set
+    to true, the same shape of run also posts its phase line and Run completed.
+    Neither pass hands a phase-lines value to the store. Removing
+    ``phase_lines=config.factory_slack_phase_lines`` from the builder leaves the
+    store at its default, so the opted-in run posts no phase line.
+    """
+
+    monkeypatch.delenv("CURIE_FACTORY_SLACK_PHASE_LINES", raising=False)
+    probe = {"stream": "probe-phase", "group": "probe-phase", "prefix": "probe-phase"}
+    assert make_config(probe).factory_slack_phase_lines is False
+    assert stack.enable_destination().status_code == 200
+    quiet_id, quiet_pr, quiet_url = _phased_finish(stack, "quiet under the default")
+    assert _production_phase_pass(stack) is True
+    (quiet_thread,) = stack.threads(quiet_id)
+    quiet_texts = [
+        call.text
+        for call in stack.slack.thread_posts(stack.factory_token, quiet_thread["root_ts"])
+    ]
+    assert quiet_texts == [f"PR open: {quiet_pr}"], quiet_texts
+    (quiet_root,) = [
+        call
+        for call in stack.slack.roots(stack.factory_token)
+        if quiet_url in call.text
+    ]
+    assert quiet_root.text.startswith("Taken:")
+    assert _kinds(quiet_id) == ["root", "pull_request"]
+    assert "quiet under the default" not in "\n".join(call.haystack for call in _chat(stack))
+    assert "Run completed" not in "\n".join(call.text for call in _chat(stack))
+
+    monkeypatch.setenv("CURIE_FACTORY_SLACK_PHASE_LINES", "true")
+    assert make_config(probe).factory_slack_phase_lines is True
+    opted_id, opted_pr, _opted_url = _phased_finish(stack, "posted because the setting is on")
+    assert _production_phase_pass(stack) is True
+    (opted_thread,) = stack.threads(opted_id)
+    opted_texts = [
+        call.text
+        for call in stack.slack.thread_posts(stack.factory_token, opted_thread["root_ts"])
+    ]
+    assert opted_texts[0] == "Phase plan: posted because the setting is on", opted_texts
+    assert opted_texts[1] == f"PR open: {opted_pr}"
+    assert opted_texts[2].startswith("Run completed"), opted_texts
+    assert _kinds(opted_id) == ["root", "phase", "pull_request", "terminal"]
