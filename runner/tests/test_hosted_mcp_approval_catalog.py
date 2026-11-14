@@ -499,8 +499,10 @@ async def _await_mcp_connected(runner: Any, server: str) -> None:
     """Block until the CLI's own MCP status reports ``server`` connected.
 
     The CLI connects MCP servers in the background, so a query sent at once can
-    be answered from a catalogue built before they finish. Not connected by the
-    deadline fails the test; it is never a skip.
+    be answered from a catalogue built before they finish. Each status read is a
+    control round trip to the CLI, so a server still connecting is read again
+    rather than slept on. Not connected by the deadline fails the test; it is
+    never a skip.
     """
 
     client = runner._session._client
@@ -510,7 +512,6 @@ async def _await_mcp_connected(runner: Any, server: str) -> None:
             found = {item.get("name"): item.get("status") for item in status["mcpServers"]}
             if found.get(server) == "connected":
                 return
-            await anyio.sleep(0.05)
 
 
 async def _drive(runner: Any, text: str, ts: str, *, connected_server: str | None = None) -> Final:
