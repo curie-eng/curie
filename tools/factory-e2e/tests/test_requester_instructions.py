@@ -764,6 +764,18 @@ def test_a_slot_needs_both_reviewers_across_its_pods() -> None:
 # --------------------------------------------------------------------------
 
 
+def test_the_live_forges_config_is_one_the_api_accepts(tmp_path: Path) -> None:
+    from curie_api.forges.config import ForgesConfig
+
+    forges = driver.live_forges("12345", "placeholder-key", f"rqp-{NONCE}")
+    config = ForgesConfig.model_validate(forges)
+    assert config.trackers[0].label == f"rqp-{NONCE}"
+    # The control: a mention that is not a GitHub login is refused at API start.
+    forges["trackers"][0]["mention"] = "@curie"
+    with pytest.raises(ValueError, match="is not a github account"):
+        ForgesConfig.model_validate(forges)
+
+
 def test_the_live_run_installs_the_factory_bundle() -> None:
     files = driver.live_bundle()
     assert set(ris.FACTORY_BUNDLE_REQUIRED) <= set(files)

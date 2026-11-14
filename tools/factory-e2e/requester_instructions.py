@@ -325,6 +325,29 @@ class LiveInputs:
         return [self.owner_token, self.second_token, self.model_url, self.model_key]
 
 
+def live_forges(app_id: str, private_key: str, label: str) -> dict[str, Any]:
+    """The live run's ``CURIE_FORGES``: one GitHub code host and its polled tracker.
+
+    The tracker's mention must be a GitHub login. The run's own label is one no
+    account uses, so only the label starts intake.
+    """
+
+    credential = {"type": "github_app", "app_id": app_id, "private_key": private_key}
+    github = {"name": "github", "kind": "github", "host": GITHUB_HOST, "api_url": GITHUB_API}
+    return {
+        "code_hosts": [{**github, "credential": credential}],
+        "trackers": [
+            {
+                **github,
+                "credential": credential,
+                "label": label,
+                "mention": label,
+                "poll_interval_s": 15,
+            }
+        ],
+    }
+
+
 def live_bundle() -> dict[str, str]:
     """The bundle a live run installs: the real factory bundle, or a refusal."""
 
@@ -390,35 +413,11 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 return env
             live = self.live_inputs
             pem = (live.app_dir / "app.pem").read_text()
-            credential = {
-                "type": "github_app",
-                "app_id": live.app["id"],
-                "private_key_file": str(live.app_dir / "app.pem"),
-            }
-            github = {
-                "name": "github",
-                "kind": "github",
-                "host": GITHUB_HOST,
-                "api_url": GITHUB_API,
-            }
             env.update(
                 {
                     "FACTORY_ENABLED": "true",
                     "FACTORY_INTAKE": "poll",
-                    "CURIE_FORGES": json.dumps(
-                        {
-                            "code_hosts": [{**github, "credential": credential}],
-                            "trackers": [
-                                {
-                                    **github,
-                                    "credential": credential,
-                                    "label": self.label,
-                                    "mention": "@curie",
-                                    "poll_interval_s": 15,
-                                }
-                            ],
-                        }
-                    ),
+                    "CURIE_FORGES": json.dumps(live_forges(live.app["id"], pem, self.label)),
                     "GITHUB_API_URL": GITHUB_API,
                     "GITHUB_CLONE_BASE": f"https://{GITHUB_HOST}",
                     "GITHUB_APP_ID": live.app["id"],
