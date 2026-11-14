@@ -1003,6 +1003,107 @@ pub struct DarkFactoryRenderOpts {
     pub out: PathBuf,
 }
 
+pub const FACTORY_TRIAGE_BUNDLE_FILES: &[(&str, &[u8])] = &[
+    (
+        "README.md",
+        include_bytes!("../../examples/factory-triage/README.md"),
+    ),
+    (
+        ".claude-plugin/plugin.json",
+        include_bytes!("../../examples/factory-triage/.claude-plugin/plugin.json"),
+    ),
+    (
+        "workflow/result.json",
+        include_bytes!("../../examples/factory-triage/workflow/result.json"),
+    ),
+    (
+        "progress/phases.json",
+        include_bytes!("../../examples/factory-triage/progress/phases.json"),
+    ),
+    (
+        "hooks/hooks.json",
+        include_bytes!("../../examples/factory-triage/hooks/hooks.json"),
+    ),
+    (
+        "hooks/reproduction_gate.py",
+        include_bytes!("../../examples/factory-triage/hooks/reproduction_gate.py"),
+    ),
+    (
+        "skills/investigate-report/SKILL.md",
+        include_bytes!("../../examples/factory-triage/skills/investigate-report/SKILL.md"),
+    ),
+    (
+        "evals/triage-cases.json",
+        include_bytes!("../../examples/factory-triage/evals/triage-cases.json"),
+    ),
+    (
+        "evals/reply-format.md",
+        include_bytes!("../../examples/factory-triage/evals/reply-format.md"),
+    ),
+];
+
+pub struct FactoryTriageRenderOutput {
+    pub path: PathBuf,
+    pub implementation_label: String,
+}
+
+impl CliOutput for FactoryTriageRenderOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "bundle_dir": self.path,
+            "rendered": true,
+            "implementation_label": self.implementation_label,
+        })
+    }
+
+    fn render(&self, ui: &Ui) {
+        ui.payload(&format!("Factory triage bundle: {}", self.path.display()));
+    }
+}
+
+pub fn render_factory_triage(
+    out: PathBuf,
+    implementation_label: String,
+) -> Result<FactoryTriageRenderOutput> {
+    if implementation_label.trim().is_empty() || implementation_label.chars().count() > 50 {
+        return Err(crate::exit::usage(
+            "implementation label must contain 1 to 50 characters",
+        ));
+    }
+    if out.exists() && (!out.is_dir() || std::fs::read_dir(&out)?.next().is_some()) {
+        return Err(crate::exit::usage(
+            "render output must be a new or empty directory",
+        ));
+    }
+    for (name, bytes) in FACTORY_TRIAGE_BUNDLE_FILES {
+        let path = out.join(name);
+        std::fs::create_dir_all(
+            path.parent()
+                .context("bundle file needs a parent directory")?,
+        )?;
+        if *name == "workflow/result.json" {
+            let mut declaration: serde_json::Value = serde_json::from_slice(bytes)?;
+            declaration["implementation_label"] =
+                serde_json::Value::String(implementation_label.clone());
+            std::fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string_pretty(&declaration)?),
+            )?;
+        } else {
+            std::fs::write(&path, bytes)?;
+        }
+        #[cfg(unix)]
+        if *name == "hooks/reproduction_gate.py" {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    Ok(FactoryTriageRenderOutput {
+        path: out,
+        implementation_label,
+    })
+}
+
 /// The dark factory runner layer each release publishes (#3747). Under ADR
 /// 0173 the bundle's owner builds its runner layer, and for this example that
 /// owner is the project, so `release.yaml` pushes it tagged by version.

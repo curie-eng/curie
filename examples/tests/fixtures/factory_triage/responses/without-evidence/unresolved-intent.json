@@ -1,0 +1,10 @@
+{
+  "kind": "ticket",
+  "title": "display(2.5) returns 3 but should return 2",
+  "body": "## Problem\n{\"component\": \"display.py display\", \"input\": [2.5], \"observed\": 3, \"expected\": 2}\n\n## Base\n{\"branch\": \"next\", \"revision\": \"0123456789abcdef0123456789abcdef01234567\"}\n\n## Blocked by\n[]\n\n## Decisions\n{\"behavior\": \"integer_addition\", \"intent\": \"unresolved\"}\n\n## Preconditions\n{\"command\": \"echo expected\", \"available\": true}\n\n## Acceptance criteria\n[{\"input\": [2.5], \"expected\": 2, \"Verified by\": \"echo expected\", \"Runs in\": \"echo expected\"}]\n\n## Out of scope\n[]",
+  "reproduction": {
+    "command": "echo expected",
+    "observed": "expected",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
