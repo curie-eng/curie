@@ -48,6 +48,7 @@ from ..hook_runs import HookRunOutcome, HookRunReason, HookRunRecorderError, ret
 from ..reply_sink import (
     TargetRoute,
 )
+from ..requester_context import RequesterContextRefused
 from ..sandbox.types import OwnerBusy, PersonalLaunchRefused
 from ..turn_progress import (
     ELIGIBILITY_ENV,
@@ -1472,6 +1473,18 @@ async def _process_event(
                 return
             except failures._WorkItemDeferred:
                 return
+            except RequesterContextRefused as exc:
+                # ADR 0278 (#5592): no model work without the acknowledged
+                # requester context. The started request fails with the reason.
+                release_order()
+                refused_run = (
+                    self._work_item_runs.get(owned_work_item_id)
+                    if owned_work_item_id is not None
+                    else None
+                )
+                if refused_run is not None:
+                    await _settle_requester_refusal(self, refused_run, exc, event_id)
+                return
             except PersonalLaunchRefused as exc:
                 release_order()
                 refused_run = (
@@ -2160,6 +2173,23 @@ async def _settle_personal_refusal(
     except WorkItemConflict as conflict:
         logger.info("personal refusal settlement for %s refused: %s", event_id, conflict.code)
         if run.started and conflict.code == "not_running":
+            run.finished = True
+    await self._markers.mark_done(event_id, marker_value="1")
+
+
+async def _settle_requester_refusal(
+    self: Kernel, run: WorkItemRun, exc: RequesterContextRefused, event_id: str
+) -> None:
+    """Fail a started request whose requester context was refused (ADR 0278)."""
+
+    logger.info("requester context refused for %s: %s", event_id, exc.reason)
+    try:
+        await run.finish(
+            outcome="failed", cause="runner_escalated", detail=exc.detail, ci_fix_round=None
+        )
+    except WorkItemConflict as conflict:
+        logger.info("requester refusal settlement for %s refused: %s", event_id, conflict.code)
+        if conflict.code == "not_running":
             run.finished = True
     await self._markers.mark_done(event_id, marker_value="1")
 

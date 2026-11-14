@@ -53,6 +53,7 @@ from apps.worker.tests.kernel.test_work_item_workspace import (
     _HttpPrecheckApi,
 )
 from apps.worker.tests.queue_fixtures import factory_context, factory_conversation
+from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -156,7 +157,7 @@ class _Workspace:
         return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha="a1" * 20)
 
 
-class _WorkItems:
+class _WorkItems(AbsentRequesterContext):
     """Dispatch double: records every finish the worker posts."""
 
     def __init__(

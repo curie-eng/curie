@@ -17,11 +17,12 @@ truth (the committed JSON Schema and generated Rust/TS are derived from them).
 
 ## What "an ACI server" is
 
-An ACI server is an **HTTP process** inside the sandbox that exposes 11 POST
-routes and streams NDJSON back: seven every server serves, plus four optional
+An ACI server is an **HTTP process** inside the sandbox that exposes 12 POST
+routes and streams NDJSON back: seven every server serves, plus five optional
 runner-private routes described below, the executor route `POST /v1/execute`,
-the checkpoint route `POST /v1/checkpoint`, and the UI evidence routes
-`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image`. Those seven plus the bearer-gated
+the checkpoint route `POST /v1/checkpoint`, the UI evidence routes
+`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image`, and the
+requester context route `POST /v1/requester-context`. Those seven plus the bearer-gated
 `GET /v1/status` are its eight required authenticated control routes:
 
 | Route | Purpose |
@@ -37,6 +38,7 @@ the checkpoint route `POST /v1/checkpoint`, and the UI evidence routes
 | `POST /v1/checkpoint` | Optional. Capture the managed workspace against a worker-supplied trusted base commit as a bounded patch plus manifest; runner-private and authenticated (see below). |
 | `POST /v1/ui-evidence/index` | Optional. Return the validated index of the gitignored `.curie/ui-evidence/` manifest and its PNG images, bound to a worker-named base commit; runner-private and authenticated (see below). |
 | `POST /v1/ui-evidence/image` | Optional. Return the raw bytes of one indexed, unchanged PNG; runner-private and authenticated (see below). |
+| `POST /v1/requester-context` | Optional. Take the worker's version 1 requester context envelope before a factory execution's first turn, check it against the execution the runner was started for and answer the acknowledgment (ADR 0278); runner-private and authenticated. A server without it answers `404`, and the worker fails the request before model work. |
 | `GET /v1/status` | Return session status plus the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`, `cwd`) and `history_durable` for the worker's replacement-authority check. |
 
 Plus two unauthenticated GETs the platform relies on: `GET /healthz` (liveness)

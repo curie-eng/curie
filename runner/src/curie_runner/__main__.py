@@ -90,6 +90,7 @@ from .harness.claude.approval import (
 from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
+from .harness.claude.requester_guard import build_subagent_guard
 from .harness.claude.tracker_result_tool import wrap_tracker_result_handler
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
@@ -153,6 +154,9 @@ from .progress import (
 )
 from .publication_precheck import PublicationPrecheck
 from .redact import collect_held_secrets, install_stdout_redaction, register_held_secrets
+from .requester_context import BLOCKED_EXPLANATION as REQUESTER_BLOCKED_EXPLANATION
+from .requester_context import Failed as RequesterFailed
+from .requester_context import RequesterContextGate, attach_gate
 from .route_callers import (
     connector_urls,
     mount_route_callers,
@@ -677,6 +681,7 @@ def _compose_system_prompt(
     progress_preamble: str | None = None,
     facts_preamble: str | None = None,
     guidance_preamble: str | None = None,
+    requester_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
 
@@ -697,6 +702,10 @@ def _compose_system_prompt(
 
     Image tools (ADR 0216) and the remote Docker contract (ADR 0217) sit beside
     the workspace verification block, before bundle instructions.
+
+    The requester's pinned coding instructions (ADR 0278) follow the stable
+    bundle prefix and model identity, between their two delimiter lines. Absent,
+    the prompt is byte-identical to what it was before the section existed.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
@@ -712,6 +721,7 @@ def _compose_system_prompt(
             progress_preamble,
             base,
             model_preamble,
+            requester_preamble,
             attachment_preamble,
         )
         if p
@@ -947,6 +957,9 @@ def build_runner(
                 else format_attachment_preamble(attachment_view)
             ),
             progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
+            requester_preamble=(
+                requester_gate.applied.section() if requester_gate.applied is not None else None
+            ),
             facts_preamble=memory_facts_preamble,
             guidance_preamble=(
                 (memory_guidance or DEFAULT_GUIDANCE)
@@ -1194,6 +1207,8 @@ def build_runner(
     # Set by ``initialize`` from the API's completion contract (ADR 0277,
     # #5586); an implementation session until then, and with no capability.
     bound_contract = BoundContract(IMPLEMENTATION)
+    # ADR 0278 (#5592): the worker's requester context envelope, decided once.
+    requester_gate = RequesterContextGate()
     observed_readonly_tools: frozenset[str] = frozenset()
 
     def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
@@ -1285,7 +1300,13 @@ def build_runner(
                     connector_availability,
                 ),
                 bundle_hooks,
-                build_factory_foreground_hooks() if progress_url and progress_token else None,
+                _merge_pre_tool_use_hooks(
+                    build_factory_foreground_hooks() if progress_url and progress_token else None,
+                    # Only a boot that can bind an execution can apply a
+                    # requester section (ADR 0278); any other boot is unchanged.
+                    build_subagent_guard(requester_gate) if issue_read is not None else None,
+                    None,
+                ),
             ),
             tool_access,
         )
@@ -1477,6 +1498,14 @@ def build_runner(
     verification_token = os.environ.get(PROGRESS_TOKEN_ENV)
 
     async def initialize() -> None:
+        try:
+            await _initialize()
+        finally:
+            # Answers a delivery still waiting when the start never bound one.
+            if not requester_gate.bound:
+                requester_gate.bind(None)
+
+    async def _initialize() -> None:
         # Runs in the runner's shared start task after the listener binds
         # (#4777): the preflight can take minutes, past the worker's claim.
         nonlocal preflight_block, real_options, bound_contract
@@ -1528,6 +1557,21 @@ def build_runner(
                     "completion contract tracker_result result_kinds=%s",
                     ",".join(bound_contract.contract.result_kinds),
                 )
+        # ADR 0278 (#5592): an execution the API bound waits for the worker's
+        # envelope and builds no model session until it is validated; a
+        # refused, missing or unsupported one answers offline.
+        if preflight_block is not None:
+            # Blocked before any model session: the start answers offline with
+            # its explanation, and the worker leaves the request's evidence.
+            requester_gate.block()
+            execution = None
+        else:
+            execution = bound_contract.contract.execution
+            requester_gate.bind(execution)
+        if execution is not None:
+            outcome = await requester_gate.wait()
+            if isinstance(outcome, RequesterFailed):
+                preflight_block = REQUESTER_BLOCKED_EXPLANATION
         if build_real_options is not None:
             real_options = build_real_options(compose_system_prompt(verification), bound_contract)
 
@@ -1615,7 +1659,7 @@ def build_runner(
         config.session.session_id,
         config.session.sandbox_id,
     )
-    return bind_status_attestation(
+    runner = bind_status_attestation(
         SessionRunner(
             cleanup_timeout_s=config.cleanup_timeout_s,
             session_factory=factory,
@@ -1662,6 +1706,8 @@ def build_runner(
         sandbox_id=config.session.sandbox_id,
         cwd=workspace_cwd,
     )
+    attach_gate(runner, requester_gate)
+    return runner
 
 
 async def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:

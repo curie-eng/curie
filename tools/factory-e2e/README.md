@@ -832,6 +832,165 @@ runner forwards and the object store relay before #5377's cleanup and proves
 their ports closed; the stub's Pod, Service and ConfigMaps go with the owned
 namespace.
 
+## Requester coding instructions proof
+
+`requester_instructions.py` is the proof driver for issue #5592 (ADR 0278),
+criteria 9 and 10: a WorkItem started by a linked requester receives that
+requester's coding instructions document, the runner acknowledges it before
+model work, reviewers never see it, and the published pull request ends with
+the trusted `Requester preferences: applied; sha256:<digest>` line. It runs on
+the owner enforcement harness above (`OwnerProof`, reused by import): the same
+exact-image build, owned namespaces, Dex OIDC principals, TLS GitHub stub,
+runner forwards, loopback registry, `env -i` child, ledger and bounded
+finalizer. Its own pure logic (documents, slot ledger, spend caps, the two
+programs it runs outside the driver, per-slot assertions and the judge) lives
+in `requester_instructions_support.py`. The API and worker run with
+`FACTORY_MODEL_AUTH_MODE=service` and
+`CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY=true`.
+
+The live run installs the real factory bundle (`examples/dark-factory`, with
+both named reviewers, the implementation skill and the review gate) and refuses
+to start when any of those files is missing. Each slot's transcript scan
+records which named reviewers the session actually ran, and criterion 10 passes
+only when both the plan reviewer and the diff reviewer ran in every slot. The
+rehearse runs the offline fake model, which loads no plugin hooks or
+subagents, so it keeps the owner proof's small fixture bundle.
+
+### Inputs
+
+`rehearse` takes the owner enforcement flags and input file unchanged
+(`--candidate`, `--context`, `--namespace`, `--docker-context`, `--registry`,
+`--input-file`, `--state-dir`, `--run-id`). `preflight` and `run` also take
+these private files, each mode 0600 and owned by the caller:
+
+1. `--app-dir`: a 0700 directory with `app.json` (`id`, `installation_id`,
+   `repo`, the public fixture repository) and `app.pem`, the factory test
+   GitHub App.
+2. `--owner-token-file` and `--second-token-file`: one GitHub user token line
+   each, for the repository owner and the second test account.
+3. `--model-credential-file`: a JSON object with `base_url` (https, or http for an endpoint reached only over a private encrypted network) and
+   `api_key` for the live model endpoint.
+4. `--conflict-file`: a JSON object with `preference` (one line that a rule in
+   the fixture repository contradicts), `forbidden_added_line_regex` (matches
+   an added line that obeys the preference instead of the rule) and
+   `rule_path` (the repository file holding the rule).
+5. `--priority-class`: an existing PriorityClass for the publication Job.
+
+`--model` (default the owner proof's model) and `--slot-seconds` (300 to 3600,
+default 1500) bound the live run.
+
+### Commands
+
+```bash
+uv run python3 tools/factory-e2e/requester_instructions.py rehearse \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$REHEARSAL_ID"
+
+uv run python3 tools/factory-e2e/requester_instructions.py preflight \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --app-dir "$APP_DIR" --owner-token-file "$OWNER_TOKEN" \
+  --second-token-file "$SECOND_TOKEN" --model-credential-file "$MODEL_FILE" \
+  --conflict-file "$CONFLICT_FILE" --priority-class "$PRIORITY_CLASS"
+
+uv run python3 tools/factory-e2e/requester_instructions.py run \
+  --candidate "$SHA" --context "$CTX" --namespace "$NS" --docker-context "$DCTX" \
+  --registry "$REG" --input-file "$INPUT" --state-dir "$STATE" --run-id "$RUN_ID" \
+  --app-dir "$APP_DIR" --owner-token-file "$OWNER_TOKEN" \
+  --second-token-file "$SECOND_TOKEN" --model-credential-file "$MODEL_FILE" \
+  --conflict-file "$CONFLICT_FILE" --priority-class "$PRIORITY_CLASS"
+
+uv run python3 tools/factory-e2e/requester_instructions.py judge \
+  --state-dir "$STATE" --run-id "$REHEARSAL_ID" --run-id "$RUN_ID" --criterion all
+```
+
+`preflight` is read-only. It runs the owner enforcement driver's checks (no
+service credential in the caller environment, flags, input file, Python
+environment, clean checkout, `docker info`, the registry, `/readyz`, namespace
+absence, RBAC), then an unused run ID in this driver's ledger
+(`requester-instructions.sqlite3`), then the live inputs: the App kit, both
+token files and the model credential file by `stat` only, the conflict file's
+shape and the PriorityClass. A missing prerequisite is a refusal with exit
+code 2. The live model probe, the App token probe and `GET /user` for both
+accounts are not preflight checks; `run` makes them inside the child,
+immediately before the first label, and refuses before any label when one
+fails.
+
+### What rehearse proves (criterion 9)
+
+The rehearsal is unpaid: the runner uses its offline fake model. It creates
+the two OIDC principals, links each to a distinct synthetic GitHub account id
+on the stub's host through `POST /identity/admin/{tenant}/code-host-links`,
+and leaves a third account id unlinked. It resolves all three through the
+production resolver (`resolve_github_requester`), run in a child with the
+API's environment, and stores a different document per linked principal with
+`PUT /coding-instructions` under that principal's console session. Each
+document carries a canary line and a marker preference. It admits one issue
+per actor through the internal admission route in service mode, with the
+requester the resolver returned. The stub records every label as its bot, so a
+human label actor cannot be driven through it; the resolver run is what ties
+the account to the principal. It then reads the API's own records: each linked
+WorkItem is `selected` with the digest of its own principal's document and its
+request's evidence is `applied`, and the unlinked WorkItem is `absent` with
+evidence `none`. Finally it scans the API, worker and every runner Pod log for
+any line of either document, and runs the full finalizer, which deletes
+everything and proves each item absent.
+
+### What run proves (criterion 10)
+
+The live run uses polling intake on the fixture repository, never webhook
+intake. It links the owner and second test accounts by their numeric ids,
+stores the owner's document (one machine-checkable marker preference and the
+conflicting preference) and a different document for the second account, binds
+the agent to the repository under a label made for this run, and runs at most
+three slots in order:
+
+1. The owner labels a new issue.
+2. The second account labels a new issue.
+3. The owner, with the document cleared, labels a new issue (the control).
+
+Each slot is written to the ledger before its label is applied. Per slot the
+driver records whether the WorkItem's requester is that account's principal,
+the request's evidence, the pull request body's last line, the diff's added
+lines, and a scan of every reviewer transcript record (subagent files and
+sidechain lines) in the runner Pod for any line of either document. Slots 1
+and 2 must end with their own document's annotation; slot 1's diff must carry
+the marker and must not obey the conflicting preference; slot 3 must have no
+annotation and no marker. Every reviewer scan must read at least one reviewer
+record and find nothing.
+
+Spend is capped as precondition 5 requires: at most 3 slots, a 5 USD cap per
+model session (`DEFAULT_MAX_USD_PER_DAY`), and at most one continuation per
+slot (`CURIE_WORK_ITEM_MAX_TURNS=2`). The image's launch gate holds every
+native start until the driver releases it, and the driver releases at most two
+per labeled slot; any other start fences the run.
+
+### Judge
+
+`judge --criterion {9,10,all}` reads the ledger only and prints a sanitized
+verdict. Criterion 9 is judged from a rehearse run and criterion 10 from a live
+run, each from the run IDs passed. A criterion with no such run, or whose run
+never finished, is reported `missing`, never passed. Each criterion also
+requires its cleanup rows to be clean and every finalizer step to succeed; for
+criterion 10 the slot table must show each slot recorded before its label and
+within its launch cap. Exit code 0 means every judged criterion passed.
+
+### Fail-closed programs
+
+The model probe runs in an `env -i` child with an empty `HOME`; the reviewer
+scan runs in the runner Pod with its needles on stdin. Each exits 2 on input
+it cannot read and 3 at its own 45 s deadline, and the driver treats any
+unreadable answer as a failure, never a clean result.
+
+### Known limits
+
+The live path runs the factory on the same host-process harness as the
+rehearsal, with the real GitHub App and poll intake in the candidate API and a
+publication Job in the owned namespace; the rehearsal does not exercise that
+composition, so only `run` proves it. GitHub's REST API cannot delete issues, so cleanup
+closes the run's issues and pull requests, deletes its branches and label, and
+counts a closed issue as removed.
+
 ## Personal Slack kickoff acceptance (#5380)
 
 `personal_slack_kickoff.py` is the live proof for issue #5380 acceptance

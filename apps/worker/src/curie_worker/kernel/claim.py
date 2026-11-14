@@ -17,7 +17,7 @@ from aci_protocol import (
     TurnSource,
 )
 
-from .. import caller_token, sweep
+from .. import caller_token, requester_context, sweep
 from ..approvals import (
     ApprovalBackendError,
     PublicationLineage,
@@ -1335,6 +1335,19 @@ async def _route_and_start(
         self._register_run(agent_id, thread_key)
     turn: TurnStream | None = None
     try:
+        # ADR 0278 (#5592): the request's pinned requester context is
+        # delivered, validated and acknowledged before its first turn, on
+        # every handle this run's event starts on; a refusal fails it here.
+        work_items = getattr(self, "_work_items", None)
+        if run is not None and run.event_id == queued_event_id and work_items is not None:
+            await requester_context.deliver(
+                work_items=work_items,
+                runner=self._runner,
+                run=run,
+                base_url=handle.base_url,
+                token=handle.token or None,
+                remaining_s=remaining_s,
+            )
         event, remaining_s = await self._bind_publication_context(
             event,
             queued_event_id=queued_event_id,
