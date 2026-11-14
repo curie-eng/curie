@@ -341,12 +341,12 @@ class Settings(BaseSettings):
     # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
     # the missed-label backstop. The poll interval is the GitHub tracker's.
     factory_intake: Literal["poll", "webhook"] = "poll"
-    # The model auth mode tracker ingress admits with (#5376, ADR 0268). Tracker
-    # events carry no verified owner, so with "personal" a new issue refuses
-    # personal_owner_required before any WorkItem exists, and only a WorkItem
-    # already bound to an owner accepts a revision or readmission. The default
-    # keeps service admissions.
+    # Personal GitHub labels use the linked requester and normal owner validation.
     factory_model_auth_mode: Literal["service", "personal"] = "service"
+    requester_coding_instructions_apply: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY"),
+    )
     factory_base_label_settle_s: int = Field(default=60, ge=0)
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with

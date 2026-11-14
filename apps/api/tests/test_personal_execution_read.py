@@ -226,6 +226,13 @@ def test_operator_read_exposes_the_owner_tuple_after_approval_and_revalidation(
     assert personal_body["requester"] == support.OTHER_REQUESTER
     assert _owner_facts(service_body) == (tenant, "service", None, None)
     assert _request_facts(service_body) == [(1, "waiting", tenant, "service", None, None)]
+    assert personal_body["requester_principal_id"] == owner
+    assert service_body["requester_principal_id"] is None
+    for detail in (personal_body, service_body):
+        assert detail["coding_instructions"]["absence_reason"] == "application_unavailable"
+        for entry in detail["requests"]:
+            assert entry["coding_instructions_selection_id"] == detail["id"]
+            assert entry["coding_instructions_evidence"] == "none"
 
     items = {item["id"]: item for item in list_body["items"]}
     assert set(items) == {str(personal.work_item_id), str(service.work_item_id)}

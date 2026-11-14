@@ -3,6 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
+from curie_internal.requester_coding_instructions import AbsenceReason
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
@@ -91,6 +92,16 @@ WorkItemCiState = Literal["passing", "failing", "pending", "none", "unavailable"
 ModelAuthMode = Literal["service", "personal"]
 
 
+class CodingInstructionsMetadata(BaseModel):
+    """Public selection metadata; the private snapshot text is never serialized."""
+
+    state: Literal["absent", "selected"]
+    absence_reason: AbsenceReason | None = None
+    revision: int | None = None
+    sha256: str | None = None
+    format_version: Literal[1] | None = None
+
+
 class WorkItemRequestOut(BaseModel):
     """Operator view of one ExecutionRequest (#2577). Built from an explicit
     allowlist dict, never from an ORM row, so no runtime-owner field leaks."""
@@ -112,6 +123,8 @@ class WorkItemRequestOut(BaseModel):
     model_auth_mode: ModelAuthMode = "service"
     owner_principal_id: uuid.UUID | None = None
     enrollment_generation: int | None = None
+    coding_instructions_selection_id: uuid.UUID | None = None
+    coding_instructions_evidence: Literal["none", "pending", "applied", "failed"] = "none"
 
 
 class WorkItemPrOut(BaseModel):
@@ -279,6 +292,8 @@ class WorkItemOutcomeOut(BaseModel):
     model_auth_mode: ModelAuthMode = "service"
     owner_principal_id: uuid.UUID | None = None
     enrollment_generation: int | None = None
+    requester_principal_id: uuid.UUID | None = None
+    coding_instructions: CodingInstructionsMetadata
 
 
 class WorkItemOutcomeList(BaseModel):

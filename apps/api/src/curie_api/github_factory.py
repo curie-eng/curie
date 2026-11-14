@@ -64,7 +64,14 @@ from .github_factory_events import (
 )
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
-from .models import AgentChannel, ExecutionRequest, FactorySlackThread, WorkItem
+from .models import (
+    AgentChannel,
+    ExecutionRequest,
+    FactorySlackThread,
+    PersonalClaudeEnrollment,
+    WorkItem,
+)
+from .personal_execution import OwnerContext
 from .workitem_dispatch import Admission, DispatchConflict
 from .workspace_policy import repository_is_allowed
 
@@ -250,8 +257,6 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, registry: ForgeRegistry
         trigger_label=(
             effective_trigger_label(binding, registry) if notice.disposition == "admit" else None
         ),
-        # The installation's mode and never an owner: a webhook carries no
-        # verified owner, and its sender is not one (#5376).
         model_auth_mode=get_settings().factory_model_auth_mode,
     )
 
@@ -474,6 +479,8 @@ async def admit_notice(
     # again (a fresh admission) or kept (ADR 0186 decision 5).
     existing = await work_item_for(session, notice_issue(notice, registry))
     served: frozenset[str] = frozenset()
+    principal: uuid.UUID | None = None
+    owner: OwnerContext | None = None
     if notice.disposition == "admit":
         issue = notice_issue(notice, registry)
         assert notice.label_event_id is not None
@@ -499,10 +506,30 @@ async def admit_notice(
             return ignored("delegated_output")
         if reason is None:
             reason = await verified.tracker.label_permission(notice)
+        if reason is None and existing is None and agent_id is not None:
+            from .factory_slack import resolve_github_requester
+
+            principal = await resolve_github_requester(
+                session,
+                agent_id=agent_id,
+                tracker_host=issue.host,
+                account_id=notice.sender_id,
+            )
+            owner = None
+            if principal is not None and settings.factory_model_auth_mode == "personal":
+                enrollment = await session.scalar(
+                    select(PersonalClaudeEnrollment).where(
+                        PersonalClaudeEnrollment.principal_id == principal,
+                        PersonalClaudeEnrollment.active.is_(True),
+                    )
+                )
+                if enrollment is not None:
+                    owner = OwnerContext(enrollment.tenant_id, principal, enrollment.generation)
         if (
             reason is None
             and settings.factory_model_auth_mode == "personal"
             and (existing is None or existing.model_auth_mode != "personal")
+            and owner is None
         ):
             reason = "personal_owner_required"
         if reason is None and len(matches) > 1:
@@ -558,6 +585,8 @@ async def admit_notice(
             )
             return ignored("installation_changed")
         return ignored("work_item_present")
+    if existing is None and notice.disposition == "admit":
+        facts = replace(facts, requester_principal_id=principal, owner=owner)
     # Dispatch helpers commit between WorkItem creation and request creation.
     # Keep those commits inside savepoints so the caller's issue lock remains
     # held until admission and delivery settlement commit together.

@@ -64,6 +64,7 @@ from .models import (
     WorkItem,
 )
 from .personal_execution import mode_of
+from .requester_instruction_admission import evidence, metadata
 
 OBJECTIVE_LIMIT = 512
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
@@ -409,6 +410,8 @@ def derive_outcome(
         model_auth_mode=mode_of(item.model_auth_mode),
         owner_principal_id=item.owner_principal_id,
         enrollment_generation=item.enrollment_generation,
+        requester_principal_id=item.requester_principal_id,
+        coding_instructions=metadata(item),
     )
 
 
@@ -453,6 +456,8 @@ def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
         model_auth_mode=mode_of(req.model_auth_mode),
         owner_principal_id=req.owner_principal_id,
         enrollment_generation=req.enrollment_generation,
+        coding_instructions_selection_id=req.coding_instructions_selection_id,
+        coding_instructions_evidence=evidence(req.coding_instructions_evidence),
     )
 
 

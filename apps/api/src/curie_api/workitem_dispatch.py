@@ -68,6 +68,7 @@ from .personal_execution import (
     existing_work_item_refusal,
     new_work_item_owner,
 )
+from .requester_instruction_admission import requester_is_active
 from .threadkeys import (
     legacy_route_adapter_of,
     pre_identity_key_of,
@@ -103,6 +104,7 @@ def _start_failure_detail(detail: str | None) -> str | None:
 
 RefusalCode = Literal[
     "not_found",
+    "requester_principal_invalid",
     "identity_mismatch",
     "active_request",
     "work_item_cancelled",
@@ -172,12 +174,11 @@ class Admission:
     # the WorkItem at admission and readmission. None for an admission no label
     # started (a revision, review feedback, the work-items API).
     trigger_label: str | None = None
-    # Who the execution runs as (#5376, ADR 0268). Only the internal worker
-    # admission route names an owner; tracker ingress passes the installation
-    # mode and never an owner. On an existing WorkItem these never change its
-    # owner tuple (``personal_execution``).
+    # Trusted internal admissions and verified GitHub label actors name owners.
+    # Existing WorkItems keep their owner tuple (personal_execution).
     model_auth_mode: ModelAuthMode = "service"
     owner: OwnerContext | None = None
+    requester_principal_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -631,6 +632,22 @@ async def readmit(
 async def _admit_new(
     session: AsyncSession, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    async with session.begin_nested() as atomic:
+        async with AsyncSession(
+            bind=await session.connection(),
+            join_transaction_mode="create_savepoint",
+            expire_on_commit=False,
+        ) as transaction:
+            result = await _admit_new_transaction(transaction, facts, adapter)
+        if not isinstance(result, WorkItemOutcome):
+            await atomic.rollback()
+    await session.commit()
+    return result
+
+
+async def _admit_new_transaction(
+    session: AsyncSession, facts: Any, adapter: str | None
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
     # The owner is settled before any row is written, in the transaction that
     # inserts the WorkItem (#5376): a refusal leaves no WorkItem or request. An
     # existing WorkItem stays locked so it keeps the tuple it is compared to.
@@ -653,6 +670,16 @@ async def _admit_new(
     contract = await _admission_contract(session, facts)
     if isinstance(contract, DispatchConflict):
         return contract
+    requester = getattr(facts, "requester_principal_id", None)
+    if existing is None:
+        if owner is not None and owner.is_personal:
+            if requester is not None and requester != owner.owner_principal_id:
+                return await _refuse(session, "requester_principal_invalid")
+            requester = owner.owner_principal_id
+        if requester is not None and not await requester_is_active(
+            session, agent_id=facts.agent_id, principal_id=requester
+        ):
+            return await _refuse(session, "requester_principal_invalid")
     created = await lifecycle.create_or_get_work_item(
         session,
         issue=facts.issue,
@@ -663,6 +690,7 @@ async def _admit_new(
         base=getattr(facts, "base", None),
         trigger_label=facts.trigger_label,
         owner=owner,
+        requester_principal_id=requester,
     )
     if isinstance(created, WorkItemConflict):
         return created
@@ -2460,6 +2488,8 @@ def work_item_view(row: WorkItemSnapshot) -> dict[str, Any]:
         "version": row.version,
         "next_sequence": row.next_sequence,
         **_owner_view(row),
+        "requester_principal_id": row.requester_principal_id,
+        "coding_instructions": row.coding_instructions.model_dump(),
     }
 
 
@@ -2488,4 +2518,6 @@ def request_snapshot_view(row: ExecutionRequestSnapshot) -> dict[str, Any]:
         "termination_observation": row.termination_observation,
         "version": row.version,
         **_owner_view(row),
+        "coding_instructions_selection_id": row.coding_instructions_selection_id,
+        "coding_instructions_evidence": row.coding_instructions_evidence,
     }

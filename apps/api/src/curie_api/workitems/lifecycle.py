@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from curie_internal.requester_coding_instructions import EvidenceState
 from curie_telemetry.redact import redact_text
 from sqlalchemy import and_, case, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -60,6 +61,14 @@ from ..personal_execution import (
     mode_of,
     snapshot_columns,
 )
+from ..requester_instruction_admission import (
+    add_snapshot,
+    evidence,
+    metadata,
+    request_selection_columns,
+    selection_columns,
+)
+from ..schemas.workitems import CodingInstructionsMetadata
 
 if TYPE_CHECKING:
     # factory_base reaches this module through factory_notices at import time.
@@ -335,6 +344,8 @@ class WorkItemSnapshot:
     model_auth_mode: ModelAuthMode
     owner_principal_id: uuid.UUID | None
     enrollment_generation: int | None
+    requester_principal_id: uuid.UUID | None
+    coding_instructions: CodingInstructionsMetadata
 
 
 @dataclass(frozen=True)
@@ -355,6 +366,8 @@ class ExecutionRequestSnapshot:
     model_auth_mode: ModelAuthMode
     owner_principal_id: uuid.UUID | None
     enrollment_generation: int | None
+    coding_instructions_selection_id: uuid.UUID | None
+    coding_instructions_evidence: EvidenceState
 
 
 @dataclass(frozen=True)
@@ -392,6 +405,8 @@ def _work_item_snapshot(row: WorkItem) -> WorkItemSnapshot:
         model_auth_mode=mode_of(row.model_auth_mode),
         owner_principal_id=row.owner_principal_id,
         enrollment_generation=row.enrollment_generation,
+        requester_principal_id=row.requester_principal_id,
+        coding_instructions=metadata(row),
     )
 
 
@@ -412,6 +427,8 @@ def _request_snapshot(row: ExecutionRequest) -> ExecutionRequestSnapshot:
         model_auth_mode=mode_of(row.model_auth_mode),
         owner_principal_id=row.owner_principal_id,
         enrollment_generation=row.enrollment_generation,
+        coding_instructions_selection_id=row.coding_instructions_selection_id,
+        coding_instructions_evidence=evidence(row.coding_instructions_evidence),
     )
 
 
@@ -702,6 +719,7 @@ async def create_or_get_work_item(
     base: ResolvedBase | None = None,
     trigger_label: str | None,
     owner: OwnerTuple | None = None,
+    requester_principal_id: uuid.UUID | None = None,
 ) -> WorkItemResult:
     """Insert the WorkItem, or return the existing one for the same issue.
 
@@ -728,12 +746,20 @@ async def create_or_get_work_item(
             "enrollment_generation": None,
         }
     )
+    current = await session.scalar(select(WorkItem.id).where(*for_tracker_issue(issue)))
+    coding_values: dict[str, Any] = {}
+    selected = None
+    if current is None:
+        coding_values, selected = await selection_columns(
+            session, agent_id=agent_id, principal_id=requester_principal_id
+        )
     new_id = uuid.uuid4()
     statement = (
         insert(WorkItem)
         .values(
             id=new_id,
             **owner_values,
+            **coding_values,
             **work_item_identity_values(issue, repository),
             code_host_installation_id=code_host_installation_id,
             agent_id=agent_id,
@@ -758,6 +784,9 @@ async def create_or_get_work_item(
     try:
         async with session.begin_nested():
             inserted_id = await session.scalar(statement)
+            if inserted_id is not None:
+                await add_snapshot(session, work_item_id=inserted_id, selection=selected)
+                await session.flush()
     except IntegrityError:
         return await _conflict(session, "identity_mismatch")
 
@@ -837,6 +866,7 @@ async def _insert_waiting_request(
                 completion_contract=completion_contract,
                 result_policy_digest=result_policy_digest,
                 **snapshot_columns(work_item),
+                **request_selection_columns(work_item),
                 **(columns or {}),
             )
         )
@@ -985,6 +1015,7 @@ async def create_revision_request(
                     wait_deadline=None,
                     version=1,
                     **snapshot_columns(work_item),
+                    **request_selection_columns(work_item),
                     **snapshot,
                 )
             )

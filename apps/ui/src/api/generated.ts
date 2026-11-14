@@ -5096,6 +5096,8 @@ export interface components {
             request_id: string;
             /** Requester */
             requester: string;
+            /** Requester Principal Id */
+            requester_principal_id?: string | null;
             tracker: components["schemas"]["TrackerIssueIn"];
         };
         /**
@@ -7091,6 +7093,25 @@ export interface components {
              * Format: uuid
              */
             link_id: string;
+        };
+        /**
+         * CodingInstructionsMetadata
+         * @description Public selection metadata; the private snapshot text is never serialized.
+         */
+        CodingInstructionsMetadata: {
+            /** Absence Reason */
+            absence_reason?: ("no_profile" | "no_verified_requester" | "tenant_disabled" | "application_unavailable" | "historical") | null;
+            /** Format Version */
+            format_version?: 1 | null;
+            /** Revision */
+            revision?: number | null;
+            /** Sha256 */
+            sha256?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "absent" | "selected";
         };
         /** CodingInstructionsOut */
         CodingInstructionsOut: {
@@ -11475,7 +11496,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "tracker_result_no_revision" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
+            refusal: ("not_found" | "requester_principal_invalid" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "tracker_result_no_revision" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -12541,6 +12562,7 @@ export interface components {
             cancelled_at: string | null;
             ci: components["schemas"]["WorkItemCiOut"] | null;
             ci_observation?: components["schemas"]["WorkItemCiObservationOut"] | null;
+            coding_instructions: components["schemas"]["CodingInstructionsMetadata"];
             correctness: components["schemas"]["WorkItemCorrectnessOut"];
             /**
              * Created At
@@ -12572,6 +12594,8 @@ export interface components {
             repository: components["schemas"]["WorkItemRepositoryOut"];
             /** Requester */
             requester: string | null;
+            /** Requester Principal Id */
+            requester_principal_id?: string | null;
             /** Requests */
             requests: components["schemas"]["WorkItemRequestOut"][];
             /**
@@ -12642,6 +12666,14 @@ export interface components {
         WorkItemRequestOut: {
             /** Capacity Deferrals */
             capacity_deferrals: number;
+            /**
+             * Coding Instructions Evidence
+             * @default none
+             * @enum {string}
+             */
+            coding_instructions_evidence?: "none" | "pending" | "applied" | "failed";
+            /** Coding Instructions Selection Id */
+            coding_instructions_selection_id?: string | null;
             /**
              * Created At
              * Format: date-time

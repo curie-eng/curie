@@ -914,6 +914,18 @@
             "title": "Requester",
             "type": "string"
           },
+          "requester_principal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requester Principal Id"
+          },
           "tracker": {
             "$ref": "#/components/schemas/TrackerIssueIn"
           }
@@ -5893,6 +5905,76 @@
           "identity_namespace_id"
         ],
         "title": "CodeHostLinkOut",
+        "type": "object"
+      },
+      "CodingInstructionsMetadata": {
+        "description": "Public selection metadata; the private snapshot text is never serialized.",
+        "properties": {
+          "absence_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "no_profile",
+                  "no_verified_requester",
+                  "tenant_disabled",
+                  "application_unavailable",
+                  "historical"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Absence Reason"
+          },
+          "format_version": {
+            "anyOf": [
+              {
+                "const": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Format Version"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "state": {
+            "enum": [
+              "absent",
+              "selected"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "CodingInstructionsMetadata",
         "type": "object"
       },
       "CodingInstructionsOut": {
@@ -15754,6 +15836,7 @@
               {
                 "enum": [
                   "not_found",
+                  "requester_principal_invalid",
                   "identity_mismatch",
                   "active_request",
                   "work_item_cancelled",
@@ -18428,6 +18511,9 @@
               }
             ]
           },
+          "coding_instructions": {
+            "$ref": "#/components/schemas/CodingInstructionsMetadata"
+          },
           "correctness": {
             "$ref": "#/components/schemas/WorkItemCorrectnessOut"
           },
@@ -18532,6 +18618,18 @@
             ],
             "title": "Requester"
           },
+          "requester_principal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requester Principal Id"
+          },
           "requests": {
             "items": {
               "$ref": "#/components/schemas/WorkItemRequestOut"
@@ -18605,7 +18703,8 @@
           "publication",
           "correctness",
           "ci",
-          "requests"
+          "requests",
+          "coding_instructions"
         ],
         "title": "WorkItemOutcomeOut",
         "type": "object"
@@ -18746,6 +18845,29 @@
           "capacity_deferrals": {
             "title": "Capacity Deferrals",
             "type": "integer"
+          },
+          "coding_instructions_evidence": {
+            "default": "none",
+            "enum": [
+              "none",
+              "pending",
+              "applied",
+              "failed"
+            ],
+            "title": "Coding Instructions Evidence",
+            "type": "string"
+          },
+          "coding_instructions_selection_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coding Instructions Selection Id"
           },
           "created_at": {
             "format": "date-time",
