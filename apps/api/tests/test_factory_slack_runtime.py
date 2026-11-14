@@ -5394,6 +5394,136 @@ def test_a_handoff_dropped_before_rendering_does_not_post_the_handoff_line(
     assert line.format(ticket=run.ticket_url) not in lines
 
 
+# --- #5588 AC7: the handoff endings post from the recorded handoff -------------------
+#
+# The delegation and handoff rows are written with plain SQL in the shapes migration
+# 0171 and `curie_api.factory_triage_handoff` store (the handoff itself is driven
+# over GitHub HTTP in apps/api/tests/test_factory_triage_handoff.py). The progress
+# loop's own insert reads them; no post record is constructed here.
+
+
+def _record_handoff(
+    run: _TriageRun, *, outcome: str | None, reason: str | None, opened: bool = True
+) -> None:
+    """The run's delegation and, when ``opened``, the handoff its delivered ticket opened."""
+
+    params = {"request": run.request_id}
+    _rows(
+        "INSERT INTO curie.factory_triage_delegations (id, work_item_id, "
+        "source_execution_request_id, actor_id, actor_login, selection_event, tracker_kind, "
+        "tracker_host, tracker_scope_id, tracker_issue_id, repository_id, "
+        "result_policy_digest, target_label) "
+        "SELECT gen_random_uuid(), w.id, r.id, '6601', 'octocat', 'github-label-event:1', "
+        "w.tracker_kind, w.tracker_host, w.tracker_scope_id, w.tracker_issue_id, "
+        "w.repository_project_id, r.result_policy_digest, 'factory-implement' "
+        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE r.id = :request",
+        params,
+    )
+    if not opened:
+        return
+    _rows(
+        "INSERT INTO curie.factory_triage_handoffs (id, delegation_id, "
+        "source_execution_request_id, output_tracker_kind, output_tracker_host, "
+        "output_scope_id, output_issue_id, output_url, output_body_sha256, "
+        "next_attempt_at, deadline_at) "
+        "SELECT gen_random_uuid(), d.id, d.source_execution_request_id, r.output_tracker_kind, "
+        "r.output_tracker_host, r.output_scope_id, r.output_issue_id, r.output_url, "
+        "r.output_body_sha256, now() + interval '1 day', now() + interval '1 day' "
+        "FROM curie.factory_triage_delegations d JOIN curie.factory_tracker_result_receipts r "
+        "ON r.execution_request_id = d.source_execution_request_id "
+        "WHERE d.source_execution_request_id = :request",
+        params,
+    )
+    if outcome is not None:
+        _settle_handoff(run, outcome=outcome, reason=reason)
+
+
+def _settle_handoff(run: _TriageRun, *, outcome: str, reason: str | None) -> None:
+    _rows(
+        "UPDATE curie.factory_triage_handoffs SET outcome = CAST(:outcome AS text), "
+        "reason = CAST(:reason AS text), settled_at = now(), "
+        "implementation_request_id = CASE WHEN CAST(:outcome AS text) = 'admitted' "
+        "THEN gen_random_uuid() END WHERE source_execution_request_id = :request",
+        {"request": run.request_id, "outcome": outcome, "reason": reason},
+    )
+
+
+_RECORDED = {
+    "admitted": ("admitted", None, "Triage published a ticket: {ticket}. Implementation admitted."),
+    "refused": (
+        "refused",
+        "authority_revoked",
+        "Triage published a ticket: {ticket}. Implementation not started: authority_revoked.",
+    ),
+}
+
+
+@pytest.mark.parametrize("ending", sorted(_RECORDED))
+def test_a_recorded_handoff_posts_its_ending_once_across_a_restart(
+    stack: Stack, ending: str
+) -> None:
+    outcome, reason, line = _RECORDED[ending]
+    run = _triage_run(stack)
+    _triage_delivery(run, kind="ticket")
+    _record_handoff(run, outcome=outcome, reason=reason)
+    _end_request(run, "completed", "completed")
+
+    stack.drain()
+    stack.drain(fresh=True)
+    stack.drain(fresh=True)
+
+    lines = [text.strip() for text in _result_lines(stack, run.root_ts)]
+    assert lines == [line.format(ticket=run.ticket_url)], lines
+    (post,) = _rows(
+        "SELECT payload, posted_at FROM curie.factory_slack_posts "
+        "WHERE work_item_id = :id AND kind = 'triage'",
+        {"id": run.work_item_id},
+    )
+    assert post["posted_at"] is not None
+    assert post["payload"]["handoff_admitted"] is (outcome == "admitted")
+
+
+def test_a_delegated_ticket_posts_nothing_until_its_handoff_outcome(stack: Stack) -> None:
+    """The line waits while the handoff is unsettled, then posts once with its
+    outcome. Controls: a ticket with no delegation (admitted before #5588), and
+    one whose delegation opened no handoff, post the published line at once."""
+
+    run = _triage_run(stack)
+    _triage_delivery(run, kind="ticket")
+    _record_handoff(run, outcome=None, reason=None)
+    _end_request(run, "completed", "completed")
+    stack.drain()
+    stack.drain(fresh=True)
+    assert _result_lines(stack, run.root_ts) == []
+    assert (
+        _rows(
+            "SELECT id FROM curie.factory_slack_posts "
+            "WHERE work_item_id = :id AND kind IN ('triage', 'terminal')",
+            {"id": run.work_item_id},
+        )
+        == []
+    )
+
+    _settle_handoff(run, outcome="refused", reason="output_changed")
+    stack.drain()
+    stack.drain(fresh=True)
+    lines = [text.strip() for text in _result_lines(stack, run.root_ts)]
+    assert lines == [
+        f"Triage published a ticket: {run.ticket_url}. Implementation not started: output_changed."
+    ], lines
+
+    for opened_none in (False, True):
+        plain = _triage_run(stack)
+        _triage_delivery(plain, kind="ticket")
+        if opened_none:
+            _record_handoff(plain, outcome=None, reason=None, opened=False)
+        _end_request(plain, "completed", "completed")
+        stack.drain()
+        lines = [text.strip() for text in _result_lines(stack, plain.root_ts)]
+        assert lines == [f"Triage published a ticket: {plain.ticket_url}."], lines
+
+
 _RENDER_TICKET = "https://tracker.example/acme/app/issues/7"
 _RENDER_COMMENT = "https://tracker.example/acme/app/issues/3#comment-1"
 
