@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/factory-triage-render/v1.json",
+  "title": "curie example factory-triage render --json",
+  "description": "Receipt for an investigation bundle rendered with an explicit implementation target.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "bundle_dir": {"type": "string"},
+    "rendered": {"const": true},
+    "implementation_label": {"type": "string", "minLength": 1, "maxLength": 50}
+  },
+  "required": ["bundle_dir", "rendered", "implementation_label"]
+}
