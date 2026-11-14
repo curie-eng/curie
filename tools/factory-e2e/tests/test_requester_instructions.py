@@ -144,7 +144,9 @@ def _evidence(slot: int, document: ris.Document, **overrides: Any) -> ris.SlotEv
         "pull_request_found": True,
         "body": body,
         "files": files,
-        "reviewer": ris.ReviewerScan(files=1, records=4, hits=0, error=None),
+        "reviewer": ris.ReviewerScan(
+            files=1, records=4, hits=0, error=None, roles=("diff-reviewer", "plan-reviewer")
+        ),
     }
     fields.update(overrides)
     return ris.SlotEvidence(**fields)
@@ -582,11 +584,41 @@ def test_caps_match_precondition_five() -> None:
 # --------------------------------------------------------------------------
 
 
-def _transcripts(root: Path, document: ris.Document, *, leak: bool) -> Path:
+def _call(use_id: str, subagent_type: str, *, ran: bool | None = True) -> list[str]:
+    """The main session's Agent call and, unless ``ran`` is None, its result."""
+
+    lines = [
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": use_id,
+                            "name": "Agent",
+                            "input": {"subagent_type": subagent_type, "prompt": "Review."},
+                        }
+                    ]
+                },
+            }
+        )
+    ]
+    if ran is not None:
+        result = {"type": "tool_result", "tool_use_id": use_id, "content": "done"}
+        if not ran:
+            result["is_error"] = True
+        lines.append(json.dumps({"type": "user", "message": {"content": [result]}}))
+    return lines
+
+
+def _transcripts(
+    root: Path, document: ris.Document, *, leak: bool, calls: tuple[str, ...] = ()
+) -> Path:
     project = root / "home" / ".claude" / "projects" / "p"
     side = project / "s1" / "subagents"
     side.mkdir(parents=True)
-    main = [json.dumps({"type": "user", "message": document.text})]
+    main = [json.dumps({"type": "user", "message": document.text}), *calls]
     (project / "s1.jsonl").write_text("\n".join(main) + "\n")
     reviewer = {"type": "user", "isSidechain": True, "message": "Review this diff."}
     lines = [json.dumps(reviewer)]
@@ -636,6 +668,101 @@ def test_reviewer_scan_fails_closed_on_an_unparsable_parent_line(tmp_path: Path)
         ris.REVIEWER_SCAN_PROGRAM, "20", str(root), stdin=json.dumps(document.needles()).encode()
     )
     assert ris.reviewer_scan_result(code, out).error == "incomplete"
+
+
+def test_reviewer_scan_reports_only_the_named_reviewers_that_ran(tmp_path: Path) -> None:
+    document = ris.make_document("first", NONCE)
+    calls = (
+        *_call("toolu_plan", "dark-factory:plan-reviewer"),
+        # Refused or never answered: neither counts as a run.
+        *_call("toolu_diff_refused", "dark-factory:diff-reviewer", ran=False),
+        *_call("toolu_diff_pending", "dark-factory:diff-reviewer", ran=None),
+        # Another subagent is not a named reviewer.
+        *_call("toolu_other", "general-purpose"),
+    )
+    root = _transcripts(tmp_path / "one", document, leak=False, calls=calls)
+    needles = json.dumps(document.needles()).encode()
+    scan = ris.reviewer_scan_result(
+        *_run(ris.REVIEWER_SCAN_PROGRAM, "20", str(root), stdin=needles)
+    )
+    assert scan.error is None and scan.roles == ("plan-reviewer",)
+    observed = ris.slot_observations(2, _evidence(2, document, reviewer=scan), document=document)
+    assert observed["slot2.plan_reviewer_ran"] is True
+    assert observed["slot2.diff_reviewer_ran"] is False
+
+    calls = (*calls, *_call("toolu_diff", "dark-factory:diff-reviewer"))
+    root = _transcripts(tmp_path / "both", document, leak=False, calls=calls)
+    scan = ris.reviewer_scan_result(
+        *_run(ris.REVIEWER_SCAN_PROGRAM, "20", str(root), stdin=needles)
+    )
+    assert scan.roles == ("diff-reviewer", "plan-reviewer")
+    observed = ris.slot_observations(2, _evidence(2, document, reviewer=scan), document=document)
+    assert observed["slot2.plan_reviewer_ran"] is observed["slot2.diff_reviewer_ran"] is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": None, "files": 1, "records": 1, "hits": 0},
+        {"error": None, "files": 1, "records": 1, "hits": 0, "roles": ["implementer"]},
+        {"error": None, "files": 1, "records": 1, "hits": 0, "roles": "plan-reviewer"},
+    ],
+)
+def test_a_scan_answer_without_valid_roles_is_unreadable(body: dict[str, Any]) -> None:
+    assert ris.reviewer_scan_result(0, json.dumps(body).encode()).error == "unreadable"
+
+
+def test_a_slot_needs_both_reviewers_across_its_pods() -> None:
+    plan = ris.ReviewerScan(1, 1, 0, None, ("plan-reviewer",))
+    diff = ris.ReviewerScan(1, 1, 0, None, ("diff-reviewer",))
+    assert ris.combine_scans([plan, diff]).roles == ("diff-reviewer", "plan-reviewer")
+    document = ris.make_document("second", NONCE)
+    for scan, ran in (
+        (plan, (True, False)),
+        (ris.combine_scans([plan, diff]), (True, True)),
+        (ris.ReviewerScan(error="deadline", roles=("plan-reviewer",)), (False, False)),
+    ):
+        observed = ris.slot_observations(
+            2, _evidence(2, document, reviewer=scan), document=document
+        )
+        assert (observed["slot2.plan_reviewer_ran"], observed["slot2.diff_reviewer_ran"]) == ran
+
+
+# --------------------------------------------------------------------------
+# The live run installs the real factory bundle
+# --------------------------------------------------------------------------
+
+
+def test_the_live_run_installs_the_factory_bundle() -> None:
+    files = driver.live_bundle()
+    assert set(ris.FACTORY_BUNDLE_REQUIRED) <= set(files)
+    assert json.loads(files[".claude-plugin/plugin.json"])["name"] == "dark-factory"
+    # Every file of the checked-in bundle, byte for byte.
+    on_disk = {
+        path.relative_to(driver.FACTORY_BUNDLE).as_posix(): path.read_text(encoding="utf-8")
+        for path in driver.FACTORY_BUNDLE.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+    assert files == on_disk
+
+
+@pytest.mark.parametrize("fault", ["missing_reviewer", "symlink", "binary", "oversize"])
+def test_a_bundle_that_is_not_the_whole_factory_is_refused(tmp_path: Path, fault: str) -> None:
+    root = tmp_path / "bundle"
+    for name in ris.FACTORY_BUNDLE_REQUIRED:
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("{}", encoding="utf-8")
+    assert set(ris.factory_bundle_files(root)) == set(ris.FACTORY_BUNDLE_REQUIRED)
+    if fault == "missing_reviewer":
+        (root / "agents" / "diff-reviewer.md").unlink()
+    elif fault == "symlink":
+        (root / "agents" / "extra.md").symlink_to(root / "agents" / "plan-reviewer.md")
+    elif fault == "binary":
+        (root / "blob.bin").write_bytes(b"\xff\xfe")
+    else:
+        (root / "large.md").write_text("x" * ris.FACTORY_BUNDLE_MAX_BYTES, encoding="utf-8")
+    with pytest.raises(ValueError, match="factory bundle"):
+        ris.factory_bundle_files(root)
 
 
 def test_reviewer_scan_finds_a_leaked_preference(tmp_path: Path) -> None:

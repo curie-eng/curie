@@ -75,6 +75,7 @@ REHEARSE_CONVERSATIONS = {
     "unlinked": "1700000000.000530",
 }
 TRANSCRIPT_ROOTS = ("/home/runner", "/tmp")
+FACTORY_BUNDLE = REPO_ROOT / "examples" / "dark-factory"
 # The production resolver, run against the owned database with the API's env.
 RESOLVE_PROGRAM = """\
 import asyncio, json, sys, uuid
@@ -324,6 +325,15 @@ class LiveInputs:
         return [self.owner_token, self.second_token, self.model_url, self.model_key]
 
 
+def live_bundle() -> dict[str, str]:
+    """The bundle a live run installs: the real factory bundle, or a refusal."""
+
+    try:
+        return ris.factory_bundle_files(FACTORY_BUNDLE)
+    except ValueError as failure:
+        raise poe.StepFailed(str(failure)) from None
+
+
 def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one class
     """``RequesterProof`` over the owner enforcement harness (loaded at runtime)."""
 
@@ -437,8 +447,13 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
             return env
 
         def bundle(self) -> dict[str, str]:
-            # No sentinel connector and no hold hooks: nothing here gates a turn.
-            return dict(cluster.bundle_files())
+            # The rehearse runs the offline fake model, which loads no plugin
+            # hooks or subagents, so the custody fixture serves it. The live
+            # run installs the real factory bundle: both named reviewers, the
+            # implementation skill and the review gate.
+            if self.live_inputs is None:
+                return dict(cluster.bundle_files())
+            return live_bundle()
 
         def create_inputs(self) -> None:
             super().create_inputs()

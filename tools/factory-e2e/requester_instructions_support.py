@@ -484,6 +484,50 @@ done(ok, status=status, error=None if ok else "empty", code=0 if ok else 1)
 # line marked ``isSidechain``. Anything it cannot read (a root or directory it
 # cannot list, a transcript it cannot open or read whole, a line it cannot
 # parse) makes the scan incomplete: an error, never a clean result.
+REVIEWER_ROLES = ("plan-reviewer", "diff-reviewer")
+# What makes the bundle the factory: its manifest, both named reviewers, the
+# implementation skill and the review gate with the hooks that run it.
+FACTORY_BUNDLE_REQUIRED = (
+    ".claude-plugin/plugin.json",
+    "agents/plan-reviewer.md",
+    "agents/diff-reviewer.md",
+    "skills/implement-issue/SKILL.md",
+    "hooks/hooks.json",
+    "hooks/review_gate.py",
+)
+# The bundle travels in one ConfigMap value, whose object limit is 1 MiB.
+FACTORY_BUNDLE_MAX_BYTES = 800_000
+
+
+def factory_bundle_files(root: Path) -> dict[str, str]:
+    """Every file of the factory bundle at ``root``, keyed by its relative path.
+
+    Refuses a symlink, a non-text file, a bundle missing a required file, and
+    one too large for its ConfigMap, so the live run never installs less than
+    the factory.
+    """
+
+    files: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if "__pycache__" in path.relative_to(root).parts:
+            continue  # a local interpreter cache, never part of a checkout
+        if path.is_symlink():
+            raise ValueError(f"factory bundle: {relative} is a symlink")
+        if not path.is_file():
+            continue
+        try:
+            files[relative] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise ValueError(f"factory bundle: {relative} is unreadable") from None
+    missing = [name for name in FACTORY_BUNDLE_REQUIRED if name not in files]
+    if missing:
+        raise ValueError(f"factory bundle: missing {', '.join(missing)}")
+    if len(json.dumps(files).encode()) > FACTORY_BUNDLE_MAX_BYTES:
+        raise ValueError("factory bundle: too large for its ConfigMap")
+    return files
+
+
 REVIEWER_SCAN_PROGRAM = """\
 import json, os, signal, sys
 def done(body, code):
@@ -505,6 +549,24 @@ forms = [(n.encode(), json.dumps(n)[1:-1].encode()) for n in needles]
 files = records = 0
 found = set()
 incomplete = []
+ROLES = ("plan-reviewer", "diff-reviewer")
+uses = {}
+results = set()
+def items_of(record):
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return [item for item in content if isinstance(item, dict)] if isinstance(content, list) else []
+def reviewer_calls(record):
+    for item in items_of(record):
+        if item.get("type") == "tool_use" and item.get("name") in ("Agent", "Task"):
+            given = item.get("input")
+            kind = given.get("subagent_type") if isinstance(given, dict) else None
+            role = kind.rsplit(":", 1)[-1].strip() if isinstance(kind, str) else None
+            if role in ROLES and isinstance(item.get("id"), str):
+                uses[item["id"]] = role
+        elif item.get("type") == "tool_result" and item.get("is_error") is not True:
+            if isinstance(item.get("tool_use_id"), str):
+                results.add(item["tool_use_id"])
 LIMIT = 64 << 20
 for root in roots:
     if not os.path.isdir(root):
@@ -530,7 +592,9 @@ for root in roots:
                     if not line.strip():
                         continue
                     try:
-                        if json.loads(line).get("isSidechain") is not True:
+                        record = json.loads(line)
+                        if record.get("isSidechain") is not True:
+                            reviewer_calls(record)
                             continue
                     except (ValueError, AttributeError):
                         incomplete.append(1)
@@ -543,7 +607,8 @@ for root in roots:
             files += seen
 if incomplete:
     done({"error": "incomplete", "files": files, "records": records}, 4)
-done({"error": None, "files": files, "records": records, "hits": len(found)}, 0)
+ran = sorted({role for use, role in uses.items() if use in results})
+done({"error": None, "files": files, "records": records, "hits": len(found), "roles": ran}, 0)
 """
 
 
@@ -553,6 +618,8 @@ class ReviewerScan:
     records: int = 0
     hits: int = 0
     error: str | None = "unscanned"
+    # Reviewer roles whose Agent call the main session saw complete, sorted.
+    roles: tuple[str, ...] = ()
 
 
 def reviewer_scan_result(returncode: int, stdout: bytes) -> ReviewerScan:
@@ -568,14 +635,17 @@ def reviewer_scan_result(returncode: int, stdout: bytes) -> ReviewerScan:
         error = body.get("error")
         return ReviewerScan(error=error if isinstance(error, str) else "failed")
     files, records, found = (body.get(key) for key in ("files", "records", "hits"))
+    roles = body.get("roles")
     if not (
         type(files) is int
         and type(records) is int
         and type(found) is int
         and min(files, records, found) >= 0
+        and isinstance(roles, list)
+        and all(role in REVIEWER_ROLES for role in roles)
     ):
         return ReviewerScan(error="unreadable")
-    return ReviewerScan(files, records, found, None)
+    return ReviewerScan(files, records, found, None, tuple(sorted(set(roles))))
 
 
 def combine_scans(scans: Iterable[ReviewerScan]) -> ReviewerScan:
@@ -592,6 +662,7 @@ def combine_scans(scans: Iterable[ReviewerScan]) -> ReviewerScan:
         sum(item.records for item in items),
         sum(item.hits for item in items),
         None,
+        tuple(sorted({role for item in items for role in item.roles})),
     )
 
 
@@ -701,6 +772,9 @@ def slot_observations(
         "pull_request_found": found.pull_request_found,
         "reviewer_transcripts_seen": reviewer.error is None and reviewer.records > 0,
         "reviewer_hits": reviewer.hits if reviewer.error is None else None,
+        # Both named reviewers of the factory bundle ran in this slot.
+        "plan_reviewer_ran": reviewer.error is None and "plan-reviewer" in reviewer.roles,
+        "diff_reviewer_ran": reviewer.error is None and "diff-reviewer" in reviewer.roles,
     }
     if slot in (1, 2):
         observed["annotation_matches"] = (
@@ -811,6 +885,8 @@ EXPECTED: dict[str, dict[str, Any]] = {
                 ("pull_request_found", True),
                 ("reviewer_transcripts_seen", True),
                 ("reviewer_hits", 0),
+                ("plan_reviewer_ran", True),
+                ("diff_reviewer_ran", True),
             )
         },
         "slot1.annotation_matches": True,

@@ -848,6 +848,14 @@ in `requester_instructions_support.py`. The API and worker run with
 `FACTORY_MODEL_AUTH_MODE=service` and
 `CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY=true`.
 
+The live run installs the real factory bundle (`examples/dark-factory`, with
+both named reviewers, the implementation skill and the review gate) and refuses
+to start when any of those files is missing. Each slot's transcript scan
+records which named reviewers the session actually ran, and criterion 10 passes
+only when both the plan reviewer and the diff reviewer ran in every slot. The
+rehearse runs the offline fake model, which loads no plugin hooks or
+subagents, so it keeps the owner proof's small fixture bundle.
+
 ### Inputs
 
 `rehearse` takes the owner enforcement flags and input file unchanged
