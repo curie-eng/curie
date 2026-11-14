@@ -139,7 +139,11 @@ def delete_owned_namespace(
     while True:
         remaining = _get_namespace(owned.context, owned.name)
         if remaining.returncode != 0:
-            return
+            if classify_failure(remaining) == "not_found":
+                return
+            raise CleanupUnverified(
+                f"could not verify namespace {owned.name} is gone ({_detail(remaining)})"
+            )
         if time.monotonic() >= deadline:
             raise CleanupUnverified(f"namespace {owned.name} remained after teardown")
         time.sleep(poll_seconds)
