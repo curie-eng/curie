@@ -700,7 +700,7 @@ async fn execute(
     let mut credit_remaining_usd = None;
     for action in &planned.actions {
         if matches!(action, Action::Deploy { .. }) {
-            credit_remaining_usd = check_credit(release_has_real_model).await;
+            credit_remaining_usd = check_credit(opts, release_has_real_model).await;
         }
         if matches!(action, Action::Cluster { .. }) && !prompted {
             prompted = true;

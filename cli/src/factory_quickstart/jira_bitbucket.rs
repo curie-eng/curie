@@ -746,7 +746,7 @@ async fn execute_jira_bitbucket(mut plan: Plan, opts: &QuickstartOpts) -> Result
         Ok(chart)
     })
     .await?;
-    let credit_remaining_usd = check_credit(release_has_real_model).await;
+    let credit_remaining_usd = check_credit(opts, release_has_real_model).await;
     let held = ensure_factory_agent(
         &common,
         &plan.agent,

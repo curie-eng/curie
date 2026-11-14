@@ -2309,10 +2309,138 @@ pub fn credit_check_key(
     explicit.or(if release_has_real_model { None } else { saved })
 }
 
+/// The model base URL name the worker reads. Quickstart has no flag for it.
+const MODEL_BASE_URL_ENV: &str = "CURIE_MODEL_BASE_URL";
+/// Exact host the server treats as OpenRouter. A subdomain is a different host.
+const OPENROUTER_HOST: &str = "openrouter.ai";
+/// Where a release can record the model base URL. The chart has no
+/// first-class field; operators set this name in extraEnv.
+const RELEASE_MODEL_BASE_POINTERS: [&str; 2] =
+    ["/worker/extraEnv", "/agentSandbox/runner/extraEnv"];
+
+/// Explicit model base URLs quickstart could read, plus whether one was
+/// named without a value it could read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelEndpoints {
+    pub urls: Vec<String>,
+    pub unreadable: bool,
+}
+
+/// The pre-deploy credit read, or a static reason it was not attempted.
+/// The reason names no URL and no credential.
+#[derive(Debug, PartialEq)]
+pub enum QuickstartCredit {
+    Balance(Option<f64>),
+    NotChecked(&'static str),
+}
+
+/// Reads OpenRouter credit for a quickstart deploy, or reports why it did not.
+///
+/// A request is made only when every explicit model base URL has host
+/// `openrouter.ai`, or when no base URL is set and `key` starts with
+/// `sk-or-`. `CURIE_OPENROUTER_API_URL` redirects that request. It is not a
+/// model endpoint, and it never authorizes a probe on its own. Any other
+/// case returns [`QuickstartCredit::NotChecked`] and makes no request.
+pub async fn read_quickstart_openrouter_credit(
+    key: &str,
+    endpoints: &ModelEndpoints,
+) -> Result<QuickstartCredit> {
+    if let Some(reason) = credit_skip_reason(key, endpoints) {
+        return Ok(QuickstartCredit::NotChecked(reason));
+    }
+    Ok(QuickstartCredit::Balance(
+        crate::openrouter_credit::remaining_credit_usd(key).await?,
+    ))
+}
+
+fn credit_skip_reason(key: &str, endpoints: &ModelEndpoints) -> Option<&'static str> {
+    if endpoints.unreadable {
+        return Some("the model endpoint is set but its host could not be read");
+    }
+    if endpoints.urls.is_empty() {
+        if key.starts_with("sk-or-") {
+            return None;
+        }
+        if key.starts_with("sk-ant-") {
+            return Some("the credential is for Anthropic");
+        }
+        return Some("the model endpoint is not known to be OpenRouter");
+    }
+    for url in &endpoints.urls {
+        match model_base_host(url) {
+            Some(host) if host == OPENROUTER_HOST => {}
+            Some(_) => return Some("the model endpoint is not OpenRouter"),
+            None => return Some("the model endpoint is set but its host could not be read"),
+        }
+    }
+    None
+}
+
+fn model_base_host(raw: &str) -> Option<String> {
+    let host = reqwest::Url::parse(raw.trim())
+        .ok()?
+        .host_str()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+fn collect_release_model_bases(endpoints: &mut ModelEndpoints, values: &serde_json::Value) {
+    for pointer in RELEASE_MODEL_BASE_POINTERS {
+        let Some(entries) = values
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for entry in entries {
+            if entry.get("name").and_then(serde_json::Value::as_str) != Some(MODEL_BASE_URL_ENV) {
+                continue;
+            }
+            match entry.get("value").and_then(serde_json::Value::as_str) {
+                Some(value) if !value.trim().is_empty() => {
+                    endpoints.urls.push(value.trim().to_string());
+                }
+                _ => endpoints.unreadable = true,
+            }
+        }
+    }
+}
+
+/// `CURIE_MODEL_BASE_URL` in this process, then the same name in the release
+/// the deploy targets. A failed or missing release read contributes nothing:
+/// with no other base URL, only an `sk-or-` key is probed.
+async fn deployment_model_endpoints(opts: &QuickstartOpts) -> ModelEndpoints {
+    let mut endpoints = ModelEndpoints::default();
+    if let Ok(value) = std::env::var(MODEL_BASE_URL_ENV) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            endpoints.urls.push(trimmed.to_string());
+        }
+    }
+    let common = CommonOpts {
+        namespace: opts.namespace.clone(),
+        release: opts.release.clone(),
+        dry_run: false,
+    };
+    if let Ok(Some(values)) = crate::ops::fetch_release_values(&common).await {
+        collect_release_model_bases(&mut endpoints, &values);
+    }
+    endpoints
+}
+
 /// Warns before deploy when the model credential has less OpenRouter credit
 /// than one factory run needs, because a reviewer refused for credit ends the
 /// run (#3935). Never fails the command; returns the credit left when known.
-async fn check_credit(release_has_real_model: bool) -> Option<f64> {
+///
+/// The credential is sent only to OpenRouter, and only when the deployment
+/// endpoint is OpenRouter. Every other case prints why credit was not checked
+/// and makes no request.
+async fn check_credit(opts: &QuickstartOpts, release_has_real_model: bool) -> Option<f64> {
     let ui = crate::ui::ui();
     let key = match credit_check_key(
         crate::ops::explicit_model_credential_env(),
@@ -2329,11 +2457,13 @@ async fn check_credit(release_has_real_model: bool) -> Option<f64> {
             return None;
         }
     };
-    if key.starts_with("sk-ant-") {
-        return None;
-    }
-    match crate::openrouter_credit::remaining_credit_usd(&key).await {
-        Ok(Some(left)) => {
+    let endpoints = deployment_model_endpoints(opts).await;
+    match read_quickstart_openrouter_credit(&key, &endpoints).await {
+        Ok(QuickstartCredit::NotChecked(reason)) => {
+            ui.note(&format!("OpenRouter credit not checked: {reason}"));
+            None
+        }
+        Ok(QuickstartCredit::Balance(Some(left))) => {
             if left < RUN_CREDIT_USD {
                 ui.warn(&format!(
                     "OpenRouter credit left: {left:.2} USD, below the {} USD one factory run needs. The reviewers run {REVIEWER_MODEL}. Add credit at https://openrouter.ai/settings/credits before labelling an issue.",
@@ -2342,7 +2472,7 @@ async fn check_credit(release_has_real_model: bool) -> Option<f64> {
             }
             Some(left)
         }
-        Ok(None) => {
+        Ok(QuickstartCredit::Balance(None)) => {
             ui.note("OpenRouter credit not checked: the key has no limit and the account balance is not readable");
             None
         }

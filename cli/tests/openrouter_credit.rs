@@ -18,7 +18,10 @@
 
 use crate::support;
 
-use curie::factory_quickstart::{credit_check_key, REVIEWER_MODEL, RUN_CREDIT_USD};
+use curie::factory_quickstart::{
+    credit_check_key, read_quickstart_openrouter_credit, ModelEndpoints, QuickstartCredit,
+    REVIEWER_MODEL, RUN_CREDIT_USD,
+};
 use curie::openrouter_credit::{remaining_credit_usd, remaining_from};
 use serde_json::{json, Value};
 use support::{serve, MockServer, Response};
@@ -217,4 +220,79 @@ fn a_saved_key_is_checked_only_when_the_release_records_no_model() {
 fn no_key_is_checked_when_none_is_known() {
     assert_eq!(credit_check_key(None, None, false), None);
     assert_eq!(credit_check_key(None, None, true), None);
+}
+
+fn endpoints(urls: &[&str]) -> ModelEndpoints {
+    ModelEndpoints {
+        urls: urls.iter().map(|url| (*url).to_string()).collect(),
+        unreadable: false,
+    }
+}
+
+/// The same production read quickstart uses. A credential that is neither
+/// Anthropic nor OpenRouter, with no model endpoint, must not reach the
+/// credit API even when the probe override points at a live stub.
+#[tokio::test]
+async fn a_non_openrouter_credential_with_an_unknown_endpoint_makes_no_request() {
+    let _env = support::ENV_LOCK.lock().await;
+    let server = serve(|_| Response::json(200, r#"{"data":{"limit_remaining":1}}"#));
+    std::env::set_var(BASE_URL_ENV, &server.base_url);
+    let key = "team.secret-PLACEHOLDER";
+    let result = read_quickstart_openrouter_credit(key, &ModelEndpoints::default()).await;
+    std::env::remove_var(BASE_URL_ENV);
+    match result.expect("a skipped read is not an error") {
+        QuickstartCredit::NotChecked(reason) => {
+            assert_eq!(reason, "the model endpoint is not known to be OpenRouter");
+            assert!(!reason.contains(key));
+        }
+        other => panic!("expected no request, got {other:?}"),
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "the unknown credential reached the credit stub: {:?}",
+        server.recorded()
+    );
+}
+
+#[tokio::test]
+async fn an_openrouter_key_aimed_at_another_host_makes_no_request() {
+    let _env = support::ENV_LOCK.lock().await;
+    let server = openrouter(200, credits_body(800.0, 599.85));
+    std::env::set_var(BASE_URL_ENV, &server.base_url);
+    let result =
+        read_quickstart_openrouter_credit(KEY, &endpoints(&["https://models.example.test/v1"]))
+            .await;
+    std::env::remove_var(BASE_URL_ENV);
+    match result.expect("a skipped read is not an error") {
+        QuickstartCredit::NotChecked(reason) => {
+            assert_eq!(reason, "the model endpoint is not OpenRouter");
+        }
+        other => panic!("expected no request, got {other:?}"),
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "the credential was sent to the credit stub: {:?}",
+        server.recorded()
+    );
+}
+
+#[tokio::test]
+async fn an_openrouter_endpoint_still_probes_through_the_override() {
+    let _env = support::ENV_LOCK.lock().await;
+    let server = openrouter(200, credits_body(800.0, 599.85));
+    std::env::set_var(BASE_URL_ENV, &server.base_url);
+    let result =
+        read_quickstart_openrouter_credit(KEY, &endpoints(&["https://openrouter.ai/api/v1"])).await;
+    std::env::remove_var(BASE_URL_ENV);
+    assert_close(
+        match result.expect("the probe succeeds") {
+            QuickstartCredit::Balance(left) => left,
+            QuickstartCredit::NotChecked(reason) => panic!("probe skipped: {reason}"),
+        },
+        73.49,
+    );
+    assert!(
+        !server.recorded().is_empty(),
+        "an OpenRouter endpoint must still reach the credit stub"
+    );
 }
