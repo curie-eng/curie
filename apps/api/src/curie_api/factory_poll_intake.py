@@ -238,7 +238,8 @@ async def _label_already_admitted(
             return True, False
         from .factory_base_reconcile import base_selection_unchanged
 
-        return True, base_selection_unchanged(
+        return True, await base_selection_unchanged(
+            session,
             item,
             labels=labels,
             default_branch=repository.get("default_branch"),

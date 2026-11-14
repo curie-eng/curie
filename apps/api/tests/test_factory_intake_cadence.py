@@ -27,7 +27,17 @@ from curie_api.factory_notices import body_digest
 from curie_api.github_app import GitHubCredentials
 from curie_api.github_factory_events import FactoryNotice
 from curie_api.main import create_app
-from curie_api.models import Agent, ExecutionRequest, FactoryStatusComment, WorkItem
+from curie_api.models import (
+    Agent,
+    AgentVersion,
+    Deployment,
+    ExecutionRequest,
+    FactoryBaseTransition,
+    FactoryPollCursor,
+    FactoryStatusComment,
+    ThreadPublicationLineage,
+    WorkItem,
+)
 from curie_api.threadkeys import route_thread_key
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_telemetry import record_metric
@@ -41,7 +51,15 @@ from forge_fakes.github import (
     factory_env,
     fake_installation_tokens,
 )
-from test_factory_poll_intake import PollGitHub
+from sqlalchemy import func, select
+from test_factory_poll_intake import (
+    PollGitHub,
+    _own_pull_request,
+    _requests,
+)
+from test_factory_poll_intake import (
+    poll_factory as poll_factory,
+)
 
 
 class SimulatedClock:
@@ -251,6 +269,7 @@ class World:
             fake.add_review(pull, 700002, "An earlier review")
         self.agents: dict[tuple[str, str], uuid.UUID] = {}
         self.background: list[tuple[str, int, uuid.UUID]] = []
+        self.lineage_count = 0
         self.calls: list[tuple[float, str, str, str]] = []
         self.delay = 0.2
         self.slow = False
@@ -424,8 +443,25 @@ async def exercise(
             for fake in world.fakes.values():
                 agent = await session.get(Agent, world.agents[fake.repo, LABEL])
                 assert agent is not None
+                version = AgentVersion(
+                    id=uuid.uuid4(), agent_id=agent.id, version_label="v1", created_by="fixture"
+                )
+                session.add(version)
+                await session.flush()
+                deployment = Deployment(
+                    id=uuid.uuid4(),
+                    agent_id=agent.id,
+                    version_id=version.id,
+                    tenant_id=agent.tenant_id,
+                    environment="dev",
+                    status="active",
+                )
+                session.add(deployment)
+                await session.flush()
                 fingerprint = None
-                for index in range(50 - len(fake.issues)):
+                background_count = 50 - len(fake.issues)
+                for index in range(background_count):
+                    published = index >= background_count // 2
                     number = fake.plant_issue()
                     issue = fake.issues[number]
                     item = WorkItem(
@@ -480,8 +516,15 @@ async def exercise(
                         work_item=item,
                         tenant_id=agent.tenant_id,
                         sequence=1,
-                        status="waiting",
+                        status="completed" if published else "waiting",
                         wait_deadline=datetime.now(UTC) + timedelta(hours=1),
+                        started_at=datetime.now(UTC) if published else None,
+                        execution_deadline=datetime.now(UTC) + timedelta(minutes=1)
+                        if published
+                        else None,
+                        execution_attempts=1 if published else 0,
+                        terminal_cause="completed" if published else None,
+                        terminal_at=datetime.now(UTC) if published else None,
                         objective=f"https://github.com/{fake.repo}/issues/{number}",
                         requester="github:6601:octocat",
                         reply_kind="github",
@@ -489,15 +532,42 @@ async def exercise(
                         reply_conversation_id=f"issue-{number}",
                     )
                     session.add(request)
-                    if index % 2:
+                    if index % 2 or published:
                         item.base_branch = fake.default_branch
                         item.base_source = "default"
                         item.base_commit = fake.branches[fake.default_branch]
                         item.base_resolved_request_id = request.id
                         item.base_selection_fingerprint = None
                     await session.flush()
+                    if published:
+                        pull = fake.plant_pull()
+                        lineage = ThreadPublicationLineage(
+                            id=uuid.uuid4(),
+                            agent_id=agent.id,
+                            deployment_id=deployment.id,
+                            conversation_id=item.conversation_id,
+                            repo_full_name=fake.repo,
+                            base_sha=item.base_commit,
+                            base_ref=item.base_branch,
+                            branch=fake.pulls[pull]["head"]["ref"],
+                            pr_number=pull,
+                            pr_url=f"https://github.com/{fake.repo}/pull/{pull}",
+                            head_sha=fake.pulls[pull]["head"]["sha"],
+                            status="open",
+                            code_host_kind="github",
+                            code_host_host="github.com",
+                            repository_project_id=str(fake.repository_id),
+                            code_host_installation_id=INSTALLATION_ID,
+                            code_host_pr_id=fake.pulls[pull]["node_id"],
+                        )
+                        session.add(lineage)
+                        await session.flush()
+                        item.publication_lineage_id = lineage.id
                     comment = fake.add_issue_comment(
-                        number, next(fake._comment_ids), "Queued work\n" + marker_for(request.id)
+                        number,
+                        next(fake._comment_ids),
+                        ("Published work\n" if published else "Queued work\n")
+                        + marker_for(request.id),
                     )
                     session.add(
                         FactoryStatusComment(
@@ -512,6 +582,18 @@ async def exercise(
                     )
                     world.background.append((fake.repo, number, request.id))
             await session.commit()
+            world.lineage_count = (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(WorkItem)
+                    .join(
+                        ThreadPublicationLineage,
+                        ThreadPublicationLineage.id == WorkItem.publication_lineage_id,
+                    )
+                    .where(ThreadPublicationLineage.status == "open")
+                )
+                or 0
+            )
         if change_selection:
             for repo, number, _ in world.background[:2]:
                 world.fakes[repo].issues[number].base_labels = ("base:main",)
@@ -584,6 +666,8 @@ def test_cadence_envelope_order_listing(
     label_end = max(at for at, _, _ in world.metrics[:20])
     record_property("first_label_pass_seconds", label_end)
     assert label_end <= 15
+    assert world.lineage_count * 2 >= len(world.background)
+    record_property("answered_open_lineages", world.lineage_count)
     assert world.started[:2] == pytest.approx([0, 45])
     for repo, number in targets:
         assert len(world.fakes[repo].answers[number]) == 1
@@ -720,3 +804,99 @@ def test_cadence_listing_failure_is_shared_and_retried(cadence_world: World) -> 
     assert len(listings) == 4
     ages = [value for _, r, value in world.metrics if r == repo]
     assert ages[1] > ages[0]
+
+
+@pytest.mark.parametrize(
+    ("condition", "shortcut"),
+    [
+        ("unchanged", True),
+        ("pending", False),
+        ("conflict", False),
+        ("refused", False),
+        ("other_target", False),
+        ("same_target", True),
+        ("settled_conflict", True),
+    ],
+)
+def test_cadence_lineage_selection_retry_boundaries(
+    poll_factory: tuple[TestClient, PollGitHub], condition: str, shortcut: bool
+) -> None:
+    client, github = poll_factory
+    number = github.plant_issue()
+
+    async def poll() -> None:
+        async with httpx.AsyncClient() as http:
+            await intake.poll_once(client.app.state.sessionmaker, get_settings(), http)
+
+    client.portal.call(poll)
+    [request] = _requests(number)
+    pull = github.plant_pull()
+    lineage_id = _own_pull_request(request["work_item_id"], pull)
+
+    async def seed() -> None:
+        async with client.app.state.sessionmaker() as session:
+            item = await session.get(WorkItem, request["work_item_id"])
+            lineage = await session.get(ThreadPublicationLineage, lineage_id)
+            current = await session.get(ExecutionRequest, request["id"])
+            assert item is not None and lineage is not None and current is not None
+            item.base_branch = github.default_branch
+            item.base_source = "default"
+            item.base_commit = github.branches[github.default_branch]
+            item.base_resolved_request_id = current.id
+            item.base_selection_fingerprint = None
+            if condition == "pending":
+                item.base_requested_branch = "next"
+                item.base_requested_source = "label"
+            elif condition in {
+                "conflict",
+                "refused",
+                "other_target",
+                "same_target",
+                "settled_conflict",
+            }:
+                phase = "conflict" if condition == "settled_conflict" else condition
+                if condition in {"other_target", "same_target"}:
+                    phase = "pending"
+                session.add(
+                    FactoryBaseTransition(
+                        id=uuid.uuid4(),
+                        work_item_id=item.id,
+                        request_id=current.id,
+                        ci_request_id=current.id,
+                        lineage_id=lineage.id,
+                        phase=phase,
+                        old_base_ref=item.base_branch,
+                        old_base_sha=item.base_commit,
+                        old_head_sha=lineage.head_sha,
+                        target_base_ref=item.base_branch if condition == "same_target" else "next",
+                        target_base_sha=github.branches["next"],
+                        base_source="label",
+                        branch=lineage.branch,
+                        pull_request_number=str(pull),
+                        committer_name="Fixture",
+                        committer_email="fixture@example.com",
+                        committer_time=datetime.now(UTC),
+                    )
+                )
+                if condition == "settled_conflict":
+                    current.started_at = datetime.now(UTC)
+                    current.execution_deadline = current.started_at + timedelta(minutes=1)
+                    current.execution_attempts = 1
+                    current.status = "completed"
+                    current.terminal_cause = "completed"
+                    current.terminal_at = datetime.now(UTC)
+            await session.commit()
+
+    client.portal.call(seed)
+    github._etags["issues"] = '"lineage-selection-check"'
+    github.failures[f"/repos/{REPO}/issues/{number}"] = 503
+    client.portal.call(poll)
+
+    async def etag() -> str | None:
+        async with client.app.state.sessionmaker() as session:
+            cursor = await session.get(FactoryPollCursor, ("github", "github.com", str(REPO_ID)))
+            assert cursor is not None
+            return cursor.etags.get(f"issues:{LABEL}")
+
+    assert (client.portal.call(etag) == github._etags["issues"]) is shortcut
+    assert [row["id"] for row in _requests(number)] == [request["id"]]
