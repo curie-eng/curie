@@ -38,7 +38,6 @@ from . import (
     factory_ci_recovery,
     factory_label_reconcile,
     factory_notices,
-    factory_poll_intake,
     factory_review_feedback,
     factory_tracker_intake,
 )
@@ -53,7 +52,6 @@ from .factory_tracker_result_delivery import (
 )
 from .forges.errors import ForgeError
 from .forges.ports import Tracker
-from .forges.registry import forges_registry
 from .models import ExecutionRequest, FactoryTrackerResultDelivery, WorkItem
 from .workitem_dispatch import (
     claim_due,
@@ -620,10 +618,8 @@ class WorkItemReconciler:
         if not settings.factory_enabled:
             return
         if settings.factory_intake == "poll":
-            tracker = forges_registry(settings).github_tracker()
-            interval = tracker.config.poll_interval_s if tracker is not None else 0.0
-        else:
-            interval = settings.factory_reconcile_interval_s
+            return
+        interval = settings.factory_reconcile_interval_s
         if interval <= 0:
             return
         clock = asyncio.get_running_loop().time()
@@ -633,12 +629,9 @@ class WorkItemReconciler:
         async with httpx.AsyncClient(
             timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
         ) as client:
-            if settings.factory_intake == "poll":
-                await factory_poll_intake.poll_once(self._sessionmaker, settings, client)
-            else:
-                await factory_label_reconcile.reconcile_missed_labels(
-                    self._sessionmaker, settings, client, now=datetime.now(UTC)
-                )
+            await factory_label_reconcile.reconcile_missed_labels(
+                self._sessionmaker, settings, client, now=datetime.now(UTC)
+            )
 
     async def _poll_trackers(self) -> None:
         """Poll every non-GitHub tracker binding through the ports (#4358 plan D1),

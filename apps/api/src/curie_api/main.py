@@ -264,6 +264,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.work_item_reconciler_enabled
         else None
     )
+    from . import factory_poll_intake
+
+    app.state.factory_poll_intake_task = (
+        asyncio.create_task(factory_poll_intake.run_forever(app.state.sessionmaker, settings))
+        if settings.work_item_reconciler_enabled
+        and settings.factory_enabled
+        and settings.factory_intake == "poll"
+        else None
+    )
     app.state.work_item_status_comments_task = (
         asyncio.create_task(work_item_reconciler.run_status_comments_forever())
         if settings.work_item_reconciler_enabled
@@ -425,6 +434,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     pass
             # These background loops use Valkey and the database, so stop them
             # before closing either resource.
+            intake_task = getattr(app.state, "factory_poll_intake_task", None)
+            if intake_task is not None:
+                intake_task.cancel()
+                try:
+                    await intake_task
+                except asyncio.CancelledError:
+                    pass
             status_task = getattr(app.state, "work_item_status_comments_task", None)
             if status_task is not None:
                 status_task.cancel()

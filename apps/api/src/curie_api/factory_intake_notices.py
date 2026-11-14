@@ -186,13 +186,14 @@ async def sync_intake_notices(
     owner: str,
     client: httpx.AsyncClient | None = None,
     limit: int = 20,
+    issue: TrackerIssueRef | None = None,
 ) -> int:
     if client is None:
         async with httpx.AsyncClient(
             timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
         ) as owned_client:
             return await sync_intake_notices(
-                sessionmaker, settings, owner=owner, client=owned_client, limit=limit
+                sessionmaker, settings, owner=owner, client=owned_client, limit=limit, issue=issue
             )
     writes = 0
     for _ in range(limit):
@@ -201,6 +202,16 @@ async def sync_intake_notices(
                 select(FactoryIntakeNotice)
                 .where(
                     FactoryIntakeNotice.posted_at.is_(None),
+                    *(
+                        ()
+                        if issue is None
+                        else (
+                            FactoryIntakeNotice.tracker_kind == issue.kind,
+                            FactoryIntakeNotice.tracker_host == issue.host,
+                            FactoryIntakeNotice.tracker_scope_id == issue.scope_id,
+                            FactoryIntakeNotice.tracker_issue_id == issue.issue_id,
+                        )
+                    ),
                     or_(
                         FactoryIntakeNotice.not_before.is_(None),
                         FactoryIntakeNotice.not_before <= func.clock_timestamp(),

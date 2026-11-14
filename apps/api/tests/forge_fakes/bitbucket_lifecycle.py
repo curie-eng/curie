@@ -483,10 +483,12 @@ class BitbucketPair:
         """The real sink, which writes a Jira WorkItem's replies through the
         ports; remembers the request each write is for."""
 
-        async def sync_one(client: httpx.AsyncClient, settings: Any, claim: Any) -> int:
+        async def sync_one(
+            client: httpx.AsyncClient, settings: Any, claim: Any, verified_repository: Any
+        ) -> int:
             self._syncing = claim.row.execution_request_id
             try:
-                return int(await original(client, settings, claim))
+                return int(await original(client, settings, claim, verified_repository))
             finally:
                 self._syncing = None
 

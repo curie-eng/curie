@@ -783,6 +783,21 @@ _REMEDIATION_LIFECYCLE_ATTRIBUTES = {
 
 
 _METRICS: dict[str, dict[str, Any]] = {
+    "curie.factory.intake.label_pass.age_seconds": _definition(
+        "gauge",
+        "s",
+        "Age of the last clean repository label pass.",
+        False,
+        {
+            "repository": {
+                "kind": "bounded",
+                "ceiling": 20,
+                "reserved": ["other"],
+                "overflow": "other",
+                "pattern": r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+            }
+        },
+    ),
     "curie.factory.intake.notice.oldest_owed_age_seconds": _definition(
         "gauge", "s", "Age of the oldest refused trigger-label notice awaiting delivery.", False, {}
     ),
