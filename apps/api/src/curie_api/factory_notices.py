@@ -52,6 +52,7 @@ from .factory_reply_target import stored_reply_target
 from .factory_triage_status import (
     delivered_triage,
     is_tracker_result,
+    recorded_handoff,
     triage_delivered_sql,
     triage_label,
     triage_label_sql,
@@ -68,13 +69,14 @@ from .forges.github.marked_comments import (
     patch_comment,
     subject_title,
 )
-from .forges.github.transport import github_headers
+from .forges.github.transport import github_headers, repository_identity_matches
 from .forges.hosts import factory_credentials, factory_tracker
 from .forges.ports import CodeHost, Tracker, comments_for
 from .forges.registry import forges_registry
 from .forges.trackers import code_host_for_repository, tracker_for_work_item
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget, RepositoryRef, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
+from .github_review_truth import VerifiedRepository
 from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
@@ -619,11 +621,14 @@ async def sync_status_comments(
     owner: str,
     limit: int = 20,
     paused_for_upgrade: bool = False,
+    request_ids: set[uuid.UUID] | None = None,
+    verified_repository: VerifiedRepository | None = None,
 ) -> int:
     """Claim, render, release the session, call GitHub, then persist under the lease.
 
     Returns the number of GitHub writes. A crashed claimer's lease expires;
-    marker recovery finds a comment whose create response was lost.
+    marker recovery finds a comment whose create response was lost. Poll callers
+    may reuse their verified repository credential for matching claims.
     """
 
     writes = 0
@@ -641,6 +646,7 @@ async def sync_status_comments(
                         owner=owner,
                         attempted_ids=attempted_ids,
                         paused_for_upgrade=paused_for_upgrade,
+                        request_ids=request_ids,
                     )
                     await session.commit()
                 if claim is None:
@@ -650,7 +656,7 @@ async def sync_status_comments(
                 token = github_calls.set(calls)
                 started = time.monotonic()
                 try:
-                    writes += await _sync_one(client, settings, claim)
+                    writes += await _sync_one(client, settings, claim, verified_repository)
                     claim.row.attempts += 1
                     async with sessionmaker() as session:
                         await _write_back(session, claim, owner=owner)
@@ -713,6 +719,7 @@ async def _claim_next(
     owner: str,
     attempted_ids: set[uuid.UUID],
     paused_for_upgrade: bool,
+    request_ids: set[uuid.UUID] | None = None,
 ) -> _StatusClaim | None:
     later = aliased(ExecutionRequest)
     is_latest = and_(
@@ -757,6 +764,11 @@ async def _claim_next(
             )
             .where(
                 FactoryStatusComment.refused_at.is_(None),
+                *(
+                    ()
+                    if request_ids is None
+                    else (FactoryStatusComment.execution_request_id.in_(request_ids),)
+                ),
                 ExecutionRequest.objective.is_not(None),
                 or_(FactoryStatusComment.finalized_at.is_(None), label_due),
                 lease_available(
@@ -908,6 +920,7 @@ async def _sync_one(
     client: httpx.AsyncClient,
     settings: Settings,
     claim: _StatusClaim,
+    verified_repository: VerifiedRepository | None,
 ) -> int:
     row = claim.row
     if row.terminal_cause == "issue_deleted":
@@ -920,11 +933,24 @@ async def _sync_one(
     registry = forges_registry(settings)
     try:
         intake = factory_tracker(registry)
-        token = await run_in_threadpool(
-            factory_credentials(registry).token_for_verified_installation,
-            claim.repository_path,
-            claim.code_host_installation_id,
-        )
+        if verified_repository is None:
+            token = await run_in_threadpool(
+                factory_credentials(registry).token_for_verified_installation,
+                claim.repository_path,
+                claim.code_host_installation_id,
+            )
+        else:
+            if (
+                verified_repository.api != intake.config.api_url.rstrip("/")
+                or verified_repository.installation_id != claim.code_host_installation_id
+                or not repository_identity_matches(
+                    verified_repository.repository,
+                    repository_id=int(claim.tracker_issue.scope_id),
+                    repo_full_name=claim.repository_path,
+                )
+            ):
+                return 0
+            token = verified_repository.token
     except (ForgeError, GitHubInstallationRefused, GitHubAppError, ValueError):
         return 0
     github = GitHubCommentClient(
@@ -1124,8 +1150,8 @@ async def _render(
     paused_for_upgrade: bool = False,
     handoff: HandoffOutcome | None = None,
 ) -> str:
-    """The status comment body. ``handoff`` is the implementation handoff of a
-    delivered ticket, which #5588 records; until then only tests pass one."""
+    """The status comment body. ``handoff`` overrides the implementation
+    handoff the triage handoff recorded for a delivered ticket (#5588)."""
 
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
@@ -1357,6 +1383,8 @@ async def _terminal_triage_text(
     delivered = await delivered_triage(session, request.id)
     if delivered is None:
         return None
+    if handoff is None:
+        handoff = await recorded_handoff(session, request.id)
     try:
         text = status_comment_text(delivered, handoff)
     except ValueError:

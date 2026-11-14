@@ -79,8 +79,9 @@ CONTRACT = "0041"
 # this floor. Execution request reads select the 0167 completion contract
 # columns. Intake notice storage requires 0168, which stays below this floor.
 # Requester selection columns require 0169, which stays below this floor.
-# Refusal posts require 0170.
-APP_SCHEMA_MIN = "0170"
+# Refusal posts require 0170, which stays below this floor.
+# Triage handoff storage requires 0171.
+APP_SCHEMA_MIN = "0171"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -113,7 +114,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
-    assert HEAD == "0170"
+    assert HEAD == "0171"
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
     # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
@@ -130,6 +131,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0168"] == KIND_EXPAND
     assert kinds["0169"] == KIND_EXPAND
     assert kinds["0170"] == KIND_EXPAND
+    assert kinds["0171"] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
@@ -214,6 +216,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0168",
             "0169",
             "0170",
+            "0171",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -269,8 +272,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0168",
             "0169",
             "0170",
+            "0171",
         }
-    assert current_revision() == "0170"
+    assert current_revision() == "0171"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -383,8 +387,9 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # this floor. Execution request reads select the 0167 completion contract
     # columns. Intake notice storage requires 0168, which stays below this
     # floor. Requester selection columns require 0169, which stays below this
-    # floor. Refusal posts require 0170.
-    for revision in sorted(known - {"0170"}):
+    # floor. Refusal posts require 0170, which stays below this floor.
+    # Triage handoff storage requires 0171.
+    for revision in sorted(known - {"0171"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -412,7 +417,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0167", window, known) is False
     assert can_serve("0168", window, known) is False
     assert can_serve("0169", window, known) is False
-    assert can_serve("0170", window, known) is True
+    assert can_serve("0170", window, known) is False
+    assert can_serve("0171", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from curie_internal.factory_triage import TRIAGED_LABEL, TriageResult
+from curie_internal.factory_triage import TRIAGED_LABEL, HandoffOutcome, TriageResult
 from sqlalchemy import and_, exists, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,7 @@ from .models import (
     ExecutionRequest,
     FactoryStatusComment,
     FactoryTrackerResultReceipt,
+    FactoryTriageHandoff,
     WorkItem,
 )
 
@@ -126,6 +127,39 @@ async def delivered_triage(
     )
 
 
+async def recorded_handoff(
+    session: AsyncSession, execution_request_id: uuid.UUID
+) -> HandoffOutcome | None:
+    """The settled implementation handoff of a delivered ticket (#5588), or None.
+
+    None while no handoff exists (a source admitted before #5588) or while it
+    is still unsettled; the ending then shows the ticket as published.
+    """
+
+    row = (
+        await session.execute(
+            select(
+                FactoryTriageHandoff.outcome,
+                FactoryTriageHandoff.reason,
+                FactoryTriageHandoff.output_url,
+            ).where(
+                FactoryTriageHandoff.source_execution_request_id == execution_request_id,
+                FactoryTriageHandoff.outcome.is_not(None),
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    outcome, reason, output_url = row
+    admitted = outcome == "admitted"
+    return HandoffOutcome(
+        admitted=admitted,
+        # The implementation run's status lives on the published ticket.
+        implementation_status_url=output_url if admitted else None,
+        refusal_reason=None if admitted else reason,
+    )
+
+
 async def on_tracker_result_settled(session: AsyncSession, execution_request_id: uuid.UUID) -> None:
     """Let the status sync render a request again once its delivery settled.
 
@@ -157,6 +191,7 @@ __all__ = [
     "delivered_triage",
     "is_tracker_result",
     "on_tracker_result_settled",
+    "recorded_handoff",
     "triage_delivered_sql",
     "triage_label",
     "triage_label_sql",

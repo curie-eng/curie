@@ -517,3 +517,173 @@ def test_label_actor_user_app_provenance_on_issue_events(stub: Any, github: http
     events = _ok(github.get(f"/repos/{REPO}/issues/3815/events"))
     assert events[-1]["actor"]["type"] == "Bot"
     assert events[-1]["performed_via_github_app"] == {"id": 51}
+
+
+# Runtime controls (#5588 decision 12). Each control has a positive test and a
+# negative control that observes the untouched default answer.
+
+PERMISSION_PATH = f"/repos/{REPO}/collaborators/octocat/permission"
+
+
+def test_permission_control_changes_the_live_answer(stub: Any, github: httpx.Client) -> None:
+    assert _ok(github.get(PERMISSION_PATH))["permission"] == "write"
+    stub.revoke_permission("octocat")
+    revoked = _ok(github.get(PERMISSION_PATH))
+    assert revoked["permission"] == "read"
+    assert revoked["user"]["login"] == "octocat"
+    stub.set_permission("octocat", "admin")
+    assert _ok(github.get(PERMISSION_PATH))["permission"] == "admin"
+    labeller = {"id": 6603, "login": "triager", "type": "User"}
+    stub.set_permission("triager", "maintain", user=labeller)
+    answer = _ok(github.get(f"/repos/{REPO}/collaborators/triager/permission"))
+    assert answer == {"permission": "maintain", "role_name": "maintain", "user": labeller}
+
+
+def test_permission_control_negative_leaves_other_collaborators_unchanged(
+    stub: Any, github: httpx.Client
+) -> None:
+    stub.revoke_permission("octocat")
+    assert _ok(github.get(f"/repos/{REPO}/collaborators/reader/permission"))["permission"] == (
+        "read"
+    )
+    assert github.get(f"/repos/{REPO}/collaborators/stranger/permission").status_code == 404
+    with pytest.raises(ValueError, match="needs a user"):
+        stub.set_permission("stranger", "write")
+    with pytest.raises(ValueError, match="unknown permission"):
+        stub.set_permission("octocat", "owner")
+
+
+def test_permission_read_fails_until_cleared(stub: Any, github: httpx.Client) -> None:
+    stub.fail_permission_reads("octocat")
+    for _ in range(3):
+        assert github.get(PERMISSION_PATH).status_code == 503
+    stub.clear_permission_failure("octocat")
+    assert _ok(github.get(PERMISSION_PATH))["permission"] == "write"
+
+
+def test_permission_read_failure_negative_is_scoped_to_its_login(
+    stub: Any, github: httpx.Client
+) -> None:
+    stub.fail_permission_reads("octocat", status=502)
+    assert github.get(PERMISSION_PATH).status_code == 502
+    assert github.get(f"/repos/{REPO}/collaborators/reader/permission").status_code == 200
+    with pytest.raises(ValueError, match="server error"):
+        stub.fail_permission_reads("reader", status=404)
+
+
+def _issue_numbers(stub: Any) -> list[int]:
+    return [row["number"] for row in stub._rows("issue")]
+
+
+def _create_issue(github: httpx.Client, title: str) -> httpx.Response:
+    return github.post(
+        f"/repos/{REPO}/issues", json={"title": title, "body": "Body.", "labels": ["base:main"]}
+    )
+
+
+def test_refused_issue_creates_write_nothing_then_recover(
+    stub: Any, github: httpx.Client
+) -> None:
+    stub.inject_fault("issue_create", "refuse", count=2, status=503)
+    assert _create_issue(github, "First").status_code == 503
+    assert _create_issue(github, "Second").status_code == 503
+    assert _issue_numbers(stub) == [3815]
+    assert stub.pending_faults() == []
+    created = _ok(_create_issue(github, "Third"), 201)
+    assert created["number"] == 3816
+    assert _issue_numbers(stub) == [3815, 3816]
+
+
+def test_ambiguous_issue_create_writes_the_issue_but_answers_an_error(
+    stub: Any, github: httpx.Client
+) -> None:
+    stub.inject_fault("issue_create", "ambiguous")
+    response = _create_issue(github, "Ambiguous")
+    assert response.status_code == 502
+    assert _issue_numbers(stub) == [3815, 3816]
+    issue = _ok(github.get(f"/repos/{REPO}/issues/3816"))
+    assert issue["title"] == "Ambiguous"
+    assert issue["labels"] == [{"name": "base:main"}]
+
+
+def test_unreadable_issue_create_answers_success_with_a_cut_body(
+    stub: Any, github: httpx.Client
+) -> None:
+    stub.inject_fault("issue_create", "unreadable")
+    response = _create_issue(github, "Unreadable")
+    assert response.status_code == 201
+    with pytest.raises(ValueError):
+        json.loads(response.content)
+    assert _ok(github.get(f"/repos/{REPO}/issues/3816"))["title"] == "Unreadable"
+
+
+def test_issue_create_fault_negative_control(stub: Any, github: httpx.Client) -> None:
+    """Without an injected fault a create is one readable 201; comments are unaffected."""
+    stub.inject_fault("comment_create", "refuse")
+    created = _ok(_create_issue(github, "Plain"), 201)
+    assert created["number"] == 3816
+    assert stub.pending_faults("issue_create") == []
+    assert stub.pending_faults("comment_create") == [
+        {"operation": "comment_create", "mode": "refuse", "status": 502}
+    ]
+    with pytest.raises(ValueError, match="unknown fault operation"):
+        stub.inject_fault("label_add", "refuse")
+    with pytest.raises(ValueError, match="unknown fault mode"):
+        stub.inject_fault("issue_create", "slow")
+
+
+def _comments(stub: Any, number: int) -> list[str]:
+    return [row["body"] for row in stub._rows("comment") if row["issue_number"] == number]
+
+
+@pytest.mark.parametrize(
+    ("mode", "status", "written"),
+    [("refuse", 503, False), ("ambiguous", 502, True), ("unreadable", 201, True)],
+)
+def test_comment_delivery_faults(
+    stub: Any, github: httpx.Client, mode: str, status: int, written: bool
+) -> None:
+    stub.inject_fault("comment_create", mode, status=503 if mode == "refuse" else 502)
+    response = github.post(f"/repos/{REPO}/issues/3815/comments", json={"body": "marked"})
+    assert response.status_code == status
+    assert _comments(stub, 3815) == (["marked"] if written else [])
+    # The fault is used once; the next delivery is an ordinary readable 201.
+    again = _ok(github.post(f"/repos/{REPO}/issues/3815/comments", json={"body": "retry"}), 201)
+    assert again["body"] == "retry"
+
+
+def test_comment_delivery_negative_control(stub: Any, github: httpx.Client) -> None:
+    stub.inject_fault("issue_create", "ambiguous")
+    created = _ok(github.post(f"/repos/{REPO}/issues/3815/comments", json={"body": "ok"}), 201)
+    assert created["user"]["type"] == "Bot"
+    assert _comments(stub, 3815) == ["ok"]
+
+
+def test_read_back_mutation_changes_the_next_read(stub: Any, github: httpx.Client) -> None:
+    created = _ok(_create_issue(github, "Delivered"), 201)
+    events_before = _ok(github.get(f"/repos/{REPO}/issues/{created['number']}/events"))
+    stub.edit_issue_body(created["number"], "Edited by a person.")
+    read = _ok(github.get(f"/repos/{REPO}/issues/{created['number']}"))
+    assert read["body"] == "Edited by a person."
+    assert _ok(github.get(f"/repos/{REPO}/issues/{created['number']}/events")) == events_before
+    comment = stub.add_issue_comment(3815, "original", author=stub_human())
+    stub.edit_comment_body(comment["id"], "changed")
+    assert _ok(github.get(f"/repos/{REPO}/issues/comments/{comment['id']}"))["body"] == "changed"
+
+
+def test_read_back_mutation_negative_control(stub: Any, github: httpx.Client) -> None:
+    created = _ok(_create_issue(github, "Delivered"), 201)
+    assert _ok(github.get(f"/repos/{REPO}/issues/{created['number']}"))["body"] == "Body."
+    stub.edit_issue_body(3815, "Other issue.")
+    assert _ok(github.get(f"/repos/{REPO}/issues/{created['number']}"))["body"] == "Body."
+    with pytest.raises(ValueError, match="does not exist"):
+        stub.edit_issue_body(9999, "missing")
+
+
+def test_branch_and_main_revision_reads(stub: Any) -> None:
+    assert stub.branches() == ["main"]
+    assert len(stub.main_revision()) == 40
+
+
+def stub_human() -> dict[str, Any]:
+    return {"id": 6601, "login": "octocat", "type": "User"}

@@ -38,7 +38,6 @@ from . import (
     factory_ci_recovery,
     factory_label_reconcile,
     factory_notices,
-    factory_poll_intake,
     factory_review_feedback,
     factory_tracker_intake,
 )
@@ -51,9 +50,9 @@ from .factory_tracker_result_delivery import (
     due_deliveries,
     expire_overdue,
 )
+from .factory_triage_handoff import abandon_attempt, due_handoffs, hand_off
 from .forges.errors import ForgeError
 from .forges.ports import Tracker
-from .forges.registry import forges_registry
 from .models import ExecutionRequest, FactoryTrackerResultDelivery, WorkItem
 from .workitem_dispatch import (
     claim_due,
@@ -179,6 +178,8 @@ class WorkItemReconciler:
             # attempt the due ones, a run's submission and platform findings alike.
             ("expire_tracker_results", self._expire_tracker_results),
             ("deliver_tracker_results", self._deliver_tracker_results),
+            # A delivered triage ticket's implementation handoff (#5588).
+            ("hand_off_triage_tickets", self._hand_off_triage_tickets),
             ("publish_execute_wakes", self._publish_execute_wakes),
         ):
             attributes = {"service.name": "curie-api", "step": name}
@@ -253,6 +254,37 @@ class WorkItemReconciler:
                     logger.warning("tracker result delivery %s attempt did not finish", delivery_id)
         finally:
             await client.aclose()
+
+    async def _hand_off_triage_tickets(self) -> None:
+        """One attempt for each due triage handoff, under this reconciler's owner."""
+
+        async with self._sessionmaker() as session:
+            due = await due_handoffs(session, limit=self._settings.work_item_batch_limit)
+            await session.rollback()
+        if not due:
+            return
+        async with httpx.AsyncClient(
+            timeout=self._settings.github_app_timeout_seconds,
+            verify=code_host_verify(self._settings),
+        ) as client:
+            for handoff_id in due:
+                try:
+                    async with asyncio.timeout(_TRACKER_RESULT_ATTEMPT_SECONDS):
+                        await hand_off(
+                            self._sessionmaker,
+                            handoff_id,
+                            settings=self._settings,
+                            client=client,
+                            owner=self._owner,
+                        )
+                except TimeoutError:
+                    logger.warning("triage handoff %s attempt did not finish", handoff_id)
+                    await abandon_attempt(
+                        self._sessionmaker,
+                        handoff_id,
+                        owner=self._owner,
+                        settings=self._settings,
+                    )
 
     async def _redispatch_lapsed_acquisitions(self) -> None:
         async with self._sessionmaker() as session:
@@ -620,10 +652,8 @@ class WorkItemReconciler:
         if not settings.factory_enabled:
             return
         if settings.factory_intake == "poll":
-            tracker = forges_registry(settings).github_tracker()
-            interval = tracker.config.poll_interval_s if tracker is not None else 0.0
-        else:
-            interval = settings.factory_reconcile_interval_s
+            return
+        interval = settings.factory_reconcile_interval_s
         if interval <= 0:
             return
         clock = asyncio.get_running_loop().time()
@@ -633,12 +663,9 @@ class WorkItemReconciler:
         async with httpx.AsyncClient(
             timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
         ) as client:
-            if settings.factory_intake == "poll":
-                await factory_poll_intake.poll_once(self._sessionmaker, settings, client)
-            else:
-                await factory_label_reconcile.reconcile_missed_labels(
-                    self._sessionmaker, settings, client, now=datetime.now(UTC)
-                )
+            await factory_label_reconcile.reconcile_missed_labels(
+                self._sessionmaker, settings, client, now=datetime.now(UTC)
+            )
 
     async def _poll_trackers(self) -> None:
         """Poll every non-GitHub tracker binding through the ports (#4358 plan D1),

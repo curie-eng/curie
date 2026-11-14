@@ -45,10 +45,13 @@ from curie_api.forges.types import (
     UpsertResult,
 )
 from curie_api.github_app import GitHubAppError
+from curie_api.github_review_truth import VerifiedRepository
 from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
 from forge_fakes import factory_wake
 from forge_fakes.github import (
+    INSTALLATION_ID,
     LABEL,
+    REPO_ID,
     _issue_event,
     _post,
     fake_installation_tokens,
@@ -1221,7 +1224,7 @@ def _link_through_jira(
     issue = jira.seed_issue("Ticket")
     linked: list[uuid.UUID] = []
 
-    async def sync_one(client: Any, settings: Any, claim: Any) -> int:
+    async def sync_one(client: Any, settings: Any, claim: Any, _verified_repository: Any) -> int:
         if claim.row.finalized_at is not None:
             return 0
         async with jira_client(jira) as http:
@@ -2642,7 +2645,7 @@ def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotentl
     ticket = jira.seed_issue("Ticket")
     linked: list[uuid.UUID] = []
 
-    async def sync_one(http: Any, settings: Any, claim: Any) -> int:
+    async def sync_one(http: Any, settings: Any, claim: Any, _verified_repository: Any) -> int:
         async with jira_client(jira) as jira_http:
             tracker = jira_tracker(jira, client=jira_http)
             code_host = _JiraLinkPorts(tracker, claim.row.execution_request_id, linked)
@@ -3155,3 +3158,194 @@ def test_an_implementation_request_never_shows_triaged(admitted: Any) -> None:  
     assert "Triage reported" not in comment["body"]
     assert "Cause: runner_failed" in comment["body"]
     assert not _label_added(sink, number, TRIAGED)
+
+
+@pytest.mark.parametrize("mismatch", ["api", "installation", "repository_id", "repository_path"])
+def test_poll_status_credential_is_scoped_to_verified_repository(
+    admitted: Any,  # noqa: F811
+    mismatch: str,
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 55850)
+    proof = VerifiedRepository(
+        get_settings().github_api_url.rstrip("/"),
+        "fixture-installation-token",
+        INSTALLATION_ID,
+        {"id": REPO_ID, "full_name": REPO},
+    )
+    if mismatch == "api":
+        proof = replace(proof, api="https://api.example.com")
+    elif mismatch == "installation":
+        proof = replace(proof, installation_id=INSTALLATION_ID + 1)
+    elif mismatch == "repository_id":
+        proof = replace(proof, repository={"id": REPO_ID + 1, "full_name": REPO})
+    else:
+        proof = replace(proof, repository={"id": REPO_ID, "full_name": "acme-corp/another-bot"})
+
+    async def go() -> None:
+        assert (
+            await sync_status_comments(
+                client.app.state.sessionmaker,
+                get_settings(),
+                owner="poll-status-proof",
+                limit=1,
+                request_ids={request_id},
+                verified_repository=proof,
+            )
+            == 0
+        )
+        assert sink.requests == []
+        assert (
+            await sync_status_comments(
+                client.app.state.sessionmaker,
+                get_settings(),
+                owner="status-retry",
+                limit=1,
+                request_ids={request_id},
+            )
+            > 0
+        )
+
+    client.portal.call(go)
+    assert len(_posts(sink)) == 1
+    assert _notices(request_id)[0]["attempts"] == 2
+
+
+# --- #5588 AC7: the handoff endings render from the recorded handoff ---------------
+#
+# The delegation and handoff rows are written with plain SQL in the shapes migration
+# 0171 and `curie_api.factory_triage_handoff` store (the handoff itself is driven
+# over GitHub HTTP in test_factory_triage_handoff.py). The status comment reads them
+# through `recorded_handoff`; nothing here passes a handoff to the renderer.
+
+
+def _record_handoff(request_id: uuid.UUID, *, outcome: str | None, reason: str | None) -> None:
+    """The delegation of ``request_id`` and its handoff on the delivered ticket; an
+    unsettled one is not due for a day, so no reconciler pass attempts it."""
+
+    params = {"request": request_id}
+    _execute(
+        "INSERT INTO curie.factory_triage_delegations (id, work_item_id, "
+        "source_execution_request_id, actor_id, actor_login, selection_event, tracker_kind, "
+        "tracker_host, tracker_scope_id, tracker_issue_id, repository_id, "
+        "result_policy_digest, target_label) "
+        "SELECT gen_random_uuid(), w.id, r.id, '6601', 'octocat', 'github-label-event:1', "
+        "w.tracker_kind, w.tracker_host, w.tracker_scope_id, w.tracker_issue_id, "
+        "w.repository_project_id, r.result_policy_digest, 'factory-implement' "
+        "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE r.id = :request",
+        params,
+    )
+    _execute(
+        "INSERT INTO curie.factory_triage_handoffs (id, delegation_id, "
+        "source_execution_request_id, output_tracker_kind, output_tracker_host, "
+        "output_scope_id, output_issue_id, output_url, output_body_sha256, "
+        "next_attempt_at, deadline_at) "
+        "SELECT gen_random_uuid(), d.id, d.source_execution_request_id, r.output_tracker_kind, "
+        "r.output_tracker_host, r.output_scope_id, r.output_issue_id, r.output_url, "
+        "r.output_body_sha256, clock_timestamp() + interval '1 day', "
+        "clock_timestamp() + interval '1 day' "
+        "FROM curie.factory_triage_delegations d JOIN curie.factory_tracker_result_receipts r "
+        "ON r.execution_request_id = d.source_execution_request_id "
+        "WHERE d.source_execution_request_id = :request",
+        params,
+    )
+    if outcome is not None:
+        _settle_handoff(request_id, outcome=outcome, reason=reason)
+
+
+def _settle_handoff(request_id: uuid.UUID, *, outcome: str, reason: str | None) -> None:
+    """The outcome the handoff commits, with the hook it calls in that transaction."""
+
+    from curie_api.factory_triage_status import on_tracker_result_settled
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with async_sessionmaker(engine)() as session:
+                await session.execute(
+                    text(
+                        "UPDATE curie.factory_triage_handoffs SET outcome = :outcome, "
+                        "reason = :reason, settled_at = clock_timestamp(), "
+                        "implementation_request_id = CASE WHEN :outcome = 'admitted' "
+                        "THEN gen_random_uuid() END "
+                        "WHERE source_execution_request_id = :request"
+                    ),
+                    {"request": request_id, "outcome": outcome, "reason": reason},
+                )
+                await session.execute(
+                    text(
+                        "UPDATE curie.factory_triage_delegations "
+                        "SET consumed_at = clock_timestamp() "
+                        "WHERE source_execution_request_id = :request"
+                    ),
+                    {"request": request_id},
+                )
+                await on_tracker_result_settled(session, request_id)
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+_HANDOFF_ENDINGS = {
+    "admitted": ("admitted", None, "Implementation admitted: {ticket}"),
+    "refused": ("refused", "authority_revoked", "Implementation not started: authority_revoked."),
+}
+
+
+@pytest.mark.parametrize("ending", sorted(_HANDOFF_ENDINGS))
+def test_a_recorded_handoff_renders_its_ending_once_across_restarts(
+    admitted: Any,  # noqa: F811
+    ending: str,
+) -> None:
+    client, github, sink = admitted
+    number = 58801 if ending == "admitted" else 58802
+    outcome, reason, line = _HANDOFF_ENDINGS[ending]
+    request_id, epoch = _triage_running(client, github, sink, number)
+    _settle(request_id, epoch, number, kind="ticket")
+    _record_handoff(request_id, outcome=outcome, reason=reason)
+    _end(request_id, "completed", "completed")
+
+    # Each pass is a fresh reconciler: a restart between renders.
+    _reconcile()
+    _reconcile()
+
+    ticket_url, comment_url = _result_urls(number)
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert f"Ticket published: {ticket_url}." in body
+    assert body.count(line.format(ticket=ticket_url)) == 1
+    assert body.count("Implementation") == 1
+    assert comment_url in body
+    assert FINAL_MARKER in body
+    assert _curie_labels(sink, number) == {TRIAGED}
+
+
+def test_a_delegated_ticket_renders_its_handoff_once_the_outcome_is_recorded(
+    admitted: Any,  # noqa: F811
+) -> None:
+    """While the handoff is unsettled the ticket shows as published; the recorded
+    outcome then edits the same comment, and is the only thing that adds the line."""
+
+    client, github, sink = admitted
+    number = 58803
+    request_id, epoch = _triage_running(client, github, sink, number)
+    _settle(request_id, epoch, number, kind="ticket")
+    _record_handoff(request_id, outcome=None, reason=None)
+    _end(request_id, "completed", "completed")
+    _reconcile()
+    ticket_url, _comment_url = _result_urls(number)
+    (pending,) = _marked(sink, request_id)
+    assert f"Ticket published: {ticket_url}." in pending["body"]
+    assert "Implementation" not in pending["body"]
+
+    _settle_handoff(request_id, outcome="refused", reason="output_changed")
+    _reconcile()
+    _reconcile()
+
+    (comment,) = _marked(sink, request_id)
+    assert comment["id"] == pending["id"]
+    assert comment["body"].count("Implementation not started: output_changed.") == 1
+    assert "Implementation admitted" not in comment["body"]

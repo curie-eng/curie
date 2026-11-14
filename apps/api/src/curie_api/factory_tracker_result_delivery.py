@@ -4,7 +4,8 @@
 (`curie_api.factory_tracker_result_runtime`), the runner result tool's route
 calls `submit_result` and one inline `deliver`, the lifecycle seals platform
 findings on exhaustion (`seal_platform_findings`), and the WorkItem reconciler
-schedules `deliver` and `expire_overdue`; #5588 reads receipts.
+schedules `deliver` and `expire_overdue`; a delivered ticket's receipt transaction
+also writes the triage handoff's internal selection event (#5588).
 
 Origins (``factory_tracker_result_deliveries.origin``). ``submitted``: a
 proposal the run submitted. ``platform``: the ``budget_exhausted`` findings the
@@ -1319,6 +1320,19 @@ async def _settle_delivered(
                 FactoryTrackerResultArtifact.delivery_id == claim.delivery_id
             )
         )
+        if linked is not None:
+            # The internal selection event of a delegated triage (#5588), with
+            # its receipt. Imported here: the handoff module imports the runtime.
+            from curie_api.factory_triage_handoff import open_handoff
+
+            await open_handoff(
+                session,
+                delivery_id=claim.delivery_id,
+                execution_request_id=claim.execution_request_id,
+                output=linked.issue,
+                output_url=linked.url,
+                output_body_sha256=linked.body_sha256,
+            )
         # The status comment renders the delivered ending on its next sync.
         await on_tracker_result_settled(session, claim.execution_request_id)
         await session.commit()

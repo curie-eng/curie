@@ -457,3 +457,42 @@ owed. The API records refusals in `factory_intake_notices` independently of
 work items and retries delivery with capped backoff beside status-comment
 synchronization. A growing age means issue-visible answers are delayed;
 check GitHub availability and the factory App's comment permissions.
+
+
+## Factory polling cadence
+
+Polling intake has its own start-to-start timer on the GitHub tracker's
+`poll_interval_s`, 45 seconds by default. The label pass reads all repositories
+and delivers its new status comments and refusal notices before review, comment
+and cancellation traffic. That later traffic stops at the next label deadline
+and rotates its first repository. The five second delivery loops retry owed
+answers and recover existing comments by their markers.
+
+A trigger label that remains on an open issue is answered within 60 seconds of
+its event or intake recovery, whichever is later, within this polling envelope:
+
+| Bound | Limit |
+| --- | --- |
+| Served repositories | 20 |
+| Bound trigger labels per repository | 4 |
+| Open labelled issues per repository | 50, one listing page per label |
+| Unanswered events per pass | 10, in any distribution |
+| Events per labelled issue | 99, one response |
+| Comments per labelled issue | 200, three responses |
+| Labels per labelled issue | 99, one response |
+| Pull requests of any state per repository | 2,500, 25 pages of 100 |
+| Tracker response time | 200 milliseconds |
+| Tracker and factory credential | Available |
+
+The cold-cache label pass, including answer delivery, has a 15 second budget.
+Repositories and issues within a repository each have a concurrency limit of ten.
+Publication discovery shares one complete repository listing within each pass.
+Webhook intake keeps its separate reconciler interval and has no polling promise.
+A label removed before the next pass may never be observed.
+
+`curie.factory.intake.label_pass.age_seconds`, labelled by `repository`, records
+the age since that repository's last clean label pass at each completion. A
+retried row leaves the reference time unchanged. Outside the envelope, the age
+and `curie.factory.intake.notice.oldest_owed_age_seconds` show delayed intake
+and delayed refusal delivery respectively. Repository labels are bounded to
+20 values, with additional repositories sharing `other`.
