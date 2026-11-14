@@ -1301,7 +1301,9 @@ def build_runner(
                 bundle_hooks,
                 _merge_pre_tool_use_hooks(
                     build_factory_foreground_hooks() if progress_url and progress_token else None,
-                    build_subagent_guard(requester_gate),
+                    # Only a boot that can bind an execution can apply a
+                    # requester section (ADR 0278); any other boot is unchanged.
+                    build_subagent_guard(requester_gate) if issue_read is not None else None,
                     None,
                 ),
             ),
