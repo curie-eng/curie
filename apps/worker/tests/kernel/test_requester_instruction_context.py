@@ -19,7 +19,8 @@ nothing inside the changed components faked:
    selection (SQL, as an earlier admission wrote it).
 2. The runner's execution binding comes from the real completion contract route,
    read with the real issue read capability the worker mints, through the
-   runner's own contract client.
+   runner's own contract client. As in a cluster, the runner reads it when it
+   boots, after the acquire and before the worker starts the request.
 3. The worker's ``requester_context.deliver`` reads the envelope over the real
    ``WorkItemDispatchClient``, posts it through the real ``RunnerClient`` to the
    real runner app (``curie_runner.server.create_app``) holding a real
@@ -147,6 +148,7 @@ class _Stage:
         self.address = f"C0EXAMPLE{uuid.uuid4().hex[:6].upper()}"
         self.wire = f"{uuid.uuid4().int % 10**10}.000100"
         self.sessions: list[FakeModelSession] = []
+        self.bindings: dict[uuid.UUID, Any] = {}
         self.servers: list[TestServer] = []
 
     async def sql(self, statement: str, **params: Any) -> list[dict[str, Any]]:
@@ -219,6 +221,9 @@ class _Stage:
             context=None,
         )
 
+        # The runner boots and reads its contract before the worker starts it.
+        self.bindings[request_id] = await self.read_binding(request_id)
+
         async def _stop(*_args: Any) -> None:
             return None
 
@@ -266,9 +271,14 @@ class _Stage:
             )
 
     async def binding(self, run: WorkItemRun) -> Any:
-        """The binding the runner reads from its real completion contract."""
+        """The binding the runner read from its real completion contract at boot."""
 
-        _issue, capability = await self.dispatch.issue_read_context(run.request_id)
+        return self.bindings[run.request_id]
+
+    async def read_binding(self, request_id: uuid.UUID) -> Any:
+        """The binding the runner reads from its real completion contract now."""
+
+        _issue, capability = await self.dispatch.issue_read_context(request_id)
         urls = sibling_urls(f"{self.services.api_url}/work-items/issue-read")
         contract = await fetch_completion_contract(urls.completion_contract, capability)
         assert contract.execution is not None
@@ -485,6 +495,22 @@ def test_a_runner_without_the_route_never_acknowledges(services: _Services) -> N
             await _deliver(stage, run, client, base_url)
 
         await _assert_failed(stage, run, refused.value, "runner_unacknowledged")
+
+    _scenario(services, body)
+
+
+def test_a_runner_that_boots_after_the_start_binds_the_same_execution(
+    services: _Services,
+) -> None:
+    async def body(stage: _Stage, client: RunnerClient) -> None:
+        run = await stage.start(selected=True)
+        late = await stage.read_binding(run.request_id)
+        assert late == await stage.binding(run)
+        gate = RequesterContextGate()
+        gate.bind(late)
+        base_url = await stage.runner(gate)
+
+        assert await _deliver(stage, run, client, base_url) == "applied"
 
     _scenario(services, body)
 

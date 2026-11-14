@@ -80,16 +80,28 @@ async def _tenant_of(session: AsyncSession, item: WorkItem) -> uuid.UUID | None:
 async def execution_binding(
     session: AsyncSession, item: WorkItem, request: ExecutionRequest
 ) -> ExecutionBindingOut | None:
-    """The binding a running request's runner checks its envelope against."""
+    """The binding the request's runner checks its envelope against.
+
+    A runner reads it when it boots, which is after the worker acquired the
+    request and before the worker starts it: the start raises the fence by one
+    (``workitem_dispatch.start``), so an acquired request is bound to the fence
+    its start assigns. A runner that boots later reads the running fence.
+    """
 
     tenant = await _tenant_of(session, item)
-    if tenant is None or request.status != "running" or request.runtime_epoch < 1:
+    if tenant is None:
+        return None
+    if request.status == "running" and request.runtime_epoch >= 1:
+        fence = request.runtime_epoch
+    elif request.status == "waiting" and request.acquire_owner is not None:
+        fence = request.runtime_epoch + 1
+    else:
         return None
     return ExecutionBindingOut(
         tenant_id=tenant,
         work_item_id=item.id,
         execution_request_id=request.id,
-        execution_fence=request.runtime_epoch,
+        execution_fence=fence,
     )
 
 
