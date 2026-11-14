@@ -69,7 +69,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -80,7 +80,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -493,7 +493,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -504,7 +504,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -1109,7 +1109,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -1120,7 +1120,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.16.4
 
@@ -1191,7 +1191,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Back off before retrying Install Helm
@@ -1201,7 +1201,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Ensure kind-registry exists
@@ -1270,7 +1270,7 @@ jobs:
       - name: Install Helm
         id: install_helm
         continue-on-error: true
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Back off before retrying Install Helm
@@ -1280,7 +1280,7 @@ jobs:
           sleep 15
       - name: Install Helm (retry)
         if: steps.install_helm.outcome == 'failure'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.17.3
       - name: Concurrent automatic threads stay isolated
