@@ -220,6 +220,16 @@ as a whole; remembered only):
   No approval creation or proxy wiring is implied by this pure contract.
   [vector: `tests/vectors/approver-ticket.json`]
   [vector: `tests/vectors/action-canonical-arguments.json`]
+31. runner vs API progress round caps (#5203) -- the runner's `report_progress`
+  tool (`runner/src/curie_runner/progress.py::build_progress_tool`) and the API's
+  `ProgressReport` validation (`apps/api/src/curie_api/factory_progress.py::Declaration.round_cap_for`)
+  ship in different images and bound a reported round independently, so when two
+  loops name one phase both must accept 1 up to the largest of their caps, in
+  either declaration order. Read by `runner/tests/test_progress.py`,
+  `apps/api/tests/test_factory_progress.py` and
+  `apps/api/tests/test_progress_round_caps.py`, which also posts the runner's
+  accepted rounds to the API model.
+  [vector: `tests/vectors/progress-round-caps.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR
