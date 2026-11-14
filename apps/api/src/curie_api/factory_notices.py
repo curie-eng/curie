@@ -51,6 +51,7 @@ from .factory_reply_target import stored_reply_target
 from .factory_triage_status import (
     delivered_triage,
     is_tracker_result,
+    recorded_handoff,
     triage_delivered_sql,
     triage_label,
     triage_label_sql,
@@ -1247,8 +1248,8 @@ async def _render(
     paused_for_upgrade: bool = False,
     handoff: HandoffOutcome | None = None,
 ) -> str:
-    """The status comment body. ``handoff`` is the implementation handoff of a
-    delivered ticket, which #5588 records; until then only tests pass one."""
+    """The status comment body. ``handoff`` overrides the implementation
+    handoff the triage handoff recorded for a delivered ticket (#5588)."""
 
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
@@ -1480,6 +1481,8 @@ async def _terminal_triage_text(
     delivered = await delivered_triage(session, request.id)
     if delivered is None:
         return None
+    if handoff is None:
+        handoff = await recorded_handoff(session, request.id)
     try:
         text = status_comment_text(delivered, handoff)
     except ValueError:
