@@ -102,6 +102,10 @@ class _Proxy:
         self.drops: dict[Target, int | None] = {}
         self.changed = asyncio.Condition()
         self.gate: _Gate | None = None
+        # Hold the next accepted connection's first reply until its client closes it.
+        self.hold_next = False
+        self.held: list[Counter[Target]] = []
+        self.released = asyncio.Event()
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
@@ -110,7 +114,8 @@ class _Proxy:
     def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.serial += 1
         self.writers.add(writer)
-        task = asyncio.create_task(self._connection(reader, writer, self.serial))
+        held, self.hold_next = self.hold_next, False
+        task = asyncio.create_task(self._connection(reader, writer, self.serial, held))
         self.tasks.add(task)
         task.add_done_callback(self._completed)
 
@@ -120,10 +125,15 @@ class _Proxy:
             self.errors.append(error)
 
     async def _connection(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, identity: int
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        identity: int,
+        held: bool = False,
     ) -> None:
         upstream: asyncio.StreamWriter | None = None
         pumps: list[asyncio.Task[None]] = []
+        sent: Counter[Target] = Counter()
         self.writers.add(writer)
         try:
             upstream_reader, upstream = await asyncio.open_connection(
@@ -140,6 +150,7 @@ class _Proxy:
                     upstream.write(raw)
                     await upstream.drain()
                     self.forwarded[target] += 1
+                    sent[target] += 1
                     commands.put_nowait((target, authenticates))
 
             async def receive() -> None:
@@ -156,6 +167,9 @@ class _Proxy:
                         await writer.drain()
                         continue
                     target, authenticates = await commands.get()
+                    if held:
+                        # Only the client closing this socket ends the hold.
+                        await self.released.wait()
                     if tag in (b"-", b"!"):
                         self.rejected[target] += 1
                         self.rejected_auth += int(authenticates)
@@ -204,12 +218,22 @@ class _Proxy:
                         pass
                     finally:
                         self.writers.discard(current)
+            if held:
+                async with self.changed:
+                    self.held.append(sent)
+                    self.changed.notify_all()
 
     async def wait_for_discard(self, target: Target, count: int) -> None:
         async with asyncio.timeout(10), self.changed:
             await self.changed.wait_for(lambda: self.discarded[target] >= count)
 
+    async def wait_for_held(self) -> Counter[Target]:
+        async with asyncio.timeout(10), self.changed:
+            await self.changed.wait_for(lambda: bool(self.held))
+        return self.held[0]
+
     async def close(self) -> None:
+        self.released.set()
         if self.gate is not None:
             self.gate.released.set()
         if self.server is not None:
@@ -660,12 +684,23 @@ def test_credential_read_retry_is_bounded_and_excludes_auth_errors(
         credentials = [recovery.credential(), recovery.credential()]
         for credential in credentials:
             recovery.proxy.drops[credential.target] = None
+        # A failed attempt invalidates every pooled socket (curie_internal.valkey),
+        # including one a concurrent read is still opening. Force that interleaving:
+        # hold the first new socket's handshake until the other read's failure
+        # closes it, so one read spends an attempt that never sent EXISTS.
+        recovery.proxy.hold_next = True
         responses = await asyncio.gather(*(recovery.read(c) for c in credentials))
-        for credential, response in zip(credentials, responses, strict=True):
+        concurrent = [credential.target for credential in credentials]
+        for response in responses:
             assert response.status_code == 503, response.text
             assert response.json() == {"detail": UNAVAILABLE}
-            assert recovery.proxy.forwarded[credential.target] == 4
-            assert recovery.proxy.discarded[credential.target] == 4
+        held = await recovery.proxy.wait_for_held()
+        assert len(recovery.proxy.held) == 1
+        assert not any(held[read] for read in concurrent)
+        # The budget is four attempts per read, not four commands on the wire.
+        for read in concurrent:
+            assert recovery.proxy.discarded[read] <= recovery.proxy.forwarded[read] <= 4
+        assert sum(recovery.proxy.forwarded[read] for read in concurrent) <= 7
         assert len(_warnings(caplog)) == 2
         _safe_logs(caplog, recovery)
 
