@@ -1,7 +1,7 @@
 """Record triage delegations and their single-use implementation handoffs (#5588).
 
 Revision ID: 0171
-Revises: 0168
+Revises: 0170
 """
 
 from collections.abc import Sequence
@@ -11,7 +11,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0171"
-down_revision: str = "0168"
+down_revision: str = "0170"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

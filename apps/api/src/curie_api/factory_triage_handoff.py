@@ -31,9 +31,9 @@ written (`github_factory.check_delegated`):
 3. The output issue is open and its body digest equals the delivered one:
    ``output_changed``.
 4. The labeller, by immutable id, may still start work (`Tracker.may_start`):
-   ``authority_revoked``. A read that fails is retried until the handoff
-   deadline (the receipt time plus the tracker result delivery deadline) and
-   then refused ``permission_unreadable``; it is never approval.
+   ``authority_revoked``. A read that fails is retried until the result
+   delivery deadline (set when the result was submitted) and then refused
+   ``permission_unreadable``; it is never approval.
 5. The frozen target binding still exists with the same identity and
    generation, still serves the label, and has the implementation contract:
    ``target_unavailable``.
@@ -258,33 +258,66 @@ async def record_delegation(
 async def open_handoff(
     session: AsyncSession,
     *,
+    delivery_id: uuid.UUID,
     execution_request_id: uuid.UUID,
     output: TrackerIssueRef,
     output_url: str,
     output_body_sha256: str,
-    settings: Settings,
 ) -> uuid.UUID | None:
     """Write the internal selection event of a verified ticket receipt, in its transaction.
 
     None when the request holds no unconsumed delegation (a source admitted
     before #5588, or an implementation request). Replaying it writes nothing.
+    The handoff keeps the delivery's own deadline: a permission read is
+    retried until the result delivery deadline, never a fresh interval.
+
+    A delegation stored while its selection readmitted a WorkItem whose
+    earlier run was still stopping has no request yet, so no fingerprint and
+    the admission-time policy digest. The request exists now: the delegation
+    is finalized against it here, in the receipt transaction.
     """
 
-    delegation_id = await session.scalar(
-        select(FactoryTriageDelegation.id).where(
+    from .factory_tracker_result_delivery import source_fingerprint
+    from .models import FactoryTrackerResultDelivery
+
+    delegation = await session.scalar(
+        select(FactoryTriageDelegation)
+        .where(
             FactoryTriageDelegation.source_execution_request_id == execution_request_id,
             FactoryTriageDelegation.consumed_at.is_(None),
         )
+        .with_for_update()
     )
-    if delegation_id is None:
+    if delegation is None:
         return None
+    deadline_at = await session.scalar(
+        select(FactoryTrackerResultDelivery.deadline_at).where(
+            FactoryTrackerResultDelivery.id == delivery_id
+        )
+    )
+    if deadline_at is None:
+        return None
+    if delegation.source_fingerprint is None:
+        work_item = await session.get(WorkItem, delegation.work_item_id)
+        request = await session.get(ExecutionRequest, execution_request_id)
+        if work_item is not None and request is not None:
+            await session.execute(
+                update(FactoryTriageDelegation)
+                .where(FactoryTriageDelegation.id == delegation.id)
+                .values(
+                    source_fingerprint=source_fingerprint(work_item, request),
+                    result_policy_digest=(
+                        request.result_policy_digest or delegation.result_policy_digest
+                    ),
+                )
+            )
     handoff_id = selection_event_id(execution_request_id, output)
     now = func.clock_timestamp()
     await session.execute(
         insert(FactoryTriageHandoff)
         .values(
             id=handoff_id,
-            delegation_id=delegation_id,
+            delegation_id=delegation.id,
             source_execution_request_id=execution_request_id,
             output_tracker_kind=output.kind,
             output_tracker_host=output.host,
@@ -293,8 +326,7 @@ async def open_handoff(
             output_url=output_url,
             output_body_sha256=output_body_sha256,
             next_attempt_at=now,
-            deadline_at=now
-            + timedelta(seconds=settings.factory_tracker_result_delivery_deadline_seconds),
+            deadline_at=deadline_at,
         )
         .on_conflict_do_nothing()
     )
@@ -586,6 +618,11 @@ async def _admit(
     async with sessionmaker() as session:
         try:
             selected = await github_factory.admit_delegated(session, settings, client, output)
+            # Cancellation locks the source WorkItem; holding it to commit
+            # serializes the re-check below with a cancel in flight.
+            await session.execute(
+                select(WorkItem.id).where(WorkItem.id == loaded.work_item.id).with_for_update()
+            )
             current = await _load(session, loaded.handoff.id)
             if current is None or _source_cancelled(current):
                 raise HandoffRefused(SOURCE_CANCELLED)
@@ -669,6 +706,11 @@ async def hand_off(
             try:
                 await _remove_label(settings, client, loaded, label)
             except HandoffDeferred as deferred:
+                # The removal is owed until the deadline; past it the refusal
+                # stands with its own reason. A label left behind starts
+                # nothing: the intake reads it as the factory's own label.
+                if now is not None and now >= loaded.handoff.deadline_at:
+                    return await _refuse(sessionmaker, loaded, owner, refused.code)
                 await _defer(
                     sessionmaker,
                     handoff_id,

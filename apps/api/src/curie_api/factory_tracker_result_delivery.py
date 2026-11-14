@@ -1327,11 +1327,11 @@ async def _settle_delivered(
 
             await open_handoff(
                 session,
+                delivery_id=claim.delivery_id,
                 execution_request_id=claim.execution_request_id,
                 output=linked.issue,
                 output_url=linked.url,
                 output_body_sha256=linked.body_sha256,
-                settings=settings,
             )
         # The status comment renders the delivered ending on its next sync.
         await on_tracker_result_settled(session, claim.execution_request_id)

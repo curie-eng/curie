@@ -112,7 +112,8 @@ def graph_payload() -> dict[str, Any]:
         ("0167", False),
         ("0168", False),
         ("0169", False),
-        ("0170", True),
+        ("0170", False),
+        ("0171", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -135,7 +136,7 @@ def test_installed_candidate_decision_preserves_unknown_revision_policy(
     )
 
 
-def test_candidate_window_raises_the_floor_to_0170() -> None:
+def test_candidate_window_raises_the_floor_to_0171() -> None:
     """@spec CONNECTOR-REQUESTER-1: agent ORM reads require the 0151 requester columns.
 
     Approval ORM reads require the 0154 reminder cursor, and dynamic approval
@@ -150,11 +151,12 @@ def test_candidate_window_raises_the_floor_to_0170() -> None:
     require 0166, which stays below this floor. Execution request reads select
     the 0167 completion contract columns. Intake notice storage requires 0168,
     which stays below this floor. Requester selection columns require 0169,
-    which stays below this floor. Refusal posts require 0170.
+    which stays below this floor. Refusal posts require 0170, which stays
+    below this floor. Triage handoff storage requires 0171.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0170"
-    assert window.schema_head == "0170"
+    assert window.schema_min == "0171"
+    assert window.schema_head == "0171"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])
