@@ -55,16 +55,6 @@ async def status(_request: web.Request) -> web.Response:
     )
 
 
-async def flood(request: web.Request) -> web.StreamResponse:
-    """Stream without end and without a turn: only retirement may cut it."""
-
-    response = web.StreamResponse()
-    await response.prepare(request)
-    chunk = b"x" * 65536
-    while True:
-        await response.write(chunk)
-
-
 async def event(request: web.Request) -> web.StreamResponse:
     body = await request.json()
     lines = int(body.get("lines", 3))
@@ -123,7 +113,6 @@ def main() -> None:
             web.get("/v1/status", status),
             web.post("/v1/event", event),
             web.post("/v1/release", release),
-            web.get("/v1/flood", flood),
             web.post("/v1/crash", crash),
         ]
     )
