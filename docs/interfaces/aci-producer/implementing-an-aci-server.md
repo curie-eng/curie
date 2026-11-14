@@ -17,11 +17,12 @@ truth (the committed JSON Schema and generated Rust/TS are derived from them).
 
 ## What "an ACI server" is
 
-An ACI server is an **HTTP process** inside the sandbox that exposes 11 POST
-routes and streams NDJSON back: seven every server serves, plus four optional
+An ACI server is an **HTTP process** inside the sandbox that exposes 12 POST
+routes and streams NDJSON back: seven every server serves, plus five optional
 runner-private routes described below, the executor route `POST /v1/execute`,
-the checkpoint route `POST /v1/checkpoint`, and the UI evidence routes
-`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image`. Those seven plus the bearer-gated
+the checkpoint route `POST /v1/checkpoint`, the UI evidence routes
+`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image`, and the
+requester context route `POST /v1/requester-context`. Those seven plus the bearer-gated
 `GET /v1/status` are its eight required authenticated control routes:
 
 | Route | Purpose |
