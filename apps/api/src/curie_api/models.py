@@ -2274,6 +2274,43 @@ class FactoryIntakeNotice(Base):
     last_error: Mapped[str | None] = mapped_column(Text, default=None)
 
 
+class FactorySlackRefusalPost(Base):
+    """One Slack channel post owed for one refused trigger label (#5589).
+
+    Keyed on the intake notice, because a refusal has no WorkItem. The lease,
+    attempt and acknowledgement columns match ``factory_slack_posts``.
+    """
+
+    __tablename__ = "factory_slack_refusal_posts"
+    __table_args__ = (
+        UniqueConstraint("notice_id", name="factory_slack_refusal_posts_notice_key"),
+        Index(
+            "ix_factory_slack_refusal_posts_owed",
+            "created_at",
+            "id",
+            postgresql_where=text("posted_at IS NULL AND failed_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    notice_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(f"{SCHEMA}.factory_intake_notices.id", ondelete="CASCADE"),
+    )
+    channel_identity: Mapped[str] = mapped_column(Text)
+    channel: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_ref: Mapped[str | None] = mapped_column(Text, default=None)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ExecutionRequestModelUsage(Base):
     """Token usage of one model in one turn of a request, with its estimate (#3223).
 

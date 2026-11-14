@@ -1507,6 +1507,14 @@ class WorkerConfig(BaseSettings):
     factory_slack_interval_s: float = Field(
         default=2.0, gt=0, validation_alias="CURIE_FACTORY_SLACK_INTERVAL_S"
     )
+    # Off (the default), the progress lane posts taken, refused, needs a person
+    # and PR open only. On, it also posts one line per phase report and a
+    # Run completed or Run cancelled line. Failed and expired runs still post
+    # needs a person either way. Turning it on later materializes what live
+    # threads owe, as a destination enabled mid-run does.
+    factory_slack_phase_lines: bool = Field(
+        default=False, validation_alias="CURIE_FACTORY_SLACK_PHASE_LINES"
+    )
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.
     cron_tick_interval_s: float = Field(

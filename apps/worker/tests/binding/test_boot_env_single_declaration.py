@@ -148,6 +148,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # run._build_factory_slack_progress. Never injected into a sandbox.
         "CURIE_FACTORY_SLACK_PROGRESS_ENABLED",
         "CURIE_FACTORY_SLACK_INTERVAL_S",
+        "CURIE_FACTORY_SLACK_PHASE_LINES",
         # Issue 5581: WorkerConfig reads the minimum at worker startup, and
         # factory_credit reads the OpenRouter credit API override from the
         # worker process. Neither name is injected into a sandbox.
