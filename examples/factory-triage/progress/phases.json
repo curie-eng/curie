@@ -1,0 +1,13 @@
+{
+  "phases": [
+    {"id": "read_report", "label": "Read report"},
+    {"id": "investigate", "label": "Investigate"},
+    {"id": "reproduce", "label": "Run reproduction"},
+    {"id": "submit_result", "label": "Submit result"}
+  ],
+  "loops": [],
+  "stages": [
+    {"id": "investigate", "label": "Investigate", "phases": ["read_report", "investigate", "reproduce"]},
+    {"id": "result", "label": "Result", "phases": ["submit_result"]}
+  ]
+}

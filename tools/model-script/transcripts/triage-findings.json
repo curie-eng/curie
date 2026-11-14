@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "exchanges": [
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 0,
+      "message": {
+        "id": "msg_scripted_findings_0",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Checking the reported Celsius to Fahrenheit result at the checked-out revision."
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted_findings_0",
+            "name": "Bash",
+            "input": {
+              "command": "git rev-parse HEAD && python3 -m unitconv 100 c f",
+              "description": "Check the reported conversion at the checked-out revision"
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 1,
+      "message": {
+        "id": "msg_scripted_findings_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "The conversion returns 212, so the report does not reproduce."
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_scripted_findings_1",
+            "name": "mcp__curie__submit_tracker_result",
+            "input": {
+              "kind": "findings",
+              "reason": "not_reproduced",
+              "tried": "Ran `git rev-parse HEAD && python3 -m unitconv 100 c f`; the conversion printed 212.",
+              "missing": "An input or command that shows a wrong Celsius to Fahrenheit result.",
+              "revision": "{{observed_revision}}"
+            }
+          }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0
+        }
+      }
+    },
+    {
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
+      "ordinal": 2,
+      "message": {
+        "id": "msg_scripted_findings_2",
+        "type": "message",
+        "role": "assistant",
+        "model": "scripted",
+        "content": [
+          {
+            "type": "text",
+            "text": "Submitted findings: not reproduced."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0
+        }
+      }
+    }
+  ]
+}

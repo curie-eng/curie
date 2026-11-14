@@ -2086,3 +2086,128 @@ def test_label_actor_reader_accepts_direct_or_other_app(via: Any) -> None:
         SENDER_ID,
         SENDER,
     )
+
+
+def test_delegated_output_own_label_draws_no_notice_at_poll_intake(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None, valkey: object
+) -> None:
+    """#5588 AC5: the factory's own label on its delegated output is not refused.
+
+    Polling intake observes the App's label event on three outputs: one whose
+    handoff died after adding the label and before admission completed, one
+    already admitted, and one refused after the label was added (its removal
+    failed, so the label stayed). None gets an intake notice, so no Slack
+    refusal is owed. The admitted output's event is stamped after its request
+    was created (GitHub's clock ahead of the database's), so the duplicate
+    label rule does not silence it and only the delegated-output lookup does.
+    Controls: the installation's label on an unrelated issue and a different
+    App's label on a delegated output each get one ``actor_bot`` notice, and
+    with the association emptied all three outputs get one.
+    """
+
+    from test_factory_triage_handoff import (
+        DEATHS,
+        IMPL,
+        OTHER_APP_ID,
+        _Death,
+        _die_once,
+        make_due,
+        published,
+        run_hand_off,
+        triage_env,
+        work_items,
+    )
+
+    def notices(number: int) -> list[str]:
+        return [
+            row["reason"]
+            for row in _rows(
+                "SELECT reason FROM curie.factory_intake_notices "
+                "WHERE tracker_issue_id = :n ORDER BY id",
+                {"n": str(number)},
+            )
+        ]
+
+    def handoff(handoff_id: uuid.UUID | None) -> dict[str, Any]:
+        (row,) = _rows(
+            "SELECT * FROM curie.factory_triage_handoffs WHERE id = :id", {"id": handoff_id}
+        )
+        return row
+
+    def poll(github: Any) -> None:
+        github.listing_generation += 1
+        from test_factory_intake_notices import _pass
+
+        _pass(github, "poll")
+
+    with triage_env(monkeypatch, tmp_path) as env:
+        github = env.github
+        # Before admission completes: the label is on, the process died.
+        before = published(env)
+        module, name, after = DEATHS["after_label_commit"]
+        _die_once(monkeypatch, module, name, after=after)
+        with pytest.raises(_Death):
+            run_hand_off(before.handoff_id)
+        # After admission completed.
+        admitted = published(env)
+        github.label_clock_offset = timedelta(minutes=1)
+        assert run_hand_off(admitted.handoff_id) == "admitted"
+        github.label_clock_offset = timedelta(0)
+        # Refused once the label had been added; its removal failed.
+        refused = published(env)
+
+        def unreadable(number: int, label: str) -> None:
+            github.permission_unreadable = True
+
+        github.on_label_added = unreadable
+        assert run_hand_off(refused.handoff_id) is None
+        github.on_label_added = None
+        github.label_delete_status = 502
+        _exec_sql(
+            "UPDATE curie.factory_triage_handoffs SET deadline_at = clock_timestamp() "
+            "- interval '1 second' WHERE id = :id",
+            {"id": refused.handoff_id},
+        )
+        make_due(refused.handoff_id)
+        assert run_hand_off(refused.handoff_id) == "refused"
+        github.label_delete_status = None
+        github.permission_unreadable = False
+        outputs = [before.output, admitted.output, refused.output]
+        assert all(
+            number is not None and IMPL in github.outputs[number].labels for number in outputs
+        )
+        assert handoff(before.handoff_id)["outcome"] is None
+        assert handoff(admitted.handoff_id)["outcome"] == "admitted"
+        assert handoff(refused.handoff_id)["reason"] == "permission_unreadable"
+        # Control: the installation's own label on an unrelated issue.
+        unrelated = github.own_issue(9700, "Unrelated", "Not a delegated output.", set())
+        github.app_label(unrelated.number, IMPL)
+
+        poll(github)
+
+        assert [notices(number) for number in outputs] == [[], [], []]
+        assert notices(unrelated.number) == ["actor_bot"]
+        assert [len(work_items(number)) for number in outputs] == [0, 1, 0]
+        # Control: without the association every one of them is answered.
+        _exec_sql("UPDATE curie.factory_triage_handoffs SET associated_at = NULL")
+        poll(github)
+        assert [notices(number) for number in outputs] == [["actor_bot"]] * 3
+
+        # Control: a different App's label on a delegated output is answered.
+        _exec_sql("UPDATE curie.factory_triage_handoffs SET associated_at = labelled_at")
+        assert refused.output is not None
+        github.app_label(refused.output, IMPL, app_id=OTHER_APP_ID)
+        poll(github)
+        assert notices(refused.output) == ["actor_bot", "actor_bot"]
+        assert [notices(number) for number in outputs[:2]] == [["actor_bot"]] * 2
+        assert notices(unrelated.number) == ["actor_bot"]
+        # The interrupted handoff still completes into one run.
+        make_due(before.handoff_id)
+        assert run_hand_off(before.handoff_id) == "admitted"
+        assert [len(work_items(number)) for number in outputs] == [1, 1, 0]
+
+
+def _exec_sql(statement: str, params: dict[str, Any] | None = None) -> None:
+    from test_factory_intake_notices import _sql
+
+    _sql(statement, params)

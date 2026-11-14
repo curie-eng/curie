@@ -2217,6 +2217,131 @@ class FactoryIntakeNotice(Base):
     last_error: Mapped[str | None] = mapped_column(Text, default=None)
 
 
+class FactoryTriageDelegation(Base):
+    """One triage selection's single-use authority to start one implementation run (#5588).
+
+    Stored in the transaction that admits a tracker-result request whose policy
+    allows a ticket. The actor is the verified human who applied the triage
+    label, by immutable id. The target is the one implementation binding the
+    declared label resolved to at admission, frozen; all three target columns
+    are null when it did not resolve to exactly one.
+    """
+
+    __tablename__ = "factory_triage_delegations"
+    __table_args__ = (
+        CheckConstraint(
+            "(target_binding_id IS NULL) = (target_agent_id IS NULL) "
+            "AND (target_binding_id IS NULL) = (target_binding_generation IS NULL)",
+            name="factory_triage_delegations_target_ck",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    source_execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), unique=True
+    )
+    actor_id: Mapped[str] = mapped_column(Text)
+    actor_login: Mapped[str] = mapped_column(Text)
+    selection_event: Mapped[str] = mapped_column(Text)
+    tracker_kind: Mapped[str] = mapped_column(Text)
+    tracker_host: Mapped[str] = mapped_column(Text)
+    tracker_scope_id: Mapped[str] = mapped_column(Text)
+    tracker_issue_id: Mapped[str] = mapped_column(Text)
+    repository_id: Mapped[str] = mapped_column(Text)
+    result_policy_digest: Mapped[str] = mapped_column(Text)
+    target_label: Mapped[str] = mapped_column(Text)
+    installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    source_fingerprint: Mapped[str | None] = mapped_column(Text, default=None)
+    target_binding_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    target_binding_generation: Mapped[int | None] = mapped_column(default=None)
+    target_agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+FACTORY_TRIAGE_HANDOFF_OUTCOMES = ("admitted", "refused")
+
+
+class FactoryTriageHandoff(Base):
+    """The internal selection event of one delivered triage ticket and its outcome (#5588).
+
+    Written with the ticket's receipt when a delegation exists. ``id`` is
+    derived from the source request and the output issue identity.
+    ``associated_at`` is the output association, committed before the
+    implementation label is added; the intake reads it to stay silent on the
+    factory's own label. ``outcome`` is ``admitted`` with
+    ``implementation_request_id`` or ``refused`` with ``reason``.
+    """
+
+    __tablename__ = "factory_triage_handoffs"
+    __table_args__ = (
+        UniqueConstraint(
+            "output_tracker_host",
+            "output_scope_id",
+            "output_issue_id",
+            name="factory_triage_handoffs_output_key",
+        ),
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('admitted', 'refused')",
+            name="factory_triage_handoffs_outcome_ck",
+        ),
+        CheckConstraint(
+            "(outcome = 'admitted') = (implementation_request_id IS NOT NULL) "
+            "AND (outcome = 'refused') = (reason IS NOT NULL) "
+            "AND (outcome IS NULL) = (settled_at IS NULL)",
+            name="factory_triage_handoffs_settled_ck",
+        ),
+        Index(
+            "ix_factory_triage_handoffs_owed",
+            "next_attempt_at",
+            postgresql_where=text("outcome IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    delegation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.factory_triage_delegations.id", ondelete="CASCADE"),
+        unique=True,
+    )
+    source_execution_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), unique=True
+    )
+    output_tracker_kind: Mapped[str] = mapped_column(Text)
+    output_tracker_host: Mapped[str] = mapped_column(Text)
+    output_scope_id: Mapped[str] = mapped_column(Text)
+    output_issue_id: Mapped[str] = mapped_column(Text)
+    output_url: Mapped[str] = mapped_column(Text)
+    output_body_sha256: Mapped[str] = mapped_column(Text)
+    implementation_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    outcome: Mapped[str | None] = mapped_column(Text, default=None)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    associated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    labelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    @property
+    def output_issue(self) -> TrackerIssueRef:
+        return TrackerIssueRef(
+            self.output_tracker_kind,
+            self.output_tracker_host,
+            self.output_scope_id,
+            self.output_issue_id,
+        )
+
+
 class ExecutionRequestModelUsage(Base):
     """Token usage of one model in one turn of a request, with its estimate (#3223).
 

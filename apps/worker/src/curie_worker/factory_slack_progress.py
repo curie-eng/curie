@@ -46,7 +46,8 @@ existing records, with no lifecycle hook:
 3. one ``pull_request`` post per lineage pull request;
 4. one ``terminal`` post per ended request at or after ``first_sequence``,
    except a tracker-result request whose result is owed or delivered, which
-   gets one ``triage`` post once delivered instead (``factory_slack_triage``).
+   gets one ``triage`` post once delivered instead (``factory_slack_triage``);
+   a delegated ticket's post waits for its handoff outcome (#5588).
 
 Delivery is ordered per WorkItem by (sequence, rank, ordinal): the root first,
 every other post only once the root has a ts, and never a post before an
@@ -187,6 +188,7 @@ class PostgresFactorySlackStore:
         self._posts = f'"{schema}".factory_slack_posts'
         self._deliveries = f'"{schema}".factory_tracker_result_deliveries'
         self._receipts = f'"{schema}".factory_tracker_result_receipts'
+        self._handoffs = f'"{schema}".factory_triage_handoffs'
         self._lease_owner = lease_owner
         self._lease_seconds = lease_seconds
         self._backoff_base = backoff_base_seconds
@@ -319,6 +321,10 @@ class PostgresFactorySlackStore:
             """
         )
         # One triage post per delivered result. The kind literal matches TRIAGE_KIND.
+        # A delegated ticket's post waits for its handoff outcome (#5588), so
+        # the one line carries the ticket and the implementation disposition.
+        # The receipt transaction writes the handoff, so a ticket with none
+        # (no delegation, or findings) posts at once and never waits.
         triages = text(
             f"""
             INSERT INTO {self._posts} AS p
@@ -329,14 +335,24 @@ class PostgresFactorySlackStore:
                        'reason', r.reason,
                        'revision', r.revision,
                        'ticket_url', r.output_url,
-                       'result_comment_url', r.result_comment_url
+                       'result_comment_url', r.result_comment_url,
+                       'handoff_admitted', CASE h.outcome
+                           WHEN 'admitted' THEN true
+                           WHEN 'refused' THEN false
+                       END,
+                       'implementation_status_url',
+                           CASE WHEN h.outcome = 'admitted' THEN h.output_url END,
+                       'refusal_reason', CASE WHEN h.outcome = 'refused' THEN h.reason END
                    )
               FROM ({live_threads}) t
               JOIN {self._requests} q
                 ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
               JOIN {self._receipts} r
                 ON r.execution_request_id = q.id
+              LEFT JOIN {self._handoffs} h
+                ON h.source_execution_request_id = q.id
              WHERE q.completion_contract = 'tracker_result'
+               AND (r.result_kind <> 'ticket' OR h.id IS NULL OR h.outcome IS NOT NULL)
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )

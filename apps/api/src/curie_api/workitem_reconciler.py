@@ -51,6 +51,7 @@ from .factory_tracker_result_delivery import (
     due_deliveries,
     expire_overdue,
 )
+from .factory_triage_handoff import due_handoffs, hand_off
 from .forges.errors import ForgeError
 from .forges.ports import Tracker
 from .forges.registry import forges_registry
@@ -179,6 +180,8 @@ class WorkItemReconciler:
             # attempt the due ones, a run's submission and platform findings alike.
             ("expire_tracker_results", self._expire_tracker_results),
             ("deliver_tracker_results", self._deliver_tracker_results),
+            # A delivered triage ticket's implementation handoff (#5588).
+            ("hand_off_triage_tickets", self._hand_off_triage_tickets),
             ("publish_execute_wakes", self._publish_execute_wakes),
         ):
             attributes = {"service.name": "curie-api", "step": name}
@@ -253,6 +256,31 @@ class WorkItemReconciler:
                     logger.warning("tracker result delivery %s attempt did not finish", delivery_id)
         finally:
             await client.aclose()
+
+    async def _hand_off_triage_tickets(self) -> None:
+        """One attempt for each due triage handoff, under this reconciler's owner."""
+
+        async with self._sessionmaker() as session:
+            due = await due_handoffs(session, limit=self._settings.work_item_batch_limit)
+            await session.rollback()
+        if not due:
+            return
+        async with httpx.AsyncClient(
+            timeout=self._settings.github_app_timeout_seconds,
+            verify=code_host_verify(self._settings),
+        ) as client:
+            for handoff_id in due:
+                try:
+                    async with asyncio.timeout(_TRACKER_RESULT_ATTEMPT_SECONDS):
+                        await hand_off(
+                            self._sessionmaker,
+                            handoff_id,
+                            settings=self._settings,
+                            client=client,
+                            owner=self._owner,
+                        )
+                except TimeoutError:
+                    logger.warning("triage handoff %s attempt did not finish", handoff_id)
 
     async def _redispatch_lapsed_acquisitions(self) -> None:
         async with self._sessionmaker() as session:

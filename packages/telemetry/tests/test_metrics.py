@@ -58,6 +58,7 @@ _RECONCILER_STEPS = [
     "reconcile_base_transitions",
     "expire_tracker_results",
     "deliver_tracker_results",
+    "hand_off_triage_tickets",
     "publish_execute_wakes",
 ]
 _RECONCILER_FAILURE_METRIC = "curie.work_item.reconciler.step.failure"
@@ -809,7 +810,7 @@ def test_reconciler_step_metrics_declare_only_the_api_and_fifteen_steps() -> Non
             "service.name": ["curie-api"],
             "step": _RECONCILER_STEPS,
         }
-        assert definition["cardinality_bound"] == 15
+        assert definition["cardinality_bound"] == len(_RECONCILER_STEPS)
 
 
 def test_reconciler_step_metrics_export_failures_and_a_resettable_gauge(
