@@ -1373,6 +1373,7 @@ def test_refused_when_the_output_was_already_selected_keeps_that_run_and_label(
         )
     (before,) = requests(triage.output)
     (item,) = work_items(triage.output)
+    label_writes_before = list(env.github.label_writes(triage.output))
 
     assert run_hand_off(triage.handoff_id) == "refused"
 
@@ -1387,7 +1388,7 @@ def test_refused_when_the_output_was_already_selected_keeps_that_run_and_label(
     )
     assert work_items(triage.output)[0]["version"] == item["version"]
     assert IMPL in env.github.outputs[triage.output].labels
-    assert env.github.label_writes(triage.output) == []
+    assert env.github.label_writes(triage.output) == label_writes_before
     assert recorded(triage).refusal_reason == "output_already_selected"
     _assert_one_triage_session(triage)
 
