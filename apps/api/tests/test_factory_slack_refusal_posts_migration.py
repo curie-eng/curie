@@ -27,7 +27,9 @@ def _sql(statement: str, params: dict[str, Any] | None = None) -> list[dict[str,
     return asyncio.run(go())
 
 
-def test_refusal_post_migration_refuses_lossy_downgrade(isolated_migration_db: Any) -> None:
+def test_key_events_refusal_post_migration_refuses_lossy_downgrade(
+    isolated_migration_db: Any,
+) -> None:
     isolated_migration_db.at("0168")
     config = alembic_config()
     command.upgrade(config, "0170")
