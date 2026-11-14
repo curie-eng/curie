@@ -56,6 +56,7 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
         ),
         sa.Column("consumed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
             "(target_binding_id IS NULL) = (target_agent_id IS NULL) "
             "AND (target_binding_id IS NULL) = (target_binding_generation IS NULL)",
@@ -90,6 +91,9 @@ def upgrade() -> None:
         sa.Column("reason", sa.Text(), nullable=True),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column(
+            "label_cleanup_owed", sa.Boolean(), nullable=False, server_default=sa.false()
+        ),
         sa.Column("lease_owner", sa.Text(), nullable=True),
         *[
             sa.Column(name, sa.DateTime(timezone=True), nullable=True)
@@ -133,7 +137,7 @@ def upgrade() -> None:
         "factory_triage_handoffs",
         ["next_attempt_at"],
         schema="curie",
-        postgresql_where=sa.text("outcome IS NULL"),
+        postgresql_where=sa.text("outcome IS NULL OR label_cleanup_owed"),
     )
 
 

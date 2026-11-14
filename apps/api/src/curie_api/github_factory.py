@@ -961,6 +961,22 @@ async def _delegated_tracker(
     )
 
 
+async def _selected_by_handoff(
+    session: AsyncSession, work_item: WorkItem, output: "DelegatedOutput"
+) -> bool:
+    """Whether the output's WorkItem was admitted by this handoff (a replay)."""
+
+    if work_item.readmit_request_id == output.request_id:
+        return True
+    found = await session.scalar(
+        select(ExecutionRequest.id).where(
+            ExecutionRequest.id == output.request_id,
+            ExecutionRequest.work_item_id == work_item.id,
+        )
+    )
+    return found is not None
+
+
 async def check_delegated(
     session: AsyncSession,
     settings: Settings,
@@ -1020,6 +1036,10 @@ async def check_delegated(
     if version is not None and version.result_policy_digest is not None:
         raise HandoffRefused("target_unavailable")
     existing = await work_item_for(session, issue)
+    if existing is not None and not await _selected_by_handoff(session, existing, output):
+        # Someone selected the output through another door: its run and its
+        # label stay as they are, and the handoff admits nothing.
+        raise HandoffRefused("output_already_selected", keep_label=True)
     bound = await bound_labels(session, registry, GITHUB_CHANNEL_KIND, output.repo_full_name)
     refusal = label_refusal(
         label=output.label,

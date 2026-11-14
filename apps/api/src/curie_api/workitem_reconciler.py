@@ -51,7 +51,7 @@ from .factory_tracker_result_delivery import (
     due_deliveries,
     expire_overdue,
 )
-from .factory_triage_handoff import due_handoffs, hand_off
+from .factory_triage_handoff import abandon_attempt, due_handoffs, hand_off
 from .forges.errors import ForgeError
 from .forges.ports import Tracker
 from .forges.registry import forges_registry
@@ -281,6 +281,12 @@ class WorkItemReconciler:
                         )
                 except TimeoutError:
                     logger.warning("triage handoff %s attempt did not finish", handoff_id)
+                    await abandon_attempt(
+                        self._sessionmaker,
+                        handoff_id,
+                        owner=self._owner,
+                        settings=self._settings,
+                    )
 
     async def _redispatch_lapsed_acquisitions(self) -> None:
         async with self._sessionmaker() as session:

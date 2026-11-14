@@ -46,6 +46,7 @@ from ..models import (
     FactoryTrackerResultDelivery,
     FactoryTrackerResultGrant,
     FactoryTrackerResultReceipt,
+    FactoryTriageDelegation,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
@@ -2112,6 +2113,26 @@ def _release_parked_hold() -> ColumnElement[datetime]:
     )
 
 
+async def _revoke_triage_delegations(
+    session: AsyncSession, work_item_id: uuid.UUID, now: datetime
+) -> None:
+    """Cancelling a triage source revokes its unconsumed delegations for good (#5588).
+
+    A later readmit clears ``cancelled_at`` but never this, so an older
+    handoff cannot be revived by relabelling the source.
+    """
+
+    await session.execute(
+        update(FactoryTriageDelegation)
+        .where(
+            FactoryTriageDelegation.work_item_id == work_item_id,
+            FactoryTriageDelegation.consumed_at.is_(None),
+            FactoryTriageDelegation.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+
+
 async def request_cancellation(
     session: AsyncSession,
     *,
@@ -2164,6 +2185,7 @@ async def request_cancellation(
 
     await _cancel_queued_requests(session, work_item_id, now, cause)
     await _expire_unused_grants(session, work_item_id)
+    await _revoke_triage_delegations(session, work_item_id, now)
 
     active = await lock_active_request(session, work_item_id)
     if active is not None and active.status == "waiting":
