@@ -1,6 +1,14 @@
 {
   "schema_version": "v1",
   "metrics": {
+    "curie.factory.intake.notice.oldest_owed_age_seconds": {
+      "type": "gauge",
+      "unit": "s",
+      "description": "Age of the oldest refused trigger-label notice awaiting delivery.",
+      "monotonic": false,
+      "attributes": {},
+      "cardinality_bound": 1
+    },
     "curie.turn.accepted": {
       "type": "counter",
       "unit": "{turn}",

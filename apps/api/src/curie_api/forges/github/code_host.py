@@ -76,7 +76,7 @@ from curie_api.forges.types import (
     publication_body,
     status_key,
 )
-from curie_api.github_app import GitHubAppError
+from curie_api.github_app import GitHubAppError, GitHubInstallationRefused
 from curie_api.publication_policy import is_publication_branch
 from curie_api.repo_full_name import repo_url_path
 from curie_api.repository_auth import resolve_repository_credential
@@ -706,6 +706,26 @@ class GitHubCodeHost:
             raise NotFound("repository_mismatch")
         return RepositoryRef(
             self.kind, self.host, str(repository_id), full_name, default_branch=default_branch
+        )
+
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        if repository.kind != self.kind or repository.host != self.host:
+            raise NotFound("repository")
+        try:
+            _, token = await run_in_threadpool(
+                self._credentials.fresh_installation_token, repository.path, None
+            )
+        except GitHubInstallationRefused:
+            raise Unauthorized("installation_credential_refused") from None
+        except GitHubAppError:
+            raise Unavailable("installation_credential_unavailable") from None
+        return Credential(
+            origin=self._html,
+            header=CredentialHeader.AUTHORIZATION_BASIC,
+            secret=token,
+            scope=CredentialScope.PUSH,
+            expiry=CredentialExpiry.UNKNOWN,
+            username="x-access-token",
         )
 
     async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:

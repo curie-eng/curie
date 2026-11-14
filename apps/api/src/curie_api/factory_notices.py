@@ -629,14 +629,14 @@ def _agent_message_block(message: str) -> str:
     return f"Agent's last message:\n{quoted}\n\n"
 
 
-def _escape_markdown(value: str) -> str:
+def escape_markdown(value: str) -> str:
     return "".join(f"\\{char}" if char in _MARKDOWN_SPECIAL else char for char in value)
 
 
 def _checklist(view: PhaseView, *, final: bool) -> list[str]:
     lines: list[str] = []
     for slot in view.phases:
-        label = _escape_markdown(slot.label)
+        label = escape_markdown(slot.label)
         if slot.state == "done":
             lines.append(f"- [x] {label}")
         elif slot.state == "current":
@@ -693,7 +693,11 @@ def status_body(
     return redact_factory_comment("\n\n".join(parts) + "\n")
 
 
-def _digest(body: str) -> str:
+def lease_available(owner: Any, expires_at: Any) -> Any:
+    return or_(owner.is_(None), expires_at <= func.clock_timestamp())
+
+
+def body_digest(body: str) -> str:
     return hashlib.sha256(body.encode()).hexdigest()
 
 
@@ -878,9 +882,8 @@ async def _claim_next(
                 FactoryStatusComment.refused_at.is_(None),
                 ExecutionRequest.objective.is_not(None),
                 or_(FactoryStatusComment.finalized_at.is_(None), label_due),
-                or_(
-                    FactoryStatusComment.sync_owner.is_(None),
-                    FactoryStatusComment.sync_lease_expires_at <= func.clock_timestamp(),
+                lease_available(
+                    FactoryStatusComment.sync_owner, FactoryStatusComment.sync_lease_expires_at
                 ),
                 FactoryStatusComment.execution_request_id.not_in(attempted_ids),
             )
@@ -1112,7 +1115,7 @@ async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _Stat
     """
 
     row, target, body, now = claim.row, claim.target, claim.body, claim.now
-    digest = _digest(body)
+    digest = body_digest(body)
     pr = claim.opened_pr
     link = pr is not None and (
         tracker.capabilities.get(Operation.LINK_PULL_REQUEST) == Support.SUPPORTED
@@ -1181,12 +1184,12 @@ async def _sync_comment(
         row.comment_list = comment_list
         row.posted_at = now
         # A comment found by its marker carries an unknown body: edit it below.
-        row.rendered_digest = _digest(body) if created else None
+        row.rendered_digest = body_digest(body) if created else None
         writes += int(created)
-    if row.rendered_digest != _digest(body):
+    if row.rendered_digest != body_digest(body):
         edited = await patch_comment(github, row, body)
         if edited == "edited":
-            row.rendered_digest = _digest(body)
+            row.rendered_digest = body_digest(body)
             writes += 1
         elif edited == "gone":
             # A person deleted the comment: re-create it next pass, marker scan first.

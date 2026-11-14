@@ -312,6 +312,15 @@ class CodeHost(Protocol):
         """A clone- or push-scoped credential with its origin and git header."""
         ...
 
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        """Optional: a platform write credential for the currently installed App.
+
+        Rediscover the installation on every call, including when a cached
+        token is usable. Refuse missing App authority instead of using an
+        operator token. Only GitHub currently supports App installations.
+        """
+        ...
+
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         """The branch's head commit, or None when the branch does not exist."""
         ...

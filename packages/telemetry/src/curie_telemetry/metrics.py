@@ -783,6 +783,9 @@ _REMEDIATION_LIFECYCLE_ATTRIBUTES = {
 
 
 _METRICS: dict[str, dict[str, Any]] = {
+    "curie.factory.intake.notice.oldest_owed_age_seconds": _definition(
+        "gauge", "s", "Age of the oldest refused trigger-label notice awaiting delivery.", False, {}
+    ),
     "curie.turn.accepted": _definition(
         "counter", "{turn}", "Turns accepted for processing.", True, _TURN_ATTRIBUTES
     ),

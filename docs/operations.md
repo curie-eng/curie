@@ -4346,3 +4346,13 @@ unreadable controller data blocks reuse.
   lands. This is functionally irrelevant for runners (the first model call
   comes later) but worth knowing when reading probe output from the first
   seconds of a pod's life.
+
+
+## Refused factory trigger labels
+
+`curie.factory.intake.notice.oldest_owed_age_seconds` is the age of the oldest
+refusal notice still awaiting its App-owned issue comment, zero when none is
+owed. The API records refusals in `factory_intake_notices` independently of
+work items and retries delivery with capped backoff beside status-comment
+synchronization. A growing age means issue-visible answers are delayed;
+check GitHub availability and the factory App's comment permissions.

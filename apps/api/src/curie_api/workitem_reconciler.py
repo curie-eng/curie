@@ -692,6 +692,10 @@ class WorkItemReconciler:
             paused_for_upgrade=paused_for_upgrade,
         )
 
+        from .factory_intake_notices import sync_intake_notices
+
+        await sync_intake_notices(self._sessionmaker, self._settings, owner=self._owner)
+
     async def _publish_execute_wakes(self) -> None:
         async with self._sessionmaker() as session:
             claimed = await claim_due(

@@ -2152,6 +2152,71 @@ class FactorySlackPost(Base):
     )
 
 
+FACTORY_INTAKE_NOTICE_REASONS = (
+    "actor_unverifiable",
+    "actor_bot",
+    "actor_own_app",
+    "actor_no_permission",
+    "personal_owner_required",
+    "binding_ambiguous",
+    "publication_completed",
+    "installation_changed",
+)
+
+
+class FactoryIntakeNotice(Base):
+    """One answer owed for one refused trigger-label addition (#5576)."""
+
+    __tablename__ = "factory_intake_notices"
+    __table_args__ = (
+        UniqueConstraint(
+            "tracker_host",
+            "tracker_scope_id",
+            "tracker_issue_id",
+            "label_event_id",
+            name="factory_intake_notices_event_key",
+        ),
+        CheckConstraint(
+            f"reason IN ({', '.join(repr(reason) for reason in FACTORY_INTAKE_NOTICE_REASONS)})",
+            name="factory_intake_notices_reason_ck",
+        ),
+        Index(
+            "ix_factory_intake_notices_owed",
+            "observed_at",
+            postgresql_where=text("posted_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    tracker_kind: Mapped[str] = mapped_column(Text)
+    tracker_host: Mapped[str] = mapped_column(Text)
+    tracker_scope_id: Mapped[str] = mapped_column(Text)
+    tracker_issue_id: Mapped[str] = mapped_column(Text)
+    label_event_id: Mapped[int] = mapped_column(BigInteger)
+    repository_path: Mapped[str] = mapped_column(Text)
+    issue_url: Mapped[str] = mapped_column(Text)
+    label: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="SET NULL"),
+        default=None,
+    )
+    actor_login: Mapped[str | None] = mapped_column(Text, default=None)
+    publication_url: Mapped[str | None] = mapped_column(Text, default=None)
+    label_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    comment_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+
+
 class ExecutionRequestModelUsage(Base):
     """Token usage of one model in one turn of a request, with its estimate (#3223).
 

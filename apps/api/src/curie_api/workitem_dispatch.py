@@ -372,7 +372,7 @@ def _snapshot_matches(row: ExecutionRequest, facts: Any) -> bool:
     return all(getattr(row, column) == value for column, value in _snapshot_values(facts).items())
 
 
-def _work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
+def work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
     return (
         item.agent_id == facts.agent_id
         and item.tracker_issue == facts.issue
@@ -427,7 +427,7 @@ async def _replay_existing(
     locked = await lock_request(session, work_item_id=work_item.id, request_id=request.id)
     if locked is None:
         return await _refuse(session, "not_found", work_item_id=work_item.id, request_id=request.id)
-    if not _work_item_matches(work_item, facts, adapter):
+    if not work_item_matches(work_item, facts, adapter):
         return await _refuse(
             session,
             "identity_mismatch",
@@ -534,7 +534,7 @@ async def admit_revision(
     )
     if work_item is None:
         return await _refuse(session, "not_found")
-    if not _work_item_matches(work_item, facts, resolved.adapter):
+    if not work_item_matches(work_item, facts, resolved.adapter):
         return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
     refused = await existing_work_item_refusal(session, work_item, facts)
     if refused is not None:
@@ -592,7 +592,7 @@ async def readmit(
     )
     if work_item is None:
         return await _admit_new(session, facts, resolved.adapter)
-    if not _work_item_matches(work_item, facts, resolved.adapter):
+    if not work_item_matches(work_item, facts, resolved.adapter):
         return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
     refused = await existing_work_item_refusal(session, work_item, facts)
     if refused is not None:
