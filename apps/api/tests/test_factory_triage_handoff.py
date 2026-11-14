@@ -1538,7 +1538,7 @@ def test_refused_after_the_label_was_added_takes_the_label_off_again(env: Env) -
 # AC11: migration ------------------------------------------------------------
 
 
-def test_triage_handoff_migration_upgrades_from_0168_and_downgrades_when_empty(
+def test_triage_handoff_migration_upgrades_from_0170_and_downgrades_when_empty(
     isolated_migration_db: Any,
 ) -> None:
     from _migration_support import alembic_config
@@ -1553,7 +1553,7 @@ def test_triage_handoff_migration_upgrades_from_0168_and_downgrades_when_empty(
             )
         ]
 
-    isolated_migration_db.at("0168")
+    isolated_migration_db.at("0170")
     assert tables() == [None, None]
     config = alembic_config()
     command.upgrade(config, "0171")
@@ -1566,7 +1566,7 @@ def test_triage_handoff_migration_upgrades_from_0168_and_downgrades_when_empty(
     assert "(output_tracker_host, output_scope_id, output_issue_id)" in defs
     assert "(source_execution_request_id)" in defs
     assert "WHERE ((outcome IS NULL) OR label_cleanup_owed)" in defs
-    command.downgrade(config, "0168")
+    command.downgrade(config, "0170")
     assert tables() == [None, None]
     command.upgrade(config, "0171")
     assert tables() == ["curie.factory_triage_delegations", "curie.factory_triage_handoffs"]
