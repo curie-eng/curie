@@ -17,8 +17,10 @@ from sqlalchemy.exc import IntegrityError
 from test_requester_coding_migration import _owners
 
 
+@pytest.mark.parametrize("request_status", ["waiting", "failed"])
 def test_upgrade_backfills_historical_without_selecting_current_documents(
     isolated_migration_db: IsolatedMigrationDb,
+    request_status: str,
 ) -> None:
     isolated_migration_db.at("0168")
     tenant, principal, _ = _owners()
@@ -61,12 +63,26 @@ def test_upgrade_backfills_historical_without_selecting_current_documents(
         sql_rows(
             "INSERT INTO curie.execution_requests "
             "(id, work_item_id, tenant_id, model_auth_mode, owner_principal_id, "
-            "enrollment_generation, sequence, status, wait_deadline, requester, "
+            "enrollment_generation, sequence, status, terminal_cause, started_at, "
+            "execution_deadline, terminal_at, execution_attempts, runtime_epoch, "
+            "wait_deadline, requester, "
             "objective, reply_kind, reply_address, reply_conversation_id) "
-            "VALUES (:request, :id, :t, :mode, :owner, :gen, 1, 'waiting', "
+            "VALUES (:request, :id, :t, :mode, :owner, :gen, 1, :status, :cause, "
+            "CASE WHEN :is_failed THEN now() ELSE NULL END, "
+            "CASE WHEN :is_failed THEN now() + interval '1 hour' ELSE NULL END, "
+            "CASE WHEN :is_failed THEN now() ELSE NULL END, "
+            "CASE WHEN :is_failed THEN 1 ELSE 0 END, "
+            "CASE WHEN :is_failed THEN 1 ELSE 0 END, "
             "now() + interval '1 hour', :requester, "
             "'Implement the issue', 'slack', 'C0EXAMPLE1', '1700000000.000100')",
-            {**params, "request": request, "requester": str(principal)},
+            {
+                **params,
+                "request": request,
+                "requester": str(principal),
+                "status": request_status,
+                "is_failed": request_status == "failed",
+                "cause": "ci_timeout" if request_status == "failed" else None,
+            },
         )
     command.upgrade(alembic_config(), "0169")
     assert stamped_revision() == "0169"
@@ -86,6 +102,9 @@ def test_upgrade_backfills_historical_without_selecting_current_documents(
         for mode in ("service", "personal")
     ]
     assert sql_dicts("SELECT * FROM curie.work_item_coding_snapshots") == []
+    assert sql_rows("SELECT status, terminal_cause FROM curie.execution_requests") == [
+        (request_status, "ci_timeout" if request_status == "failed" else None)
+    ] * 2
     assert sql_rows(
         "SELECT bool_and(coding_instructions_selection_id = work_item_id "
         "AND coding_instructions_evidence = 'none') FROM curie.execution_requests"
