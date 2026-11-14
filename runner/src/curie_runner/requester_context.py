@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -325,14 +325,29 @@ def subagent_prompt_refusal(tool_input: Mapping[str, Any], applied: Applied | No
 
     if applied is None:
         return None
-    prompt = tool_input.get("prompt")
-    text = prompt if isinstance(prompt, str) else json.dumps(dict(tool_input), default=str)
-    if OPEN_PREFIX in text or CLOSE_PREFIX in text:
-        return _SUBAGENT_REFUSAL
     pinned = applied.text.strip()
-    if pinned and pinned in text:
-        return _SUBAGENT_REFUSAL
+    # Every string the call carries, at any depth, not only ``prompt``: a
+    # subagent may be handed the text in any field of its input.
+    for text in _strings(tool_input):
+        if OPEN_PREFIX in text or CLOSE_PREFIX in text:
+            return _SUBAGENT_REFUSAL
+        if pinned and pinned in text:
+            return _SUBAGENT_REFUSAL
     return None
+
+
+def _strings(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            yield from _strings(key)
+            yield from _strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _strings(item)
+    else:
+        yield json.dumps(value, default=str)
 
 
 def build_subagent_guard(gate: RequesterContextGate) -> dict[str, list[HookMatcher]]:
