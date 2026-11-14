@@ -1231,13 +1231,13 @@ def test_refused_permission_unreadable_only_at_the_deadline(env: Env) -> None:
     _assert_refused(env, triage, "permission_unreadable")
 
 
-def test_refused_permission_unreadable_on_the_first_attempt_after_a_late_receipt(
+def test_refused_on_the_first_attempt_after_a_late_receipt_without_trying_github(
     env: Env,
 ) -> None:
     """The receipt of a delivery that settled at its deadline: the handoff keeps
-    that deadline, so a failing permission read refuses at once. The receipt
-    transaction's event is written again here for a delivery whose deadline has
-    passed, as a receipt settled at that moment writes it."""
+    that deadline, so its first attempt refuses before any GitHub read. The
+    receipt transaction's event is written again here for a delivery whose
+    deadline has passed, as a receipt settled at that moment writes it."""
 
     triage = published(env)
     assert triage.output is not None
@@ -1255,13 +1255,14 @@ def test_refused_permission_unreadable_on_the_first_attempt_after_a_late_receipt
     )
     assert handoff(triage.handoff_id)["deadline_at"] == delivery["deadline_at"]
     env.github.permission_unreadable = True
+    calls = len(env.github.calls)
 
     assert run_hand_off(triage.handoff_id) == "refused"
 
+    assert env.github.calls[calls:] == []
     assert handoff(triage.handoff_id)["attempts"] == 1
     assert handoff(triage.handoff_id)["associated_at"] is None
-    assert env.github.label_writes(triage.output) == []
-    _assert_refused(env, triage, "permission_unreadable")
+    _assert_refused(env, triage, "delivery_deadline_passed")
 
 
 def _past_deadline(handoff_id: uuid.UUID) -> None:
