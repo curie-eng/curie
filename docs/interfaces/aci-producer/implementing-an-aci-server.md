@@ -121,7 +121,10 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
 - `ToolNote` → `tool_note` `{version, text, tool?}`
 - `Final` → `final` `{version, text, status}` where `status ∈ {done,
   idle-awaiting-input, classified-failure}`
-- `ErrorEvent` → `error` `{version, message, classification?}`
+- `ErrorEvent` → `error` `{version, message, classification?, retry_condition?}`;
+  set `retry_condition` (`RetryCondition`) only from the provider's own retry
+  signal, and leave it null when you have none: null means no trusted retry
+  condition, never retry now
 - `SideEffectFlag` → `side_effect_flag` `{version, tool?, detail?, call_id?,
   arguments?, result?, failed?, redacted?}`, emitted once when a side-effecting
   call is made and once when its result arrives, joined on `call_id` (ADR-0117).
@@ -130,7 +133,7 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
   placeholder
 
 **Version gate (strict producer, tolerant consumer).** Your producer emits its
-**exact build `PROTOCOL_VERSION`** (currently `0.5.3`) on every outbound event and
+**exact build `PROTOCOL_VERSION`** (currently `0.5.26`) on every outbound event and
 constructs strictly -- an unknown field is an error at construction, catching your
 mistakes at the source. A **consumer** decoding the wire is tolerant the other way:
 it accepts any version compatible with its own build (`major.minor` match under
