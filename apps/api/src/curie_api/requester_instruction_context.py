@@ -122,6 +122,15 @@ async def _running(
     return request, item
 
 
+async def _tenant_disabled(session: AsyncSession, tenant: uuid.UUID | None) -> bool:
+    if tenant is None:
+        return True
+    enabled = await session.scalar(
+        select(RequesterCodingPolicy.enabled).where(RequesterCodingPolicy.tenant_id == tenant)
+    )
+    return enabled is False
+
+
 async def read_envelope(
     session: AsyncSession, request_id: uuid.UUID, *, runtime_epoch: int
 ) -> dict[str, Any] | Refused:
@@ -136,10 +145,7 @@ async def read_envelope(
         return Refused("coding_instructions_unavailable")
     selection: SelectedCodingInstructions | AbsentCodingInstructions
     if item.coding_instructions_state == "selected":
-        enabled = await session.scalar(
-            select(RequesterCodingPolicy.enabled).where(RequesterCodingPolicy.tenant_id == tenant)
-        )
-        if enabled is False:
+        if await _tenant_disabled(session, tenant):
             return Refused("tenant_disabled")
         text = await session.scalar(
             select(WorkItemCodingSnapshot.text).where(
@@ -208,6 +214,13 @@ async def accept_acknowledgment(
         if current not in ("pending", "applied"):
             await session.rollback()
             return Refused("evidence_conflict")
+        if await _tenant_disabled(session, await _tenant_of(session, item)):
+            # The tenant turned the capability off after the envelope was read:
+            # the request fails here, before any model work, and keeps its
+            # pinned snapshot.
+            await _record_evidence(session, request, item, body.runtime_epoch, "failed")
+            await session.commit()
+            return Refused("tenant_disabled")
         evidence = "applied"
     elif ack is not None and ack.outcome == "none":
         if selected:
@@ -224,20 +237,29 @@ async def accept_acknowledgment(
             return Refused("evidence_conflict")
         evidence = "failed"
     if evidence != current:
-        await session.execute(
-            update(ExecutionRequest)
-            .where(
-                ExecutionRequest.id == request.id,
-                ExecutionRequest.runtime_epoch == body.runtime_epoch,
-            )
-            .values(
-                coding_instructions_selection_id=request.coding_instructions_selection_id
-                or item.id,
-                coding_instructions_evidence=evidence,
-            )
-        )
+        await _record_evidence(session, request, item, body.runtime_epoch, evidence)
     await session.commit()
     return evidence
+
+
+async def _record_evidence(
+    session: AsyncSession,
+    request: ExecutionRequest,
+    item: WorkItem,
+    runtime_epoch: int,
+    evidence: str,
+) -> None:
+    await session.execute(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.runtime_epoch == runtime_epoch,
+        )
+        .values(
+            coding_instructions_selection_id=request.coding_instructions_selection_id or item.id,
+            coding_instructions_evidence=evidence,
+        )
+    )
 
 
 async def applied_digest(session: AsyncSession, request_id: uuid.UUID) -> str | None:

@@ -64,6 +64,10 @@ async def _relay(
         )
     except WorkItemConflict as conflict:
         code = conflict.code
+        if code in _FAILING_READS:
+            # The API recorded the failure itself (the tenant turned the
+            # capability off after the envelope was read).
+            raise RequesterContextRefused(code) from None
         raise RequesterContextRefused(
             code if code.startswith("acknowledgment_") else f"acknowledgment_{code}"
         ) from None

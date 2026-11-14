@@ -564,6 +564,65 @@ def test_a_tenant_that_disabled_the_capability_fails_the_request(services: _Serv
     _scenario(services, body)
 
 
+class _DisablingFirst:
+    """A pass-through runner client that runs ``before`` once the envelope was read."""
+
+    def __init__(self, inner: RunnerClient, before: Any) -> None:
+        self.inner = inner
+        self.before = before
+
+    async def deliver_requester_context(
+        self, base_url: str, envelope: bytes, *, token: str | None, timeout_s: float
+    ) -> tuple[int, dict[str, object] | None]:
+        await self.before()
+        return await self.inner.deliver_requester_context(
+            base_url, envelope, token=token, timeout_s=timeout_s
+        )
+
+
+def test_a_tenant_that_disables_the_capability_after_the_read_fails_the_request(
+    services: _Services,
+) -> None:
+    async def body(stage: _Stage, client: RunnerClient) -> None:
+        run = await stage.start(selected=True)
+        gate = RequesterContextGate()
+        gate.bind(await stage.binding(run))
+        base_url = await stage.runner(gate)
+        (tenant,) = await stage.sql(
+            "SELECT tenant_id FROM curie.agents WHERE id = :id", id=stage.agent_id
+        )
+
+        async def disable() -> None:
+            # The envelope was read while enabled; the runner is still to answer.
+            await stage.sql(
+                "INSERT INTO curie.requester_coding_policies (tenant_id, enabled) "
+                "VALUES (:t, false) ON CONFLICT (tenant_id) DO UPDATE SET enabled = false",
+                t=tenant["tenant_id"],
+            )
+
+        try:
+            with pytest.raises(RequesterContextRefused) as refused:
+                await _deliver(stage, run, _DisablingFirst(client, disable), base_url)
+            # The runner validated the envelope; the API refused to record it applied.
+            assert isinstance(gate.outcome, Applied)
+            await _assert_failed(stage, run, refused.value, "tenant_disabled")
+            # The pinned snapshot stays with the WorkItem.
+            (kept,) = await stage.sql(
+                "SELECT count(*) AS n FROM curie.work_item_coding_snapshots s "
+                "JOIN curie.execution_requests r ON r.work_item_id = s.work_item_id "
+                "WHERE r.id = :id",
+                id=run.request_id,
+            )
+            assert kept["n"] == 1
+        finally:
+            await stage.sql(
+                "UPDATE curie.requester_coding_policies SET enabled = true WHERE tenant_id = :t",
+                t=tenant["tenant_id"],
+            )
+
+    _scenario(services, body)
+
+
 # --- The kernel half ---------------------------------------------------------------
 
 SELECTED_DIGEST = "a" * 64
