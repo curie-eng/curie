@@ -31,17 +31,30 @@ from urllib.request import Request, urlopen
 
 import factory_e2e as fe
 import kind_images
+import scripted_lanes
 import scripted_scenario as scenario
+import triage_run
+import triage_scenario
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = REPO_ROOT / "tools/factory-e2e/fixtures/unitconv"
 ISSUE = REPO_ROOT / "tools/factory-e2e/fixtures/unitconv-issue.md"
 TRANSCRIPT = REPO_ROOT / "tools/model-script/transcripts/unitconv-issue.json"
 IMAGES = ("curie-api:local", "curie-worker:local", "curie-ui:local", "curie-runner:latest")
+# The chart runs its channel gateway on the dispatcher image, which
+# install_values names curie-dispatcher:local. A run that enables the gateway
+# builds and imports it beside the other candidates.
+GATEWAY_COMPONENT = "dispatcher"
+GATEWAY_IMAGE = f"curie-{GATEWAY_COMPONENT}:local"
+# The tracker intake poll interval of this install. The triage replay derives
+# its quiet window from it.
+TRACKER_POLL_SECONDS = 5
 BOUND_SECONDS = 2400
 RECORD_BUDGET_USD = 20
 RECORD_REQUEST_RESERVE_USD = 2.0
 RECORD_ATTEMPTS = 3
+# The gateway sends this to the in-process Slack recorder only; it is no credential.
+SCRIPTED_SLACK_BOT_TOKEN = "xoxb-0000000000-scripted-example"
 
 
 class ScriptedScenarioError(RuntimeError):
@@ -84,8 +97,13 @@ def scripted_values(
     clone_base: str,
     ca_configmap: str,
     runner_image: str,
+    slack_api_base_url: str | None = None,
 ) -> dict[str, Any]:
-    """Candidate chart values using only the disposable external endpoints."""
+    """Candidate chart values using only the disposable external endpoints.
+
+    With ``slack_api_base_url`` the chart deploys its channel gateway against
+    that Slack Web API endpoint, so factory Slack posts reach the recorder.
+    """
 
     config = fe.FactoryConfig(
         kube_context="kind-local",
@@ -116,7 +134,7 @@ def scripted_values(
     for entry in (*values["factory"]["codeHosts"], *values["factory"]["trackers"]):
         entry["apiUrl"] = github_api
         entry["host"] = urlsplit(github_api).netloc
-    values["factory"]["trackers"][0]["pollIntervalSeconds"] = 5
+    values["factory"]["trackers"][0]["pollIntervalSeconds"] = TRACKER_POLL_SECONDS
     values["codeHostTrust"] = {
         "caBundle": {"configMapRef": {"name": ca_configmap, "key": "ca.pem"}}
     }
@@ -138,6 +156,11 @@ def scripted_values(
     values["agentSandbox"]["runner"]["imagePullPolicy"] = "IfNotPresent"
     allowed = values["security"]["networkPolicy"]["allowedEgress"]
     allowed.append(fe.model_proxy_egress(clone_base))
+    if slack_api_base_url is not None:
+        values.setdefault("dispatcher", {}).setdefault("slack", {})["botToken"] = (
+            SCRIPTED_SLACK_BOT_TOKEN
+        )
+        values.setdefault("worker", {})["slackApiBaseUrl"] = slack_api_base_url
     return values
 
 
@@ -317,11 +340,16 @@ def registry_bind_rejected(detail: str) -> bool:
 class ScriptedRun:
     """One private cluster, registry, fixture server and model endpoint."""
 
+    # The triage-to-pr scenario and the channel gateway it posts through. A
+    # subclass that drives its own scenario on this install turns both off.
+    TRIAGE_TO_PR = True
+    tracker_poll_seconds = TRACKER_POLL_SECONDS
+
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.run_id = uuid.uuid4().hex[:8]
         self.image_refs = (
-            IMAGES
+            IMAGES + ((GATEWAY_IMAGE,) if self.gateway_enabled() else ())
             if args.scenario != "facts"
             else tuple(
                 f"curie-{component}:facts-{self.run_id}" for component in ("api", "worker", "ui")
@@ -349,13 +377,19 @@ class ScriptedRun:
         self.workdir: Path | None = None
         self.stub: Any = None
         self.model: Any = None
+        # The triage-to-pr scenario: per-agent model lanes, the Slack recorder,
+        # and the scenario itself once the issue-to-pull-request one passed.
+        self.router: scripted_lanes.LaneRouter | None = None
+        self.slack: scripted_lanes.SlackRecorder | None = None
+        self.triage: triage_run.TriageToPr | None = None
+        self.triage_error: str | None = None
         self.forward: subprocess.Popen[str] | None = None
         self.cluster_attempted = False
         self.registry_attempted = False
         self.registry_ref: str | None = None
         self.install_started: float | None = None
         self.deadline: float | None = None
-        self.secrets = [os.environ.get("CURIE_FACTORY_RECORD_KEY")]
+        self.secrets = [os.environ.get("CURIE_FACTORY_RECORD_KEY"), SCRIPTED_SLACK_BOT_TOKEN]
         self.env = dict(os.environ)
         # Only the in-process recording proxy receives the upstream credential.
         self.env.pop("CURIE_FACTORY_RECORD_KEY", None)
@@ -374,6 +408,15 @@ class ScriptedRun:
         # Set when teardown begins; a request still waiting on either lock is
         # then refused, since cleanup would never measure the credit it spends.
         self.recording_closed = False
+
+    def gateway_enabled(self) -> bool:
+        """Whether this run deploys the channel gateway for the triage scenario.
+
+        Recording captures only the issue-to-pull-request transcript, and the
+        facts scenario posts nothing to Slack, so neither runs the gateway.
+        """
+
+        return self.TRIAGE_TO_PR and self.args.scenario != "facts" and not self.args.record
 
     def check_disk(self, stage: str, *, required_bytes: int = 30 * 1024**3) -> None:
         free = shutil.disk_usage("/").free
@@ -581,7 +624,10 @@ class ScriptedRun:
         if self.args.record:
             self.prepare_recording()
         if self.args.build_images:
-            for component in ("api", "worker", "ui"):
+            components = ["api", "worker", "ui"]
+            if self.gateway_enabled():
+                components.append(GATEWAY_COMPONENT)
+            for component in components:
                 self.check_disk(f"building {component}")
                 self.command(
                     "docker",
@@ -704,6 +750,19 @@ class ScriptedRun:
             )
             if self.args.record:
                 self.count_recording_requests(model)
+            elif self.gateway_enabled():
+                # Recording captures the issue-to-pull-request transcript only;
+                # triage lanes are scripted and need no provider.
+                self.router = triage_run.build_router(model)
+                self.router.resolvers.append(
+                    triage_run.output_resolver(
+                        self.stub, model.load_transcript(Path(self.args.transcript))
+                    )
+                )
+                self.router.hooks.append(triage_run.revoke_on_first_turn(self.stub))
+                self.router.install(self.model, model)
+                self.slack = scripted_lanes.SlackRecorder(host=callback)
+                self.slack.start()
             self.model.start()
         self.evidence.update(
             stub_port=self.stub.port, model_port=None if self.model is None else self.model.port
@@ -736,6 +795,7 @@ class ScriptedRun:
             clone_base=self.stub.base_url,
             ca_configmap="github-stub-ca",
             runner_image=runner_image,
+            slack_api_base_url=None if self.slack is None else self.slack.base_url,
         )
         if self.args.scenario == "facts":
             for component in ("api", "worker", "ui"):
@@ -842,6 +902,20 @@ class ScriptedRun:
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
         self.wait_for_final()
         self.observe()
+        if self.router is not None and self.slack is not None:
+            self.run_triage_to_pr(github)
+
+    def run_triage_to_pr(self, github: Any) -> None:
+        """The second scenario, on this install, after the first one passed."""
+
+        assert self.router is not None and self.slack is not None
+        self.triage = triage_run.TriageToPr(self, self.router, self.slack)
+        try:
+            self.triage.execute(github)
+        except (RuntimeError, AssertionError, OSError, ValueError, KeyError) as exc:
+            detail, _ = fe.redact_agent_text(str(exc), self.secrets)
+            self.triage_error = detail or type(exc).__name__
+            raise ScriptedScenarioError(f"triage-to-pr: {self.triage_error}") from None
 
     def publication_namespace(self) -> str:
         namespace = self.kubectl(
@@ -1508,6 +1582,19 @@ class ScriptedRun:
                 sqlite3.Error,
             ) as exc:
                 errors.append(str(exc))
+        if self.slack is not None:
+            try:
+                self.slack.close()
+                self.evidence["slack_recorder_unauthenticated_calls"] = self.slack.unauthenticated
+                with socket.socket() as sock:
+                    sock.settimeout(1)
+                    if (
+                        sock.connect_ex((self.slack.host, self.slack.port)) == 0
+                        and sock.getsockname() != sock.getpeername()
+                    ):
+                        errors.append(f"owned endpoint still listens on port {self.slack.port}")
+            except OSError as exc:
+                errors.append(str(exc))
         for service, field in (
             (self.model, "unexpected_model_requests"),
             (self.stub, "unsupported_stub_requests"),
@@ -1767,6 +1854,20 @@ def main(args: argparse.Namespace) -> int:
             run.evidence["cleanup_errors"] = [str(exc)]
             run.evidence["cleanup_verified"] = False
             result = fe.EXIT_FAILED
+        if run.triage is not None:
+            # Point 10 needs the verified teardown, so the verdict follows cleanup.
+            scenario_error = run.triage_error or (
+                None if result == 0 else run.evidence.get("error", "scenario failed")
+            )
+            if not run.triage.finish(run.evidence, scenario_error) and result == 0:
+                result = fe.EXIT_FAILED
+            run.evidence["triage_to_pr"] = run.triage.evidence["result"]
+            triage_path = run.evidence_path.with_name(triage_scenario.EVIDENCE_NAME)
+            triage_path.parent.mkdir(parents=True, exist_ok=True)
+            recorded, _ = fe.redact_agent_text(
+                json.dumps(run.triage.evidence, indent=2), run.secrets
+            )
+            triage_path.write_text((recorded or "{}") + "\n")
         run.evidence["result"] = "passed" if result == 0 else "failed"
         if run.install_started is not None and "elapsed_seconds" not in run.evidence:
             run.evidence["elapsed_seconds"] = time.monotonic() - run.install_started

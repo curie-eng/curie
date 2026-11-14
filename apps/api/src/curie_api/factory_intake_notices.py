@@ -43,20 +43,37 @@ def observe_label(notice: FactoryNotice, event: dict[str, Any], *, app_id: str) 
         raw_login = actor.get("login") if isinstance(actor, dict) else None
         login = raw_login if isinstance(raw_login, str) else ""
         sender_id = 0
+    via = event.get("performed_via_github_app")
+    via_id = via.get("id") if isinstance(via, dict) else None
     return replace(
         notice,
         sender_id=sender_id,
         sender_login=login,
         label_event_id=identity,
         actor_refusal=reason,
+        own_app_label=(reason == "actor_bot" and type(via_id) is int and str(via_id) == app_id),
     )
 
 
 async def delegated_output_before_label(
     session: AsyncSession, issue: TrackerIssueRef, notice: FactoryNotice
 ) -> bool:
-    """The triage handoff supplies recorded provenance here; no source exists yet."""
-    return False
+    """Whether a Bot label event is the factory's own label on its delegated output (#5588).
+
+    True only for a label event GitHub attributes to this installation's own
+    App, on an issue the triage handoff recorded as its delegated output, for
+    the label that handoff applies, and not earlier than the recorded
+    association (ADR 0279 row 7). Every other Bot label, a different App's
+    on the same output included, keeps its ``actor_bot`` notice.
+    """
+
+    if not notice.own_app_label or not notice.label:
+        return False
+    from .factory_triage_handoff import delegated_output_label
+
+    return await delegated_output_label(
+        session, issue, label=notice.label, event_at=notice.label_event_at
+    )
 
 
 def event_key(issue: TrackerIssueRef, event_id: int) -> tuple[Any, ...]:
