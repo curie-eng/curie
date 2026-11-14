@@ -11,6 +11,7 @@ deadline under 60 seconds and a failing exit on any input it cannot read.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import json
 import os
@@ -530,15 +531,20 @@ def factory_bundle_files(root: Path) -> dict[str, str]:
 
 
 REVIEWER_SCAN_PROGRAM = """\
-import json, os, signal, sys
+import base64, json, os, signal, sys
+retain = False
+transcripts = {}
 def done(body, code):
+    if retain:
+        body["transcripts"] = transcripts
     print(json.dumps(body))
     raise SystemExit(code)
 def expired(*_):
     done({"error": "deadline"}, 3)
 try:
     deadline = float(sys.argv[1])
-    roots = sys.argv[2:]
+    retain = sys.argv[2] == "--retain"
+    roots = sys.argv[3:] if retain else sys.argv[2:]
     needles = json.loads(sys.stdin.read())
     assert 0 < deadline < 60 and roots and isinstance(needles, list) and needles
     assert all(isinstance(item, str) and item for item in needles)
@@ -569,7 +575,7 @@ def reviewer_calls(record):
             if isinstance(item.get("tool_use_id"), str):
                 results.add(item["tool_use_id"])
 LIMIT = 64 << 20
-for root in roots:
+for root_index, root in enumerate(roots):
     if not os.path.isdir(root):
         incomplete.append(1)
     for base, _dirs, names in os.walk(root, onerror=lambda error: incomplete.append(1)):
@@ -587,6 +593,9 @@ for root in roots:
             if len(data) > LIMIT:
                 incomplete.append(1)
                 continue
+            if retain:
+                relative = str(root_index) + "/" + os.path.relpath(path, root)
+                transcripts[relative] = base64.b64encode(data).decode("ascii")
             if data and not data.endswith(b"\\n"):
                 # A truncated final record: the read is incomplete.
                 incomplete.append(1)
@@ -618,6 +627,33 @@ if incomplete:
 ran = sorted({role for use, role in uses.items() if use in results})
 done({"error": None, "files": files, "records": records, "hits": len(found), "roles": ran}, 0)
 """
+
+
+def retain_transcripts(stdout: bytes, directory: Path) -> None:
+    """Keep the scan's exact inputs privately, including partial JSON records."""
+
+    try:
+        body = json.loads(stdout)
+        transcripts = body["transcripts"]
+        if not isinstance(transcripts, dict):
+            raise ValueError("transcript inventory is unreadable")
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for relative, encoded in transcripts.items():
+            path = Path(relative)
+            if path.is_absolute() or ".." in path.parts or path.suffix != ".jsonl":
+                raise ValueError("transcript path is invalid")
+            data = base64.b64decode(encoded, validate=True)
+            parent = directory
+            for part in path.parts[:-1]:
+                parent = parent / part
+                parent.mkdir(mode=0o700, exist_ok=True)
+            fd = os.open(
+                directory / path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+            )
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+    except (OSError, ValueError, TypeError, KeyError) as failure:
+        raise ValueError("session transcripts could not be retained") from failure
 
 
 @dataclasses.dataclass(frozen=True)

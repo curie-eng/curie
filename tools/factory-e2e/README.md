@@ -991,6 +991,17 @@ composition, so only `run` proves it. GitHub's REST API cannot delete issues, so
 closes the run's issues and pull requests, deletes its branches and label, and
 counts a closed issue as removed.
 
+An unreadable pull request or branch inventory fails cleanup even when known
+objects were removed. The driver continues deleting known objects and records
+the unreadable inventory in its ledger, so the judge cannot call it absent.
+Each live reviewer scan saves the exact parent and reviewer JSONL inputs under
+`$STATE/proof/enrollment-<owner>/transcripts/`, in private directories (0700)
+and files (0600). It captures them again before deleting runner Pods, including
+on a failed run; a capture failure still deletes the Pods and fails cleanup.
+The saved JSONL retains the `subagents` directory structure so the same scanner
+can be applied after teardown. These files contain private session text and
+stay outside public artifacts.
+
 ## Personal Slack kickoff acceptance (#5380)
 
 `personal_slack_kickoff.py` is the live proof for issue #5380 acceptance
