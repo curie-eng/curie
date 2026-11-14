@@ -447,11 +447,13 @@ never appear in it; it names grant files, which `check_grant_file` validates.
    `independence_unasserted`). The two grant files must differ by resolved
    path, inode and content digest (`duplicate_owner_grant`).
 3. `usable_until` is ISO 8601 with an offset or epoch seconds, stated by the
-   caller. Each must be at least 5,400 s (live plus cleanup) after now, else
+   caller. Each must be at least 10,200 s (live plus cleanup) after now, else
    `lifetime_insufficient`; the run records the window and the budget judge
    checks it covers the live end.
 4. `prior_item_output_tokens` is the item's earlier actual spend (0 to 32,768).
-   It counts against the aggregate guard and shrinks the schedule's room.
+   It counts against `item_output_token_cap` (default 32,768, explicitly approved
+   maximum 49,152). Each run still has its separate 32,768-token limit.
+   The next attempt records 16,384 prior tokens and an item cap of 49,152.
 5. `namespace` is at most 56 characters because the driver also owns
    `<namespace>-grants`, the custody namespace, created before helm.
 
@@ -495,7 +497,7 @@ p judge --criterion all
 The approved ceiling, exactly as `approved_ceiling()` builds it:
 
 ```text
-sessions=16,turns=192,session-turns=32,output-tokens=32768,session-output-tokens=8192,owner-output-tokens=16384,session-seconds=300,live-seconds=4800,cleanup-seconds=600,paid-retries=0,probe-model=claude-haiku-5-5,probe-output-tokens=32,probe-turns=1,probe-seconds=30
+sessions=16,turns=192,session-turns=32,output-tokens=32768,session-output-tokens=8192,owner-output-tokens=16384,session-seconds=600,live-seconds=9600,cleanup-seconds=600,paid-retries=0,probe-model=claude-haiku-5-5,probe-output-tokens=32,probe-turns=1,probe-seconds=30
 ```
 
 ### The 16-start manifest
@@ -511,9 +513,9 @@ sessions)`.
 |---|---|---|---|
 | a-probe | A | 1 probe | driver grant probe in an empty HOME, before A1 |
 | a1 | A | implementer, plan reviewer, diff reviewer | trusted admission, execute turn; reviewers via the Agent tool |
+| a2 | A | implementer, plan reviewer, diff reviewer | admission of the fresh successor after rejection |
 | b-probe | B | 1 probe | driver grant probe, before B1 |
 | b1 | B | implementer, plan reviewer, diff reviewer | trusted admission, execute turn |
-| a2 | A | implementer, plan reviewer, diff reviewer | admission of the fresh successor after rejection |
 | b-r1 | B | implementer, held at its prompt, zero usage | the `factory_ci` round-2 continuation consumed after the worker restart (reserved before B1's card is resolved) |
 | a3 | A | implementer | admission of the authorized follow-up; ended by disconnect |
 | b-r2 | B | implementer, diff reviewer, second diff reviewer | kernel runner-error retry on the same request and epoch |
@@ -529,18 +531,20 @@ reservation. The unpaid schedule check (G-SESSION-PLAN, run by `preflight` and
 reviewer 1,000, diff reviewer 800, probe 32 output tokens) and requires 16
 starts, a share of at least 2,700 for implementer groups and 1,000 for others,
 at least 16 turns per session, each owner at most 16,384 and the aggregate at
-most 32,768 minus prior spend, and every production transition mapped.
+most the smaller of 32,768 and the item cap minus prior spend, and every production transition mapped.
 
 ### Live phase order
 
 1. Unpaid: `refusals`, `namespace`, `images`, `install`, `setup` (Dex login and
    enrollment per owner), `forge`, `drill` (an undelivered card fails here,
    before any reservation or native start). Then `probe-a`, `attempt-a1`
-   (parks on card 1), `probe-b`, `attempt-b1` (parks on card 3). Every
+   (parks on card 1, refuses the unlisted operator and rejects as the listed
+   operator immediately after card delivery). Every
    attempt's pod is deleted at its park after terminal capture, so each later
    start is a fresh native process.
-2. `wrong-owner`, then `reject-a1` (unlisted operator refused, listed operator
-   rejects), `attempt-a2` (fresh successor in a new pod), `approve-a2`.
+2. `wrong-owner`, then `reject-a1` (verifies the earlier rejection),
+   `attempt-a2` (fresh successor in a new pod), `approve-a2`, `probe-b`,
+   `attempt-b1` (parks on card 3).
 3. `approve-b1` once A is quiescent: B-r1 is reserved before B1's card is
    resolved, because the worker keeps running to publish and production may
    start the repair early. Until `worker-stop` observes the worker gone, any
@@ -575,7 +579,7 @@ by its pid and start time and waits up to 240 s (hook timeout 250 s) for a
 release; a timeout fails closed. A long-lived in-pod stream reports holds to
 the driver, which waits until the harvest has read the transcript to the
 reported size, recomputes usage, and releases only if the session share,
-per-session cap, turns, 300 s, owner allocation (16,384) and aggregate guard
+per-session cap, turns, 600 s, owner allocation (16,384) and aggregate guard
 all hold. Every ceiling is inclusive: usage at a ceiling is within it, above
 it is a breach. A Stop or SubagentStop hold asks for nothing more, so it passes
 at a ceiling; any other hold precedes one more response, so it stops once the
@@ -592,9 +596,9 @@ Each run's clock is on the driver's monotonic clock and starts at the first
 observation of its native process (the runner container's start when the pod
 reports it, else the pod's discovery or its first hold); subagents run inside
 that process and share it, and it never stops. A watchdog thread, also run at
-every wait, stops a run at 300 s while its native process may still ask the
+every wait, stops a run at 600 s while its native process may still ask the
 model for more, including while the main session is idle after Stop, stops a
-kept hold 15 s before its hook gives up, and fences paid starts when the 4,800 s live window
+kept hold 15 s before its hook gives up, and fences paid starts when the 9,600 s live window
 ends, even while the main thread is blocked in a call. Known runner pods are
 deleted before any log read, scale call, claim discovery or lock wait on exit.
 Finalize keeps the watchdog until the fence has stopped execution and grant
@@ -626,7 +630,15 @@ capture receipt (sources read, failed reads) per capture channel and the trace
 backend the install values imply. The pod_logs receipt also names, by digest,
 each pod the driver removed: `before_deletion` when every log read before the
 removal succeeded, `uncaptured` otherwise. A rehearsal has no harvest or forge
-channel.
+channel. The ledger also commits content-free timing events as capture arrives:
+process and transcript starts, every assistant record timestamp and allowlisted
+stop reason, Stop/SubagentStop, native turn-end records, approval creation, card
+delivery, operator resolution, observed runner turn end, PR opening, pod removal
+and the watchdog clock reading at a fence. Session paths and record keys are
+digests. Partial records wait for their next chunk; historical transcript bytes
+from an earlier runtime are excluded. Missing native timestamps stay missing;
+an observation time does not replace them. A failed run retains these events
+even when full usage settlement is impossible.
 `traces_backend` `absent` (telemetry disabled) is the only way to pass without a
 trace capture; an external backend fails the audit.
 Public output is verdicts, booleans, counts and refusal codes: no identifier, no
@@ -653,10 +665,10 @@ CLI reads session files the driver writes 0600 and the finalizer removes.
    is a product question. It is not the wrong-owner Slack steer control.
 5. `curie cluster message` cannot target a GitHub-issue conversation, so no
    message control is recorded.
-6. A run's 300 s clock counts its native process's whole life from the first
+6. A run's 600 s clock counts its native process's whole life from the first
    observation, including idle time after the main session's Stop, because a
    previously released subagent may still be generating.
-7. The watchdog acts at its deadline (300 s, 4,800 s), as the ceiling decision
+7. The watchdog acts at its deadline (600 s, 9,600 s), as the ceiling decision
    says; settled usage exactly at a ceiling still passes the budget judge.
 8. The drill runs in the live run too. A publication approval owes no model
    wake and the approved drill publication's push Job fails fetching its
@@ -670,7 +682,7 @@ CLI reads session files the driver writes 0600 and the finalizer removes.
    seen during the run, including pods the product removed before finalization.
    Missing capture makes that group's usage unknown, charges its full share
    even if previously settled, and prevents a passing result.
-10. Grant windows cover the 4,800 s live window and the 600 s cleanup window;
+10. Grant windows cover the 9,600 s live window and the 600 s cleanup window;
     reservations recheck the fixed end of both windows after unpaid preparation.
 11. The shared forge probe polls the ref listing after deleting its own branch,
     for both scenarios, so an eventually consistent listing can converge before

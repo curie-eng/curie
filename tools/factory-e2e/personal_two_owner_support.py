@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import copy
 import dataclasses
+import datetime as dt
 import hashlib
 import hmac
 import html
@@ -73,12 +74,13 @@ MAX_TURNS = 192
 SESSION_TURNS = 32
 #: Output tokens across the run, and the item's aggregate actual-spend guard.
 MAX_OUTPUT_TOKENS = 32768
+MAX_ITEM_OUTPUT_TOKENS = 49152
 #: Output tokens in one session, checked after every response.
 SESSION_OUTPUT_TOKENS = 8192
 #: Absolute seconds one session may run before the runner is interrupted.
-SESSION_SECONDS = 300
+SESSION_SECONDS = 600
 #: Seconds from the live start to the end of paid work.
-LIVE_SECONDS = 4800
+LIVE_SECONDS = MAX_SESSIONS * SESSION_SECONDS
 #: Seconds the finalizer may spend after the live window.
 CLEANUP_SECONDS = 600
 #: No paid retry, diagnostic rerun or second live start for a run ID.
@@ -180,6 +182,7 @@ _TOP_KEYS = frozenset(
         "owners",
         "independent_accounts",
         "prior_item_output_tokens",
+        "item_output_token_cap",
         "probe_cli",
     }
 )
@@ -196,7 +199,9 @@ _GRANT_KEY = re.compile(
     r"token|grant|secret|passw|credential|oauth|api[_-]?key|cookie|session|bearer|private",
     re.IGNORECASE,
 )
-_ALLOWED_GRANT_KEYS = frozenset({"grant_file", "slack_bot_token_file", "prior_item_output_tokens"})
+_ALLOWED_GRANT_KEYS = frozenset(
+    {"grant_file", "slack_bot_token_file", "prior_item_output_tokens", "item_output_token_cap"}
+)
 # Token-shaped content: known credential prefixes, a bearer value, PEM, or a
 # long unbroken run of token alphabet mixing upper case, lower case and digits.
 _TOKEN_PREFIX = re.compile(
@@ -295,6 +300,7 @@ class ScenarioInputs:
     independent_accounts: bool
     prior_item_output_tokens: int
     probe_cli: str
+    item_output_token_cap: int = MAX_OUTPUT_TOKENS
 
     def __repr__(self) -> str:
         return f"<scenario inputs mode={self.mode}>"
@@ -539,6 +545,9 @@ def load_inputs_file(path: Path, *, mode: Literal["setup", "live"], now: float) 
     prior = document.get("prior_item_output_tokens", 0 if mode == "setup" else None)
     if type(prior) is not int or not 0 <= prior <= MAX_OUTPUT_TOKENS:
         raise pps.Refusal("inputs_invalid", "prior_item_output_tokens")
+    item_cap = document.get("item_output_token_cap", MAX_OUTPUT_TOKENS)
+    if type(item_cap) is not int or not prior < item_cap <= MAX_ITEM_OUTPUT_TOKENS:
+        raise pps.Refusal("inputs_invalid", "item_output_token_cap")
     owners: list[OwnerInput] = []
     independent = False
     if mode == "live":
@@ -573,6 +582,7 @@ def load_inputs_file(path: Path, *, mode: Literal["setup", "live"], now: float) 
         independent_accounts=independent,
         prior_item_output_tokens=prior,
         probe_cli=probe_cli,
+        item_output_token_cap=item_cap,
     )
 
 
@@ -615,18 +625,18 @@ MANIFEST: tuple[Group, ...] = (
         (IMPLEMENTER, PLAN_REVIEWER, DIFF_REVIEWER),
         "trusted admission, execute turn; reviewers via Agent",
     ),
+    Group(
+        "a2",
+        "a",
+        (IMPLEMENTER, PLAN_REVIEWER, DIFF_REVIEWER),
+        "admission of the fresh successor after rejection",
+    ),
     Group("b-probe", "b", (PROBE,), "driver grant probe, empty HOME, before B1", "probe"),
     Group(
         "b1",
         "b",
         (IMPLEMENTER, PLAN_REVIEWER, DIFF_REVIEWER),
         "trusted admission, execute turn",
-    ),
-    Group(
-        "a2",
-        "a",
-        (IMPLEMENTER, PLAN_REVIEWER, DIFF_REVIEWER),
-        "admission of the fresh successor after rejection",
     ),
     Group(
         "b-r1",
@@ -731,6 +741,7 @@ def _impossible(reason: str) -> pps.Refusal:
 def schedule_check(
     prior_item_output_tokens: int,
     *,
+    item_output_token_cap: int = MAX_OUTPUT_TOKENS,
     manifest: Sequence[Group] = MANIFEST,
     transitions: Mapping[str, str] = TRANSITIONS,
     usage: Mapping[str, int] = PLANNING_USAGE,
@@ -756,6 +767,12 @@ def schedule_check(
         0 <= prior_item_output_tokens <= MAX_OUTPUT_TOKENS
     ):
         raise _impossible("prior spend outside 0..32768")
+    if (
+        type(item_output_token_cap) is not int
+        or not prior_item_output_tokens < item_output_token_cap <= MAX_ITEM_OUTPUT_TOKENS
+    ):
+        raise _impossible("invalid item cap")
+    run_limit = min(MAX_OUTPUT_TOKENS, item_output_token_cap - prior_item_output_tokens)
     names = [group.name for group in manifest]
     if len(set(names)) != len(names):
         raise _impossible("duplicate group name")
@@ -817,7 +834,7 @@ def schedule_check(
                 owner_used += tokens
         count = len(group.roles)
         owner_left = OWNER_OUTPUT_TOKENS - owner_used
-        aggregate_left = MAX_OUTPUT_TOKENS - prior_item_output_tokens - aggregate_used
+        aggregate_left = run_limit - aggregate_used
         if group.kind == "probe":
             share, turn_share = PROBE_OUTPUT_TOKENS, PROBE_TURNS
             if min(owner_left, aggregate_left) < share * count:
@@ -852,7 +869,7 @@ def schedule_check(
         if total > OWNER_OUTPUT_TOKENS:
             raise _impossible(f"owner {owner} plans {total} output tokens, over 16384")
     aggregate = sum(owner_totals.values())
-    limit = MAX_OUTPUT_TOKENS - prior_item_output_tokens
+    limit = run_limit
     if aggregate > limit:
         raise _impossible(f"the aggregate plans {aggregate} output tokens, over {limit}")
     total_turns = sum(row["planned_turns"] for row in rows)
@@ -871,6 +888,7 @@ def schedule_check(
         "owner_totals": owner_totals,
         "aggregate": aggregate,
         "prior_item_output_tokens": prior_item_output_tokens,
+        "item_output_token_cap": item_output_token_cap,
         "aggregate_limit": limit,
         "planned_turns": total_turns,
         "transitions": len(transitions),
@@ -919,6 +937,37 @@ _GROUP_SCHEMA = (
     "owner TEXT NOT NULL, grp TEXT NOT NULL, PRIMARY KEY (run_id, seq))"
 )
 PRIOR_SPEND_KEY = "prior_item_output_tokens"
+ITEM_CAP_KEY = "item_output_token_cap"
+_TIMING_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS timings (run_id TEXT NOT NULL, grp TEXT NOT NULL, "
+    "session_digest TEXT NOT NULL, event TEXT NOT NULL, event_key TEXT NOT NULL, "
+    "at REAL, observed_at REAL NOT NULL, stop_reason TEXT, elapsed REAL, "
+    "PRIMARY KEY(run_id,grp,session_digest,event,event_key))"
+)
+TIMING_EVENTS = frozenset(
+    {
+        "native_start",
+        "assistant",
+        "stop",
+        "subagent_stop",
+        "turn_end",
+        "process_start",
+        "reservation",
+        "approval_requested",
+        "card_delivered",
+        "resolution_started",
+        "resolution_finished",
+        "runner_turn_end_observed",
+        "pod_deleted",
+        "pr_open",
+        "watchdog_fence",
+        "fence",
+        "pod_delete_requested",
+    }
+)
+STOP_REASONS = frozenset(
+    {"end_turn", "tool_use", "max_tokens", "stop_sequence", "pause_turn", "refusal"}
+)
 UNMAPPED = "unmapped"
 
 
@@ -944,6 +993,7 @@ class TwoOwnerLedger(pps.Ledger):
         ledger = cast("TwoOwnerLedger", super().open(state_dir, run_id, scrubber=scrubber))
         with ledger.transaction() as db:
             db.execute(_GROUP_SCHEMA)
+            db.execute(_TIMING_SCHEMA)
         return ledger
 
     @classmethod
@@ -960,6 +1010,67 @@ class TwoOwnerLedger(pps.Ledger):
         return ledger
 
     # -- settings recorded once ------------------------------------------
+
+    def record_timing(
+        self,
+        group: str,
+        session: str,
+        event: str,
+        key: str,
+        at: float | None,
+        *,
+        observed_at: float,
+        stop_reason: str | None = None,
+        elapsed: float | None = None,
+    ) -> None:
+        if event not in TIMING_EVENTS or not re.fullmatch(r"[a-z0-9_-]{1,40}", group):
+            raise pps.Refusal("arguments_invalid", "timing event")
+        for value in (at, observed_at, elapsed):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise pps.Refusal("arguments_invalid", "timing clock")
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO timings VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                (
+                    self.run_id,
+                    group,
+                    pps.ref_digest(session),
+                    event,
+                    pps.ref_digest(key),
+                    at,
+                    observed_at,
+                    stop_reason if stop_reason in STOP_REASONS else None,
+                    elapsed,
+                ),
+            )
+
+    def timing_rows(self) -> list[dict[str, Any]]:
+        cursor = self.db.execute(
+            "SELECT grp,session_digest,event,event_key,at,observed_at,stop_reason,elapsed "
+            "FROM timings WHERE run_id=? ORDER BY observed_at,rowid",
+            (self.run_id,),
+        )
+        names = [item[0] for item in cursor.description]
+        return [dict(zip(names, row, strict=True)) for row in cursor]
+
+    def set_item_cap(self, cap: int) -> None:
+        if type(cap) is not int or not 0 < cap <= MAX_ITEM_OUTPUT_TOKENS:
+            raise pps.Refusal("arguments_invalid", ITEM_CAP_KEY)
+        with self.transaction() as db:
+            if self._recorded(db, ITEM_CAP_KEY) is None and self._rows(db):
+                raise pps.Refusal("arguments_invalid", "item cap after a reservation")
+            self._write_once(db, ITEM_CAP_KEY, cap)
+
+    def aggregate_ceiling(self) -> int:
+        value = self._recorded(self.db, ITEM_CAP_KEY)
+        cap = MAX_OUTPUT_TOKENS if value is None else value
+        if type(cap) is not int or not 0 < cap <= MAX_ITEM_OUTPUT_TOKENS:
+            raise pps.Refusal("ledger_unsafe", ITEM_CAP_KEY)
+        return min(cap, self.prior_spend() + self.output_token_ceiling())
 
     def _recorded(self, db: sqlite3.Connection, key: str) -> Any:
         row = db.execute(
@@ -1154,7 +1265,7 @@ class TwoOwnerLedger(pps.Ledger):
             owner_used = sum(self._tokens(row, None) for row in rows if row["owner"] == group.owner)
             aggregate_used = sum(self._tokens(row, None) for row in rows) + self._prior(db)
             owner_left = OWNER_OUTPUT_TOKENS - owner_used
-            aggregate_left = self.output_token_ceiling() - aggregate_used
+            aggregate_left = self.aggregate_ceiling() - aggregate_used
             if group.kind == "probe":
                 tokens, turns, seconds = PROBE_OUTPUT_TOKENS, PROBE_TURNS, float(PROBE_SECONDS)
                 if owner_left < tokens * count:
@@ -1279,7 +1390,7 @@ class TwoOwnerLedger(pps.Ledger):
             spent = sum(self._tokens(row, None) for row in actual if row["owner"] == owner)
             exceeded |= spent > OWNER_OUTPUT_TOKENS
         aggregate = sum(self._tokens(row, None) for row in actual) + self._prior(db)
-        exceeded |= aggregate > self.output_token_ceiling()
+        exceeded |= aggregate > self.aggregate_ceiling()
         exceeded |= sum(self._turns(row) for row in actual) > MAX_TURNS
         if exceeded:
             self._mark_exceeded(db)
@@ -1288,6 +1399,103 @@ class TwoOwnerLedger(pps.Ledger):
 # --------------------------------------------------------------------------
 # E. The in-pod response gate
 # --------------------------------------------------------------------------
+
+
+class TimingHarvest(pps.HarvestState):
+    def __init__(
+        self,
+        scan: pps.TokenScan,
+        ledger: TwoOwnerLedger,
+        group: str,
+        clock: Callable[[], float],
+        *,
+        not_before: float = 0.0,
+        baseline: Mapping[str, bytes] | None = None,
+    ) -> None:
+        super().__init__(scan)
+        self.ledger, self.group, self.clock = ledger, group, clock
+        self.timing_offsets = {path: len(data) for path, data in (baseline or {}).items()}
+        self.timing_started: set[str] = set()
+        self.not_before = not_before
+
+    def feed(self, line: bytes) -> None:
+        super().feed(line)
+        for path, data in self.files.items():
+            if not path.endswith(".jsonl"):
+                continue
+            offset = self.timing_offsets.get(path, 0)
+            while (end := data.find(b"\n", offset)) >= 0:
+                try:
+                    record = json.loads(data[offset:end])
+                except ValueError:
+                    record = None
+                if isinstance(record, dict):
+                    self.record_transcript(path, offset, record)
+                offset = end + 1
+            self.timing_offsets[path] = offset
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return
+        if isinstance(record, dict) and record.get("kind") == "process":
+            for process in self.processes:
+                start = process.get("start")
+                if (
+                    isinstance(start, (int, float))
+                    and not isinstance(start, bool)
+                    and math.isfinite(start)
+                    and start >= self.not_before
+                ):
+                    self.ledger.record_timing(
+                        self.group,
+                        "",
+                        "process_start",
+                        str(process.get("pid")) + str(start),
+                        float(start),
+                        observed_at=self.clock(),
+                    )
+
+    def record_transcript(self, path: str, offset: int, record: Mapping[str, Any]) -> None:
+        at = None
+        try:
+            stamp = record.get("timestamp")
+            if isinstance(stamp, str):
+                at = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+        except (ValueError, OverflowError, OSError):
+            pass
+        if at is not None and not math.isfinite(at):
+            at = None
+        if at is not None and at < self.not_before:
+            return
+        session = path.removesuffix(".jsonl")
+        if at is not None and session not in self.timing_started:
+            self.ledger.record_timing(
+                self.group, session, "native_start", "start", at, observed_at=self.clock()
+            )
+            self.timing_started.add(session)
+        kind = record.get("type")
+        event = (
+            "assistant"
+            if kind == "assistant"
+            else (
+                "turn_end"
+                if kind == "system" and record.get("subtype") == "turn_duration"
+                else None
+            )
+        )
+        if event:
+            message = record.get("message")
+            reason = message.get("stop_reason") if isinstance(message, dict) else None
+            self.ledger.record_timing(
+                self.group,
+                session,
+                event,
+                str(offset),
+                at,
+                observed_at=self.clock(),
+                stop_reason=reason if isinstance(reason, str) else None,
+            )
+
 
 GATE_DIR = "/tmp/pto-gate"
 GATE_FILE = "two_owner_gate.py"
@@ -1634,6 +1842,7 @@ def gate_decision(
     session_started_at: float | None,
     now: float,
     final: bool,
+    aggregate_ceiling: int = MAX_OUTPUT_TOKENS,
 ) -> tuple[str, str]:
     """``("go", "")`` or ``("stop", reason)`` for one hold. Pure.
 
@@ -1674,7 +1883,7 @@ def gate_decision(
             return "stop", "session_seconds"
         if owner_spent > OWNER_OUTPUT_TOKENS:
             return "stop", "owner_allocation"
-        if aggregate_spent > MAX_OUTPUT_TOKENS:
+        if aggregate_spent > aggregate_ceiling:
             return "stop", "aggregate_guard"
         return "go", ""
     if tokens >= reservation.output_tokens:
@@ -1687,7 +1896,7 @@ def gate_decision(
         return "stop", "session_seconds"
     if owner_spent + RESPONSE_OUTPUT_TOKENS > OWNER_OUTPUT_TOKENS:
         return "stop", "owner_allocation"
-    if aggregate_spent + len(OWNERS) * RESPONSE_OUTPUT_TOKENS > MAX_OUTPUT_TOKENS:
+    if aggregate_spent + len(OWNERS) * RESPONSE_OUTPUT_TOKENS > aggregate_ceiling:
         return "stop", "aggregate_guard"
     return "go", ""
 
@@ -3235,7 +3444,7 @@ def _judge_budget(ledger: TwoOwnerLedger) -> tuple[dict[str, bool], dict[str, in
             f"owner_output_within_{owner}": known and tokens[owner] <= OWNER_OUTPUT_TOKENS
             for owner in OWNERS
         },
-        "aggregate_output_within": known and total + prior <= MAX_OUTPUT_TOKENS,
+        "aggregate_output_within": known and total + prior <= ledger.aggregate_ceiling(),
         "budget_not_exceeded": run["budget_state"] == "ok",
         "no_paid_retry": run["live_starts"] == 1 and "paid_retry" not in observed,
         "live_elapsed_within": live_start is not None
@@ -3256,6 +3465,7 @@ def _judge_budget(ledger: TwoOwnerLedger) -> tuple[dict[str, bool], dict[str, in
         "assistant_turns": sum(int(row["assistant_turns"] or 0) for row in rows),
         "output_tokens": total,
         "prior_item_output_tokens": prior,
+        "item_output_token_cap": ledger.aggregate_ceiling(),
         **{f"output_tokens_{owner}": tokens[owner] for owner in OWNERS},
         "retry_refusals": ledger.observation_int("budget", "retry_refusals"),
     }

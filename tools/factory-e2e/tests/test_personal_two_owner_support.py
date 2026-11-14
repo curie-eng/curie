@@ -101,7 +101,7 @@ def _kit(tmp_path: Path) -> dict[str, Any]:
         "gateway": {"slack_bot_token_file": str(slack), "resolution_channel": CHANNEL},
         "owners": {
             "a": {"grant_file": str(grant_a), "usable_until": int(WINDOW)},
-            "b": {"grant_file": str(grant_b), "usable_until": "2027-01-15T10:00:00+00:00"},
+            "b": {"grant_file": str(grant_b), "usable_until": "2027-01-15T12:00:00+00:00"},
         },
         "independent_accounts": True,
         "prior_item_output_tokens": 0,
@@ -164,7 +164,7 @@ def test_ceilings_are_the_approved_numbers() -> None:
         8192,
         16384,
     )
-    assert (pto.SESSION_SECONDS, pto.LIVE_SECONDS, pto.CLEANUP_SECONDS) == (300, 4800, 600)
+    assert (pto.SESSION_SECONDS, pto.LIVE_SECONDS, pto.CLEANUP_SECONDS) == (600, 9600, 600)
     assert (pto.PAID_RETRIES, pto.PROBE_OUTPUT_TOKENS, pto.PROBE_SECONDS) == (0, 32, 30)
     assert pto.PROBE_MODEL == "claude-haiku-5-5" == pps.GRANT_PROBE_MODEL
     assert pto.RESPONSE_OUTPUT_TOKENS == 2048
@@ -177,8 +177,8 @@ def test_approved_ceiling_is_canonical_and_accepted() -> None:
     text = pto.approved_ceiling()
     assert text == (
         "sessions=16,turns=192,session-turns=32,output-tokens=32768,"
-        "session-output-tokens=8192,owner-output-tokens=16384,session-seconds=300,"
-        "live-seconds=4800,cleanup-seconds=600,paid-retries=0,probe-model=claude-haiku-5-5,"
+        "session-output-tokens=8192,owner-output-tokens=16384,session-seconds=600,"
+        "live-seconds=9600,cleanup-seconds=600,paid-retries=0,probe-model=claude-haiku-5-5,"
         "probe-output-tokens=32,probe-turns=1,probe-seconds=30"
     )
     pto.require_live_approval(text)
@@ -221,8 +221,8 @@ def test_live_inputs_load_both_owners_without_grant_bytes(tmp_path: Path) -> Non
     assert inputs.mode == "live" and inputs.independent_accounts is True
     assert [item.owner for item in inputs.owners] == ["a", "b"]
     assert inputs.owner("a").usable_until == WINDOW
-    # T0 is 2027-01-15T08:00:00Z, so the ISO bound is two hours later.
-    assert inputs.owner("b").usable_until == T0 + 7200
+    # T0 is 2027-01-15T08:00:00Z, so the ISO bound is four hours later.
+    assert inputs.owner("b").usable_until == T0 + 14400
     assert inputs.target.context == CONTEXT
     assert inputs.target.registry == "localhost:5999" and inputs.target.registry_port == 5999
     assert inputs.target.grant_namespace == "pto-acme-1-grants"
@@ -389,6 +389,9 @@ INVALID_CORPUS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
     ("prior too large", lambda doc: _set(doc, "prior_item_output_tokens", 32769)),
     ("prior bool", lambda doc: _set(doc, "prior_item_output_tokens", True)),
     ("prior string", lambda doc: _set(doc, "prior_item_output_tokens", "0")),
+    ("item cap too large", lambda doc: _set(doc, "item_output_token_cap", 49153)),
+    ("item cap bool", lambda doc: _set(doc, "item_output_token_cap", True)),
+    ("item cap exhausted", lambda doc: _set(doc, "item_output_token_cap", 0)),
     ("probe cli space", lambda doc: _set(doc, "probe_cli", "claude --x")),
     ("list value", lambda doc: _set(doc, "probe_cli", ["claude"])),
 ]
@@ -596,6 +599,65 @@ def test_schedule_check_passes_the_approved_plan() -> None:
     assert result["verdict"] == "pass"
 
 
+def test_renewed_item_allowance_keeps_an_independent_run_cap(tmp_path: Path) -> None:
+    document = _kit(tmp_path)
+    document.update(prior_item_output_tokens=16384, item_output_token_cap=49152)
+    inputs = _load(tmp_path, document)
+    assert inputs.item_output_token_cap == 49152 and inputs.prior_item_output_tokens == 16384
+    result = pto.schedule_check(16384, item_output_token_cap=49152)
+    assert result["aggregate_limit"] == 32768
+    ledger = _ledger(tmp_path, prior=16384)
+    ledger.set_item_cap(49152)
+    for group in pto.MANIFEST:
+        reservations = ledger.reserve_group(group.name, now=T0)
+        _settle(ledger, reservations)
+    assert ledger.aggregate_spent() == 16384 + sum(
+        int(row["output_tokens"] or 0) for row in ledger.session_rows()
+    )
+    assert ledger.aggregate_ceiling() == 49152
+    assert ledger.budget_state() == "ok"
+    empty = _ledger(tmp_path / "new-item")
+    empty.set_item_cap(49152)
+    assert empty.aggregate_ceiling() == 32768
+    assert pto.gate_decision(
+        session_usage=pps.SessionUsage(1, 1, 1, pps.IMPLEMENTER_MODEL),
+        reservation=pps.Reservation(1, 1, pto.IMPLEMENTER, 8192, 32, 600),
+        owner_spent=1,
+        aggregate_spent=32769,
+        aggregate_ceiling=empty.aggregate_ceiling(),
+        session_started_at=T0,
+        now=T0 + 1,
+        final=True,
+    ) == ("stop", "aggregate_guard")
+
+
+def test_session_clock_and_grant_window_follow_the_600_second_ruling(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    _settle(ledger, ledger.reserve_group("a-probe", now=T0))
+    reservation = ledger.reserve_group("a1", now=T0)[0]
+    assert reservation.seconds == 600
+    usage = pps.SessionUsage(1, 1, 599, pps.IMPLEMENTER_MODEL)
+    assert pto.gate_decision(
+        session_usage=usage,
+        reservation=reservation,
+        owner_spent=1,
+        aggregate_spent=1,
+        session_started_at=T0,
+        now=T0 + 599,
+        final=False,
+    ) == ("go", "")
+    assert pto.gate_decision(
+        session_usage=usage,
+        reservation=reservation,
+        owner_spent=1,
+        aggregate_spent=1,
+        session_started_at=T0,
+        now=T0 + 600,
+        final=False,
+    ) == ("stop", "session_seconds")
+    assert pto.GRANT_MIN_LIFETIME == 10200
+
+
 def test_schedule_check_accepts_the_largest_prior_spend() -> None:
     assert pto.schedule_check(8312)["aggregate_limit"] == 32768 - 8312
 
@@ -634,7 +696,7 @@ IMPOSSIBLE: list[tuple[str, int, Callable[[], dict[str, Any]], str]] = [
         "owner a plans 16832",
     ),
     ("prior spend leaves the aggregate short", 8313, dict, "a3: share 2699"),
-    ("prior spend far over", 20000, dict, "a2: share 1234"),
+    ("prior spend far over", 20000, dict, "b1: share 1234"),
     ("prior spend over the ceiling", 32769, dict, "prior spend"),
     (
         "turn share under 16",
@@ -946,7 +1008,7 @@ def test_reserve_group_boundaries_are_admitted(tmp_path: Path) -> None:
 
 def test_open_session_of_the_other_owner_is_charged_at_its_share(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
-    _reserve_through(ledger, "a2")
+    _reserve_through(ledger, "b1")
     b_r1 = ledger.reserve_group("b-r1", now=T0 + 20)
     assert b_r1[0].output_tokens == 8192
     assert ledger.owner_spent("b") == 4532 + 8192
@@ -1112,7 +1174,7 @@ def test_settle_within_bounds_keeps_the_budget(tmp_path: Path) -> None:
 def test_settled_usage_at_every_ceiling_keeps_the_budget(
     tmp_path: Path, extra: int, state: str
 ) -> None:
-    # Inclusive ceilings: a session at 8,192 tokens, 32 turns and 300 s is within;
+    # Inclusive ceilings: a session at 8,192 tokens, 32 turns and 600 s is within;
     # the owner then reaches exactly 16,384 output tokens, and one more is over.
     ledger = _ledger(tmp_path)
     _settle(ledger, ledger.reserve_group("a-probe", now=T0))
@@ -1169,7 +1231,12 @@ def test_open_existing_requires_a_two_owner_ledger(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 RESERVATION = pps.Reservation(
-    seq=2, attempt=2, role="implementer", output_tokens=5000, turns=32, seconds=300.0
+    seq=2,
+    attempt=2,
+    role="implementer",
+    output_tokens=5000,
+    turns=32,
+    seconds=float(pto.SESSION_SECONDS),
 )
 FULL_SHARE = dataclasses.replace(RESERVATION, output_tokens=8192)
 
@@ -1224,7 +1291,7 @@ def test_gate_decision_releases_within_every_bound() -> None:
             },
             "session_turns",
         ),
-        ({"now": T0 + 300}, "session_seconds"),
+        ({"now": T0 + pto.SESSION_SECONDS}, "session_seconds"),
         (
             {"owner_spent": pto.OWNER_OUTPUT_TOKENS - pto.RESPONSE_OUTPUT_TOKENS + 1},
             "owner_allocation",
@@ -2577,7 +2644,7 @@ LEDGER_BREAKS: list[tuple[str, Callable[[pto.TwoOwnerLedger], None], str]] = [
     ("paid retry recorded", lambda led: led.record("budget", "paid_retry", True), "no_paid_retry"),
     (
         "live window overrun",
-        lambda led: _session(led, "UPDATE runs SET live_ended_at=?", T0 + 4801),
+        lambda led: _session(led, "UPDATE runs SET live_ended_at=?", T0 + pto.LIVE_SECONDS + 1),
         "live_elapsed_within",
     ),
     (
@@ -2602,7 +2669,7 @@ LEDGER_BREAKS: list[tuple[str, Callable[[pto.TwoOwnerLedger], None], str]] = [
     ),
     (
         "session over its bound",
-        lambda led: _session(led, "UPDATE sessions SET elapsed=301 WHERE seq=2"),
+        lambda led: _session(led, "UPDATE sessions SET elapsed=601 WHERE seq=2"),
         "session_bounds",
     ),
     (

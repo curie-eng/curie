@@ -29,9 +29,9 @@ reads session and token files the driver writes 0600 into the private work
 directory, and the finalizer removes them.
 
 After the drill, the paid phases (``PAID_PHASES``) follow the live timeline: a
-grant probe per owner, A1 and B1 parked on their cards with A1's pod deleted at
-the park, the wrong-owner controls, A1's rejection and its fresh successor A2, both
-approvals, a worker stop that lets B's real failing check queue the
+grant probe for A, A1 parked and rejected after its pod is deleted, the
+wrong-owner controls and rejection verification, its fresh successor A2 and
+approval, B's probe and B1 publication, a worker stop that lets B's real failing check queue the
 production repair, A's follow-up A3, the worker restart, B-r1 held at its
 prompt while A3 runs one tool, A's disconnect, the process interruption that
 makes the kernel retry B's repair as B-r2, B's revision-2 approval, and the
@@ -96,12 +96,12 @@ REHEARSAL_CUT = "rehearsal-controls"
 PAID_PHASES = (
     "probe-a",
     "attempt-a1",
-    "probe-b",
-    "attempt-b1",
     "wrong-owner",
     "reject-a1",
     "attempt-a2",
     "approve-a2",
+    "probe-b",
+    "attempt-b1",
     "approve-b1",
     "worker-stop",
     "queue-a3",
@@ -860,7 +860,9 @@ def cmd_preflight(args: argparse.Namespace, runtime: pp.Runtime) -> int:
     pp.base_inputs(args)
     pto.require_live_approval(getattr(args, "approve_live", None))
     inputs, scenario = load_scenario(args, runtime, "live")
-    schedule = pto.schedule_check(scenario.prior_item_output_tokens)
+    schedule = pto.schedule_check(
+        scenario.prior_item_output_tokens, item_output_token_cap=scenario.item_output_token_cap
+    )
     ledger = pto.TwoOwnerLedger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
     try:
         ledger.ensure_run(inputs.candidate, phase="preflight")
@@ -902,7 +904,9 @@ def cmd_run(args: argparse.Namespace, runtime: pp.Runtime) -> int:
     pp.base_inputs(args)
     pto.require_live_approval(getattr(args, "approve_live", None))
     inputs, scenario = load_scenario(args, runtime, "live")
-    schedule = pto.schedule_check(scenario.prior_item_output_tokens)
+    schedule = pto.schedule_check(
+        scenario.prior_item_output_tokens, item_output_token_cap=scenario.item_output_token_cap
+    )
     ledger = pto.TwoOwnerLedger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
     try:
         if ledger.is_rehearsal():
@@ -910,6 +914,7 @@ def cmd_run(args: argparse.Namespace, runtime: pp.Runtime) -> int:
         ledger.ensure_run(inputs.candidate, phase="run")
         ledger.refuse_paid_retry()
         ledger.set_prior_spend(scenario.prior_item_output_tokens)
+        ledger.set_item_cap(scenario.item_output_token_cap)
         for owner in scenario.owners:
             ledger.set_owner_window(owner.owner, owner.usable_until)
         ledger.record("budget", "schedule_check_passed", schedule["verdict"] == "pass")
@@ -928,7 +933,9 @@ def cmd_rehearse(args: argparse.Namespace, runtime: pp.Runtime) -> int:
         raise pps.Refusal("arguments_invalid", "rehearse takes no --approve-live")
     pp.base_inputs(args)
     inputs, scenario = load_scenario(args, runtime, "setup")
-    schedule = pto.schedule_check(scenario.prior_item_output_tokens)
+    schedule = pto.schedule_check(
+        scenario.prior_item_output_tokens, item_output_token_cap=scenario.item_output_token_cap
+    )
     ledger = pto.TwoOwnerLedger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
     try:
         ledger.ensure_run(inputs.candidate, phase="rehearse")
@@ -1421,6 +1428,15 @@ class TwoOwnerRun(pp.LiveRun):
         files = self.pod_files(run)
         facts = self.pod_facts(run, files)
         stem, role, session = self.session_of(run, record, facts)
+        if mode in pto.FINAL_MODES:
+            self.owner_ledger.record_timing(
+                run.group,
+                stem,
+                "stop" if mode == "stop" else "subagent_stop",
+                key,
+                record.get("written_at"),
+                observed_at=self.clock.now(),
+            )
         usage = pto.hold_usage(session, initial_prompt=initial)
         reservation = self.map_session(run, stem, role, usage)
         if session is not None and (session.synthetic or session.errors):
@@ -1445,6 +1461,7 @@ class TwoOwnerRun(pp.LiveRun):
             session_started_at=run.clock_started,
             now=now,
             final=mode in pto.FINAL_MODES,
+            aggregate_ceiling=self.owner_ledger.aggregate_ceiling(),
         )
         if verdict != "go":
             self.stop_session(run, reason, record=record, role=role)
@@ -1701,7 +1718,7 @@ class TwoOwnerRun(pp.LiveRun):
 
     @staticmethod
     def session_limit(run: PodRun) -> float:
-        """The run's session seconds: 300, or less where one of its reservations holds less."""
+        """The approved session seconds, bounded by every reservation."""
 
         return min(
             [float(pto.SESSION_SECONDS), *(float(item.seconds) for item in run.reservations)]
@@ -1762,6 +1779,12 @@ class TwoOwnerRun(pp.LiveRun):
     def trip(self, run: PodRun | None, reason: str) -> None:
         """The watchdog's stop: interrupt the run, charge every open share, fence, fail."""
 
+        at = self.clock.now()
+        elapsed = (
+            self.clock.monotonic() - run.clock_started
+            if run and run.clock_started is not None
+            else None
+        )
         self.interrupt_known_runners()
         where = run.group if run is not None else "live"
         entry = f"{where}:-:{reason}"
@@ -1769,6 +1792,18 @@ class TwoOwnerRun(pp.LiveRun):
             self.paid_failure = f"{where}: the watchdog stopped paid work ({reason})"
             self.watch_trips.append(entry)
             book = self.book()
+            self.safe(
+                lambda: book.record_timing(
+                    where,
+                    "",
+                    "watchdog_fence",
+                    entry,
+                    at,
+                    observed_at=self.clock.now(),
+                    elapsed=elapsed,
+                ),
+                None,
+            )
             trips = sorted(set(self.watch_trips))
             self.safe(lambda: book.record("diagnostics", "watchdog_trips", trips), None)
             self.safe(lambda: self.note_stop(entry, reason), None)
@@ -1887,13 +1922,19 @@ class TwoOwnerRun(pp.LiveRun):
     def interrupt_known_runners(self, runs: Sequence[PodRun] | None = None) -> None:
         """Issue every known pod delete before taking a lock or doing other IO."""
 
-        removed: list[PodRun] = []
+        removed: list[tuple[PodRun, float, float | None]] = []
         for run in list(self.pods) if runs is None else runs:
             run.ending = run.stopped = True
             identity = run.pod_uid or run.pod
             if not run.pod or identity in self.deleted_uids:
                 continue
-            self.pod_deletions.append((run.pod, run.pod_uid, self.clock.now()))
+            at = self.clock.now()
+            elapsed = (
+                self.clock.monotonic() - run.clock_started
+                if run.clock_started is not None
+                else None
+            )
+            self.pod_deletions.append((run.pod, run.pod_uid, at))
             result = self.safe(
                 functools.partial(
                     self.kube.ctl,
@@ -1910,14 +1951,28 @@ class TwoOwnerRun(pp.LiveRun):
             )
             if result is not None and result.returncode == 0:
                 self.deleted_uids.add(identity)
-            removed.append(run)
-        for run in removed:
+            removed.append((run, at, elapsed))
+        for run, at, elapsed in removed:
             self.note_removal(
                 run.pod,
                 workload="runner",
                 step="emergency-stop",
                 captured=(run.pod_uid, run.restart_count) in self.runner_log_instances,
             )
+            for event in ("fence", "pod_delete_requested"):
+                self.safe(
+                    functools.partial(
+                        self.book().record_timing,
+                        run.group,
+                        "",
+                        event,
+                        "emergency-stop",
+                        at,
+                        observed_at=self.clock.now(),
+                        elapsed=elapsed,
+                    ),
+                    None,
+                )
 
     def charge_open(self) -> None:
         """Every reserved, unsettled session becomes unknown: charged at its full share."""
@@ -2073,6 +2128,9 @@ class TwoOwnerRun(pp.LiveRun):
         run.reserved_at = now
         self.reserved_at[run.group] = now
         self.attempts[run.number] = run
+        self.owner_ledger.record_timing(
+            run.group, "", "reservation", "reserved", now, observed_at=now
+        )
 
     def admit_group(self, run: PodRun, owner: Owner) -> None:
         """Reserve the group, then admit it on the owner's own tracker issue."""
@@ -2362,8 +2420,6 @@ class TwoOwnerRun(pp.LiveRun):
     def open_harvest(self, run: PodRun) -> None:
         """``pps.HARVEST_PROGRAM`` in the runner container, fed under the run's lock."""
 
-        state = pps.HarvestState(self.scan)
-        run.harvest = state
         run.eof = threading.Event()
         process = self.shell.spawn(
             [
@@ -2392,10 +2448,26 @@ class TwoOwnerRun(pp.LiveRun):
         eof = run.eof
 
         def read() -> None:
-            for line in process.stdout if process.stdout is not None else []:
+            ledger = pto.TwoOwnerLedger.open(self.inputs.state_dir, self.inputs.run_id)
+            state = pto.TimingHarvest(
+                self.scan,
+                ledger,
+                run.group,
+                self.clock.now,
+                not_before=self.not_before(run),
+                baseline=run.baseline,
+            )
+            run.harvest = state
+            try:
+                for line in process.stdout if process.stdout is not None else []:
+                    with run.harvest_lock:
+                        state.feed(line)
+            except Exception:  # noqa: BLE001
                 with run.harvest_lock:
-                    state.feed(line)
-            eof.set()
+                    state.bad_lines += 1
+            finally:
+                ledger.close()
+                eof.set()
 
         def drain() -> None:
             for line in process.stderr if process.stderr is not None else []:
@@ -2492,6 +2564,9 @@ class TwoOwnerRun(pp.LiveRun):
             lambda: self.pod_uid_gone(run), until=until, what=f"{run.group} pod removal", every=2.0
         )
         run.gone_at = self.clock.now()
+        self.owner_ledger.record_timing(
+            run.group, "", "pod_deleted", "removed", run.gone_at, observed_at=run.gone_at
+        )
         self.wait_until(run.eof.is_set, until=until, what=f"{run.group} capture end", every=1.0)
         self.close_pod(run)
 
@@ -2532,6 +2607,22 @@ class TwoOwnerRun(pp.LiveRun):
 
         self.wait_until(parked, until=self.deadline(), what=f"{run.group} publication park")
         run.parked_at = pps.iso_epoch(self.approval(run.approval_id).get("created_at"))
+        self.owner_ledger.record_timing(
+            run.group,
+            "",
+            "approval_requested",
+            "publication",
+            run.parked_at,
+            observed_at=self.clock.now(),
+        )
+        self.owner_ledger.record_timing(
+            run.group,
+            "",
+            "runner_turn_end_observed",
+            "parked",
+            self.clock.now(),
+            observed_at=self.clock.now(),
+        )
         run.publication_id = next(
             (
                 str(row.get("id"))
@@ -2754,7 +2845,23 @@ class TwoOwnerRun(pp.LiveRun):
         extra: tuple[str, ...] = ()
         if decision == "rejected":
             extra = ("--reject", "--note", "two-owner rejection control")
+        self.owner_ledger.record_timing(
+            run.group,
+            "",
+            "resolution_started",
+            decision,
+            self.clock.now(),
+            observed_at=self.clock.now(),
+        )
         result = self.resolve(run.approval_id, self.allowed_token, *extra)
+        self.owner_ledger.record_timing(
+            run.group,
+            "",
+            "resolution_finished",
+            decision,
+            self.clock.now(),
+            observed_at=self.clock.now(),
+        )
         audit = self.audit(run.approval_id)
         self.record_resolution(f"{key}_{decision}", result, audit, self.allowed_subject)
         resolved = (
@@ -2812,6 +2919,9 @@ class TwoOwnerRun(pp.LiveRun):
             published,
             until=self.clock.now() + pp.PUBLICATION_WAIT_SECONDS,
             what=f"card {run.card} publication",
+        )
+        self.owner_ledger.record_timing(
+            run.group, "", "pr_open", "publication", self.clock.now(), observed_at=self.clock.now()
         )
         return publication
 
@@ -3060,6 +3170,8 @@ class TwoOwnerRun(pp.LiveRun):
         self.ledger.record("restarts", "pod_marker_before", marker)
         self.finish_park(run)
         self.deliver_card(run)
+        self.unlisted_control(run)
+        self.resolve_card(run, "rejected")
         absent = self.pod_uid_gone(run)
         self.ledger.record("restarts", "pod_old_runtime_absent", absent)
         self.require({"lineage": lineage, "marker": marker, "old_pod_absent": absent}, "attempt A1")
@@ -3150,8 +3262,6 @@ class TwoOwnerRun(pp.LiveRun):
     def phase_reject_a1(self) -> None:
         self.require_live("reject-a1")
         first = self.pod_run("a1")
-        self.unlisted_control(first)
-        self.resolve_card(first, "rejected")
 
         def denied() -> bool:
             row = self.request_row(first.request_id)
@@ -5193,7 +5303,20 @@ class TwoOwnerRun(pp.LiveRun):
 
         self.card_publications[key] = publication_id
         self.cards[key] = pps.ref_digest(publication_id)
+        publication = self.publication(publication_id)
+        approval = self.approval(str(publication.get("approval_id") or ""))
+        self.owner_ledger.record_timing(
+            key,
+            "",
+            "approval_requested",
+            "created",
+            pps.iso_epoch(approval.get("created_at")),
+            observed_at=self.clock.now(),
+        )
         super().await_card(publication_id, key)
+        self.owner_ledger.record_timing(
+            key, "", "card_delivered", "card", self.clock.now(), observed_at=self.clock.now()
+        )
 
     def phase_drill(self) -> None:
         """Unpaid in both modes: routed cards are delivered and answered before any paid phase.
@@ -5222,17 +5345,18 @@ class TwoOwnerRun(pp.LiveRun):
         if self.allowed_token is None or self.unlisted_token is None:
             raise StepFailed("an operator principal was not minted")
         first = self.drill_publication("reject")
-        second = self.drill_publication("approve")
         refused = self.resolve(first, self.unlisted_token)
         unlisted = self.record_resolution(
             "drill_unlisted", refused, self.audit(first), self.unlisted_subject
         )
         pending = self.approval(first).get("status") == "pending"
+        rejected = self.drill_resolve(first, "rejected")
+        second = self.drill_publication("approve")
         checks = {
             "drill_unlisted_refused_by_list": unlisted["http_status"] == 403
             and unlisted["audit_authorizer"] == pps.EXPLICIT_USERS_AUTHORIZER
             and pending,
-            "drill_reject_resolved": self.drill_resolve(first, "rejected"),
+            "drill_reject_resolved": rejected,
             "drill_approve_resolved": self.drill_resolve(second, "approved"),
             "drill_started_nothing": self.drill_started_nothing(),
             "drill_pushed_nothing": self.drill_pushed_nothing(),
@@ -5247,7 +5371,24 @@ class TwoOwnerRun(pp.LiveRun):
         """The allowed operator answers one drill card; the audit names it as operator."""
 
         extra = ("--reject", "--note", "drill rejection") if decision == "rejected" else ()
+        group = "drill_reject" if decision == "rejected" else "drill_approve"
+        self.owner_ledger.record_timing(
+            group,
+            "",
+            "resolution_started",
+            "operator",
+            self.clock.now(),
+            observed_at=self.clock.now(),
+        )
         result = self.resolve(approval_id, self.allowed_token, *extra)
+        self.owner_ledger.record_timing(
+            group,
+            "",
+            "resolution_finished",
+            "operator",
+            self.clock.now(),
+            observed_at=self.clock.now(),
+        )
         audit = self.audit(approval_id)
         step = "drill_reject" if decision == "rejected" else "drill_approve"
         self.record_resolution(step, result, audit, self.allowed_subject)

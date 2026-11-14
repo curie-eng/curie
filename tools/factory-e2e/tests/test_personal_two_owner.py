@@ -3837,6 +3837,7 @@ def test_a_live_drill_proves_card_delivery_before_any_paid_phase(tmp_path: Path)
         DRILL_APPROVAL["reject"]: "rejected",
         DRILL_APPROVAL["approve"]: "approved",
     }
+
     # Both drill cards are in the run's card list, and the approved one's branch is
     # owned by the run for the absence inventory.
     assert h.run.cards == {
@@ -3847,6 +3848,116 @@ def test_a_live_drill_proves_card_delivery_before_any_paid_phase(tmp_path: Path)
     # Unpaid: no reservation, no live window.
     assert h.ledger.session_rows() == []
     assert h.ledger.run_row()["live_started_at"] is None
+
+
+def test_rejection_is_resolved_before_waiting_for_the_next_card(tmp_path: Path) -> None:
+    h = _live(tmp_path, begin=False)
+    state = _drill_setup(h)
+    original = h.run.drill_publication
+
+    def create(label: str) -> str:
+        if label == "approve":
+            assert state["status"][DRILL_APPROVAL["reject"]] == "rejected"
+        return original(label)
+
+    h.run.drill_publication = create  # type: ignore[method-assign]
+    h.run.phase_drill()
+    events = h.ledger.timing_rows()
+    assert [
+        (row["grp"], row["event"]) for row in events if row["event"] == "resolution_finished"
+    ] == [("drill_reject", "resolution_finished"), ("drill_approve", "resolution_finished")]
+
+
+def test_a1_answers_its_card_before_starting_the_other_owner(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    run = h.run.new_run("a1", card=1)
+    h.run.new_run = lambda *_a, **_k: run  # type: ignore[method-assign]
+    events: list[str] = []
+    for name in (
+        "admit_group",
+        "await_runner",
+        "await_park",
+        "read_before",
+        "finish_park",
+        "deliver_card",
+        "unlisted_control",
+        "resolve_card",
+    ):
+        setattr(h.run, name, lambda *_a, name=name: events.append(name))
+    h.run.record_lineage = lambda _r: True  # type: ignore[method-assign]
+    h.run.append_marker = lambda _o: True  # type: ignore[method-assign]
+    h.run.pod_uid_gone = lambda _r: True  # type: ignore[method-assign]
+    h.run.phase_attempt_a1()
+    assert events[-3:] == ["deliver_card", "unlisted_control", "resolve_card"]
+    names = [name for name, _ in h.run.paid_phases()]
+    assert names.index("approve-a2") < names.index("probe-b")
+
+
+def test_incremental_timing_survives_a_fence_without_retaining_content(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1")
+    run.harvest = pto.TimingHarvest(h.runtime.scan, h.ledger, run.group, h.clock.now)
+    marker = "private-content-must-never-be-retained"
+    first = {"type": "user", "timestamp": _stamp(1), "message": {"content": marker}}
+    reply = _reply("msg-one", 10, 15, [{"type": "text", "text": marker}])
+    reply["message"]["stop_reason"] = "end_turn"
+    end = {"type": "system", "subtype": "turn_duration", "timestamp": _stamp(11)}
+    data = _jsonl([first, reply, end])
+    split = len(_jsonl([first])) + 17
+    _feed(run, {MAIN: data[:split]}, at=T0 + 2)
+    assert [row["event"] for row in h.ledger.timing_rows() if row["at"] == T0 + 1] == [
+        "native_start"
+    ]
+    _feed(run, {MAIN: data}, at=T0 + 12)
+    h.clock.wait(12)
+    h.run.gate_event(run, _hold("stop", 1, size=len(data), written=T0 + 11))
+    h.clock.wait(600)
+    h.run.watchdog_tick()
+    reopened = pto.TwoOwnerLedger.open_existing(h.run.inputs.state_dir, RUN_ID)
+    rows = reopened.timing_rows()
+    assert [
+        (row["event"], row["at"])
+        for row in rows
+        if row["event"] in {"native_start", "assistant", "turn_end", "stop"}
+    ] == [
+        ("native_start", T0 + 1),
+        ("assistant", T0 + 10),
+        ("turn_end", T0 + 11),
+        ("stop", T0 + 11),
+    ]
+    assert next(row for row in rows if row["event"] == "assistant")["stop_reason"] == "end_turn"
+    fence = next(row for row in rows if row["event"] == "watchdog_fence")
+    assert fence["elapsed"] == 600
+    assert all(row["source"] == "unknown" for row in reopened.session_rows() if row["grp"] == "a1")
+    reopened.close()
+    assert marker.encode() not in (h.run.inputs.state_dir / "ledger.sqlite3").read_bytes()
+    assert MAIN.encode() not in (h.run.inputs.state_dir / "ledger.sqlite3").read_bytes()
+
+
+def test_runner_capture_writes_timing_through_the_production_reader(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1")
+    data = _jsonl([_reply("msg-one", 1, 2, [])])
+    line = (
+        json.dumps(
+            {"kind": "file", "path": MAIN, "offset": 0, "data": base64.b64encode(data).decode()}
+        ).encode()
+        + b"\n"
+    )
+    process = _FakeProcess(43001)
+    process.stdout, process.stderr = io.BytesIO(line), io.BytesIO()
+    h.shell.spawn = lambda _argv: process  # type: ignore[method-assign]
+    pt.TwoOwnerRun.open_harvest(h.run, run)
+    assert run.eof.wait(timeout=5)
+    reader = pto.TwoOwnerLedger.open_existing(h.run.inputs.state_dir, RUN_ID)
+    assert [(row["event"], row["at"]) for row in reader.timing_rows() if row["grp"] == "a1"] == [
+        ("reservation", T0),
+        ("native_start", T0 + 1),
+        ("assistant", T0 + 1),
+    ]
+    reader.close()
 
 
 def test_an_undelivered_drill_card_fails_the_live_run_before_any_reservation(
