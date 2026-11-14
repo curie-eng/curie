@@ -68,13 +68,14 @@ from .forges.github.marked_comments import (
     patch_comment,
     subject_title,
 )
-from .forges.github.transport import github_headers
+from .forges.github.transport import github_headers, repository_identity_matches
 from .forges.hosts import factory_credentials, factory_tracker
 from .forges.ports import CodeHost, Tracker, comments_for
 from .forges.registry import forges_registry
 from .forges.trackers import code_host_for_repository, tracker_for_work_item
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget, RepositoryRef, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
+from .github_review_truth import VerifiedRepository
 from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
@@ -620,11 +621,13 @@ async def sync_status_comments(
     limit: int = 20,
     paused_for_upgrade: bool = False,
     request_ids: set[uuid.UUID] | None = None,
+    verified_repository: VerifiedRepository | None = None,
 ) -> int:
     """Claim, render, release the session, call GitHub, then persist under the lease.
 
     Returns the number of GitHub writes. A crashed claimer's lease expires;
-    marker recovery finds a comment whose create response was lost.
+    marker recovery finds a comment whose create response was lost. Poll callers
+    may reuse their verified repository credential for matching claims.
     """
 
     writes = 0
@@ -652,7 +655,7 @@ async def sync_status_comments(
                 token = github_calls.set(calls)
                 started = time.monotonic()
                 try:
-                    writes += await _sync_one(client, settings, claim)
+                    writes += await _sync_one(client, settings, claim, verified_repository)
                     claim.row.attempts += 1
                     async with sessionmaker() as session:
                         await _write_back(session, claim, owner=owner)
@@ -916,6 +919,7 @@ async def _sync_one(
     client: httpx.AsyncClient,
     settings: Settings,
     claim: _StatusClaim,
+    verified_repository: VerifiedRepository | None,
 ) -> int:
     row = claim.row
     if row.terminal_cause == "issue_deleted":
@@ -928,11 +932,24 @@ async def _sync_one(
     registry = forges_registry(settings)
     try:
         intake = factory_tracker(registry)
-        token = await run_in_threadpool(
-            factory_credentials(registry).token_for_verified_installation,
-            claim.repository_path,
-            claim.code_host_installation_id,
-        )
+        if verified_repository is None:
+            token = await run_in_threadpool(
+                factory_credentials(registry).token_for_verified_installation,
+                claim.repository_path,
+                claim.code_host_installation_id,
+            )
+        else:
+            if (
+                verified_repository.api != intake.config.api_url.rstrip("/")
+                or verified_repository.installation_id != claim.code_host_installation_id
+                or not repository_identity_matches(
+                    verified_repository.repository,
+                    repository_id=int(claim.tracker_issue.scope_id),
+                    repo_full_name=claim.repository_path,
+                )
+            ):
+                return 0
+            token = verified_repository.token
     except (ForgeError, GitHubInstallationRefused, GitHubAppError, ValueError):
         return 0
     github = GitHubCommentClient(

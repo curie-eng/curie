@@ -440,6 +440,7 @@ async def _poll_repository(
                 installation_id=installation_id,
                 repository=repository,
                 publications=publications,
+                verified_repository=verified,
                 limit=issues,
             )
             and clean
@@ -561,6 +562,7 @@ async def _admit_labeled(
     installation_id: int,
     repository: dict[str, Any],
     publications: factory_rediscovery.PassPublications,
+    verified_repository: VerifiedRepository,
     limit: asyncio.Semaphore,
 ) -> bool:
     label = tracker.label
@@ -643,6 +645,7 @@ async def _admit_labeled(
                 tracker,
                 repository,
                 publications=publications,
+                verified_repository=verified_repository,
             )
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             logger.info("factory labeled issue poll for %s issue %s deferred", repo, number)
@@ -912,6 +915,7 @@ async def _apply_notice(
     repository: dict[str, Any],
     *,
     publications: factory_rediscovery.PassPublications | None = None,
+    verified_repository: VerifiedRepository | None = None,
 ) -> None:
     """Apply one polled notice, confirmed with the pass's token and against
     its one repository read (#4361 decision 14)."""
@@ -959,6 +963,7 @@ async def _apply_notice(
             settings,
             owner=f"poll-intake:{notice.request_id}",
             request_ids={notice.request_id},
+            verified_repository=verified_repository,
         )
         async with sessionmaker() as session:
             status = await session.get(FactoryStatusComment, notice.request_id)

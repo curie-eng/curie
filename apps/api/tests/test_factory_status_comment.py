@@ -45,10 +45,13 @@ from curie_api.forges.types import (
     UpsertResult,
 )
 from curie_api.github_app import GitHubAppError
+from curie_api.github_review_truth import VerifiedRepository
 from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
 from forge_fakes import factory_wake
 from forge_fakes.github import (
+    INSTALLATION_ID,
     LABEL,
+    REPO_ID,
     _issue_event,
     _post,
     fake_installation_tokens,
@@ -1221,7 +1224,7 @@ def _link_through_jira(
     issue = jira.seed_issue("Ticket")
     linked: list[uuid.UUID] = []
 
-    async def sync_one(client: Any, settings: Any, claim: Any) -> int:
+    async def sync_one(client: Any, settings: Any, claim: Any, _verified_repository: Any) -> int:
         if claim.row.finalized_at is not None:
             return 0
         async with jira_client(jira) as http:
@@ -2642,7 +2645,7 @@ def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotentl
     ticket = jira.seed_issue("Ticket")
     linked: list[uuid.UUID] = []
 
-    async def sync_one(http: Any, settings: Any, claim: Any) -> int:
+    async def sync_one(http: Any, settings: Any, claim: Any, _verified_repository: Any) -> int:
         async with jira_client(jira) as jira_http:
             tracker = jira_tracker(jira, client=jira_http)
             code_host = _JiraLinkPorts(tracker, claim.row.execution_request_id, linked)
@@ -3155,3 +3158,54 @@ def test_an_implementation_request_never_shows_triaged(admitted: Any) -> None:  
     assert "Triage reported" not in comment["body"]
     assert "Cause: runner_failed" in comment["body"]
     assert not _label_added(sink, number, TRIAGED)
+
+
+@pytest.mark.parametrize("mismatch", ["api", "installation", "repository_id", "repository_path"])
+def test_poll_status_credential_is_scoped_to_verified_repository(
+    admitted: Any,  # noqa: F811
+    mismatch: str,
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 55850)
+    proof = VerifiedRepository(
+        get_settings().github_api_url.rstrip("/"),
+        "fixture-installation-token",
+        INSTALLATION_ID,
+        {"id": REPO_ID, "full_name": REPO},
+    )
+    if mismatch == "api":
+        proof = replace(proof, api="https://api.example.com")
+    elif mismatch == "installation":
+        proof = replace(proof, installation_id=INSTALLATION_ID + 1)
+    elif mismatch == "repository_id":
+        proof = replace(proof, repository={"id": REPO_ID + 1, "full_name": REPO})
+    else:
+        proof = replace(proof, repository={"id": REPO_ID, "full_name": "acme-corp/another-bot"})
+
+    async def go() -> None:
+        assert (
+            await sync_status_comments(
+                client.app.state.sessionmaker,
+                get_settings(),
+                owner="poll-status-proof",
+                limit=1,
+                request_ids={request_id},
+                verified_repository=proof,
+            )
+            == 0
+        )
+        assert sink.requests == []
+        assert (
+            await sync_status_comments(
+                client.app.state.sessionmaker,
+                get_settings(),
+                owner="status-retry",
+                limit=1,
+                request_ids={request_id},
+            )
+            > 0
+        )
+
+    client.portal.call(go)
+    assert len(_posts(sink)) == 1
+    assert _notices(request_id)[0]["attempts"] == 2
