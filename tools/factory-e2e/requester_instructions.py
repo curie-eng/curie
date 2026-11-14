@@ -382,7 +382,7 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
             self.last_scan: dict[str, float] = {}
             self.forge: Any = None
             self.label = f"rqp-{self.nonce}"
-            self.branch_prefix = f"rqp-{self.nonce}-"
+            self.branch_prefix = f"rqp-{self.nonce}/"
             self.created_issues: list[str] = []
             self.created_pulls: list[int] = []
             self.label_created = False
@@ -442,6 +442,7 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                     "CURIE_WORK_ITEM_MAX_TURNS": str(1 + ris.MAX_CONTINUATIONS),
                     "DEFAULT_MAX_OUTPUT_TOKENS_PER_RUN": "32000",
                     "CURIE_RUNNER_TOTAL_TIMEOUT_S": str(self.live_inputs.slot_seconds),
+                    "CURIE_DELIVERY_BUDGET_S": str(self.live_inputs.slot_seconds),
                     "CURIE_RUNNER_IMAGE": self.image,
                     "CURIE_PUBLICATION_PRIORITY_CLASS_NAME": self.live_inputs.priority_class,
                 }
@@ -1038,6 +1039,12 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 raise poe.StepFailed(f"slot {slot}: the label was refused ({status})")
             labeled_at = time.time()
             self.ctx.ledger.mark_labeled(slot, labeled_at)
+            self.finish_slot(slot, actor, role, number)
+
+        def finish_slot(self, slot: int, actor: str, role: str | None, number: str) -> None:
+            live = self.live_inputs
+            assert live is not None
+            self.slot = slot
             principal = self.principals["owner" if actor == "owner" else "other"]["id"]
 
             def work_item() -> str | None:

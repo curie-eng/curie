@@ -1034,6 +1034,45 @@ def _live_proof(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     return proof
 
 
+def test_live_publication_prefix_is_accepted_by_the_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api.schemas.agents import AgentUpdate
+
+    proof = _live_proof(tmp_path, monkeypatch)
+    try:
+        update = AgentUpdate(
+            publication_policy="auto", publication_branch_prefix=proof.branch_prefix
+        )
+        assert update.publication_branch_prefix == proof.branch_prefix
+        with pytest.raises(ValueError, match="slash-terminated"):
+            AgentUpdate(publication_branch_prefix=proof.branch_prefix.rstrip("/"))
+    finally:
+        proof.ctx.ledger.close()
+
+
+def test_live_worker_environment_is_accepted_by_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_worker.config import WorkerConfig
+
+    proof = _live_proof(tmp_path, monkeypatch)
+    proof.ports = {
+        name: 19000 + i for i, name in enumerate(("api", "postgres", "valkey", "s3", "dex"))
+    }
+    proof.relay = SimpleNamespace(port=19010)
+    proof.ca_bundle_path = tmp_path / "ca.pem"
+    proof.image = "registry.example.com/runner:proof"
+    try:
+        for name, value in proof.worker_env().items():
+            monkeypatch.setenv(name, value)
+        config = WorkerConfig(_env_file=None)
+        assert config.runner_total_timeout_s == proof.live_inputs.slot_seconds
+        assert config.delivery_budget_s >= config.runner_total_timeout_s
+    finally:
+        proof.ctx.ledger.close()
+
+
 def _pod_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, leak: bool) -> Any:
     executable = tmp_path / "kubectl"
     executable.write_text(
