@@ -51,7 +51,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from curie_runner import RunTracer, SideEffectClassifier, load_plugins
-from curie_runner.adapter import ClaudeAgentSession, build_options
+from curie_runner.adapter import ClaudeAgentSession, StructuredResume, build_options
 from curie_runner.plugin import bundle_skill_names
 from curie_runner.sdk_auth import resolve_sdk_env
 from curie_runner.session import SessionRunner
@@ -421,10 +421,14 @@ def messages_stream(
         if "".join(reply.chunks) != reply.text:
             raise ValueError("scripted text chunks must reconstruct the reply")
         events[2:3] = [
-            ("content_block_delta", {
-                "type": "content_block_delta", "index": 0,
-                "delta": {"type": "text_delta", "text": chunk},
-            })
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": chunk},
+                },
+            )
             for chunk in reply.chunks
         ]
     return b"".join(_sse(name, data) for name, data in events)
@@ -842,12 +846,17 @@ def wire_session(
     plugin_dir: str | None = None,
     max_turns: int = 6,
     implementer_model: str | None = IMPLEMENTER_MODEL,
+    system_prompt: str = IMPLEMENTER_MARKER,
+    resume: StructuredResume | None = None,
+    extra_hooks: Mapping[str, list[Any]] | None = None,
 ) -> Wiring:
     """``resolve_sdk_env(os.environ)`` then ``build_options``, as ``__main__`` does.
 
     ``explicit_env`` is what a caller hands ``build_options`` as the SDK env on
     top of the boot override (``ClaudeAgentOptions.env``). ``implementer_model``
-    is the session ``model``; None leaves it to the CLI's default.
+    is the session ``model``; None leaves it to the CLI's default. ``resume``
+    is a :func:`build_structured_resume` envelope for a resumed or replayed turn,
+    and ``extra_hooks`` are merged behind the turn gate as ``__main__`` merges them.
     """
 
     override = resolve_sdk_env(os.environ)
@@ -856,12 +865,16 @@ def wire_session(
         plugins=load_plugins(plugin_dir),
         model=implementer_model,
         reviewer_model=reviewer_model,
-        system_prompt=IMPLEMENTER_MARKER,
+        system_prompt=system_prompt,
         max_turns=max_turns,
         max_budget_usd=None,
-        resume=None,
+        resume=resume.resume if resume is not None else None,
+        session_id=resume.session_id if resume is not None else None,
+        session_store=resume.session_store if resume is not None else None,
         cwd=str(installation.workspace),
-        hooks=front_pre_tool_use_hooks(None, access),
+        hooks=front_pre_tool_use_hooks(
+            dict(extra_hooks) if extra_hooks is not None else None, access
+        ),
         skills=bundle_skill_names(plugin_dir),
         env={**(override or {}), **(explicit_env or {})},
     )
