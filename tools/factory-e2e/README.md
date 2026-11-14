@@ -868,7 +868,7 @@ these private files, each mode 0600 and owned by the caller:
    GitHub App.
 2. `--owner-token-file` and `--second-token-file`: one GitHub user token line
    each, for the repository owner and the second test account.
-3. `--model-credential-file`: a JSON object with `base_url` (https) and
+3. `--model-credential-file`: a JSON object with `base_url` (https, or http for an endpoint reached only over a private encrypted network) and
    `api_key` for the live model endpoint.
 4. `--conflict-file`: a JSON object with `preference` (one line that a rule in
    the fixture repository contradicts), `forbidden_added_line_regex` (matches

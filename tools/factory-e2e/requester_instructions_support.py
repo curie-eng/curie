@@ -279,7 +279,8 @@ def load_model_credential(path: Path) -> tuple[pps.HeldSecret, pps.HeldSecret]:
     base, key = body.get("base_url"), body.get("api_key")
     if set(body) != {"base_url", "api_key"} or not isinstance(base, str):
         raise Refusal("model_credential_invalid", "--model-credential-file")
-    if not re.fullmatch(r"https://[A-Za-z0-9.:-]{1,253}(/[A-Za-z0-9._~/-]*)?", base):
+    # http is allowed for an endpoint reached only over a private, encrypted network.
+    if not re.fullmatch(r"https?://[A-Za-z0-9.:-]{1,253}(/[A-Za-z0-9._~/-]*)?", base):
         raise Refusal("model_credential_invalid", "base_url")
     if not isinstance(key, str) or not 8 <= len(key) <= 512 or any(c.isspace() for c in key):
         raise Refusal("model_credential_invalid", "api_key")
@@ -457,7 +458,7 @@ try:
     deadline = float(sys.argv[1])
     request = json.loads(sys.stdin.read())
     base, key, model = request["base_url"], request["api_key"], request["model"]
-    assert 0 < deadline < 60 and base.startswith("https://") and key and model
+    assert 0 < deadline < 60 and base.startswith(("https://", "http://")) and key and model
 except Exception:
     done(False, error="input", code=2)
 signal.signal(signal.SIGALRM, expired)

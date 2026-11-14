@@ -451,8 +451,11 @@ def test_model_credential_shape(tmp_path: Path) -> None:
     good = {"base_url": "https://model.example.com/", "api_key": "k" * 20}
     base, key = ris.load_model_credential(_private(tmp_path / "m.json", json.dumps(good)))
     assert base.reveal() == "https://model.example.com" and key.reveal() == "k" * 20
+    plain = {**good, "base_url": "http://10.0.0.7:8317"}
+    base, _key = ris.load_model_credential(_private(tmp_path / "m.json", json.dumps(plain)))
+    assert base.reveal() == "http://10.0.0.7:8317"
     for bad in (
-        {**good, "base_url": "http://model.example.com"},
+        {**good, "base_url": "ftp://model.example.com"},
         {**good, "api_key": "has space in the key"},
         {"base_url": good["base_url"]},
     ):
@@ -854,7 +857,7 @@ def test_a_crashed_or_unreadable_scan_is_never_clean() -> None:
 def test_model_probe_refuses_bad_input() -> None:
     for argv, stdin in (
         (["20"], b"not json"),
-        (["20"], json.dumps({"base_url": "http://x", "api_key": "k", "model": "m"}).encode()),
+        (["20"], json.dumps({"base_url": "ftp://x", "api_key": "k", "model": "m"}).encode()),
         (["90"], json.dumps({"base_url": "https://x", "api_key": "k", "model": "m"}).encode()),
     ):
         code, out = _run(ris.MODEL_PROBE_PROGRAM, *argv, stdin=stdin)
