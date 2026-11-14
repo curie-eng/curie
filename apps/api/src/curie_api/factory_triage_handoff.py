@@ -25,7 +25,14 @@ Consumption (`hand_off`, run by the WorkItem reconciler). Every check below is
 read again on every attempt, and all of them pass before any label is
 written (`github_factory.check_delegated`):
 
-1. The source WorkItem and request are not cancelled: ``source_cancelled``.
+0. The result delivery deadline has not passed: past it nothing external is
+   tried again, and the handoff refuses with the last deferred code, or
+   ``delivery_deadline_passed``. An attempt cut off by the reconciler's time
+   cap is released and backed off (`abandon_attempt`), so the next attempt
+   reaches this check.
+1. The source WorkItem and request are not cancelled, and the delegation was
+   never revoked: ``source_cancelled``. Cancelling the source stamps the
+   delegation's ``revoked_at``, which a later readmit does not clear.
 2. The repository is allowlisted and the installation still covers it:
    ``scope_lost``.
 3. The output issue is open and its body digest equals the delivered one:
@@ -37,7 +44,9 @@ written (`github_factory.check_delegated`):
 5. The frozen target binding still exists with the same identity and
    generation, still serves the label, and has the implementation contract:
    ``target_unavailable``.
-6. Ordinary admission's ownership, label conflict and rediscovery rules:
+6. No WorkItem already exists on the output except one this handoff admitted:
+   ``output_already_selected``. That selection keeps its run and its label.
+7. Ordinary admission's ownership, label conflict and rediscovery rules:
    their own codes.
 
 Writes, in order. (1) ``associated_at`` commits the output association, which
@@ -49,8 +58,13 @@ the triage label. (3) Under the output issue lock, the shared admission
 service admits a separate WorkItem with the request id `implementation_request_id`
 derives from the selection event, and the delegation's consumption and the
 outcome commit in that same transaction. A crash anywhere replays into the
-same request. An admission refused after (2) removes the label again and
-records the refusal.
+same request. The deadline is checked again inside that transaction.
+
+A refusal is recorded first and never waits on GitHub. When the label may
+have been written and belongs to no other selection, its removal stays owed
+(``label_cleanup_owed``) and is retried with backoff until a read-back
+confirms it, after the outcome settled. A WorkItem that appears on the output
+meanwhile owns the label, and the cleanup is dropped.
 
 Outcomes. ``admitted`` with the implementation request id, or ``refused``
 with the reason. Either re-renders the source's status comment (endings 1 and
@@ -104,13 +118,21 @@ SOURCE_CANCELLED = "source_cancelled"
 TARGET_UNAVAILABLE = "target_unavailable"
 SCOPE_LOST = "scope_lost"
 PERMISSION_UNREADABLE = "permission_unreadable"
+OUTPUT_ALREADY_SELECTED = "output_already_selected"
+DEADLINE_PASSED = "delivery_deadline_passed"
+ATTEMPT_TIMED_OUT = "attempt_timed_out"
 
 
 class HandoffRefused(Exception):
-    """A check failed: the handoff ends refused with ``code``."""
+    """A check failed: the handoff ends refused with ``code``.
 
-    def __init__(self, code: str) -> None:
+    ``keep_label`` is set when the label on the output belongs to another
+    selection, which removing it would cancel.
+    """
+
+    def __init__(self, code: str, *, keep_label: bool = False) -> None:
         self.code = code
+        self.keep_label = keep_label
         super().__init__(f"triage handoff refused: {code}")
 
 
@@ -400,6 +422,9 @@ def _source_cancelled(loaded: _Loaded) -> bool:
     request = loaded.request
     return (
         loaded.delegation.consumed_at is not None
+        # Cancellation revokes the delegation for good; a readmit of the
+        # source clears ``cancelled_at`` but not this.
+        or loaded.delegation.revoked_at is not None
         or loaded.work_item.cancelled_at is not None
         or request is None
         or request.status == "cancelled"
@@ -441,7 +466,7 @@ async def _claim(
             update(FactoryTriageHandoff)
             .where(
                 FactoryTriageHandoff.id == handoff_id,
-                FactoryTriageHandoff.outcome.is_(None),
+                _owed(),
                 FactoryTriageHandoff.next_attempt_at <= func.clock_timestamp(),
                 or_(
                     FactoryTriageHandoff.lease_owner.is_(None),
@@ -457,6 +482,15 @@ async def _claim(
         )
         await session.commit()
     return claimed is not None
+
+
+def _owed() -> ColumnElement[bool]:
+    """Work remains: an unsettled handoff, or a refusal whose label removal is owed."""
+
+    return or_(
+        FactoryTriageHandoff.outcome.is_(None),
+        FactoryTriageHandoff.label_cleanup_owed.is_(True),
+    )
 
 
 def _held(handoff_id: uuid.UUID, owner: str) -> tuple[ColumnElement[bool], ...]:
@@ -497,10 +531,13 @@ async def _settle(
     outcome: str,
     reason: str | None = None,
     request_id: uuid.UUID | None = None,
+    cleanup: bool = False,
 ) -> bool:
     """Consume the delegation and record the outcome in ``session``; the caller commits.
 
-    False when another attempt already settled it or the lease was lost.
+    With ``cleanup`` the label removal stays owed and this attempt keeps its
+    lease to try it at once. False when another attempt already settled it or
+    the lease was lost.
     """
 
     handoff_id = loaded.handoff.id
@@ -512,8 +549,9 @@ async def _settle(
             reason=reason,
             implementation_request_id=request_id,
             settled_at=func.clock_timestamp(),
-            lease_owner=None,
-            lease_expires_at=None,
+            label_cleanup_owed=cleanup,
+            lease_owner=owner if cleanup else None,
+            lease_expires_at=FactoryTriageHandoff.lease_expires_at if cleanup else None,
             last_error=None,
         )
         .returning(FactoryTriageHandoff.id)
@@ -534,15 +572,93 @@ async def _settle(
 
 
 async def _refuse(
-    sessionmaker: async_sessionmaker[AsyncSession], loaded: _Loaded, owner: str, reason: str
+    sessionmaker: async_sessionmaker[AsyncSession],
+    loaded: _Loaded,
+    owner: str,
+    reason: str,
+    *,
+    cleanup: bool,
+    settings: Settings,
+    client: httpx.AsyncClient,
 ) -> str | None:
+    """Record the refusal first, so it never waits on GitHub; then remove the label.
+
+    The removal stays owed (`_clean`) until a read-back confirms it.
+    """
+
     async with sessionmaker() as session:
-        settled = await _settle(session, loaded, owner, outcome="refused", reason=reason)
+        settled = await _settle(
+            session, loaded, owner, outcome="refused", reason=reason, cleanup=cleanup
+        )
         await session.commit()
     if not settled:
         return None
     logger.info("triage handoff refused handoff=%s reason=%s", loaded.handoff.id, reason)
+    if cleanup:
+        await _clean(sessionmaker, loaded, owner, settings=settings, client=client)
     return "refused"
+
+
+async def _clean(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    loaded: _Loaded,
+    owner: str,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> None:
+    """Take the handoff's label off a refused output, or retry later; never give up.
+
+    A WorkItem on the output means another selection owns the label now:
+    removing it would cancel that run, so the cleanup is dropped instead.
+    """
+
+    from .workitems.lifecycle import for_tracker_issue
+
+    held = (
+        FactoryTriageHandoff.id == loaded.handoff.id,
+        FactoryTriageHandoff.label_cleanup_owed.is_(True),
+        FactoryTriageHandoff.lease_owner == owner,
+    )
+    async with sessionmaker() as session:
+        selected = await session.scalar(
+            select(WorkItem.id).where(*for_tracker_issue(loaded.handoff.output_issue))
+        )
+    error: str | None = None
+    if selected is None:
+        try:
+            await _remove_label(settings, client, loaded, loaded.delegation.target_label)
+        except HandoffDeferred as deferred:
+            error = deferred.code
+    async with sessionmaker() as session:
+        if error is None:
+            values: dict[str, object] = {"label_cleanup_owed": False, "last_error": None}
+        else:
+            delay = _backoff(settings, loaded.handoff.attempts + 1)
+            values = {
+                "last_error": error,
+                "next_attempt_at": func.clock_timestamp() + timedelta(seconds=delay),
+            }
+        await session.execute(
+            update(FactoryTriageHandoff)
+            .where(*held)
+            .values(lease_owner=None, lease_expires_at=None, **values)
+        )
+        await session.commit()
+    logger.info(
+        "triage handoff label cleanup handoff=%s result=%s",
+        loaded.handoff.id,
+        "dropped" if selected is not None else (error or "removed"),
+    )
+
+
+def _backoff(settings: Settings, attempts: int) -> int:
+    return int(
+        min(
+            settings.work_item_backoff_base_seconds * int(2 ** max(attempts - 1, 0)),
+            settings.work_item_backoff_max_seconds,
+        )
+    )
 
 
 async def _defer(
@@ -553,10 +669,7 @@ async def _defer(
     settings: Settings,
     attempts: int,
 ) -> None:
-    delay = min(
-        settings.work_item_backoff_base_seconds * int(2 ** max(attempts - 1, 0)),
-        settings.work_item_backoff_max_seconds,
-    )
+    delay = _backoff(settings, attempts)
     async with sessionmaker() as session:
         await session.execute(
             update(FactoryTriageHandoff)
@@ -626,6 +739,12 @@ async def _admit(
             current = await _load(session, loaded.handoff.id)
             if current is None or _source_cancelled(current):
                 raise HandoffRefused(SOURCE_CANCELLED)
+            if not await session.scalar(
+                select(FactoryTriageHandoff.deadline_at > func.clock_timestamp()).where(
+                    FactoryTriageHandoff.id == loaded.handoff.id
+                )
+            ):
+                raise HandoffRefused(DEADLINE_PASSED)
         except BaseException:
             await session.rollback()
             raise
@@ -674,6 +793,11 @@ async def hand_off(
         await session.rollback()
     if loaded is None:
         return None
+    if loaded.handoff.outcome is not None:
+        # Settled; only the label removal of a refusal is still owed.
+        if loaded.handoff.label_cleanup_owed:
+            await _clean(sessionmaker, loaded, owner, settings=settings, client=client)
+        return None
     label = loaded.delegation.target_label
     labelled = loaded.handoff.labelled_at is not None
     # Once associated, the label may have been written even if ``labelled_at``
@@ -682,6 +806,10 @@ async def hand_off(
     try:
         if _source_cancelled(loaded):
             raise HandoffRefused(SOURCE_CANCELLED)
+        # Past the deadline nothing external is tried again: an attempt that
+        # timed out, or a read that recovered too late, ends here.
+        if now is None or now >= loaded.handoff.deadline_at:
+            raise HandoffRefused(loaded.handoff.last_error or DEADLINE_PASSED)
         output = _output(loaded)
         if not labelled:
             async with sessionmaker() as session:
@@ -702,46 +830,84 @@ async def hand_off(
             output = replace(output, labelled_at=labelled_at)
         return await _admit(sessionmaker, loaded, output, owner, settings=settings, client=client)
     except HandoffRefused as refused:
-        if associated:
-            try:
-                await _remove_label(settings, client, loaded, label)
-            except HandoffDeferred as deferred:
-                # The removal is owed until the deadline; past it the refusal
-                # stands with its own reason. A label left behind starts
-                # nothing: the intake reads it as the factory's own label.
-                if now is not None and now >= loaded.handoff.deadline_at:
-                    return await _refuse(sessionmaker, loaded, owner, refused.code)
-                await _defer(
-                    sessionmaker,
-                    handoff_id,
-                    owner,
-                    deferred.code,
-                    settings,
-                    loaded.handoff.attempts + 1,
-                )
-                return None
-        return await _refuse(sessionmaker, loaded, owner, refused.code)
+        return await _refuse(
+            sessionmaker,
+            loaded,
+            owner,
+            refused.code,
+            cleanup=associated and not refused.keep_label,
+            settings=settings,
+            client=client,
+        )
     except HandoffDeferred as deferred:
         if now is not None and now >= loaded.handoff.deadline_at:
-            if associated:
-                try:
-                    await _remove_label(settings, client, loaded, label)
-                except HandoffDeferred:
-                    pass
-            return await _refuse(sessionmaker, loaded, owner, deferred.code)
+            return await _refuse(
+                sessionmaker,
+                loaded,
+                owner,
+                deferred.code,
+                cleanup=associated,
+                settings=settings,
+                client=client,
+            )
         await _defer(
             sessionmaker, handoff_id, owner, deferred.code, settings, loaded.handoff.attempts + 1
         )
         return None
 
 
+async def abandon_attempt(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    handoff_id: uuid.UUID,
+    *,
+    owner: str,
+    settings: Settings,
+) -> None:
+    """Release an attempt cut off by the caller's time cap and back it off.
+
+    The next attempt starts with the deadline check, so an overdue handoff
+    settles there without trying GitHub again.
+    """
+
+    async with sessionmaker() as session:
+        await session.execute(
+            update(FactoryTriageHandoff)
+            .where(
+                FactoryTriageHandoff.id == handoff_id,
+                FactoryTriageHandoff.lease_owner == owner,
+                _owed(),
+            )
+            .values(
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=ATTEMPT_TIMED_OUT,
+                next_attempt_at=func.clock_timestamp()
+                + func.make_interval(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    func.least(
+                        settings.work_item_backoff_base_seconds
+                        * func.power(2, func.greatest(FactoryTriageHandoff.attempts - 1, 0)),
+                        settings.work_item_backoff_max_seconds,
+                    ),
+                ),
+            )
+        )
+        await session.commit()
+
+
 async def due_handoffs(session: AsyncSession, *, limit: int = 50) -> list[uuid.UUID]:
-    """Unsettled handoffs whose backoff has passed and whose lease is free or lapsed."""
+    """Handoffs with work owed (unsettled, or a label removal) whose backoff has
+    passed and whose lease is free or lapsed."""
 
     ids = await session.scalars(
         select(FactoryTriageHandoff.id)
         .where(
-            FactoryTriageHandoff.outcome.is_(None),
+            _owed(),
             FactoryTriageHandoff.next_attempt_at <= func.clock_timestamp(),
             or_(
                 FactoryTriageHandoff.lease_owner.is_(None),
@@ -756,6 +922,7 @@ async def due_handoffs(session: AsyncSession, *, limit: int = 50) -> list[uuid.U
 
 __all__ = [
     "DelegatedOutput",
+    "abandon_attempt",
     "HandoffDeferred",
     "HandoffRefused",
     "ImplementationTarget",

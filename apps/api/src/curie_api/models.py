@@ -2353,6 +2353,8 @@ class FactoryTriageDelegation(Base):
     target_agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # Set when the source WorkItem is cancelled; a later readmit never clears it.
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
 FACTORY_TRIAGE_HANDOFF_OUTCOMES = ("admitted", "refused")
@@ -2390,7 +2392,7 @@ class FactoryTriageHandoff(Base):
         Index(
             "ix_factory_triage_handoffs_owed",
             "next_attempt_at",
-            postgresql_where=text("outcome IS NULL"),
+            postgresql_where=text("outcome IS NULL OR label_cleanup_owed"),
         ),
     )
 
@@ -2416,6 +2418,9 @@ class FactoryTriageHandoff(Base):
     reason: Mapped[str | None] = mapped_column(Text, default=None)
     last_error: Mapped[str | None] = mapped_column(Text, default=None)
     attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    # A refusal after the label may have been written owes its removal until
+    # a read-back confirms it, independently of the outcome.
+    label_cleanup_owed: Mapped[bool] = mapped_column(default=False, server_default="false")
     lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
     associated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     labelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

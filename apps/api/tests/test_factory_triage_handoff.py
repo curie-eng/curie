@@ -60,6 +60,7 @@ from curie_api.forges.types import ReplyTarget, SourceContent, TrackerIssueRef
 from curie_api.main import create_app
 from curie_api.models import ExecutionRequest, FactoryTrackerResultGrant, WorkItem
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
+from curie_api.workitem_reconciler import WorkItemReconciler
 from fastapi.testclient import TestClient
 from forge_fakes import factory_wake
 from forge_fakes.github import (
@@ -168,6 +169,23 @@ class TriageGitHub(NoticeGitHub):
                 "created_at": _iso(datetime.now(UTC) + self.label_clock_offset),
             }
         )
+
+    def human_label(self, number: int, name: str) -> None:
+        """A person applies ``name`` to an App-created issue."""
+
+        output = self.outputs[number]
+        output.labels.add(name)
+        output.events.append(
+            {
+                "id": next(_EVENT_IDS),
+                "event": "labeled",
+                "label": {"name": name},
+                "actor": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+                "performed_via_github_app": None,
+                "created_at": _iso(datetime.now(UTC)),
+            }
+        )
+        self.listing_generation += 1
 
     def _unlabel(self, number: int, name: str) -> None:
         output = self.outputs[number]
@@ -1246,12 +1264,18 @@ def test_refused_permission_unreadable_on_the_first_attempt_after_a_late_receipt
     _assert_refused(env, triage, "permission_unreadable")
 
 
-def test_refused_with_its_own_reason_when_the_label_cannot_be_removed_by_the_deadline(
-    env: Env,
-) -> None:
+def _past_deadline(handoff_id: uuid.UUID) -> None:
+    _sql(
+        "UPDATE curie.factory_triage_handoffs SET deadline_at = clock_timestamp() "
+        "- interval '1 second' WHERE id = :id",
+        {"id": handoff_id},
+    )
+
+
+def test_refused_label_removal_stays_owed_until_github_recovers(env: Env) -> None:
     """Authority is revoked after the label was added and its removal fails: the
-    handoff defers while the removal is owed, and past the deadline refuses
-    with the original reason. The label left behind starts nothing."""
+    refusal is recorded at once with its own reason, and the removal stays owed
+    and is retried after the outcome settled, until a read-back confirms it."""
 
     triage = published(env)
     assert triage.handoff_id is not None and triage.output is not None
@@ -1261,27 +1285,237 @@ def test_refused_with_its_own_reason_when_the_label_cannot_be_removed_by_the_dea
 
     env.github.on_label_added = revoke
     env.github.label_delete_status = 502
-    assert run_hand_off(triage.handoff_id) is None
-    row = handoff(triage.handoff_id)
-    assert (row["outcome"], row["last_error"]) == (None, "label_removal_unavailable")
-    make_due(triage.handoff_id)
-    assert run_hand_off(triage.handoff_id) is None
-    assert handoff(triage.handoff_id)["outcome"] is None
-
-    _sql(
-        "UPDATE curie.factory_triage_handoffs SET deadline_at = clock_timestamp() "
-        "- interval '1 second' WHERE id = :id",
-        {"id": triage.handoff_id},
-    )
-    make_due(triage.handoff_id)
     assert run_hand_off(triage.handoff_id) == "refused"
 
     row = handoff(triage.handoff_id)
     assert (row["outcome"], row["reason"]) == ("refused", "authority_revoked")
+    assert row["label_cleanup_owed"] is True
+    assert row["last_error"] == "label_removal_unavailable"
     assert IMPL in env.github.outputs[triage.output].labels
-    assert work_items(triage.output) == []
-    _assert_one_triage_session(triage)
     assert recorded(triage).refusal_reason == "authority_revoked"
+    # Not due until its backoff passes; still failing, still owed.
+    assert run_hand_off(triage.handoff_id) is None
+    make_due(triage.handoff_id)
+    assert run_hand_off(triage.handoff_id) is None
+    assert handoff(triage.handoff_id)["label_cleanup_owed"] is True
+    # Past the deadline the cleanup is still owed: it is not bounded by it.
+    _past_deadline(triage.handoff_id)
+
+    env.github.label_delete_status = None
+    make_due(triage.handoff_id)
+    assert run_hand_off(triage.handoff_id) is None
+
+    row = handoff(triage.handoff_id)
+    assert row["label_cleanup_owed"] is False and row["last_error"] is None
+    assert (row["outcome"], row["reason"]) == ("refused", "authority_revoked")
+    deletes = [c for c in env.github.label_writes(triage.output) if c.method == "DELETE"]
+    assert len(deletes) == 3
+    _assert_refused(env, triage, "authority_revoked")
+    # Nothing is owed any more: no further removal is tried.
+    assert len([c for c in env.github.label_writes(triage.output) if c.method == "DELETE"]) == 3
+
+
+def test_refused_cleanup_is_dropped_once_another_selection_owns_the_label(env: Env) -> None:
+    """While the removal is owed, a person selects the output: the label is now
+    theirs, so the cleanup is dropped instead of cancelling their run."""
+
+    triage = published(env)
+    assert triage.handoff_id is not None and triage.output is not None
+
+    def revoke(number: int, name: str) -> None:
+        env.github.permission = "read"
+
+    env.github.on_label_added = revoke
+    env.github.label_delete_status = 502
+    assert run_hand_off(triage.handoff_id) == "refused"
+    env.github.on_label_added = None
+    env.github.label_delete_status = None
+    env.github.permission = "write"
+    env.github.outputs[triage.output].labels.discard(IMPL)
+    env.github.human_label(triage.output, IMPL)
+    _pass(env.github, "poll")
+    (human,) = requests(triage.output)
+
+    make_due(triage.handoff_id)
+    assert run_hand_off(triage.handoff_id) is None
+
+    assert handoff(triage.handoff_id)["label_cleanup_owed"] is False
+    assert IMPL in env.github.outputs[triage.output].labels
+    assert len([c for c in env.github.label_writes(triage.output) if c.method == "DELETE"]) == 1
+    (still,) = requests(triage.output)
+    assert (still["id"], still["status"]) == (human["id"], human["status"])
+
+
+SELECTED_ELSEWHERE = ["waiting", "running", "completed"]
+
+
+@pytest.mark.parametrize("state", SELECTED_ELSEWHERE)
+def test_refused_when_the_output_was_already_selected_keeps_that_run_and_label(
+    env: Env, state: str
+) -> None:
+    """A person selected the published output before the handoff ran: the handoff
+    admits nothing, leaves that run and its label alone, and is refused."""
+
+    triage = published(env)
+    assert triage.handoff_id is not None and triage.output is not None
+    env.github.human_label(triage.output, IMPL)
+    _pass(env.github, "poll")
+    (human,) = requests(triage.output)
+    if state in {"running", "completed"}:
+        _start_running(env.client, human["id"])
+    if state == "completed":
+        _sql(
+            "UPDATE curie.execution_requests SET status = 'completed', "
+            "terminal_at = clock_timestamp(), terminal_cause = 'completed', "
+            "acquire_owner = NULL, acquire_expires_at = NULL WHERE id = :id",
+            {"id": human["id"]},
+        )
+    (before,) = requests(triage.output)
+    (item,) = work_items(triage.output)
+
+    assert run_hand_off(triage.handoff_id) == "refused"
+
+    row = handoff(triage.handoff_id)
+    assert (row["outcome"], row["reason"]) == ("refused", "output_already_selected")
+    assert row["label_cleanup_owed"] is False
+    (after,) = requests(triage.output)
+    assert (after["id"], after["status"], after["version"]) == (
+        before["id"],
+        before["status"],
+        before["version"],
+    )
+    assert work_items(triage.output)[0]["version"] == item["version"]
+    assert IMPL in env.github.outputs[triage.output].labels
+    assert env.github.label_writes(triage.output) == []
+    assert recorded(triage).refusal_reason == "output_already_selected"
+    _assert_one_triage_session(triage)
+
+
+def test_source_cancelled_then_relabelled_still_refuses_the_older_handoff(env: Env) -> None:
+    """Cancelling the source revokes its delegation for good: relabelling the
+    source readmits it, which clears ``cancelled_at`` but cannot revive the
+    older ticket's handoff."""
+
+    triage = published(env)
+    assert triage.handoff_id is not None and triage.output is not None
+    env.github.unlabel_issue(triage.number)
+    _pass(env.github, "poll")
+    assert work_items(triage.number)[0]["cancelled_at"] is not None
+    assert delegations(triage.request_id)[0]["revoked_at"] is not None
+    # A relabel readmits the source, which clears ``cancelled_at``
+    # (`lifecycle.readmit`); the older request stays completed.
+    _sql(
+        "UPDATE curie.work_items SET cancelled_at = NULL, version = version + 1 WHERE id = :id",
+        {"id": triage.work_item_id},
+    )
+    assert work_items(triage.number)[0]["cancelled_at"] is None
+
+    assert run_hand_off(triage.handoff_id) == "refused"
+
+    row = handoff(triage.handoff_id)
+    assert (row["outcome"], row["reason"]) == ("refused", "source_cancelled")
+    assert work_items(triage.output) == []
+    assert env.github.label_writes(triage.output) == []
+
+
+def test_refused_when_the_permission_read_recovers_only_after_the_deadline(env: Env) -> None:
+    """A read that failed before the deadline and recovers after it writes
+    nothing: past the deadline no external step is tried again."""
+
+    triage = published(env)
+    assert triage.handoff_id is not None and triage.output is not None
+    env.github.permission_unreadable = True
+    assert run_hand_off(triage.handoff_id) is None
+    assert handoff(triage.handoff_id)["last_error"] == "permission_unreadable"
+    env.github.permission_unreadable = False
+    _past_deadline(triage.handoff_id)
+    make_due(triage.handoff_id)
+    calls = len(env.github.calls)
+
+    assert run_hand_off(triage.handoff_id) == "refused"
+
+    assert env.github.calls[calls:] == []
+    _assert_refused(env, triage, "permission_unreadable")
+
+
+def test_refused_when_the_deadline_passes_between_the_label_and_admission(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deadline is checked again inside the admission transaction."""
+
+    import curie_api.factory_triage_handoff as handoff_module
+
+    triage = published(env)
+    assert triage.handoff_id is not None and triage.output is not None
+    handoff_id = triage.handoff_id
+    add_label = handoff_module._add_label
+
+    async def add_then_expire(*args: Any, **kwargs: Any) -> None:
+        await add_label(*args, **kwargs)
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.factory_triage_handoffs SET deadline_at = "
+                        "clock_timestamp() - interval '1 second' WHERE id = :id"
+                    ),
+                    {"id": handoff_id},
+                )
+        finally:
+            await engine.dispose()
+
+    monkeypatch.setattr(handoff_module, "_add_label", add_then_expire)
+
+    assert run_hand_off(handoff_id) == "refused"
+
+    assert [c.method for c in env.github.label_writes(triage.output)] == ["POST", "DELETE"]
+    _assert_refused(env, triage, "delivery_deadline_passed")
+
+
+def test_attempt_cut_off_by_the_time_cap_is_released_and_settles_after_the_deadline(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reconciler's per-attempt cap cancels an attempt that hangs on GitHub:
+    its lease is released with a backoff, and once the deadline passed the next
+    pass refuses without trying GitHub again."""
+
+    import curie_api.factory_triage_handoff as handoff_module
+    import curie_api.workitem_reconciler as reconciler_module
+
+    triage = published(env)
+    assert triage.handoff_id is not None and triage.output is not None
+    hung = asyncio.Event()
+
+    async def hang(*args: Any, **kwargs: Any) -> None:
+        await hung.wait()
+
+    cap, add_label = reconciler_module._TRACKER_RESULT_ATTEMPT_SECONDS, handoff_module._add_label
+    monkeypatch.setattr(reconciler_module, "_TRACKER_RESULT_ATTEMPT_SECONDS", 0.05)
+    monkeypatch.setattr(handoff_module, "_add_label", hang)
+    reconciler = WorkItemReconciler(
+        env.client.app.state.sessionmaker, env.client.app.state.valkey, get_settings()
+    )
+    env.client.portal.call(reconciler._hand_off_triage_tickets)
+
+    row = handoff(triage.handoff_id)
+    assert row["outcome"] is None
+    assert (row["lease_owner"], row["last_error"]) == (None, "attempt_timed_out")
+    assert row["next_attempt_at"] > row["created_at"]
+
+    monkeypatch.setattr(reconciler_module, "_TRACKER_RESULT_ATTEMPT_SECONDS", cap)
+    monkeypatch.setattr(handoff_module, "_add_label", add_label)
+    _past_deadline(triage.handoff_id)
+    _sql(
+        "UPDATE curie.factory_triage_handoffs SET next_attempt_at = clock_timestamp() "
+        "- interval '1 second' WHERE id = :id",
+        {"id": triage.handoff_id},
+    )
+    env.client.portal.call(reconciler._hand_off_triage_tickets)
+
+    row = handoff(triage.handoff_id)
+    assert (row["outcome"], row["reason"]) == ("refused", "attempt_timed_out")
+    assert work_items(triage.output) == []
 
 
 def test_refused_after_the_label_was_added_takes_the_label_off_again(env: Env) -> None:
