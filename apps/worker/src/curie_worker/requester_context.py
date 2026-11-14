@@ -63,7 +63,10 @@ async def _relay(
             run.request_id, runtime_epoch=epoch, acknowledgment=acknowledgment, reason=reason
         )
     except WorkItemConflict as conflict:
-        raise RequesterContextRefused(f"acknowledgment_{conflict.code}") from None
+        code = conflict.code
+        raise RequesterContextRefused(
+            code if code.startswith("acknowledgment_") else f"acknowledgment_{code}"
+        ) from None
 
 
 async def deliver(
@@ -116,7 +119,16 @@ async def deliver(
     refusal = (
         reason if isinstance(reason, str) and failed else ("runner_refused" if failed else None)
     )
-    evidence = await _relay(work_items, run, epoch, acknowledgment, refusal)
+    try:
+        evidence = await _relay(work_items, run, epoch, acknowledgment, refusal)
+    except RequesterContextRefused as exc:
+        if exc.reason != "acknowledgment_mismatch":
+            raise
+        # The runner answered for another execution, fence or digest, so the
+        # API kept the evidence pending: record the failure without it.
+        reason = refusal or exc.reason
+        await _relay(work_items, run, epoch, None, reason)
+        raise RequesterContextRefused(reason) from None
     if failed or evidence == "failed":
         raise RequesterContextRefused(refusal or "runner_refused")
     logger.info("requester context accepted for %s evidence=%s", run.request_id, evidence)

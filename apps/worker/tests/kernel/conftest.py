@@ -775,6 +775,9 @@ class FakeRunner:
         )
         # Envelopes posted before a first turn (ADR 0278), in order.
         self.requester_contexts: list[dict[str, Any]] = []
+        # When set, the requester context route answers this status and body
+        # instead of acknowledging, as a refusing or older runner would.
+        self.requester_context_answer: tuple[int, dict[str, Any]] | None = None
         self.turn_active = False
         self.turn_epoch: str | None = None
         self._turn_lock = asyncio.Lock()
@@ -842,6 +845,9 @@ class FakeRunner:
 
         envelope = await request.json()
         self.requester_contexts.append(envelope)
+        if self.requester_context_answer is not None:
+            status, body = self.requester_context_answer
+            return web.json_response(body, status=status)
         selection = envelope.get("selection") or {}
         ack: dict[str, Any] = {
             "envelope_version": 1,
