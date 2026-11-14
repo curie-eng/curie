@@ -1,10 +1,1 @@
-{
-  "kind": "ticket",
-  "title": "add(2, 3) returns -1 instead of 5",
-  "body": "## Problem\n{\"component\": \"calc.add\", \"input\": [2, 3], \"observed\": -1, \"expected\": 5}\n\n## Base\n{\"branch\": \"next\", \"revision\": \"0123456789abcdef0123456789abcdef01234567\"}\n\n## Blocked by\n[]\n\n## Decisions\n{\"behavior\": \"integer_addition\", \"intent\": \"settled\"}\n\n## Preconditions\n{\"command\": \"python3 -m pytest tests/test_calc.py -q\", \"available\": true}\n\n## Acceptance criteria\n[{\"input\": [2, 3], \"expected\": 5, \"Verified by\": \"python3 -m pytest tests/test_calc.py -q\", \"Runs in\": \"sandbox\"}]\n\n## Out of scope\n[\"new arithmetic conventions\"]\n",
-  "reproduction": {
-    "command": "python3 -m pytest tests/test_calc.py -q",
-    "observed": "AssertionError: expected 5, got -1",
-    "revision": "0123456789abcdef0123456789abcdef01234567"
-  }
-}
+{"kind":"ticket","title":"add(2, 3) returns -1 instead of 5","body":"## Problem\n{\"component\":\"calc.add\",\"input\":[2,3],\"observed\":-1,\"expected\":5}\n\n## Base\n{\"branch\":\"next\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"}\n\n## Blocked by\n[]\n\n## Decisions\n{\"behavior\":\"integer_addition\",\"intent\":\"settled\"}\n\n## Preconditions\n{\"command\":\"python3 -m pytest tests/test_calc.py -q\",\"available\":true}\n\n## Acceptance criteria\n[{\"input\":[2,3],\"expected\":5,\"Verified by\":\"python3 -m pytest tests/test_calc.py -q\",\"Runs in\":\"sandbox\"}]\n\n## Out of scope\n[\"new arithmetic conventions\"]","reproduction":{"command":"python3 -m pytest tests/test_calc.py -q","observed":"AssertionError: expected 5, got -1","revision":"0123456789abcdef0123456789abcdef01234567"}}

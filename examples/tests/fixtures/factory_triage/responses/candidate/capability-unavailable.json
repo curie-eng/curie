@@ -1,7 +1,1 @@
-{
-  "kind": "findings",
-  "reason": "capability_unavailable",
-  "tried": "{\"command\": \"python3 -m pytest tests/test_persistence.py -q\", \"exit_status\": 2, \"output\": \"ConnectionRefusedError: database unavailable\", \"report_match\": null, \"landed_fix\": null, \"unsafe_instructions\": \"none\"}",
-  "missing": "{\"need\": \"working_database\", \"choices\": []}",
-  "revision": "0123456789abcdef0123456789abcdef01234567"
-}
+{"kind":"findings","reason":"capability_unavailable","tried":"{\"command\":\"python3 -m pytest tests/test_persistence.py -q\",\"exit_status\":2,\"output\":\"ConnectionRefusedError: database unavailable\",\"report_match\":null,\"landed_fix\":null,\"unsafe_instructions\":\"none\"}","missing":"{\"need\":\"working_database\",\"choices\":[]}","revision":"0123456789abcdef0123456789abcdef01234567"}

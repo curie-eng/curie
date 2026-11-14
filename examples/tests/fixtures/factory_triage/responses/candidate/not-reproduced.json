@@ -1,7 +1,1 @@
-{
-  "kind": "findings",
-  "reason": "not_reproduced",
-  "tried": "{\"command\": \"python3 -m pytest tests/test_calc.py -q\", \"exit_status\": 0, \"output\": \"4 passed\", \"report_match\": false, \"landed_fix\": null, \"unsafe_instructions\": \"none\"}",
-  "missing": "{\"need\": \"matching_reproduction\", \"choices\": []}",
-  "revision": "0123456789abcdef0123456789abcdef01234567"
-}
+{"kind":"findings","reason":"not_reproduced","tried":"{\"command\":\"python3 -m pytest tests/test_calc.py -q\",\"exit_status\":0,\"output\":\"4 passed\",\"report_match\":false,\"landed_fix\":null,\"unsafe_instructions\":\"none\"}","missing":"{\"need\":\"matching_reproduction\",\"choices\":[]}","revision":"0123456789abcdef0123456789abcdef01234567"}
