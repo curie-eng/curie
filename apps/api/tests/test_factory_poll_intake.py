@@ -2101,3 +2101,64 @@ def test_label_actor_reader_accepts_direct_or_other_app(via: Any) -> None:
         SENDER_ID,
         SENDER,
     )
+
+
+@pytest.mark.parametrize("write_status", [201, 403, 503])
+def test_cadence_status_answer_terminal_refusal_and_transient_retry(
+    poll_factory: tuple[TestClient, PollGitHub],
+    monkeypatch: pytest.MonkeyPatch,
+    write_status: int,
+) -> None:
+    from curie_api.factory_poll_intake import Cadence, IntakeClock
+
+    _client, github = poll_factory
+    number = github.plant_issue()
+    original = PollGitHub.handle
+
+    def handle(self: PollGitHub, request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "POST"
+            and request.url.path == f"/repos/{REPO}/issues/{number}/comments"
+            and write_status != 201
+        ):
+            return httpx.Response(write_status, json={"message": "Fixture write failure"})
+        return original(self, request)
+
+    monkeypatch.setattr(PollGitHub, "handle", handle)
+
+    async def observe() -> list[tuple[dict[str, Any], dict[str, float]]]:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        now = 10.0
+
+        async def wait(delay: float) -> None:
+            raise AssertionError("poll_once must not wait for its timer")
+
+        cadence = Cadence(IntakeClock(lambda: now, wait), 45, last_clean={REPO: 0.0})
+        snapshots = []
+        try:
+            async with httpx.AsyncClient() as http:
+                for instant in (10.0, 80.0):
+                    now = instant
+                    await poll_once(maker, get_settings(), http, cadence=cadence)
+                    async with maker() as session:
+                        etags = await session.scalar(
+                            text("SELECT etags FROM curie.factory_poll_cursors")
+                        )
+                    snapshots.append((dict(etags), dict(cadence.last_clean)))
+        finally:
+            await engine.dispose()
+        return snapshots
+
+    first, second = asyncio.run(observe())
+    [status] = _rows("SELECT posted_at,refused_at FROM curie.factory_terminal_notices")
+    assert (status["posted_at"] is not None) == (write_status == 201)
+    assert (status["refused_at"] is not None) == (write_status == 403)
+    for (etags, last_clean), instant in zip((first, second), (10.0, 80.0), strict=True):
+        if write_status == 503:
+            assert f"issues:{LABEL}" not in etags
+            assert last_clean[REPO] == 0.0
+        else:
+            assert etags[f"issues:{LABEL}"] == github._etags["issues"]
+            assert last_clean[REPO] == instant
+    assert len(_requests(number)) == 1

@@ -917,7 +917,9 @@ async def _apply_notice(
                     FactoryIntakeNotice.posted_at.is_(None),
                 )
             )
-            if owed is not None or (status is not None and status.posted_at is None):
+            if owed is not None or (
+                status is not None and status.posted_at is None and status.refused_at is None
+            ):
                 raise FeedbackUnavailable("label_answer_unavailable")
 
 
