@@ -50,6 +50,8 @@ class FactoryNotice:
     comment_id: int | None = None
     comment_body: str | None = None
     label_event_id: int | None = None
+    actor_refusal: str | None = None
+    previously_admitted: bool = False
 
     @property
     def request_id(self) -> uuid.UUID:

@@ -242,6 +242,7 @@ class InMemoryHarness:
             # Jira's shape: linked output issues are GitHub only (ADR 0277).
             tracker_caps[Operation.CREATE_LINKED_ISSUE] = Support.UNSUPPORTED
             code_caps[Operation.RERUN_FAILED] = Support.NOOP
+            code_caps[Operation.CURRENT_INSTALLATION_CREDENTIAL] = Support.UNSUPPORTED
             code_caps[Operation.CI_DIAGNOSTICS] = Support.UNSUPPORTED
             code_caps[Operation.USER_CAN_WRITE] = Support.UNSUPPORTED
             code_caps[Operation.REQUIRED_CHECKS] = Support.UNSUPPORTED

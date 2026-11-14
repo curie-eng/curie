@@ -44,6 +44,7 @@ class Operation(enum.StrEnum):
     # CodeHost
     RESOLVE_REPOSITORY = "code_host.resolve_repository"
     CREDENTIAL = "code_host.credential"
+    CURRENT_INSTALLATION_CREDENTIAL = "code_host.current_installation_credential"
     BRANCH_HEAD = "code_host.branch_head"
     READ_COMMIT = "code_host.read_commit"
     IS_ANCESTOR = "code_host.is_ancestor"
@@ -92,6 +93,7 @@ OPTIONAL_OPERATIONS: frozenset[Operation] = frozenset(
         # correct answer (ADR 0277).
         Operation.CREATE_LINKED_ISSUE,
         Operation.FACTS_EXCHANGE,
+        Operation.CURRENT_INSTALLATION_CREDENTIAL,
         Operation.CI_DIAGNOSTICS,
         Operation.RERUN_FAILED,
         Operation.USER_CAN_WRITE,

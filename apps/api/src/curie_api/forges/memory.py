@@ -1106,6 +1106,10 @@ class InMemoryCodeHost(_Declared):
             raise NotFound("repository")
         return found
 
+    async def current_installation_credential(self, repository: RepositoryRef) -> Credential:
+        self._gate(Operation.CURRENT_INSTALLATION_CREDENTIAL)
+        return await self.credential(repository, CredentialScope.PUSH)
+
     async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:
         self._gate(Operation.CREDENTIAL)
         current = self._repository(repository)

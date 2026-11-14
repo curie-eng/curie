@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
 from curie_api.schemas.deployments import WebhookResult
@@ -27,7 +27,7 @@ from curie_api.workitems.lifecycle import (
     same_repository,
 )
 
-from . import factory_rediscovery, workitem_dispatch
+from . import factory_intake_notices, factory_rediscovery, workitem_dispatch
 from .config import Settings, get_settings
 from .factory_admission import (
     LABEL_REFUSAL_MARKER,
@@ -40,7 +40,6 @@ from .forges.errors import ForgeError, Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND, resolve_binding
 from .forges.github.comments import static_token
 from .forges.github.identity import delivery_uuid
-from .forges.github.review_polling import label_actor
 from .forges.github.tracker import GitHubTracker, IssueFacts, last_label_event
 from .forges.github.transport import parse_time
 from .forges.hosts import (
@@ -65,7 +64,7 @@ from .github_factory_events import (
 )
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
-from .models import AgentChannel, FactorySlackThread, WorkItem
+from .models import AgentChannel, ExecutionRequest, FactorySlackThread, WorkItem
 from .workitem_dispatch import Admission, DispatchConflict
 from .workspace_policy import repository_is_allowed
 
@@ -415,18 +414,18 @@ async def _settle_label_refusal(
 
 
 async def _refuse_rediscovered(
+    session: AsyncSession,
+    agent_id: uuid.UUID,
     notice: FactoryNotice,
     settings: Settings,
     client: httpx.AsyncClient,
     verified: VerifiedIssue,
-) -> None:
+) -> str | None:
     """Refuse a label admission with no local WorkItem when the code host
     already has this issue's factory publication (#4629).
 
-    Raises `FactoryRefused` ``publication_exists`` (an open, ambiguous or
-    unconfirmed one is named on the issue; a completed one whose trigger this
-    replays is logged), or `FeedbackUnavailable` when the evidence cannot be
-    read completely, so the caller defers instead of admitting.
+    Open and ambiguous publications keep their existing notice. A replay of
+    completed work owes an intake notice. An incomplete read is retried.
     """
 
     issue = notice_issue(notice, forges_registry(settings))
@@ -442,7 +441,18 @@ async def _refuse_rediscovered(
     except ForgeError:
         raise FeedbackUnavailable("publication_listing_unavailable") from None
     if found.verdict == "clear":
-        return
+        return None
+    if found.verdict == "completed":
+        await factory_intake_notices.record_notice(
+            session,
+            notice,
+            issue,
+            settings=settings,
+            reason="publication_completed",
+            agent_id=agent_id,
+            publication_url=found.publications[0].url,
+        )
+        return "publication_completed"
     try:
         await factory_rediscovery.report(verified.tracker, issue, found)
     except ForgeError:
@@ -457,12 +467,57 @@ async def admit_notice(
     verified: VerifiedIssue,
     *,
     client: httpx.AsyncClient,
+    reconcile_only: bool = False,
 ) -> WebhookResult:
     registry = forges_registry(settings)
     # Under the issue lock: the WorkItem decides whether the base is resolved
     # again (a fresh admission) or kept (ADR 0186 decision 5).
     existing = await work_item_for(session, notice_issue(notice, registry))
     served: frozenset[str] = frozenset()
+    if notice.disposition == "admit":
+        issue = notice_issue(notice, registry)
+        assert notice.label_event_id is not None
+        if await factory_intake_notices.answered(session, issue, notice.label_event_id):
+            return ignored("label_event_answered")
+        admitted = await session.get(ExecutionRequest, notice.request_id)
+        if admitted is not None or notice.previously_admitted:
+            if (
+                notice.actor_refusal is None
+                and await verified.tracker.label_permission(notice) is None
+            ):
+                await record_base_label_notice(session, notice, verified, settings, client=client)
+            return WebhookResult(status="factory_duplicate")
+        grouped = await bound_labels(session, registry, GITHUB_CHANNEL_KIND, notice.repo_full_name)
+        matches = grouped.get(notice.label or "", [])
+        if not matches:
+            raise FactoryRefused("binding_missing")
+        agent_id = matches[0].agent_id if len(matches) == 1 else None
+        reason = notice.actor_refusal
+        if reason == "actor_bot" and await factory_intake_notices.delegated_output_before_label(
+            session, issue, notice
+        ):
+            return ignored("delegated_output")
+        if reason is None:
+            reason = await verified.tracker.label_permission(notice)
+        if (
+            reason is None
+            and settings.factory_model_auth_mode == "personal"
+            and (existing is None or existing.model_auth_mode != "personal")
+        ):
+            reason = "personal_owner_required"
+        if reason is None and len(matches) > 1:
+            reason = "binding_ambiguous"
+        if reason is not None:
+            await factory_intake_notices.record_notice(
+                session,
+                notice,
+                issue,
+                settings=settings,
+                reason=reason,
+                agent_id=agent_id,
+            )
+            code = "sender_permission_refused" if reason == "actor_no_permission" else reason
+            return ignored(code)
     if notice.disposition == "mention":
         if existing is None:
             raise FactoryRefused("not_admitted")
@@ -480,8 +535,29 @@ async def admit_notice(
         )
     if existing is None and notice.disposition == "admit":
         # No local history: the code host's own publications decide (#4629).
-        await _refuse_rediscovered(notice, settings, client, verified)
+        refused = await _refuse_rediscovered(
+            session, binding.agent_id, notice, settings, client, verified
+        )
+        if refused is not None:
+            return ignored(refused)
     facts = _facts(notice, binding, registry)
+    if reconcile_only and existing is not None:
+        if (
+            existing.agent_id == binding.agent_id
+            and existing.tracker_issue == facts.issue
+            and same_repository(existing.repository, facts.repository)
+            and not workitem_dispatch.work_item_matches(existing, facts, binding.adapter)
+        ):
+            await factory_intake_notices.record_notice(
+                session,
+                notice,
+                facts.issue,
+                settings=settings,
+                reason="installation_changed",
+                agent_id=binding.agent_id,
+            )
+            return ignored("installation_changed")
+        return ignored("work_item_present")
     # Dispatch helpers commit between WorkItem creation and request creation.
     # Keep those commits inside savepoints so the caller's issue lock remains
     # held until admission and delivery settlement commit together.
@@ -505,6 +581,31 @@ async def admit_notice(
                 settings=settings,
             )
         outcome = admission_result(result, facts.request_id)
+    if notice.disposition == "admit" and isinstance(result, DispatchConflict):
+        reason = None
+        if result.code == "personal_owner_required":
+            reason = result.code
+        elif (
+            result.code == "identity_mismatch"
+            and existing is not None
+            and (
+                existing.agent_id == binding.agent_id
+                and existing.tracker_issue == facts.issue
+                and same_repository(existing.repository, facts.repository)
+                and not workitem_dispatch.work_item_matches(existing, facts, binding.adapter)
+            )
+        ):
+            reason = "installation_changed"
+        if reason is not None:
+            await factory_intake_notices.record_notice(
+                session,
+                notice,
+                facts.issue,
+                settings=settings,
+                reason=reason,
+                agent_id=binding.agent_id,
+            )
+            return ignored(reason)
     # A label refusal can stand only where several labels are served, so a
     # single-label repository pays no read for it.
     if existing is None and len(served) > 1 and outcome.status == "factory_admitted":
@@ -593,15 +694,12 @@ async def _with_label_event(
     except Unavailable:
         raise FeedbackUnavailable("label_events_unavailable") from None
     event = last_label_event(events, label)
-    if event is None or type(event.get("id")) is not int:
+    if event is None:
         raise FeedbackUnavailable("label_events_unavailable")
-    sender_id, sender_login = label_actor(event, app_id=tracker.app_id)
-    return replace(
-        notice,
-        sender_id=sender_id,
-        sender_login=sender_login,
-        label_event_id=event["id"],
-        label_event_at=parse_time(event.get("created_at")),
+    return factory_intake_notices.observe_label(
+        replace(notice, label_event_at=parse_time(event.get("created_at"))),
+        event,
+        app_id=tracker.app_id,
     )
 
 
@@ -691,4 +789,14 @@ async def handle_factory_delivery(
     else:
         settle_review_delivery(audit, "accepted")
     await session.commit()
+    try:
+        await factory_intake_notices.sync_intake_notices(
+            async_sessionmaker(session.bind, expire_on_commit=False),
+            settings,
+            owner="webhook-intake",
+            client=client,
+            limit=1,
+        )
+    except Exception:
+        logger.exception("factory intake notice delivery deferred")
     return outcome

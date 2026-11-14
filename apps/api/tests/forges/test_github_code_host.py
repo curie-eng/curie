@@ -13,10 +13,14 @@ import json
 import logging
 import uuid
 from collections.abc import Callable, Coroutine
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from curie_api import factory_ci
 from curie_api.config import Settings
 from curie_api.forges import types
@@ -916,6 +920,116 @@ def test_the_credential_renders_the_same_git_header_for_both_scopes() -> None:
         assert credential.origin == "https://github.com"
         assert f"Authorization: {GIT_HEADER}" == credential.git_header()
         assert "fixture-installation-token" not in repr(credential)
+
+
+@pytest.fixture(scope="module")
+def installation_key() -> str:
+    return (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+
+
+def test_current_installation_credential_revalidates_a_cached_token(
+    monkeypatch: pytest.MonkeyPatch, installation_key: str
+) -> None:
+    # App installation discovery and mint responses follow GitHub REST:
+    # https://docs.github.com/en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
+    # https://docs.github.com/en/rest/apps/installations#create-an-installation-access-token
+    installation = 5501
+    discovery_status = 200
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == f"/repos/{REPO}/installation":
+            return httpx.Response(discovery_status, json={"id": installation})
+        if request.url.path == f"/app/installations/{installation}/access_tokens":
+            return httpx.Response(
+                201,
+                json={
+                    "token": f"fixture-installation-{installation}",
+                    "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                },
+            )
+        return httpx.Response(404)
+
+    class AppClient(httpx.Client):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["transport"] = httpx.MockTransport(handler)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", AppClient)
+    credentials = GitHubCredentials(
+        GitHubAuth(
+            app_id="51",
+            private_key=installation_key,
+            token="fixture-operator-token",
+            api_url="https://api.github.com",
+            timeout_s=1,
+            ca_bundle="",
+        )
+    )
+
+    async def run() -> None:
+        nonlocal installation, discovery_status
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            host: CodeHost = _code_host(client, credentials=credentials)
+            first = await host.current_installation_credential(_repository())
+            assert first.secret == "fixture-installation-5501"
+            installation = 5502
+            second = await host.current_installation_credential(_repository())
+            assert second.secret == "fixture-installation-5502"
+            assert second.scope is CredentialScope.PUSH
+            discovery_status = 503
+            with pytest.raises(Unavailable, match="installation_credential_unavailable"):
+                await host.current_installation_credential(_repository())
+            before = len(calls)
+            with pytest.raises(NotFound):
+                await host.current_installation_credential(
+                    replace(_repository(), host="other.example.com")
+                )
+            assert len(calls) == before
+
+    asyncio.run(run())
+    assert [request.url.path for request in calls] == [
+        f"/repos/{REPO}/installation",
+        "/app/installations/5501/access_tokens",
+        f"/repos/{REPO}/installation",
+        "/app/installations/5502/access_tokens",
+        f"/repos/{REPO}/installation",
+    ]
+
+
+def test_current_installation_credential_refuses_an_operator_token() -> None:
+    credentials = GitHubCredentials(
+        GitHubAuth(
+            app_id="",
+            private_key="",
+            token="fixture-operator-token",
+            api_url="https://api.github.com",
+            timeout_s=1,
+            ca_bundle="",
+        )
+    )
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(500)
+
+    with pytest.raises(Unauthorized, match="installation_credential_refused"):
+        _with_host(
+            handler,
+            lambda host: host.current_installation_credential(_repository()),
+            credentials=credentials,
+        )
+    assert calls == []
 
 
 # --- CI ------------------------------------------------------------------------------

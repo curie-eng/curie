@@ -447,3 +447,13 @@ is the five `langfuse.*` writer attributes (`langfuse.trace.name`,
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 2 (Observability / OTel store), grade B+.
 - **ADR(s):** [ADR-0004](../../adr/0004-langfuse-observability-and-eval-backbone.md) — Langfuse as the single observability + eval backbone (OTLP over HTTP/protobuf to the collector).
   [ADR-0076](../../adr/0076-closed-typed-telemetry-attribute-schema.md) (Accepted, epic #512) — the closed, versioned attribute schema, the export-time validator, and the `gen_ai.approval.decision` key that closed the approval-gate observability gap ADR-0038 left open.
+
+
+## Refused factory trigger labels
+
+`curie.factory.intake.notice.oldest_owed_age_seconds` is the age of the oldest
+refusal notice still awaiting its App-owned issue comment, zero when none is
+owed. The API records refusals in `factory_intake_notices` independently of
+work items and retries delivery with capped backoff beside status-comment
+synchronization. A growing age means issue-visible answers are delayed;
+check GitHub availability and the factory App's comment permissions.

@@ -38,8 +38,7 @@ import httpx
 import pytest
 import redis.asyncio as aioredis
 from curie_api.config import Settings, get_settings
-from curie_api.forges.github.review_polling import label_actor
-from curie_api.github_review_events import FeedbackIgnored
+from curie_api.github_review_events import FeedbackIgnored, label_actor
 from curie_api.main import create_app
 from curie_api.models import ExecutionRequest
 from curie_api.threadkeys import route_thread_key
