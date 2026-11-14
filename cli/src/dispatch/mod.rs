@@ -534,6 +534,20 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
         ),
         Some(Command::Example {
+            action:
+                ExampleAction::FactoryTriage {
+                    action:
+                        FactoryTriageAction::Render {
+                            out,
+                            implementation_label,
+                        },
+                },
+            ..
+        }) => emit(curie::examples::render_factory_triage(
+            out,
+            implementation_label,
+        )?),
+        Some(Command::Example {
             action: ExampleAction::SreBot { action },
             context,
         }) => {
