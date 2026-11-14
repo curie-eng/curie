@@ -32,6 +32,10 @@ from curie_runner.translate import TurnState, translate_message
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = REPO_ROOT / "examples" / "dark-factory"
+ROUND_CAPS_VECTOR = REPO_ROOT / "tests" / "vectors" / "progress-round-caps.json"
+_ROUND_CAPS_TOP_LEVEL_KEYS = frozenset({"comment", "cases"})
+_ROUND_CAPS_CASE_KEYS = frozenset({"name", "declaration", "reports"})
+_ROUND_CAPS_REPORT_KEYS = frozenset({"phase", "round", "accepted"})
 TOKEN = "sbx.example-progress-token.signature"
 BUNDLE_PHASES = [
     "read_issue",
@@ -171,8 +175,8 @@ def test_any_factory_progress_boot_signal_is_detected(env: dict[str, str]) -> No
 # --- the tool ----------------------------------------------------------------
 
 
-def _tool(url: str, activity: ProgressActivity | None = None) -> Any:
-    resolved = resolve_progress({PROGRESS_URL_ENV: url, PROGRESS_TOKEN_ENV: TOKEN}, BUNDLE)
+def _tool(url: str, activity: ProgressActivity | None = None, bundle: Path = BUNDLE) -> Any:
+    resolved = resolve_progress({PROGRESS_URL_ENV: url, PROGRESS_TOKEN_ENV: TOKEN}, bundle)
     assert resolved is not None
     client, declaration = resolved
     return build_progress_tool(declaration, client, activity or ProgressActivity())
@@ -210,6 +214,64 @@ def test_the_tool_refuses_an_undeclared_phase_or_a_bad_round_without_posting(
     assert result.get("is_error") is True
     assert needle in _text(result)
     assert recorder.received == []
+
+
+def _round_caps_cases() -> list[dict[str, Any]]:
+    payload = json.loads(ROUND_CAPS_VECTOR.read_text(encoding="utf-8"))
+    assert set(payload) == _ROUND_CAPS_TOP_LEVEL_KEYS, (
+        f"{ROUND_CAPS_VECTOR} has unexpected top-level keys "
+        f"{sorted(set(payload) - _ROUND_CAPS_TOP_LEVEL_KEYS)} and is missing "
+        f"{sorted(_ROUND_CAPS_TOP_LEVEL_KEYS - set(payload))}. A new key is rejected on "
+        "purpose: one this reader cannot see would pass vacuously."
+    )
+    assert payload["comment"]
+    cases = payload["cases"]
+    assert cases
+    for case in cases:
+        assert set(case) == _ROUND_CAPS_CASE_KEYS, (
+            f"case {case.get('name')!r} has unexpected keys "
+            f"{sorted(set(case) - _ROUND_CAPS_CASE_KEYS)} and is missing "
+            f"{sorted(_ROUND_CAPS_CASE_KEYS - set(case))}."
+        )
+        assert case["reports"]
+        for entry in case["reports"]:
+            assert set(entry) == _ROUND_CAPS_REPORT_KEYS, (
+                f"a report in case {case['name']!r} has unexpected keys "
+                f"{sorted(set(entry) - _ROUND_CAPS_REPORT_KEYS)} and is missing "
+                f"{sorted(_ROUND_CAPS_REPORT_KEYS - set(entry))}."
+            )
+    return cases
+
+
+def test_a_round_on_a_phase_two_loops_share_reaches_the_larger_cap(tmp_path: Path) -> None:
+    for index, case in enumerate(_round_caps_cases()):
+        bundle = _bundle(tmp_path / f"case-{index}", case["declaration"])
+        recorder = _Recorder()
+
+        async def go(
+            case: dict[str, Any] = case, bundle: Path = bundle, recorder: _Recorder = recorder
+        ) -> None:
+            async with TestServer(recorder.app()) as server:
+                url = str(server.make_url("/v1/work-item-progress/example-request"))
+                tool = _tool(url, bundle=bundle)
+                for entry in case["reports"]:
+                    args: dict[str, Any] = {"phase": entry["phase"]}
+                    if entry["round"] is not None:
+                        args["round"] = entry["round"]
+                    posted = len(recorder.received)
+                    result = await tool.handler(args)
+                    where = f"case {case['name']!r}, phase {entry['phase']}, round {entry['round']}"
+                    if entry["accepted"]:
+                        assert result.get("is_error") is not True, f"{where} was refused: {result}"
+                        assert len(recorder.received) == posted + 1, where
+                        body, _key = recorder.received[-1]
+                        assert body["phase"] == entry["phase"], where
+                        assert body.get("round") == entry["round"], where
+                    else:
+                        assert result.get("is_error") is True, f"{where} was accepted: {result}"
+                        assert len(recorder.received) == posted, f"{where} was posted"
+
+        anyio.run(go)
 
 
 def test_a_valid_report_posts_the_wire_body_with_the_token_header() -> None:
