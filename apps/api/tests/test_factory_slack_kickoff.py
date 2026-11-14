@@ -24,6 +24,7 @@ WorkItem, kickoff ones included, so it is not repeated here.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import uuid
 from collections.abc import Callable
@@ -190,6 +191,67 @@ def test_an_enrolled_sender_at_root_admits_one_personal_work_item_and_request(
     assert "Outcome: admitted" in attempt.edits[-1].text
     assert issue_url(number) in attempt.edits[-1].text
     _assert_no_sandbox(stack)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_kickoff_pins_the_verified_senders_coding_selection(
+    kickoff: SteeringStack, monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    monkeypatch.setenv("CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY", str(enabled).lower())
+    get_settings.cache_clear()
+    try:
+        person = enrolled(kickoff)
+        document = "EXAMPLE_SLACK_CODING_INSTRUCTIONS_5591\n"
+        digest = hashlib.sha256(document.encode()).hexdigest()
+        _rows(
+            "INSERT INTO curie.requester_coding_profiles "
+            "(tenant_id, principal_id, text, revision, sha256, format_version) "
+            "VALUES (:tenant, :principal, :text, 1, :sha, 1)",
+            {
+                "tenant": DEFAULT_TENANT_ID,
+                "principal": person.principal_id,
+                "text": document,
+                "sha": digest,
+            },
+        )
+        number = next_issue()
+        plant_issue(kickoff, number)
+        response = ask_over_http(
+            kickoff, person_mention(kickoff, person.slack_user, linking(number))
+        ).result(timeout=60)
+        assert response.status_code == 200, response.text
+        work_item_id, _request_id = _assert_admitted(response.json(), number)
+        (item,) = _rows(
+            "SELECT requester_principal_id, owner_principal_id, coding_instructions_state, "
+            "coding_instructions_revision, coding_instructions_sha256, "
+            "coding_instructions_absence_reason FROM curie.work_items WHERE id = :id",
+            {"id": work_item_id},
+        )
+        assert item["requester_principal_id"] == person.principal_id
+        assert item["owner_principal_id"] == person.principal_id
+        (request,) = _rows(
+            "SELECT coding_instructions_selection_id, coding_instructions_evidence "
+            "FROM curie.execution_requests WHERE work_item_id = :id",
+            {"id": work_item_id},
+        )
+        assert request["coding_instructions_selection_id"] == work_item_id
+        snapshots = _rows(
+            "SELECT text FROM curie.work_item_coding_snapshots WHERE work_item_id = :id",
+            {"id": work_item_id},
+        )
+        if enabled:
+            assert item["coding_instructions_state"] == "selected"
+            assert item["coding_instructions_revision"] == 1
+            assert item["coding_instructions_sha256"] == digest
+            assert snapshots == [{"text": document}]
+            assert request["coding_instructions_evidence"] == "pending"
+        else:
+            assert item["coding_instructions_absence_reason"] == "application_unavailable"
+            assert snapshots == []
+            assert request["coding_instructions_evidence"] == "none"
+        assert document not in response.text
+    finally:
+        get_settings.cache_clear()
 
 
 def test_an_unmapped_thread_reply_admits_under_its_thread_root(kickoff: SteeringStack) -> None:
