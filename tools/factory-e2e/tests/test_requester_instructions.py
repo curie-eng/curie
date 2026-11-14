@@ -34,6 +34,7 @@ CANDIDATE = "0123456789abcdef0123456789abcdef01234567"
 TOKEN = "synthetic_user_token_sentinel_not_a_token_0001"
 T0 = 1_800_000_000.0
 NONCE = "a1b2c3d4"
+KUBE_CONTEXT = "throwaway"
 
 
 # --------------------------------------------------------------------------
@@ -159,7 +160,7 @@ def _common(tmp_path: Path) -> list[str]:
         "--candidate",
         CANDIDATE,
         "--context",
-        "throwaway",
+        KUBE_CONTEXT,
         "--namespace",
         "rqp-test",
         "--docker-context",
@@ -254,7 +255,7 @@ def _stub_owner_preflight(
 ) -> list[list[str]]:
     state = _state(tmp_path)
     flags = poe.Flags(
-        CANDIDATE, "throwaway", "rqp-test", "scratch", "127.0.0.1:5000", 5000, state, "run-1"
+        CANDIDATE, KUBE_CONTEXT, "rqp-test", "scratch", "127.0.0.1:5000", 5000, state, "run-1"
     )
     inputs = poe.InputFile(str(tmp_path / "kubeconfig"), "/bin/true", "10.0.0.1")
     monkeypatch.setattr(
@@ -298,7 +299,7 @@ def test_preflight_composes_owner_checks_ledger_and_live_inputs(
         [
             "kubectl",
             "--context",
-            "throwaway",
+            KUBE_CONTEXT,
             "get",
             "priorityclass",
             "proof-critical",
