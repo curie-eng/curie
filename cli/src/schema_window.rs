@@ -777,9 +777,9 @@ print(json.dumps(graph))
         // tables. Owner coding profiles and tenant policies require 0165,
         // which stays below this floor. Slack kickoff thread origin reads
         // require 0166, which stays below this floor. Execution request reads
-        // select the 0167 completion contract columns. Intake notices require 0168.
-        assert_eq!(candidate.schema_min, "0168");
-        assert_eq!(candidate.schema_head, "0168");
+        // select the 0167 completion contract columns. Intake notices require 0168. Triage handoff storage requires 0171.
+        assert_eq!(candidate.schema_min, "0171");
+        assert_eq!(candidate.schema_head, "0171");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -835,7 +835,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0165", &current));
         assert!(!live_in_window("0166", &current));
         assert!(!live_in_window("0167", &current));
-        assert!(live_in_window("0168", &current));
+        assert!(!live_in_window("0168", &current));
+        assert!(live_in_window("0171", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

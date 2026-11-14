@@ -22,7 +22,17 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 REPOSITORY = "acme-corp/acme-bot"
 HUMAN = {"id": 6601, "login": "octocat", "type": "User"}
+READER = {"id": 6602, "login": "reader", "type": "User"}
 BOT = {"id": 51, "login": "example-app[bot]", "type": "Bot"}
+# Collaborator permission levels the REST answer may carry.
+# https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+PERMISSION_LEVELS = ("admin", "maintain", "write", "triage", "read", "none")
+# Write operations a test can make fail or answer ambiguously, and how.
+FAULT_OPERATIONS = ("issue_create", "comment_create")
+# refuse: answer the status and write nothing.
+# ambiguous: write the object, then answer the status as if it failed.
+# unreadable: write the object, then answer 201 with a body that is not JSON.
+FAULT_MODES = ("refuse", "ambiguous", "unreadable")
 PERMISSIONS = {
     "contents": "write",
     "issues": "write",
@@ -192,6 +202,18 @@ class GithubStub:
                 " PRIMARY KEY(kind,id)); CREATE TABLE unsupported(request TEXT);"
                 "CREATE TABLE tokens(token TEXT PRIMARY KEY, permissions TEXT);"
                 "CREATE TABLE request_log(method TEXT NOT NULL, path TEXT NOT NULL);"
+                "CREATE TABLE collaborators(login TEXT PRIMARY KEY, permission TEXT NOT NULL,"
+                " user TEXT NOT NULL);"
+                "CREATE TABLE permission_faults(login TEXT PRIMARY KEY, status INTEGER NOT NULL);"
+                "CREATE TABLE faults(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " operation TEXT NOT NULL, mode TEXT NOT NULL, status INTEGER NOT NULL);"
+            )
+            connection.executemany(
+                "INSERT INTO collaborators VALUES(?,?,?)",
+                [
+                    (HUMAN["login"], "write", json.dumps(HUMAN)),
+                    (READER["login"], "read", json.dumps(READER)),
+                ],
             )
         self._repository.parent.mkdir(parents=True, exist_ok=True)
         self._run("git", "init", "--bare", "--initial-branch=main", str(self._repository))
@@ -493,6 +515,137 @@ class GithubStub:
         self._put("comment", identifier, comment)
         return comment
 
+    # Runtime controls. The scripted driver holds this object in process, so a
+    # control is a method call, like ``advance`` and ``add_issue_comment``. Each
+    # writes SQLite state the request threads read on every request.
+
+    def set_permission(
+        self, login: str, permission: str, *, user: dict[str, Any] | None = None
+    ) -> None:
+        """Answer ``permission`` for ``login`` from now on, adding the collaborator."""
+
+        if permission not in PERMISSION_LEVELS:
+            raise ValueError(f"unknown permission level: {permission}")
+        with sqlite3.connect(self._database) as connection:
+            row = connection.execute(
+                "SELECT user FROM collaborators WHERE login=?", (login,)
+            ).fetchone()
+            if user is None:
+                if row is None:
+                    raise ValueError(f"collaborator {login} needs a user to be added")
+                user = json.loads(row[0])
+            connection.execute(
+                "INSERT OR REPLACE INTO collaborators VALUES(?,?,?)",
+                (login, permission, json.dumps(user)),
+            )
+
+    def revoke_permission(self, login: str) -> None:
+        """Drop ``login`` to read access; GitHub still lists a read collaborator."""
+
+        self.set_permission(login, "read")
+
+    def permission(self, login: str) -> str | None:
+        with sqlite3.connect(self._database) as connection:
+            row = connection.execute(
+                "SELECT permission FROM collaborators WHERE login=?", (login,)
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def fail_permission_reads(self, login: str, status: int = 503) -> None:
+        """Answer every permission read for ``login`` with ``status`` until cleared."""
+
+        if status < 500:
+            raise ValueError("a permission read failure is a server error status")
+        with sqlite3.connect(self._database) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO permission_faults VALUES(?,?)", (login, status)
+            )
+
+    def clear_permission_failure(self, login: str) -> None:
+        with sqlite3.connect(self._database) as connection:
+            connection.execute("DELETE FROM permission_faults WHERE login=?", (login,))
+
+    def inject_fault(
+        self, operation: str, mode: str, *, count: int = 1, status: int = 502
+    ) -> None:
+        """Make the next ``count`` ``operation`` requests fail in ``mode``.
+
+        Faults are consumed in the order they were injected, one per request.
+        """
+
+        if operation not in FAULT_OPERATIONS:
+            raise ValueError(f"unknown fault operation: {operation}")
+        if mode not in FAULT_MODES:
+            raise ValueError(f"unknown fault mode: {mode}")
+        if count < 1:
+            raise ValueError("a fault needs a positive count")
+        if mode != "unreadable" and status < 500:
+            raise ValueError("a refused or ambiguous write answers a server error status")
+        with sqlite3.connect(self._database) as connection:
+            connection.executemany(
+                "INSERT INTO faults(operation, mode, status) VALUES(?,?,?)",
+                [(operation, mode, status)] * count,
+            )
+
+    def pending_faults(self, operation: str | None = None) -> list[dict[str, Any]]:
+        with sqlite3.connect(self._database) as connection:
+            rows = connection.execute(
+                "SELECT operation, mode, status FROM faults ORDER BY id"
+            ).fetchall()
+        return [
+            {"operation": row[0], "mode": row[1], "status": row[2]}
+            for row in rows
+            if operation is None or row[0] == operation
+        ]
+
+    def _take_fault(self, operation: str) -> tuple[str, int] | None:
+        with sqlite3.connect(self._database) as connection:
+            row = connection.execute(
+                "SELECT id, mode, status FROM faults WHERE operation=? ORDER BY id LIMIT 1",
+                (operation,),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute("DELETE FROM faults WHERE id=?", (row[0],))
+        return str(row[1]), int(row[2])
+
+    def edit_issue_body(self, number: int, body: str) -> dict[str, Any]:
+        """Change an issue body out of band, as a person editing it would.
+
+        No label or timeline event is written; the next read returns ``body``.
+        """
+
+        issue = self._get("issue", number)
+        if issue is None:
+            raise ValueError(f"issue {number} does not exist")
+        issue.update(body=body, updated_at=_utc())
+        self._put("issue", number, issue)
+        return issue
+
+    def edit_comment_body(self, identifier: int, body: str) -> dict[str, Any]:
+        """Change a comment body out of band; the next read returns ``body``."""
+
+        comment = self._get("comment", identifier)
+        if comment is None:
+            raise ValueError(f"comment {identifier} does not exist")
+        comment.update(body=body, updated_at=_utc())
+        self._put("comment", identifier, comment)
+        return comment
+
+    def branches(self) -> list[str]:
+        refs = self._run(
+            "git",
+            "--git-dir",
+            str(self._repository),
+            "for-each-ref",
+            "--format=%(refname:strip=2)",
+            "refs/heads/",
+        ).decode()
+        return sorted(line for line in refs.splitlines() if line)
+
+    def main_revision(self) -> str:
+        return self._ref("main")
+
     @property
     def request_log(self) -> list[dict[str, str]]:
         with sqlite3.connect(self._database) as connection:
@@ -532,8 +685,32 @@ class GithubStub:
             return
         if result is None:
             self._unsupported(handler)
+        elif len(result) == 3:
+            # A faulted write: the object exists, the answer is not JSON.
+            self._raw(handler, result[0], result[2])
         else:
             self._json(handler, *result)
+
+    def _raw(self, handler: BaseHTTPRequestHandler, status: int, payload: bytes) -> None:
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+    @staticmethod
+    def _faulted(
+        fault: tuple[str, int] | None, status: int, created: Any
+    ) -> tuple[int, Any] | tuple[int, Any, bytes]:
+        """The answer for a write that was made, under the fault that was taken."""
+
+        if fault is None:
+            return status, created
+        mode, fault_status = fault
+        if mode == "ambiguous":
+            return fault_status, {"message": "Server Error"}
+        # unreadable: a success status whose body is cut off mid-object.
+        return status, None, json.dumps(created).encode()[:12]
 
     def _unsupported(self, handler: BaseHTTPRequestHandler) -> None:
         request = f"{handler.command} {urlsplit(handler.path).path}"
@@ -577,7 +754,7 @@ class GithubStub:
 
     def _rest(
         self, method: str, path: str, query: dict[str, list[str]], body: Any
-    ) -> tuple[int, Any] | None:
+    ) -> tuple[int, Any] | tuple[int, Any, bytes] | None:
         if method == "GET" and path == "/app":
             # The authenticated App; its bot user, ``<slug>[bot]``, authors what
             # its installation token writes (BOT).
@@ -615,16 +792,18 @@ class GithubStub:
             }
         if method == "GET" and tail.startswith("collaborators/") and tail.endswith("/permission"):
             login = tail.split("/")[1]
-            actors = {
-                HUMAN["login"]: HUMAN,
-                "reader": {"id": 6602, "login": "reader", "type": "User"},
-            }
-            if login not in actors:
+            with sqlite3.connect(self._database) as connection:
+                failure = connection.execute(
+                    "SELECT status FROM permission_faults WHERE login=?", (login,)
+                ).fetchone()
+                row = connection.execute(
+                    "SELECT permission, user FROM collaborators WHERE login=?", (login,)
+                ).fetchone()
+            if failure is not None:
+                return int(failure[0]), {"message": "Server Error"}
+            if row is None:
                 return 404, {"message": "Not Found"}
-            return 200, {
-                "permission": "read" if login == "reader" else "write",
-                "user": actors[login],
-            }
+            return 200, {"permission": row[0], "role_name": row[0], "user": json.loads(row[1])}
         if method == "GET" and tail.startswith("rules/branches/"):
             # No ruleset on this fixture. HTTP 404 contributes no required names.
             # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
@@ -721,6 +900,9 @@ class GithubStub:
                     query,
                 )
             if method == "POST":
+                fault = self._take_fault("issue_create")
+                if fault is not None and fault[0] == "refuse":
+                    return fault[1], {"message": "Server Error"}
                 number = max(row["number"] for row in self._rows("issue")) + 1
                 issue = self._issue(
                     number, body["title"], body.get("body", ""), body.get("labels", [])
@@ -729,7 +911,7 @@ class GithubStub:
                 self._put("issue", number, issue)
                 for label in issue["labels"]:
                     self._label_event(number, label["name"], "labeled", BOT)
-                return 201, issue
+                return self._faulted(fault, 201, issue)
         if tail.startswith("issues/"):
             parts = tail.split("/")
             number = int(parts[1])
@@ -789,6 +971,9 @@ class GithubStub:
                         query,
                     )
                 if method == "POST":
+                    fault = self._take_fault("comment_create")
+                    if fault is not None and fault[0] == "refuse":
+                        return fault[1], {"message": "Server Error"}
                     identifier = max((row["id"] for row in self._rows("comment")), default=0) + 1
                     comment = {
                         "id": identifier,
@@ -805,7 +990,7 @@ class GithubStub:
                         ),
                     }
                     self._put("comment", identifier, comment)
-                    return 201, comment
+                    return self._faulted(fault, 201, comment)
         if tail == "pulls/comments" and method == "GET":
             return 200, []
         if tail == "pulls":
