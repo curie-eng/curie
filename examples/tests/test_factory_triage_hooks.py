@@ -131,11 +131,19 @@ def test_mounted_checkout_ownership_allows_recorded_ticket(
     assert real_git is not None
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    global_config = tmp_path / "gitconfig"
+    global_config.touch()
     launcher = bin_dir / "git"
     # Git's ownership tests use this switch to exercise the real trust check:
     # https://github.com/git/git/blob/v2.39.5/t/t0033-safe-directory.sh
     launcher.write_text(
-        "#!/bin/sh\nGIT_TEST_ASSUME_DIFFERENT_OWNER=1 exec " + shlex.quote(real_git) + ' "$@"\n'
+        "#!/bin/sh\n"
+        f"HOME={shlex.quote(str(home))} "
+        f"GIT_CONFIG_GLOBAL={shlex.quote(str(global_config))} "
+        "GIT_CONFIG_NOSYSTEM=1 GIT_TEST_ASSUME_DIFFERENT_OWNER=1 exec "
+        f'{shlex.quote(real_git)} "$@"\n'
     )
     launcher.chmod(0o755)
     session.env.update(
