@@ -4163,6 +4163,54 @@ If the fence cannot be taken inside `CURIE_MIGRATION_FENCE_LOCK_TIMEOUT_MS`
 database is exactly as it was. Stop that writer, or raise the bound, and
 re-run.
 
+## Factory tool observations
+
+The Kubernetes worker observes the runner selected for each GitHub factory
+agent and repository. Selection uses the same repository, agent and platform
+pool routing as a factory claim. The loop starts with the worker and ticks
+every 300 seconds under a Postgres advisory lock. One subject's failure does
+not stop the remaining subjects or the worker.
+
+Tool facts require an immutable digest declared by the deployment: a repository
+runner entry, an agent runner image digest, or the worker's platform runner
+digest. A deployment whose runner is a mutable tag with no declared digest gets
+`unknown` with reason `unreadable` for tools. A probe whose cluster-reported
+runner digest differs from its declaration also produces `unknown` with reason
+`unreadable`. Missing repository pools and stale runner bases produce `unknown`
+with reason `runner_unavailable`.
+
+The probe uses a separate short-lived claim with no workspace, bundle fetch,
+model credential or connector secret. It looks up the fixed catalog in PATH
+as the sandbox user with the image's default environment, without executing
+catalog programs. It releases its claim and confirms removal within its
+120-second budget. Capacity refusal defers the subject until another tick.
+
+The same probe records `uname -s` and `uname -m` for its process platform.
+Linux on `x86_64` or `aarch64` becomes `linux/amd64` or `linux/arm64` in the
+observation digest. Missing or unsupported platform answers produce `unknown`
+with reason `unreadable`. The observer needs no cluster-scoped permission.
+
+Catalog version 1 contains `bash`, `sh`, `git`, `curl`, `wget`, `jq`, `make`,
+`gcc`, `cc`, `python3`, `pip`, `uv`, `pytest`, `ruff`, `node`, `npm`, `npx`,
+`pnpm`, `yarn`, `tsc`, `cargo`, `rustc`, `rustfmt`, `go`, `java`, `mvn`,
+`gradle`, `ruby`, `bundle`, `php`, `composer`, `dotnet`, `docker`, `kubectl`,
+`helm`, `terraform`, `psql`, `sqlite3`, `redis-cli`, `valkey-cli`, `gh` and
+`shellcheck`. Versions and subcommands are outside this catalog.
+
+Observations expire 900 seconds after their original observation time. Reading
+facts or ticking an unchanged subject never extends a positive observation;
+renewal requires another successful probe. Unchanged subjects reprobe when
+300 seconds or less remain, keeping the old rows readable until replacement.
+A changed selection, configuration or catalog deletes old rows before
+replacement. The API reads these cached rows without starting a run or
+accepting uploaded observations. A name outside
+the current catalog answers `unknown` with reason `outside_catalog`; missing or
+expired observations remain `unknown`.
+
+The separate `docker` service fact is `configured` only when the selected
+repository runner enables per-claim daemon provisioning. It never claims the
+daemon has been observed healthy. Other services remain `unknown`.
+
 ## Which claim env reaches which sandbox container
 
 Almost nobody writes a `SandboxClaim` by hand -- the worker creates them. But

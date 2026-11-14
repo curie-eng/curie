@@ -30,7 +30,7 @@ from .forge_credential_health import code_host_health
 from .forges.registry import forges_registry
 from .forges.surfaces import bound_labels
 from .killswitch import KillSwitch
-from .models import AgentChannel, AgentVersion, Deployment
+from .models import AgentChannel, AgentVersion, Deployment, FactoryFactObservation
 
 FACTS_DEADLINE_SECONDS = 45.0
 
@@ -120,7 +120,7 @@ async def read_facts(
                     kind="tool",
                     agent_id=binding.agent_id,
                     scope=repository_id,
-                    item=name,
+                    item=f"service:{name}" if model is ServiceFact else name,
                     now=now,
                 )
                 identity["observations"].append(["tool", name, observation.subject_digest])
@@ -131,6 +131,20 @@ async def read_facts(
                     "observed_at": observation.observed_at,
                 }
                 if model is ExecutableFact:
+                    if observation.reason == "observation_missing":
+                        current = await session.scalar(
+                            select(FactoryFactObservation.item)
+                            .where(
+                                FactoryFactObservation.kind == "tool",
+                                FactoryFactObservation.agent_id == binding.agent_id,
+                                FactoryFactObservation.scope == repository_id,
+                                FactoryFactObservation.expires_at > now,
+                                ~FactoryFactObservation.item.startswith("service:"),
+                            )
+                            .limit(1)
+                        )
+                        if current is not None:
+                            fields["reason"] = "outside_catalog"
                     fields["basis"] = (
                         "selected_image_probe"
                         if observation.state in ("present", "absent")

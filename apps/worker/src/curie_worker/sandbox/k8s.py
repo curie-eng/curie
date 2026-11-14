@@ -50,6 +50,17 @@ from .claim_tokens import (
 )
 from .quota import ADMISSION_DIMENSIONS, quota_has_live_headroom, quota_rejection_is_valid
 from .resources import claim_resources_spec, pod_resources, prepare_resources_claim
+from .tool_probe import (
+    PROBE_PREFIX,
+    ProbeResult,
+    ProbeSelection,
+    parse_probe,
+    probe_template,
+    reported_digest,
+)
+from .tool_probe import (
+    digest as probe_digest,
+)
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
@@ -652,6 +663,175 @@ class KubernetesSandboxClient:
         self._networking_api = k8s_client.NetworkingV1Api(api_client)
         self._node_api = k8s_client.NodeV1Api(api_client)
         self._namespace = namespace
+        self._tool_probe_sandboxes: dict[str, str] = {}
+
+    def inspect_tool_probe(self, pool: str, *, deadline: float) -> ProbeSelection:
+        template = self._pool_template_name(pool, request_timeout_seconds=_claim_timeout(deadline))
+        spec = self._source_template_spec(
+            template, request_timeout_seconds=_claim_timeout(deadline)
+        )
+        return ProbeSelection(
+            pool, template, spec, probe_digest([pool, template, spec]), frozenset()
+        )
+
+    def create_tool_probe(self, name: str, selection: ProbeSelection, *, deadline: float) -> None:
+        """Create a cold claim from the selected image, with no runtime credentials."""
+        spec = probe_template(selection, name)
+        names = claim_object_names(name)
+        labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: name}
+        created = cast(
+            dict[str, Any],
+            self._api.create_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxtemplates",
+                _extension_body(
+                    "SandboxTemplate", {"name": names.template, "labels": labels}, spec
+                ),
+                _request_timeout=_claim_timeout(deadline),
+            ),
+        )
+        owner = _owner_ref(
+            f"{EXT_GROUP}/{EXT_VERSION}",
+            "SandboxTemplate",
+            names.template,
+            created["metadata"]["uid"],
+        )
+        self._api.create_namespaced_custom_object(
+            EXT_GROUP,
+            EXT_VERSION,
+            self._namespace,
+            "sandboxwarmpools",
+            _extension_body(
+                "SandboxWarmPool",
+                {"name": names.pool, "labels": labels, "ownerReferences": [owner]},
+                {"replicas": 0, "sandboxTemplateRef": {"name": names.template}},
+            ),
+            _request_timeout=_claim_timeout(deadline),
+        )
+        self.create_claim(name, pool=names.pool, env={}, labels=labels, deadline=deadline)
+        claim = self._get(
+            EXT_GROUP,
+            EXT_VERSION,
+            "sandboxclaims",
+            name,
+            request_timeout_seconds=_claim_timeout(deadline),
+        )
+        if claim is None:
+            raise ValueError("observation claim disappeared")
+        self._api.patch_namespaced_custom_object(
+            EXT_GROUP,
+            EXT_VERSION,
+            self._namespace,
+            "sandboxtemplates",
+            names.template,
+            {
+                "metadata": {
+                    "ownerReferences": [
+                        _owner_ref(
+                            f"{EXT_GROUP}/{EXT_VERSION}",
+                            "SandboxClaim",
+                            name,
+                            claim["metadata"]["uid"],
+                        )
+                    ]
+                }
+            },
+            _request_timeout=_claim_timeout(deadline),
+        )
+
+    def read_tool_probe(self, sandbox: str, *, deadline: float) -> ProbeResult | None:
+        """Read only the fixed result and the cluster-reported container identity."""
+        pod = self._core_api.read_namespaced_pod(
+            sandbox, self._namespace, _request_timeout=_claim_timeout(deadline)
+        )
+        status, spec = pod.status, pod.spec
+        if status is None or spec is None:
+            return None
+        container = next((c for c in status.container_statuses or [] if c.name == "runner"), None)
+        if container is None or container.state is None or container.state.terminated is None:
+            return None
+        if container.state.terminated.exit_code != 0:
+            raise ValueError("tool observation failed")
+        runner = next(c for c in spec.containers if c.name == "runner")
+        security = runner.security_context
+        user_id = None if security is None else security.run_as_user
+        if user_id is None and spec.security_context is not None:
+            user_id = spec.security_context.run_as_user
+        if type(user_id) is not int:
+            raise ValueError("sandbox user identity unavailable")
+        output = self._core_api.read_namespaced_pod_log(
+            sandbox,
+            self._namespace,
+            container="runner",
+            limit_bytes=4096,
+            _request_timeout=_claim_timeout(deadline),
+        )
+        if not isinstance(container.image_id, str):
+            raise ValueError("runner image identity unavailable")
+        present, platform = parse_probe(output)
+        return ProbeResult(present, reported_digest(container.image_id), platform, user_id)
+
+    def delete_tool_probe(self, name: str, *, deadline: float) -> bool:
+        if not name.startswith(PROBE_PREFIX):
+            raise ValueError("invalid observation claim")
+        claim = self.get_claim(name, request_timeout_seconds=_claim_timeout(deadline))
+        if claim is not None and claim.sandbox_name is not None:
+            self._tool_probe_sandboxes[name] = claim.sandbox_name
+        sandbox = self._tool_probe_sandboxes.get(name)
+        try:
+            self._api.delete_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxclaims",
+                name,
+                body=k8s_client.V1DeleteOptions(propagation_policy="Foreground"),
+                _request_timeout=_claim_timeout(deadline),
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status != 404:
+                raise
+        self._rollback_delete("sandboxtemplates", claim_object_names(name).template)
+        while True:
+            claim = self.get_claim(name, request_timeout_seconds=_claim_timeout(deadline))
+            pod: Any = None
+            if sandbox is not None:
+                pod = self._get(
+                    CORE_GROUP,
+                    CORE_VERSION,
+                    "sandboxes",
+                    sandbox,
+                    request_timeout_seconds=_claim_timeout(deadline),
+                )
+                if pod is None:
+                    try:
+                        pod = self._core_api.read_namespaced_pod(
+                            sandbox, self._namespace, _request_timeout=_claim_timeout(deadline)
+                        )
+                    except k8s_client.ApiException as exc:
+                        if exc.status != 404:
+                            raise
+            names = claim_object_names(name)
+            template = self._get(
+                EXT_GROUP,
+                EXT_VERSION,
+                "sandboxtemplates",
+                names.template,
+                request_timeout_seconds=_claim_timeout(deadline),
+            )
+            pool = self._get(
+                EXT_GROUP,
+                EXT_VERSION,
+                "sandboxwarmpools",
+                names.pool,
+                request_timeout_seconds=_claim_timeout(deadline),
+            )
+            if claim is None and pod is None and template is None and pool is None:
+                self._tool_probe_sandboxes.pop(name, None)
+                return True
+            time.sleep(min(0.2, _claim_timeout(deadline)))
 
     def _resources_pool(
         self,
