@@ -210,6 +210,10 @@ def acknowledgment(binding: ExecutionBinding, outcome: Outcome) -> dict[str, Any
     return body
 
 
+# The route's answer when the start is blocked before any model session.
+PREFLIGHT_BLOCKED = "requester_context_preflight_blocked"
+
+
 class RequesterContextGate:
     """One delivery per process: the worker posts, the start awaits the outcome.
 
@@ -224,6 +228,7 @@ class RequesterContextGate:
         self._decided = anyio.Event()
         self._outcome: Outcome | None = None
         self._raw: bytes | None = None
+        self._blocked = False
 
     @property
     def outcome(self) -> Outcome | None:
@@ -239,6 +244,16 @@ class RequesterContextGate:
 
     def bind(self, binding: ExecutionBinding | None) -> None:
         self._binding = binding
+        self._bound.set()
+
+    def block(self) -> None:
+        """The start is blocked before any model session (a verification check
+        that cannot run, or no completion contract): it answers offline with
+        its explanation, so the route tells the worker to leave the evidence
+        as it is rather than fail the request for a missing acknowledgment."""
+
+        self._blocked = True
+        self._binding = None
         self._bound.set()
 
     def _decide(self, outcome: Outcome) -> None:
@@ -261,6 +276,8 @@ class RequesterContextGate:
         with anyio.move_on_after(bind_deadline_s):
             await self._bound.wait()
         binding = self._binding
+        if self._blocked:
+            return 409, {"error": PREFLIGHT_BLOCKED}
         if not self._bound.is_set() or binding is None:
             return 409, {"error": "requester_context_not_expected"}
         if self._outcome is not None:

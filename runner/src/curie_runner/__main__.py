@@ -1560,8 +1560,14 @@ def build_runner(
         # ADR 0278 (#5592): an execution the API bound waits for the worker's
         # envelope and builds no model session until it is validated; a
         # refused, missing or unsupported one answers offline.
-        execution = bound_contract.contract.execution if preflight_block is None else None
-        requester_gate.bind(execution)
+        if preflight_block is not None:
+            # Blocked before any model session: the start answers offline with
+            # its explanation, and the worker leaves the request's evidence.
+            requester_gate.block()
+            execution = None
+        else:
+            execution = bound_contract.contract.execution
+            requester_gate.bind(execution)
         if execution is not None:
             outcome = await requester_gate.wait()
             if isinstance(outcome, RequesterFailed):

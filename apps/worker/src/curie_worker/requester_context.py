@@ -5,7 +5,10 @@ request's version 1 context envelope from the API for the current execution
 fence, posts it to the runner behind the per-claim bearer, and relays the
 runner's acknowledgment to the API. Model work starts only after the API
 accepted it: every other path raises `RequesterContextRefused`, and the kernel
-fails the request before the first turn with the reason visible.
+fails the request before the first turn with the reason visible. The one
+exception is a runner whose start is blocked before any model session: its
+first turn only answers its explanation offline, so nothing is acknowledged
+and the evidence stays as it was.
 
 The envelope carries the pinned text, so nothing here logs a body, an
 envelope or an exception message that could quote one.
@@ -26,6 +29,10 @@ logger = logging.getLogger(__name__)
 # A bound runner's start can still be in its verification preflight when the
 # worker delivers, so the post waits up to this long for it (within budget).
 DELIVERY_TIMEOUT_S = 900.0
+# The runner route's answer when its start is blocked before any model session.
+PREFLIGHT_BLOCKED = "requester_context_preflight_blocked"
+# What `deliver` returns then: no acknowledgment, the evidence left as it was.
+PREFLIGHT_BLOCKED_EVIDENCE = "unchanged"
 # API refusals of the envelope read that fail the request rather than retry it.
 _FAILING_READS = frozenset({"tenant_disabled", "coding_instructions_unavailable"})
 
@@ -82,7 +89,8 @@ async def deliver(
     token: str | None,
     remaining_s: float | None,
 ) -> str:
-    """Deliver and acknowledge; the accepted evidence (``applied`` or ``none``)."""
+    """Deliver and acknowledge; the accepted evidence (``applied`` or ``none``),
+    or ``unchanged`` when the runner's start is blocked before any model session."""
 
     epoch = run.runtime_epoch
     if epoch is None:
@@ -111,6 +119,16 @@ async def deliver(
             type(exc).__name__,
         )
         status, body = 0, None
+    if status == 409 and body is not None and body.get("error") == PREFLIGHT_BLOCKED:
+        # The runner's start is blocked before any model session (a declared
+        # check that cannot run, or no completion contract). Its first turn
+        # answers offline with that explanation and no model work runs, so the
+        # request keeps the evidence it had: absent stays none, a selection
+        # stays pending (never acknowledged, never falsely failed).
+        logger.info(
+            "requester context not delivered for %s: runner preflight blocked", run.request_id
+        )
+        return PREFLIGHT_BLOCKED_EVIDENCE
     acknowledgment = body.get("acknowledgment") if status == 200 and body is not None else None
     if not isinstance(acknowledgment, dict):
         # An older runner without the route (404), a runner that expects no

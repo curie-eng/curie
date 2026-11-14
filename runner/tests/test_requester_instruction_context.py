@@ -64,6 +64,7 @@ from curie_runner.requester_context import (
     CONTEXT_PATH,
     MAX_ENVELOPE_BYTES,
     OPEN_PREFIX,
+    PREFLIGHT_BLOCKED,
     Applied,
     EnvelopeRefused,
     ExecutionBinding,
@@ -80,6 +81,7 @@ from curie_runner.requester_context import (
     subagent_prompt_refusal,
 )
 from curie_runner.session import SessionRunner
+from curie_runner.tracker_result import CONTRACT_BLOCKED_EXPLANATION
 from personal_auth_support import requires_cli
 
 from .test_personal_claude_reviewers import _FACTORY, _git, _plugin_name, _ReviewGate
@@ -919,8 +921,10 @@ _PROBE = McpToolCapabilityProbe(
 )
 
 
-def _contract_api() -> web.Application:
+def _contract_api(refused: bool = False) -> web.Application:
     async def contract(_request: web.Request) -> web.Response:
+        if refused:
+            return web.json_response({"detail": {"code": "invalid_context"}}, status=403)
         return web.json_response(
             {
                 "completion_contract": "implementation",
@@ -984,6 +988,8 @@ def _boot_run(
     *,
     config_env: dict[str, str] | None = None,
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]] = _messages,
+    contract_refused: bool = False,
+    delivered_status: int = 200,
 ) -> _Boot:
     """``_boot_turn`` with an operator config and a scripted stand-in, keeping the runner."""
 
@@ -993,7 +999,7 @@ def _boot_run(
     async def go() -> _Boot:
         provider = _stand_in(handler)
         async with (
-            TestServer(_contract_api(), host="127.0.0.1") as api,
+            TestServer(_contract_api(contract_refused), host="127.0.0.1") as api,
             TestServer(provider, host="127.0.0.1") as model,
         ):
             monkeypatch.setenv(ISSUE_READ_URL_ENV, str(api.make_url("/work-items/issue-read")))
@@ -1018,7 +1024,7 @@ def _boot_run(
             async with TestClient(TestServer(create_app(runner, token=TOKEN))) as client:
                 with anyio.fail_after(120):
                     delivered = await client.post(CONTEXT_PATH, data=raw, headers=BEARER)
-                    assert delivered.status == 200
+                    assert delivered.status == delivered_status
                     ack: dict[str, Any] = await delivered.json()
                     turn = await client.post(
                         "/v1/event",
@@ -1085,6 +1091,19 @@ def test_a_failed_boot_sends_zero_model_requests(
     assert bodies == []
     assert other == []
     assert final.text == BLOCKED_EXPLANATION
+
+
+@requires_cli
+@pytest.mark.parametrize("raw", [VALID, ABSENT], ids=["selected", "absent"])
+def test_a_preflight_blocked_boot_says_so_and_still_answers_its_explanation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: bytes
+) -> None:
+    # No completion contract: the start is blocked before any model session.
+    booted = _boot_run(tmp_path, monkeypatch, raw, contract_refused=True, delivered_status=409)
+    assert booted.ack == {"error": PREFLIGHT_BLOCKED}
+    assert booted.final.text == CONTRACT_BLOCKED_EXPLANATION
+    assert booted.bodies == []
+    assert booted.other == []
 
 
 # --- Reuse: one runner process, one execution, one selection ---------------------

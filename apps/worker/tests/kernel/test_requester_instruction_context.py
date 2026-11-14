@@ -57,6 +57,7 @@ from curie_internal.requester_coding_instructions import text_sha256
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
 from curie_runner.requester_context import (
+    PREFLIGHT_BLOCKED,
     Applied,
     Failed,
     NoneSelected,
@@ -68,7 +69,11 @@ from curie_runner.session import SessionRunner
 from curie_runner.tracker_result import fetch_completion_contract, sibling_urls
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import FactoryWake
-from curie_worker.requester_context import RequesterContextRefused, deliver
+from curie_worker.requester_context import (
+    PREFLIGHT_BLOCKED_EVIDENCE,
+    RequesterContextRefused,
+    deliver,
+)
 from curie_worker.runner_client import RunnerClient
 from curie_worker.workitem_dispatch import WorkItemDispatchClient, WorkItemRun
 from sqlalchemy import text
@@ -515,6 +520,26 @@ def test_a_runner_that_boots_after_the_start_binds_the_same_execution(
     _scenario(services, body)
 
 
+@pytest.mark.parametrize(("selected", "kept"), [(False, "none"), (True, "pending")])
+def test_a_preflight_blocked_runner_leaves_the_evidence(
+    services: _Services, selected: bool, kept: str
+) -> None:
+    async def body(stage: _Stage, client: RunnerClient) -> None:
+        run = await stage.start(selected=selected)
+        gate = RequesterContextGate()
+        # The start found a declared check it cannot run: blocked before any session.
+        gate.block()
+        base_url = await stage.runner(gate)
+
+        assert await _deliver(stage, run, client, base_url) == PREFLIGHT_BLOCKED_EVIDENCE
+
+        # Absent stays absent; a selection is never acknowledged nor falsely failed.
+        assert await stage.evidence(run) == kept
+        assert gate.outcome is None
+
+    _scenario(services, body)
+
+
 def test_an_envelope_never_delivered_fails_the_request(services: _Services) -> None:
     async def body(stage: _Stage, client: RunnerClient) -> None:
         run = await stage.start(selected=True)
@@ -734,6 +759,32 @@ def test_a_runner_that_never_acknowledges_fails_the_request_before_model_work(
 
             assert work_items.relayed == [(None, relayed_reason)]
             _assert_failed_before_model_work(h, work_items, relayed_reason)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_a_preflight_blocked_runner_still_answers_its_explanation_turn(
+    make_harness, selected: bool
+) -> None:
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            h.runner.requester_context_answer = (409, {"error": PREFLIGHT_BLOCKED})
+            work_items = _RecordingWorkItems(selected=selected)
+
+            await _execute(h, work_items)
+
+            # Posted once, nothing relayed: the evidence stays as admission left it.
+            assert len(h.runner.requester_contexts) == 1
+            assert work_items.relayed == []
+            # The blocked start's turn opens and answers its own explanation.
+            assert h.runner.opened, "the blocked request never reached its explanation turn"
+            ((finish),) = work_items.finishes
+            assert finish["cause"] != "runner_escalated"
 
     asyncio.run(exercise())
 
