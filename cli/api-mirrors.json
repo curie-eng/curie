@@ -64,6 +64,14 @@
         {
           "field": "title",
           "why": "The console Factory view reads the issue title; the work-items verbs identify an item by repo and issue number, and #4102 keeps their --json output unchanged."
+        },
+        {
+          "field": "coding_instructions",
+          "why": "cli/src/commands/work.rs renders lifecycle state, cause and publication. Admission selection metadata is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "requester_principal_id",
+          "why": "cli/src/commands/work.rs reads requester display text and execution ownership. It does not consume the admission requester reference exposed by the API."
         }
       ]
     },
@@ -109,6 +117,14 @@
         {
           "field": "last_start_failure_detail",
           "why": "The CLI renders the previous start failure through the item's actionable_cause; no CLI path reads the raw request field."
+        },
+        {
+          "field": "coding_instructions_selection_id",
+          "why": "cli/src/commands/work.rs reports request lifecycle and deferral facts. The admission selection reference is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "coding_instructions_evidence",
+          "why": "cli/src/commands/work.rs does not apply or acknowledge coding instructions. Per-request selection evidence is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
         }
       ]
     },
