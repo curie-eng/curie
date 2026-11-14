@@ -2506,6 +2506,54 @@ def test_runtime_cleared_refuses_an_unverified_teardown() -> None:
         ts.assert_runtime_cleared(0, 0, {"cleanup_verified": False})
 
 
+@pytest.mark.parametrize("state", ["suspended", "active", "foreign", "delete_failed"])
+def test_runtime_cleanup_deletes_only_owned_suspended_claims(
+    state: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Observed controller state: suspend removes the pod and reports
+    # SandboxSuspended. The substrate retains the claim for a later resume.
+    claim = {
+        "metadata": {"name": "curie-thread-example", "namespace": "curie"},
+        "status": {"conditions": [{
+            "type": "Ready", "status": "False", "reason": "SandboxSuspended",
+        }]},
+    }
+    if state == "active":
+        claim["status"]["conditions"][0].update(status="True", reason="SandboxReady")
+    if state == "foreign":
+        claim["metadata"]["namespace"] = "other"
+    claims = [claim]
+    deletes: list[tuple[str, ...]] = []
+
+    def kubectl(*argv: str) -> str:
+        if argv[:2] == ("get", "sandboxclaims"):
+            return json.dumps({"items": claims})
+        if "delete" in argv:
+            deletes.append(argv)
+            if state != "delete_failed":
+                claims.clear()
+            return ""
+        return json.dumps({"items": []})
+
+    driver = type("Driver", (), {"namespace": "curie", "stub": None})()
+    monkeypatch.setattr(driver, "kubectl", kubectl, raising=False)
+    run = triage_run.TriageToPr(driver, lanes.LaneRouter({"triage": "x"}), None)  # type: ignore[arg-type]
+    clock = iter(range(100))
+    monkeypatch.setattr(triage_run.time, "monotonic", lambda: float(next(clock)))
+    monkeypatch.setattr(triage_run.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(triage_run, "RUNTIME_SETTLE_SECONDS", 5)
+    if state == "suspended":
+        run.assert_runtime_drained()
+        assert len(deletes) == 1
+        assert deletes[0][:5] == ("-n", "curie", "delete", "sandboxclaim", "curie-thread-example")
+        assert run.evidence["sandbox_claims"] == 0
+    else:
+        with pytest.raises(ts.TriageAssertionError):
+            run.assert_runtime_drained()
+        if state in {"active", "foreign"}:
+            assert deletes == []
+
+
 class _ClosedRecorder:
     host = "127.0.0.1"
 
@@ -2624,6 +2672,8 @@ class _ReplayStub:
         self.log: list[dict[str, str]] = []
         self.events: list[tuple[int, str]] = []
         self.unknown_requests: list[str] = []
+        self.comments: list[dict[str, Any]] = []
+        self.event_rows: list[dict[str, Any]] = []
 
     @property
     def request_log(self) -> list[dict[str, str]]:
@@ -2633,10 +2683,23 @@ class _ReplayStub:
         return list(self.log)
 
     def _rows(self, kind: str) -> list[dict[str, Any]]:
-        return []
+        return list({"comment": self.comments, "event": self.event_rows}.get(kind, []))
 
-    def _label_event(self, number: int, label: str, _event: str, _actor: Any) -> None:
+    def _label_event(self, number: int, label: str, _event: str, actor: Any) -> None:
         self.events.append((number, label))
+        event_id = len(self.events)
+        self.event_rows.append({
+            "id": event_id, "issue_number": number, "event": "labeled",
+            "label": {"name": label}, "actor": actor,
+            "performed_via_github_app": {"id": 51},
+        })
+        if number == ts.SOURCE_TICKET:
+            self.comments.append({
+                "id": 1, "issue_number": number, "user": actor,
+                "performed_via_github_app": {"id": 51},
+                "body": f"Not started.<!-- {ts.INTAKE_NOTICE_PREFIX}{event_id}-"
+                        "0123456789abcdef reason=actor_bot -->",
+            })
 
 
 class _ReplayDriver:
@@ -2703,7 +2766,9 @@ def test_replay_runs_the_internal_selection_event_in_the_api_pod(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run, driver = _replay_run(monkeypatch)
-    run.assert_replay(type("GitHub", (), {"BOT": {"login": "app[bot]", "type": "Bot"}})())
+    run.assert_replay(
+        type("GitHub", (), {"BOT": {"id": 51, "login": "app[bot]", "type": "Bot"}})()
+    )
     execs = [argv for argv in driver.calls if "exec" in argv]
     assert execs == [
         (
@@ -2724,12 +2789,60 @@ def test_replay_runs_the_internal_selection_event_in_the_api_pod(
     assert driver.calls.index(execs[0]) > restart
     assert run.evidence["selection_replay"] == ADMITTED_REPLAY
     assert len(driver.stub.events) == 2
+    assert run.evidence["replay_counts"]["comments"] == 0
+    assert run.evidence["bot_label_control"]["after"]["comments"] == 1
 
 
 def test_replay_that_creates_a_work_item_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     run, _ = _replay_run(monkeypatch, grow=True)
     with pytest.raises(ts.TriageAssertionError, match="replay changed the outcome"):
-        run.assert_replay(type("GitHub", (), {"BOT": {"login": "app[bot]", "type": "Bot"}})())
+        run.assert_replay(
+            type("GitHub", (), {"BOT": {"id": 51, "login": "app[bot]", "type": "Bot"}})()
+        )
+
+
+@pytest.mark.parametrize("defect", [
+    "new_work", "extra_comment", "missing_notice", "unrelated_comment", "output_notice",
+    "wrong_event", "wrong_reason", "human_author", "other_bot", "other_app",
+])
+def test_source_bot_label_control_rejects_unexpected_effects(defect: str) -> None:
+    bot = {"id": 51, "login": "app[bot]", "type": "Bot"}
+    before = {"work_items": 3, "execution_requests": 4, "comments": 0}
+    after = {**before, "comments": 1}
+    event = {
+        "id": 2, "issue_number": ts.SOURCE_TICKET, "event": "labeled",
+        "label": {"name": ts.TRIAGE_LABEL}, "actor": dict(bot),
+        "performed_via_github_app": {"id": 51},
+    }
+    notice = {
+        "id": 1, "issue_number": ts.SOURCE_TICKET, "user": dict(bot),
+        "performed_via_github_app": {"id": 51},
+        "body": "Not started.<!-- curie-factory-intake-2-0123456789abcdef reason=actor_bot -->",
+    }
+    comments = [notice]
+    if defect == "new_work":
+        after["work_items"] += 1
+    elif defect == "extra_comment":
+        comments.append({**notice, "id": 2})
+        after["comments"] += 1
+    elif defect == "missing_notice":
+        comments.clear()
+    elif defect == "unrelated_comment":
+        notice["body"] = "Another status comment"
+    elif defect == "output_notice":
+        notice["issue_number"] = 3904
+    elif defect == "wrong_event":
+        notice["body"] = notice["body"].replace("intake-2-", "intake-3-")
+    elif defect == "wrong_reason":
+        notice["body"] = notice["body"].replace("actor_bot", "actor_no_permission")
+    elif defect == "human_author":
+        notice["user"]["type"] = "User"
+    elif defect == "other_bot":
+        notice["user"]["id"] = 52
+    elif defect == "other_app":
+        notice["performed_via_github_app"]["id"] = 52
+    with pytest.raises(ts.TriageAssertionError):
+        ts.assert_bot_label_refusal(before, after, [], comments, event, bot)
 
 
 def test_replay_that_changes_the_handoff_outcome_is_refused(
@@ -2737,7 +2850,9 @@ def test_replay_that_changes_the_handoff_outcome_is_refused(
 ) -> None:
     run, _ = _replay_run(monkeypatch, replay={**ADMITTED_REPLAY, "outcome_after": "refused"})
     with pytest.raises(triage_run.TriageScenarioError, match="expected admitted"):
-        run.assert_replay(type("GitHub", (), {"BOT": {"login": "app[bot]", "type": "Bot"}})())
+        run.assert_replay(
+            type("GitHub", (), {"BOT": {"id": 51, "login": "app[bot]", "type": "Bot"}})()
+        )
 
 
 def test_replay_quiet_window_needs_observed_intake_reads(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2745,7 +2860,9 @@ def test_replay_quiet_window_needs_observed_intake_reads(monkeypatch: pytest.Mon
     clock = iter(range(0, 10_000, 7))
     monkeypatch.setattr(triage_run.time, "monotonic", lambda: float(next(clock)))
     with pytest.raises(triage_run.TriageScenarioError, match="intake read the tracker 0 times"):
-        run.assert_replay(type("GitHub", (), {"BOT": {"login": "app[bot]", "type": "Bot"}})())
+        run.assert_replay(
+            type("GitHub", (), {"BOT": {"id": 51, "login": "app[bot]", "type": "Bot"}})()
+        )
 
 
 def test_replay_quiet_window_is_bounded_by_the_install_poll_interval(

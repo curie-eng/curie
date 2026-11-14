@@ -579,7 +579,7 @@ class TriageToPr:
             time.sleep(poll / 5)
 
     def assert_replay(self, github: Any) -> None:
-        """Point 7: an API restart, the internal event and bot label events create nothing."""
+        """Replay is silent; an ordinary bot label gets one refusal and starts no work."""
 
         assert self.output is not None
         before = self.counts()
@@ -592,25 +592,59 @@ class TriageToPr:
         )
         replay = self.replay_selection()
         since = self.intake_reads()
-        # The factory's own label again on its output, and an App label event on
-        # the source: neither is a human selection.
         self.stub._label_event(self.output, ts.IMPLEMENTATION_LABEL, "labeled", github.BOT)
-        self.stub._label_event(ts.SOURCE_TICKET, ts.TRIAGE_LABEL, "labeled", github.BOT)
         self.wait_for_intake_passes(since)
         after = self.counts()
         comments = [c for c in self.stub._rows("comment") if c["issue_number"] == self.output]
         ts.assert_no_replay_effects(before, after, comments)
         self.evidence.update(replay_counts=after, selection_replay=replay)
 
+        comments_before = self.stub._rows("comment")
+        event_ids = {event["id"] for event in self.stub._rows("event")}
+        since = self.intake_reads()
+        self.stub._label_event(ts.SOURCE_TICKET, ts.TRIAGE_LABEL, "labeled", github.BOT)
+        events = [event for event in self.stub._rows("event") if event["id"] not in event_ids]
+        if len(events) != 1:
+            raise TriageScenarioError("expected one source bot-label control event")
+        self.wait_for_intake_passes(since)
+        control_after = self.counts()
+        notice = ts.assert_bot_label_refusal(
+            after, control_after, comments_before, self.stub._rows("comment"), events[0], github.BOT
+        )
+        self.evidence["bot_label_control"] = {
+            "before": after, "after": control_after, "notice_comment_id": notice["id"],
+            "label_event_id": events[0]["id"], "issue": ts.SOURCE_TICKET,
+        }
+
     def assert_runtime_drained(self) -> None:
-        """Point 10, in-cluster half: no sandbox or publication resource remains."""
+        """Clean up retained suspended claims, then verify runtime resources are gone."""
 
         settle = time.monotonic() + RUNTIME_SETTLE_SECONDS
         claims = resources = -1
+        cleaned: set[str] = set()
         while time.monotonic() < settle:
-            claims = len(json.loads(
+            inventory = json.loads(
                 self.driver.kubectl("get", "sandboxclaims", "-A", "-o", "json")
-            )["items"])
+            )["items"]
+            claims = len(inventory)
+            for claim in inventory:
+                suspended = any(
+                    condition.get("type") == "Ready" and condition.get("status") == "False"
+                    and condition.get("reason") == "SandboxSuspended"
+                    for condition in claim.get("status", {}).get("conditions", [])
+                )
+                if not suspended:
+                    continue
+                metadata = claim["metadata"]
+                if metadata["namespace"] != self.driver.namespace:
+                    raise ts.TriageAssertionError(
+                        "a suspended claim is outside the owned namespace"
+                    )
+                self.driver.kubectl(
+                    "-n", self.driver.namespace, "delete", "sandboxclaim", metadata["name"],
+                    "--ignore-not-found=true", "--wait=true", "--timeout=60s",
+                )
+                cleaned.add(metadata["name"])
             resources = len(json.loads(self.driver.kubectl(
                 "get", "jobs,pods", "-A", "-l", "curietech.ai/component=publication",
                 "-o", "json",
@@ -618,7 +652,10 @@ class TriageToPr:
             if claims == 0 and resources == 0:
                 break
             time.sleep(5)
-        self.evidence.update(sandbox_claims=claims, publication_resources=resources)
+        self.evidence.update(
+            sandbox_claims=claims, publication_resources=resources,
+            suspended_claim_cleanup=sorted(cleaned),
+        )
         if claims or resources:
             raise ts.TriageAssertionError(
                 f"{claims} sandbox claims and {resources} publication resources remain"

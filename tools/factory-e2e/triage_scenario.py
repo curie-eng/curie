@@ -12,6 +12,7 @@ not hold. They read no prompt or skill text.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -250,6 +251,43 @@ def assert_no_replay_effects(
     _require(dict(before) == dict(after), f"replay changed the outcome: {before} -> {after}")
     notices = [c for c in output_comments if INTAKE_NOTICE_PREFIX in c["body"]]
     _require(not notices, "the factory's own label drew an intake notice")
+
+
+def assert_bot_label_refusal(
+    before: Mapping[str, int],
+    after: Mapping[str, int],
+    comments_before: Sequence[Mapping[str, Any]],
+    comments_after: Sequence[Mapping[str, Any]],
+    event: Mapping[str, Any],
+    bot: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """The ordinary bot-label control gets exactly one refusal and starts no work."""
+
+    expected = {**before, "comments": before["comments"] + 1}
+    _require(dict(after) == expected, f"bot-label control changed the outcome: {before} -> {after}")
+    ids = {comment["id"] for comment in comments_before}
+    added = [comment for comment in comments_after if comment["id"] not in ids]
+    _require(len(added) == 1, "the bot-label control did not create exactly one comment")
+    notice = added[0]
+    _require(
+        event["issue_number"] == SOURCE_TICKET and event["event"] == "labeled"
+        and event["label"]["name"] == TRIAGE_LABEL
+        and event["actor"]["type"] == "Bot" and event["actor"]["id"] == bot["id"],
+        "the bot-label control names another selection",
+    )
+    _require(notice["issue_number"] == SOURCE_TICKET, "the bot refusal was posted on another issue")
+    _require(
+        notice["user"]["type"] == "Bot" and notice["user"]["id"] == bot["id"]
+        and notice.get("performed_via_github_app") == event["performed_via_github_app"]
+        and bool(event["performed_via_github_app"]),
+        "the bot refusal was not posted by the configured App",
+    )
+    marker = rf"<!-- {INTAKE_NOTICE_PREFIX}{event['id']}-[0-9a-f]{{16}} reason=actor_bot -->"
+    _require(
+        re.search(marker, notice["body"]) is not None,
+        "the bot refusal names another event or reason",
+    )
+    return notice
 
 
 def assert_source_preserved(before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
