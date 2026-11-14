@@ -740,7 +740,7 @@ def test_label_routing_install_label_changed_to_collide_admits_nothing(
 
     number, response = factory.opened(intake, FAST)
 
-    _refused(response, "binding_missing")
+    _refused(response, "binding_ambiguous")
     assert _owner(number) is None
     if intake == "poll":
         collided = [

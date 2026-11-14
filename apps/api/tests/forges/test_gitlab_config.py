@@ -104,6 +104,7 @@ def test_the_declared_capabilities_follow_decisions_14_and_19() -> None:
         # UI evidence hosting is GitHub only.
         Operation.STORE_EVIDENCE: Support.UNSUPPORTED,
         Operation.DELETE_EVIDENCE: Support.UNSUPPORTED,
+        Operation.CURRENT_INSTALLATION_CREDENTIAL: Support.UNSUPPORTED,
     }
     for side in (tracker, code_host):
         assert dict(side.marked_comments.capabilities) == dict.fromkeys(
