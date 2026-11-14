@@ -1775,7 +1775,10 @@ def _build_factory_slack_progress(
         return None
     return FactorySlackProgressLoop(
         store=PostgresFactorySlackStore(
-            engine, schema=config.db_schema, lease_owner=config.consumer_name
+            engine,
+            schema=config.db_schema,
+            lease_owner=config.consumer_name,
+            phase_lines=config.factory_slack_phase_lines,
         ),
         replies=ObservedReplySink(sink),
         interval_seconds=config.factory_slack_interval_s,
