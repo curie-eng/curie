@@ -13,7 +13,6 @@ loader (gated on the ``claude`` CLI being present).
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +20,7 @@ from pathlib import Path
 import anyio
 import pytest
 from curie_runner.check import evaluate, extract_declared, run_check
+from sdk_cli_support import sdk_cli_available
 
 _HERE = Path(__file__).resolve().parent
 _FIXTURES = _HERE / "fixtures"
@@ -29,7 +29,7 @@ _MCP_RED_POINTER = _FIXTURES / "mcp_red_pointer"
 _MCP_RED_BROKEN = _FIXTURES / "mcp_red_broken"
 _PLUGIN_FORMAT_FIXTURES = _HERE.parents[1] / "packages/plugin-format/tests/fixtures"
 
-_CLAUDE_ON_PATH = shutil.which("claude") is not None
+_CLAUDE_ON_PATH = sdk_cli_available()
 
 # The github-issues example forwards this credential env var. Held as a named
 # constant (not an inline "<NAME>": "<placeholder>" literal pair) so the

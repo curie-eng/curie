@@ -15,7 +15,6 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from shutil import which
 from typing import Any
 from uuid import uuid4
 
@@ -42,6 +41,7 @@ from curie_runner.mcp_tool_capability import probe_mcp_tool_capability
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from runner_boot_session import initialized_session_sync
+from sdk_cli_support import sdk_cli_available
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
@@ -54,7 +54,7 @@ WRITE_APPROVAL = "mcp__operations__write_approval"
 WRITE_DENIED = "mcp__operations__write_denied"
 WRITE_UNMATCHED = "mcp__operations__write_unmatched"
 
-_HAS_CLAUDE_CLI = which("claude") is not None
+_HAS_CLAUDE_CLI = sdk_cli_available()
 
 
 class _TranscriptStore:
