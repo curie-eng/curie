@@ -121,6 +121,7 @@ KNOWN_BODY_MODULES = frozenset(
         "curie_api.schemas.workspaces",
         "curie_api.turn_progress",
         "curie_api.workitem_dispatch",
+        "curie_api.requester_instruction_context",
         "aci_protocol.turn",
         "aci_protocol.wire",
         "curie_internal.identity_approval",
