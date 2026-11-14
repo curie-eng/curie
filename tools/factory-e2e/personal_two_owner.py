@@ -1422,21 +1422,21 @@ class TwoOwnerRun(pp.LiveRun):
             if not run.limits_acked:
                 run.deferred.append(dict(record))
                 return
+        if mode in pto.FINAL_MODES:
+            self.owner_ledger.record_timing(
+                run.group,
+                self.session_stem(run, record),
+                "stop" if mode == "stop" else "subagent_stop",
+                key,
+                record.get("written_at"),
+                observed_at=self.clock.now(),
+            )
         initial = self.initial_prompt(run, record)
         if not self.await_coverage(run, record, allow_missing=initial):
             self.stop_session(run, "capture_incomplete", record=record)
         files = self.pod_files(run)
         facts = self.pod_facts(run, files)
         stem, role, session = self.session_of(run, record, facts)
-        if mode in pto.FINAL_MODES:
-            self.owner_ledger.record_timing(
-                run.group,
-                stem,
-                "stop" if mode == "stop" else "subagent_stop",
-                key,
-                record.get("written_at"),
-                observed_at=self.clock.now(),
-            )
         usage = pto.hold_usage(session, initial_prompt=initial)
         reservation = self.map_session(run, stem, role, usage)
         if session is not None and (session.synthetic or session.errors):
@@ -1615,11 +1615,7 @@ class TwoOwnerRun(pp.LiveRun):
         run.last_facts = facts
         return facts
 
-    def session_of(
-        self, run: PodRun, record: Mapping[str, Any], facts: pps.TranscriptFacts
-    ) -> tuple[str, str, pps.SessionFacts | None]:
-        """The native session a hold belongs to: transcript stem, role and parsed facts."""
-
+    def session_stem(self, run: PodRun, record: Mapping[str, Any]) -> str:
         main = pto.hold_relpath(record.get("transcript_path"))
         agent = record.get("agent_id")
         if isinstance(agent, str) and agent:
@@ -1634,6 +1630,19 @@ class TwoOwnerRun(pp.LiveRun):
                 self.stop_session(run, "session_unknown", record=record)
             if PurePosixPath(stem).name != f"agent-{agent}":
                 self.stop_session(run, "session_unknown", record=record)
+            return stem
+        if main is None:
+            self.stop_session(run, "session_unknown", record=record)
+        return main.removesuffix(".jsonl")
+
+    def session_of(
+        self, run: PodRun, record: Mapping[str, Any], facts: pps.TranscriptFacts
+    ) -> tuple[str, str, pps.SessionFacts | None]:
+        """The native session a hold belongs to: transcript stem, role and parsed facts."""
+
+        stem = self.session_stem(run, record)
+        agent = record.get("agent_id")
+        if isinstance(agent, str) and agent:
             session = next((item for item in facts.sessions if item.path == stem), None)
             role = run.agent_roles.get(agent)
             if session is not None and session.role in pps.REVIEWER_ROLES:
@@ -1645,9 +1654,6 @@ class TwoOwnerRun(pp.LiveRun):
             if session is not None:
                 session.role = role
             return stem, role, session
-        if main is None:
-            self.stop_session(run, "session_unknown", record=record)
-        stem = main.removesuffix(".jsonl")
         session = next(
             (item for item in facts.sessions if item.path == stem and item.role == pps.IMPLEMENTER),
             None,
@@ -2600,21 +2606,22 @@ class TwoOwnerRun(pp.LiveRun):
                 approval_id = str(row.get("id") or "")
                 if not approval_id or approval_id in known:
                     continue
-                if self.approval(approval_id).get("conversation_id") == run.conversation_id:
+                approval = self.approval(approval_id)
+                if approval.get("conversation_id") == run.conversation_id:
                     run.approval_id = approval_id
+                    run.parked_at = pps.iso_epoch(approval.get("created_at"))
+                    self.owner_ledger.record_timing(
+                        run.group,
+                        "",
+                        "approval_requested",
+                        "publication",
+                        run.parked_at,
+                        observed_at=self.clock.now(),
+                    )
                     return item.get("state") == "awaiting_approval"
             return False
 
         self.wait_until(parked, until=self.deadline(), what=f"{run.group} publication park")
-        run.parked_at = pps.iso_epoch(self.approval(run.approval_id).get("created_at"))
-        self.owner_ledger.record_timing(
-            run.group,
-            "",
-            "approval_requested",
-            "publication",
-            run.parked_at,
-            observed_at=self.clock.now(),
-        )
         self.owner_ledger.record_timing(
             run.group,
             "",

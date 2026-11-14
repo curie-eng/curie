@@ -3960,6 +3960,45 @@ def test_runner_capture_writes_timing_through_the_production_reader(tmp_path: Pa
     reader.close()
 
 
+def test_observed_stop_is_saved_even_when_usage_capture_cannot_complete(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1")
+    with pytest.raises(pp.StepFailed, match="capture_incomplete"):
+        h.run.gate_event(run, _hold("stop", 1, size=100, written=T0))
+    stops = [row for row in h.ledger.timing_rows() if row["event"] == "stop"]
+    assert [(row["grp"], row["session_digest"], row["at"]) for row in stops] == [
+        ("a1", pps.ref_digest(MAIN.removesuffix(".jsonl")), T0)
+    ]
+    assert all(row["source"] == "unknown" for row in _rows(h, "a1"))
+    assert run.stopped and h.run.paid_failure is not None
+
+
+def test_pending_card_time_survives_failure_to_observe_the_work_item_park(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    run.conversation_id = "issue-11"
+    h.run.work_item_of = lambda _id: {"state": "running", "requests": []}  # type: ignore[method-assign]
+    h.run.pending_publication_approvals = lambda: [{"id": DRILL_APPROVAL["reject"]}]  # type: ignore[method-assign]
+    h.api.route("GET", "/approvals/" + DRILL_APPROVAL["reject"])(
+        lambda _p, _h, _b: (200, {"conversation_id": "issue-11", "created_at": _stamp(5)})
+    )
+
+    def wait(condition: Callable[[], bool], **_kwargs: Any) -> None:
+        assert condition() is False
+        raise pp.StepFailed("park was not observed")
+
+    h.run.wait_until = wait  # type: ignore[method-assign]
+    with pytest.raises(pp.StepFailed, match="park was not observed"):
+        h.run.await_park(run)
+    assert [
+        (row["event"], row["at"])
+        for row in h.ledger.timing_rows()
+        if row["event"] == "approval_requested"
+    ] == [("approval_requested", T0 + 5)]
+
+
 def test_an_undelivered_drill_card_fails_the_live_run_before_any_reservation(
     tmp_path: Path,
 ) -> None:
