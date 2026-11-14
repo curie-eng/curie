@@ -274,6 +274,40 @@ def test_a_round_on_a_phase_two_loops_share_reaches_the_larger_cap(tmp_path: Pat
         anyio.run(go)
 
 
+def test_implement_round_4_is_accepted_when_two_loops_share_implement(tmp_path: Path) -> None:
+    declaration = {
+        "phases": [
+            {"id": phase, "label": phase}
+            for phase in ["plan", "implement", "review_diff", "publish", "wait_ci"]
+        ],
+        "loops": [
+            {"start": "implement", "review": "review_diff", "cap": 5},
+            {"start": "implement", "review": "wait_ci", "cap": 3},
+        ],
+    }
+    bundle = _bundle(tmp_path, declaration)
+    recorder = _Recorder()
+
+    async def report(phase: str, round_: int) -> dict[str, Any]:
+        async with TestServer(recorder.app()) as server:
+            tool = _tool(
+                str(server.make_url("/v1/work-item-progress/example-request")), bundle=bundle
+            )
+            return await tool.handler({"phase": phase, "round": round_})
+
+    for phase, round_, accepted in [
+        ("implement", 4, True),
+        ("implement", 5, True),
+        ("implement", 6, False),
+        ("review_diff", 5, True),
+        ("wait_ci", 4, False),
+    ]:
+        result = anyio.run(report, phase, round_)
+        assert (result.get("is_error") is not True) == accepted, (
+            f"{phase} round {round_}: {_text(result)}"
+        )
+
+
 def test_a_valid_report_posts_the_wire_body_with_the_token_header() -> None:
     recorder = _Recorder()
     activity = ProgressActivity()
