@@ -889,7 +889,10 @@ def test_duplicate_effective_label_is_refused_at_admission(paused_factory: Admit
         "SELECT count(*) FROM curie.work_items "
         f"WHERE tracker_kind='github' AND tracker_issue_id='{ticket.number}'"
     ) == 0
-    assert run.comments(ticket) == []
+    comments = run.comments(ticket)
+    assert len(comments) == 1
+    assert comments[0].splitlines()[-1].startswith("<!-- curie-factory-intake-")
+    assert comments[0].splitlines()[-1].endswith(" reason=binding_ambiguous -->")
     assert not [lane for lane, _, _ in run.model.observations() if ticket.url in lane]
 
 
