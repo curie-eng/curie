@@ -1,6 +1,8 @@
 """Requester coding instructions, worker to runner (ADR 0278 sections 3 and 6, #5592).
 
-Two halves, both through real components.
+Three parts, all through real components. The joined part at the end runs the
+boundary path below against a runner built by the production boot with the real
+Claude Code CLI, and reads what reached the model and the trace exporter.
 
 The kernel half drives the real kernel (real Valkey lock and markers, the fake
 Kubernetes control plane, the in-process fake runner): a WorkItem execute
@@ -38,9 +40,11 @@ instruction text never reaches a log.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import os
+import shutil
 import sys
 import uuid
 from collections.abc import Iterator
@@ -49,14 +53,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import claude_agent_sdk
 import httpx
 import pytest
+from aci_protocol import Event, Final
+from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_api.config import get_settings
 from curie_internal.requester_coding_instructions import text_sha256
-from curie_runner import RunTracer, SideEffectClassifier
+from curie_runner import RunnerConfig, RunTracer, SideEffectClassifier
+from curie_runner import __main__ as runner_boot
+from curie_runner.__main__ import build_runner
 from curie_runner.fake import FakeModelSession
+from curie_runner.issue_read import ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
+from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.requester_context import (
+    BLOCKED_EXPLANATION,
     PREFLIGHT_BLOCKED,
     Applied,
     Failed,
@@ -183,6 +195,19 @@ class _Stage:
         )
 
     async def start(self, *, selected: bool) -> WorkItemRun:
+        run = await self.acquired(selected=selected)
+        # The runner boots and reads its contract before the worker starts it.
+        self.bindings[run.request_id] = await self.read_binding(run.request_id)
+        await self.begin(run)
+        return run
+
+    async def begin(self, run: WorkItemRun) -> None:
+        await run.start(claim_name=f"claim-{run.request_id.hex[:8]}", sandbox_name="sbx-requester")
+        assert run.runtime_epoch is not None
+
+    async def acquired(self, *, selected: bool) -> WorkItemRun:
+        """An admitted request the worker acquired and has not started yet."""
+
         request_id = uuid.uuid4()
         admitted = await self.http.post(
             f"{self.services.api_url}/v1/internal/work-items/admissions",
@@ -226,9 +251,6 @@ class _Stage:
             context=None,
         )
 
-        # The runner boots and reads its contract before the worker starts it.
-        self.bindings[request_id] = await self.read_binding(request_id)
-
         async def _stop(*_args: Any) -> None:
             return None
 
@@ -243,8 +265,6 @@ class _Stage:
             on_stop=_stop,
             on_stale=_stop,
         )
-        await run.start(claim_name=f"claim-{request_id.hex[:8]}", sandbox_name="sbx-requester")
-        assert run.runtime_epoch is not None
         return run
 
     async def pin(self, work_item_id: uuid.UUID, request_id: uuid.UUID) -> None:
@@ -646,6 +666,303 @@ def test_a_tenant_that_disables_the_capability_after_the_read_fails_the_request(
             )
 
     _scenario(services, body)
+
+
+# --- The joined path: worker, API and a booted runner with the real CLI ------------
+#
+# The runner here is the production boot (``build_runner``), not a test session:
+# it reads its execution from the real completion contract when it boots, waits
+# for the envelope, and only then lets the real Claude Code CLI reach a model.
+# The model is a local Messages stand-in that reads the request's committed
+# evidence on every model request it receives, and the trace exporter posts to a
+# local OTLP collector stand-in, so AC7 reads what the runner actually exported.
+
+_CLI_AVAILABLE = (
+    Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+).is_file() or shutil.which("claude") is not None
+requires_cli = pytest.mark.skipif(
+    not _CLI_AVAILABLE, reason="requires the Claude Code CLI the SDK spawns"
+)
+_PROBE = McpToolCapabilityProbe(
+    complete=True,
+    has_potential_write_tool=True,
+    tool_count=1,
+    observed_tools=frozenset(),
+    readonly_tools=frozenset(),
+)
+# The model's reply is exported on the generation span (the user prompt never
+# is): the positive control that makes the absence of the instruction text in
+# the same exported bytes meaningful.
+OUTPUT_CONTROL = "OUTPUT-CONTROL-5592-7d2e"
+JOINED_SESSION = "session-acme-requester-joined"
+
+
+def _sse(event: str, data: dict[str, Any]) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+class _Model:
+    """A Messages stand-in recording the committed evidence at each request."""
+
+    def __init__(self, stage: _Stage, run: WorkItemRun) -> None:
+        self.stage = stage
+        self.run = run
+        self.evidence: list[str] = []
+        self.systems: list[str] = []
+
+    async def messages(self, request: web.Request) -> web.StreamResponse:
+        body = await request.json()
+        self.evidence.append(await self.stage.evidence(self.run))
+        self.systems.append(json.dumps(body.get("system")))
+        response = web.StreamResponse(headers={"content-type": "text/event-stream"})
+        await response.prepare(request)
+        message = {
+            "id": "msg_stand_in",
+            "type": "message",
+            "role": "assistant",
+            "model": body.get("model", "stand-in"),
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        for event, data in (
+            ("message_start", {"type": "message_start", "message": message}),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": OUTPUT_CONTROL},
+                },
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            (
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 1},
+                },
+            ),
+            ("message_stop", {"type": "message_stop"}),
+        ):
+            await response.write(_sse(event, data))
+        await response.write_eof()
+        return response
+
+    async def other(self, _request: web.Request) -> web.Response:
+        return web.json_response({"input_tokens": 1})
+
+    def app(self) -> web.Application:
+        app = web.Application()
+        app.router.add_post("/v1/messages", self.messages)
+        app.router.add_route("*", "/{tail:.*}", self.other)
+        return app
+
+
+class _Collector:
+    """An OTLP/HTTP collector stand-in keeping every exported trace body."""
+
+    def __init__(self) -> None:
+        self.bodies: list[bytes] = []
+
+    async def traces(self, request: web.Request) -> web.Response:
+        raw = await request.read()
+        if request.headers.get("content-encoding") == "gzip":
+            raw = gzip.decompress(raw)
+        self.bodies.append(raw)
+        return web.Response(body=b"", content_type="application/x-protobuf")
+
+    def app(self) -> web.Application:
+        app = web.Application()
+        app.router.add_post("/{tail:.*}", self.traces)
+        return app
+
+    @property
+    def exported(self) -> bytes:
+        return b"".join(self.bodies)
+
+
+@dataclass
+class _Joined:
+    final: Final
+    model: _Model
+    collector: _Collector
+    refused: RequesterContextRefused | None
+    run: WorkItemRun
+
+
+def _joined(
+    services: _Services,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rewrite: Any = None,
+) -> _Joined:
+    """Acquire, boot the runner, start, deliver, then open the first turn."""
+
+    for name in list(os.environ):
+        # The API under test keeps its own CURIE_ settings; the runner's model
+        # and exporter come only from the config below.
+        if name.startswith(("OTEL_", "ANTHROPIC_", "CLAUDE_CODE_")):
+            monkeypatch.delenv(name)
+    plugin = tmp_path / "bundle"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "implementer", "version": "0.1.0", "description": "t"}),
+        encoding="utf-8",
+    )
+    providers: list[Any] = []
+    real_provider = runner_boot.build_tracer_provider
+
+    def keep_provider(*args: Any, **kwargs: Any) -> Any:
+        provider = real_provider(*args, **kwargs)
+        providers.append(provider)
+        return provider
+
+    monkeypatch.setattr(runner_boot, "build_tracer_provider", keep_provider)
+    result: dict[str, Any] = {}
+
+    async def body(stage: _Stage, client: RunnerClient) -> None:
+        run = await stage.acquired(selected=True)
+        model = _Model(stage, run)
+        collector = _Collector()
+        _issue, capability = await stage.dispatch.issue_read_context(run.request_id)
+        monkeypatch.setenv(ISSUE_READ_URL_ENV, f"{stage.services.api_url}/work-items/issue-read")
+        monkeypatch.setenv(ISSUE_READ_TOKEN_ENV, capability)
+        async with (
+            TestServer(model.app(), host="127.0.0.1") as model_server,
+            TestServer(collector.app(), host="127.0.0.1") as collector_server,
+        ):
+            config = RunnerConfig.from_env(
+                {
+                    "CURIE_PLUGIN_DIR": str(plugin),
+                    "CURIE_SESSION_ID": JOINED_SESSION,
+                    "CURIE_SANDBOX_ID": "sandbox-acme-requester-joined",
+                    "CURIE_BUDGET": '{"max_output_tokens_per_run": 64, "max_usd_per_day": 1.0}',
+                    "CURIE_MODEL": "claude-sonnet-5",
+                    "OTEL_EXPORTER_OTLP_ENDPOINT": str(collector_server.make_url("")).rstrip("/"),
+                    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                }
+            )
+            runner = build_runner(
+                config,
+                sdk_env={
+                    "ANTHROPIC_BASE_URL": str(model_server.make_url("")).rstrip("/"),
+                    "ANTHROPIC_API_KEY": "sk-ant-placeholder",
+                    "ANTHROPIC_AUTH_TOKEN": "",
+                    "CLAUDE_CODE_OAUTH_TOKEN": "",
+                    "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config"),
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                    "DISABLE_TELEMETRY": "1",
+                    "HTTP_PROXY": "",
+                    "HTTPS_PROXY": "",
+                    "ALL_PROXY": "",
+                    "NO_PROXY": "127.0.0.1,localhost",
+                },
+                mcp_capability=_PROBE,
+            )
+            # The runner boots (and reads its execution) after the acquire...
+            server = TestServer(create_runner_app(runner, token=RUNNER_TOKEN), host="127.0.0.1")
+            await server.start_server()
+            stage.servers.append(server)
+            base_url = str(server.make_url("")).rstrip("/")
+            # ...and the worker starts the request, then delivers the envelope.
+            await stage.begin(run)
+            sender: Any = client if rewrite is None else _Rewriting(client, rewrite)
+            refused: RequesterContextRefused | None = None
+            try:
+                assert await _deliver(stage, run, sender, base_url) == "applied"
+            except RequesterContextRefused as exc:
+                refused = exc
+            assert model.evidence == [], "a model request came before the acknowledgment"
+            event = Event(
+                kind="event", type="message", text="start the issue", user="U0EXAMPLE1", ts="1"
+            )
+            finals: list[Final] = []
+            async with asyncio.timeout(120):
+                async with await client.start_turn(base_url, event, token=RUNNER_TOKEN) as stream:
+                    async for frame in stream:
+                        if isinstance(frame, Final):
+                            finals.append(frame)
+            (provider,) = providers
+            assert provider is not None, "the runner built no trace exporter"
+            assert await asyncio.to_thread(provider.force_flush, 30_000)
+            result["joined"] = _Joined(finals[0], model, collector, refused, run)
+            if refused is not None:
+                await _assert_failed(stage, run, refused, refused.reason)
+            (row,) = await stage.sql(
+                "SELECT row_to_json(r)::text AS row FROM curie.execution_requests r WHERE id = :id",
+                id=run.request_id,
+            )
+            result["row"] = row["row"]
+            await server.close()
+            stage.servers.remove(server)
+
+    _scenario(services, body)
+    joined: _Joined = result["joined"]
+    # Errors: neither the request row (its terminal detail) nor the final carries the text.
+    assert CANARY not in result["row"]
+    assert CANARY not in (joined.final.text or "")
+    return joined
+
+
+@requires_cli
+def test_the_booted_runner_reaches_the_model_only_after_the_acknowledgment_commits(
+    services: _Services,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    joined = _joined(services, tmp_path, monkeypatch)
+
+    assert joined.refused is None
+    assert joined.model.evidence, "the applied run made no model request"
+    assert set(joined.model.evidence) == {"applied"}
+    # The section reached the model: the text is in the system prompt it sent.
+    assert any(CANARY in system for system in joined.model.systems)
+    assert joined.final.text != BLOCKED_EXPLANATION
+    # Traces: the model's reply was exported (the control), the instructions never.
+    exported = joined.collector.exported
+    assert JOINED_SESSION.encode() in exported and OUTPUT_CONTROL.encode() in exported
+    assert CANARY.encode() not in exported
+    assert CANARY not in caplog.text
+
+
+@requires_cli
+@pytest.mark.parametrize(
+    ("rewrite", "reason"),
+    [(_tamper_text, "digest_mismatch"), (_future_version, "unsupported_version")],
+)
+def test_a_refused_envelope_never_reaches_the_model_through_the_booted_runner(
+    services: _Services,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    rewrite: Any,
+    reason: str,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    joined = _joined(services, tmp_path, monkeypatch, rewrite=rewrite)
+
+    assert joined.refused is not None and joined.refused.reason == reason
+    assert joined.model.evidence == []
+    assert joined.final.text == BLOCKED_EXPLANATION
+    exported = joined.collector.exported
+    assert JOINED_SESSION.encode() in exported
+    assert CANARY.encode() not in exported
+    assert CANARY not in caplog.text
+    assert CANARY not in joined.refused.detail
 
 
 # --- The kernel half ---------------------------------------------------------------
