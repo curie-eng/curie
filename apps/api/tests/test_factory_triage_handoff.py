@@ -1564,7 +1564,7 @@ def test_triage_handoff_migration_upgrades_from_0168_and_downgrades_when_empty(
     defs = " ".join(row["indexdef"] for row in unique)
     assert "(output_tracker_host, output_scope_id, output_issue_id)" in defs
     assert "(source_execution_request_id)" in defs
-    assert "WHERE (outcome IS NULL)" in defs
+    assert "WHERE ((outcome IS NULL) OR label_cleanup_owed)" in defs
     command.downgrade(config, "0168")
     assert tables() == [None, None]
     command.upgrade(config, "0171")
