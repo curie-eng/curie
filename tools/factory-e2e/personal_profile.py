@@ -992,6 +992,8 @@ class ImageBuilder:
                     platform,
                     "--label",
                     f"{pps.REVISION_LABEL}={inputs.candidate}",
+                    "--label",
+                    f"dev.curie.acceptance-run={inputs.run_id}",
                     "-f",
                     str(source / dockerfile),
                     "-t",
@@ -1000,6 +1002,19 @@ class ImageBuilder:
                 ],
                 timeout=3600,
             )
+            owner = self.shell.run(
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    "--format",
+                    '{{ index .Config.Labels "dev.curie.acceptance-run" }}',
+                    ref,
+                ],
+                timeout=60,
+            )
+            if owner.stdout.decode().strip() != inputs.run_id:
+                raise pps.Refusal("candidate_image_mismatch", name)
             self.shell.run(["docker", "push", ref], timeout=1800)
             image = pps.registry_image(self.get, name, tag)
             if image is not None:

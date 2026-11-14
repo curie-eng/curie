@@ -294,6 +294,152 @@ def test_registry_image_reads_the_revision_through_a_buildkit_index() -> None:
         assert pps.registry_image(pps.loopback_get("127.0.0.1", port), "curie-api", tag) is None
 
 
+@pytest.mark.parametrize("drop_labels", [False, True])
+def test_image_builder_keeps_same_head_runs_distinct_in_the_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drop_labels: bool
+) -> None:
+    # Docker labels change image config: https://docs.docker.com/reference/cli/docker/buildx/build/#label
+    # Observed in #5379: CRI reused an older index ID when two indexes shared a config.
+    candidate = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
+    ).strip()
+    manifests: dict[tuple[str, str], bytes] = {}
+    blobs: dict[str, bytes] = {}
+    configs: dict[str, str] = {}
+    runtime: dict[str, str] = {}
+
+    def get(path: str, _headers: Mapping[str, str]) -> tuple[int, dict[str, str], bytes]:
+        _, _, repository, kind, reference = path.split("/", 4)
+        raw = (
+            manifests.get((repository, reference)) if kind == "manifests" else blobs.get(reference)
+        )
+        if raw is None:
+            return 404, {}, b""
+        return 200, {"docker-content-digest": "sha256:" + hashlib.sha256(raw).hexdigest()}, raw
+
+    monkeypatch.setattr(pps, "loopback_get", lambda *_a, **_kw: get)
+
+    class Docker(pp.Shell):
+        def run(self, argv: list[str], **kwargs: Any) -> pp.Completed:
+            if argv[:2] == ["docker", "build"]:
+                ref = argv[argv.index("-t") + 1]
+                repository, tag = pps.split_image_ref(ref)
+                labels = dict(
+                    argv[i + 1].split("=", 1) for i, a in enumerate(argv) if a == "--label"
+                )
+                index_raw, config_raw, children = _index_image(candidate)
+                config = json.loads(config_raw)
+                config["config"]["Labels"] = (
+                    {pps.REVISION_LABEL: labels[pps.REVISION_LABEL]} if drop_labels else labels
+                )
+                config["config"]["Cmd"] = [repository]
+                config_raw = json.dumps(config, sort_keys=True).encode()
+                config_id = "sha256:" + hashlib.sha256(config_raw).hexdigest()
+                blobs[config_id] = config_raw
+                index = json.loads(index_raw)
+                image = index["manifests"][0]
+                manifest = json.loads(children[image["digest"]])
+                manifest["config"].update(digest=config_id, size=len(config_raw))
+                manifest_raw = json.dumps(manifest, sort_keys=True).encode()
+                image["digest"] = "sha256:" + hashlib.sha256(manifest_raw).hexdigest()
+                image["size"] = len(manifest_raw)
+                manifests[repository, image["digest"]] = manifest_raw
+                index["annotations"] = {"org.opencontainers.image.ref.name": ref}
+                manifests[repository, tag] = json.dumps(index, sort_keys=True).encode()
+                configs[ref] = config_id
+                return pp.Completed(0, b"", b"")
+            if argv[:3] == ["docker", "image", "inspect"]:
+                label = re.fullmatch(r'{{ index \.Config.Labels "(.*?)" }}', argv[4])
+                assert label is not None
+                labels = json.loads(blobs[configs[argv[5]]])["config"]["Labels"]
+                return pp.Completed(0, labels.get(label[1], "").encode(), b"")
+            if argv[0] == "git":
+                result = subprocess.run(argv, capture_output=True, check=False)
+                return pp.Completed(result.returncode, result.stdout, result.stderr)
+            if argv[:3] == ["kubectl", "--context", "fixture"]:
+                return pp.Completed(
+                    0, b'{"items":[{"status":{"nodeInfo":{"architecture":"amd64"}}}]}', b""
+                )
+            if argv[:2] == ["docker", "push"] or argv[:3] == ["docker", "image", "ls"]:
+                return pp.Completed(0, b"", b"")
+            raise AssertionError(argv)
+
+    class BaseImages(pp.ImageBuilder):
+        def build_layer(
+            self, bundle: Path, platform: str, tag: str, pushed: Any, tags: Any
+        ) -> pps.RegistryImage:
+            return pps.RegistryImage("fixture-runner", tag, "sha256:" + "4" * 64, candidate)
+
+    previous: dict[str, str] = {}
+    for run_id in ("acme-image-first", "acme-image-second"):
+        ledger = pps.Ledger.open(_private(tmp_path / run_id), run_id)
+        ledger.ensure_run(candidate, phase="images")
+        scrubber = pps.Scrubber()
+        scan = pps.TokenScan(scrubber)
+        inputs = pp.Inputs(
+            candidate,
+            run_id,
+            tmp_path / run_id,
+            context="fixture",
+            registry="localhost:5999",
+            registry_port=5999,
+        )
+        shell = Docker(env={}, scrubber=scrubber, scan=scan, cwd=REPO_ROOT)
+        finalizer = pp.Finalizer(None)
+        try:
+            builder = BaseImages(
+                inputs=inputs,
+                shell=shell,
+                ledger=ledger,
+                finalizer=finalizer,
+                out=pp.Output(scrubber, scan),
+                curie_bin="fixture-curie",
+            )
+            if drop_labels:
+                with pytest.raises(pps.Refusal, match="candidate_image_mismatch"):
+                    builder.build()
+                assert pp.recorded_pushed(ledger) == []
+                continue
+            builder.build()
+            for image in pp.recorded_pushed(ledger):
+                tag = "localhost:5999/" + image.repository + ":" + image.reference
+                actual = runtime.setdefault(configs[tag], image.digest)
+                spec = "localhost:5999/" + image.repository + "@" + image.digest
+                pod = {
+                    "spec": {"containers": [{"name": "app", "image": spec}]},
+                    "status": {
+                        "containerStatuses": [
+                            {
+                                "name": "app",
+                                "imageID": "docker-pullable://"
+                                + spec.rsplit("@", 1)[0]
+                                + "@"
+                                + actual,
+                            }
+                        ]
+                    },
+                }
+                failures = pps.running_image_failures(
+                    {"items": [pod]},
+                    {image.name: image.digest},
+                    registry="localhost:5999",
+                    required=(image.name,),
+                )
+                assert failures == [], (run_id, image.name, failures)
+                if image.name in previous:
+                    pod["status"]["containerStatuses"][0]["imageID"] = previous[image.name]
+                    assert pps.running_image_failures(
+                        {"items": [pod]},
+                        {image.name: image.digest},
+                        registry="localhost:5999",
+                        required=(image.name,),
+                    )
+                previous[image.name] = image.digest
+        finally:
+            finalizer.run()
+            ledger.close()
+
+
 def test_docker_listed_tags_keep_tagged_rows_only() -> None:
     # Recorded `docker image ls --format '{{.Repository}}:{{.Tag}}' <repo>` output
     # after `curie build` pushed a runner layer, plus an untagged leftover row.
