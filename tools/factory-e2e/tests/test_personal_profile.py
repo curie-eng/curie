@@ -356,7 +356,7 @@ def test_image_builder_keeps_same_head_runs_distinct_in_the_runtime(
             if argv[0] == "git":
                 result = subprocess.run(argv, capture_output=True, check=False)
                 return pp.Completed(result.returncode, result.stdout, result.stderr)
-            if argv[:3] == ["kubectl", "--context", "fixture"]:
+            if argv[:3] == ["kubectl", "--context", inputs.context]:
                 return pp.Completed(
                     0, b'{"items":[{"status":{"nodeInfo":{"architecture":"amd64"}}}]}', b""
                 )
