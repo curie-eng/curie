@@ -2567,7 +2567,14 @@ URL, password included, into each proxy's environment as a literal, and the
 superseded ReplicaSets of a connector Deployment keep that value until their
 history is pruned. After upgrading from such a release and letting the
 connector Deployments roll (the next `cluster deploy` of each agent, or the
-next pass of `worker.connectorReconciler`), rotate the Valkey password.
+next pass of `worker.connectorReconciler`), rotate the Valkey password. Then
+restart the connector Deployments, for example `kubectl rollout restart
+deployment -n <namespace> -l
+app.kubernetes.io/component=mcp-connector,app.kubernetes.io/part-of=<release>`:
+each caller proxy reads the password from the Secret only when its container
+starts, so a running proxy keeps the old password and cannot spend grants until
+it restarts. The same restart applies after any later rotation of the Valkey
+password.
 
 ### HTTP identity operator files
 
