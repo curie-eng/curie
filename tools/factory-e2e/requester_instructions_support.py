@@ -481,7 +481,9 @@ done(ok, status=status, error=None if ok else "empty", code=0 if ok else 1)
 # In a runner Pod: every reviewer record in the native transcripts, scanned for
 # the needles on stdin (a JSON list). argv[1] is the deadline, argv[2:] the roots.
 # A reviewer record is any line of a file under a ``subagents`` directory, or a
-# line marked ``isSidechain``.
+# line marked ``isSidechain``. Anything it cannot read (a root or directory it
+# cannot list, a transcript it cannot open or read whole, a line it cannot
+# parse) makes the scan incomplete: an error, never a clean result.
 REVIEWER_SCAN_PROGRAM = """\
 import json, os, signal, sys
 def done(body, code):
@@ -502,8 +504,12 @@ signal.setitimer(signal.ITIMER_REAL, deadline)
 forms = [(n.encode(), json.dumps(n)[1:-1].encode()) for n in needles]
 files = records = 0
 found = set()
+incomplete = []
+LIMIT = 64 << 20
 for root in roots:
-    for base, _dirs, names in os.walk(root, onerror=lambda error: None):
+    if not os.path.isdir(root):
+        incomplete.append(1)
+    for base, _dirs, names in os.walk(root, onerror=lambda error: incomplete.append(1)):
         for name in names:
             if not name.endswith(".jsonl"):
                 continue
@@ -511,16 +517,23 @@ for root in roots:
             side = "subagents" in path.split(os.sep)
             try:
                 with open(path, "rb") as stream:
-                    lines = stream.read(64 << 20).splitlines()
+                    data = stream.read(LIMIT + 1)
             except OSError:
+                incomplete.append(1)
+                continue
+            if len(data) > LIMIT:
+                incomplete.append(1)
                 continue
             seen = False
-            for line in lines:
+            for line in data.splitlines():
                 if not side:
+                    if not line.strip():
+                        continue
                     try:
                         if json.loads(line).get("isSidechain") is not True:
                             continue
                     except (ValueError, AttributeError):
+                        incomplete.append(1)
                         continue
                 seen = True
                 records += 1
@@ -528,6 +541,8 @@ for root in roots:
                     if raw in line or escaped in line:
                         found.add(index)
             files += seen
+if incomplete:
+    done({"error": "incomplete", "files": files, "records": records}, 4)
 done({"error": None, "files": files, "records": records, "hits": len(found)}, 0)
 """
 

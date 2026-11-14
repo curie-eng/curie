@@ -607,6 +607,37 @@ def test_reviewer_scan_counts_reviewer_records_only(tmp_path: Path) -> None:
     assert scan == ris.ReviewerScan(files=1, records=1, hits=0, error=None)
 
 
+@pytest.mark.parametrize("fault", ["unreadable_transcript", "missing_root"])
+def test_reviewer_scan_fails_closed_on_an_incomplete_read(tmp_path: Path, fault: str) -> None:
+    document = ris.make_document("first", NONCE)
+    # One clean, readable reviewer transcript...
+    root = _transcripts(tmp_path / "mixed", document, leak=False)
+    roots = [str(root)]
+    if fault == "unreadable_transcript":
+        # ...beside one that cannot be opened (a dangling link names it).
+        side = next(path for path in root.rglob("subagents") if path.is_dir())
+        (side / "agent-unreadable.jsonl").symlink_to(tmp_path / "gone.jsonl")
+    else:
+        roots.append(str(tmp_path / "absent"))
+    code, out = _run(
+        ris.REVIEWER_SCAN_PROGRAM, "20", *roots, stdin=json.dumps(document.needles()).encode()
+    )
+    assert code == 4
+    assert ris.reviewer_scan_result(code, out).error == "incomplete"
+
+
+def test_reviewer_scan_fails_closed_on_an_unparsable_parent_line(tmp_path: Path) -> None:
+    document = ris.make_document("first", NONCE)
+    root = _transcripts(tmp_path / "torn", document, leak=False)
+    parent = next(path for path in root.rglob("*.jsonl") if "subagents" not in path.parts)
+    with parent.open("ab") as stream:
+        stream.write(b'{"isSidechain": tru\n')
+    code, out = _run(
+        ris.REVIEWER_SCAN_PROGRAM, "20", str(root), stdin=json.dumps(document.needles()).encode()
+    )
+    assert ris.reviewer_scan_result(code, out).error == "incomplete"
+
+
 def test_reviewer_scan_finds_a_leaked_preference(tmp_path: Path) -> None:
     document = ris.make_document("first", NONCE)
     root = _transcripts(tmp_path / "leak", document, leak=True)
