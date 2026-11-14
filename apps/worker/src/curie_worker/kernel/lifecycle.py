@@ -1257,6 +1257,8 @@ async def _process_event(
         dependency_deadline: float | None = None
         dependency_refusals = 0
         dependency_attempts = 0
+        unreachable_deadline: float | None = None
+        unreachable_attempts = 0
         while True:
             attempt += 1
             hook_carry = constants._HOOK_RUN_CARRY.get()
@@ -1314,7 +1316,8 @@ async def _process_event(
                         qevent,
                         route,
                         "The run exceeded its delivery deadline after "
-                        f"{attempt - 1 + dependency_attempts} attempt(s) and was not restarted. "
+                        f"{attempt - 1 + dependency_attempts + unreachable_attempts} attempt(s) "
+                        "and was not restarted. "
                         "Flagging for a human.",
                         failure_class="delivery-deadline",
                     )
@@ -1780,7 +1783,8 @@ async def _process_event(
                     qevent,
                     route,
                     "The run exceeded its delivery deadline after "
-                    f"{attempt + dependency_attempts} attempt(s) and was not restarted. "
+                    f"{attempt + dependency_attempts + unreachable_attempts} attempt(s) "
+                    "and was not restarted. "
                     "Flagging for a human.",
                     failure_class="delivery-deadline",
                 )
@@ -1802,7 +1806,34 @@ async def _process_event(
                 if dependency_retry
                 else retryable and qevent.source is not TurnSource.CRON
             )
-            if not retryable or (attempt >= self._config.max_attempts and not dependency_retry):
+            # #4733: a connect-phase turn-start failure (a recreated sandbox
+            # pod not yet listening) retries for one window per delivery, the
+            # sandbox claim timeout long and never reset, without consuming
+            # max_attempts. Placed after the side-effect halt, between
+            # attempts and outside the thread lock. After the window closes it
+            # is an ordinary runner-error outcome again.
+            unreachable_wait = False
+            unreachable_remaining = 0.0
+            if outcome.runner_unreachable and retryable and not dependency_retry:
+                if unreachable_deadline is None:
+                    window_s = self._substrate.claim_timeout_seconds
+                    unreachable_deadline = clock.time.monotonic() + window_s
+                    logger.warning(
+                        "runner unreachable at turn start for event %s; retrying for up to "
+                        "%.1fs without consuming attempts",
+                        event_id,
+                        window_s,
+                    )
+                unreachable_remaining = unreachable_deadline - clock.time.monotonic()
+                if unreachable_remaining > 0:
+                    unreachable_wait = True
+                    unreachable_attempts += 1
+                    attempt -= 1
+            if not retryable or (
+                attempt >= self._config.max_attempts
+                and not dependency_retry
+                and not unreachable_wait
+            ):
                 if (
                     outcome.classification in {"runner-error", "sandbox-capacity"}
                     and termination_detail is not None
@@ -1821,7 +1852,7 @@ async def _process_event(
                         qevent,
                         lead=failures._with_guidance(
                             f"The run failed ({token}) after "
-                            f"{attempt + dependency_attempts} attempt(s).",
+                            f"{attempt + dependency_attempts + unreachable_attempts} attempt(s).",
                             token,
                             delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
                         ),
@@ -1865,6 +1896,12 @@ async def _process_event(
                 if capacity_continuation is not None
                 else attempt
             )
+            if unreachable_wait:
+                backoff_s = min(
+                    self._backoff(unreachable_attempts),
+                    constants._RUNNER_UNREACHABLE_RETRY_MAX_S,
+                    unreachable_remaining,
+                )
             remaining = claim._remaining_budget(lease)
             if dependency_retry:
                 remaining = (

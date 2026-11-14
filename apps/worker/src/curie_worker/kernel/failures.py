@@ -201,6 +201,9 @@ class TurnOutcome:
     error_message: str | None = None
     workspace_stage_timeout: bool = False
     workspace_dependency_unavailable: bool = False
+    # True only when turn start failed in the connect phase, so no request
+    # reached a runner (#4733).
+    runner_unreachable: bool = False
     text: str = ""
     status: SessionStatus | None = None
     steered: bool = False

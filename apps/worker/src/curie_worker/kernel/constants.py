@@ -368,6 +368,12 @@ IDENTITY_REFUSED_RELAY_NOTICE = (
 # the deadline that the escalation and the terminal settle still need.
 _MIN_ATTEMPT_BUDGET_S = 5.0
 
+# The cap on one sleep inside the runner-unreachable window (#4733). A
+# connect-phase turn-start failure retries for up to the sandbox claim timeout
+# without consuming max_attempts; this keeps a recreated pod from idling
+# behind a long backoff once it is reachable.
+_RUNNER_UNREACHABLE_RETRY_MAX_S = 5.0
+
 # Bound request status reads so continuations cannot stall (#4191).
 _REQUEST_STATUS_READ_TIMEOUT_S = 5.0
 

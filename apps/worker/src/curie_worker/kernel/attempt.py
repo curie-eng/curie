@@ -759,7 +759,13 @@ async def _attempt_turn(
                 )
                 raise CapacityWaitRequested() from None
         logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
-        return failures.TurnOutcome(terminal_ok=False, classification="runner-error")
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            classification="runner-error",
+            runner_unreachable=isinstance(
+                exc, (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError)
+            ),
+        )
     assert routed is not None
     record_reclaimed_retry()
     try:
