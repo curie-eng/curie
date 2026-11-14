@@ -8,7 +8,8 @@ https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+import uuid
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,11 +17,18 @@ from typing import Any
 
 import httpx
 import pytest
+from anyio.to_thread import current_default_thread_limiter
 from curie_api import factory_poll_intake as intake
 from curie_api.config import get_settings
+from curie_api.db import create_engine, create_sessionmaker
+from curie_api.factory_base_reconcile import initialize_base_selection
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import body_digest
 from curie_api.github_app import GitHubCredentials
+from curie_api.github_factory_events import FactoryNotice
 from curie_api.main import create_app
-from curie_api.models import FactoryIntakeNotice
+from curie_api.models import Agent, ExecutionRequest, FactoryStatusComment, WorkItem
+from curie_api.threadkeys import route_thread_key
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_telemetry import record_metric
 from fastapi.testclient import TestClient
@@ -33,7 +41,6 @@ from forge_fakes.github import (
     factory_env,
     fake_installation_tokens,
 )
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from test_factory_poll_intake import PollGitHub
 
 
@@ -76,9 +83,7 @@ class SimulatedClock:
             await self.turn()
             others = asyncio.all_tasks() - {asyncio.current_task()}
             chains = {task: self.chain(task) for task in others}
-            threads = sum(
-                any("run_sync_in_worker_thread" in n for n in names) for names in chains.values()
-            )
+            threads = current_default_thread_limiter().borrowed_tokens
             responses = sum(task.get_name() == "credential-response" for task in others)
             runnable = bool(loop._ready)
             blocked = set()
@@ -113,7 +118,21 @@ class SimulatedClock:
             if blocked:
                 changed = asyncio.create_task(self.changed.wait())
                 try:
-                    await asyncio.wait((*blocked, changed), return_when=asyncio.FIRST_COMPLETED)
+                    async with asyncio.timeout(5):
+                        await asyncio.wait((*blocked, changed), return_when=asyncio.FIRST_COMPLETED)
+                except TimeoutError:
+                    pending = [
+                        (
+                            task.get_name(),
+                            self.chain(task),
+                            type(getattr(task, "_fut_waiter", None)).__qualname__,
+                        )
+                        for task in others
+                        if getattr(task, "_fut_waiter", None) in blocked
+                    ]
+                    raise AssertionError(
+                        f"cadence clock blocked at {self.now}; tasks={pending}"
+                    ) from None
                 finally:
                     changed.cancel()
                     await asyncio.gather(changed, return_exceptions=True)
@@ -193,7 +212,7 @@ class EnvelopeGitHub(PollGitHub):
                     for c in self.comments.values()
                     if c["issue_url"].endswith(f"/issues/{number}")
                 ]
-                rows = history + own
+                rows = history[: max(0, 200 - len(own))] + own
                 per_page = int(params.get("per_page", "100"))
                 page = int(params.get("page", "1"))
                 return httpx.Response(200, json=rows[(page - 1) * per_page : page * per_page])
@@ -230,6 +249,8 @@ class World:
             pull = fake.plant_pull()
             fake.add_review_comment(pull, 700001, "An earlier review comment")
             fake.add_review(pull, 700002, "An earlier review")
+        self.agents: dict[tuple[str, str], uuid.UUID] = {}
+        self.background: list[tuple[str, int, uuid.UUID]] = []
         self.calls: list[tuple[float, str, str, str]] = []
         self.delay = 0.2
         self.slow = False
@@ -362,6 +383,7 @@ def cadence_world(
                     },
                 )
                 assert response.status_code == 201, response.text
+                world.agents[repo, label] = uuid.UUID(response.json()["id"])
         yield world
     get_settings.cache_clear()
 
@@ -375,9 +397,10 @@ async def exercise(
     slow_reconciler: bool = False,
     require_answers: bool = True,
     stop_at: float | None = None,
+    change_selection: bool = False,
 ) -> list[tuple[str, int]]:
-    engine = create_async_engine(get_settings().database_url, pool_size=10, max_overflow=10)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
+    engine = create_engine()
+    maker = create_sessionmaker(engine)
     clock = world.clock
     world.loop = asyncio.get_running_loop()
     started = []
@@ -397,29 +420,101 @@ async def exercise(
         selected = list(world.fakes.items())[: 1 if concentrated else 10]
         for index, (repo, fake) in enumerate(selected):
             targets += [(repo, n) for n in fake.burst(10 if concentrated else 1, offset=index)]
-        # Cold cursors and fifty already answered issues in each repository.
         async with maker() as session:
             for fake in world.fakes.values():
-                for _ in range(50 - len(fake.issues)):
+                agent = await session.get(Agent, world.agents[fake.repo, LABEL])
+                assert agent is not None
+                fingerprint = None
+                for index in range(50 - len(fake.issues)):
                     number = fake.plant_issue()
-                    event = fake._events(fake.issues[number])[-1]
+                    issue = fake.issues[number]
+                    item = WorkItem(
+                        id=uuid.uuid4(),
+                        tenant_id=agent.tenant_id,
+                        agent_id=agent.id,
+                        conversation_id=route_thread_key(
+                            "github", None, fake.repo, f"issue-{number}"
+                        ),
+                        tracker_kind="github",
+                        tracker_host="github.com",
+                        tracker_scope_id=str(fake.repository_id),
+                        tracker_issue_id=str(number),
+                        code_host_kind="github",
+                        code_host_host="github.com",
+                        repository_project_id=str(fake.repository_id),
+                        repository_path=fake.repo,
+                        code_host_installation_id=INSTALLATION_ID,
+                        trigger_label=LABEL,
+                        next_sequence=2,
+                        base_selection_fingerprint=fingerprint,
+                    )
+                    session.add(item)
+                    if fingerprint is None:
+                        await session.flush()
+                        await initialize_base_selection(
+                            session,
+                            item_id=item.id,
+                            labels={label["name"] for label in fake._issue_body(issue)["labels"]},
+                            default_branch=fake.default_branch,
+                            settings=get_settings(),
+                        )
+                        fingerprint = item.base_selection_fingerprint
+                    notice = FactoryNotice(
+                        uuid.uuid4(),
+                        "issues",
+                        "labeled",
+                        "admit",
+                        INSTALLATION_ID,
+                        fake.repository_id,
+                        fake.repo,
+                        number,
+                        6601,
+                        "octocat",
+                        label_event_at=issue.labeled_at,
+                        label=LABEL,
+                        label_event_id=issue.event_id,
+                    )
+                    request = ExecutionRequest(
+                        id=notice.request_id,
+                        work_item_id=item.id,
+                        work_item=item,
+                        tenant_id=agent.tenant_id,
+                        sequence=1,
+                        status="waiting",
+                        wait_deadline=datetime.now(UTC) + timedelta(hours=1),
+                        objective=f"https://github.com/{fake.repo}/issues/{number}",
+                        requester="github:6601:octocat",
+                        reply_kind="github",
+                        reply_address=fake.repo,
+                        reply_conversation_id=f"issue-{number}",
+                    )
+                    session.add(request)
+                    if index % 2:
+                        item.base_branch = fake.default_branch
+                        item.base_source = "default"
+                        item.base_commit = fake.branches[fake.default_branch]
+                        item.base_resolved_request_id = request.id
+                        item.base_selection_fingerprint = None
+                    await session.flush()
+                    comment = fake.add_issue_comment(
+                        number, next(fake._comment_ids), "Queued work\n" + marker_for(request.id)
+                    )
                     session.add(
-                        FactoryIntakeNotice(
-                            tracker_kind="github",
-                            tracker_host="github.com",
-                            tracker_scope_id=str(fake.repository_id),
-                            tracker_issue_id=str(number),
-                            repository_path=fake.repo,
-                            label=LABEL,
-                            label_event_id=event["id"],
-                            actor_login="octocat",
-                            reason="actor_bot",
-                            issue_url=f"https://github.com/{fake.repo}/issues/{number}",
+                        FactoryStatusComment(
+                            execution_request_id=request.id,
+                            work_item_id=item.id,
                             posted_at=datetime.now(UTC),
-                            comment_id=number,
+                            comment_id=comment["id"],
+                            comment_list="issue",
+                            rendered_digest=body_digest(comment["body"]),
+                            applied_label="curie-factory:queued",
                         )
                     )
+                    world.background.append((fake.repo, number, request.id))
             await session.commit()
+        if change_selection:
+            for repo, number, _ in world.background[:2]:
+                world.fakes[repo].issues[number].base_labels = ("base:main",)
 
         async def drive() -> None:
             def finished() -> bool:
@@ -479,9 +574,16 @@ async def exercise(
 
 
 @pytest.mark.parametrize("concentrated", [False, True])
-def test_cadence_envelope_order_listing(cadence_world: World, concentrated: bool) -> None:
+def test_cadence_envelope_order_listing(
+    cadence_world: World,
+    concentrated: bool,
+    record_property: Callable[[str, object], None],
+) -> None:
     world = cadence_world
     targets = asyncio.run(exercise(world, concentrated=concentrated))
+    label_end = max(at for at, _, _ in world.metrics[:20])
+    record_property("first_label_pass_seconds", label_end)
+    assert label_end <= 15
     assert world.started[:2] == pytest.approx([0, 45])
     for repo, number in targets:
         assert len(world.fakes[repo].answers[number]) == 1
@@ -490,8 +592,6 @@ def test_cadence_envelope_order_listing(cadence_world: World, concentrated: bool
     answers = [world.fakes[r].answers[n][0] for r, n in targets]
     assert traffic and min(traffic) >= max(answers)
     assert max(answers) <= 15
-    label_end = max(at for at, _, _ in world.metrics[:20])
-    assert label_end <= 15
     assert min(traffic) >= label_end
     assert max(value for _, _, value in world.metrics) <= 60
     assert any(world.fakes[r].refused for r, n in targets)
@@ -505,6 +605,39 @@ def test_cadence_envelope_order_listing(cadence_world: World, concentrated: bool
             and "page=" not in url.replace("per_page=", "")
         ]
         assert len(first_pages) <= 1
+
+
+def test_cadence_answered_admissions_reconcile_changed_selection(cadence_world: World) -> None:
+    world = cadence_world
+    asyncio.run(exercise(world, change_selection=True))
+
+    async def selections() -> list[tuple[str | None, str | None, str | None, int]]:
+        engine = create_engine()
+        try:
+            async with create_sessionmaker(engine)() as session:
+                selected = []
+                for _, _, request_id in world.background[:2]:
+                    request = await session.get(ExecutionRequest, request_id)
+                    assert request is not None
+                    item = await session.get(WorkItem, request.work_item_id)
+                    assert item is not None
+                    selected.append(
+                        (
+                            item.base_branch,
+                            item.base_source,
+                            item.base_selection_fingerprint,
+                            item.version,
+                        )
+                    )
+                return selected
+        finally:
+            await engine.dispose()
+
+    unresolved, pinned = asyncio.run(selections())
+    assert unresolved[:2] == (None, None)
+    assert unresolved[2] is not None
+    assert unresolved[3] == 2
+    assert pinned == ("main", "label", None, 2)
 
 
 def test_cadence_restart(cadence_world: World) -> None:
@@ -572,7 +705,7 @@ def test_cadence_slow_reconciler_lifespan(
     monkeypatch.setattr(WorkItemReconciler, "_settle_publications", slow)
     asyncio.run(exercise(world, slow_reconciler=True))
     assert began and world.started[:2] == pytest.approx([0, 45])
-    assert world.completed[0] < 45
+    assert max(at for at, _, _ in world.metrics[:20]) <= 15
 
 
 def test_cadence_listing_failure_is_shared_and_retried(cadence_world: World) -> None:

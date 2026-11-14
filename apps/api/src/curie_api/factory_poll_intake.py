@@ -182,8 +182,14 @@ async def _label_already_admitted(
     issue: TrackerIssueRef,
     event: dict[str, Any],
     installation_id: int,
-) -> bool:
-    """True when this label event is not newer than the work item's latest request.
+    *,
+    label: str,
+    labels: set[str] | None,
+    repository: dict[str, Any],
+    agent_id: uuid.UUID | None,
+    settings: Settings,
+) -> tuple[bool, bool]:
+    """Return prior admission and whether its unchanged selection is answered.
 
     Requests admitted through a webhook use the delivery id, not the timeline
     event id. Treating that same label as a new admission would cancel the
@@ -192,21 +198,52 @@ async def _label_already_admitted(
 
     event_at = parse_time(event.get("created_at"))
     if event_at is None:
-        return False
+        return False, False
     async with sessionmaker() as session:
         item = await github_factory.work_item_for(session, issue)
         if (
-            item is None or item.cancelled_at is not None
+            item is None
+            or item.cancelled_at is not None
             or item.code_host_installation_id != installation_id
         ):
-            return False
-        latest = await session.scalar(
-            select(ExecutionRequest.created_at)
-            .where(ExecutionRequest.work_item_id == item.id)
-            .order_by(desc(ExecutionRequest.sequence))
-            .limit(1)
+            return False, False
+        latest = (
+            await session.execute(
+                select(
+                    ExecutionRequest.id,
+                    ExecutionRequest.created_at,
+                    FactoryStatusComment.posted_at,
+                )
+                .outerjoin(
+                    FactoryStatusComment,
+                    FactoryStatusComment.execution_request_id == ExecutionRequest.id,
+                )
+                .where(ExecutionRequest.work_item_id == item.id)
+                .order_by(desc(ExecutionRequest.sequence))
+                .limit(1)
+            )
+        ).one_or_none()
+        if latest is None or event_at > latest.created_at:
+            return False, False
+        if (
+            latest.posted_at is None
+            or agent_id != item.agent_id
+            or item.trigger_label != label
+            or labels is None
+            or label not in labels
+            or item.repository_path != repository.get("full_name")
+            or item.repository_project_id != str(repository.get("id"))
+            or item.base_resolved_request_id not in (None, latest.id)
+        ):
+            return True, False
+        from .factory_base_reconcile import base_selection_unchanged
+
+        return True, base_selection_unchanged(
+            item,
+            labels=labels,
+            default_branch=repository.get("default_branch"),
+            settings=settings,
         )
-    return latest is not None and event_at <= latest
 
 
 async def poll_once(
@@ -531,6 +568,10 @@ async def _admit_labeled(
     listed, etag = await tracker.labeled_open_issues(cursor.etags.get(key))
     if listed is None:
         return True
+    async with sessionmaker() as session:
+        bindings = await bound_labels(session, forges_registry(settings), GITHUB_CHANNEL_KIND, repo)
+        matches = bindings.get(label, [])
+        agent_id = matches[0].agent_id if len(matches) == 1 else None
 
     async def admit(issue: Any) -> bool:
         if not isinstance(issue, dict) or "pull_request" in issue:
@@ -539,9 +580,9 @@ async def _admit_labeled(
         if type(number) is not int or number <= 0:
             return True
         async with limit:
-            return await apply(number)
+            return await apply(number, label_names(issue))
 
-    async def apply(number: int) -> bool:
+    async def apply(number: int, labels: set[str] | None) -> bool:
         try:
             events = await tracker.issue_events(number)
             event = last_label_event(events, label)
@@ -577,9 +618,20 @@ async def _admit_labeled(
                 )
             if answered is not None:
                 return True
-            if await _label_already_admitted(
-                sessionmaker, tracker.issue(number), event, installation_id
-            ):
+            admitted, unchanged = await _label_already_admitted(
+                sessionmaker,
+                tracker.issue(number),
+                event,
+                installation_id,
+                label=label,
+                labels=labels,
+                repository=repository,
+                agent_id=agent_id,
+                settings=settings,
+            )
+            if unchanged and notice.actor_refusal is None:
+                return True
+            if admitted:
                 # Reconcile an observed base edit on the existing work item.
                 notice = replace(notice, previously_admitted=True)
             await _apply_notice(
