@@ -85,10 +85,16 @@ another handler that mints a `QueuedTurn` with the right `source`. The ten hardc
   with the installation credential and admits through the same verification the
   webhook uses, without writing a delivery receipt. Cursors live in
   `curie.factory_poll_cursors`, and one API replica polls at a time under a Postgres
-  advisory lock. It runs as a step of the API's WorkItem reconciler loop
-  (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._reconcile_missed_labels`),
-  every `poll_interval_s` of the GitHub tracker in `CURIE_FORGES` (45 seconds by default), and only when
-  factory ingress is on. In poll mode no webhook secret is needed to boot.
+  advisory lock. `apps/api/src/curie_api/factory_poll_intake.py::run_forever`
+  runs beside the WorkItem reconciler on its own start-to-start timer,
+  every `poll_interval_s` of the GitHub tracker in `CURIE_FORGES` (45 seconds
+  by default), when factory ingress is on. Labels and their new answers precede
+  all review, comment and cancellation reads. Later traffic yields at the next
+  label deadline and rotates its first repository. Inside the
+  [polling envelope](../../operations.md#factory-polling-cadence), a persistent
+  trigger label receives an answer within 60 seconds, including recovery.
+  `curie.factory.intake.label_pass.age_seconds` exposes each repository's age
+  since its last clean pass. In poll mode no webhook secret is needed to boot.
 6. **Factory missed-label reconciliation** (webhook mode only):
   `apps/api/src/curie_api/factory_label_reconcile.py::reconcile_missed_labels` lists
   open issues carrying the factory label on every bound repository and admits any with

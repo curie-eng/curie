@@ -619,6 +619,7 @@ async def sync_status_comments(
     owner: str,
     limit: int = 20,
     paused_for_upgrade: bool = False,
+    request_ids: set[uuid.UUID] | None = None,
 ) -> int:
     """Claim, render, release the session, call GitHub, then persist under the lease.
 
@@ -641,6 +642,7 @@ async def sync_status_comments(
                         owner=owner,
                         attempted_ids=attempted_ids,
                         paused_for_upgrade=paused_for_upgrade,
+                        request_ids=request_ids,
                     )
                     await session.commit()
                 if claim is None:
@@ -713,6 +715,7 @@ async def _claim_next(
     owner: str,
     attempted_ids: set[uuid.UUID],
     paused_for_upgrade: bool,
+    request_ids: set[uuid.UUID] | None = None,
 ) -> _StatusClaim | None:
     later = aliased(ExecutionRequest)
     is_latest = and_(
@@ -757,6 +760,11 @@ async def _claim_next(
             )
             .where(
                 FactoryStatusComment.refused_at.is_(None),
+                *(
+                    ()
+                    if request_ids is None
+                    else (FactoryStatusComment.execution_request_id.in_(request_ids),)
+                ),
                 ExecutionRequest.objective.is_not(None),
                 or_(FactoryStatusComment.finalized_at.is_(None), label_due),
                 lease_available(

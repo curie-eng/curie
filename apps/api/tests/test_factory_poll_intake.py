@@ -1,7 +1,7 @@
 """Polling is the default factory intake (#3745).
 
-These tests drive ``WorkItemReconciler.run_once``, ``Settings``, and
-``POST /github/webhook``. They do not call the poll helper. GitHub is an
+These tests drive ``poll_once``, ``WorkItemReconciler.run_once``, ``Settings``, and
+``POST /github/webhook``. GitHub is an
 in-process fixture. List and conditional reads follow:
 
 https://docs.github.com/en/rest/issues/issues#list-repository-issues
@@ -28,6 +28,7 @@ import sys
 import threading
 import uuid
 from collections.abc import Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,6 +39,7 @@ import httpx
 import pytest
 import redis.asyncio as aioredis
 from curie_api.config import Settings, get_settings
+from curie_api.factory_poll_intake import poll_once
 from curie_api.github_review_events import FeedbackIgnored, label_actor
 from curie_api.main import create_app
 from curie_api.models import ExecutionRequest
@@ -147,7 +149,9 @@ class PollGitHub:
     failures: dict[str, int] = field(default_factory=dict)
     permission_failures: set[int] = field(default_factory=set)
     failed_permissions: list[int] = field(default_factory=list)
-    _permission_issue: int | None = None
+    _permission_issue: ContextVar[int | None] = field(
+        default_factory=lambda: ContextVar("permission_issue", default=None)
+    )
     issues: dict[int, _PlantedIssue] = field(default_factory=dict)
     comments: dict[int, dict[str, Any]] = field(default_factory=dict)
     review_comments: dict[int, dict[str, Any]] = field(default_factory=dict)
@@ -509,7 +513,7 @@ class PollGitHub:
             issue = self.issues.get(number)
             if issue is None:
                 return httpx.Response(404, json={"message": "missing fixture"})
-            self._permission_issue = number
+            self._permission_issue.set(number)
             body = self._issue_body(issue)
             etag = f'"{hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()}"'
             if request.headers.get("if-none-match") == etag:
@@ -517,7 +521,8 @@ class PollGitHub:
                 return httpx.Response(304, headers={"ETag": etag})
             return httpx.Response(200, json=body, headers={"ETag": etag})
         if path == f"{root}/collaborators/{SENDER}/permission":
-            number, self._permission_issue = self._permission_issue, None
+            number = self._permission_issue.get()
+            self._permission_issue.set(None)
             if number in self.permission_failures:
                 assert number is not None
                 self.failed_permissions.append(number)
@@ -628,6 +633,9 @@ async def _run_once_async(github: PollGitHub) -> None:
     maker = async_sessionmaker(engine, expire_on_commit=False)
     client = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
     try:
+        if get_settings().factory_intake == "poll":
+            async with httpx.AsyncClient() as http:
+                await poll_once(maker, get_settings(), http)
         await WorkItemReconciler(maker, client, get_settings()).run_once()
     finally:
         await client.aclose()
@@ -895,7 +903,13 @@ def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_aft
     )
     assert admitted["base_resolved_request_id"] is None
     assert not any("/git/ref/heads/" in request.url.path for request in github.calls)
-    assert github.comments == {}
+    [status] = _rows(
+        "SELECT comment_id, posted_at FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )
+    assert status["posted_at"] is not None
+    assert set(github.comments) == {status["comment_id"]}
 
     refused = _acquire(client, request_id)
 
@@ -906,9 +920,10 @@ def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_aft
     assert refusal["start_deferrals"] == 0
     assert refusal["last_deferral_reason"].startswith("base_")
     comments = list(github.comments.values())
-    assert len(comments) == 1
-    assert "<!-- curie-factory-base-refusal -->" in comments[0]["body"]
-    assert reason in comments[0]["body"]
+    assert len(comments) == 2
+    [base_refusal] = [comment for comment in comments if comment["id"] != status["comment_id"]]
+    assert "<!-- curie-factory-base-refusal -->" in base_refusal["body"]
+    assert reason in base_refusal["body"]
 
     github._etags["issues"] = f'"retry-refusal-{number}"'
     _run_once(github)
@@ -929,7 +944,7 @@ def test_poll_admits_invalid_base_then_acquisition_rechecks_the_same_request_aft
                 and request.url.path == f"/repos/{REPO}/issues/{number}/comments"
             ]
         )
-        == 1
+        == 2
     )
 
     github.issues[number].base_labels = ()
@@ -2067,7 +2082,7 @@ def test_label_actor_reader_preserves_app_review_refusal(
     comment["performed_via_github_app"] = {"id": 52}
     _run_once(github)
     assert len(_requests(number)) == 1
-    comment["performed_via_github_app"] = None
+    github.add_issue_comment(pull, 73992, f"@{MENTION} revise this")
     github._etags["issue-comments"] = '"human-comment"'
     _run_once(github)
     assert len(_requests(number)) == 2
