@@ -64,6 +64,12 @@ from . import ui_evidence
 from .executor import EXECUTOR_MODE, ExecuteRefusal, Executor
 from .executor import RUNNER_MODE_ENV as RUNNER_MODE_ENV
 from .final_answer import FINAL_ANSWER_HEADER
+from .requester_context import (
+    CONTEXT_PATH,
+    MAX_ENVELOPE_BYTES,
+    RequesterContextGate,
+    attached_gate,
+)
 from .session import SessionRunner
 from .turn_progress import ProgressCapability
 from .workspace_checkpoint import (
@@ -95,6 +101,8 @@ _GATED_PATHS = frozenset(
         "/v1/ui-evidence/index",
         "/v1/ui-evidence/image",
         "/v1/status",
+        # ADR 0278: the worker's requester context envelope.
+        CONTEXT_PATH,
         # @spec ACTION-EXECUTOR-6: served only in executor mode; an ordinary
         # runner answers 404 behind the same bearer.
         "/v1/execute",
@@ -115,6 +123,8 @@ STATUS_ATTESTATION: web.AppKey[object] = web.AppKey("status_attestation", object
 # managed workspace from the runner-held attestation (never from a request).
 CHECKPOINT_AUTHENTICATED: web.AppKey[bool] = web.AppKey("checkpoint_authenticated", bool)
 CHECKPOINT_WORKSPACE: web.AppKey[object] = web.AppKey("checkpoint_workspace", object)
+# The process's one requester context gate (ADR 0278), or None: route answers 404.
+REQUESTER_CONTEXT: web.AppKey[object] = web.AppKey("requester_context", object)
 
 
 class _StatusAttestation(TypedDict):
@@ -187,6 +197,7 @@ def create_app(
     snapshotter: Snapshotter | None = None,
     *,
     ui_evidence_workspace: Path | None = None,
+    requester_context: RequesterContextGate | None = None,
 ) -> web.Application:
     """Build the aiohttp application that starts ``runner`` in the background.
 
@@ -216,6 +227,9 @@ def create_app(
     app[RUNNER] = runner
     app[SNAPSHOTTER] = snapshotter
     app[UI_EVIDENCE_WORKSPACE] = ui_evidence_workspace
+    app[REQUESTER_CONTEXT] = (
+        requester_context if requester_context is not None else attached_gate(runner)
+    )
     # An identity-bearing response exists only when middleware above enforces a
     # non-empty bearer. Tokenless apps (dev flag or in-process tests) keep both
     # status routes probe-only.
@@ -238,6 +252,7 @@ def create_app(
             web.post("/v1/checkpoint", _checkpoint),
             web.post("/v1/ui-evidence/index", _ui_evidence_index),
             web.post("/v1/ui-evidence/image", _ui_evidence_image),
+            web.post(CONTEXT_PATH, _requester_context),
         ]
     )
     app.on_startup.append(_on_startup)
@@ -258,6 +273,7 @@ _EXECUTOR_REFUSED_ROUTES = (
     "/v1/checkpoint",
     "/v1/ui-evidence/index",
     "/v1/ui-evidence/image",
+    CONTEXT_PATH,
 )
 
 
@@ -532,9 +548,7 @@ async def _event(request: web.Request) -> web.StreamResponse:
     try:
         frame = _parse(await request.json())
     except Exception as exc:  # noqa: BLE001 - map any decode/validation error to 400
-        return web.json_response(
-            {"error": f"invalid event frame: {_frame_error(exc)}"}, status=400
-        )
+        return web.json_response({"error": f"invalid event frame: {_frame_error(exc)}"}, status=400)
     if not isinstance(frame, Event):
         return web.json_response(
             {"error": "expected an event frame; use /v1/interrupt for interrupts"},
@@ -565,7 +579,9 @@ async def _event(request: web.Request) -> web.StreamResponse:
     progress = ProgressCapability.from_headers(request.headers)
     async with contextlib.aclosing(
         runner.run_turn(
-            frame, parent=parent, turn_epoch=turn_epoch,
+            frame,
+            parent=parent,
+            turn_epoch=turn_epoch,
             admission_required=admission_header == "wait",
             progress=progress,
         )
@@ -581,9 +597,7 @@ async def _steer(request: web.Request) -> web.Response:
     try:
         frame = _parse(await request.json())
     except Exception as exc:  # noqa: BLE001
-        return web.json_response(
-            {"error": f"invalid steer frame: {_frame_error(exc)}"}, status=400
-        )
+        return web.json_response({"error": f"invalid steer frame: {_frame_error(exc)}"}, status=400)
     if not isinstance(frame, Event):
         return web.json_response({"error": "expected an event frame"}, status=400)
 
@@ -660,6 +674,28 @@ async def _turn_admit(request: web.Request) -> web.Response:
     if not runner.admit_turn(epoch, allow=body["allow"]):
         return web.json_response({"error": "turn epoch is not pending"}, status=409)
     return web.json_response({"ok": True})
+
+
+async def _requester_context(request: web.Request) -> web.Response:
+    """Decide the worker's requester context envelope (ADR 0278, #5592).
+
+    Answers the version 1 acknowledgment; a refused envelope is still a 200
+    with outcome ``failed`` and its reason, and the start then blocks offline.
+    """
+
+    gate = request.app[REQUESTER_CONTEXT]
+    if not isinstance(gate, RequesterContextGate):
+        return web.json_response({"error": "requester_context_not_served"}, status=404)
+    raw = bytearray()
+    oversized = request.content_length is not None and request.content_length > MAX_ENVELOPE_BYTES
+    if not oversized:
+        async for chunk in request.content.iter_any():
+            raw.extend(chunk)
+            if len(raw) > MAX_ENVELOPE_BYTES:
+                oversized = True
+                break
+    status, body = await gate.deliver(bytes(raw), oversized=oversized)
+    return web.json_response(body, status=status)
 
 
 async def _reset(request: web.Request) -> web.Response:

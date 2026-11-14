@@ -39,7 +39,7 @@ from curie_api.schemas.publications import (
 )
 from curie_api.schemas.workspaces import RepositoryCredentialOut
 
-from .. import factory_ci, factory_progress
+from .. import factory_ci, factory_progress, requester_instruction_context
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
@@ -519,6 +519,16 @@ async def create_publication(
             f"publication patch exceeds the {patch_limit_bytes}-byte limit",
         )
     traceparent = canonicalize_traceparent(request.headers.get(TRACEPARENT_STREAM_FIELD))
+    # ADR 0278 section 6: only the platform writes the requester annotation.
+    if requester_instruction_context.carries_annotation(data.body):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.requester_annotation_reserved",
+                "message": "a line starting with 'Requester preferences:' is written only "
+                "by the platform; remove it and publish again",
+            },
+        )
 
     if data.work_item_request_id is not None:
         work_item_request_id = data.work_item_request_id
@@ -627,6 +637,12 @@ async def create_publication(
                 body = f"{body.rstrip()}\n\n{marker}"
             if body != data.body:
                 data = data.model_copy(update={"body": body})
+        # Last, from the acknowledged execution record (ADR 0278 section 6), and
+        # before the publication contract is captured below.
+        digest = await requester_instruction_context.applied_digest(session, work_item_request_id)
+        if digest is not None:
+            annotated = requester_instruction_context.annotate(data.body or "", digest)
+            data = data.model_copy(update={"body": annotated})
 
     async def metadata_check() -> None:
         if patch:

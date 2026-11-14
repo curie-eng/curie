@@ -7,12 +7,12 @@ from datetime import datetime
 from typing import Any, Literal, Self
 
 from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, StrictBool, model_validator
 
 from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
 
-from .. import personal_execution, workitem_dispatch
+from .. import personal_execution, requester_instruction_context, workitem_dispatch
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import LivenessSessionDep, SessionDep
@@ -617,3 +617,39 @@ async def record_work_item_termination(
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, {"code": "not_found"})
     return workitem_dispatch.request_view(row)
+
+
+# Requester coding instructions (ADR 0278 section 3 and 6, #5592) -----------------
+
+
+@router.post("/requests/{request_id}/requester-context")
+async def read_requester_context(
+    request_id: uuid.UUID,
+    body: requester_instruction_context.ContextBody,
+    session: SessionDep,
+    response: Response,
+) -> dict[str, Any]:
+    """The running request's version 1 context envelope, for the current fence."""
+
+    response.headers["Cache-Control"] = "no-store"
+    result = await requester_instruction_context.read_envelope(
+        session, request_id, runtime_epoch=body.runtime_epoch
+    )
+    await session.rollback()
+    if isinstance(result, requester_instruction_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return result
+
+
+@router.post("/requests/{request_id}/requester-context/acknowledgment")
+async def acknowledge_requester_context(
+    request_id: uuid.UUID,
+    body: requester_instruction_context.AcknowledgmentBody,
+    session: SessionDep,
+) -> dict[str, Any]:
+    """Accept the relayed acknowledgment only for the current request and fence."""
+
+    result = await requester_instruction_context.accept_acknowledgment(session, request_id, body)
+    if isinstance(result, requester_instruction_context.Refused):
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return {"evidence": result}

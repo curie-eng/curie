@@ -343,8 +343,10 @@ class Settings(BaseSettings):
     factory_intake: Literal["poll", "webhook"] = "poll"
     # Personal GitHub labels use the linked requester and normal owner validation.
     factory_model_auth_mode: Literal["service", "personal"] = "service"
+    # ADR 0278 (#5592): the worker and runner deliver, validate and acknowledge
+    # the pinned document, so admission selects it by default.
     requester_coding_instructions_apply: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices("CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY"),
     )
     factory_base_label_settle_s: int = Field(default=60, ge=0)

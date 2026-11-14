@@ -195,6 +195,7 @@ api:
   FACTORY_ENABLED: factory.enabled
   FACTORY_INTAKE: factory.intake
   FACTORY_BASE_LABEL_SETTLE_S: factory.baseLabelSettleSeconds
+  CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY: factory.requesterCodingInstructions.apply
   GITHUB_API_URL: api.githubApiUrl
   GITHUB_APP_ID: api.githubAppId
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret

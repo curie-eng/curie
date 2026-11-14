@@ -39,6 +39,19 @@ class IssueReadResult(BaseModel):
     execution_seconds: int
 
 
+class ExecutionBindingOut(BaseModel):
+    """The execution a runner process is bound to (ADR 0278, #5592).
+
+    The runner checks the worker's requester context envelope against it, and
+    its presence tells the runner to wait for one before any model work.
+    """
+
+    tenant_id: uuid.UUID
+    work_item_id: uuid.UUID
+    execution_request_id: uuid.UUID
+    execution_fence: int
+
+
 class CompletionContractOut(BaseModel):
     """How the execution completes (ADR 0277, #5586): by a pull request
     (``implementation``) or by one delivered tracker result (``tracker_result``).
@@ -51,6 +64,7 @@ class CompletionContractOut(BaseModel):
     completion_contract: Literal["implementation", "tracker_result"]
     result_kinds: list[str]
     session_usd_allowance: float | None
+    execution: ExecutionBindingOut | None = None
 
 
 class TrackerResultSubmission(BaseModel):
