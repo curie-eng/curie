@@ -274,6 +274,25 @@ def test_delivery_before_bind_is_not_expected_and_after_bind_is_applied() -> Non
         )
         assert unbound.outcome is None
 
+        # An envelope posted while the start is still in its preflight waits
+        # for the binding, by default far longer than the start waits for it.
+        assert rc.BIND_DEADLINE_SECONDS > rc.DELIVERY_DEADLINE_SECONDS
+        early = RequesterContextGate()
+        posted = anyio.Event()
+        answers: list[tuple[int, dict[str, Any]]] = []
+
+        async def post() -> None:
+            posted.set()
+            answers.append(await early.deliver(VALID))
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(post)
+            await posted.wait()
+            await anyio.wait_all_tasks_blocked()
+            assert answers == []
+            early.bind(BINDING)
+        assert answers == [(200, {"acknowledgment": _ack("applied", sha256=DIGEST)})]
+
         bound = RequesterContextGate()
         bound.bind(BINDING)
         assert await bound.deliver(VALID, bind_deadline_s=0.05) == (
@@ -336,8 +355,12 @@ def test_wait_without_delivery_is_missing_envelope() -> None:
         started = time.monotonic()
         assert await gate.wait(deadline_s=0.05) == Failed("missing_envelope")
         assert time.monotonic() - started < 5
-        # A late envelope cannot replace the decided outcome.
-        assert await gate.deliver(VALID) == (409, {"error": "requester_context_already_delivered"})
+        # A late envelope cannot replace the decided outcome; it learns the
+        # reason, so the request fails with it.
+        assert await gate.deliver(VALID) == (
+            200,
+            {"acknowledgment": _ack("failed"), "reason": "missing_envelope"},
+        )
         assert gate.outcome == Failed("missing_envelope")
 
         control = RequesterContextGate()
@@ -1030,3 +1053,118 @@ def test_a_failed_boot_sends_zero_model_requests(
     assert bodies == []
     assert other == []
     assert final.text == BLOCKED_EXPLANATION
+
+
+# --- Reuse: one runner process, one execution, one selection ---------------------
+
+
+def _snapshot(system_prompt: str) -> dict[str, Any]:
+    """The prompt the bundled CLI records and would restore (see test_history.py)."""
+
+    return {
+        "type": "attachment",
+        "uuid": "snapshot-1",
+        "timestamp": "1970-01-01T00:00:00.000Z",
+        "attachment": {
+            "type": "prompt_snapshot",
+            "systemPrompt": [system_prompt],
+            "reminderFold": False,
+        },
+    }
+
+
+_PRIOR = (
+    ConversationMessage(role="user", content="start the work"),
+    ConversationMessage(role="assistant", content=[{"type": "text", "text": "started"}]),
+)
+_PRIOR_ENTRIES = (
+    {
+        "type": "user",
+        "uuid": "entry-1",
+        "timestamp": "1970-01-01T00:00:00.000Z",
+        "message": {"role": "user", "content": "start the work"},
+    },
+    {
+        "type": "assistant",
+        "uuid": "entry-2",
+        "timestamp": "1970-01-01T00:00:00.000Z",
+        "message": {"role": "assistant", "content": _PRIOR[1].content},
+    },
+)
+
+
+def _prompt_for(selection_id: str | None) -> str:
+    prompt = _compose_system_prompt(
+        "You implement factory tickets.",
+        None,
+        model=None,
+        requester_preamble=(
+            requester_section(selection_id, DIGEST, TEXT) if selection_id is not None else None
+        ),
+    )
+    assert prompt is not None
+    return prompt
+
+
+@pytest.mark.parametrize(
+    ("recorded", "restored"),
+    [
+        # The control: the same selection's checkpoint is restored.
+        (WORK_ITEM, True),
+        # Another WorkItem's selection of the very same text: identity, not text.
+        (OTHER_ID, False),
+        # A checkpoint recorded with no selection under a selected boot.
+        (None, False),
+    ],
+)
+def test_a_checkpoint_is_restored_only_under_its_own_selection(
+    tmp_path: Path, recorded: str | None, restored: bool
+) -> None:
+    checkpoint = HarnessReplayState(
+        harness="claude",
+        kind="checkpoint",
+        entries=(*_PRIOR_ENTRIES, _snapshot(_prompt_for(recorded))),
+    )
+
+    resume = build_structured_resume(
+        _PRIOR,
+        curie_session_id="curie-thread-requester",
+        cwd=str(tmp_path),
+        harness_replay=checkpoint,
+        system_prompt=_prompt_for(WORK_ITEM),
+    )
+
+    assert resume.session_store is not None
+    entries = anyio.run(resume.session_store.load, resume.session_key)
+    assert entries is not None
+    assert (entries == list(checkpoint.entries)) is restored
+    if not restored:
+        # The portable conversation is replayed under this boot's own prompt.
+        assert [entry["message"] for entry in entries] == [m.to_dict() for m in _PRIOR]
+
+
+def test_a_decided_runner_never_serves_a_second_execution_its_section() -> None:
+    # A runner process is bound to the one execution its completion contract
+    # names. Another request's envelope on the same process is refused, so that
+    # request fails before model work and never runs under this section.
+    gate = _applied_gate()
+    other = _raw(_envelope(execution_request_id=OTHER_ID))
+
+    status, body = anyio.run(gate.deliver, other)
+
+    assert status == 409 and body == {"error": "requester_context_already_delivered"}
+    assert gate.applied is not None and gate.applied.selection_id == WORK_ITEM
+    # The control: the same execution's identical bytes are acknowledged again.
+    assert anyio.run(gate.deliver, VALID)[0] == 200
+    # A fresh process for the other execution applies its own selection.
+    fresh = RequesterContextGate()
+    fresh.bind(
+        ExecutionBinding(
+            tenant_id=TENANT,
+            work_item_id=WORK_ITEM,
+            execution_request_id=OTHER_ID,
+            execution_fence=FENCE,
+        )
+    )
+    assert anyio.run(fresh.deliver, other)[0] == 200
+    assert fresh.applied is not None

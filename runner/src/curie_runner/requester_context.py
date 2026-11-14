@@ -51,6 +51,11 @@ CONTEXT_PATH = "/v1/requester-context"
 MAX_ENVELOPE_BYTES = 131_072
 # How long a bound implementation start waits for the worker's envelope.
 DELIVERY_DEADLINE_SECONDS = 120.0
+# How long a posted envelope waits for the start to bind its execution. The
+# start may still be in its verification preflight, which can take minutes;
+# it always binds (to nothing on failure), so this bounds only a start that
+# never finishes. Matches the worker's own delivery timeout.
+BIND_DEADLINE_SECONDS = 900.0
 
 OPEN_PREFIX = "<<<curie-requester-preferences"
 CLOSE_PREFIX = "<<<end-curie-requester-preferences"
@@ -247,7 +252,7 @@ class RequesterContextGate:
         raw: bytes,
         *,
         oversized: bool = False,
-        bind_deadline_s: float = DELIVERY_DEADLINE_SECONDS,
+        bind_deadline_s: float = BIND_DEADLINE_SECONDS,
     ) -> tuple[int, dict[str, Any]]:
         """Decide one posted envelope: ``(HTTP status, body)``.
 
@@ -261,6 +266,10 @@ class RequesterContextGate:
             return 409, {"error": "requester_context_not_expected"}
         if self._outcome is not None:
             if raw == self._raw and not oversized:
+                return 200, acknowledgment(binding, self._outcome)
+            if self._raw is None:
+                # The start already gave up waiting (missing_envelope): a late
+                # envelope learns that reason, and the request fails with it.
                 return 200, acknowledgment(binding, self._outcome)
             return 409, {"error": "requester_context_already_delivered"}
         try:
