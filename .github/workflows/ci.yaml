@@ -3654,10 +3654,12 @@ jobs:
           set -euo pipefail
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           df -h /
-      - name: Load the four images built by the ci-images job
+      - name: Load the images built by the ci-images job
         uses: ./.github/actions/load-ci-images
         with:
-          images: "{api,worker,ui,runner}"
+          # The dispatcher image runs the channel gateway the triage-to-pr
+          # scenario posts its Slack lines through.
+          images: "{api,worker,ui,runner,dispatcher}"
       - name: Tag the images for the factory driver
         run: |
           set -euo pipefail
@@ -3665,6 +3667,7 @@ jobs:
           docker tag curie-ci/worker:candidate curie-worker:local
           docker tag curie-ci/ui:candidate curie-ui:local
           docker tag curie-ci/runner:candidate curie-runner:latest
+          docker tag curie-ci/dispatcher:candidate curie-dispatcher:local
       - name: Run the scripted factory scenario
         if: matrix.suite == 'scenario'
         env:

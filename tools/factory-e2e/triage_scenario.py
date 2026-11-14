@@ -15,6 +15,8 @@ import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+import factory_e2e as fe
+
 TRIAGE_LABEL = "triage"
 # The dark factory agent of the existing scenario serves the configured
 # tracker label; the triage declaration names it as its implementation label.
@@ -31,6 +33,10 @@ REFUSED_LABELLER = {"id": 6603, "login": "triager", "type": "User"}
 REFUSAL_REASON = "authority_revoked"
 INTAKE_NOTICE_PREFIX = "curie-factory-intake-"
 EVIDENCE_NAME = "scripted-triage-to-pr.json"
+# The success terminus factory_e2e's issue-to-pull-request judges require of
+# an execution request, and the check conclusions they count as green.
+IMPLEMENTATION_SUCCESS_STATUS = "completed"
+GREEN_CHECK_CONCLUSIONS = fe.FIRST_HEAD_GREEN
 
 
 class TriageAssertionError(AssertionError):
@@ -192,8 +198,14 @@ def assert_implementation_terminus(
     pulls: Sequence[Mapping[str, Any]],
     final_comments: Sequence[Mapping[str, Any]],
     output_number: int,
+    checks_by_head: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> Mapping[str, Any]:
-    """Point 6: fresh bounds, then the normal pull request and check terminus."""
+    """Point 6: fresh bounds, then the normal pull request and check terminus.
+
+    ``checks_by_head`` maps a head commit to the check runs the code host
+    reports on it. The pull request's head must carry at least one, and every
+    one must have completed green.
+    """
 
     # Both timestamps come from one json_build_object, so they share one
     # ISO 8601 rendering and compare as strings.
@@ -210,6 +222,21 @@ def assert_implementation_terminus(
     _require(len(closing) == 1, f"expected one pull request for the output, found {len(closing)}")
     _require(len(final_comments) == 1, "expected one final comment on the output")
     _require(closing[0]["html_url"] in final_comments[0]["body"], "final comment omits the PR")
+    status = request.get("status")
+    _require(
+        status == IMPLEMENTATION_SUCCESS_STATUS,
+        f"the implementation request ended {status!r}, expected {IMPLEMENTATION_SUCCESS_STATUS!r}",
+    )
+    head = str((closing[0].get("head") or {}).get("sha") or "")
+    _require(bool(head), "the pull request has no head commit")
+    checks = [c for c in checks_by_head.get(head, []) if c.get("head_sha") == head]
+    _require(bool(checks), "the pull request head has no check runs")
+    red = sorted(
+        str(c.get("name"))
+        for c in checks
+        if c.get("status") != "completed" or c.get("conclusion") not in GREEN_CHECK_CONCLUSIONS
+    )
+    _require(not red, f"pull request checks did not pass: {red}")
     return closing[0]
 
 

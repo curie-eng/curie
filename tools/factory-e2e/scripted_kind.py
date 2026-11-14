@@ -41,6 +41,14 @@ FIXTURE = REPO_ROOT / "tools/factory-e2e/fixtures/unitconv"
 ISSUE = REPO_ROOT / "tools/factory-e2e/fixtures/unitconv-issue.md"
 TRANSCRIPT = REPO_ROOT / "tools/model-script/transcripts/unitconv-issue.json"
 IMAGES = ("curie-api:local", "curie-worker:local", "curie-ui:local", "curie-runner:latest")
+# The chart runs its channel gateway on the dispatcher image, which
+# install_values names curie-dispatcher:local. A run that enables the gateway
+# builds and imports it beside the other candidates.
+GATEWAY_COMPONENT = "dispatcher"
+GATEWAY_IMAGE = f"curie-{GATEWAY_COMPONENT}:local"
+# The tracker intake poll interval of this install. The triage replay derives
+# its quiet window from it.
+TRACKER_POLL_SECONDS = 5
 BOUND_SECONDS = 2400
 RECORD_BUDGET_USD = 20
 RECORD_REQUEST_RESERVE_USD = 2.0
@@ -126,7 +134,7 @@ def scripted_values(
     for entry in (*values["factory"]["codeHosts"], *values["factory"]["trackers"]):
         entry["apiUrl"] = github_api
         entry["host"] = urlsplit(github_api).netloc
-    values["factory"]["trackers"][0]["pollIntervalSeconds"] = 5
+    values["factory"]["trackers"][0]["pollIntervalSeconds"] = TRACKER_POLL_SECONDS
     values["codeHostTrust"] = {
         "caBundle": {"configMapRef": {"name": ca_configmap, "key": "ca.pem"}}
     }
@@ -332,11 +340,16 @@ def registry_bind_rejected(detail: str) -> bool:
 class ScriptedRun:
     """One private cluster, registry, fixture server and model endpoint."""
 
+    # The triage-to-pr scenario and the channel gateway it posts through. A
+    # subclass that drives its own scenario on this install turns both off.
+    TRIAGE_TO_PR = True
+    tracker_poll_seconds = TRACKER_POLL_SECONDS
+
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.run_id = uuid.uuid4().hex[:8]
         self.image_refs = (
-            IMAGES
+            IMAGES + ((GATEWAY_IMAGE,) if self.gateway_enabled() else ())
             if args.scenario != "facts"
             else tuple(
                 f"curie-{component}:facts-{self.run_id}" for component in ("api", "worker", "ui")
@@ -395,6 +408,15 @@ class ScriptedRun:
         # Set when teardown begins; a request still waiting on either lock is
         # then refused, since cleanup would never measure the credit it spends.
         self.recording_closed = False
+
+    def gateway_enabled(self) -> bool:
+        """Whether this run deploys the channel gateway for the triage scenario.
+
+        Recording captures only the issue-to-pull-request transcript, and the
+        facts scenario posts nothing to Slack, so neither runs the gateway.
+        """
+
+        return self.TRIAGE_TO_PR and self.args.scenario != "facts" and not self.args.record
 
     def check_disk(self, stage: str, *, required_bytes: int = 30 * 1024**3) -> None:
         free = shutil.disk_usage("/").free
@@ -602,7 +624,10 @@ class ScriptedRun:
         if self.args.record:
             self.prepare_recording()
         if self.args.build_images:
-            for component in ("api", "worker", "ui"):
+            components = ["api", "worker", "ui"]
+            if self.gateway_enabled():
+                components.append(GATEWAY_COMPONENT)
+            for component in components:
                 self.check_disk(f"building {component}")
                 self.command(
                     "docker",
@@ -725,7 +750,7 @@ class ScriptedRun:
             )
             if self.args.record:
                 self.count_recording_requests(model)
-            else:
+            elif self.gateway_enabled():
                 # Recording captures the issue-to-pull-request transcript only;
                 # triage lanes are scripted and need no provider.
                 self.router = triage_run.build_router(model)
