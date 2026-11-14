@@ -147,7 +147,8 @@ def test_candidate_window_raises_the_floor_to_0171() -> None:
     stay below this floor. Owner coding profiles and tenant policies require
     0165, which stays below this floor. Slack kickoff thread origin reads
     require 0166, which stays below this floor. Execution request reads select
-    the 0167 completion contract columns. Intake notice storage requires 0168. Triage handoff storage requires 0171.
+    the 0167 completion contract columns. Intake notice storage requires 0168.
+    Triage handoff storage requires 0171.
     """
     window = shared().load_metadata().window
     assert window.schema_min == "0171"
