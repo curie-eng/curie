@@ -5561,12 +5561,13 @@ class PublicationCandidateInstallation(Base):
 class PublicationCandidateOutcome(Base):
     __tablename__ = "publication_candidate_outcomes"
     __table_args__ = (
-        CheckConstraint("char_length(code) BETWEEN 1 AND 128",
-                        name="publication_candidate_outcome_code_ck"),
+        CheckConstraint(
+            "char_length(code) BETWEEN 1 AND 128", name="publication_candidate_outcome_code_ck"
+        ),
     )
 
     work_item_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="RESTRICT"), primary_key=True
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"), primary_key=True
     )
     code: Mapped[str] = mapped_column(String(128))
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -5605,16 +5606,24 @@ class PublicationCandidate(Base):
     __tablename__ = "publication_candidates"
     __table_args__ = (
         UniqueConstraint("work_item_id", "id", name="publication_candidate_group_id_key"),
-        UniqueConstraint("origin_request_id", "idempotency_key",
-                         name="publication_candidate_idempotency_key"),
-        CheckConstraint("status IN ('staging', 'complete', 'tombstoned')",
-                        name="publication_candidate_status_ck"),
-        CheckConstraint("runtime_epoch >= 1 AND dispatch_generation >= 1 AND version >= 1",
-                        name="publication_candidate_authority_ck"),
-        CheckConstraint("char_length(idempotency_key) BETWEEN 1 AND 256",
-                        name="publication_candidate_idempotency_length_ck"),
-        CheckConstraint("content_sha256 ~ '^[0-9a-f]{64}$'",
-                        name="publication_candidate_digest_ck"),
+        UniqueConstraint(
+            "origin_request_id", "idempotency_key", name="publication_candidate_idempotency_key"
+        ),
+        CheckConstraint(
+            "status IN ('staging', 'complete', 'tombstoned')",
+            name="publication_candidate_status_ck",
+        ),
+        CheckConstraint(
+            "runtime_epoch >= 1 AND dispatch_generation >= 1 AND version >= 1",
+            name="publication_candidate_authority_ck",
+        ),
+        CheckConstraint(
+            "char_length(idempotency_key) BETWEEN 1 AND 256",
+            name="publication_candidate_idempotency_length_ck",
+        ),
+        CheckConstraint(
+            "content_sha256 ~ '^[0-9a-f]{64}$'", name="publication_candidate_digest_ck"
+        ),
         CheckConstraint(
             "char_length(title) <= 256 AND char_length(body) <= 65536 AND "
             "CASE WHEN jsonb_typeof(changed_paths) = 'array' "
@@ -5631,8 +5640,12 @@ class PublicationCandidate(Base):
             "(previous_owner_request_id IS NULL) = (owner_transferred_at IS NULL)",
             name="publication_candidate_transfer_ck",
         ),
-        Index("publication_candidate_one_staging", "work_item_id", unique=True,
-              postgresql_where=text("status = 'staging'")),
+        Index(
+            "publication_candidate_one_staging",
+            "work_item_id",
+            unique=True,
+            postgresql_where=text("status = 'staging'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -5672,28 +5685,44 @@ class PublicationCandidateObject(Base):
     __table_args__ = (
         ForeignKeyConstraint(
             ["work_item_id", "candidate_id"],
-            [f"{SCHEMA}.publication_candidates.work_item_id",
-             f"{SCHEMA}.publication_candidates.id"],
-            name="publication_candidate_object_candidate_fkey", ondelete="RESTRICT",
+            [
+                f"{SCHEMA}.publication_candidates.work_item_id",
+                f"{SCHEMA}.publication_candidates.id",
+            ],
+            name="publication_candidate_object_candidate_fkey",
+            ondelete="RESTRICT",
         ),
-        CheckConstraint("kind IN ('base', 'patch') AND "
-                        "((kind = 'base') = (candidate_id IS NULL))",
-                        name="publication_candidate_object_kind_ck"),
-        CheckConstraint("size_bytes >= 0 AND sha256 ~ '^[0-9a-f]{64}$'",
-                        name="publication_candidate_object_descriptor_ck"),
-        CheckConstraint("key LIKE 'publication-candidates/%'",
-                        name="publication_candidate_object_key_ck"),
-        CheckConstraint("status IN ('staging', 'complete', 'tombstoned', 'claimed')",
-                        name="publication_candidate_object_status_ck"),
-        CheckConstraint("version >= 0 AND ((status = 'claimed' AND claim_id IS NOT NULL "
-                        "AND collector_id IS NOT NULL AND claimed_until IS NOT NULL) OR "
-                        "(status <> 'claimed' AND claim_id IS NULL AND collector_id IS NULL "
-                        "AND claimed_until IS NULL))",
-                        name="publication_candidate_object_claim_ck"),
-        UniqueConstraint("candidate_id", "kind",
-                         name="publication_candidate_object_candidate_kind_key"),
-        Index("publication_candidate_object_one_base", "work_item_id", unique=True,
-              postgresql_where=text("kind = 'base'")),
+        CheckConstraint(
+            "kind IN ('base', 'patch') AND ((kind = 'base') = (candidate_id IS NULL))",
+            name="publication_candidate_object_kind_ck",
+        ),
+        CheckConstraint(
+            "size_bytes >= 0 AND sha256 ~ '^[0-9a-f]{64}$'",
+            name="publication_candidate_object_descriptor_ck",
+        ),
+        CheckConstraint(
+            "key LIKE 'publication-candidates/%'", name="publication_candidate_object_key_ck"
+        ),
+        CheckConstraint(
+            "status IN ('staging', 'complete', 'tombstoned', 'claimed')",
+            name="publication_candidate_object_status_ck",
+        ),
+        CheckConstraint(
+            "version >= 0 AND ((status = 'claimed' AND claim_id IS NOT NULL "
+            "AND collector_id IS NOT NULL AND claimed_until IS NOT NULL) OR "
+            "(status <> 'claimed' AND claim_id IS NULL AND collector_id IS NULL "
+            "AND claimed_until IS NULL))",
+            name="publication_candidate_object_claim_ck",
+        ),
+        UniqueConstraint(
+            "candidate_id", "kind", name="publication_candidate_object_candidate_kind_key"
+        ),
+        Index(
+            "publication_candidate_object_one_base",
+            "work_item_id",
+            unique=True,
+            postgresql_where=text("kind = 'base'"),
+        ),
         Index("publication_candidate_object_group", "work_item_id"),
     )
 
@@ -5719,12 +5748,19 @@ class PublicationCandidateReader(Base):
     __table_args__ = (
         ForeignKeyConstraint(
             ["work_item_id", "candidate_id"],
-            [f"{SCHEMA}.publication_candidates.work_item_id",
-             f"{SCHEMA}.publication_candidates.id"],
-            name="publication_candidate_reader_candidate_fkey", ondelete="RESTRICT",
+            [
+                f"{SCHEMA}.publication_candidates.work_item_id",
+                f"{SCHEMA}.publication_candidates.id",
+            ],
+            name="publication_candidate_reader_candidate_fkey",
+            ondelete="RESTRICT",
         ),
-        UniqueConstraint("work_item_id", "candidate_id", "holder_id",
-                         name="publication_candidate_reader_holder_key"),
+        UniqueConstraint(
+            "work_item_id",
+            "candidate_id",
+            "holder_id",
+            name="publication_candidate_reader_holder_key",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

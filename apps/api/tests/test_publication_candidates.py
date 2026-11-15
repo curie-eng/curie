@@ -16,7 +16,9 @@ import pytest
 from _migration_support import sql_dicts
 from curie_api import publication_candidates as ledger
 from curie_api.config import Settings, get_settings
+from curie_api.models import PublicationCandidate
 from pydantic import ValidationError
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 ROOT = "/v1/internal/publication-candidates"
@@ -168,16 +170,22 @@ def _seed(agent_id: str | None = None) -> dict[str, Any]:
     return _request(_work_item(agent_id))
 
 
-def _terminate(source: dict[str, Any], seconds_ago: int = 0) -> datetime:
-    """Give a running request its final disposition ``seconds_ago`` on the database clock."""
+TERMINATE = (
+    "UPDATE curie.execution_requests SET status = 'completed', terminal_cause = 'completed', "
+    "terminal_at = clock_timestamp() - CAST(:ago AS integer) * interval '1 second' "
+    "WHERE id = :id AND terminal_at IS NULL RETURNING terminal_at"
+)
 
-    _sql(
-        "UPDATE curie.execution_requests SET status = 'completed', terminal_cause = 'completed', "
-        "terminal_at = clock_timestamp() - CAST(:ago AS integer) * interval '1 second' "
-        "WHERE id = :id",
-        id=uuid.UUID(source["request_id"]),
-        ago=seconds_ago,
-    )
+
+def _terminate(source: dict[str, Any], seconds_ago: int = 0) -> datetime:
+    """Give a pending request its final disposition ``seconds_ago`` on the database clock.
+
+    Set once, backdated, before any read could fix an expiry from it: a
+    request's ``terminal_at`` is never rewritten afterwards.
+    """
+
+    rows = _sql(TERMINATE, id=uuid.UUID(source["request_id"]), ago=seconds_ago)
+    assert len(rows) == 1, "a request's terminal_at is set exactly once"
     return _terminal_at(source)
 
 
@@ -188,6 +196,20 @@ def _terminal_at(source: dict[str, Any]) -> datetime:
     )[0]["terminal_at"]
     assert isinstance(value, datetime)
     return value
+
+
+def _expiry(reservation: dict[str, Any]) -> dict[str, Any]:
+    """The candidate's expiry, checked against its owner on the database clock."""
+
+    [row] = _sql(
+        "SELECT c.expires_at, "
+        "c.expires_at = r.terminal_at + interval '86400 seconds' AS exact, "
+        "c.expires_at <= clock_timestamp() AS past "
+        "FROM curie.publication_candidates c "
+        "JOIN curie.execution_requests r ON r.id = c.owner_request_id WHERE c.id = :id",
+        id=uuid.UUID(reservation["candidate_id"]),
+    )
+    return row
 
 
 def _authority(source: dict[str, Any]) -> dict[str, Any]:
@@ -240,7 +262,11 @@ def _reserved(client: Any, source: dict[str, Any], **kwargs: Any) -> dict[str, A
     body = _reserve_body(source, **kwargs)
     result = _ok(_post(client, "reserve", body))
     assert set(result) == {
-        "candidate_id", "objects", "capture_deadline", "staging_expires_at", "replayed"
+        "candidate_id",
+        "objects",
+        "capture_deadline",
+        "staging_expires_at",
+        "replayed",
     }
     assert result["replayed"] is False
     expected = {obj["kind"]: obj for obj in body["objects"]}
@@ -295,9 +321,13 @@ def _reader(
 
 
 def _release(client: Any, reader: dict[str, Any]) -> None:
-    _ok(_post(client, "release-reader", {
-        "lease_id": reader["lease_id"], "holder_id": reader["holder_id"]
-    }))
+    _ok(
+        _post(
+            client,
+            "release-reader",
+            {"lease_id": reader["lease_id"], "holder_id": reader["holder_id"]},
+        )
+    )
 
 
 def _readable(client: Any, source: dict[str, Any], reservation: dict[str, Any]) -> None:
@@ -313,12 +343,16 @@ def _claims(client: Any, collector: str = "fixture-collector") -> list[dict[str,
 
 
 def _finalize(client: Any, claim: dict[str, Any], collector: str = "fixture-collector") -> Any:
-    return _post(client, "finalize-collection", {
-        "collector_id": collector,
-        "object_id": claim["object_id"],
-        "claim_id": claim["claim_id"],
-        "version": claim["version"],
-    })
+    return _post(
+        client,
+        "finalize-collection",
+        {
+            "collector_id": collector,
+            "object_id": claim["object_id"],
+            "claim_id": claim["claim_id"],
+            "version": claim["version"],
+        },
+    )
 
 
 def _drain(client: Any) -> None:
@@ -428,7 +462,9 @@ def test_candidate_routes_require_the_worker_token(
     before = _snapshot()
     for operation in OPERATIONS:
         for headers in (
-            {}, {"X-Curie-Worker-Token": "wrong-token"}, auth_headers,
+            {},
+            {"X-Curie-Worker-Token": "wrong-token"},
+            auth_headers,
             {"X-Curie-Worker-Token": get_settings().api_key},
         ):
             response = client.post(f"{ROOT}/{operation}", json=body, headers=headers)
@@ -437,7 +473,9 @@ def test_candidate_routes_require_the_worker_token(
     assert _outcome(source) is None
     # Liveness: the worker token opens the capture context.
     assert _ok(_post(client, "context", _authority(source))) == {
-        "repository": REPOSITORY, "base_commit": BASE, "target_branch": "main",
+        "repository": REPOSITORY,
+        "base_commit": BASE,
+        "target_branch": "main",
     }
 
 
@@ -479,7 +517,8 @@ def test_reserve_complete_and_replay_answer_one_candidate(candidates: None, clie
     assert after == {**first, "replayed": True}
     _refused(
         _post(client, "reserve", {**body, "title": "A different title"}),
-        409, "idempotency_conflict",
+        409,
+        "idempotency_conflict",
     )
     assert _count("publication_candidates") == 1
     row = _candidate(first)
@@ -489,9 +528,19 @@ def test_reserve_complete_and_replay_answer_one_candidate(candidates: None, clie
 
     # A writer never withdraws an acknowledged candidate.
     before = _snapshot()
-    _refused(_post(client, "fail", {
-        **_authority(source), "candidate_id": first["candidate_id"], "reason": "upload_failed"
-    }), 409, "candidate_state")
+    _refused(
+        _post(
+            client,
+            "fail",
+            {
+                **_authority(source),
+                "candidate_id": first["candidate_id"],
+                "reason": "upload_failed",
+            },
+        ),
+        409,
+        "candidate_state",
+    )
     assert _snapshot() == before
     _readable(client, source, first)
 
@@ -500,19 +549,76 @@ def test_fail_withdraws_only_a_staging_candidate(candidates: None, client: Any) 
     source = _seed()
     staging = _reserved(client, source)
     failure = {
-        **_authority(source), "candidate_id": staging["candidate_id"], "reason": "upload_failed"
+        **_authority(source),
+        "candidate_id": staging["candidate_id"],
+        "reason": "upload_failed",
     }
     assert _ok(_post(client, "fail", failure)) == {
-        "candidate_id": staging["candidate_id"], "status": "tombstoned"
+        "candidate_id": staging["candidate_id"],
+        "status": "tombstoned",
     }
     assert _ok(_post(client, "fail", failure))["status"] == "tombstoned"
     assert _outcome(source) == "upload_failed"
-    _refused(_post(client, "complete", _completion(source, staging)), 409,
-             "capture_deadline_or_state")
+    _refused(
+        _post(client, "complete", _completion(source, staging)), 409, "capture_deadline_or_state"
+    )
     _drain(client)
     assert _count("publication_candidate_groups") == 0
     # Liveness: a fresh capture of the same WorkItem starts a new group.
     _completed(client, source)
+
+
+def test_replay_without_the_base_declaration_answers_the_same_candidate(
+    candidates: None, client: Any
+) -> None:
+    source = _seed()
+    without_base = _reserve_body(source, key="base-later", base=False)
+    before = _snapshot()
+    _refused(_post(client, "reserve", without_base), 409, "base_required")
+    assert _snapshot() == before
+    assert _outcome(source) is None
+    with_base = _reserve_body(source, key="base-later")
+    first = _ok(_post(client, "reserve", with_base))
+    assert first["replayed"] is False
+    assert sorted(obj["kind"] for obj in first["objects"]) == ["base", "patch"]
+    _ok(_post(client, "complete", _completion(source, first)))
+    for body in (without_base, with_base):
+        replay = _ok(_post(client, "reserve", body))
+        assert replay == {**first, "replayed": True}
+    assert _count("publication_candidates") == 1
+    # The rest of the content still binds the identity.
+    changed = {**without_base, "objects": [_descriptor("patch", 31, "base-later")]}
+    before = _snapshot()
+    _refused(_post(client, "reserve", changed), 409, "idempotency_conflict")
+    assert _snapshot() == before
+
+
+def test_outcome_needs_only_the_capture_identity(candidates: None, client: Any) -> None:
+    source = _seed()
+    _sql(
+        "UPDATE curie.execution_requests SET "
+        "runtime_heartbeat_expires_at = clock_timestamp() - interval '1 minute' WHERE id = :id",
+        id=uuid.UUID(source["request_id"]),
+    )
+    # The capture is no longer live, so it cannot start ...
+    _refused(_post(client, "context", _authority(source)), 409, "expired_source")
+    # ... but it still records why it ended.
+    outcome = {**_authority(source), "reason": "capture_timeout"}
+    assert _ok(_post(client, "outcome", outcome)) == {"recorded": True}
+    assert _outcome(source) == "capture_timeout"
+    _terminate(source)
+    assert _ok(_post(client, "outcome", {**outcome, "reason": "capture_failed"})) == {
+        "recorded": True
+    }
+    assert _outcome(source) == "capture_failed"
+    # Identity still binds: another epoch, generation or request records nothing.
+    for invalid in (
+        {**outcome, "runtime_epoch": 2},
+        {**outcome, "dispatch_generation": 1},
+        {**outcome, "request_id": str(uuid.uuid4())},
+    ):
+        _refused(_post(client, "outcome", invalid), 409, "source_identity")
+        assert _outcome(source) == "capture_failed"
 
 
 def test_expiry_is_fixed_exactly_from_the_owner_final_disposition(
@@ -540,6 +646,8 @@ def test_expiry_is_fixed_exactly_from_the_owner_final_disposition(
     reader = _reader(client, source, reservation)
     fixed = _candidate(reservation)["expires_at"]
     assert fixed == terminal_at + RETENTION
+    check = _expiry(reservation)
+    assert check["exact"] is True and check["past"] is False
     listed = _listing(client, auth_headers, source)["candidates"][0]
     assert _date(listed["expires_at"]) == terminal_at + RETENTION
     assert _date(listed["final_disposition_at"]) == terminal_at
@@ -556,7 +664,8 @@ def test_expiry_is_fixed_exactly_from_the_owner_final_disposition(
     before_version = _candidate(expired)["version"]
     _refused(
         _post(client, "acquire-reader", _reader_body(expired_source, expired)),
-        409, "candidate_unavailable",
+        409,
+        "candidate_unavailable",
     )
     row = _candidate(expired)
     assert row["version"] == before_version and row["expires_at"] is None, (
@@ -566,6 +675,16 @@ def test_expiry_is_fixed_exactly_from_the_owner_final_disposition(
     row = _candidate(expired)
     assert row["expires_at"] == terminal_at + RETENTION
     assert row["status"] == "tombstoned"
+    check = _expiry(expired)
+    assert check["exact"] is True and check["past"] is True
+    # A second read of either kind leaves the fixed expiry where it is.
+    _refused(
+        _post(client, "acquire-reader", _reader_body(expired_source, expired)),
+        409,
+        "candidate_unavailable",
+    )
+    assert _claims(client) == claims
+    assert _expiry(expired) == check
     patch_key = next(obj["key"] for obj in expired["objects"] if obj["kind"] == "patch")
     assert [claim["key"] for claim in claims] == [patch_key]
     listed = _listing(client, auth_headers, expired_source)["candidates"][0]
@@ -575,7 +694,7 @@ def test_expiry_is_fixed_exactly_from_the_owner_final_disposition(
     _readable(client, source, reservation)
 
 
-def test_transfer_keeps_a_candidate_past_its_origin_expiry(
+def test_transfer_clears_expiry_and_fixes_it_from_the_successor(
     candidates: None, client: Any, auth_headers: Any
 ) -> None:
     origin = _seed()
@@ -590,10 +709,6 @@ def test_transfer_keeps_a_candidate_past_its_origin_expiry(
     assert row["owner_transferred_at"] is not None
     assert row["expires_at"] is None
 
-    _sql(
-        "UPDATE curie.execution_requests SET terminal_at = clock_timestamp() - "
-        "interval '86401 seconds' WHERE id = :id", id=uuid.UUID(origin["request_id"]),
-    )
     _readable(client, origin, reservation)
     assert _claims(client) == []
     row = _candidate(reservation)
@@ -609,6 +724,74 @@ def test_transfer_keeps_a_candidate_past_its_origin_expiry(
     terminal_at = _terminate(successor, seconds_ago=10)
     _readable(client, origin, reservation)
     assert _candidate(reservation)["expires_at"] == terminal_at + RETENTION
+    check = _expiry(reservation)
+    assert check["exact"] is True and check["past"] is False
+    _readable(client, origin, reservation)
+    assert _expiry(reservation) == check
+
+
+def test_transfer_keeps_a_candidate_past_its_origin_expiry(
+    candidates: None, client: Any, auth_headers: Any
+) -> None:
+    """A stale owner observation never fixes an expiry from the previous owner."""
+
+    origin = _seed()
+    reservation = _completed(client, origin)
+    successor = _request(origin, "queued")
+    candidate_id = uuid.UUID(reservation["candidate_id"])
+    origin_id = uuid.UUID(origin["request_id"])
+    age = 3 * 86400
+
+    async def stale_fix() -> tuple[Any, Any]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with (
+                AsyncSession(engine, expire_on_commit=False) as stale,
+                AsyncSession(engine, expire_on_commit=False) as other,
+            ):
+                # The stale reader observes the origin as owner, then the
+                # candidate moves to the pending successor and the origin turns
+                # terminal far past its retention window, before it acts.
+                row = await stale.get(PublicationCandidate, candidate_id)
+                assert row is not None and row.owner_request_id == origin_id
+                moved = await ledger.transfer_ownership(
+                    other,
+                    work_item_id=uuid.UUID(origin["work_item_id"]),
+                    candidate_id=candidate_id,
+                    to_request_id=uuid.UUID(successor["request_id"]),
+                )
+                assert moved.expires_at is None
+                assert (
+                    await other.execute(text(TERMINATE), {"id": origin_id, "ago": age})
+                ).one_or_none() is not None
+                await other.commit()
+                await ledger._fix_expiry(stale, row)
+                await stale.commit()
+                return row.owner_request_id, row.expires_at
+        finally:
+            await engine.dispose()
+
+    owner, expires_at = asyncio.run(stale_fix())
+    assert owner == uuid.UUID(successor["request_id"]) and expires_at is None
+    assert _sql(
+        "SELECT terminal_at + interval '86400 seconds' <= clock_timestamp() AS past "
+        "FROM curie.execution_requests WHERE id = :id",
+        id=origin_id,
+    ) == [{"past": True}]
+
+    assert _claims(client) == []
+    row = _candidate(reservation)
+    assert row["status"] == "complete" and row["expires_at"] is None
+    assert str(row["origin_request_id"]) == origin["request_id"]
+    assert str(row["owner_request_id"]) == successor["request_id"]
+    _readable(client, origin, reservation)
+    listed = _listing(client, auth_headers, origin)["candidates"][0]
+    assert listed["origin_request_id"] == origin["request_id"]
+    assert listed["owner_request_id"] == successor["request_id"]
+    assert listed["previous_owner_request_id"] == origin["request_id"]
+    assert listed["final_disposition_at"] is None and listed["available"] is True
+    assert listed["status"] == "complete"
+    assert _candidate(reservation)["expires_at"] is None
 
 
 def test_transfer_refusals_leave_ownership_unchanged(candidates: None, client: Any) -> None:
@@ -672,25 +855,46 @@ def test_refusals_are_recorded_and_preserve_existing_candidates(
         _readable(client, source, first)
 
     # Oversized patch: above the 900000 ceiling, and above the declared limit.
-    refused(_reserve_body(source, base=False, patch_size=900001), 413, "patch_too_large",
-            recorded=True)
-    refused(_reserve_body(source, base=False, patch_size=1001, patch_limit=1000), 413,
-            "patch_too_large", recorded=True)
-    refused(_reserve_body(source, base_size=ARCHIVE_LIMIT + 1), 413, "base_too_large",
-            recorded=True)
+    refused(
+        _reserve_body(source, base=False, patch_size=900001), 413, "patch_too_large", recorded=True
+    )
+    refused(
+        _reserve_body(source, base=False, patch_size=1001, patch_limit=1000),
+        413,
+        "patch_too_large",
+        recorded=True,
+    )
+    refused(
+        _reserve_body(source, base_size=ARCHIVE_LIMIT + 1), 413, "base_too_large", recorded=True
+    )
     # A retained base with another digest conflicts; the same digest is a redundant
     # declaration.
-    refused(_reserve_body(source, base_salt="other-base"), 409, "retained_base_conflict",
-            recorded=True)
+    refused(
+        _reserve_body(source, base_salt="other-base"), 409, "retained_base_conflict", recorded=True
+    )
     refused(_reserve_body(source), 409, "retained_base_declaration", recorded=False)
     # Wrong identity: another request, a stale epoch, another WorkItem's repository.
-    refused({**_reserve_body(source, base=False), "request_id": str(uuid.uuid4())}, 409,
-            "source_identity", recorded=False)
-    refused({**_reserve_body(source, base=False), "runtime_epoch": 2}, 409,
-            "source_identity", recorded=False)
-    refused({**_reserve_body(source, base=False), "repository": {
-        **REPOSITORY, "path": "acme-corp/other-repo"}}, 409, "workspace_identity",
-        recorded=False)
+    refused(
+        {**_reserve_body(source, base=False), "request_id": str(uuid.uuid4())},
+        409,
+        "source_identity",
+        recorded=False,
+    )
+    refused(
+        {**_reserve_body(source, base=False), "runtime_epoch": 2},
+        409,
+        "source_identity",
+        recorded=False,
+    )
+    refused(
+        {
+            **_reserve_body(source, base=False),
+            "repository": {**REPOSITORY, "path": "acme-corp/other-repo"},
+        },
+        409,
+        "workspace_identity",
+        recorded=False,
+    )
     # Liveness: the neighbouring valid inputs are accepted (exactly at the limits).
     second = _completed(client, source, base=False, patch_size=1000, patch_limit=1000)
     third = _completed(client, source, base=False, patch_size=900000)
@@ -701,18 +905,21 @@ def test_refusals_are_recorded_and_preserve_existing_candidates(
         _readable(client, source, kept)
     listing = _listing(client, auth_headers, source)
     assert [entry["candidate_id"] for entry in listing["candidates"]] == [
-        first["candidate_id"], second["candidate_id"], third["candidate_id"]
+        first["candidate_id"],
+        second["candidate_id"],
+        third["candidate_id"],
     ]
     assert all(entry["available"] for entry in listing["candidates"])
 
     # Installation capacity: an exact fit is accepted, one byte more is refused.
-    used = _sql(
-        "SELECT sum(size_bytes) AS value FROM curie.publication_candidate_objects"
-    )[0]["value"]
+    used = _sql("SELECT sum(size_bytes) AS value FROM curie.publication_candidate_objects")[0][
+        "value"
+    ]
     _set_env(monkeypatch, "CURIE_PUBLICATION_CANDIDATE_MAX_BYTES", str(used + 130))
     full = _seed()
-    _refused(_post(client, "reserve", _reserve_body(full, patch_size=31)), 429,
-             "installation_capacity")
+    _refused(
+        _post(client, "reserve", _reserve_body(full, patch_size=31)), 429, "installation_capacity"
+    )
     assert _outcome(full) == "installation_capacity"
     assert _listing(client, auth_headers, full)["capture_outcome"] == "installation_capacity"
     assert not _sql(
@@ -736,7 +943,9 @@ def test_retained_work_item_capacity_refuses_a_new_group(
         "base_commit) SELECT gen_random_uuid(), 'github', 'github.com', '101', "
         "(800000 + n)::text, 'github', 'github.com', '101', :path, 202, :agent, "
         "'candidate-count-seed', 'main', 'default', :base FROM generate_series(1, 9999) n",
-        path=REPOSITORY["path"], agent=uuid.UUID(source["agent_id"]), base=BASE,
+        path=REPOSITORY["path"],
+        agent=uuid.UUID(source["agent_id"]),
+        base=BASE,
     )
     _sql(
         "INSERT INTO curie.publication_candidate_groups "
@@ -744,13 +953,13 @@ def test_retained_work_item_capacity_refuses_a_new_group(
         "repository_path, base_commit, target_branch, base_sha256) SELECT id, "
         "code_host_kind, code_host_host, repository_project_id, repository_path, "
         "base_commit, base_branch, :digest FROM curie.work_items "
-        "WHERE conversation_id = 'candidate-count-seed'", digest="b" * 64,
+        "WHERE conversation_id = 'candidate-count-seed'",
+        digest="b" * 64,
     )
     assert _count("publication_candidate_groups") == 10000
     newcomer = _seed()
     before = _snapshot()
-    _refused(_post(client, "reserve", _reserve_body(newcomer)), 429,
-             "retained_work_item_capacity")
+    _refused(_post(client, "reserve", _reserve_body(newcomer)), 429, "retained_work_item_capacity")
     assert _snapshot() == before
     assert _outcome(newcomer) == "retained_work_item_capacity"
     assert _listing(client, auth_headers, newcomer)["capture_outcome"] == (
@@ -781,7 +990,8 @@ def test_disabled_ledger_refuses_capture_and_readers_but_drains(
     _ok(_post(client, "complete", _completion(source, staging)))
     _sql(
         "UPDATE curie.publication_candidates SET expires_at = clock_timestamp() - "
-        "interval '1 second' WHERE work_item_id = :id", id=uuid.UUID(source["work_item_id"]),
+        "interval '1 second' WHERE work_item_id = :id",
+        id=uuid.UUID(source["work_item_id"]),
     )
     _drain(client)
     assert _count("publication_candidate_groups") == 0
@@ -800,9 +1010,10 @@ def test_concurrent_reserves_never_over_admit_the_installation(
     assert sorted(answer.status_code for answer in answers) == [200, 429]
     loser = next(i for i, answer in enumerate(answers) if answer.status_code == 429)
     _refused(answers[loser], 429, "installation_capacity")
-    assert _sql(
-        "SELECT sum(size_bytes) AS value FROM curie.publication_candidate_objects"
-    )[0]["value"] == 130
+    assert (
+        _sql("SELECT sum(size_bytes) AS value FROM curie.publication_candidate_objects")[0]["value"]
+        == 130
+    )
     assert _outcome(sources[loser]) == "installation_capacity"
     assert _count("publication_candidate_groups") == 1
 
@@ -818,14 +1029,18 @@ def test_reader_lease_pins_a_tombstoned_patch_against_collection(
     assert _claims(client) == [], "a leased candidate's patch is never claimed"
     assert _candidate(reservation)["status"] == "tombstoned"
     assert _count("publication_candidate_readers") == 1
-    _refused(_post(client, "acquire-reader", _reader_body(source, reservation, "late")), 409,
-             "candidate_unavailable")
+    _refused(
+        _post(client, "acquire-reader", _reader_body(source, reservation, "late")),
+        409,
+        "candidate_unavailable",
+    )
     if unpin == "release":
         _release(client, reader)
     else:
         _sql(
             "UPDATE curie.publication_candidate_readers SET expires_at = clock_timestamp() - "
-            "interval '1 second' WHERE id = :id", id=uuid.UUID(reader["lease_id"]),
+            "interval '1 second' WHERE id = :id",
+            id=uuid.UUID(reader["lease_id"]),
         )
     claims = _claims(client)
     patch_key = next(obj["key"] for obj in reservation["objects"] if obj["kind"] == "patch")
@@ -851,8 +1066,7 @@ def test_collector_killed_after_delete_is_finished_by_the_next_claim(
     assert resumed[0]["claim_id"] != crashed[0]["claim_id"]
     assert resumed[0]["version"] > crashed[0]["version"]
     before = _snapshot()
-    _refused(_finalize(client, crashed[0], "crashed-collector"), 409,
-             "collection_claim_conflict")
+    _refused(_finalize(client, crashed[0], "crashed-collector"), 409, "collection_claim_conflict")
     assert _snapshot() == before
     _ok(_finalize(client, resumed[0], "replacement-collector"))
     assert not _sql(
@@ -878,19 +1092,28 @@ def test_metadata_route_reveals_no_private_content(
     path = f"/work-items/{source['work_item_id']}/publication-candidates"
     for headers in ({}, {"X-API-Key": "invalid"}, _worker()):
         assert client.get(path, headers=headers).status_code == 401
-    unknown = client.get(f"/work-items/{uuid.uuid4()}/publication-candidates",
-                         headers=auth_headers)
+    unknown = client.get(f"/work-items/{uuid.uuid4()}/publication-candidates", headers=auth_headers)
     _refused(unknown, 404, "work_item_not_found")
     response = client.get(path, headers=auth_headers)
     listing = _ok(response)
-    assert set(listing) == {"work_item_id", "capture_outcome", "capture_outcome_at",
-                            "candidates"}
+    assert set(listing) == {"work_item_id", "capture_outcome", "capture_outcome_at", "candidates"}
     assert listing["capture_outcome"] == "complete"
     [entry] = listing["candidates"]
     assert set(entry) == {
-        "candidate_id", "origin_request_id", "owner_request_id", "previous_owner_request_id",
-        "owner_transferred_at", "runtime_epoch", "status", "created_at", "completed_at",
-        "final_disposition_at", "expires_at", "available", "changed_path_count", "patch",
+        "candidate_id",
+        "origin_request_id",
+        "owner_request_id",
+        "previous_owner_request_id",
+        "owner_transferred_at",
+        "runtime_epoch",
+        "status",
+        "created_at",
+        "completed_at",
+        "final_disposition_at",
+        "expires_at",
+        "available",
+        "changed_path_count",
+        "patch",
         "base",
     }
     assert entry["changed_path_count"] == len(PATHS)
@@ -898,11 +1121,21 @@ def test_metadata_route_reveals_no_private_content(
     base = next(obj for obj in reservation["objects"] if obj["kind"] == "base")
     assert entry["patch"] == {"size_bytes": patch["size_bytes"], "sha256": patch["sha256"]}
     assert entry["base"] == {
-        "size_bytes": base["size_bytes"], "sha256": base["sha256"], "base_commit": BASE
+        "size_bytes": base["size_bytes"],
+        "sha256": base["sha256"],
+        "base_commit": BASE,
     }
     text = response.text
-    for secret in (TITLE, BODY, "marker", *PATHS, patch["key"], base["key"],
-                   "publication-candidates/", "http"):
+    for secret in (
+        TITLE,
+        BODY,
+        "marker",
+        *PATHS,
+        patch["key"],
+        base["key"],
+        "publication-candidates/",
+        "http",
+    ):
         assert secret not in text
 
 

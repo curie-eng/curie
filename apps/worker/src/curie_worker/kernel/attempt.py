@@ -111,6 +111,8 @@ from .log import logger
 
 # The publication candidate capture's ceiling (#5428), inside the snapshot budget.
 _CANDIDATE_CAPTURE_BUDGET_S = 60.0
+# Time kept back for validation, UI evidence and admission after a capture.
+_CANDIDATE_VALIDATION_RESERVE_S = 30.0
 
 # Tests replace these so the 10 s termination window does not wait on the wall clock.
 _pod_termination_clock = time.monotonic
@@ -1043,8 +1045,9 @@ async def _retain_and_validate_publication_snapshot(
 
     The capture runs first, and only for the owned, started WorkItem run of
     this exact event with a runtime epoch, so finished work survives a failed
-    validation or admission. It is bounded by min(60 s, remaining - 5 s) and
-    skipped when that is not positive. It never raises and never changes the
+    validation or admission. It is bounded by min(60 s, half of what is left
+    beyond a 30 s reserve for validation, UI evidence and admission) and skipped
+    when that is under 5 s. It never raises and never changes the
     outcome: validation then runs exactly as it would without it, and its
     errors propagate unchanged.
     """
@@ -1059,12 +1062,24 @@ async def _retain_and_validate_publication_snapshot(
         and not run.finished
         and run.runtime_epoch is not None
     ):
+        # Validation, UI evidence and admission keep the larger share of what is
+        # left: the capture takes at most half of the time beyond a reserve for
+        # them, and is skipped rather than squeezed below a useful minimum.
         budget_s = (
             _CANDIDATE_CAPTURE_BUDGET_S
             if remaining_s is None
-            else min(_CANDIDATE_CAPTURE_BUDGET_S, remaining_s - constants._MIN_ATTEMPT_BUDGET_S)
+            else min(
+                _CANDIDATE_CAPTURE_BUDGET_S,
+                (remaining_s - _CANDIDATE_VALIDATION_RESERVE_S) / 2,
+            )
         )
-        if budget_s > 0:
+        if budget_s < constants._MIN_ATTEMPT_BUDGET_S:
+            logger.warning(
+                "publication candidate capture skipped for %s: %.1f s left is too little",
+                qevent.event_id,
+                remaining_s,
+            )
+        else:
             try:
                 prepared = await asyncio.to_thread(self._workspace.current, thread_key)
                 if prepared is not None:

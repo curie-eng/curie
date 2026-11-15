@@ -21,7 +21,7 @@ def upgrade() -> None:
         "CONSTRAINT publication_candidate_installation_singleton_ck CHECK (id = 1))",
         "INSERT INTO curie.publication_candidate_installation (id) VALUES (1)",
         """CREATE TABLE curie.publication_candidate_outcomes (
-            work_item_id uuid PRIMARY KEY REFERENCES curie.work_items(id) ON DELETE RESTRICT,
+            work_item_id uuid PRIMARY KEY REFERENCES curie.work_items(id) ON DELETE CASCADE,
             code varchar(128) NOT NULL,
             recorded_at timestamptz NOT NULL,
             CONSTRAINT publication_candidate_outcome_code_ck

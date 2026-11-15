@@ -95,9 +95,15 @@ async def _superseded(session: AsyncSession, request: ExecutionRequest) -> bool:
     )
 
 
-async def _authority(
-    session: AsyncSession, body: wire.CandidateCaptureAuthority, *, live: bool
+async def _identity(
+    session: AsyncSession, body: wire.CandidateCaptureAuthority
 ) -> tuple[WorkItem, ExecutionRequest]:
+    """Lock the WorkItem then the request; only the capture's identity must match.
+
+    No liveness, sequence or status requirement: a terminal or superseded
+    request still answers for its own capture.
+    """
+
     item = await lock_work_item(session, body.work_item_id)
     if item is None:
         raise CandidateRefusal("source_identity")
@@ -106,10 +112,16 @@ async def _authority(
         request is None
         or request.runtime_epoch != body.runtime_epoch
         or request.dispatch_generation != body.dispatch_generation
-        or item.base_commit is None
-        or item.base_branch is None
-        or await _superseded(session, request)
     ):
+        raise CandidateRefusal("source_identity")
+    return item, request
+
+
+async def _authority(
+    session: AsyncSession, body: wire.CandidateCaptureAuthority, *, live: bool
+) -> tuple[WorkItem, ExecutionRequest]:
+    item, request = await _identity(session, body)
+    if item.base_commit is None or item.base_branch is None or await _superseded(session, request):
         raise CandidateRefusal("source_identity")
     _live(item, request, await database_now(session), live=live)
     return item, request
@@ -235,35 +247,35 @@ async def _reservation(
 async def _fix_expiry(session: AsyncSession, candidate: Candidate) -> None:
     """Fix a complete candidate's expiry from its owner's final disposition, once.
 
-    ``terminal_at`` is immutable, so reading it without the request lock is
-    exact; an owner that turns terminal after this read is fixed by a later call.
+    One conditional UPDATE: it applies only while the row is still complete,
+    still has no expiry and is still owned by the owner this caller observed,
+    and it reads that owner's ``terminal_at`` in the same statement, so an
+    expiry is never fixed from a request that no longer owns the candidate.
+    An owner that is not yet terminal leaves the row untouched; a later call
+    fixes it. The ORM row is refreshed from the database afterwards.
     """
 
     if candidate.status != "complete" or candidate.expires_at is not None:
         return
-    terminal_at = await session.scalar(
-        select(ExecutionRequest.terminal_at).where(
-            ExecutionRequest.id == candidate.owner_request_id
-        )
+    observed_owner = candidate.owner_request_id
+    owner_expiry = (
+        select(ExecutionRequest.terminal_at + timedelta(seconds=RETENTION_SECONDS))
+        .where(ExecutionRequest.id == observed_owner)
+        .scalar_subquery()
     )
-    if terminal_at is None:
-        return
-    expires_at = terminal_at + timedelta(seconds=RETENTION_SECONDS)
-    version = await session.scalar(
+    await session.execute(
         update(Candidate)
         .where(
             Candidate.id == candidate.id,
-            Candidate.version == candidate.version,
-            Candidate.owner_request_id == candidate.owner_request_id,
             Candidate.expires_at.is_(None),
+            Candidate.owner_request_id == observed_owner,
+            Candidate.status == "complete",
+            owner_expiry.is_not(None),
         )
-        .values(expires_at=expires_at, version=candidate.version + 1)
-        .returning(Candidate.version)
+        .values(expires_at=owner_expiry, version=Candidate.version + 1)
+        .execution_options(synchronize_session=False)
     )
-    if version is None:
-        raise CandidateRefusal("candidate_version_conflict")
-    set_committed_value(candidate, "expires_at", expires_at)
-    set_committed_value(candidate, "version", version)
+    await session.refresh(candidate)
 
 
 def _unexpired(candidate: Candidate, now: datetime) -> bool:
@@ -293,17 +305,31 @@ async def context(
 async def outcome(
     session: AsyncSession, settings: Settings, body: wire.CandidateOutcome
 ) -> wire.CandidateOutcomeRecorded:
-    """Record a capture that ended before any reservation; a later outcome is kept."""
+    """Record a capture that ended before any reservation; a later outcome is kept.
+
+    Identity-only authority, like ``fail``: a capture that outlived its
+    heartbeat, its deadline or its request still records why it ended.
+    """
 
     _enabled(settings)
-    item, _ = await _authority(session, body, live=False)
+    item, _ = await _identity(session, body)
     recorded = await _write_outcome(session, item.id, body.reason, await database_now(session))
     return wire.CandidateOutcomeRecorded(recorded=recorded)
 
 
 def _content_digest(body: wire.CandidateReserve) -> str:
+    """The replay digest of one capture's content.
+
+    A ``base`` declaration is excluded: the base is covered by ``base_commit``
+    and the group's base digest, and a writer declares it only after a
+    ``base_required`` answer, so a replay without it is the same capture.
+    """
+
     contents = body.model_dump(mode="json", exclude={"capture_budget_seconds"})
-    contents["objects"] = sorted(contents["objects"], key=lambda value: value["kind"])
+    contents["objects"] = sorted(
+        (value for value in contents["objects"] if value["kind"] != "base"),
+        key=lambda value: value["kind"],
+    )
     return hashlib.sha256(json.dumps(contents, sort_keys=True).encode()).hexdigest()
 
 
@@ -534,16 +560,7 @@ async def fail(session: AsyncSession, body: wire.CandidateFail) -> wire.Candidat
     is retained until its expiry.
     """
 
-    item = await lock_work_item(session, body.work_item_id)
-    if item is None:
-        raise CandidateRefusal("source_identity")
-    request = await lock_request(session, work_item_id=item.id, request_id=body.request_id)
-    if (
-        request is None
-        or request.runtime_epoch != body.runtime_epoch
-        or request.dispatch_generation != body.dispatch_generation
-    ):
-        raise CandidateRefusal("source_identity")
+    item, _ = await _identity(session, body)
     await _installation(session)
     if await _group(session, item.id) is None:
         raise CandidateRefusal("candidate_identity")
@@ -863,6 +880,10 @@ async def transfer_ownership(
     recorded, and the expiry is cleared so it is fixed again, exactly, from the
     successor's final disposition. A read never reaches this path. The caller
     commits; a refusal leaves nothing written.
+
+    Locks follow the module order: WorkItem, target request, installation row,
+    group, candidate. Collection takes the installation row first too, so a
+    transfer and a collection pass never interleave.
     """
 
     item = await lock_work_item(session, work_item_id)
