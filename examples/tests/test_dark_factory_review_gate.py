@@ -870,7 +870,14 @@ def test_decision_followup_eval_grades_the_answer(case_id: str) -> None:
         assert case.grader.grade(answer)
     for answer in fixtures["counterexamples"][key]:
         assert not case.grader.grade(answer)
-    for empty_answer in ("", "Done.", "No changes needed:", case.input):
+    for empty_answer in (
+        "",
+        "Done.",
+        "No changes needed:",
+        case.input,
+        "No changes needed: the pull request is already complete; I answered "
+        "by citing Decisions entry 1. Nothing in the question asked for a code change.",
+    ):
         assert not case.grader.grade(empty_answer)
 
 
