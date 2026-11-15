@@ -545,6 +545,7 @@ class PodRun(pp.Attempt):
     closed: bool = False
     logs: list[RunnerLog] = dataclasses.field(default_factory=list)
     log_instance: int = 0
+    rejection_settled: bool = False
     logs_finished: bool = False
     logs_complete: bool = False
 
@@ -3408,6 +3409,9 @@ class TwoOwnerRun(pp.LiveRun):
         self.require_live("wrong-owner")
         a, b = self.owners["a"], self.owners["b"]
         first = self.pod_run("a1")
+        # A1's card was rejected in its own phase; the product's own settling of
+        # that rejection moves A's versions and thread, so it must end first.
+        self.await_rejection_settled(first)
         thread = self.threads.get("a", "")
         before = self.thread_records().get(thread)
         controls = self.wrong_owner_controls(a, b, first.work_item_id, first.admission_key)
@@ -3453,16 +3457,24 @@ class TwoOwnerRun(pp.LiveRun):
             self.ledger.record("wrong-owner", key, value)
         self.require(checks, "wrong-owner controls")
 
-    def phase_reject_a1(self) -> None:
-        self.require_live("reject-a1")
-        first = self.pod_run("a1")
+    def await_rejection_settled(self, run: PodRun) -> None:
+        """Once: the rejected request is ``publication_denied`` and the settle pause passed."""
+
+        if run.rejection_settled:
+            return
 
         def denied() -> bool:
-            row = self.request_row(first.request_id)
+            row = self.request_row(run.request_id)
             return row.get("terminal_cause") == "publication_denied"
 
         self.wait_until(denied, until=self.clock.now() + 180, what="publication_denied")
         self.pause(pp.REJECTION_SETTLE_SECONDS)
+        run.rejection_settled = True
+
+    def phase_reject_a1(self) -> None:
+        self.require_live("reject-a1")
+        first = self.pod_run("a1")
+        self.await_rejection_settled(first)
         checks = {
             "rejected_no_branch": self.branch_head(first.branch) is None,
             "rejected_no_pr": not self.branch_pulls(first.branch),
@@ -5879,6 +5891,17 @@ class TwoOwnerRun(pp.LiveRun):
             reached = own_code == 409 and self.code_of(own_answer) in pto.OWNER_REVALIDATION_CODES
         final_status, final = self.personal_context(owner, work_item_id)
         final_rows = rows()
+        # Content-free: which binding fields moved during the controls, if any.
+        moved = sorted(
+            {
+                key
+                for code, answer in ((between_status, between), (final_status, final))
+                if code == 200 and binding is not None
+                for key, value in (pto.context_binding(answer) or {}).items()
+                if binding.get(key) != value
+            }
+        )
+        self.ledger.record("diagnostics", "adoption_binding_moved", moved)
         bound = (
             binding is not None
             and binding["owner_principal_id"] == owner.principal_id

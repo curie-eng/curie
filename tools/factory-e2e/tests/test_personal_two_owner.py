@@ -4535,6 +4535,11 @@ def _wrong_owner_setup(
     h.run.request_rows = lambda _w: [  # type: ignore[method-assign]
         {"id": REQUEST_A1, "owner_principal_id": PRINCIPAL_A}
     ]
+    # A1's card was rejected in its own phase and the product has settled it.
+    h.run.request_row = lambda _r: {  # type: ignore[method-assign]
+        "id": REQUEST_A1,
+        "terminal_cause": "publication_denied",
+    }
     state: dict[str, Any] = {"work_item_version": 3, "request_version": 5, "revalidations": []}
     request = {
         "id": REQUEST_A1,
@@ -5515,3 +5520,35 @@ def test_b1s_suspended_claim_is_no_successor_unless_it_has_a_pod(
         return
     facts = h.run.interrupt_native_process(held.pod, held.kept or {})
     assert facts["successor_claim_observed"] is False
+
+
+def test_wrong_owner_controls_wait_for_a1s_rejection_to_settle(tmp_path: Path) -> None:
+    """The product's own settling of A1's rejection moves A's versions; controls follow it."""
+
+    h = _live(tmp_path)
+    _wrong_owner_setup(h)
+    order: list[str] = []
+    causes = iter([None, None, "publication_denied"])
+
+    def request_row(_request: str) -> dict[str, Any]:
+        cause = next(causes)
+        order.append(f"row:{cause}")
+        return {"id": REQUEST_A1, "terminal_cause": cause}
+
+    original = h.run.admit_owner
+
+    def admit(*args: Any, **kwargs: Any) -> Any:
+        order.append("control")
+        return original(*args, **kwargs)
+
+    h.run.request_row = request_row  # type: ignore[method-assign]
+    h.run.admit_owner = admit  # type: ignore[method-assign]
+    h.run.phase_wrong_owner()
+    assert order[:4] == ["row:None", "row:None", "row:publication_denied", "control"]
+    assert h.ledger.observations("diagnostics")["adoption_binding_moved"] == []
+    # reject-a1 reads no second settle.
+    h.run.branch_head = lambda _b: None  # type: ignore[method-assign]
+    h.run.branch_pulls = lambda _b: []  # type: ignore[method-assign]
+    h.run.approval = lambda _a: {"status": "rejected"}  # type: ignore[method-assign]
+    h.run.phase_reject_a1()
+    assert order.count("row:publication_denied") == 1
