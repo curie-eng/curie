@@ -205,6 +205,8 @@ class _WorkItems(AbsentRequesterContext):
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path=WORK_ITEM_REPO,
             context=factory_context(AGENT_ID, wake),
+            resource_gate=None,
+            predecessor_claim_name=None,
         )
         self.acquisitions[request_id] = grant
         return grant

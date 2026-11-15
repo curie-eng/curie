@@ -180,6 +180,7 @@ async def _complete(
                     ci_fix_round=None,
                     retry_safety=retry_safety,
                     retry_condition=retry_condition,
+                    exhausted_volume=None,
                 )
             elif outcome == "delivered":
                 ci_fix = parsed is not None and parsed.is_ci_fix
@@ -214,6 +215,7 @@ async def _complete(
                         ci_fix_round=ci_fix_round,
                         retry_safety=retry_safety,
                         retry_condition=retry_condition,
+                        exhausted_volume=None,
                     )
                 except WorkItemConflict as exc:
                     if exc.code != "publication_pending":
@@ -231,6 +233,7 @@ async def _complete(
                     ci_fix_round=None,
                     retry_safety=retry_safety,
                     retry_condition=retry_condition,
+                    exhausted_volume=failures._exhausted_volume(turn),
                 )
             else:
                 await self._finish_or_settle(
@@ -241,6 +244,7 @@ async def _complete(
                     ci_fix_round=None,
                     retry_safety=retry_safety,
                     retry_condition=retry_condition,
+                    exhausted_volume=None,
                 )
         except WorkItemConflict as exc:
             logger.warning(

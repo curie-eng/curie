@@ -116,6 +116,7 @@ from .types import (
     ClaimView,
     DaemonObjectKind,
     DaemonObjectView,
+    DeliveredLimits,
     KubeTransientError,
     ListableDaemonKind,
     MissingAgentPoolError,
@@ -1219,6 +1220,23 @@ class StaticPoolSandboxClient(ClaimInputStaging):
     ) -> SandboxTermination | None:
         del name, since, request_timeout_seconds
         return None
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        # A shell enforces no per-claim limit this worker can observe.
+        del name, request_timeout_seconds
+        return None
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        del pool, runner_resources, agent_name
+        return DeliveredLimits(
+            memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+        )
 
     def create_daemon_object(
         self, namespace: str, manifest: Mapping[str, Any], *, request_timeout_seconds: float

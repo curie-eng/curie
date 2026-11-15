@@ -2487,6 +2487,8 @@ class _FactoryWorkItems(AbsentRequesterContext):
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path="acme-corp/widgets",
             context=factory_context(uuid.UUID("11111111-1111-4111-8111-111111114180"), wake),
+            resource_gate=None,
+            predecessor_claim_name=None,
         )
 
     async def start(

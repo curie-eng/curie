@@ -8,7 +8,7 @@ import math
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from aci_protocol import (
     CHANNEL_READ_STATUS_FIELD,
@@ -68,6 +68,9 @@ from ..turn_progress import (
     ELIGIBILITY_ENV,
 )
 from ..workitem_dispatch import (
+    PREDECESSOR_RUNTIME_PRESENT,
+    RESOURCE_GATE_UNMET,
+    WorkItemConflict,
     WorkItemRun,
     WorkItemStartRefused,
 )
@@ -393,6 +396,97 @@ def _connector_tool_grant(
     )
 
 
+_SUBSTRATE_GATE_DIMENSIONS = frozenset({"memory", "ephemeral_storage", "scratch"})
+
+
+def _positive_int(raw: str | None) -> int | None:
+    if raw is None or not raw.isascii() or not raw.isdigit():
+        return None
+    value = int(raw)
+    return value if value >= 1 else None
+
+
+async def _defer_unstarted(run: WorkItemRun, reason: str) -> NoReturn:
+    """Defer an unstarted request uncounted and end this delivery without a turn."""
+
+    try:
+        await run.defer(reason, capacity=False, start_failure_detail=None)
+    except WorkItemConflict as exc:
+        logger.info("work-item %s defer refused for %s: %s", reason, run.request_id, exc.code)
+    raise failures._WorkItemDeferred()
+
+
+async def _admit_resource_successor(
+    self: Kernel,
+    run: WorkItemRun,
+    thread_key: str,
+    *,
+    boot_env: dict[str, str] | None,
+    workspace_repo: str | None,
+    agent_name: str | None,
+    runner_resources: dict[str, Any] | None,
+) -> None:
+    """ADR 0269 (#5427): what a resource successor proves before it claims anything.
+
+    First its failed predecessor's runtime is fenced: released if the thread's
+    route still names it, then confirmed gone. Then a gated request needs no
+    live route on the thread and a current limit strictly greater than the one
+    its predecessor failed under, resolved the way the next claim would
+    resolve it. Either short of that defers uncounted and creates nothing.
+    """
+
+    predecessor = run.predecessor_claim_name
+    if predecessor is not None and not await asyncio.to_thread(
+        self._substrate.predecessor_absent, thread_key, predecessor
+    ):
+        logger.info(
+            "work-item %s waits for predecessor runtime %s to be gone",
+            run.request_id,
+            predecessor,
+        )
+        await _defer_unstarted(run, PREDECESSOR_RUNTIME_PRESENT)
+    gate = run.resource_gate
+    if gate is None:
+        return
+    live = await asyncio.to_thread(self._substrate.lookup, thread_key)
+    current: int | None
+    if live is not None:
+        current = None
+    elif gate.dimension in _SUBSTRATE_GATE_DIMENSIONS:
+        current = await asyncio.to_thread(
+            functools.partial(
+                self._substrate.resource_gate_readiness,
+                gate,
+                env=boot_env,
+                workspace_repo=workspace_repo,
+                agent_name=agent_name,
+                runner_resources=runner_resources,
+            )
+        )
+    elif gate.dimension == "max_turns":
+        current = _positive_int((boot_env or {}).get(MAX_TURNS_ENV))
+    else:
+        current = gate.current_limit
+    if current is not None and current > gate.failed_limit:
+        logger.info(
+            "resource gate %s met for %s: failed limit %d, current limit %d",
+            gate.condition,
+            run.request_id,
+            gate.failed_limit,
+            current,
+        )
+        return
+    logger.info(
+        "resource gate %s unmet for %s: failed limit %d, current limit %s%s",
+        gate.condition,
+        run.request_id,
+        gate.failed_limit,
+        current,
+        "; a live route holds the thread" if live is not None else "",
+    )
+    await _defer_unstarted(run, RESOURCE_GATE_UNMET)
+
+
 async def _route_and_start(
     self: Kernel,
     thread_key: str,
@@ -577,6 +671,17 @@ async def _route_and_start(
         # repository record remains authority for this refusal, so an
         # approval resume cannot rebuild a workspace route as generic.
         raise WorkspaceSelectionRefused(WORKSPACES_DISABLED_REFUSAL)
+    if owned_run is not None and not owned_run.started:
+        # Before the route snapshot, any claim and any capacity preflight.
+        await _admit_resource_successor(
+            self,
+            owned_run,
+            thread_key,
+            boot_env=boot_env,
+            workspace_repo=workspace_repo,
+            agent_name=agent_name,
+            runner_resources=runner_resources,
+        )
     existing_handle = await asyncio.to_thread(self._substrate.lookup, thread_key)
     # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
     # route lock, if an enabled greeting/help pack matches the message text AND
@@ -1287,10 +1392,30 @@ async def _route_and_start(
     if run is not None and run.finished:
         raise WorkItemStartRefused("work item authority is finished")
     if run is not None and not run.started:
-        started = await run.start(
-            claim_name=handle.claim_name,
-            sandbox_name=handle.sandbox_name,
+        # ADR 0269 (#5427): what this runtime was actually given, read from
+        # the created pod. An unread pod sends nulls, which release nothing.
+        delivered = await asyncio.to_thread(
+            functools.partial(
+                self._substrate.delivered_limits,
+                handle,
+                max_turns=_positive_int(handle.max_turns),
+            )
         )
+        try:
+            started = await run.start(
+                claim_name=handle.claim_name,
+                sandbox_name=handle.sandbox_name,
+                delivered_limits=delivered.to_wire(),
+            )
+        except WorkItemStartRefused as exc:
+            if exc.code != RESOURCE_GATE_UNMET:
+                raise
+            # The limit fell back between the gate and the start. Give the
+            # unstarted claim back and wait again, uncounted.
+            from .work_items import _release_claim
+
+            await _release_claim(self, thread_key, handle.claim_name)
+            await _defer_unstarted(run, RESOURCE_GATE_UNMET)
         remaining_s = (
             started.remaining_s if remaining_s is None else min(remaining_s, started.remaining_s)
         )

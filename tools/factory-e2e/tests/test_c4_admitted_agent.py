@@ -49,6 +49,14 @@ from c4_admitted_kind import (  # noqa: E402
 from c4_shared_install import CaseIsolationError, leftover_state  # noqa: E402
 from channel_protocol.work_item_events import ci_event_id, terminate_event_id  # noqa: E402
 
+# A start refused before the fence reads limits still needs the required body.
+NO_DELIVERED_LIMITS = {
+    "memory_bytes": None,
+    "ephemeral_storage_bytes": None,
+    "scratch_bytes": {},
+    "max_turns": None,
+}
+
 
 @pytest.fixture(autouse=True)
 def candidate_curie() -> None:
@@ -1715,6 +1723,7 @@ def test_renewal_and_late_start_revalidate_granted_binding(
             "owner": body["owner"], "generation": body["generation"],
             "context": grant["context"], "claim_name": "acme-unstarted-claim",
             "sandbox_name": "acme-unstarted-sandbox",
+            "delivered_limits": NO_DELIVERED_LIMITS,
         }
         target = "/start"
     status, refusal = run.api_result("POST", path + target, body, internal=True)
@@ -1730,6 +1739,7 @@ def test_renewal_and_late_start_revalidate_granted_binding(
             "owner": "acme-test-worker", "generation": before["dispatch_generation"],
             "context": grant["context"], "claim_name": "acme-unstarted-claim",
             "sandbox_name": "acme-unstarted-sandbox",
+            "delivered_limits": NO_DELIVERED_LIMITS,
         }, internal=True,
     )
     assert status == 409
@@ -1761,6 +1771,7 @@ def test_renewal_and_late_start_revalidate_granted_binding(
                     "owner": "acme-test-worker", "generation": current["dispatch_generation"],
                     "context": grant["context"], "claim_name": "acme-unstarted-claim",
                     "sandbox_name": "acme-unstarted-sandbox",
+                    "delivered_limits": NO_DELIVERED_LIMITS,
                 }, internal=True,
             )
             assert status == 409

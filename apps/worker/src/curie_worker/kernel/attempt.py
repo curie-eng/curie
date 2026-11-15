@@ -1226,6 +1226,7 @@ async def _consume(
                 or termination is not None
             ),
             retry_condition=acc.retry_condition,
+            sandbox_exhaustion=termination.exhaustion if termination is not None else None,
         )
     except ActionBackendError as exc:
         # The ledger refused a write (ADR-0117). The change to the world has

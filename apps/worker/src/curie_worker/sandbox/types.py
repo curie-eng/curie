@@ -701,17 +701,64 @@ class SandboxView:
     base_path: str = ""
 
 
+ResourceExhaustionKind = Literal["memory", "ephemeral_storage", "scratch", "node_disruption"]
+
+
+@dataclass(frozen=True)
+class ResourceExhaustion:
+    """A termination the substrate positively identified, and the limit it hit.
+
+    ``limit_bytes`` comes from the spec of the same pod the evidence was read
+    from, never from desired configuration or from message text alone.
+    ``volume`` names the emptyDir for ``scratch`` and is None otherwise. A
+    ``node_disruption`` names no volume and no limit.
+    """
+
+    kind: ResourceExhaustionKind
+    volume: str | None
+    limit_bytes: int | None
+
+
 @dataclass(frozen=True)
 class SandboxTermination:
     """Confirmed termination of the runner pod, with safe diagnostic text.
 
     ``exit_code`` is the runner container's terminated exit code when the pod
-    status reported a real int; it never changes ``detail``.
+    status reported a real int; it never changes ``detail``. ``exhaustion`` is
+    set only on positive identification; None is unknown, not "not exhausted".
     """
 
     reason: str
     detail: str | None = None
     exit_code: int | None = None
+    exhaustion: ResourceExhaustion | None = None
+
+
+@dataclass(frozen=True)
+class DeliveredLimits:
+    """The enforced limits one runtime actually got (ADR 0269, #5427).
+
+    ``memory_bytes`` is the runner container's memory limit,
+    ``ephemeral_storage_bytes`` the sum of the regular containers'
+    ephemeral-storage limits (the quantity the kubelet compares), and
+    ``scratch_bytes`` each emptyDir's sizeLimit by volume name. None and an
+    empty mapping mean the limit was not observed, which never releases a gate.
+    """
+
+    memory_bytes: int | None
+    ephemeral_storage_bytes: int | None
+    scratch_bytes: Mapping[str, int]
+    max_turns: int | None
+
+    def to_wire(self) -> dict[str, Any]:
+        """The start body's ``delivered_limits`` object."""
+
+        return {
+            "memory_bytes": self.memory_bytes,
+            "ephemeral_storage_bytes": self.ephemeral_storage_bytes,
+            "scratch_bytes": dict(self.scratch_bytes),
+            "max_turns": self.max_turns,
+        }
 
 
 OperatingMode = Literal["Running", "Suspended"]
@@ -859,6 +906,29 @@ class SandboxClient(Protocol):
         self, name: str, *, since: datetime, request_timeout_seconds: float
     ) -> SandboxTermination | None:
         """Confirmed pod termination, or None when the evidence is absent."""
+
+        ...
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        """The limits in pod ``name``'s own spec; None when it cannot be read.
+
+        ``max_turns`` is not a pod fact and is always None here.
+        """
+
+        ...
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        """What the next claim from ``pool`` would deliver, read only.
+
+        The same source template and override resolution a claim uses. Raises
+        when the template does not resolve. ``max_turns`` is always None here.
+        """
 
         ...
 

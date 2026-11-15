@@ -46,7 +46,12 @@ from curie_worker.sandbox import (
 )
 from curie_worker.sandbox.claim_tokens import CLAIM_LABEL
 from curie_worker.sandbox.docker import DockerError, DockerSandboxClient
-from curie_worker.sandbox.types import ClaimTimeoutError, SandboxError, SandboxTermination
+from curie_worker.sandbox.types import (
+    ClaimTimeoutError,
+    DeliveredLimits,
+    SandboxError,
+    SandboxTermination,
+)
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
@@ -604,6 +609,15 @@ class FakeSandboxClient:
     pod_reads: list[str] = field(default_factory=list)
     termination: SandboxTermination | None = None
     termination_reads: list[str] = field(default_factory=list)
+    # ADR 0269 (#5427): what pod_limits and claim_limits answer. Unobserved
+    # by default, which never releases a resource gate.
+    delivered: DeliveredLimits | None = None
+    template_limits: DeliveredLimits = field(
+        default_factory=lambda: DeliveredLimits(
+            memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+        )
+    )
+    pod_limit_reads: list[str] = field(default_factory=list)
     created: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     # Every claim-scoped template sweep the substrate asked for, as
@@ -1114,6 +1128,20 @@ class FakeSandboxClient:
         assert since.tzinfo is not None
         self.termination_reads.append(name)
         return self.termination
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        assert request_timeout_seconds > 0
+        self.pod_limit_reads.append(name)
+        return self.delivered
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        return self.template_limits
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode

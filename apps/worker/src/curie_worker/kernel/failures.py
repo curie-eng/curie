@@ -18,6 +18,7 @@ from ..runner_client import (
     RunnerWorkspaceSnapshot,
 )
 from ..sandbox.types import (
+    ResourceExhaustion,
     SandboxTermination,
 )
 from ..workitem_dispatch import RetrySafety
@@ -48,10 +49,32 @@ def map_error_classification(raw: str | None) -> str:
     return constants.UNCLASSIFIED_ERROR_CLASSIFICATION
 
 
+# ADR 0269 (#5427): a sandbox termination the substrate positively identified.
+# Only the pod observation sets ``sandbox_exhaustion``, so a runner error
+# frame, whatever its text, can never produce one of these causes.
+_EXHAUSTION_CAUSES = {
+    "memory": "sandbox_memory_exhausted",
+    "ephemeral_storage": "sandbox_storage_exhausted",
+    "scratch": "sandbox_scratch_exhausted",
+    "node_disruption": "sandbox_node_disrupted",
+}
+
+
 def _escalation_cause(failure: TurnOutcome | None) -> str:
     if failure is None or failure.classification is None:
         return "runner_escalated"
+    if failure.classification == "sandbox-terminated" and failure.sandbox_exhaustion is not None:
+        return _EXHAUSTION_CAUSES[failure.sandbox_exhaustion.kind]
     return constants._ESCALATION_CAUSES.get(failure.classification, "runner_escalated")
+
+
+def _exhausted_volume(failure: TurnOutcome | None) -> str | None:
+    """The scratch volume a ``sandbox_scratch_exhausted`` finish names, else None."""
+
+    exhaustion = failure.sandbox_exhaustion if failure is not None else None
+    if exhaustion is None or _escalation_cause(failure) != "sandbox_scratch_exhausted":
+        return None
+    return exhaustion.volume
 
 
 def retry_safety(
@@ -263,6 +286,9 @@ class TurnOutcome:
     # The provider retry condition the runner put on an error frame, reported
     # unchanged at finish. None when the stream carried none.
     retry_condition: RetryCondition | None = None
+    # What the substrate positively identified as ending a ``sandbox-terminated``
+    # turn (ADR 0269, #5427). None when it identified nothing.
+    sandbox_exhaustion: ResourceExhaustion | None = None
 
 
 class _FactoryExecutionEnded(Exception):
