@@ -701,7 +701,14 @@ class _Stage:
         run = self.run
         assert run is not None
         await self.h.kernel._finish_or_settle(
-            run, outcome="failed", cause="runner_failed", detail=None, ci_fix_round=None
+            run,
+            outcome="failed",
+            cause="runner_failed",
+            detail=None,
+            ci_fix_round=None,
+            # Unproven safety earns no automatic successor, so this disposition is final.
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert run.finished
         await self.sql(
