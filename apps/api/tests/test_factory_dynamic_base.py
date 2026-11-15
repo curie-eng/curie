@@ -62,6 +62,12 @@ def _start(client: Any, number: int, grant: Any) -> Any:
             "claim_name": "claim-factory-base",
             "sandbox_name": "sandbox-factory-base",
             "context": grant.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
 
@@ -800,6 +806,12 @@ def test_a_base_label_waiting_behind_the_first_pin_still_replaces_its_granted_ow
             "claim_name": "claim-factory-base",
             "sandbox_name": "sandbox-factory-base",
             "context": acquired.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert stale_start.status_code == 409, stale_start.text

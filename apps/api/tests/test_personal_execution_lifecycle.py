@@ -454,6 +454,7 @@ def _start(request_id: UUID, generation: int, context: Any) -> StartResult | Dis
             claim_name=support.CLAIM_NAME,
             sandbox_name=support.SANDBOX_NAME,
             context=context,
+            delivered_limits=lifecycle.NO_DELIVERED_LIMITS,
         )
     )
 

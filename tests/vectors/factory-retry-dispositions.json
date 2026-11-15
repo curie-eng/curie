@@ -1,5 +1,5 @@
 {
-  "comment": "Shared factory retry disposition vectors (issue 5424, ADR 0269). The API reads them in apps/api/tests/test_factory_retry.py and the worker in apps/worker/tests/kernel/test_factory_retry.py. finish holds the facts a boundary reports: the cause, the safety fact and the decoded carrier in canonical spelling. worker is present only when a worker kernel classification produces the cause; its runner_ended follows the observed turn end and its finish must equal the case's finish. error_frame omits version. A case with retry_at_from_now_seconds uses retry_at as a placeholder that boundary tests replace with database time plus that many seconds; the pure policy test reads the placeholder as written. expected.disposition, condition, not_before and policy_successor are the pure policy result; successor, blocked_on and timing are the boundary result. finish_wire_retry_condition, when present, is the carrier as posted on the wire. setup holds the state a boundary test arranges first.",
+  "comment": "Shared factory retry disposition vectors (issue 5424, ADR 0269). The API reads them in apps/api/tests/test_factory_retry.py and the worker in apps/worker/tests/kernel/test_factory_retry.py. finish holds the facts a boundary reports: the cause, the safety fact and the decoded carrier in canonical spelling. worker is present only when a worker kernel classification produces the cause; its runner_ended follows the observed turn end and its finish must equal the case's finish. error_frame omits version. A case with retry_at_from_now_seconds uses retry_at as a placeholder that boundary tests replace with database time plus that many seconds; the pure policy test reads the placeholder as written. expected.disposition, condition, not_before and policy_successor are the pure policy result; successor, blocked_on and timing are the boundary result. finish_wire_retry_condition, when present, is the carrier as posted on the wire. setup holds the state a boundary test arranges first. A finish of cause sandbox_scratch_exhausted also names exhausted_volume, the scratch volume it filled; boundary tests post it. Timing gated (#5427) is a blocked successor that carries a resource gate: the reconciler offers it every resource gate probe interval, so its dispatch time is the predecessor's settlement plus that interval instead of its waiting deadline. Boundary tests start every request with a delivered limit for every dimension.",
   "allowance": {
     "limit": 2,
     "delays_seconds": [
@@ -1755,7 +1755,7 @@
         "policy_successor": true,
         "successor": true,
         "blocked_on": "history_capacity",
-        "timing": "blocked"
+        "timing": "gated"
       }
     },
     {
@@ -1825,7 +1825,7 @@
         "policy_successor": true,
         "successor": true,
         "blocked_on": "turn_limit",
-        "timing": "blocked"
+        "timing": "gated"
       }
     },
     {
@@ -1850,6 +1850,168 @@
       },
       "finish": {
         "cause": "max_turns",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "sandbox_memory_exhausted_no_effects_is_gated",
+      "row": "sandbox_memory_exhausted",
+      "path": "positive",
+      "boundary": "finish",
+      "finish": {
+        "cause": "sandbox_memory_exhausted",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "memory_limit",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "memory_limit",
+        "timing": "gated"
+      }
+    },
+    {
+      "id": "sandbox_memory_exhausted_flagged_terminal",
+      "row": "sandbox_memory_exhausted",
+      "path": "refusal",
+      "boundary": "finish",
+      "finish": {
+        "cause": "sandbox_memory_exhausted",
+        "retry_safety": "flagged",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "sandbox_storage_exhausted_no_effects_is_gated",
+      "row": "sandbox_storage_exhausted",
+      "path": "positive",
+      "boundary": "finish",
+      "finish": {
+        "cause": "sandbox_storage_exhausted",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "ephemeral_storage_limit",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "ephemeral_storage_limit",
+        "timing": "gated"
+      }
+    },
+    {
+      "id": "sandbox_storage_exhausted_uncertain_terminal",
+      "row": "sandbox_storage_exhausted",
+      "path": "refusal",
+      "boundary": "finish",
+      "finish": {
+        "cause": "sandbox_storage_exhausted",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "sandbox_scratch_exhausted_no_effects_is_gated",
+      "row": "sandbox_scratch_exhausted",
+      "path": "positive",
+      "boundary": "finish",
+      "finish": {
+        "cause": "sandbox_scratch_exhausted",
+        "retry_safety": "no_effects",
+        "retry_condition": null,
+        "exhausted_volume": "workspace"
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "scratch_limit",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "scratch_limit",
+        "timing": "gated"
+      }
+    },
+    {
+      "id": "sandbox_scratch_exhausted_flagged_terminal",
+      "row": "sandbox_scratch_exhausted",
+      "path": "refusal",
+      "boundary": "finish",
+      "finish": {
+        "cause": "sandbox_scratch_exhausted",
+        "retry_safety": "flagged",
+        "retry_condition": null,
+        "exhausted_volume": "workspace"
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "sandbox_node_disrupted_no_effects_retries",
+      "row": "sandbox_node_disrupted",
+      "path": "positive",
+      "boundary": "finish",
+      "finish": {
+        "cause": "sandbox_node_disrupted",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "backoff"
+      }
+    },
+    {
+      "id": "sandbox_node_disrupted_uncertain_terminal",
+      "row": "sandbox_node_disrupted",
+      "path": "refusal",
+      "boundary": "finish",
+      "finish": {
+        "cause": "sandbox_node_disrupted",
         "retry_safety": "uncertain",
         "retry_condition": null
       },

@@ -717,6 +717,12 @@ def test_duplicate_silent_base_label_requires_writer(
             "claim_name": "claim-intake-notice",
             "sandbox_name": "sandbox-intake-notice",
             "context": acquired.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text

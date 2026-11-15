@@ -582,6 +582,12 @@ def start_refusal(stack: SteeringStack, request_id: uuid.UUID) -> str | None:
             "claim_name": f"claim-{request_id.hex[:12]}",
             "sandbox_name": f"sbx-{request_id.hex[:12]}",
             "context": acquired.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     if started.status_code != 200:

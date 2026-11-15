@@ -7460,6 +7460,26 @@ export interface components {
             /** Start Failure Detail */
             start_failure_detail?: string | null;
         };
+        /**
+         * DeliveredLimitsIn
+         * @description The limits the worker read from the sandbox it claimed (#5427).
+         *
+         *     Read from the created sandbox, never from desired configuration. A null or
+         *     absent volume means the substrate enforces no such limit, which can never
+         *     release a resource gate.
+         */
+        DeliveredLimitsIn: {
+            /** Ephemeral Storage Bytes */
+            ephemeral_storage_bytes: number | null;
+            /** Max Turns */
+            max_turns: number | null;
+            /** Memory Bytes */
+            memory_bytes: number | null;
+            /** Scratch Bytes */
+            scratch_bytes: {
+                [key: string]: number;
+            };
+        };
         /** DeploymentCreate */
         DeploymentCreate: {
             /**
@@ -8515,6 +8535,8 @@ export interface components {
             ci_fix_round?: number | null;
             /** Detail */
             detail?: string | null;
+            /** Exhausted Volume */
+            exhausted_volume?: string | null;
             /**
              * Outcome
              * @enum {string}
@@ -11308,6 +11330,27 @@ export interface components {
             slack_channel?: string | null;
         };
         /**
+         * ResourceGateOut
+         * @description The raised limit a blocked retry of a resource failure waits for (#5427).
+         *
+         *     ``failed_limit`` is the limit the failed attempt actually had; the retry
+         *     starts only when the limit delivered to its own sandbox is larger.
+         *     ``volume`` names the scratch volume for a scratch gate.
+         */
+        ResourceGateOut: {
+            /** Condition */
+            condition: string;
+            /**
+             * Dimension
+             * @enum {string}
+             */
+            dimension: "memory" | "ephemeral_storage" | "scratch" | "max_turns" | "history_capacity" | "execution_seconds";
+            /** Failed Limit */
+            failed_limit: number;
+            /** Volume */
+            volume: string | null;
+        };
+        /**
          * RetryCondition
          * @description Provider-derived evidence that a failed turn should wait before a retry.
          *
@@ -11650,7 +11693,7 @@ export interface components {
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "requester_principal_invalid" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "tracker_result_no_revision" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
+            refusal: ("not_found" | "requester_principal_invalid" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "stale_version" | "termination_observation_required" | "tracker_result_no_revision" | "resource_gate_unmet" | "personal_owner_required" | "owner_context_unexpected" | "owner_tenant_mismatch" | "owner_tenant_inactive" | "owner_principal_missing" | "owner_principal_inactive" | "enrollment_inactive" | "enrollment_generation_mismatch" | "owner_mismatch" | "personal_rollout_in_progress") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -11940,6 +11983,7 @@ export interface components {
             /** Claim Name */
             claim_name: string;
             context: components["schemas"]["FactoryContext"];
+            delivered_limits: components["schemas"]["DeliveredLimitsIn"];
             /** Generation */
             generation: number;
             /** Owner */
@@ -12860,6 +12904,7 @@ export interface components {
             model_auth_mode?: "service" | "personal";
             /** Owner Principal Id */
             owner_principal_id?: string | null;
+            resource_gate: components["schemas"]["ResourceGateOut"] | null;
             /** Retry Kind */
             retry_kind: ("owner_loss" | "failure") | null;
             /** Retry Of Request Id */

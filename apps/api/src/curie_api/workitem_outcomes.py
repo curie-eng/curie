@@ -35,6 +35,7 @@ from curie_api.forges.hosts import issue_url as tracker_issue_url
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.types import RepositoryRef, RollupState
 from curie_api.schemas.workitems import (
+    ResourceGateOut,
     WorkItemCiObservationOut,
     WorkItemCiOut,
     WorkItemCiState,
@@ -495,6 +496,16 @@ def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
         ),
         dispatch_not_before=req.dispatch_not_before,
         blocked_on=req.blocked_on,
+        resource_gate=(
+            None
+            if req.resource_gate is None
+            else ResourceGateOut.model_validate(
+                {
+                    key: req.resource_gate.get(key)
+                    for key in ("condition", "dimension", "volume", "failed_limit")
+                }
+            )
+        ),
         retry_safety=cast(RetrySafety | None, req.retry_safety),
     )
 

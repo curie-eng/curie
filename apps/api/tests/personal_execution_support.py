@@ -534,6 +534,7 @@ def start_request(request_id: UUID, *, owner: str = RUNTIME_OWNER) -> int:
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits=lifecycle.NO_DELIVERED_LIMITS,
         )
         assert isinstance(started, StartResult), started
         return started.runtime_epoch
@@ -555,6 +556,7 @@ def finish_failed(request_id: UUID, runtime_epoch: int, *, cause: str = "deadlin
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
         assert isinstance(finished, WorkItemOutcome), finished
         assert finished.request is not None and finished.request.status == "failed"

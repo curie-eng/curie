@@ -26,7 +26,7 @@ def test_packaged_schema_metadata_matches_api_authority() -> None:
     api = REPO / "apps/api/src/curie_api"
     window = json.loads((api / "schema_compat.json").read_text())
     kinds = json.loads((api / "revision_kinds.json").read_text())
-    assert window == {"schema_min": "0172", "schema_head": "0172"}
+    assert window == {"schema_min": "0174", "schema_head": "0174"}
     assert metadata["schema_min"] == window["schema_min"]
     assert metadata["schema_head"] == window["schema_head"]
     graph = ScriptDirectory(str(REPO / "apps/api/alembic"))
@@ -61,6 +61,8 @@ def test_packaged_schema_metadata_matches_api_authority() -> None:
     assert revisions["0171"]["kind"] == "expand"
     assert revisions["0172"]["parents"] == ["0171"]
     assert revisions["0172"]["kind"] == "expand"
+    assert revisions["0174"]["parents"] == ["0172"]
+    assert revisions["0174"]["kind"] == "expand"
     for revision in graph.walk_revisions():
         parent = revision.down_revision
         parents = list(parent) if isinstance(parent, (list, tuple)) else [parent] if parent else []

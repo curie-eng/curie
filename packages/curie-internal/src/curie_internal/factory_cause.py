@@ -37,6 +37,27 @@ _CAUSE_TEXT = {
         "reason below, then retry after addressing the sandbox failure."
     ),
     "workspace_error": "the repository workspace could not be prepared for the run.",
+    # Resource exhaustion the substrate positively identified (#5427). A clean
+    # run retries automatically once the named limit delivered is larger.
+    "sandbox_memory_exhausted": (
+        "the runner ran out of memory. Raise the agent's memory limit with "
+        "curie cluster overrides <agent> --runner-resources; the automatic retry "
+        "starts once the limit delivered to the sandbox is larger."
+    ),
+    "sandbox_storage_exhausted": (
+        "the sandbox ran out of ephemeral storage. Raise the agent's ephemeral-storage "
+        "limit with curie cluster overrides <agent> --runner-resources; the automatic "
+        "retry starts once the limit delivered to the sandbox is larger."
+    ),
+    "sandbox_scratch_exhausted": (
+        "a sandbox scratch volume filled up. Raise that volume's size limit in the "
+        "chart's agentSandbox.resourceProfiles; the automatic retry starts once the "
+        "size delivered to the sandbox is larger."
+    ),
+    "sandbox_node_disrupted": (
+        "the Kubernetes node running the sandbox was disrupted. A run with no side "
+        "effects is retried automatically."
+    ),
     "history_capacity": (
         "conversation history capacity exceeded. Work may have happened. "
         "Inspect the result and retry."

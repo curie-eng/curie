@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel, Field, StrictBool, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, model_validator
 
 from curie_api.workitems.lifecycle import RetryConditionFact, WorkItemConflict, WorkItemOutcome
 
@@ -132,12 +132,38 @@ class DeferBody(BaseModel):
     start_failure_detail: str | None = None
 
 
+# A Kubernetes volume name: a DNS label, as the sandbox pod spec names it.
+VOLUME_NAME_PATTERN = r"^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$"
+VolumeName = Annotated[str, StringConstraints(pattern=VOLUME_NAME_PATTERN)]
+
+
+class DeliveredLimitsIn(BaseModel):
+    """The limits the worker read from the sandbox it claimed (#5427).
+
+    Read from the created sandbox, never from desired configuration. A null or
+    absent volume means the substrate enforces no such limit, which can never
+    release a resource gate.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The runner container's memory limit.
+    memory_bytes: int | None = Field(ge=1)
+    # The sum of the pod's regular containers' ephemeral storage limits, the
+    # quantity the kubelet compares.
+    ephemeral_storage_bytes: int | None = Field(ge=1)
+    scratch_bytes: dict[VolumeName, Annotated[int, Field(ge=1)]]
+    # The turn limit in the boot environment the claim used.
+    max_turns: int | None = Field(ge=1)
+
+
 class StartBody(BaseModel):
     owner: str = Field(min_length=1)
     generation: int = Field(ge=1)
     claim_name: str = Field(min_length=1)
     sandbox_name: str = Field(min_length=1)
     context: workitem_dispatch.FactoryContext
+    delivered_limits: DeliveredLimitsIn
 
 
 class HeartbeatBody(BaseModel):
@@ -163,6 +189,9 @@ class FinishBody(BaseModel):
     retry_safety: Literal["no_effects", "flagged", "uncertain"]
     # The provider retry condition the worker received, decoded tolerantly.
     retry_condition: RetryConditionBody | None = None
+    # The scratch volume a scratch exhaustion filled (#5427). Required for
+    # ``sandbox_scratch_exhausted`` and refused for every other cause.
+    exhausted_volume: VolumeName | None = None
 
     @model_validator(mode="after")
     def _round_matches_cause(self) -> Self:
@@ -171,6 +200,15 @@ class FinishBody(BaseModel):
             raise ValueError("ci_fix_unpublished requires ci_fix_round")
         if not unpublished and self.ci_fix_round is not None:
             raise ValueError("ci_fix_round is only valid with cause ci_fix_unpublished")
+        return self
+
+    @model_validator(mode="after")
+    def _volume_matches_cause(self) -> Self:
+        scratch = self.cause.strip() == "sandbox_scratch_exhausted"
+        if scratch and self.exhausted_volume is None:
+            raise ValueError("sandbox_scratch_exhausted requires exhausted_volume")
+        if not scratch and self.exhausted_volume is not None:
+            raise ValueError("exhausted_volume is only valid with cause sandbox_scratch_exhausted")
         return self
 
 
@@ -471,6 +509,8 @@ async def acquire_work_item_request(
         "repository_path": result.repository_path,
         "context": result.context,
         "completion_contract": result.completion_contract,
+        "resource_gate": result.resource_gate,
+        "predecessor_claim_name": result.predecessor_claim_name,
     }
 
 
@@ -509,6 +549,7 @@ async def start_work_item_request(
         claim_name=body.claim_name,
         sandbox_name=body.sandbox_name,
         context=body.context,
+        delivered_limits=body.delivered_limits.model_dump(),
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)
@@ -591,6 +632,7 @@ async def finish_work_item_request(
                 scope_key=body.retry_condition.scope_key,
             )
         ),
+        exhausted_volume=body.exhausted_volume,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

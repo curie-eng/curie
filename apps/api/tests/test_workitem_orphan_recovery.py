@@ -242,6 +242,12 @@ async def _recover(app: Any, request_id: uuid.UUID, old: str) -> dict[str, Any]:
                 claim_name=CLAIM_NAME,
                 sandbox_name=SANDBOX_NAME,
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
 
             # The restarted process: same name, a fresh kernel holding nothing.

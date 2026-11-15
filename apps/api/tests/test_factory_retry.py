@@ -69,6 +69,14 @@ CASES: list[dict[str, Any]] = VECTORS["cases"]
 PLACEHOLDER_AT = "2030-01-01T00:00:00Z"
 _ABSENT = object()
 LIMIT = VECTORS["allowance"]["limit"]
+# Every start delivers a limit for every worker dimension, so a resource gated
+# vector always has its predecessor's delivered value (#5427).
+DELIVERED_LIMITS: dict[str, Any] = {
+    "memory_bytes": 1073741824,
+    "ephemeral_storage_bytes": 2147483648,
+    "scratch_bytes": {"workspace": 1073741824},
+    "max_turns": 40,
+}
 
 
 # -- harness -----------------------------------------------------------------
@@ -325,6 +333,7 @@ async def _acquire_and_start(app: Any, request_id: uuid.UUID, generation: int) -
             claim_name=f"curie-thread-{request_id.hex[:12]}",
             sandbox_name=f"sbx-curie-thread-{request_id.hex[:12]}",
             context=grant.context,
+            delivered_limits=DELIVERED_LIMITS,
         )
         return started.runtime_epoch
 
@@ -358,12 +367,15 @@ def _finish(
     *,
     condition: object = _ABSENT,
     outcome: str = "failed",
+    exhausted_volume: str | None = None,
 ) -> httpx.Response:
     body: dict[str, Any] = {"runtime_epoch": epoch, "outcome": outcome, "cause": cause}
     if safety is not _ABSENT:
         body["retry_safety"] = safety
     if condition is not _ABSENT:
         body["retry_condition"] = condition
+    if exhausted_volume is not None:
+        body["exhausted_volume"] = exhausted_volume
     return api.post(
         f"/v1/internal/work-items/requests/{request_id}/finish", json=body, headers=WORKER
     )
@@ -485,6 +497,12 @@ def _assert_timing(
     due = successor["dispatch_not_before"]
     if case_timing == "blocked":
         assert due == wait
+    elif case_timing == "gated":
+        # Offered again every probe interval, not slept until the deadline.
+        probe = timedelta(seconds=get_settings().work_item_resource_gate_probe_seconds)
+        assert terminal_at + probe <= due <= terminal_at + probe + timedelta(seconds=5)
+        assert successor["resource_gate"] is not None
+        assert successor["resource_gate"]["condition"] == blocked_on
     elif case_timing == "backoff":
         low, high = {1: (24, 36), 2: (96, 144)}[_slot_of(successor)]
         assert timedelta(seconds=low) <= due - terminal_at <= timedelta(seconds=high + 1)
@@ -1447,6 +1465,7 @@ def test_finish_boundary_matches_every_vector(
         facts["cause"],
         facts["retry_safety"],
         condition=_ABSENT if carrier is None else carrier,
+        exhausted_volume=facts.get("exhausted_volume"),
     )
     assert finished.status_code == 200, finished.text
     predecessor = _request(item.request_id)

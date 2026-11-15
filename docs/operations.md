@@ -2059,13 +2059,35 @@ backoff of about 30 seconds for the first retry and about 120 seconds for the
 second, each with a fixed 20 percent jitter keyed by the WorkItem, or at a
 later provider retry time when the worker reported one. A blocked retry waits
 for a named condition, such as `provider_usage_reset` or
-`runner_fault_diagnosis`, and is never dispatched while it is blocked. Nothing
-in this release releases a block, so a blocked retry ends `expired` with cause
-`retry_condition_expired` when its waiting deadline passes, unless a person
-relabels the issue first. Only a wait that was not blocked expires as
+`runner_fault_diagnosis`, and is never dispatched while it is blocked. Only a
+resource gate, described next, releases a block; any other blocked retry ends
+`expired` with cause `retry_condition_expired` when its waiting deadline
+passes, unless a person relabels the issue first. Only a wait that was not blocked expires as
 `capacity_wait_expired`. The counted `not_started` deferrals carry across the
 retries of one WorkItem, so `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` bounds the
 whole chain, not each request.
+
+A run that exhausted a limit is retried only under a strictly larger limit
+(#5427). Each start records the limits actually delivered to its sandbox: the
+runner container memory limit, the pod's ephemeral storage limit, each scratch
+volume's size, the turn limit, the conversation history capacity and the
+execution deadline. A clean `sandbox_memory_exhausted`,
+`sandbox_storage_exhausted`, `sandbox_scratch_exhausted`, `history_capacity`
+or `max_turns` failure admits one retry blocked on `memory_limit`,
+`ephemeral_storage_limit`, `scratch_limit`, `history_capacity` or
+`turn_limit`, gated on the limit the failed run had. A failed run with no
+recorded value for that limit admits no retry. Every
+`CURIE_WORK_ITEM_RESOURCE_GATE_PROBE_SECONDS` (default 300) the reconciler
+offers the gated retry again. The worker checks the current limit before it
+claims a sandbox and defers `resource_gate_unmet` when it is not larger; that
+wait is never counted as a failed start. The start itself refuses the retry
+unless the limit delivered to the new sandbox is strictly larger, so raise
+memory or ephemeral storage with `curie cluster overrides <agent>
+--runner-resources`, and scratch with the volume size in
+`agentSandbox.resourceProfiles`. An unrelated change, such as CPU or another
+scratch volume, does not release it. A gated retry that is never released
+expires as `retry_condition_expired` naming its condition. A clean
+`sandbox_node_disrupted` failure is retried on the ordinary backoff.
 
 Upgrade note: the finish route now requires `retry_safety`. A worker from an
 earlier release omits it, its finish is refused with 422, and its request ends

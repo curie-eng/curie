@@ -288,6 +288,12 @@ def _started_case(client: TestClient, name: str) -> Case:
             "claim_name": f"fixture-{case.request_id.hex}",
             "sandbox_name": f"fixture-sandbox-{case.request_id.hex}",
             "context": acquired.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
         headers=WORKER_HEADERS,
     )

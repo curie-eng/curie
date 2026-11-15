@@ -6748,6 +6748,66 @@
         "title": "DeferBody",
         "type": "object"
       },
+      "DeliveredLimitsIn": {
+        "additionalProperties": false,
+        "description": "The limits the worker read from the sandbox it claimed (#5427).\n\nRead from the created sandbox, never from desired configuration. A null or\nabsent volume means the substrate enforces no such limit, which can never\nrelease a resource gate.",
+        "properties": {
+          "ephemeral_storage_bytes": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ephemeral Storage Bytes"
+          },
+          "max_turns": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Turns"
+          },
+          "memory_bytes": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Bytes"
+          },
+          "scratch_bytes": {
+            "patternProperties": {
+              "^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$": {
+                "minimum": 1.0,
+                "type": "integer"
+              }
+            },
+            "title": "Scratch Bytes",
+            "type": "object"
+          }
+        },
+        "required": [
+          "memory_bytes",
+          "ephemeral_storage_bytes",
+          "scratch_bytes",
+          "max_turns"
+        ],
+        "title": "DeliveredLimitsIn",
+        "type": "object"
+      },
       "DeploymentCreate": {
         "properties": {
           "agent_id": {
@@ -9188,6 +9248,18 @@
               }
             ],
             "title": "Detail"
+          },
+          "exhausted_volume": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exhausted Volume"
           },
           "outcome": {
             "enum": [
@@ -15409,6 +15481,50 @@
         "title": "ResolvedTarget",
         "type": "object"
       },
+      "ResourceGateOut": {
+        "description": "The raised limit a blocked retry of a resource failure waits for (#5427).\n\n``failed_limit`` is the limit the failed attempt actually had; the retry\nstarts only when the limit delivered to its own sandbox is larger.\n``volume`` names the scratch volume for a scratch gate.",
+        "properties": {
+          "condition": {
+            "title": "Condition",
+            "type": "string"
+          },
+          "dimension": {
+            "enum": [
+              "memory",
+              "ephemeral_storage",
+              "scratch",
+              "max_turns",
+              "history_capacity",
+              "execution_seconds"
+            ],
+            "title": "Dimension",
+            "type": "string"
+          },
+          "failed_limit": {
+            "title": "Failed Limit",
+            "type": "integer"
+          },
+          "volume": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Volume"
+          }
+        },
+        "required": [
+          "condition",
+          "dimension",
+          "volume",
+          "failed_limit"
+        ],
+        "title": "ResourceGateOut",
+        "type": "object"
+      },
       "RetryCondition": {
         "description": "Provider-derived evidence that a failed turn should wait before a retry.\n\nCarried as ``ErrorEvent.retry_condition``. A missing or null carrier means\nno trusted retry condition, and a consumer must never read that as retry\nnow. A present carrier is evidence for a wait. It is never authorization,\nan approval, an increased limit, or permission to replay an effect: the\nno-retry-after-side-effects rule and every other gate still apply.\n\n``reason`` is the closed ``RetryReason`` the producer derived from the\nprovider's own signal. Nothing infers a reset from\n``ErrorEvent.classification``; a classification token alone never creates\na retry condition.\n\n``retry_at`` is optional. When present it is an absolute, provider-derived\nUTC instant spelled as ``RETRY_AT_PATTERN`` describes. Naive values,\nnumeric offsets (``+00:00`` included), unix numbers and every other\nspelling are refused rather than coerced, so every lane reads the same\ninstant. A past instant is valid; consumers judge time themselves. The\nscheduler adds its own separate 60 second reset grace; the producer reports\nthe provider's time without it. A Python ``datetime`` is accepted only with\na zero UTC offset and is normalized to ``UTC``, so every Python producer\nwrites the ``Z`` form. Python also normalizes the fraction spelling on\nre-encode (``.5Z`` becomes ``.500000Z`` and a zero fraction is dropped)\nwhile the generated Rust keeps the received string; both name the same\ninstant.\n\n``scope_key`` is optional. When present it is an opaque digest of the\ncredential scope the condition applies to, ``sha256:`` followed by 64\nlowercase hex digits (``RETRY_SCOPE_KEY_PATTERN``). It is never a\ncredential value, an account name or a provider message. The grammar check\nis the only guard on it and is not a secret detector, so a producer must\nderive the value from a digest rather than rely on validation to catch a\nleak.",
         "properties": {
@@ -16029,6 +16145,7 @@
                   "stale_version",
                   "termination_observation_required",
                   "tracker_result_no_revision",
+                  "resource_gate_unmet",
                   "personal_owner_required",
                   "owner_context_unexpected",
                   "owner_tenant_mismatch",
@@ -16797,6 +16914,9 @@
           "context": {
             "$ref": "#/components/schemas/FactoryContext"
           },
+          "delivered_limits": {
+            "$ref": "#/components/schemas/DeliveredLimitsIn"
+          },
           "generation": {
             "minimum": 1.0,
             "title": "Generation",
@@ -16818,7 +16938,8 @@
           "generation",
           "claim_name",
           "sandbox_name",
-          "context"
+          "context",
+          "delivered_limits"
         ],
         "title": "StartBody",
         "type": "object"
@@ -19134,6 +19255,16 @@
             ],
             "title": "Owner Principal Id"
           },
+          "resource_gate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResourceGateOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "retry_kind": {
             "anyOf": [
               {
@@ -19273,6 +19404,7 @@
           "retry_kind",
           "dispatch_not_before",
           "blocked_on",
+          "resource_gate",
           "retry_safety"
         ],
         "title": "WorkItemRequestOut",

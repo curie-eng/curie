@@ -483,6 +483,12 @@ def _start_running(client: TestClient, request_id: uuid.UUID) -> int:
                 claim_name=f"claim-{request_id.hex[:12]}",
                 sandbox_name=f"sbx-{request_id.hex[:12]}",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)

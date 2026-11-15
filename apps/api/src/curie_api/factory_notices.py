@@ -131,6 +131,12 @@ _FAILURE_CLASS_BY_CAUSE = {
     "budget_exceeded": "budget-exceeded",
     "runner_timeout": "runner-timeout",
     "sandbox_terminated": "sandbox-terminated",
+    # A diagnosed sandbox exhaustion or node disruption is still a sandbox
+    # termination by class (#5427); the cause names which.
+    "sandbox_memory_exhausted": "sandbox-terminated",
+    "sandbox_storage_exhausted": "sandbox-terminated",
+    "sandbox_scratch_exhausted": "sandbox-terminated",
+    "sandbox_node_disrupted": "sandbox-terminated",
     "workspace_error": "workspace-error",
     "runner_error": "runner-error",
     "authentication_required": "authentication-required",
@@ -497,7 +503,8 @@ def utc_text(value: datetime) -> str:
 def retry_state_line(*, dispatch_not_before: datetime, blocked_on: str | None) -> str:
     """Whether an automatic retry is scheduled or blocked, and until when.
 
-    A blocked retry stores its waiting deadline as ``dispatch_not_before``.
+    For a blocked retry the caller passes its waiting deadline, which
+    ``retry_state_time`` picks.
     """
 
     if blocked_on:
@@ -507,6 +514,19 @@ def retry_state_line(*, dispatch_not_before: datetime, blocked_on: str | None) -
             f"{utc_text(dispatch_not_before)}, the retry expires."
         )
     return f"Scheduled: the automatic retry starts at or after {utc_text(dispatch_not_before)}."
+
+
+def retry_state_time(row: ExecutionRequest) -> datetime:
+    """The time a retry's state line names: its waiting deadline when blocked.
+
+    An ungated blocked retry stores that deadline as its dispatch time, but a
+    resource gated one is offered every probe interval (#5427), so its
+    dispatch time is the next probe, not when the wait ends.
+    """
+
+    if row.blocked_on is not None and row.wait_deadline is not None:
+        return row.wait_deadline
+    return row.dispatch_not_before
 
 
 def _retrying_section(cause: str, successor: RetrySuccessor, *, feedback_url: str | None) -> str:
@@ -552,7 +572,7 @@ async def retry_successor(
     return RetrySuccessor(
         owner_loss=successor.owner_lost_retry,
         slot=int(slot or 0),
-        dispatch_not_before=successor.dispatch_not_before,
+        dispatch_not_before=retry_state_time(successor),
         blocked_on=successor.blocked_on,
     )
 
@@ -1386,7 +1406,7 @@ async def _render(
     elif request.status == "waiting" and request.retry_of_request_id is not None:
         waiting_lines.append(
             retry_state_line(
-                dispatch_not_before=request.dispatch_not_before, blocked_on=request.blocked_on
+                dispatch_not_before=retry_state_time(request), blocked_on=request.blocked_on
             )
         )
     if request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
