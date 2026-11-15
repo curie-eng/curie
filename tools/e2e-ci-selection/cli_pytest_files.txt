@@ -149,6 +149,7 @@ tools/factory-e2e/tests/test_docker_scenario.py
 tools/factory-e2e/tests/test_dynamic_base_harness.py
 tools/factory-e2e/tests/test_factory_e2e.py
 tools/factory-e2e/tests/test_factory_e2e_loop.py
+tools/factory-e2e/tests/test_factory_resource_retry.py
 tools/factory-e2e/tests/test_forge_instance_harness.py
 tools/factory-e2e/tests/test_gitlab_acceptance.py
 tools/factory-e2e/tests/test_gitlab_driver.py

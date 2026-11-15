@@ -2084,7 +2084,9 @@ wait is never counted as a failed start. The start itself refuses the retry
 unless the limit delivered to the new sandbox is strictly larger, so raise
 memory or ephemeral storage with `curie cluster overrides <agent>
 --runner-resources`, and scratch with the volume size in
-`agentSandbox.resourceProfiles`. An unrelated change, such as CPU or another
+`agentSandbox.resourceProfiles`, the conversation history capacity with
+`api.transcriptMaxThreadBytes`, and the turn limit with
+`worker.workItemMaxTurns`. An unrelated change, such as CPU or another
 scratch volume, does not release it. A gated retry that is never released
 expires as `retry_condition_expired` naming its condition. A clean
 `sandbox_node_disrupted` failure is retried on the ordinary backoff.

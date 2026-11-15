@@ -59,8 +59,9 @@ _CAUSE_TEXT = {
         "effects is retried automatically."
     ),
     "history_capacity": (
-        "conversation history capacity exceeded. Work may have happened. "
-        "Inspect the result and retry."
+        "conversation history capacity exceeded. Raise api.transcriptMaxThreadBytes "
+        "(TRANSCRIPT_MAX_THREAD_BYTES); a run with no side effects retries automatically "
+        "once the cap is larger. If work may have happened, inspect the result and retry."
     ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
     "runner_error": "the runner reported an error the run could not recover from.",
@@ -74,7 +75,8 @@ _CAUSE_TEXT = {
     ),
     "max_turns": (
         "the run used its whole turn budget. Raise worker.workItemMaxTurns "
-        "(CURIE_WORK_ITEM_MAX_TURNS) to allow more turns, then retry."
+        "(CURIE_WORK_ITEM_MAX_TURNS); a run with no side effects retries automatically "
+        "once the budget is larger. If work may have happened, inspect the result and retry."
     ),
     "runner_failed": "the run ended without a result.",
     "approval_create_failed": (
