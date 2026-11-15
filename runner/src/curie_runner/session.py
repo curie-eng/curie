@@ -440,6 +440,7 @@ class SessionRunner:
         channel_kind: str | None = None,
         final_answer: FinalAnswerPolicy | None = None,
         initializer: Callable[[], Awaitable[None]] | None = None,
+        session_initializer: Callable[[], Awaitable[None]] | None = None,
         cleanup_timeout_s: float = _ABANDONED_TURN_DRAIN_TIMEOUT_S,
     ) -> None:
         if not math.isfinite(cleanup_timeout_s) or cleanup_timeout_s <= 0:
@@ -452,6 +453,8 @@ class SessionRunner:
         # task, which is scheduled at application startup and does not block
         # the listener from binding (#4777).
         self._initializer = initializer
+        self._session_initializer = session_initializer
+        self._boot_ready = False
         self._start_task: asyncio.Task[None] | None = None
         # The attachments this boot found, named on the first prompt sent
         # (#3691): the worker boots a sandbox for every turn that carries a
@@ -646,7 +649,7 @@ class SessionRunner:
 
     @property
     def ready(self) -> bool:
-        return self._started
+        return self._started or self._boot_ready
 
     @property
     def turn_active(self) -> bool:
@@ -1108,10 +1111,18 @@ class SessionRunner:
     async def _initialize(self) -> None:
         if self._initializer is not None:
             await self._initializer()
-        self._advertised_tools = None
-        self._session = self._factory()
-        await self._session.connect()
-        self._started = True
+        # The worker must observe boot readiness before it can deliver inputs
+        # needed to construct the model session (ADR 0278, #5592).
+        self._boot_ready = self._session_initializer is not None
+        try:
+            if self._session_initializer is not None:
+                await self._session_initializer()
+            self._advertised_tools = None
+            self._session = self._factory()
+            await self._session.connect()
+            self._started = True
+        finally:
+            self._boot_ready = False
         logger.info("session started session=%s", self._session_id)
 
     async def start(self) -> None:

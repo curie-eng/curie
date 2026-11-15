@@ -52,6 +52,7 @@ from opentelemetry import trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
 
 from apps.worker.tests.queue_fixtures import factory_context, factory_conversation
+from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
 
 # importlib import mode does not add the tests directory to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -2458,7 +2459,7 @@ class _FactoryWorkspace:
         return SimpleNamespace(repo_full_name="acme-corp/widgets", base_sha="a1" * 20)
 
 
-class _FactoryWorkItems:
+class _FactoryWorkItems(AbsentRequesterContext):
     """The WorkItems dispatch double: an acquired execution that records each call."""
 
     def __init__(self) -> None:

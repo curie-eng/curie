@@ -36,13 +36,24 @@ settings refusals in ``test_personal_claude_auth.py`` instead.
 
 from __future__ import annotations
 
+import datetime
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
+import anyio
 import pytest
 from aci_protocol import SessionStatus
 from curie_runner import personal_auth
+from curie_runner.adapter import (
+    ClaudeAgentSession,
+    build_structured_resume,
+    model_message_to_conversation,
+)
+from curie_runner.history import ConversationMessage, HarnessReplayState
 from curie_runner.personal_auth import AUTH_MODE_ENV, PersonalLaunchRefusedError
 from personal_auth_support import (
     FORCED_SUBAGENT_MODEL,
@@ -510,3 +521,293 @@ def test_a_workspace_fallback_model_is_refused_before_the_cli_starts(
         connect_session(wiring)
 
     assert_cli_never_started(install.proxy)
+
+
+# --- ADR 0278 section 5: reviewer context isolation (#5592) ---------------------------------
+#
+# Only the implementer applies the requester's coding instructions. These cases
+# give the implementer a system prompt carrying a requester section and user
+# text of its own, then drive both reviewer roles through the real bundled CLI on
+# a fresh session, a native resume and a portable replay whose native checkpoint
+# was dropped. Every reviewer request must carry its role file and the control
+# token the review gate hook delivered in its rewritten prompt, and nothing that
+# exists only in the implementer's system prompt or transcript. The implementer's
+# own requests carry every canary, which is the proof this test would see a leak.
+
+_SECTION_CANARY = "REQUESTER-CANARY-7f3c: prefer early returns over nested branches."
+_PRIOR_CANARY = "PRIOR-TURN-CANARY-41d9"
+_TURN_CANARY = "THIS-TURN-CANARY-c02e"
+_CONTROL = "REVIEW-CONTROL-TOKEN-9a1b"
+_REVIEW_GATE = _FACTORY / "hooks" / "review_gate.py"
+_CONTRACT = _FACTORY / "verification" / "contract.md"
+_ISSUE_READ = "mcp__curie__get_issue"
+
+
+def _implementer_prompt(section: str) -> str:
+    return f"{IMPLEMENTER_MARKER}\n\n{section}"
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=factory@example.com",
+            "-c",
+            "user.name=Factory Test",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=cwd,
+        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        check=True,
+        capture_output=True,
+    )
+
+
+class _ReviewGate:
+    """The factory's real review gate hook, driven over its stdin contract.
+
+    It rewrites each reviewer call the way the bundle's PreToolUse hook does in
+    a pod: the verification contract appended, and for the diff reviewer the
+    ``CANDIDATE:`` block naming the rendered patch.
+    """
+
+    def __init__(self, root: Path, workspace: Path) -> None:
+        self.workspace = workspace
+        self.env = {
+            **{
+                k: v
+                for k, v in os.environ.items()
+                if not k.startswith("GIT_") and k not in ("CURIE_SESSION_ID",)
+            },
+            "DARK_FACTORY_STATE_DIR": str(root / "review-state"),
+            "DARK_FACTORY_PROGRESS_LOG": str(root / "review-progress.log"),
+        }
+
+    def send(self, event: str, **fields: object) -> dict[str, object] | None:
+        payload = {
+            "session_id": "review-isolation",
+            "hook_event_name": event,
+            "cwd": str(self.workspace),
+            **fields,
+        }
+        done = subprocess.run(
+            [sys.executable, str(_REVIEW_GATE)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=self.env,
+            check=True,
+        )
+        return json.loads(done.stdout) if done.stdout.strip() else None
+
+    def rewritten_prompts(self, plugin: str) -> dict[str, str]:
+        """Each role's prompt after the hook's PreToolUse rewrite."""
+
+        deadline = (
+            datetime.datetime.now(datetime.UTC).replace(microsecond=0) + datetime.timedelta(hours=2)
+        ).isoformat()
+        self.send("UserPromptSubmit", prompt="Implement the issue.")
+        issue = {
+            "issue": "#1",
+            "url": "https://github.com/example/repo/issues/1",
+            "ticket": "example",
+            "execution_deadline": deadline,
+            "execution_seconds": 7200,
+        }
+        self.send(
+            "PostToolUse",
+            tool_name=_ISSUE_READ,
+            tool_input={},
+            tool_response=[{"type": "text", "text": json.dumps(issue)}],
+        )
+        prompts: dict[str, str] = {}
+        for role in _ROLES:
+            kind = f"{plugin}:{role}"
+            out = self.send(
+                "PreToolUse",
+                tool_name="Agent",
+                tool_input={
+                    "subagent_type": kind,
+                    "description": role,
+                    "prompt": f"Review the change for issue 1. {_CONTROL}",
+                },
+            )
+            assert isinstance(out, dict), out
+            decision = out["hookSpecificOutput"]
+            assert isinstance(decision, dict) and decision["permissionDecision"] == "allow", out
+            updated = decision["updatedInput"]
+            assert isinstance(updated, dict)
+            prompts[role] = str(updated["prompt"])
+            self.send(
+                "PostToolUse",
+                tool_name="Agent",
+                tool_input=updated,
+                tool_response={
+                    "content": [{"type": "text", "text": f"REVIEWER: {role}\nVERDICT: APPROVE"}]
+                },
+            )
+            if role == "plan-reviewer":
+                # A change for the diff reviewer's candidate to render.
+                (self.workspace / "notes.txt").write_text("changed\n", encoding="utf-8")
+        return prompts
+
+
+class _IsolationScript(_ReviewScript):
+    """Primes one implementer turn, then calls each role with the hook's prompt."""
+
+    def __init__(self, plugin: str, prompts: Mapping[str, str]) -> None:
+        super().__init__(plugin)
+        self.prompts = dict(prompts)
+        self.priming = False
+
+    def __call__(self, request: RecordedRequest) -> Reply:
+        role = self.role_of(request)
+        if role == "implementer":
+            if self.priming:
+                return TextReply("primed")
+            done = len(request.tool_results())
+            if done < len(_ROLES):
+                return ToolCall(
+                    "Agent",
+                    {
+                        "subagent_type": self.subagent_types[done],
+                        "description": f"Review round {done + 1}",
+                        "prompt": self.prompts[_ROLES[done]],
+                        "run_in_background": False,
+                    },
+                    f"toolu_review_{done + 1}",
+                )
+            return TextReply("done")
+        if role in _ROLES:
+            return TextReply(f"REVIEWER: {role}\nVERDICT: APPROVE")
+        return TextReply("done")
+
+
+def _prime(
+    install: Installation, script: _IsolationScript, bundle: str, system_prompt: str
+) -> tuple[list[ConversationMessage], HarnessReplayState | None]:
+    """One earlier implementer turn; its portable messages and native checkpoint."""
+
+    resume = build_structured_resume(
+        (), curie_session_id=_ISOLATION_SESSION, cwd=str(install.workspace)
+    )
+    wiring = wire_session(
+        install,
+        reviewer_model=REVIEWER_MODEL,
+        plugin_dir=bundle,
+        system_prompt=system_prompt,
+        resume=resume,
+    )
+
+    async def scenario() -> tuple[list[ConversationMessage], HarnessReplayState | None]:
+        session = ClaudeAgentSession(wiring.options)
+        await session.connect()
+        try:
+            await session.query(f"Start on the issue. {_PRIOR_CANARY}")
+            messages = [
+                projected
+                for message in [m async for m in session.receive_turn()]
+                if (projected := model_message_to_conversation(message)) is not None
+            ]
+            return messages, await session.export_replay_state()
+        finally:
+            await session.close()
+
+    script.priming = True
+    try:
+        return anyio.run(scenario)
+    finally:
+        script.priming = False
+
+
+_ISOLATION_SESSION = "curie-thread-review-isolation"
+_ISOLATION_PATHS = ("fresh", "native-resume", "replay-without-checkpoint")
+
+
+def _isolation_turn(
+    install: Installation, path: str, section: str
+) -> tuple[_IsolationScript, dict[str, list[RecordedRequest]]]:
+    _git(install.workspace, "init", "-q")
+    (install.workspace / "README.md").write_text("fixture\n", encoding="utf-8")
+    _git(install.workspace, "add", "-A")
+    _git(install.workspace, "commit", "-q", "-m", "init")
+    plugin = _plugin_name()
+    prompts = _ReviewGate(install.root, install.workspace).rewritten_prompts(plugin)
+    bundle = write_bundle(
+        install.root / "bundle",
+        name=plugin,
+        agents={f"{role}.md": _role_text(role) for role in _ROLES},
+    )
+    script = _IsolationScript(plugin, prompts)
+    install.proxy.responder = script
+    system_prompt = _implementer_prompt(section)
+    resume = None
+    if path != "fresh":
+        prior, checkpoint = _prime(install, script, bundle, system_prompt)
+        assert checkpoint is not None and checkpoint.kind == "checkpoint"
+        prior_user = ConversationMessage(
+            role="user", content=f"Start on the issue. {_PRIOR_CANARY}"
+        )
+        resume = build_structured_resume(
+            (prior_user, *prior),
+            curie_session_id=_ISOLATION_SESSION,
+            cwd=str(install.workspace),
+            harness_replay=checkpoint if path == "native-resume" else None,
+            system_prompt=system_prompt,
+        )
+        assert resume.resume is not None
+    primed = len(install.proxy.model_requests())
+    outcome = run_turn(
+        wire_session(
+            install,
+            reviewer_model=REVIEWER_MODEL,
+            plugin_dir=bundle,
+            max_turns=8,
+            system_prompt=system_prompt,
+            resume=resume,
+        ),
+        prompt=f"Implement the issue. {_TURN_CANARY}",
+    )
+    assert outcome.final.status is SessionStatus.DONE, outcome.errors
+    by_role: dict[str, list[RecordedRequest]] = {}
+    for request in install.proxy.model_requests()[primed:]:
+        by_role.setdefault(script.role_of(request), []).append(request)
+    assert sorted(by_role) == sorted(["implementer", *_ROLES]), sorted(by_role)
+    return script, by_role
+
+
+def _contract_line() -> str:
+    return next(line for line in _CONTRACT.read_text("utf-8").splitlines() if line.strip())
+
+
+@requires_cli
+@pytest.mark.parametrize("path", _ISOLATION_PATHS)
+def test_reviewer_requests_never_carry_the_implementer_context(
+    install: Installation, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
+
+    script, by_role = _isolation_turn(install, path, _SECTION_CANARY)
+
+    implementer_only = [_SECTION_CANARY, IMPLEMENTER_MARKER, _TURN_CANARY, _PRIOR_CANARY]
+    # Positive control: the implementer's own requests carry every canary the
+    # reviewers must not, so a leak would be seen.
+    first = by_role["implementer"][0]
+    assert _SECTION_CANARY in first.system and IMPLEMENTER_MARKER in first.system
+    implementer_body = json.dumps(first.body)
+    assert _TURN_CANARY in implementer_body
+    assert (_PRIOR_CANARY in implementer_body) is (path != "fresh")
+    for role in _ROLES:
+        assert by_role[role], f"{role} sent no request"
+        for request in by_role[role]:
+            body = json.dumps(request.body)
+            assert script.role_lines[role] in request.system
+            # The hook-rewritten prompt reached the reviewer: the control token
+            # and the appended verification contract.
+            assert _CONTROL in body, f"{role} never saw its own prompt"
+            assert _contract_line() in body, f"{role} prompt was not the hook's rewrite"
+            leaked = [token for token in implementer_only if token in body]
+            assert leaked == [], f"{role} request on {path} carried {leaked}"

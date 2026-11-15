@@ -15,7 +15,7 @@ import os
 import shutil
 import socket
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -51,8 +51,11 @@ from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_internal.turn_queue import to_stream_fields
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
+from curie_runner.issue_read import resolve_issue_read
+from curie_runner.requester_context import RequesterContextGate
 from curie_runner.server import create_app as create_runner_app
 from curie_runner.session import SessionRunner
+from curie_runner.tracker_result import bind_completion_contract
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import FactoryWake
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
@@ -199,10 +202,17 @@ def _provider_unreachable() -> list[Any]:
     ]
 
 
-def _real_runner_app(index: int, paths: list[str]) -> web.Application:
-    """The production runner app over a scripted model, recording each path asked."""
+def _real_runner_app(
+    index: int, paths: list[str], boot_env: Callable[[], dict[str, str] | None]
+) -> web.Application:
+    """The production runner app over a scripted model, recording each path asked.
+
+    ``boot_env`` answers the environment of the claim that took this runner.
+    """
 
     session = FakeModelSession(script_factory=_provider_unreachable)
+    gate = RequesterContextGate()
+    booting = asyncio.Lock()
     app = create_runner_app(
         SessionRunner(
             max_usd_per_day=None,
@@ -212,12 +222,20 @@ def _real_runner_app(index: int, paths: list[str]) -> web.Application:
             tracer=RunTracer(None),
             classifier=SideEffectClassifier(),
             trace_name=f"factory-retry-{index}",
-        )
+        ),
+        requester_context=gate,
     )
 
     @web.middleware
     async def record(request: web.Request, handler: Any) -> web.StreamResponse:
         paths.append(request.path)
+        async with booting:
+            if not gate.bound:
+                # The runner process boots after its claim: it reads its
+                # completion contract through the issue read capability in its
+                # environment and serves the requester context of that execution.
+                contract = await bind_completion_contract(resolve_issue_read(boot_env() or {}))
+                gate.bind(contract.contract.execution)
         response: web.StreamResponse = await handler(request)
         return response
 
@@ -790,9 +808,17 @@ class FactoryRetryCase(StartWaitCase):
         """
 
         served: list[RealRunner] = []
+        cluster = self.h.fake_k8s
+        # Every claim from here on takes the next pooled runner, in order.
+        unpooled = len(cluster.claim_envs) - len(cluster.assigned_ports)
         for index in range(count):
             paths: list[str] = []
-            server = TestServer(_real_runner_app(index, paths))
+            position = unpooled + len(cluster.runner_ports)
+            server = TestServer(
+                _real_runner_app(
+                    index, paths, lambda position=position: cluster.claim_envs[position]
+                )
+            )
             await server.start_server()
             assert server.port is not None
             self.runner_servers.append(server)

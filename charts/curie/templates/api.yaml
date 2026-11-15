@@ -392,6 +392,8 @@ spec:
               value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
             - name: FACTORY_BASE_LABEL_SETTLE_S
               value: {{ dig "baseLabelSettleSeconds" 60 (.Values.factory | default dict) | quote }}
+            - name: CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY
+              value: {{ dig "requesterCodingInstructions" "apply" true (.Values.factory | default dict) | quote }}
             - name: FACTORY_CI_WAIT_S
               value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 3600) | quote }}
             - name: CURIE_FORGES

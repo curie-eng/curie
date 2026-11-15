@@ -28,6 +28,7 @@ from curie_api.schemas.workitems import (
 )
 
 from .. import factory_tracker_result_runtime as runtime
+from .. import requester_instruction_context
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
@@ -314,10 +315,17 @@ async def read_completion_contract(
         raise _refused(refused.code) from None
     except (runtime.SourceUnavailable, IssueReadUnavailable):
         raise _tracker_unavailable() from None
+    # ADR 0278 (#5592): the runner waits for the worker's envelope for this
+    # execution, and checks it against this binding, before any model work.
+    execution = await requester_instruction_context.execution_binding(
+        session, pair.work_item, pair.request
+    )
+    await session.rollback()
     return CompletionContractOut(
         completion_contract=view.completion_contract,
         result_kinds=list(view.result_kinds),
         session_usd_allowance=view.session_usd_allowance,
+        execution=execution,
     )
 
 

@@ -1520,6 +1520,8 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/work-items/requests/{request_id}/requester-context",
+          "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
           "/v1/internal/factory-slack/kickoff",
           "/v1/internal/channel-read/context",
@@ -1570,7 +1572,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9200
+      "cardinality_bound": 9280
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1784,6 +1786,8 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/work-items/requests/{request_id}/requester-context",
+          "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
           "/v1/internal/factory-slack/kickoff",
           "/v1/internal/channel-read/context",
@@ -1834,7 +1838,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9200
+      "cardinality_bound": 9280
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -2048,6 +2052,8 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/work-items/requests/{request_id}/requester-context",
+          "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
           "/v1/internal/factory-slack/steer",
           "/v1/internal/factory-slack/kickoff",
           "/v1/internal/channel-read/context",
@@ -2091,7 +2097,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1840
+      "cardinality_bound": 1856
     },
     "curie.background.loop": {
       "type": "counter",

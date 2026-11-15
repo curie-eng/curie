@@ -385,7 +385,7 @@ def test_partial_resource_creation_failure_deletes_every_attempted_owned_resourc
     assert "connection lost after create" in evidence["error"]
     assert evidence["cleanup_verified"] is True
     assert evidence["cleanup_errors"] == []
-    assert ("docker", "rm", "-f", evidence["registry"]) in calls
+    assert ("docker", "rm", "-f", "-v", evidence["registry"]) in calls
     cluster_delete = ("kind", "delete", "cluster", "--name", evidence["cluster"])
     assert (cluster_delete in calls) is (failure_stage == "cluster")
     assert not list((tmp_path / "scratch").iterdir())
@@ -433,7 +433,7 @@ def test_remaining_owned_cluster_overrides_a_successful_scenario(
     assert evidence["cleanup_verified"] is False
     assert "owned kind cluster remains after teardown" in evidence["cleanup_errors"]
     assert "owned kind node container remains after teardown" in evidence["cleanup_errors"]
-    assert ("docker", "rm", "-f", evidence["registry"]) in calls
+    assert ("docker", "rm", "-f", "-v", evidence["registry"]) in calls
 
 
 def test_cluster_delete_error_does_not_prevent_registry_deletion(
@@ -460,7 +460,7 @@ def test_cluster_delete_error_does_not_prevent_registry_deletion(
     evidence = _evidence(tmp_path)
     assert evidence["cleanup_verified"] is False
     assert any("owned cluster deletion failed" in error for error in evidence["cleanup_errors"])
-    assert ("docker", "rm", "-f", evidence["registry"]) in calls
+    assert ("docker", "rm", "-f", "-v", evidence["registry"]) in calls
 
 
 def test_unexpected_real_model_request_fails_and_records_evidence_after_endpoint_cleanup(
@@ -553,7 +553,7 @@ def _assert_remaining_teardown_attempted(
     calls: list[tuple[str, ...]],
 ) -> None:
     assert ("kind", "delete", "cluster", "--name", run.cluster) in calls
-    assert ("docker", "rm", "-f", run.registry) in calls
+    assert ("docker", "rm", "-f", "-v", run.registry) in calls
     assert run.workdir is not None and not run.workdir.exists()
 
 
@@ -691,8 +691,48 @@ def test_failed_registry_delete_and_verification_still_remove_owned_workdir(
     errors = run.cleanup()
     assert any("owned registry verification failed" in error for error in errors)
     assert run.evidence["cleanup_verified"] is False
-    assert ("docker", "rm", "-f", run.registry) in calls
+    assert ("docker", "rm", "-f", "-v", run.registry) in calls
     assert run.workdir is not None and not run.workdir.exists()
+
+
+def test_teardown_removes_anonymous_volumes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown removes anonymous volumes with the containers that own them."""
+
+    run = _cleanup_run(tmp_path, monkeypatch)
+    calls: list[tuple[str, ...]] = []
+    labelled_listings = 0
+
+    def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal labelled_listings
+        calls.append(argv)
+        output = ""
+        if argv[:3] == ("docker", "ps", "-aq") and any(
+            "label=curie.factory-scripted=" in arg for arg in argv
+        ):
+            labelled_listings += 1
+            if labelled_listings == 1:
+                output = "deadbeef\n"
+        elif argv[:3] not in {
+            ("kind", "delete", "cluster"),
+            ("kind", "get", "clusters"),
+            ("docker", "rm", "-f"),
+            ("docker", "ps", "-aq"),
+        }:
+            raise AssertionError(f"unexpected external command: {argv}")
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+
+    assert run.cleanup() == []
+    # docker rm --volumes removes anonymous volumes associated with the container.
+    # https://docs.docker.com/reference/cli/docker/container/rm/
+    rm_argv = [argv for argv in calls if argv[:2] == ("docker", "rm")]
+    assert ("docker", "rm", "-f", "-v", run.registry) in rm_argv
+    assert ("docker", "rm", "-f", "-v", "deadbeef") in rm_argv
+    assert all("-v" in argv for argv in rm_argv)
 
 
 def test_registry_publishes_the_explicit_port_its_mirror_names(

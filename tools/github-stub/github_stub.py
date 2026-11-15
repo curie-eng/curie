@@ -14,6 +14,7 @@ import ssl
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -334,6 +335,35 @@ class GithubStub:
                 "INSERT OR REPLACE INTO objects VALUES(?,?,?)", (kind, identifier, json.dumps(body))
             )
 
+    def _insert_new(self, kind: str, build: Callable[[int], dict[str, Any]]) -> dict[str, Any]:
+        """Insert one new object, allocating its id under a write lock.
+
+        The id is chosen and the row is inserted before the lock is released, so
+        concurrent creators cannot share an id or replace one another's row.
+        """
+
+        connection = sqlite3.connect(self._database, timeout=30, isolation_level="IMMEDIATE")
+        try:
+            # A data-changing statement opens the write transaction. This matches
+            # no row, and the id read and the insert then share that lock.
+            connection.execute("UPDATE objects SET kind=kind WHERE 0")
+            current = connection.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM objects WHERE kind=?", (kind,)
+            ).fetchone()
+            identifier = int(current[0]) + 1
+            body = build(identifier)
+            if int(body["id"]) != identifier:
+                raise RuntimeError("allocated id does not match the stored object")
+            connection.execute(
+                "INSERT INTO objects(kind, id, body) VALUES(?,?,?)",
+                (kind, identifier, json.dumps(body)),
+            )
+            connection.commit()
+            return body
+        finally:
+            # Close rolls back when commit did not run, releasing the write lock.
+            connection.close()
+
     def _rows(self, kind: str) -> list[dict[str, Any]]:
         with sqlite3.connect(self._database) as connection:
             return [
@@ -369,21 +399,23 @@ class GithubStub:
         *,
         performed_via_github_app: dict[str, Any] | None = None,
     ) -> None:
-        identifier = max((row["id"] for row in self._rows("event")), default=0) + 1
-        row = {
-            "id": identifier,
-            "issue_number": number,
-            "event": event,
-            "label": {"name": label},
-            "actor": actor,
-            "created_at": _utc(),
-        }
-        row["performed_via_github_app"] = (
-            {"id": 51}
-            if actor == BOT and performed_via_github_app is None
-            else performed_via_github_app
-        )
-        self._put("event", identifier, row)
+        def build(identifier: int) -> dict[str, Any]:
+            row = {
+                "id": identifier,
+                "issue_number": number,
+                "event": event,
+                "label": {"name": label},
+                "actor": actor,
+                "created_at": _utc(),
+            }
+            row["performed_via_github_app"] = (
+                {"id": 51}
+                if actor == BOT and performed_via_github_app is None
+                else performed_via_github_app
+            )
+            return row
+
+        self._insert_new("event", build)
 
     def _ref(self, branch: str) -> str:
         return (
@@ -500,20 +532,23 @@ class GithubStub:
         app: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Seed an authenticated-read comment with independent author and App provenance."""
-        identifier = max((row["id"] for row in self._rows("comment")), default=0) + 1
-        comment = {
-            "id": identifier,
-            "body": body,
-            "issue_number": number,
-            "user": author,
-            "performed_via_github_app": app,
-            "created_at": _utc(),
-            "updated_at": _utc(),
-            "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
-            "html_url": f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}",
-        }
-        self._put("comment", identifier, comment)
-        return comment
+
+        def build(identifier: int) -> dict[str, Any]:
+            return {
+                "id": identifier,
+                "body": body,
+                "issue_number": number,
+                "user": author,
+                "performed_via_github_app": app,
+                "created_at": _utc(),
+                "updated_at": _utc(),
+                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
+                "html_url": (
+                    f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}"
+                ),
+            }
+
+        return self._insert_new("comment", build)
 
     # Runtime controls. The scripted driver holds this object in process, so a
     # control is a method call, like ``advance`` and ``add_issue_comment``. Each
@@ -565,9 +600,7 @@ class GithubStub:
         with sqlite3.connect(self._database) as connection:
             connection.execute("DELETE FROM permission_faults WHERE login=?", (login,))
 
-    def inject_fault(
-        self, operation: str, mode: str, *, count: int = 1, status: int = 502
-    ) -> None:
+    def inject_fault(self, operation: str, mode: str, *, count: int = 1, status: int = 502) -> None:
         """Make the next ``count`` ``operation`` requests fail in ``mode``.
 
         Faults are consumed in the order they were injected, one per request.
@@ -903,14 +936,17 @@ class GithubStub:
                 fault = self._take_fault("issue_create")
                 if fault is not None and fault[0] == "refuse":
                     return fault[1], {"message": "Server Error"}
-                number = max(row["number"] for row in self._rows("issue")) + 1
-                issue = self._issue(
-                    number, body["title"], body.get("body", ""), body.get("labels", [])
-                )
-                issue.update(user=BOT, performed_via_github_app={"id": 51})
-                self._put("issue", number, issue)
+
+                def build(number: int) -> dict[str, Any]:
+                    issue = self._issue(
+                        number, body["title"], body.get("body", ""), body.get("labels", [])
+                    )
+                    issue.update(user=BOT, performed_via_github_app={"id": 51})
+                    return issue
+
+                issue = self._insert_new("issue", build)
                 for label in issue["labels"]:
-                    self._label_event(number, label["name"], "labeled", BOT)
+                    self._label_event(issue["number"], label["name"], "labeled", BOT)
                 return self._faulted(fault, 201, issue)
         if tail.startswith("issues/"):
             parts = tail.split("/")
@@ -974,22 +1010,24 @@ class GithubStub:
                     fault = self._take_fault("comment_create")
                     if fault is not None and fault[0] == "refuse":
                         return fault[1], {"message": "Server Error"}
-                    identifier = max((row["id"] for row in self._rows("comment")), default=0) + 1
-                    comment = {
-                        "id": identifier,
-                        "body": body["body"],
-                        "issue_number": number,
-                        "user": BOT,
-                        "performed_via_github_app": {"id": 51},
-                        "created_at": _utc(),
-                        "updated_at": _utc(),
-                        "issue_url": f"{self.base_url}{prefix}/issues/{number}",
-                        "html_url": (
-                            f"{self.base_url}/{REPOSITORY}/issues/{number}"
-                            f"#issuecomment-{identifier}"
-                        ),
-                    }
-                    self._put("comment", identifier, comment)
+
+                    def build(identifier: int) -> dict[str, Any]:
+                        return {
+                            "id": identifier,
+                            "body": body["body"],
+                            "issue_number": number,
+                            "user": BOT,
+                            "performed_via_github_app": {"id": 51},
+                            "created_at": _utc(),
+                            "updated_at": _utc(),
+                            "issue_url": f"{self.base_url}{prefix}/issues/{number}",
+                            "html_url": (
+                                f"{self.base_url}/{REPOSITORY}/issues/{number}"
+                                f"#issuecomment-{identifier}"
+                            ),
+                        }
+
+                    comment = self._insert_new("comment", build)
                     return self._faulted(fault, 201, comment)
         if tail == "pulls/comments" and method == "GET":
             return 200, []
@@ -1006,24 +1044,32 @@ class GithubStub:
                         ]
                 return 200, self._page(pulls, query)
             if method == "POST":
-                number = max((row["id"] for row in self._rows("pull")), default=0) + 1
                 repository = self._repository_row()
-                pull = {
-                    "id": number,
-                    "node_id": f"PR_stub{number}",
-                    "number": number,
-                    "state": "open",
-                    "merged": False,
-                    "title": body["title"],
-                    "body": body.get("body", ""),
-                    "user": BOT,
-                    "html_url": f"{self.base_url}/{REPOSITORY}/pull/{number}",
-                    "head": {"ref": body["head"].split(":")[-1], "repo": repository},
-                    "base": {"ref": body["base"], "repo": repository},
-                }
-                pull = self._fresh_pull(pull)
-                self._put("pull", number, pull)
-                return 201, pull
+                # Resolve git refs before the write lock. _insert_new holds that
+                # lock only for the id allocation and the insert.
+                resolved = self._fresh_pull(
+                    {
+                        "head": {"ref": body["head"].split(":")[-1], "repo": repository},
+                        "base": {"ref": body["base"], "repo": repository},
+                    }
+                )
+
+                def build(number: int) -> dict[str, Any]:
+                    return {
+                        "id": number,
+                        "node_id": f"PR_stub{number}",
+                        "number": number,
+                        "state": "open",
+                        "merged": False,
+                        "title": body["title"],
+                        "body": body.get("body", ""),
+                        "user": BOT,
+                        "html_url": f"{self.base_url}/{REPOSITORY}/pull/{number}",
+                        "head": resolved["head"],
+                        "base": resolved["base"],
+                    }
+
+                return 201, self._insert_new("pull", build)
         if tail.startswith("pulls/"):
             parts = tail.split("/")
             number = int(parts[1])

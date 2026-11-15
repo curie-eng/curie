@@ -38,6 +38,7 @@ from curie_worker.workitem_dispatch import (
 from curie_worker.workitem_orphans import WorkItemOrphanSweeper
 
 from apps.worker.tests.queue_fixtures import factory_context, factory_conversation
+from apps.worker.tests.requester_context_doubles import TENANT_ID
 
 from .test_work_item_early_stop import (
     AGENT_ID,
@@ -167,6 +168,34 @@ class Api:
                     "refusal": None,
                 },
             )
+        if path.endswith("/requester-context"):
+            assert self.running and self.start_grant is not None
+            assert body == {"runtime_epoch": self.start_grant["runtime_epoch"]}
+            return httpx.Response(
+                200,
+                json={
+                    "envelope_version": 1,
+                    "tenant_id": str(TENANT_ID),
+                    "work_item_id": str(self.request_id),
+                    "execution_request_id": str(self.request_id),
+                    "execution_fence": self.start_grant["runtime_epoch"],
+                    "selection": {"kind": "absent", "reason": "historical"},
+                },
+            )
+        if path.endswith("/requester-context/acknowledgment"):
+            assert self.running and self.start_grant is not None
+            assert body == {
+                "runtime_epoch": self.start_grant["runtime_epoch"],
+                "acknowledgment": {
+                    "envelope_version": 1,
+                    "work_item_id": str(self.request_id),
+                    "execution_request_id": str(self.request_id),
+                    "execution_fence": self.start_grant["runtime_epoch"],
+                    "outcome": "none",
+                },
+                "reason": None,
+            }
+            return httpx.Response(200, json={"evidence": "none"})
         if path.endswith("/issue-read/context"):
             self.run = self.kernel._work_item_runs[self.request_id]
             return httpx.Response(

@@ -2388,7 +2388,7 @@ def owner_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, one cl
             ready = self.wait_soft(
                 lambda: (
                     True
-                    if (log.exists() and log.stat().st_size and process.poll() is None)
+                    if (log.exists() and log.stat().st_size and process.poll() in (None, 0))
                     else None
                 ),
                 timeout=15,

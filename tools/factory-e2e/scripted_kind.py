@@ -1665,7 +1665,7 @@ class ScriptedRun:
                 errors.append(str(exc))
         if self.registry_attempted:
             try:
-                self.command("docker", "rm", "-f", self.registry, timeout=60)
+                self.command("docker", "rm", "-f", "-v", self.registry, timeout=60)
             except (
                 OSError,
                 RuntimeError,
@@ -1744,7 +1744,7 @@ class ScriptedRun:
                     "docker", "ps", "-aq", "--filter", f"label=curie.factory-scripted={self.run_id}"
                 )
                 if remaining.strip():
-                    self.command("docker", "rm", "-f", *remaining.split())
+                    self.command("docker", "rm", "-f", "-v", *remaining.split())
                 if self.command(
                     "docker", "ps", "-aq", "--filter", f"label=curie.factory-scripted={self.run_id}"
                 ).strip():

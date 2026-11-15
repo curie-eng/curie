@@ -1313,6 +1313,11 @@ factory:
   enabled: false
   intake: poll  # or webhook
   baseLabelSettleSeconds: 60
+  # Requester coding instructions (ADR 0278): admission pins each requester's
+  # stored document and the worker delivers it to the implementer. false makes
+  # new WorkItems record explicit absence; a pinned WorkItem keeps its pin.
+  requesterCodingInstructions:
+    apply: true
   cardBaseUrl: ""
   ciWaitSeconds: 3600
   codeHosts: []
