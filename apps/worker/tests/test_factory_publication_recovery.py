@@ -82,7 +82,6 @@ BASE_ARCHIVE_LIMIT = 64 << 20
 ADDED_PATH = "unitconv/kelvin.py"
 OTHER_BASE = "0123456789abcdef0123456789abcdef01234567"
 PUBLICATION_ROUTE = "/v1/internal/publications"
-WAIT_S = 30.0
 _SETTLED = ("status", "terminal_at", "terminal_cause", "version", "retry_safety")
 
 
@@ -143,6 +142,7 @@ class _Retained:
     settled: dict[str, Any]
     snapshot: RunnerWorkspaceSnapshot
     base_sha: str
+    base_checkout: Path
     candidate_id: uuid.UUID
     successor_id: uuid.UUID
 
@@ -253,7 +253,10 @@ async def _snapshot(
 async def _retained_failure(case: FactoryRetryCase, owned: _Owned, root: Path) -> _Retained:
     """The predecessor: started, captured, finished as a lost publication create."""
 
-    item = await case.admit()
+    # The case's own admitted WorkItem. Its request is due from admission, so
+    # any other WorkItem would leave it for the first reconciler pass to wake
+    # into a model turn on the runner meant for the recovery.
+    item = case.item
     claimed = await asyncio.to_thread(
         case.workspace.claim_or_resume_with_handle,
         thread_key=item.thread,
@@ -292,6 +295,10 @@ async def _retained_failure(case: FactoryRetryCase, owned: _Owned, root: Path) -
     assert run.runtime_epoch is not None
     archive = b"".join(case.objects.get_stream(prepared.object_key))
     snapshot = await _snapshot(owned, root, archive, prepared.base_sha, prepared.repo_origin)
+    # The trusted base the recovery runtime mounts; its boot preflight runs here.
+    base_checkout = root / "base-checkout"
+    owned.paths.append(base_checkout)
+    _extract(archive, base_checkout)
 
     ledger = PublicationCandidateClient(
         api_base_url=case.api_url, worker_token=WORKER_TOKEN, client=case.http
@@ -339,6 +346,7 @@ async def _retained_failure(case: FactoryRetryCase, owned: _Owned, root: Path) -
         settled={key: predecessor[key] for key in _SETTLED},
         snapshot=snapshot,
         base_sha=prepared.base_sha,
+        base_checkout=base_checkout,
         candidate_id=captured.candidate_id,
         successor_id=successor["id"],
     )
@@ -352,12 +360,33 @@ async def _publications(case: FactoryRetryCase, request_id: uuid.UUID) -> list[d
     )
 
 
-async def _until_published(case: FactoryRetryCase, request_id: uuid.UUID) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + WAIT_S
-    while not await _publications(case, request_id):
-        assert loop.time() < deadline, f"no publication for {request_id}"
-        await asyncio.sleep(0.05)
+async def _drop_candidates(case: FactoryRetryCase) -> None:
+    """Delete the candidate rows of this case's WorkItems, children first.
+
+    The candidate ledger restricts deleting a WorkItem it still references, so
+    the case's agent teardown can only cascade once these owned rows are gone.
+    The bucket and its objects belong to the case and go with it.
+    """
+
+    owned = {"ids": [item.work_item_id for item in case.items]}
+    for table in (
+        "publication_candidate_readers",
+        "publication_candidate_objects",
+        "publication_candidates",
+        "publication_candidate_groups",
+    ):
+        await case.execute(
+            f"DELETE FROM curie.{table} WHERE work_item_id = ANY(:ids)",
+            owned,
+        )
+    for table in ("publication_candidate_groups", "publication_candidate_objects"):
+        assert (
+            await case.rows(
+                f"SELECT 1 FROM curie.{table} WHERE work_item_id = ANY(:ids)",
+                owned,
+            )
+            == []
+        )
 
 
 def _no_finish(case: FactoryRetryCase, request_id: uuid.UUID) -> bool:
@@ -377,10 +406,10 @@ def test_recovery_publishes_the_retained_candidate_once_without_a_model_turn(
         try:
             retained = await _retained_failure(case, owned, tmp_path)
             lossy = _wire(case, owned, lose_first_create=True)
-            (runner,) = await case.real_runners(1)
+            (runner,) = await case.real_runners(1, preflight_workspace=retained.base_checkout)
 
             await case.publish_wake(retained.successor_id)
-            await _until_published(case, retained.successor_id)
+            # The delivery acks only after the publication pause created it.
             await case.settle()
 
             (publication,) = await _publications(case, retained.successor_id)
@@ -388,7 +417,11 @@ def test_recovery_publishes_the_retained_candidate_once_without_a_model_turn(
             assert bytes(publication["patch_bytes"]) == retained.snapshot.patch
             assert sorted(publication["changed_paths"]) == sorted(retained.snapshot.changed_paths)
             assert publication["base_sha"] == retained.base_sha
-            assert (publication["title"], publication["body"]) == (TITLE, BODY)
+            # The retained proposal; the API appends its verification disclosure
+            # for a Python change exactly as on any other publication.
+            body, separator, disclosure = publication["body"].partition("\n\n")
+            assert (publication["title"], body, separator) == (TITLE, BODY, "\n\n")
+            assert "in-sandbox verification" in disclosure, disclosure
             # The lost create response was retried under the same dedupe key.
             assert (lossy.dropped, lossy.creates) == (1, 2)
             approvals = await case.rows(
@@ -415,6 +448,7 @@ def test_recovery_publishes_the_retained_candidate_once_without_a_model_turn(
             assert len(await case.requests(retained.item.work_item_id)) == 2
         finally:
             await owned.close()
+            await _drop_candidates(case)
 
     case.run(exercise())
 
@@ -445,7 +479,7 @@ def test_a_refused_recovery_finishes_terminal_with_its_code(
         try:
             retained = await _retained_failure(case, owned, tmp_path)
             _wire(case, owned, lose_first_create=False)
-            (runner,) = await case.real_runners(1)
+            (runner,) = await case.real_runners(1, preflight_workspace=retained.base_checkout)
             if variant == "base_changed":
                 await case.execute(
                     "UPDATE curie.work_items SET base_commit = :base WHERE id = :id",
@@ -480,5 +514,6 @@ def test_a_refused_recovery_finishes_terminal_with_its_code(
             assert {key: predecessor[key] for key in _SETTLED} == retained.settled
         finally:
             await owned.close()
+            await _drop_candidates(case)
 
     case.run(exercise())

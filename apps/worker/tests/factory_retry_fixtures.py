@@ -53,10 +53,12 @@ from curie_internal.turn_queue import to_stream_fields
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
 from curie_runner.issue_read import resolve_issue_read
+from curie_runner.progress import PROGRESS_TOKEN_ENV, PROGRESS_URL_ENV
 from curie_runner.requester_context import RequesterContextGate
 from curie_runner.server import create_app as create_runner_app
 from curie_runner.session import SessionRunner
 from curie_runner.tracker_result import bind_completion_contract
+from curie_runner.verification import preflight_workspace_verification
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import FactoryWake
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
@@ -209,12 +211,15 @@ def _real_runner_app(
     boot_env: Callable[[], dict[str, str] | None],
     script: Callable[[], list[Any]] = _provider_unreachable,
     provider_scope: ProviderScope | None = None,
+    preflight: tuple[Path, Path] | None = None,
 ) -> web.Application:
     """The production runner app over a scripted model, recording each path asked.
 
     ``boot_env`` answers the environment of the claim that took this runner.
     ``script`` answers each model turn's SDK messages, and ``provider_scope`` is
     the boot credential scope the runner's own entry point would derive.
+    ``preflight`` is the mounted workspace and the bundle directory the boot
+    runs its verification preflight over; None skips the preflight.
     """
 
     session = FakeModelSession(script_factory=script)
@@ -239,10 +244,17 @@ def _real_runner_app(
         paths.append(request.path)
         async with booting:
             if not gate.bound:
-                # The runner process boots after its claim: it reads its
+                # The runner process boots after its claim: it reports its
+                # verification preflight when asked to, then reads its
                 # completion contract through the issue read capability in its
                 # environment and serves the requester context of that execution.
-                contract = await bind_completion_contract(resolve_issue_read(boot_env() or {}))
+                env = boot_env() or {}
+                if preflight is not None:
+                    workspace, bundle = preflight
+                    await preflight_workspace_verification(
+                        workspace, bundle, env[PROGRESS_URL_ENV], env[PROGRESS_TOKEN_ENV]
+                    )
+                contract = await bind_completion_contract(resolve_issue_read(env))
                 gate.bind(contract.contract.execution)
         response: web.StreamResponse = await handler(request)
         return response
@@ -814,14 +826,25 @@ class FactoryRetryCase(StartWaitCase):
         *,
         script: Callable[[], list[Any]] = _provider_unreachable,
         provider_scope: ProviderScope | None = None,
+        preflight_workspace: Path | None = None,
     ) -> list[RealRunner]:
         """Serve real runner apps, one for each sandbox the case claims next.
 
         Each runs the production session over a scripted model. By default its
         turn ends in the provider error the runner reports as an unreachable
         model; ``script`` replaces those SDK messages, and ``provider_scope``
-        is the scope the runner names on its retry conditions.
+        is the scope the runner names on its retry conditions. With
+        ``preflight_workspace``, each boot first runs the production
+        verification preflight over that checkout, with no bundle declaration,
+        and reports it on the claim's progress capability.
         """
+
+        preflight: tuple[Path, Path] | None = None
+        if preflight_workspace is not None:
+            # An empty bundle directory: the repository declaration decides.
+            bundle = self.root / "runner-bundle"
+            bundle.mkdir(exist_ok=True)
+            preflight = (preflight_workspace, bundle)
 
         served: list[RealRunner] = []
         cluster = self.h.fake_k8s
@@ -837,6 +860,7 @@ class FactoryRetryCase(StartWaitCase):
                     lambda position=position: cluster.claim_envs[position],
                     script,
                     provider_scope,
+                    preflight,
                 )
             )
             await server.start_server()

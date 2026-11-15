@@ -597,10 +597,11 @@
           "start",
           "steer",
           "finish-race",
-          "observed"
+          "observed",
+          "publication-recovery"
         ]
       },
-      "cardinality_bound": 7
+      "cardinality_bound": 8
     },
     "curie.attachments.ledger.append": {
       "type": "counter",
@@ -637,10 +638,11 @@
           "start",
           "steer",
           "finish-race",
-          "observed"
+          "observed",
+          "publication-recovery"
         ]
       },
-      "cardinality_bound": 7
+      "cardinality_bound": 8
     },
     "curie.thread.route.active": {
       "type": "gauge",
@@ -661,10 +663,11 @@
           "start",
           "steer",
           "finish-race",
-          "observed"
+          "observed",
+          "publication-recovery"
         ]
       },
-      "cardinality_bound": 7
+      "cardinality_bound": 8
     },
     "curie.sandbox.lifecycle": {
       "type": "counter",
