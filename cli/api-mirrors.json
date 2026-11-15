@@ -72,6 +72,14 @@
         {
           "field": "requester_principal_id",
           "why": "cli/src/commands/work.rs reads requester display text and execution ownership. It does not consume the admission requester reference exposed by the API."
+        },
+        {
+          "field": "automatic_retries_used",
+          "why": "cli/src/commands/work.rs renders state, cause and publication. The WorkItem's used automatic retry allowance (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "automatic_retry_limit",
+          "why": "cli/src/commands/work.rs renders state, cause and publication. The automatic retry limit (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
         }
       ]
     },
@@ -125,6 +133,26 @@
         {
           "field": "coding_instructions_evidence",
           "why": "cli/src/commands/work.rs does not apply or acknowledge coding instructions. Per-request selection evidence is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "retry_of_request_id",
+          "why": "cli/src/commands/work.rs renders request lifecycle and deferral facts. Automatic retry lineage (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "retry_kind",
+          "why": "cli/src/commands/work.rs renders the item's actionable_cause, which already says when a request is an automatic retry. The retry kind (ADR 0269) is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "dispatch_not_before",
+          "why": "The CLI renders a scheduled or blocked retry through the item's actionable_cause; no CLI path reads the raw dispatch time."
+        },
+        {
+          "field": "blocked_on",
+          "why": "The CLI renders a blocked retry's named condition through the item's actionable_cause; no CLI path reads the raw condition field."
+        },
+        {
+          "field": "retry_safety",
+          "why": "cli/src/commands/work.rs does not decide retries. The worker's side effect fact (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
         }
       ]
     },

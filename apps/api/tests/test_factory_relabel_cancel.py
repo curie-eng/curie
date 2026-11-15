@@ -139,7 +139,12 @@ def test_relabel_after_a_terminal_request_admits_a_second_request(admitted: Any)
     failed = client.post(
         f"/v1/internal/work-items/requests/{first['id']}/finish",
         headers=WORKER,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "runner_escalated"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "runner_escalated",
+            "retry_safety": "uncertain",
+        },
     )
     assert failed.status_code == 200, failed.text
 

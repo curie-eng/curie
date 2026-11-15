@@ -42,6 +42,7 @@ _CAUSE_TEXT = {
         "Inspect the result and retry."
     ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
+    "runner_error": "the runner reported an error the run could not recover from.",
     "pull_request_not_adopted": (
         "an earlier pull request on this issue could not be continued. "
         "A person should close or merge it, then re-add the label."
@@ -66,6 +67,9 @@ _CAUSE_TEXT = {
     ),
     "execution_deadline": "the run did not finish before its deadline.",
     "capacity_wait_expired": "sandbox admission did not complete before the wait expired.",
+    "retry_condition_expired": (
+        "the automatic retry was still blocked on its named condition when its wait expired."
+    ),
     "start_failed": "the sandbox did not start.",
     "owner_lost": "the worker running this request stopped responding.",
     # Personal Claude execution (#5377, ADR 0268 section 3).

@@ -8520,6 +8520,12 @@ export interface components {
              * @enum {string}
              */
             outcome: "completed" | "failed";
+            retry_condition?: components["schemas"]["RetryCondition"] | null;
+            /**
+             * Retry Safety
+             * @enum {string}
+             */
+            retry_safety: "no_effects" | "flagged" | "uncertain";
             /** Runtime Epoch */
             runtime_epoch: number;
         };
@@ -11302,6 +11308,68 @@ export interface components {
             slack_channel?: string | null;
         };
         /**
+         * RetryCondition
+         * @description Provider-derived evidence that a failed turn should wait before a retry.
+         *
+         *     Carried as ``ErrorEvent.retry_condition``. A missing or null carrier means
+         *     no trusted retry condition, and a consumer must never read that as retry
+         *     now. A present carrier is evidence for a wait. It is never authorization,
+         *     an approval, an increased limit, or permission to replay an effect: the
+         *     no-retry-after-side-effects rule and every other gate still apply.
+         *
+         *     ``reason`` is the closed ``RetryReason`` the producer derived from the
+         *     provider's own signal. Nothing infers a reset from
+         *     ``ErrorEvent.classification``; a classification token alone never creates
+         *     a retry condition.
+         *
+         *     ``retry_at`` is optional. When present it is an absolute, provider-derived
+         *     UTC instant spelled as ``RETRY_AT_PATTERN`` describes. Naive values,
+         *     numeric offsets (``+00:00`` included), unix numbers and every other
+         *     spelling are refused rather than coerced, so every lane reads the same
+         *     instant. A past instant is valid; consumers judge time themselves. The
+         *     scheduler adds its own separate 60 second reset grace; the producer reports
+         *     the provider's time without it. A Python ``datetime`` is accepted only with
+         *     a zero UTC offset and is normalized to ``UTC``, so every Python producer
+         *     writes the ``Z`` form. Python also normalizes the fraction spelling on
+         *     re-encode (``.5Z`` becomes ``.500000Z`` and a zero fraction is dropped)
+         *     while the generated Rust keeps the received string; both name the same
+         *     instant.
+         *
+         *     ``scope_key`` is optional. When present it is an opaque digest of the
+         *     credential scope the condition applies to, ``sha256:`` followed by 64
+         *     lowercase hex digits (``RETRY_SCOPE_KEY_PATTERN``). It is never a
+         *     credential value, an account name or a provider message. The grammar check
+         *     is the only guard on it and is not a secret detector, so a producer must
+         *     derive the value from a digest rather than rely on validation to catch a
+         *     leak.
+         */
+        RetryCondition: {
+            reason: components["schemas"]["RetryReason"];
+            /** Retry At */
+            retry_at?: string | null;
+            /** Scope Key */
+            scope_key?: string | null;
+        };
+        /**
+         * RetryReason
+         * @description Why a provider asked the platform to wait before another attempt.
+         *
+         *     Carried only inside ``RetryCondition``. Each value names the provider's
+         *     signal, not a platform decision: ``rate_limited`` is a request rate limit,
+         *     ``usage_reset`` is a usage allowance that resets at a provider time,
+         *     ``credit_exhausted`` is a spent credit balance, ``credential_rejected`` is
+         *     a credential the provider refused, and ``transient_service`` is a temporary
+         *     provider service failure. These are deliberately not the hyphenated
+         *     ``ErrorEvent.classification`` tokens, and neither vocabulary maps onto the
+         *     other.
+         *
+         *     A closed enum, not free text: an unknown value is refused on the wire,
+         *     never read as an absent condition. Adding a value is a breaking change
+         *     under ADR 0036.
+         * @enum {string}
+         */
+        RetryReason: "rate_limited" | "usage_reset" | "credit_exhausted" | "credential_rejected" | "transient_service";
+        /**
          * RevalidationBody
          * @description The versions the caller read, compared and set in one transaction.
          */
@@ -12644,6 +12712,10 @@ export interface components {
              * Format: uuid
              */
             agent_id: string;
+            /** Automatic Retries Used */
+            automatic_retries_used: number;
+            /** Automatic Retry Limit */
+            automatic_retry_limit: number;
             /** Cancelled At */
             cancelled_at: string | null;
             ci: components["schemas"]["WorkItemCiOut"] | null;
@@ -12750,6 +12822,8 @@ export interface components {
          *     allowlist dict, never from an ORM row, so no runtime-owner field leaks.
          */
         WorkItemRequestOut: {
+            /** Blocked On */
+            blocked_on: string | null;
             /** Capacity Deferrals */
             capacity_deferrals: number;
             /**
@@ -12765,6 +12839,11 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
+            /**
+             * Dispatch Not Before
+             * Format: date-time
+             */
+            dispatch_not_before: string;
             /** Enrollment Generation */
             enrollment_generation?: number | null;
             /** Execution Deadline */
@@ -12781,6 +12860,12 @@ export interface components {
             model_auth_mode?: "service" | "personal";
             /** Owner Principal Id */
             owner_principal_id?: string | null;
+            /** Retry Kind */
+            retry_kind: ("owner_loss" | "failure") | null;
+            /** Retry Of Request Id */
+            retry_of_request_id: string | null;
+            /** Retry Safety */
+            retry_safety: ("no_effects" | "flagged" | "uncertain") | null;
             /** Sequence */
             sequence: number;
             /** Started At */

@@ -238,6 +238,7 @@ def test_gitlab_core_not_adopted_note_links_the_stored_merge_request(
             "runtime_epoch": request["runtime_epoch"],
             "outcome": "failed",
             "cause": "pull_request_not_adopted",
+            "retry_safety": "uncertain",
         },
     )
     assert failed.status_code == 200, failed.text

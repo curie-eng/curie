@@ -304,6 +304,13 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   `sandbox-terminated`, `workspace-error` and `model-unreachable` are transient (bounded exponential
   backoff);
   `budget-exceeded` and everything else escalate.
+  A started factory implementation execute turn is the one exception (ADR
+  0269): it never retries inside a delivery, except a `sandbox-capacity`
+  refusal that opened no runner turn. Its finish reports a required safety fact
+  (`no_effects`, `flagged` or `uncertain`) and the provider retry condition the
+  runner sent, and the SQL lifecycle owns the retry as a fresh request.
+  Interactive, cron, CI fix and approval resume turns keep the classification
+  list.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
   told apart from `runner-error`, which is a plain transport failure without
   confirmed sandbox termination. When Kubernetes confirms that the sandbox pod

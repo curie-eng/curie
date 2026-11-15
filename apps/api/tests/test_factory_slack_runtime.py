@@ -594,9 +594,19 @@ class Stack:
 
         if published:
             _seed_succeeded_publication(self, request_id)
-            body = {"runtime_epoch": epoch, "outcome": "completed", "cause": "completed"}
+            body = {
+                "runtime_epoch": epoch,
+                "outcome": "completed",
+                "cause": "completed",
+                "retry_safety": "no_effects",
+            }
         else:
-            body = {"runtime_epoch": epoch, "outcome": "failed", "cause": "runner_failed"}
+            body = {
+                "runtime_epoch": epoch,
+                "outcome": "failed",
+                "cause": "runner_failed",
+                "retry_safety": "uncertain",
+            }
         response = self.client.post(
             f"/v1/internal/work-items/requests/{request_id}/finish",
             headers=self.internal,

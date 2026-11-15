@@ -1096,15 +1096,15 @@ _FENCES = [
 
 
 @pytest.mark.parametrize(("fence", "code"), _FENCES)
-def test_a_pod_restart_retry_rereads_custody_and_refuses_after_a_fence(
+def test_a_pod_restart_ends_the_started_request_and_never_reuses_its_grant(
     make_harness, monkeypatch, fence: _Change | None, code: str | None
 ) -> None:
     """The started request's pod is deleted mid-turn (``sandbox-terminated``,
-    retryable, no side effect) and its claim is gone with it. The retry inside
-    the same delivery authorizes again and boots a fresh runtime with a fresh
-    custody read. An enrollment fence that lands between the attempts refuses
-    the retry before any grant read, create or turn, so the old grant is never
-    used again, and the started run finishes ``authentication_required``."""
+    no side effect) and its claim is gone with it. The SQL lifecycle owns the
+    retry as a fresh request (ADR 0269), so this delivery authorizes nothing
+    again: no second grant read, create or turn, whether or not an enrollment
+    fence lands after the termination read. The started run finishes
+    ``sandbox_terminated``."""
 
     async def exercise() -> None:
         async with _seeded_owner() as owner:
@@ -1128,22 +1128,16 @@ def test_a_pod_restart_retry_rereads_custody_and_refuses_after_a_fence(
                 await h.kernel.process_event(_execute(request_id))
 
                 created = k8s.owner_creates(owner)
-                assert k8s.termination_queries, "the first attempt must end sandbox-terminated"
+                assert k8s.termination_queries, "the attempt must end sandbox-terminated"
                 assert work_items.calls.count("start") == 1
-                if fence is None:
-                    assert len(created) == 2
-                    assert len(owner.secrets.reads) == 2
-                    assert _turns(h.runner) == [_PROMPT, _PROMPT]
-                    assert all(f["cause"] != "authentication_required" for f in work_items.finishes)
-                else:
-                    assert len(created) == 1
-                    assert len(k8s.claim_envs) == 1
-                    assert len(owner.secrets.reads) == 1
-                    assert len(h.runner.opened) == 1
-                    [finish] = work_items.finishes
-                    assert finish["outcome"] == "failed"
-                    assert finish["cause"] == "authentication_required"
-                    assert str(code) in str(finish["detail"])
+                assert len(created) == 1
+                assert len(k8s.claim_envs) == 1
+                assert len(owner.secrets.reads) == 1
+                assert _turns(h.runner) == [_PROMPT]
+                [finish] = work_items.finishes
+                assert finish["outcome"] == "failed"
+                assert finish["cause"] == "sandbox_terminated"
+                assert code is None or str(code) not in str(finish["detail"])
 
     asyncio.run(exercise())
 

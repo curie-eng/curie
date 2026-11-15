@@ -1,0 +1,3736 @@
+{
+  "comment": "Shared factory retry disposition vectors (issue 5424, ADR 0269). The API reads them in apps/api/tests/test_factory_retry.py and the worker in apps/worker/tests/kernel/test_factory_retry.py. finish holds the facts a boundary reports: the cause, the safety fact and the decoded carrier in canonical spelling. worker is present only when a worker kernel classification produces the cause; its runner_ended follows the observed turn end and its finish must equal the case's finish. error_frame omits version. A case with retry_at_from_now_seconds uses retry_at as a placeholder that boundary tests replace with database time plus that many seconds; the pure policy test reads the placeholder as written. expected.disposition, condition, not_before and policy_successor are the pure policy result; successor, blocked_on and timing are the boundary result. finish_wire_retry_condition, when present, is the carrier as posted on the wire. setup holds the state a boundary test arranges first.",
+  "allowance": {
+    "limit": 2,
+    "delays_seconds": [
+      30,
+      120
+    ],
+    "jitter_fraction": 0.2,
+    "reset_grace_seconds": 60
+  },
+  "cases": [
+    {
+      "id": "model_unreachable_no_effects_retries",
+      "row": "model_unreachable",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-unreachable",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-unreachable",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "backoff"
+      }
+    },
+    {
+      "id": "model_unreachable_flagged_terminal",
+      "row": "model_unreachable",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-unreachable",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-unreachable",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": true,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_unreachable",
+        "retry_safety": "flagged",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_unreachable_uncertain_terminal",
+      "row": "model_unreachable",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-unreachable",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-unreachable",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": true,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_unreachable",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_rate_limited_no_effects_retries",
+      "row": "model_rate_limited",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "rate-limit",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "rate-limit",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_rate_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "backoff"
+      }
+    },
+    {
+      "id": "model_rate_limited_flagged_terminal",
+      "row": "model_rate_limited",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "rate-limit",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "rate-limit",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": true,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_rate_limited",
+        "retry_safety": "flagged",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_rate_limited_uncertain_terminal",
+      "row": "model_rate_limited",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "rate-limit",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "rate-limit",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": true,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_rate_limited",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_error_no_effects_retries",
+      "row": "model_error",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "server-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "server-error",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_error",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "backoff"
+      }
+    },
+    {
+      "id": "model_error_flagged_terminal",
+      "row": "model_error",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "server-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "server-error",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": true,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_error",
+        "retry_safety": "flagged",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_error_uncertain_terminal",
+      "row": "model_error",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "server-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "server-error",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": true,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_error",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_unreachable_durable_marker_flagged_terminal",
+      "row": "model_unreachable",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-unreachable",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-unreachable",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": true
+      },
+      "finish": {
+        "cause": "model_unreachable",
+        "retry_safety": "flagged",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_unreachable_transport_drop_uncertain_terminal",
+      "row": "model_unreachable",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-unreachable",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-unreachable",
+          "retry_condition": null
+        },
+        "turn_end": "transport_drop",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": false,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_unreachable",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_unreachable_not_own_execute_turn_uncertain_terminal",
+      "row": "model_unreachable",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-unreachable",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-unreachable",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": false,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_unreachable",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_unreachable_transient_service_carrier_retries",
+      "row": "model_unreachable",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-unreachable",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-unreachable",
+          "retry_condition": {
+            "reason": "transient_service"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "backoff"
+      }
+    },
+    {
+      "id": "model_unreachable_carrier_with_unknown_extra_key_still_retries",
+      "row": "model_unreachable",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-unreachable",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-unreachable",
+          "retry_condition": {
+            "reason": "transient_service",
+            "future_member": "example"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "finish_wire_retry_condition": {
+        "reason": "transient_service",
+        "future_member": "example"
+      },
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "backoff"
+      }
+    },
+    {
+      "id": "model_rate_limited_with_provider_time_waits_for_it",
+      "row": "model_rate_limited",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "rate-limit",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "rate-limit",
+          "retry_condition": {
+            "reason": "rate_limited",
+            "retry_at": "2030-01-01T00:00:00Z"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_rate_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "rate_limited",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": null
+        }
+      },
+      "retry_at_from_now_seconds": 600,
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": "provider_rate_limit",
+        "not_before": "2030-01-01T00:00:00Z",
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "provider_time"
+      }
+    },
+    {
+      "id": "model_rate_limited_error_frame_then_accepted_timeout_is_uncertain",
+      "row": "model_rate_limited",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "rate-limit",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "rate-limit",
+          "retry_condition": {
+            "reason": "rate_limited",
+            "retry_at": "2030-01-01T00:00:00Z"
+          }
+        },
+        "turn_end": "accepted_timeout",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": false,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_rate_limited",
+        "retry_safety": "uncertain",
+        "retry_condition": {
+          "reason": "rate_limited",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": null
+        }
+      },
+      "retry_at_from_now_seconds": 600,
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_rate_limited_error_frame_then_final_control_retries",
+      "row": "model_rate_limited",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "rate-limit",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "rate-limit",
+          "retry_condition": {
+            "reason": "rate_limited",
+            "retry_at": "2030-01-01T00:00:00Z"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_rate_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "rate_limited",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": null
+        }
+      },
+      "retry_at_from_now_seconds": 600,
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": "provider_rate_limit",
+        "not_before": "2030-01-01T00:00:00Z",
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "provider_time"
+      }
+    },
+    {
+      "id": "model_rate_limited_contradicting_credential_reason_waits_on_credential",
+      "row": "model_rate_limited",
+      "path": "secondary",
+      "boundary": "finish",
+      "worker": {
+        "classification": "rate-limit",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "rate-limit",
+          "retry_condition": {
+            "reason": "credential_rejected"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_rate_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "credential_rejected",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_credential",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_credential",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "model_error_with_usage_reset_reason_uses_the_reset",
+      "row": "model_error",
+      "path": "secondary",
+      "boundary": "finish",
+      "worker": {
+        "classification": "server-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "server-error",
+          "retry_condition": {
+            "reason": "usage_reset",
+            "retry_at": "2030-01-01T00:00:00Z"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_error",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": null
+        }
+      },
+      "retry_at_from_now_seconds": 600,
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_usage_reset",
+        "not_before": "2030-01-01T00:01:00Z",
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "provider_time"
+      }
+    },
+    {
+      "id": "model_unreachable_absent_safety_through_api_settlement_terminal",
+      "row": "model_unreachable",
+      "path": "refusal",
+      "boundary": "api_settlement",
+      "finish": {
+        "cause": "model_unreachable",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "workspace_error_transient_service_retries",
+      "row": "workspace_error",
+      "path": "positive",
+      "boundary": "finish",
+      "finish": {
+        "cause": "workspace_error",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "backoff"
+      }
+    },
+    {
+      "id": "workspace_error_without_diagnosis_is_blocked",
+      "row": "workspace_error",
+      "path": "secondary",
+      "boundary": "finish",
+      "finish": {
+        "cause": "workspace_error",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "workspace_preparation",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "workspace_preparation",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "workspace_error_before_runner_accepted_is_uncertain",
+      "row": "workspace_error",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "workspace-error",
+        "error_frame": null,
+        "turn_end": "not_accepted",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": false,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "workspace_error",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "runner_error_reported_with_final_is_blocked",
+      "row": "runner_error",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "runner-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "runner-error",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "runner_error",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "runner_fault_diagnosis",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "runner_fault_diagnosis",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "runner_error_transient_service_with_time_is_scheduled",
+      "row": "runner_error",
+      "path": "secondary",
+      "boundary": "finish",
+      "worker": {
+        "classification": "runner-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "runner-error",
+          "retry_condition": {
+            "reason": "transient_service",
+            "retry_at": "2030-01-01T00:00:00Z"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "runner_error",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": null
+        }
+      },
+      "retry_at_from_now_seconds": 600,
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": "provider_service",
+        "not_before": "2030-01-01T00:00:00Z",
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "provider_time"
+      }
+    },
+    {
+      "id": "runner_error_contradicting_rate_limited_reason_is_ignored",
+      "row": "runner_error",
+      "path": "secondary",
+      "boundary": "finish",
+      "worker": {
+        "classification": "runner-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "runner-error",
+          "retry_condition": {
+            "reason": "rate_limited"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "runner_error",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "rate_limited",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "runner_fault_diagnosis",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "runner_fault_diagnosis",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "runner_error_flagged_terminal",
+      "row": "runner_error",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "runner-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "runner-error",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": true,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "runner_error",
+        "retry_safety": "flagged",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "runner_failed_without_diagnosis_is_blocked",
+      "row": "runner_failed",
+      "path": "positive",
+      "boundary": "finish",
+      "finish": {
+        "cause": "runner_failed",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "runner_fault_diagnosis",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "runner_fault_diagnosis",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "runner_failed_flagged_terminal",
+      "row": "runner_failed",
+      "path": "refusal",
+      "boundary": "finish",
+      "finish": {
+        "cause": "runner_failed",
+        "retry_safety": "flagged",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "sandbox_terminated_observed_termination_is_blocked",
+      "row": "sandbox_terminated",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "sandbox-terminated",
+        "error_frame": null,
+        "turn_end": "observed_termination",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "sandbox_terminated",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "sandbox_disruption_diagnosis",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "sandbox_disruption_diagnosis",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "sandbox_terminated_transport_drop_without_observation_is_uncertain",
+      "row": "sandbox_terminated",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "sandbox-terminated",
+        "error_frame": null,
+        "turn_end": "transport_drop",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": false,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "sandbox_terminated",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "sandbox_terminated_diagnosed_transient_retries",
+      "row": "sandbox_terminated",
+      "path": "secondary",
+      "boundary": "finish",
+      "finish": {
+        "cause": "sandbox_terminated",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "retry_backoff",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "backoff"
+      }
+    },
+    {
+      "id": "runner_timeout_accepted_stop_is_blocked",
+      "row": "runner_timeout",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "runner-timeout",
+        "error_frame": null,
+        "turn_end": "accepted_timeout",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "runner_timeout",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "runner_stop_confirmation",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "runner_stop_confirmation",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "runner_timeout_unconfirmed_reports_uncertain",
+      "row": "runner_timeout",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "runner-timeout-unconfirmed",
+        "error_frame": null,
+        "turn_end": "unconfirmed_timeout",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": false,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "runner_timeout",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "runner_timeout_unconfirmed_token_is_terminal",
+      "row": "runner_timeout",
+      "path": "refusal",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "runner-timeout-unconfirmed",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "runner_timeout_token_aliases_to_its_cause",
+      "row": "runner_timeout",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "runner-timeout",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "runner_stop_confirmation",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "start_failed_after_five_counted_deferrals_is_terminal",
+      "row": "start_failed",
+      "path": "positive",
+      "boundary": "defer",
+      "finish": {
+        "cause": "start_failed",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": "start_preparation",
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null,
+        "status": "failed",
+        "terminal_cause": "start_failed"
+      }
+    },
+    {
+      "id": "start_failed_with_clean_transient_facts_stays_terminal",
+      "row": "start_failed",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "start_failed",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": "start_preparation",
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "owner_lost_after_observed_teardown_is_admitted",
+      "row": "owner_lost",
+      "path": "positive",
+      "boundary": "runtime_termination",
+      "finish": {
+        "cause": "owner_lost",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "immediate",
+        "status": "failed",
+        "terminal_cause": "owner_lost"
+      }
+    },
+    {
+      "id": "owner_lost_reported_by_name_earns_nothing",
+      "row": "owner_lost",
+      "path": "refusal",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "owner_lost",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "owner_lost_with_the_allowance_spent_admits_nothing",
+      "row": "owner_lost",
+      "path": "refusal",
+      "boundary": "runtime_termination",
+      "finish": {
+        "cause": "owner_lost",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "setup": {
+        "automatic_retries_used_before": 2
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null,
+        "status": "failed",
+        "terminal_cause": "owner_lost"
+      }
+    },
+    {
+      "id": "sandbox_capacity_keeps_the_same_request",
+      "row": "sandbox-capacity",
+      "path": "positive",
+      "boundary": "defer",
+      "finish": {
+        "cause": "sandbox-capacity",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "setup": {
+        "defer_reason": "capacity",
+        "defer_capacity": true
+      },
+      "expected": {
+        "disposition": "same_request_wait",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null,
+        "status": "waiting"
+      }
+    },
+    {
+      "id": "workspace_timeout_keeps_the_same_request",
+      "row": "workspace_timeout",
+      "path": "positive",
+      "boundary": "defer",
+      "finish": {
+        "cause": "workspace_timeout",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "setup": {
+        "defer_reason": "workspace_timeout",
+        "defer_capacity": false
+      },
+      "expected": {
+        "disposition": "same_request_wait",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null,
+        "status": "waiting"
+      }
+    },
+    {
+      "id": "workspace_timeout_reported_as_a_finish_admits_nothing",
+      "row": "workspace_timeout",
+      "path": "secondary",
+      "boundary": "finish",
+      "finish": {
+        "cause": "workspace_timeout",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "same_request_wait",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_usage_limited_trusted_reset_is_scheduled_after_grace",
+      "row": "model_usage_limited",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-usage-limited",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-usage-limited",
+          "retry_condition": {
+            "reason": "usage_reset",
+            "retry_at": "2030-01-01T00:00:00Z",
+            "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_usage_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+        }
+      },
+      "retry_at_from_now_seconds": 600,
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_usage_reset",
+        "not_before": "2030-01-01T00:01:00Z",
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "provider_time"
+      }
+    },
+    {
+      "id": "model_usage_limited_without_reset_is_blocked",
+      "row": "model_usage_limited",
+      "path": "secondary",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-usage-limited",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-usage-limited",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_usage_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_usage_reset",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_usage_reset",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "model_usage_limited_reset_past_the_wait_deadline_is_blocked",
+      "row": "model_usage_limited",
+      "path": "secondary",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-usage-limited",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-usage-limited",
+          "retry_condition": {
+            "reason": "usage_reset",
+            "retry_at": "2030-01-01T00:00:00Z"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_usage_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": null
+        }
+      },
+      "retry_at_from_now_seconds": 86370,
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_usage_reset",
+        "not_before": "2030-01-01T00:01:00Z",
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_usage_reset",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "model_usage_limited_flagged_terminal",
+      "row": "model_usage_limited",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-usage-limited",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-usage-limited",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": true,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_usage_limited",
+        "retry_safety": "flagged",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_credit_exhausted_is_blocked_on_credit",
+      "row": "model_credit_exhausted",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-credit-exhausted",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-credit-exhausted",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_credit_exhausted",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_credit",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_credit",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "model_credit_exhausted_daily_reset_uses_the_reset_condition",
+      "row": "model_credit_exhausted",
+      "path": "secondary",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-credit-exhausted",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-credit-exhausted",
+          "retry_condition": {
+            "reason": "usage_reset",
+            "retry_at": "2030-01-01T00:00:00Z"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_credit_exhausted",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": null
+        }
+      },
+      "retry_at_from_now_seconds": 600,
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_usage_reset",
+        "not_before": "2030-01-01T00:01:00Z",
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": null,
+        "timing": "provider_time"
+      }
+    },
+    {
+      "id": "model_credit_exhausted_time_without_reset_reason_is_ignored",
+      "row": "model_credit_exhausted",
+      "path": "secondary",
+      "boundary": "finish",
+      "finish": {
+        "cause": "model_credit_exhausted",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": null
+        }
+      },
+      "retry_at_from_now_seconds": 600,
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_credit",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_credit",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "model_credential_rejected_is_blocked_on_the_credential",
+      "row": "model_credential_rejected",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-credential-rejected",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-credential-rejected",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_credential_rejected",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_credential",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_credential",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "model_credential_rejected_carrier_time_is_ignored",
+      "row": "model_credential_rejected",
+      "path": "secondary",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-credential-rejected",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-credential-rejected",
+          "retry_condition": {
+            "reason": "credential_rejected",
+            "retry_at": "2030-01-01T00:00:00Z"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_credential_rejected",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "credential_rejected",
+          "retry_at": "2030-01-01T00:00:00Z",
+          "scope_key": null
+        }
+      },
+      "retry_at_from_now_seconds": 600,
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_credential",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_credential",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "history_capacity_is_blocked",
+      "row": "history_capacity",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "history-persistence-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "history-persistence-error",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "history_capacity",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "history_capacity",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "history_capacity",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "history_capacity_flagged_terminal",
+      "row": "history_capacity",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "history-persistence-error",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "history-persistence-error",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": true,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "history_capacity",
+        "retry_safety": "flagged",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "max_turns_is_blocked",
+      "row": "max_turns",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "max-turns",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "max-turns",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "max_turns",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "turn_limit",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "turn_limit",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "max_turns_uncertain_terminal",
+      "row": "max_turns",
+      "path": "refusal",
+      "boundary": "finish",
+      "worker": {
+        "classification": "max-turns",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "max-turns",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": true,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "max_turns",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "execution_deadline_expiry_has_no_safety_and_admits_nothing",
+      "row": "execution_deadline",
+      "path": "positive",
+      "boundary": "runtime_termination",
+      "finish": {
+        "cause": "execution_deadline",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null,
+        "status": "expired",
+        "terminal_cause": "execution_deadline"
+      }
+    },
+    {
+      "id": "execution_deadline_with_no_effects_names_the_time_limit",
+      "row": "execution_deadline",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "execution_deadline",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "execution_time_limit",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "execution_time_limit",
+        "timing": null
+      }
+    },
+    {
+      "id": "approval_create_failed_is_publication_recovery",
+      "row": "approval_create_failed",
+      "path": "positive",
+      "boundary": "finish",
+      "finish": {
+        "cause": "approval_create_failed",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "publication_recovery",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "approval_create_failed_transient_carrier_admits_no_request",
+      "row": "approval_create_failed",
+      "path": "secondary",
+      "boundary": "finish",
+      "finish": {
+        "cause": "approval_create_failed",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "publication_recovery",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "publication_failed_is_publication_recovery",
+      "row": "publication_failed",
+      "path": "positive",
+      "boundary": "api_settlement",
+      "finish": {
+        "cause": "publication_failed",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "publication_recovery",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "publication_failed_clean_transient_facts_admit_no_request",
+      "row": "publication_failed",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "publication_failed",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "publication_recovery",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "publication_unrecorded_is_publication_recovery",
+      "row": "publication_unrecorded",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "publication-unrecorded",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "publication-unrecorded",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "publication_unrecorded",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "publication_recovery",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "publication_unrecorded_token_aliases_to_its_cause",
+      "row": "publication_unrecorded",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "publication-unrecorded",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "publication_recovery",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ci_timeout_is_ci_observation",
+      "row": "ci_timeout",
+      "path": "positive",
+      "boundary": "api_settlement",
+      "finish": {
+        "cause": "ci_timeout",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "ci_observation",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ci_timeout_clean_transient_facts_admit_no_request",
+      "row": "ci_timeout",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "ci_timeout",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "ci_observation",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ci_unverified_is_ci_observation",
+      "row": "ci_unverified",
+      "path": "positive",
+      "boundary": "api_settlement",
+      "finish": {
+        "cause": "ci_unverified",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "ci_observation",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ci_unverified_clean_transient_facts_admit_no_request",
+      "row": "ci_unverified",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "ci_unverified",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "ci_observation",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "merge_conflict_waits_on_lineage_without_a_request",
+      "row": "merge_conflict",
+      "path": "positive",
+      "boundary": "api_settlement",
+      "finish": {
+        "cause": "merge_conflict",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "pull_request_lineage",
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "merge_conflict_clean_transient_facts_admit_no_request",
+      "row": "merge_conflict",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "merge_conflict",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "pull_request_lineage",
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "pull_request_not_adopted_waits_on_lineage_without_a_request",
+      "row": "pull_request_not_adopted",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "pull-request-not-adopted",
+        "error_frame": null,
+        "turn_end": "not_accepted",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": false,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "pull_request_not_adopted",
+        "retry_safety": "uncertain",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "pull_request_lineage",
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "pull_request_not_adopted_token_aliases_to_its_cause",
+      "row": "pull_request_not_adopted",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "pull-request-not-adopted",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "pull_request_lineage",
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ci_failed_is_terminal",
+      "row": "ci_failed",
+      "path": "positive",
+      "boundary": "api_settlement",
+      "finish": {
+        "cause": "ci_failed",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ci_failed_clean_transient_facts_stay_terminal",
+      "row": "ci_failed",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "ci_failed",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ci_fix_unpublished_is_terminal",
+      "row": "ci_fix_unpublished",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "ci_fix_unpublished",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ci_fix_unpublished_clean_transient_facts_stay_terminal",
+      "row": "ci_fix_unpublished",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "ci_fix_unpublished",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "early_stop_is_terminal",
+      "row": "early_stop",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "early_stop",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "no_pull_request_is_terminal",
+      "row": "no_pull_request",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "no_pull_request",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "revision_unchanged_is_terminal",
+      "row": "revision_unchanged",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "revision_unchanged",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "no_pull_request_clean_transient_facts_stay_terminal",
+      "row": "no_pull_request",
+      "path": "secondary",
+      "boundary": "finish",
+      "finish": {
+        "cause": "no_pull_request",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "early_stop_clean_transient_facts_stay_terminal",
+      "row": "early_stop",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "early_stop",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "revision_unchanged_clean_transient_facts_stay_terminal",
+      "row": "revision_unchanged",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "revision_unchanged",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "budget_exceeded_is_terminal",
+      "row": "budget_exceeded",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "budget-exceeded",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "budget-exceeded",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "budget_exceeded",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "budget_exceeded_clean_transient_facts_stay_terminal",
+      "row": "budget_exceeded",
+      "path": "secondary",
+      "boundary": "finish",
+      "finish": {
+        "cause": "budget_exceeded",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "capacity_wait_expired_ends_an_unblocked_wait",
+      "row": "capacity_wait_expired",
+      "path": "positive",
+      "boundary": "wait_expiry",
+      "finish": {
+        "cause": "capacity_wait_expired",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "setup": {
+        "blocked_before": false
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null,
+        "status": "expired",
+        "terminal_cause": "capacity_wait_expired"
+      }
+    },
+    {
+      "id": "retry_condition_expired_ends_a_blocked_wait",
+      "row": "capacity_wait_expired",
+      "path": "secondary",
+      "boundary": "wait_expiry",
+      "finish": {
+        "cause": "retry_condition_expired",
+        "retry_safety": null,
+        "retry_condition": null
+      },
+      "setup": {
+        "blocked_before": true
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null,
+        "status": "expired",
+        "terminal_cause": "retry_condition_expired"
+      }
+    },
+    {
+      "id": "publication_denied_is_terminal",
+      "row": "publication_denied",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "publication_denied",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "publication_denied_clean_transient_facts_stay_terminal",
+      "row": "publication_denied",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "publication_denied",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "publication_expired_is_terminal",
+      "row": "publication_expired",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "publication_expired",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "publication_expired_clean_transient_facts_stay_terminal",
+      "row": "publication_expired",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "publication_expired",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "issue_cancelled_is_terminal",
+      "row": "issue_cancelled",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "issue_cancelled",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "issue_cancelled_clean_transient_facts_stay_terminal",
+      "row": "issue_cancelled",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "issue_cancelled",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "issue_deleted_is_terminal",
+      "row": "issue_deleted",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "issue_deleted",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "issue_deleted_clean_transient_facts_stay_terminal",
+      "row": "issue_deleted",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "issue_deleted",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "lineage_closed_is_terminal",
+      "row": "lineage_closed",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "lineage_closed",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "lineage_closed_clean_transient_facts_stay_terminal",
+      "row": "lineage_closed",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "lineage_closed",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "pr_closed_is_terminal",
+      "row": "pr_closed",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "pr_closed",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "pr_closed_clean_transient_facts_stay_terminal",
+      "row": "pr_closed",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "pr_closed",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ledger_error_token_is_terminal",
+      "row": "ledger-error",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "ledger-error",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ledger_error_token_with_clean_transient_facts_stays_terminal",
+      "row": "ledger-error",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "ledger-error",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ownership_store_unavailable_token_is_terminal",
+      "row": "ownership-store-unavailable",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "ownership-store-unavailable",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "ownership_store_unavailable_token_with_clean_transient_facts_stays_terminal",
+      "row": "ownership-store-unavailable",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "ownership-store-unavailable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "tool_access_unenforced_token_is_terminal",
+      "row": "tool-access-unenforced",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "tool-access-unenforced",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "tool_access_unenforced_token_with_clean_transient_facts_stays_terminal",
+      "row": "tool-access-unenforced",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "tool-access-unenforced",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "channel_read_unenforced_token_is_terminal",
+      "row": "channel-read-unenforced",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "channel-read-unenforced",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "channel_read_unenforced_token_with_clean_transient_facts_stays_terminal",
+      "row": "channel-read-unenforced",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "channel-read-unenforced",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "tool_access_refused_token_is_terminal",
+      "row": "tool-access-refused",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "tool-access-refused",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "tool_access_refused_token_with_clean_transient_facts_stays_terminal",
+      "row": "tool-access-refused",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "tool-access-refused",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "false_completion_token_is_terminal",
+      "row": "false-completion",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "false-completion",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "false_completion_token_with_clean_transient_facts_stays_terminal",
+      "row": "false-completion",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "false-completion",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "final_answer_validation_token_is_terminal",
+      "row": "final-answer-validation",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "final-answer-validation",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "final_answer_validation_token_with_clean_transient_facts_stays_terminal",
+      "row": "final-answer-validation",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "final-answer-validation",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "runner_escalated_is_terminal",
+      "row": "runner_escalated",
+      "path": "positive",
+      "boundary": "finish",
+      "finish": {
+        "cause": "runner_escalated",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "runner_escalated_clean_transient_facts_stay_terminal",
+      "row": "runner_escalated",
+      "path": "secondary",
+      "boundary": "finish",
+      "finish": {
+        "cause": "runner_escalated",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "unclassified_is_terminal",
+      "row": "unclassified",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "unclassified",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "unclassified",
+          "retry_condition": null
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "unclassified",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "unclassified_clean_transient_facts_stay_terminal",
+      "row": "unclassified",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "unclassified",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "approval_not_acted_is_observe_only",
+      "row": "approval-not-acted",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "approval-not-acted",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "observe_only",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "approval_not_acted_clean_transient_facts_stay_observe_only",
+      "row": "approval-not-acted",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "approval-not-acted",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "observe_only",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "completed_is_terminal_success",
+      "row": "completed",
+      "path": "positive",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "completed",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal_success",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "completed_clean_transient_facts_stay_terminal_success",
+      "row": "completed",
+      "path": "secondary",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "completed",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal_success",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "unknown_blank_looking_cause_is_terminal",
+      "row": "unknown",
+      "path": "refusal",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "   ",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "unknown_empty_cause_is_terminal",
+      "row": "unknown",
+      "path": "refusal",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "unknown_underscored_cause_is_terminal",
+      "row": "unknown",
+      "path": "refusal",
+      "boundary": "finish",
+      "finish": {
+        "cause": "model_unreachable_maybe",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "unknown_hyphenated_token_is_terminal",
+      "row": "unknown",
+      "path": "refusal",
+      "boundary": "finish",
+      "finish": {
+        "cause": "model-unreachable-maybe",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "transient_service",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "unknown_case_variant_is_terminal",
+      "row": "unknown",
+      "path": "refusal",
+      "boundary": "policy_only",
+      "finish": {
+        "cause": "Model_Unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": null
+      },
+      "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    }
+  ],
+  "refused_finish_bodies": [
+    {
+      "id": "missing_safety",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable"
+      },
+      "why": "retry_safety is required and has no default"
+    },
+    {
+      "id": "null_safety",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": null
+      },
+      "why": "a null safety is not a safety fact"
+    },
+    {
+      "id": "unknown_safety",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "clean"
+      },
+      "why": "only no_effects, flagged and uncertain are safety facts"
+    },
+    {
+      "id": "empty_safety",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": ""
+      },
+      "why": "an empty string is not a safety fact"
+    },
+    {
+      "id": "uppercase_safety",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "NO_EFFECTS"
+      },
+      "why": "safety values are exact"
+    },
+    {
+      "id": "unknown_reason",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "quota_raised"
+        }
+      },
+      "why": "the carrier reason is a closed enum"
+    },
+    {
+      "id": "classification_token_reason",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "rate-limit"
+        }
+      },
+      "why": "a classification token is not a reason"
+    },
+    {
+      "id": "missing_reason",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "retry_at": "2026-11-14T17:00:00Z"
+        }
+      },
+      "why": "a carrier needs its reason"
+    },
+    {
+      "id": "null_reason",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": null
+        }
+      },
+      "why": "a carrier reason cannot be null"
+    },
+    {
+      "id": "naive_retry_at",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00"
+        }
+      },
+      "why": "retry_at needs the Z designator"
+    },
+    {
+      "id": "numeric_retry_at",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": 1794243600
+        }
+      },
+      "why": "retry_at is never a unix number"
+    },
+    {
+      "id": "zero_offset_spelling_retry_at",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00+00:00"
+        }
+      },
+      "why": "the +00:00 spelling is refused"
+    },
+    {
+      "id": "impossible_day_retry_at",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-02-30T00:00:00Z"
+        }
+      },
+      "why": "retry_at must name a real calendar instant"
+    },
+    {
+      "id": "short_scope_key",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": "sha256:cefc1ab876b7698f"
+        }
+      },
+      "why": "scope_key is sha256 and 64 lowercase hex digits"
+    },
+    {
+      "id": "account_name_scope_key",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": "operator@example.com"
+        }
+      },
+      "why": "scope_key is never an account name"
+    },
+    {
+      "id": "string_carrier",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": "rate_limited"
+      },
+      "why": "the carrier is an object"
+    },
+    {
+      "id": "list_carrier",
+      "body": {
+        "outcome": "failed",
+        "cause": "model_unreachable",
+        "retry_safety": "no_effects",
+        "retry_condition": [
+          "transient_service"
+        ]
+      },
+      "why": "the carrier is an object"
+    }
+  ],
+  "malformed_hints": [
+    {
+      "id": "unknown_reason",
+      "error_frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-unreachable",
+        "retry_condition": {
+          "reason": "quota_raised"
+        }
+      }
+    },
+    {
+      "id": "missing_reason",
+      "error_frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-unreachable",
+        "retry_condition": {
+          "retry_at": "2026-11-14T17:00:00Z"
+        }
+      }
+    },
+    {
+      "id": "null_reason",
+      "error_frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-unreachable",
+        "retry_condition": {
+          "reason": null
+        }
+      }
+    },
+    {
+      "id": "naive_retry_at",
+      "error_frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-unreachable",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00"
+        }
+      }
+    },
+    {
+      "id": "numeric_retry_at",
+      "error_frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-unreachable",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": 1794243600
+        }
+      }
+    },
+    {
+      "id": "zero_offset_spelling_retry_at",
+      "error_frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-unreachable",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00+00:00"
+        }
+      }
+    },
+    {
+      "id": "impossible_day_retry_at",
+      "error_frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-unreachable",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-02-30T00:00:00Z"
+        }
+      }
+    },
+    {
+      "id": "short_scope_key",
+      "error_frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-unreachable",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": "sha256:cefc1ab876b7698f"
+        }
+      }
+    },
+    {
+      "id": "string_carrier",
+      "error_frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-unreachable",
+        "retry_condition": "rate_limited"
+      }
+    }
+  ]
+}

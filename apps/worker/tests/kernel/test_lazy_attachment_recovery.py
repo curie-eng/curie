@@ -211,7 +211,7 @@ def test_lazy_factory_continuation_refuses_displaced_authority_before_model(make
             assert calls == 2
             assert len(h.runner.opened) == 1
             assert len(items.finishes) == 1
-            assert items.finishes[0]["cause"] in {"runner_failed", "runner_escalated"}
+            assert items.finishes[0]["cause"] in {"runner_failed", "runner_error"}
             assert any(op == "revoke" for op, _ in control.calls)
 
     asyncio.run(run())
@@ -397,7 +397,11 @@ def test_lazy_continuation_lock_exit_closes_accepted_stream_and_blocks_retry(
     asyncio.run(run())
 
 
-def test_lazy_continuation_preaccept_failure_keeps_retry_policy(make_harness):
+def test_lazy_continuation_preaccept_failure_ends_the_turn_without_a_side_effect_fence(
+    make_harness,
+):
+    """ADR 0269: a started execute turn is one attempt; the fence stays unlatched."""
+
     from curie_worker.runner_client import RunnerError
 
     async def run():
@@ -411,7 +415,8 @@ def test_lazy_continuation_preaccept_failure_keeps_retry_policy(make_harness):
             max_attempts=2,
         ) as h:
             h.kernel._attachment_access = Control()
-            h.kernel._work_items = _WorkItems()
+            items = _WorkItems()
+            h.kernel._work_items = items
             h.runner.attachment_access_enforced = True
             h.runner.turn_scripts = [list(ZERO_WORK_TURN), [_done("cannot complete")]]
             original_start = h.kernel._runner.start_turn
@@ -427,8 +432,12 @@ def test_lazy_continuation_preaccept_failure_keeps_retry_policy(make_harness):
             h.kernel._runner.start_turn = start
             event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
             await h.kernel.process_event(event)
-            assert calls >= 3
-            assert len(h.runner.event_bodies) >= 2
+            assert calls == 2
+            assert len(h.runner.event_bodies) == 1
             assert not await h.kernel._markers.saw_side_effect(event.event_id)
+            [finish] = items.finishes
+            assert finish["cause"] == "runner_error"
+            # The continuation never started, so no turn end was observed.
+            assert finish["retry_safety"] == "uncertain"
 
     asyncio.run(run())

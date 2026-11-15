@@ -335,6 +335,8 @@ def _finish(request_id: uuid.UUID, epoch: int, outcome: str, cause: str) -> None
             cause=cause,
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert getattr(result, "code", None) is None, result
 
@@ -1085,6 +1087,8 @@ def test_completion_without_a_pull_request_stays_running(
             cause="completed",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert getattr(result, "code", None) is not None, result
 
@@ -1279,6 +1283,8 @@ def test_pr_opened_after_execution_deadline_binds_and_completes(
             request_id=seeded.request_id,
             expected_work_item_version=work_item_version,
             expected_request_version=request_version,
+            retry_safety=None,
+            retry_condition=None,
         )
         assert isinstance(result, workitems.WorkItemOutcome), result
 
@@ -1549,6 +1555,8 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         model_auth_mode="service",
         coding_instructions_state="absent",
         coding_instructions_absence_reason="historical",
+        # The database default an inserted row would carry.
+        automatic_retries_used=0,
     )
     request = ExecutionRequest(
         id=uuid.uuid4(),
@@ -1569,6 +1577,9 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         requester=REQUESTER,
         model_auth_mode="service",
         coding_instructions_evidence="none",
+        # The database defaults an inserted row would carry.
+        dispatch_not_before=now,
+        owner_lost_retry=False,
     )
     outcome = derive_outcome(
         item,
@@ -1611,6 +1622,8 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         model_auth_mode="service",
         coding_instructions_state="absent",
         coding_instructions_absence_reason="historical",
+        # The database default an inserted row would carry.
+        automatic_retries_used=0,
     )
     request = ExecutionRequest(
         id=uuid.uuid4(),
@@ -1630,6 +1643,9 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         requester=REQUESTER,
         model_auth_mode="service",
         coding_instructions_evidence="none",
+        # The database defaults an inserted row would carry.
+        dispatch_not_before=now,
+        owner_lost_retry=False,
     )
 
     outcome = derive_outcome(

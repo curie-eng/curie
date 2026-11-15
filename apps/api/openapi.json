@@ -9197,6 +9197,25 @@
             "title": "Outcome",
             "type": "string"
           },
+          "retry_condition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RetryCondition"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retry_safety": {
+            "enum": [
+              "no_effects",
+              "flagged",
+              "uncertain"
+            ],
+            "title": "Retry Safety",
+            "type": "string"
+          },
           "runtime_epoch": {
             "minimum": 1.0,
             "title": "Runtime Epoch",
@@ -9206,7 +9225,8 @@
         "required": [
           "runtime_epoch",
           "outcome",
-          "cause"
+          "cause",
+          "retry_safety"
         ],
         "title": "FinishBody",
         "type": "object"
@@ -15389,6 +15409,56 @@
         "title": "ResolvedTarget",
         "type": "object"
       },
+      "RetryCondition": {
+        "description": "Provider-derived evidence that a failed turn should wait before a retry.\n\nCarried as ``ErrorEvent.retry_condition``. A missing or null carrier means\nno trusted retry condition, and a consumer must never read that as retry\nnow. A present carrier is evidence for a wait. It is never authorization,\nan approval, an increased limit, or permission to replay an effect: the\nno-retry-after-side-effects rule and every other gate still apply.\n\n``reason`` is the closed ``RetryReason`` the producer derived from the\nprovider's own signal. Nothing infers a reset from\n``ErrorEvent.classification``; a classification token alone never creates\na retry condition.\n\n``retry_at`` is optional. When present it is an absolute, provider-derived\nUTC instant spelled as ``RETRY_AT_PATTERN`` describes. Naive values,\nnumeric offsets (``+00:00`` included), unix numbers and every other\nspelling are refused rather than coerced, so every lane reads the same\ninstant. A past instant is valid; consumers judge time themselves. The\nscheduler adds its own separate 60 second reset grace; the producer reports\nthe provider's time without it. A Python ``datetime`` is accepted only with\na zero UTC offset and is normalized to ``UTC``, so every Python producer\nwrites the ``Z`` form. Python also normalizes the fraction spelling on\nre-encode (``.5Z`` becomes ``.500000Z`` and a zero fraction is dropped)\nwhile the generated Rust keeps the received string; both name the same\ninstant.\n\n``scope_key`` is optional. When present it is an opaque digest of the\ncredential scope the condition applies to, ``sha256:`` followed by 64\nlowercase hex digits (``RETRY_SCOPE_KEY_PATTERN``). It is never a\ncredential value, an account name or a provider message. The grammar check\nis the only guard on it and is not a secret detector, so a producer must\nderive the value from a digest rather than rely on validation to catch a\nleak.",
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/RetryReason"
+          },
+          "retry_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?Z$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry At"
+          },
+          "scope_key": {
+            "anyOf": [
+              {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope Key"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "RetryCondition",
+        "type": "object"
+      },
+      "RetryReason": {
+        "description": "Why a provider asked the platform to wait before another attempt.\n\nCarried only inside ``RetryCondition``. Each value names the provider's\nsignal, not a platform decision: ``rate_limited`` is a request rate limit,\n``usage_reset`` is a usage allowance that resets at a provider time,\n``credit_exhausted`` is a spent credit balance, ``credential_rejected`` is\na credential the provider refused, and ``transient_service`` is a temporary\nprovider service failure. These are deliberately not the hyphenated\n``ErrorEvent.classification`` tokens, and neither vocabulary maps onto the\nother.\n\nA closed enum, not free text: an unknown value is refused on the wire,\nnever read as an absent condition. Adding a value is a breaking change\nunder ADR 0036.",
+        "enum": [
+          "rate_limited",
+          "usage_reset",
+          "credit_exhausted",
+          "credential_rejected",
+          "transient_service"
+        ],
+        "title": "RetryReason",
+        "type": "string"
+      },
       "RevalidationBody": {
         "description": "The versions the caller read, compared and set in one transaction.",
         "properties": {
@@ -18577,6 +18647,14 @@
             "title": "Agent Id",
             "type": "string"
           },
+          "automatic_retries_used": {
+            "title": "Automatic Retries Used",
+            "type": "integer"
+          },
+          "automatic_retry_limit": {
+            "title": "Automatic Retry Limit",
+            "type": "integer"
+          },
           "cancelled_at": {
             "anyOf": [
               {
@@ -18802,7 +18880,9 @@
           "correctness",
           "ci",
           "requests",
-          "coding_instructions"
+          "coding_instructions",
+          "automatic_retries_used",
+          "automatic_retry_limit"
         ],
         "title": "WorkItemOutcomeOut",
         "type": "object"
@@ -18940,6 +19020,17 @@
       "WorkItemRequestOut": {
         "description": "Operator view of one ExecutionRequest (#2577). Built from an explicit\nallowlist dict, never from an ORM row, so no runtime-owner field leaks.",
         "properties": {
+          "blocked_on": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocked On"
+          },
           "capacity_deferrals": {
             "title": "Capacity Deferrals",
             "type": "integer"
@@ -18970,6 +19061,11 @@
           "created_at": {
             "format": "date-time",
             "title": "Created At",
+            "type": "string"
+          },
+          "dispatch_not_before": {
+            "format": "date-time",
+            "title": "Dispatch Not Before",
             "type": "string"
           },
           "enrollment_generation": {
@@ -19037,6 +19133,49 @@
               }
             ],
             "title": "Owner Principal Id"
+          },
+          "retry_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "owner_loss",
+                  "failure"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Kind"
+          },
+          "retry_of_request_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Of Request Id"
+          },
+          "retry_safety": {
+            "anyOf": [
+              {
+                "enum": [
+                  "no_effects",
+                  "flagged",
+                  "uncertain"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Safety"
           },
           "sequence": {
             "title": "Sequence",
@@ -19129,7 +19268,12 @@
           "termination_observation",
           "capacity_deferrals",
           "last_deferral_reason",
-          "last_start_failure_detail"
+          "last_start_failure_detail",
+          "retry_of_request_id",
+          "retry_kind",
+          "dispatch_not_before",
+          "blocked_on",
+          "retry_safety"
         ],
         "title": "WorkItemRequestOut",
         "type": "object"

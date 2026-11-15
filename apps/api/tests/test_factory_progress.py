@@ -386,7 +386,12 @@ def _fail(client: Any, request_id: uuid.UUID) -> None:
     failed = client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=WORKER,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "runner_failed"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "runner_failed",
+            "retry_safety": "uncertain",
+        },
     )
     assert failed.status_code == 200, failed.text
 

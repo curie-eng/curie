@@ -798,7 +798,7 @@ _PILLS: dict[str, tuple[str, str, bool]] = {
     "running": ("RUNNING", "#2f81f7", True),
     "cancellation_requested": ("STOPPING", "#bc4c00", True),
     "completed": ("SUCCEEDED", "#1a7f37", False),
-    # Failed and expired runs need a human unless an owner_lost successor was admitted.
+    # Failed and expired runs need a human unless an automatic successor was admitted.
     "failed": ("NEEDS HUMAN", "#bf8700", False),
     "expired": ("NEEDS HUMAN", "#bf8700", False),
     "cancelled": ("CANCELLED", "#6e7781", False),

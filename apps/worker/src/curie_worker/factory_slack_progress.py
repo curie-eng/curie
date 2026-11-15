@@ -201,6 +201,13 @@ def _needs_a_person(payload: dict[str, Any]) -> str:
     return _with_url(f"Needs a person: {_escaped(sentence)}", payload.get("ticket_url"))
 
 
+def _retry_queued(payload: dict[str, Any]) -> str:
+    """A failed run whose automatic retry was admitted with it: nobody is needed yet."""
+
+    sentence = cause_text(str(payload.get("cause") or ""))
+    return _with_url(f"Automatic retry queued: {_escaped(sentence)}", payload.get("ticket_url"))
+
+
 def _refusal_sentence(reason: str, login: object) -> str:
     if reason == "actor_no_permission":
         who = str(login) if login else "the account"
@@ -237,6 +244,8 @@ def render_post(kind: str, payload: dict[str, Any]) -> str:
     if kind == "terminal":
         status = str(payload.get("status") or "")
         if status in _NEEDS_A_PERSON:
+            if payload.get("retry_queued") is True:
+                return _retry_queued(payload)
             return _needs_a_person(payload)
         line = f"Run {_escaped(status or 'ended')}"
         cause = payload.get("cause")
@@ -466,6 +475,10 @@ class PostgresFactorySlackStore:
                    jsonb_strip_nulls(jsonb_build_object(
                        'status', q.status,
                        'cause', q.terminal_cause,
+                       'retry_queued', CASE WHEN EXISTS (
+                           SELECT 1 FROM {self._requests} s
+                            WHERE s.retry_of_request_id = q.id
+                       ) THEN true END,
                        'ticket_url', NULLIF(split_part(q.objective, '#', 1), '')
                    ))
               FROM ({live_threads}) t

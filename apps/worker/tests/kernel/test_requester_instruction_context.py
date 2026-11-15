@@ -410,7 +410,12 @@ async def _assert_failed(
     assert await stage.evidence(run) == "failed"
     # The kernel settles exactly this way (lifecycle `_settle_requester_refusal`).
     await run.finish(
-        outcome="failed", cause="runner_escalated", detail=refused.detail, ci_fix_round=None
+        outcome="failed",
+        cause="runner_escalated",
+        detail=refused.detail,
+        ci_fix_round=None,
+        retry_safety="uncertain",
+        retry_condition=None,
     )
     (row,) = await stage.sql(
         "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
@@ -1196,5 +1201,9 @@ def _assert_failed_before_model_work(h: Any, work_items: _WorkItems, reason: str
     assert finish["outcome"] == "failed"
     assert finish["cause"] == "runner_escalated"
     assert reason in str(finish["detail"])
+    # A refusal before any turn proves nothing about effects (ADR 0269), so it
+    # never earns an automatic retry.
+    assert finish["retry_safety"] == "uncertain"
+    assert finish["retry_condition"] is None
     # The claim is released, as for any other settled request.
     assert h.fake_k8s.claims == {}

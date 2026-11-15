@@ -1025,6 +1025,11 @@ class WorkItem(Base):
         ),
         CheckConstraint("version >= 1", name="work_items_version_ck"),
         CheckConstraint("next_sequence >= 1", name="work_items_next_sequence_ck"),
+        # Migration 0172 (#5424): the lifetime automatic retry slots spent. A
+        # trigger refuses any update that lowers it.
+        CheckConstraint(
+            "automatic_retries_used >= 0", name="work_items_automatic_retries_used_ck"
+        ),
         UniqueConstraint(
             "tracker_kind",
             "tracker_host",
@@ -1160,6 +1165,7 @@ class WorkItem(Base):
     )
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
+    automatic_retries_used: Mapped[int] = mapped_column(default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -1280,10 +1286,12 @@ class ExecutionRequest(Base):
             f"interval '{MAX_EXECUTION_DEADLINE_SECONDS} seconds')",
             name="execution_requests_deadline_ck",
         ),
-        # Frozen with migration 0160 (#5377): an enrollment fence stops a
-        # running request (``enrollment_fenced``, which like ``owner_lost``
-        # ends failed with an observation), and a started completed or failed
-        # request may carry a confirmed teardown observation.
+        # Frozen with migration 0172 (#5424): the 0160 shape (#5377: an
+        # enrollment fence stops a running request, ``enrollment_fenced``,
+        # which like ``owner_lost`` ends failed with an observation, and a
+        # started completed or failed request may carry a confirmed teardown
+        # observation) with one branch changed: an unstarted expired request
+        # may also end ``retry_condition_expired`` when it was blocked.
         CheckConstraint(
             "((status = 'failed' AND started_at IS NULL AND execution_deadline IS NULL "
             "AND terminal_at IS NOT NULL AND terminal_cause = 'start_failed' "
@@ -1317,7 +1325,9 @@ class ExecutionRequest(Base):
             "OR termination_observation IS NOT NULL)) "
             "OR (status = 'expired' AND terminal_at IS NOT NULL AND "
             "((started_at IS NULL AND execution_deadline IS NULL "
-            "AND terminal_cause IS NOT NULL AND terminal_cause = 'capacity_wait_expired' "
+            "AND terminal_cause IS NOT NULL "
+            "AND (terminal_cause = 'capacity_wait_expired' "
+            "OR (terminal_cause = 'retry_condition_expired' AND blocked_on IS NOT NULL)) "
             "AND termination_observation IS NULL) OR "
             "(started_at IS NOT NULL AND execution_deadline IS NOT NULL "
             "AND terminal_cause IS NOT NULL AND terminal_cause = 'execution_deadline' "
@@ -1433,10 +1443,38 @@ class ExecutionRequest(Base):
             name="execution_requests_work_item_owner_fkey",
             ondelete="CASCADE",
         ),
+        # Migration 0172 (#5424): the automatic retry lineage, the typed block,
+        # and the safety fact and provider condition a finish reported.
+        CheckConstraint(
+            "(retry_of_request_id IS NULL) = (retry_origin_request_id IS NULL) "
+            "AND (retry_of_request_id IS NULL OR retry_of_request_id <> id)",
+            name="execution_requests_retry_lineage_ck",
+        ),
+        CheckConstraint(
+            "blocked_on IS NULL OR (blocked_on <> '' AND started_at IS NULL)",
+            name="execution_requests_blocked_unstarted_ck",
+        ),
+        CheckConstraint(
+            "retry_safety IS NULL "
+            "OR (retry_safety IN ('no_effects', 'flagged', 'uncertain') "
+            "AND terminal_at IS NOT NULL)",
+            name="execution_requests_retry_safety_ck",
+        ),
+        CheckConstraint(
+            "retry_condition_reason IS NOT NULL "
+            "OR (retry_condition_retry_at IS NULL AND retry_condition_scope_key IS NULL)",
+            name="execution_requests_retry_condition_ck",
+        ),
         UniqueConstraint(
             "work_item_id",
             "sequence",
             name="execution_requests_work_item_sequence_key",
+        ),
+        Index(
+            "uq_execution_requests_retry_of",
+            "retry_of_request_id",
+            unique=True,
+            postgresql_where=text("retry_of_request_id IS NOT NULL"),
         ),
         Index(
             "uq_execution_requests_active_work_item",
@@ -1560,6 +1598,25 @@ class ExecutionRequest(Base):
     reply_conversation_id: Mapped[str | None] = mapped_column(Text, default=None)
     # Admitted because its predecessor ended failed/owner_lost (ADR 0206).
     owner_lost_retry: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Automatic retry lineage and state (migration 0172, ADR 0269). No foreign
+    # key: requests are deleted only with their WorkItem. Historical owner loss
+    # successors keep null lineage.
+    retry_of_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    retry_origin_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    # The typed condition a waiting successor is held on, or NULL when scheduled.
+    blocked_on: Mapped[str | None] = mapped_column(Text, default=None)
+    # What a finish reported: the safety fact, and the optional provider
+    # condition with its reset time and scope.
+    retry_safety: Mapped[str | None] = mapped_column(Text, default=None)
+    retry_condition_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    retry_condition_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    retry_condition_scope_key: Mapped[str | None] = mapped_column(Text, default=None)
     # Where the factory status reply lands (ADR 0197 decision fact 4): the
     # tracker issue, a pull request conversation, or one review thread. A
     # revision answers on its pull request; every other request on the issue.

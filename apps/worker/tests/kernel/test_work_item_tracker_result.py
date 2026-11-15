@@ -352,13 +352,12 @@ def test_a_dollar_halt_finishes_budget_exceeded_with_no_further_turn(make_harnes
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize(
-    ("contract", "turns"),
-    [(TRACKER_RESULT, 1), (IMPLEMENTATION, 3)],
-)
-def test_a_transient_failure_is_retried_only_for_implementation(
-    make_harness, contract: CompletionContract, turns: int
+@pytest.mark.parametrize("contract", [TRACKER_RESULT, IMPLEMENTATION])
+def test_a_transient_failure_is_not_retried_inside_the_delivery(
+    make_harness, contract: CompletionContract
 ) -> None:
+    """ADR 0277 and ADR 0269: neither contract opens a second session here."""
+
     async def exercise() -> None:
         async with _harness(make_harness, _CountingPublicationApi(), max_attempts=3) as h:
             items = _ContractWorkItems(contract)
@@ -374,7 +373,8 @@ def test_a_transient_failure_is_retried_only_for_implementation(
 
             await asyncio.wait_for(h.kernel.process_event(event), timeout=30)
 
-            assert h.runner.opened == [ISSUE_PROMPT] * turns
+            assert h.config.max_attempts == 3
+            assert h.runner.opened == [ISSUE_PROMPT]
             assert items.calls.count("start") == 1
             [finish] = items.finishes
             assert finish["outcome"] == "failed"

@@ -522,7 +522,12 @@ def test_revalidation_refuses_a_normally_finished_run_without_a_recorded_termina
     # The worker reports the run finished; its sandbox cleanup afterwards is best effort.
     finished = api.post(
         f"{support.INTERNAL_PREFIX}/requests/{first.request_id}/finish",
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "deadline_halted"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "deadline_halted",
+            "retry_safety": "uncertain",
+        },
         headers=WORKER_HEADERS,
     )
     assert finished.status_code == 200, finished.text
