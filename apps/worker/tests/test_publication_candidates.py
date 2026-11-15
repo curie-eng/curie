@@ -1330,13 +1330,14 @@ def test_helper_captures_only_for_this_events_started_run_with_budget(
             stage.direct_edits()
             snapshot = await stage.snapshot()
             stage.h.kernel._publication_candidates = stage.capture(await stage.ledger())
-            # Another event's turn, and a snapshot budget of 5 s or less, capture
-            # nothing; validation passes either way.
+            # Another event's turn, and a snapshot budget that cannot keep 30 s for
+            # validation and still give the capture 5 s, capture nothing; validation
+            # passes either way.
             await stage.h.kernel._retain_and_validate_publication_snapshot(
                 _qevent("some-other-event"), stage.thread_key, snapshot, run, 120.0
             )
             await stage.h.kernel._retain_and_validate_publication_snapshot(
-                _qevent(run.event_id), stage.thread_key, snapshot, run, 5.0
+                _qevent(run.event_id), stage.thread_key, snapshot, run, 39.0
             )
             await stage.h.kernel._retain_and_validate_publication_snapshot(
                 _qevent(run.event_id), stage.thread_key, snapshot, None, 120.0

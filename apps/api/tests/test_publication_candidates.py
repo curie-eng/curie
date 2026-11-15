@@ -611,6 +611,10 @@ def test_outcome_needs_only_the_capture_identity(candidates: None, client: Any) 
         "recorded": True
     }
     assert _outcome(source) == "capture_failed"
+    # A later admitted request of the same WorkItem does not take the record away.
+    _request(source, "waiting")
+    assert _ok(_post(client, "outcome", outcome)) == {"recorded": True}
+    assert _outcome(source) == "capture_timeout"
     # Identity still binds: another epoch, generation or request records nothing.
     for invalid in (
         {**outcome, "runtime_epoch": 2},
@@ -618,7 +622,7 @@ def test_outcome_needs_only_the_capture_identity(candidates: None, client: Any) 
         {**outcome, "request_id": str(uuid.uuid4())},
     ):
         _refused(_post(client, "outcome", invalid), 409, "source_identity")
-        assert _outcome(source) == "capture_failed"
+        assert _outcome(source) == "capture_timeout"
 
 
 def test_expiry_is_fixed_exactly_from_the_owner_final_disposition(
