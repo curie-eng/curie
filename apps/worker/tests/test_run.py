@@ -23,6 +23,7 @@ import pytest
 import redis
 import redis.asyncio
 from curie_worker import run
+from curie_worker.boot_grace import BOOT_GRACE_S
 from curie_worker.config import WorkerConfig
 from curie_worker.run import (
     _MAX_TUNABLE_SECONDS,
@@ -1045,7 +1046,7 @@ def test_supervise_policy_reads_worker_config() -> None:
         "max_restart_backoff_s": 30.0,
         "max_consecutive_failures": 5,
         "failure_reset_s": 120.0,
-        "boot_grace_s": run._BOOT_GRACE_S,
+        "boot_grace_s": BOOT_GRACE_S,
     }
 
 
