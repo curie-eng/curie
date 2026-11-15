@@ -267,8 +267,8 @@ grep -q "Kernel isolation" "$NOTES_OUT" || fail "7 NOTES render lacks the sandbo
 if grep -q "Sandbox capacity" "$NOTES_OUT"; then
   fail "7 NOTES printed a capacity block with no nodes from lookup"
 fi
-grep -qF "Sandbox request memory headroom: resourceQuota.hard.requestsMemory is 10Gi. The factory profile requests 8Gi and the standard profile requests 192Mi. Integer division: factory sandboxes 1, standard sandboxes in the remainder 10." "$NOTES_OUT" \
-  || fail "7 NOTES headroom line does not admit one factory sandbox and ten standard sandboxes beside it"
+grep -qF "Beside one factory sandbox the quota admits 6 standard sandboxes. limits.cpu binds before requests.memory. requests.memory would allow 10 and limits.cpu would allow 6." "$NOTES_OUT" \
+  || fail "7 NOTES headroom line does not admit six standard sandboxes beside one factory sandbox"
 
 # 9. An unsupported memory quantity fails rendering loudly, naming it.
 BAD_CHART="$TMP/bad-chart"

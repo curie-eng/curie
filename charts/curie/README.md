@@ -1384,13 +1384,16 @@ Capacity consequences of the factory profile:
 1. The 8Gi memory request means a factory sandbox needs a node with 8Gi of
    unrequested allocatable memory.
 2. The default `resourceQuota.hard.requestsMemory` of `10Gi` admits exactly one
-   factory sandbox at a time (the factory profile requests 8Gi) and leaves 2Gi,
-   ten standard sandboxes at 192Mi, beside it. A second factory sandbox does
-   not fit. Raise `resourceQuota.hard.requestsMemory` for factory concurrency,
-   or opt the agent to `standard` with `agentSandbox.agentResourceProfiles` on
-   a small trial cluster. `limitsMemory` stays 16Gi and `limitsCpu` stays 8:
-   one factory sandbox plus one standard sandbox fits both (8Gi + 768Mi, and
-   2 + 1 CPU). The 10Gi request quota is what refuses the second factory sandbox.
+   factory sandbox at a time (the factory profile requests 8Gi). Beside that
+   sandbox, six standard sandboxes fit and a seventh is refused. `limits.cpu`
+   binds before `requests.memory`: the factory profile limits CPU at 2, the
+   standard profile limits CPU at 1, and `limitsCpu` stays 8. `requests.memory`
+   would allow ten standard sandboxes at 192Mi in the 2Gi remainder. A second
+   factory sandbox does not fit. Raise `resourceQuota.hard.requestsMemory` for
+   factory concurrency, or opt the agent to `standard` with
+   `agentSandbox.agentResourceProfiles` on a small trial cluster.
+   `limitsMemory` stays 16Gi. The 10Gi request quota is what refuses the
+   second factory sandbox.
 3. Existing sandbox pods keep the volume limits and resources they were created
    with. Kubernetes cannot resize an `emptyDir` `sizeLimit` in place, so new
    limits apply to sandboxes created after the upgrade.

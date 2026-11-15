@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 from curie_worker.run import _substrate_config
-from curie_worker.sandbox.quota import admission_quota_headroom
+from curie_worker.sandbox.quota import admission_quota_headroom, resource_vector
 from curie_worker.sandbox.resources import pod_resources
 from curie_worker.sandbox.types import AdmissionConfig, QuotaStatus
 
@@ -525,3 +526,38 @@ def test_default_quota_admits_one_factory_sandbox_beside_a_standard_sandbox(
 
     assert admission_quota_headroom(config, namespace, factory, counted(standard))
     assert not admission_quota_headroom(config, namespace, factory, counted(factory))
+
+    # limits.cpu is 8. One factory sandbox limits CPU at 2 and each standard
+    # sandbox limits CPU at 1, so six standard sandboxes beside that factory
+    # sandbox fit and the seventh is refused on limits.cpu.
+    sixth = _plus(factory, _times(standard, 5))
+    seventh_used = _plus(factory, _times(standard, 6))
+    assert admission_quota_headroom(config, namespace, standard, counted(sixth))
+    assert not admission_quota_headroom(
+        config, namespace, standard, counted(seventh_used)
+    )
+    assert _refused_by(contract["hard"], seventh_used, standard) == ["limits.cpu"]
+
+
+def _times(resources: dict[str, str], count: int) -> dict[str, str]:
+    return {key: format(Decimal(value) * count, "f") for key, value in resources.items()}
+
+
+def _plus(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
+    return {
+        key: format(Decimal(left.get(key, "0")) + Decimal(right.get(key, "0")), "f")
+        for key in set(left) | set(right)
+    }
+
+
+def _refused_by(
+    hard: dict[str, str], used: dict[str, str], requested: dict[str, str]
+) -> list[str]:
+    hard_n = resource_vector(hard)
+    used_n = resource_vector(used)
+    requested_n = resource_vector(requested)
+    return [
+        key
+        for key in sorted(hard_n)
+        if Decimal(used_n[key]) + Decimal(requested_n.get(key, "0")) > Decimal(hard_n[key])
+    ]
