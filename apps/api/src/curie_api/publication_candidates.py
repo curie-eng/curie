@@ -219,6 +219,18 @@ async def _objects(session: AsyncSession, item_id: uuid.UUID) -> list[CandidateO
     )
 
 
+LIVE_BASE_STATUSES = ("staging", "complete")
+
+
+def _live_base(objects: list[CandidateObject]) -> CandidateObject | None:
+    """The WorkItem's one staging or complete base; a withdrawn base awaits collection."""
+
+    return next(
+        (obj for obj in objects if obj.kind == "base" and obj.status in LIVE_BASE_STATUSES),
+        None,
+    )
+
+
 def _receipt(obj: CandidateObject) -> wire.CandidateObjectReceipt:
     return wire.CandidateObjectReceipt.model_validate(
         {"kind": obj.kind, "key": obj.key, "size_bytes": obj.size_bytes, "sha256": obj.sha256}
@@ -228,11 +240,9 @@ def _receipt(obj: CandidateObject) -> wire.CandidateObjectReceipt:
 async def _reservation(
     session: AsyncSession, candidate: Candidate, *, replayed: bool
 ) -> wire.CandidateReservation:
-    objects = [
-        obj
-        for obj in await _objects(session, candidate.work_item_id)
-        if obj.candidate_id == candidate.id or (candidate.includes_base and obj.kind == "base")
-    ]
+    stored = await _objects(session, candidate.work_item_id)
+    base = _live_base(stored) if candidate.includes_base else None
+    objects = [obj for obj in stored if obj.candidate_id == candidate.id or obj is base]
     if len(objects) != (2 if candidate.includes_base else 1):
         raise CandidateRefusal("candidate_collecting")
     return wire.CandidateReservation(
@@ -360,6 +370,8 @@ async def reserve(
         .where(
             Candidate.origin_request_id == request.id,
             Candidate.idempotency_key == body.dedupe_key,
+            # A withdrawn capture is not replayed: the same event retains afresh.
+            Candidate.status != "tombstoned",
         )
         .with_for_update()
         .execution_options(populate_existing=True)
@@ -367,8 +379,6 @@ async def reserve(
     if replay is not None:
         if replay.content_sha256 != digest:
             raise CandidateRefusal("idempotency_conflict")
-        if replay.status == "tombstoned":
-            raise CandidateRefusal("candidate_state")
         if (
             replay.status == "staging"
             and replay.includes_base
@@ -385,22 +395,33 @@ async def reserve(
         await _record_refusal(session, item, "patch_too_large", 413)
     if base is not None and base.size_bytes > settings.workspace_max_archive_bytes:
         await _record_refusal(session, item, "base_too_large", 413)
-    if group is not None:
+    retained = _live_base(await _objects(session, item.id)) if group is not None else None
+    if group is not None and retained is not None:
         if _group_identity(group) != identity or (
             base is not None and base.sha256 != group.base_sha256
         ):
             await _record_refusal(session, item, "retained_base_conflict")
-        retained = next(
-            (obj for obj in await _objects(session, item.id) if obj.kind == "base"), None
-        )
-        if retained is None or retained.status != "complete":
+        if retained.status != "complete":
             await _record_refusal(session, item, "retained_base_unavailable")
         if base is not None:
             raise CandidateRefusal("retained_base_declaration")
+    elif group is not None:
+        # Every earlier base was withdrawn with its capture and nothing retained
+        # depends on it, so this capture declares a new base, as for a new group.
+        if _group_identity(group) != identity:
+            await _record_refusal(session, item, "retained_base_conflict")
+        if base is None:
+            raise CandidateRefusal("base_required")
+        group.base_sha256 = base.sha256
     elif base is None:
         raise CandidateRefusal("base_required")
+    # A withdrawn candidate holds no slot; its bytes still count until collected.
     candidates = list(
-        await session.scalars(select(Candidate).where(Candidate.work_item_id == item.id))
+        await session.scalars(
+            select(Candidate).where(
+                Candidate.work_item_id == item.id, Candidate.status != "tombstoned"
+            )
+        )
     )
     if len(candidates) >= MAX_CANDIDATES_PER_WORK_ITEM or any(
         candidate.status == "staging" for candidate in candidates
@@ -538,6 +559,9 @@ async def complete(session: AsyncSession, body: wire.CandidateComplete) -> wire.
     now = await database_now(session)
     _live(item, request, now, live=False)
     _capture_identity(candidate, body)
+    if candidate.status == "tombstoned":
+        # Its withdrawn base is no longer the WorkItem's live base to compare against.
+        raise CandidateRefusal("capture_deadline_or_state")
     reservation = await _reservation(session, candidate, replayed=True)
     expected = sorted(obj.model_dump_json() for obj in reservation.objects)
     actual = sorted(obj.model_dump_json() for obj in body.receipts)
@@ -548,14 +572,14 @@ async def complete(session: AsyncSession, body: wire.CandidateComplete) -> wire.
     if candidate.status != "staging" or candidate.capture_deadline <= now:
         raise CandidateRefusal("capture_deadline_or_state")
     objects = await _objects(session, item.id)
-    base = next((obj for obj in objects if obj.kind == "base"), None)
+    base = _live_base(objects)
     if base is None or base.status != ("staging" if candidate.includes_base else "complete"):
         raise CandidateRefusal("base_incomplete")
     if any(obj.status != "staging" for obj in objects if obj.candidate_id == candidate.id):
         raise CandidateRefusal("candidate_incomplete")
     await _transition(session, candidate, new_status="complete", completed_at=now)
     for obj in objects:
-        if obj.candidate_id == candidate.id or (candidate.includes_base and obj.kind == "base"):
+        if obj.candidate_id == candidate.id or (candidate.includes_base and obj is base):
             obj.status = "complete"
     await session.flush()
     await _write_outcome(session, item.id, "complete", now)
@@ -620,11 +644,9 @@ async def acquire_reader(
     now = await database_now(session)
     if candidate.status != "complete" or not _unexpired(candidate, now):
         raise CandidateRefusal("candidate_unavailable")
-    objects = [
-        obj
-        for obj in await _objects(session, group.work_item_id)
-        if obj.kind == "base" or obj.candidate_id == candidate.id
-    ]
+    stored = await _objects(session, group.work_item_id)
+    base = _live_base(stored)
+    objects = [obj for obj in stored if obj is base or obj.candidate_id == candidate.id]
     if sorted(obj.kind for obj in objects) != ["base", "patch"] or any(
         obj.status != "complete" for obj in objects
     ):
@@ -752,7 +774,9 @@ async def claim_collection(
             if len(claims) >= body.limit:
                 break
             if obj.kind == "base":
-                if candidates or readers:
+                # The live base waits for the group to drain; a withdrawn one
+                # serves no candidate and is collected beside its successor.
+                if obj.status in LIVE_BASE_STATUSES and (candidates or readers):
                     continue
             elif obj.candidate_id not in eligible:
                 continue
@@ -977,7 +1001,7 @@ async def list_metadata(session: AsyncSession, work_item_id: uuid.UUID) -> wire.
             )
         )
         owners = {row.id: row.terminal_at for row in rows}
-    base = next((obj for obj in objects if obj.kind == "base"), None)
+    base = _live_base(objects)
     public = []
     for candidate in candidates:
         patch = next((obj for obj in objects if obj.candidate_id == candidate.id), None)

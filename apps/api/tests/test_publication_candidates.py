@@ -568,6 +568,97 @@ def test_fail_withdraws_only_a_staging_candidate(candidates: None, client: Any) 
     _completed(client, source)
 
 
+def _withdraw(client: Any, source: dict[str, Any], reservation: dict[str, Any]) -> None:
+    failure = {
+        **_authority(source),
+        "candidate_id": reservation["candidate_id"],
+        "reason": "upload_failed",
+    }
+    assert _ok(_post(client, "fail", failure))["status"] == "tombstoned"
+
+
+def _base_rows(source: dict[str, Any]) -> list[tuple[str, str]]:
+    return [
+        (row["status"], row["sha256"])
+        for row in _sql(
+            "SELECT status, sha256 FROM curie.publication_candidate_objects "
+            "WHERE work_item_id = :id AND kind = 'base' ORDER BY status",
+            id=uuid.UUID(source["work_item_id"]),
+        )
+    ]
+
+
+def test_redelivery_after_a_failed_capture_retains_without_collection(
+    candidates: None, client: Any
+) -> None:
+    source = _seed()
+    first = _reserved(client, source, key="redelivered")
+    _withdraw(client, source, first)
+    # No collector runs: the withdrawn candidate and its base are still stored.
+    assert [row["status"] for row in _sql("SELECT status FROM curie.publication_candidates")] == [
+        "tombstoned"
+    ]
+    # The same event, redelivered, is not a replay of the withdrawn capture.
+    without_base = _reserve_body(source, key="redelivered", base=False)
+    _refused(_post(client, "reserve", without_base), 409, "base_required")
+    retry = _completed(client, source, key="redelivered")
+    assert retry["candidate_id"] != first["candidate_id"]
+    assert {obj["key"] for obj in retry["objects"]}.isdisjoint(
+        obj["key"] for obj in first["objects"]
+    )
+    _readable(client, source, retry)
+    assert _base_rows(source) == [
+        ("complete", _descriptor("base", 100)["sha256"]),
+        ("tombstoned", _descriptor("base", 100)["sha256"]),
+    ]
+    # The retained capture now answers its own replay.
+    assert _ok(_post(client, "reserve", without_base)) == {
+        **{k: v for k, v in retry.items() if k != "body"},
+        "replayed": True,
+    }
+    # Collection removes only the withdrawn rows and keeps the retained candidate.
+    _drain(client)
+    assert _base_rows(source) == [("complete", _descriptor("base", 100)["sha256"])]
+    _readable(client, source, retry)
+
+
+def test_new_request_after_a_failed_capture_retains_without_collection(
+    candidates: None, client: Any, auth_headers: Any
+) -> None:
+    source = _seed()
+    first = _reserved(client, source)
+    _withdraw(client, source, first)
+    _terminate(source)
+    successor = _request(source, "running")
+    # A base from the successor's own claim, which need not match the withdrawn one.
+    retained = _completed(client, successor, base_salt="successor")
+    _readable(client, successor, retained)
+    listed = _listing(client, auth_headers, successor)
+    [entry] = [c for c in listed["candidates"] if c["candidate_id"] == retained["candidate_id"]]
+    assert entry["available"] is True
+    assert entry["base"]["sha256"] == _descriptor("base", 100, "successor")["sha256"]
+    assert sorted(_base_rows(source)) == sorted(
+        [
+            ("complete", _descriptor("base", 100, "successor")["sha256"]),
+            ("tombstoned", _descriptor("base", 100)["sha256"]),
+        ]
+    )
+    # Liveness of the retained-base rule: with a live base the next capture
+    # reuses it and may not declare another.
+    later = _reserve_body(successor, base_salt="successor")
+    _refused(_post(client, "reserve", later), 409, "retained_base_declaration")
+    _completed(client, successor, base=False)
+
+
+def test_withdrawn_captures_hold_no_candidate_slot(candidates: None, client: Any) -> None:
+    source = _seed()
+    for _ in range(3):
+        _withdraw(client, source, _reserved(client, source))
+    retained = _completed(client, source)
+    _readable(client, source, retained)
+    assert _count("publication_candidates") == 4
+
+
 def test_replay_without_the_base_declaration_answers_the_same_candidate(
     candidates: None, client: Any
 ) -> None:

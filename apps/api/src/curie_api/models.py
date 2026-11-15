@@ -5663,8 +5663,13 @@ class PublicationCandidate(Base):
     __tablename__ = "publication_candidates"
     __table_args__ = (
         UniqueConstraint("work_item_id", "id", name="publication_candidate_group_id_key"),
-        UniqueConstraint(
-            "origin_request_id", "idempotency_key", name="publication_candidate_idempotency_key"
+        # A withdrawn capture frees its dedupe key, so a redelivery retains afresh.
+        Index(
+            "publication_candidate_idempotency_key",
+            "origin_request_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("status <> 'tombstoned'"),
         ),
         CheckConstraint(
             "status IN ('staging', 'complete', 'tombstoned')",
@@ -5778,7 +5783,8 @@ class PublicationCandidateObject(Base):
             "publication_candidate_object_one_base",
             "work_item_id",
             unique=True,
-            postgresql_where=text("kind = 'base'"),
+            # One live base; a withdrawn base awaits collection beside its successor.
+            postgresql_where=text("kind = 'base' AND status IN ('staging', 'complete')"),
         ),
         Index("publication_candidate_object_group", "work_item_id"),
     )

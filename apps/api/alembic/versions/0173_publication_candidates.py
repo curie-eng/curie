@@ -74,8 +74,6 @@ def upgrade() -> None:
             completed_at timestamptz,
             expires_at timestamptz,
             CONSTRAINT publication_candidate_group_id_key UNIQUE (work_item_id, id),
-            CONSTRAINT publication_candidate_idempotency_key
-                UNIQUE (origin_request_id, idempotency_key),
             CONSTRAINT publication_candidate_status_ck
                 CHECK (status IN ('staging', 'complete', 'tombstoned')),
             CONSTRAINT publication_candidate_authority_ck
@@ -95,6 +93,9 @@ def upgrade() -> None:
             CONSTRAINT publication_candidate_transfer_ck CHECK (
                 (previous_owner_request_id IS NULL) = (owner_transferred_at IS NULL))
         )""",
+        "CREATE UNIQUE INDEX publication_candidate_idempotency_key ON "
+        "curie.publication_candidates(origin_request_id, idempotency_key) "
+        "WHERE status <> 'tombstoned'",
         "CREATE UNIQUE INDEX publication_candidate_one_staging ON "
         "curie.publication_candidates(work_item_id) WHERE status = 'staging'",
         """CREATE TABLE curie.publication_candidate_objects (
@@ -132,7 +133,8 @@ def upgrade() -> None:
                 AND claimed_until IS NULL)))
         )""",
         "CREATE UNIQUE INDEX publication_candidate_object_one_base ON "
-        "curie.publication_candidate_objects(work_item_id) WHERE kind = 'base'",
+        "curie.publication_candidate_objects(work_item_id) "
+        "WHERE kind = 'base' AND status IN ('staging', 'complete')",
         "CREATE INDEX publication_candidate_object_group ON "
         "curie.publication_candidate_objects(work_item_id)",
         """CREATE TABLE curie.publication_candidate_readers (
