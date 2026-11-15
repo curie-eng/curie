@@ -41,6 +41,7 @@ KIND_MODULES = (
 )
 CONTAINER_FILES = PYTEST_TESTS.CONTAINER_FILES
 DRY_RUN_FILE = PYTEST_TESTS.DRY_RUN_FILE
+RESOURCE_RETRY_FILE = PYTEST_TESTS.RESOURCE_RETRY_FILE
 SELECTOR_PATH = "tools/e2e-ci-selection/select_tiers.py"
 REGENERATE = "uv run python tools/e2e-ci-selection/cli_pytest_files.py --write"
 CLI_SCOPE = {
@@ -827,6 +828,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "--ignore", CONTAINER_FILES[0],
         "--ignore", CONTAINER_FILES[1],
         "--ignore", DRY_RUN_FILE,
+        "--ignore", RESOURCE_RETRY_FILE,
         *(
             argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
             for argument in ("--ignore", directory, "--ignore-glob", f"{directory}/tests/*")
@@ -842,7 +844,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         assert DRY_RUN_FILE in files
         expected.extend(
             path for path in files
-            if path not in (*KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE)
+            if path not in (*KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE, RESOURCE_RETRY_FILE)
             and not any(
                 path.startswith(directory + "/") for directory in PYTEST_TESTS.CI_POLICY_DIRS
             )
@@ -911,6 +913,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "--ignore", CONTAINER_FILES[0],
         "--ignore", CONTAINER_FILES[1],
         "--ignore", DRY_RUN_FILE,
+        "--ignore", RESOURCE_RETRY_FILE,
         *(
             argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
             for argument in ("--ignore", directory, "--ignore-glob", f"{directory}/tests/*")
@@ -921,7 +924,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         expected.extend(
             path
             for path in (tmp_path / LIST_PATH).read_text().splitlines()
-            if path not in (*KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE)
+            if path not in (*KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE, RESOURCE_RETRY_FILE)
             and not any(
                 path.startswith(directory + "/") for directory in PYTEST_TESTS.CI_POLICY_DIRS
             )

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import socket
+import tempfile
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -514,6 +515,125 @@ def write_file_turn(last: str) -> list[Any]:
     ]
 
 
+# Resource exhaustion directives (#5427). ``[fake:hold-memory <MiB>]`` allocates
+# that many MiB inside the runner process, touching every page so the memory
+# is resident, holds it, releases it and answers. ``[fake:fill-scratch <MiB>]``
+# writes that many MiB of zeros to one file in the temporary directory (the
+# runner's /tmp scratch volume in a sandbox, whose root filesystem is read-only)
+# in 1 MiB chunks, holds it, deletes it and answers. Neither emits a tool call, so the
+# turn raises no side effect flag, and neither touches the network. Under a
+# runner limit smaller than the request the kubelet or the kernel ends the
+# runner first, which is the point. Out of range or unparsable arguments fall
+# back to the default turn, like the other directives.
+HOLD_MEMORY_MARKER = "[fake:hold-memory"
+FILL_SCRATCH_MARKER = "[fake:fill-scratch"
+_HOLD_MEMORY_RE = re.compile(r"\[fake:hold-memory (\d{1,5})\]")
+_FILL_SCRATCH_RE = re.compile(r"\[fake:fill-scratch (\d{1,5})\]")
+RESOURCE_DIRECTIVE_MAX_MIB = 16384
+_MIB = 1024 * 1024
+_PAGE = 4096
+# Read at call time, so a test can shorten them. Memory is resident the moment
+# it is touched, so a short hold suffices. The kubelet measures local storage
+# on its own housekeeping cadence, so a scratch file is held long enough for
+# at least one eviction pass to see it.
+HOLD_MEMORY_SECONDS = 5.0
+FILL_SCRATCH_SECONDS = 180.0
+FILL_SCRATCH_FILE = "curie-fake-fill-scratch.bin"
+# A standing directive for every turn of this runner (fake tier only), read at
+# call time: the fake treats it as part of the person's words. A factory turn's
+# text is only the issue link, so a test that needs a directive on a tracker
+# admitted turn sets it per agent through the chart's agentSandbox.runnerEnv.
+STANDING_DIRECTIVE_ENV = "FAKE_MODEL_DIRECTIVE"
+
+
+@dataclass(frozen=True)
+class _HoldMemory:
+    """A scripted allocation of ``mib`` resident MiB, held and then released."""
+
+    mib: int
+
+
+@dataclass(frozen=True)
+class _FillScratch:
+    """A scripted ``mib`` MiB scratch file in the temporary directory, held and then deleted."""
+
+    path: str
+    mib: int
+
+
+def _resource_mib(pattern: re.Pattern[str], last: str) -> int | None:
+    match = pattern.search(last)
+    if match is None:
+        return None
+    mib = int(match.group(1))
+    return mib if 1 <= mib <= RESOURCE_DIRECTIVE_MAX_MIB else None
+
+
+def _resource_answer() -> list[Any]:
+    return [
+        _assistant(TextBlock(text="all done"), usage={"input_tokens": 20, "output_tokens": 8}),
+        _result(text="all done", usage={"input_tokens": 20, "output_tokens": 8}),
+    ]
+
+
+def hold_memory_turn(last: str) -> list[Any]:
+    """A turn that holds the directive's MiB of resident memory, then answers."""
+
+    mib = _resource_mib(_HOLD_MEMORY_RE, last)
+    if mib is None:
+        return default_turn()
+    return [_assistant(TextBlock(text="Holding memory")), _HoldMemory(mib), *_resource_answer()]
+
+
+def fill_scratch_turn(last: str) -> list[Any]:
+    """A turn that fills the directive's MiB of temporary scratch, then answers."""
+
+    mib = _resource_mib(_FILL_SCRATCH_RE, last)
+    if mib is None:
+        return default_turn()
+    path = os.path.join(tempfile.gettempdir(), FILL_SCRATCH_FILE)
+    return [
+        _assistant(TextBlock(text="Filling scratch")),
+        _FillScratch(path, mib),
+        *_resource_answer(),
+    ]
+
+
+def _touch_memory(mib: int) -> bytearray:
+    buffer = bytearray(mib * _MIB)
+    for offset in range(0, len(buffer), _PAGE):
+        buffer[offset] = 1
+    return buffer
+
+
+def _write_scratch(path: str, mib: int) -> None:
+    chunk = bytes(_MIB)
+    with open(path, "wb") as stream:
+        for _ in range(mib):
+            stream.write(chunk)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+async def _hold_memory(mib: int) -> None:
+    buffer = await anyio.to_thread.run_sync(_touch_memory, mib)
+    try:
+        await anyio.sleep(HOLD_MEMORY_SECONDS)
+    finally:
+        del buffer
+
+
+async def _fill_scratch(call: _FillScratch) -> None:
+    try:
+        await anyio.to_thread.run_sync(_write_scratch, call.path, call.mib)
+        await anyio.sleep(FILL_SCRATCH_SECONDS)
+    finally:
+        try:
+            os.unlink(call.path)
+        except FileNotFoundError:
+            pass
+
+
 async def _dial_connector_tool(
     config: Mapping[str, Any], tool: str, args: Mapping[str, Any], timeout: float
 ) -> tuple[bool, str]:
@@ -690,6 +810,9 @@ class FakeModelSession:
         """
 
         last = _user_message(self.queries[-1] if self.queries else "")
+        standing = os.environ.get(STANDING_DIRECTIVE_ENV, "").strip()
+        if standing:
+            last = f"{last}\n{standing}"
         match = _APPROVAL_MARKER_RE.search(last)
         if match:
             summary = last[match.end() :].strip() or "unspecified request"
@@ -700,6 +823,10 @@ class FakeModelSession:
             return progress_demo_turn()
         if WRITE_FILE_MARKER in last:
             return write_file_turn(last)
+        if HOLD_MEMORY_MARKER in last:
+            return hold_memory_turn(last)
+        if FILL_SCRATCH_MARKER in last:
+            return fill_scratch_turn(last)
         if GATED_CONNECTOR_TOOL_MARKER in last:
             gated = _parse_gated_connector_tool(last)
             return gated_connector_tool_turn(*gated) if gated else default_turn()
@@ -750,6 +877,12 @@ class FakeModelSession:
                 continue
             if isinstance(message, _FileWrite):
                 yield self._perform_write(message)
+                continue
+            if isinstance(message, _HoldMemory):
+                await _hold_memory(message.mib)
+                continue
+            if isinstance(message, _FillScratch):
+                await _fill_scratch(message)
                 continue
             if isinstance(message, _ProgressCall):
                 # A refused call already got its refusal from the gate; the
