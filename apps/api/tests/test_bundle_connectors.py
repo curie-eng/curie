@@ -920,7 +920,7 @@ def test_an_agent_no_target_names_still_renders_every_connector(
 def _proxy_admits(manifests: list[dict[str, Any]]) -> list[str]:
     dep = next(o for o in manifests if o["kind"] == "Deployment")
     containers = {c["name"]: c for c in dep["spec"]["template"]["spec"]["containers"]}
-    env = {e["name"]: e["value"] for e in containers["caller-proxy"]["env"]}
+    env = {e["name"]: e["value"] for e in containers["caller-proxy"]["env"] if "value" in e}
     return json.loads(env["CURIE_CALLER_PROXY_ADMITS"])
 
 
@@ -942,10 +942,15 @@ def test_the_manifests_carry_the_proxy_the_caller_passes(tmp_path: Path) -> None
         _render(root, proxy=None)
 
 
+_GRANT_STORE_SECRET = "acme-rel-secrets"
+
+
 @pytest.fixture
 def _caller_key(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setenv("CURIE_CONNECTOR_CALLER_PUBLIC_KEY", _CALLER_PUBLIC)
     monkeypatch.setenv("CURIE_CONNECTOR_PROXY_IMAGE", _PROXY_IMAGE)
+    # The chart renders this beside the caller key (#5550).
+    monkeypatch.setenv("CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME", _GRANT_STORE_SECRET)
     get_settings.cache_clear()
     yield
     monkeypatch.undo()
@@ -982,6 +987,137 @@ def test_the_route_renders_the_proxy_from_the_api_settings(
     assert _proxy_admits(body["manifests"]) == ["acme-bot"]
     service = next(o for o in body["manifests"] if o["kind"] == "Service")
     assert service["spec"]["ports"][0]["targetPort"] == "caller"
+
+
+# #5550: the proxy reads the Valkey password from the chart Secret. No rendered
+# object carries it, and a render that cannot name the Secret is a 422.
+_VALKEY_SENTINEL = "Sentinel5550ValkeyPasswordNeverRendered"
+
+
+def _connectors_route(client: Any, headers: dict[str, str], root: Path) -> Any:
+    agent_id, version_id = _version_with_bundle(client, headers, _archive(root))
+    return client.get(
+        f"/agents/{agent_id}/versions/{version_id}/connectors",
+        params={"release": RELEASE, "namespace": NAMESPACE, "app_name": APP_NAME},
+        headers=headers,
+    )
+
+
+def _grant_store_env(manifests: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    dep = next(o for o in manifests if o["kind"] == "Deployment")
+    containers = {c["name"]: c for c in dep["spec"]["template"]["spec"]["containers"]}
+    return {e["name"]: e for e in containers["caller-proxy"]["env"]}
+
+
+def _with_valkey(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
+    # After the client's lifespan opened its own Valkey clients, so only the
+    # route's fresh settings read these. VALKEY_URL and VALKEY_TLS start unset
+    # so each case states the whole Valkey configuration it renders from.
+    monkeypatch.delenv("VALKEY_URL", raising=False)
+    monkeypatch.delenv("VALKEY_TLS", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+
+
+def test_the_route_references_the_grant_store_secret_and_renders_no_password(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from urllib.parse import urlsplit
+
+    root = _bundle(tmp_path, HOSTED)
+    _with_valkey(
+        monkeypatch,
+        VALKEY_PASSWORD=_VALKEY_SENTINEL,
+        VALKEY_HOST="acme-rel-valkey",
+        VALKEY_PORT="6379",
+    )
+    resp = _connectors_route(client, auth_headers, root)
+    assert resp.status_code == 200, resp.text
+    assert _VALKEY_SENTINEL not in resp.text
+    env = _grant_store_env(resp.json()["manifests"])
+    assert env["CURIE_CALLER_PROXY_GRANT_STORE"]["value"] == "redis://acme-rel-valkey:6379/0"
+    assert urlsplit(env["CURIE_CALLER_PROXY_GRANT_STORE"]["value"]).password is None
+    assert env["CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD"] == {
+        "name": "CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": _GRANT_STORE_SECRET,
+                "key": "valkeyPassword",
+                "optional": False,
+            }
+        },
+    }
+
+
+def test_the_route_refuses_a_proxy_render_with_no_grant_store_secret(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _bundle(tmp_path, HOSTED)
+    _with_valkey(monkeypatch, CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME="  ")
+    resp = _connectors_route(client, auth_headers, root)
+    assert resp.status_code == 422, resp.text
+    assert "hosted_connector_requires_grant_store_secret" in resp.text
+    assert "CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME" in resp.text
+
+
+def test_the_route_refuses_a_valkey_url_whose_password_is_not_the_secret(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _bundle(tmp_path, HOSTED)
+    _with_valkey(
+        monkeypatch,
+        VALKEY_PASSWORD=_VALKEY_SENTINEL,
+        VALKEY_URL="redis://:Other5550UrlPassword@acme-rel-valkey:6379/0",
+    )
+    resp = _connectors_route(client, auth_headers, root)
+    assert resp.status_code == 422, resp.text
+    assert "grant_store_password_not_in_secret" in resp.text
+    assert _VALKEY_SENTINEL not in resp.text
+    assert "Other5550UrlPassword" not in resp.text
+
+
+@pytest.mark.parametrize(
+    "valkey_url",
+    [
+        f"redis://:{_VALKEY_SENTINEL}@acme-rel-valkey:6380/2",
+        "redis://acme-rel-valkey:6380/2",
+    ],
+    ids=["same_password", "no_password"],
+)
+def test_the_route_renders_a_valkey_url_the_secret_agrees_with(
+    tmp_path: Path,
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    _caller_key: None,
+    monkeypatch: pytest.MonkeyPatch,
+    valkey_url: str,
+) -> None:
+    root = _bundle(tmp_path, HOSTED)
+    _with_valkey(monkeypatch, VALKEY_PASSWORD=_VALKEY_SENTINEL, VALKEY_URL=valkey_url)
+    resp = _connectors_route(client, auth_headers, root)
+    assert resp.status_code == 200, resp.text
+    assert _VALKEY_SENTINEL not in resp.text
+    env = _grant_store_env(resp.json()["manifests"])
+    assert env["CURIE_CALLER_PROXY_GRANT_STORE"]["value"] == "redis://acme-rel-valkey:6380/2"
+    ref = env["CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD"]["valueFrom"]["secretKeyRef"]
+    assert (ref["name"], ref["key"]) == (_GRANT_STORE_SECRET, "valkeyPassword")
 
 
 # --------------------------------------------------------------------------- #

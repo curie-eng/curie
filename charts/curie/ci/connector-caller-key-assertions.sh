@@ -3,7 +3,7 @@
 # Render assertions for the connector caller key pair (ADR-0168 decision 7).
 #
 # The worker signs each sandbox's caller token, and the API renders the public
-# half into every hosted connector's caller proxy. Eight properties:
+# half into every hosted connector's caller proxy. Nine properties:
 #
 #   (a) A stock install references the signing key from the worker alone and
 #       the public key from the API alone, both from the release Secret, which
@@ -26,6 +26,10 @@
 #   (h) The api and worker roll when the caller pair they trust changes:
 #       leaving dev mode or supplying a pair changes both pods' checksum, the
 #       same render does not, and the checksum carries no signing key.
+#   (i) The API names the Secret its own VALKEY_PASSWORD reads from in
+#       CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME, with and without
+#       valkey.existingSecret, so each caller proxy reads the grant store
+#       password by reference rather than as a literal (#5550).
 set -euo pipefail
 
 # NOTE: read variables with a herestring, never `printf ... | cmd`; see
@@ -247,5 +251,31 @@ elif [[ "$(caller_checksums <<<"$(render "$CHART" --set connectorCaller.signingK
 else
     echo "ok: the api and worker roll when the trusted caller pair changes, and only then"
 fi
+
+# -- (i) ----------------------------------------------------------------------
+for case in "-:t-curie-secrets" "valkey.existingSecret=acme-valkey-credentials:acme-valkey-credentials"; do
+    setting="${case%%:*}"
+    expected="${case#*:}"
+    if [[ "$setting" == "-" ]]; then
+        RENDERED="$DEFAULT"
+    else
+        RENDERED="$(render "$CHART" --set "$setting")"
+    fi
+    NAMED="$(holders CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME <<<"$RENDERED")"
+    VALKEY_REF="$(holders VALKEY_PASSWORD <<<"$RENDERED")"
+    API_REF=""
+    while read -r component container name key; do
+        if [[ "$component $container" == "api api" ]]; then
+            API_REF="$name $key"
+        fi
+    done <<<"$VALKEY_REF"
+    if [[ "$NAMED" != "api api - $expected" ]]; then
+        fail "the API grant store Secret name is not $expected (${setting/#-/default}): ${NAMED:-nothing}"
+    elif [[ "$API_REF" != "$expected valkeyPassword" ]]; then
+        fail "the API VALKEY_PASSWORD does not read $expected valkeyPassword (${setting/#-/default}): ${API_REF:-nothing}"
+    else
+        echo "ok: the API names the Secret behind its own VALKEY_PASSWORD for the grant store (${setting/#-/default})"
+    fi
+done
 
 exit "$FAILED"

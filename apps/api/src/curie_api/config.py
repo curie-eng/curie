@@ -13,7 +13,7 @@ production deployments.
 import json
 from functools import lru_cache
 from typing import Annotated, Any, Literal
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
@@ -38,7 +38,7 @@ from curie_internal.driver_declaration import (
 )
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT, WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
-from plugin_format.connector_render import ConnectorProxy
+from plugin_format.connector_render import ConnectorProxy, GrantStore
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -55,6 +55,10 @@ _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
 _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN
 _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET
 _DEV_DEFAULT_REMEDIATION_AUTHORITY_KEY = PUBLISHED_DEFAULT_REMEDIATION_AUTHORITY_KEY
+
+# The key of the chart Secret that holds the Valkey password, the same key the
+# API, worker and dispatcher read VALKEY_PASSWORD from (#5550).
+GRANT_STORE_SECRET_KEY = "valkeyPassword"
 
 
 class Settings(BaseSettings):
@@ -910,6 +914,15 @@ class Settings(BaseSettings):
             "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "connector_proxy_image_pull_secrets"
         ),
     )
+    # The Secret holding the Valkey password (#5550). The chart renders the
+    # name it gives VALKEY_PASSWORD's own secretKeyRef, so the caller proxy
+    # reads the password by reference and no rendered object holds it.
+    connector_grant_store_secret_name: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME", "connector_grant_store_secret_name"
+        ),
+    )
     e2e_connector_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_ENABLED", "e2e_connector_enabled"),
@@ -1007,6 +1020,47 @@ class Settings(BaseSettings):
                 for name in self.connector_proxy_image_pull_secrets.split(",")
                 if name.strip()
             ),
+        )
+
+    def connector_grant_store(self) -> GrantStore:
+        """Where the caller proxy spends grants: a credential-free address and
+        the Secret reference its password arrives by (#5550).
+
+        The address is ``valkey_dsn()`` without its password. A ``VALKEY_URL``
+        whose password is not ``VALKEY_PASSWORD`` is refused: the proxy reads
+        the password from the chart Secret, so it would authenticate with the
+        wrong one. No message here carries a password or the URL.
+        """
+
+        secret_name = self.connector_grant_store_secret_name.strip()
+        if not secret_name:
+            raise ValueError(
+                "hosted_connector_requires_grant_store_secret: a hosted connector's caller "
+                "proxy reads the Valkey password from a Secret, and no Secret is named; "
+                "the chart sets CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME on the API"
+            )
+        if self.valkey_url:
+            try:
+                parts = urlsplit(self.valkey_url)
+                password = parts.password
+            except ValueError:
+                raise ValueError("VALKEY_URL is not a parsable URL") from None
+            if password and unquote(password) != self.valkey_password:
+                raise ValueError(
+                    "grant_store_password_not_in_secret: VALKEY_URL carries a password "
+                    "that differs from VALKEY_PASSWORD, and the caller proxy reads only "
+                    "the Secret behind VALKEY_PASSWORD"
+                )
+            userinfo, at, hostport = parts.netloc.rpartition("@")
+            username = userinfo.split(":", 1)[0] if at else ""
+            netloc = f"{username}@{hostport}" if username else hostport
+            address = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        else:
+            # The same scheme choice as valkey_dsn(): the scheme carries valkey_tls.
+            scheme = "rediss" if self.valkey_tls else "redis"
+            address = f"{scheme}://{self.valkey_host}:{self.valkey_port}/0"
+        return GrantStore(
+            address=address, secret_name=secret_name, secret_key=GRANT_STORE_SECRET_KEY
         )
 
     def e2e_install(self) -> E2EInstall:

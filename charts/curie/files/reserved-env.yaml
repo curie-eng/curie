@@ -140,6 +140,7 @@ api:
   CURIE_CODE_HOST_CA_BUNDLE: codeHostTrust.caBundle.configMapRef.name
   CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY: connectorCaller.previousVerifyKey
   CURIE_CONNECTOR_CALLER_PUBLIC_KEY: connectorCaller.verifyKey
+  CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME: valkey.existingSecret
   CURIE_CONNECTOR_PROXY_IMAGE: worker.image
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_POLICY: worker.image.pullPolicy
   CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS: worker.imagePullSecrets

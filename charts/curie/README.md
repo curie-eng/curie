@@ -2555,6 +2555,27 @@ still running, and that pod can take turns until it is replaced. Upgrading
 first with no key and generating one later does not remove this: the second
 upgrade rolls workers that do not yet hold the key in the same way.
 
+Each caller proxy spends approval grants in this release's Valkey. The API is
+given `CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME`, the name of the Secret its
+own `VALKEY_PASSWORD` reads (`valkey.existingSecret`, else the release
+Secret), and renders the proxy with a credential-free Valkey address plus a
+`secretKeyRef` to key `valkeyPassword` of that Secret. The password is never
+written into a connector Deployment, ReplicaSet or Pod. A `VALKEY_URL` whose
+password differs from `VALKEY_PASSWORD` is refused at render
+(`grant_store_password_not_in_secret`). Earlier releases wrote the whole Valkey
+URL, password included, into each proxy's environment as a literal, and the
+superseded ReplicaSets of a connector Deployment keep that value until their
+history is pruned. After upgrading from such a release and letting the
+connector Deployments roll (the next `cluster deploy` of each agent, or the
+next pass of `worker.connectorReconciler`), rotate the Valkey password. Then
+restart the connector Deployments, for example `kubectl rollout restart
+deployment -n <namespace> -l
+app.kubernetes.io/component=mcp-connector,app.kubernetes.io/part-of=<release>`:
+each caller proxy reads the password from the Secret only when its container
+starts, so a running proxy keeps the old password and cannot spend grants until
+it restarts. The same restart applies after any later rotation of the Valkey
+password.
+
 ### HTTP identity operator files
 
 HTTP identity (ADR 0246,

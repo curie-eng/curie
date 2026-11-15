@@ -171,9 +171,14 @@ including `#`, `%`, `/`, `?`, `@` and `+`. Worker and dispatcher constructors
 pass the password as a separate argument and need no URL encoding.
 The CLI local and cluster direct queue builders also encode the password through
 one shared URL builder. The
-connector proxy receives the API-built DSN and percent-decodes its password;
-it does not build a second URL. When supplying `VALKEY_URL` directly, encode
-its password yourself.
+connector proxy receives a credential-free address the API derives from the
+same DSN, and the password separately from the Secret behind
+`VALKEY_PASSWORD`. It percent-encodes that password with an empty safe set and
+builds its URL in memory, so the password never appears in a workload spec.
+When supplying `VALKEY_URL` directly, encode its password yourself, and keep it
+equal to `VALKEY_PASSWORD`: the API refuses to render a hosted connector
+(`grant_store_password_not_in_secret`) when the two differ, since the proxy
+reads only the Secret.
 
 For auth-token rotation, use AWS `ROTATE` to accept the new token alongside
 the old one, update **every** consumer, including Langfuse, API, worker,
