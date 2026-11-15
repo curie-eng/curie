@@ -2243,15 +2243,9 @@ worker:
     recovery:
       enabled: false
       maxBytes: null
-    # Publication candidate retention (#5428). Off by default. Enabling it keeps
-    # a private, non-authorizing copy of each factory run's publication snapshot
-    # and its trusted base, captured before validation, until 24 hours after the
-    # owning request's final disposition; it grants no publication. maxBytes is
-    # the positive installation-wide cap that counts every candidate byte, and
-    # a full cap refuses retention visibly instead of evicting anything. It
-    # requires managed workspaces (agentSandbox.runner.workspace.enabled); the
-    # render fails without them. The API also receives maxArchiveBytes above so
-    # its ledger matches the worker's limit.
+    # Publication candidates (#5428): keep a private copy of each factory run's
+    # snapshot until 24 h after its final disposition. maxBytes caps all
+    # candidate bytes. Needs agentSandbox.runner.workspace.enabled.
     publicationCandidates:
       enabled: false
       maxBytes: 1073741824

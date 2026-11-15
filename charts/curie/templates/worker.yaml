@@ -333,8 +333,6 @@ spec:
             # value from the same helper.
             - name: CURIE_WORKSPACE_RECOVERY_ENABLED
               value: {{ include "curie.workspaceRecoveryEnabled" . | quote }}
-            # Publication candidate retention (#5428). The API renders the same
-            # value from the same helper.
             - name: CURIE_PUBLICATION_CANDIDATES_ENABLED
               value: {{ include "curie.publicationCandidatesEnabled" . | quote }}
             - name: CURIE_WORKSPACE_MAX_MEMBERS
