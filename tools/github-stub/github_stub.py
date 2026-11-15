@@ -342,9 +342,11 @@ class GithubStub:
         concurrent creators cannot share an id or replace one another's row.
         """
 
-        connection = sqlite3.connect(self._database, timeout=30, isolation_level=None)
+        connection = sqlite3.connect(self._database, timeout=30, isolation_level="IMMEDIATE")
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            # A data-changing statement opens the write transaction. This matches
+            # no row, and the id read and the insert then share that lock.
+            connection.execute("UPDATE objects SET kind=kind WHERE 0")
             current = connection.execute(
                 "SELECT COALESCE(MAX(id), 0) FROM objects WHERE kind=?", (kind,)
             ).fetchone()
@@ -356,10 +358,10 @@ class GithubStub:
                 "INSERT INTO objects(kind, id, body) VALUES(?,?,?)",
                 (kind, identifier, json.dumps(body)),
             )
-            connection.execute("COMMIT")
+            connection.commit()
             return body
         finally:
-            # Close rolls back when COMMIT did not run, releasing the write lock.
+            # Close rolls back when commit did not run, releasing the write lock.
             connection.close()
 
     def _rows(self, kind: str) -> list[dict[str, Any]]:
