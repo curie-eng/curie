@@ -27,7 +27,7 @@ from sqlalchemy import select
 from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_card import CardInput, render_card
-from ..factory_notices import cause_text
+from ..factory_notices import cause_text, retry_successor
 from ..factory_progress import (
     PROGRESS_SCOPE,
     ProgressReport,
@@ -45,7 +45,6 @@ from ..models import (
     ThreadPublicationLineage,
     WorkItem,
 )
-from ..workitems.lifecycle import automatic_successor_of
 
 router = APIRouter(tags=["factory-status"])
 
@@ -184,11 +183,8 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             )
         )
     terminal = request.terminal_cause if request.terminal_at is not None else None
-    retrying = (
-        request.status == "failed"
-        and terminal == "owner_lost"
-        and await automatic_successor_of(session, request) is not None
-    )
+    # Any automatic successor, owner loss or ordinary failure (ADR 0269).
+    retrying = await retry_successor(session, request) is not None
     body = render_card(
         CardInput(
             repo=work_item.repository_path,

@@ -6,6 +6,8 @@ from typing import Any, Literal
 from curie_internal.requester_coding_instructions import AbsenceReason
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
+from curie_api.factory_retry_policy import RetrySafety
+
 
 class IssueReadContextMint(BaseModel):
     """Trusted worker identity for one factory execution's issue read (ADR 0187)."""
@@ -90,6 +92,7 @@ WorkItemOutcomeState = Literal[
 WorkItemCiState = Literal["passing", "failing", "pending", "none", "unavailable", "not_applicable"]
 # Who an execution's model calls are billed to (#5376, ADR 0268).
 ModelAuthMode = Literal["service", "personal"]
+RetryKind = Literal["owner_loss", "failure"]
 
 
 class CodingInstructionsMetadata(BaseModel):
@@ -125,6 +128,18 @@ class WorkItemRequestOut(BaseModel):
     enrollment_generation: int | None = None
     coding_instructions_selection_id: uuid.UUID | None = None
     coding_instructions_evidence: Literal["none", "pending", "applied", "failed"] = "none"
+    # Automatic retry lineage (ADR 0269): the request this one retries, and
+    # whether it was admitted after owner loss or after an ordinary failure.
+    retry_of_request_id: uuid.UUID | None
+    retry_kind: RetryKind | None
+    # The earliest time the reconciler dispatches the request; a blocked retry
+    # stores its waiting deadline here.
+    dispatch_not_before: datetime
+    # The named condition a blocked retry waits for; null when nothing blocks it.
+    blocked_on: str | None
+    # The worker's side effect fact from this request's finish; null when the
+    # request did not end through a worker finish.
+    retry_safety: RetrySafety | None
 
 
 class WorkItemPrOut(BaseModel):
@@ -294,6 +309,10 @@ class WorkItemOutcomeOut(BaseModel):
     enrollment_generation: int | None = None
     requester_principal_id: uuid.UUID | None = None
     coding_instructions: CodingInstructionsMetadata
+    # The WorkItem's lifetime automatic retry allowance (ADR 0269): slots spent
+    # by owner loss and ordinary failures together, and the limit.
+    automatic_retries_used: int
+    automatic_retry_limit: int
 
 
 class WorkItemOutcomeList(BaseModel):

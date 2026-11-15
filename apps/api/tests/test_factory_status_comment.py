@@ -1459,10 +1459,12 @@ def _lose_owner(client: Any, request_id: uuid.UUID) -> None:
 
 
 RETRIED = (
-    "the worker running this request stopped responding. Curie started the work "
-    "again as a new run (attempt {attempt} of 3)."
+    "the worker running this request stopped responding. Curie observed the sandbox "
+    "teardown and admitted automatic retry {slot} of 2 as a new run. Work the lost run "
+    "already did is not ruled out."
 )
-EXHAUSTED = "the worker running this request stopped responding 3 times."
+LOST = "the worker running this request stopped responding."
+EXHAUSTED = "2 of 2 automatic retries used."
 
 
 def test_a_retried_owner_lost_hands_the_label_to_the_successor(
@@ -1487,10 +1489,11 @@ def test_a_retried_owner_lost_hands_the_label_to_the_successor(
     (lost,) = _marked(sink, lost_id)
     body = lost["body"]
     assert "Status: RETRYING" in body
-    assert f"Retrying: {RETRIED.format(attempt=2)}" in body
+    assert f"Retrying: {RETRIED.format(slot=1)}" in body
+    assert "Scheduled: the automatic retry starts at or after " in body
     assert "Could not complete:" not in body
     assert "NEEDS HUMAN" not in body
-    assert EXHAUSTED not in body
+    assert "automatic retries used" not in body
     assert "Cause: owner_lost" in body
     assert FINAL_MARKER in body
     (successor,) = _marked(sink, successor_id)
@@ -1501,22 +1504,22 @@ def test_a_retried_owner_lost_hands_the_label_to_the_successor(
 
 
 def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F811
-    """ADR 0206: two losses are retried; the third needs a human."""
+    """ADR 0206 and ADR 0269: two losses spend both retries; the third needs a human."""
 
     client, github, sink = admitted
     number = 9932
     current = _admit(client, github, sink, number)
     _reconcile()
     lost: list[uuid.UUID] = []
-    for attempt in (2, 3):
+    for slot in (1, 2):
         _lose_owner(client, current)
         lost.append(current)
         requests = _issue_requests(number)
-        assert len(requests) == attempt, requests
+        assert len(requests) == slot + 1, requests
         (comment,) = _marked(sink, current)
         body = comment["body"]
         assert "Status: RETRYING" in body
-        assert f"Retrying: {RETRIED.format(attempt=attempt)}" in body
+        assert f"Retrying: {RETRIED.format(slot=slot)}" in body
         assert "Could not complete:" not in body
         assert "NEEDS HUMAN" not in body
         assert "Cause: owner_lost" in body
@@ -1529,18 +1532,19 @@ def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F8
     assert [(r["status"], r["terminal_cause"]) for r in requests] == [("failed", "owner_lost")] * 3
     (comment,) = _marked(sink, current)
     body = comment["body"]
-    assert f"Could not complete: {EXHAUSTED}" in body
-    assert "Curie started the work again" not in body
+    assert f"Could not complete: {LOST}\n{EXHAUSTED}\n" in body
+    assert body.count("automatic retries used") == 1
+    assert "Retrying:" not in body
     assert "Cause: owner_lost" in body
     assert "Status: NEEDS HUMAN" in body
     assert "Status: FAILED" not in body
     assert FINAL_MARKER in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
     # The earlier comments keep their retry text once the third loss lands.
-    for attempt, request_id in zip((2, 3), lost, strict=True):
+    for slot, request_id in zip((1, 2), lost, strict=True):
         (earlier,) = _marked(sink, request_id)
         assert "Status: RETRYING" in earlier["body"]
-        assert f"Retrying: {RETRIED.format(attempt=attempt)}" in earlier["body"]
+        assert f"Retrying: {RETRIED.format(slot=slot)}" in earlier["body"]
         assert "Could not complete:" not in earlier["body"]
         assert "NEEDS HUMAN" not in earlier["body"]
         assert "Cause: owner_lost" in earlier["body"]

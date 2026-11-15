@@ -34,7 +34,9 @@ import redis.asyncio as aredis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
 from channel_protocol.work_item_events import execute_event_id
 from curie_api.config import get_settings
-from curie_api.factory_retry_policy import RetryFacts, decide
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import utc_text
+from curie_api.factory_retry_policy import RetryFacts, condition_text, decide
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_api.workitems import lifecycle
@@ -42,8 +44,14 @@ from curie_worker.binding import FactoryWake
 from curie_worker.workitem_dispatch import TerminationObservation, WorkItemDispatchClient
 from fastapi.testclient import TestClient
 from forge_fakes import factory_wake
+from forge_fakes.github_comments import _LABELS, admitted, comments
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from test_factory_terminus import _label as _label_issue
+from test_factory_terminus import _notices as _status_rows
+from test_factory_terminus import _reconcile as _reconcile_and_sync
+from test_factory_terminus import _request as _issue_request
+from test_factory_terminus import _start_running
 from test_workitems import _attach_own_publication, _seed_transcript, _transcript_threads
 
 WORKER_TOKEN = "factory-retry-worker-token"
@@ -1592,3 +1600,256 @@ def test_unknown_causes_stop_and_valid_transient_advances(
     assert successor["blocked_on"] is None
     assert successor["owner_lost_retry"] is False
     assert _used(alias.work_item_id) == 1
+
+
+# -- AC2: what operators see ---------------------------------------------------
+#
+# The tracker scenarios run the real notice consumer (the reconciler pass and
+# its status comment sync) against the threaded GitHub stand-in, which records
+# every comment and label write it receives.
+
+# The tracker fixtures pytest resolves by name for the scenarios below.
+TRACKER_FIXTURES = (admitted, comments)
+TRACKER_WORKER = {"X-Curie-Worker-Token": "factory-terminus-worker"}
+NEEDS_HUMAN = "curie-factory:needs-human"
+QUEUED_LABEL = "curie-factory:queued"
+USED_PHRASE = "automatic retries used"
+
+
+def _admin() -> dict[str, str]:
+    return {"X-API-Key": get_settings().api_key}
+
+
+def _outcome(client: TestClient, work_item_id: uuid.UUID) -> dict[str, Any]:
+    response = client.get(f"/work-items/{work_item_id}", headers=_admin())
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert isinstance(body, dict)
+    return body
+
+
+def _marked_body(sink: Any, request_id: uuid.UUID) -> str:
+    everything = list(sink.comments) + [c for listed in sink.lists.values() for c in listed]
+    (comment,) = [c for c in everything if marker_for(request_id) in (c.get("body") or "")]
+    body = comment["body"]
+    assert isinstance(body, str)
+    return body
+
+
+def _state_labels(sink: Any, number: int) -> set[str]:
+    labels: set[str] = sink.issue_labels.get(number, set())
+    return {label for label in labels if label.startswith("curie-factory:")}
+
+
+def _needs_human_applications(sink: Any) -> int:
+    return sum(
+        1
+        for method, path, body in sink.requests
+        if method == "POST" and _LABELS.match(path) and body and NEEDS_HUMAN in body
+    )
+
+
+def _tracker_issue(client: TestClient, github: Any, number: int) -> Ref:
+    _label_issue(client, github, number)
+    row = _issue_request(number)
+    _reconcile_and_sync()
+    return Ref(row["id"], row["work_item_id"])
+
+
+def _tracker_fail(client: TestClient, request_id: uuid.UUID, cause: str) -> None:
+    """Start the request and finish it flag clean through the real finish route."""
+
+    epoch = _start_running(client, request_id)
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/finish",
+        headers=TRACKER_WORKER,
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": cause,
+            "retry_safety": "no_effects",
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    _reconcile_and_sync()
+
+
+def test_owner_loss_and_failure_successors_report_their_retry_kind(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """Display half of test 20, through the public outcome route."""
+
+    agent_id = _agent(api, auth_headers)
+    lost = _admit(api, agent_id, 54290)
+    failed = _admit(api, agent_id, 54291)
+    _lose_owner(api, lost.request_id)
+    _fail(api, failed.request_id)
+
+    for ref, kind, safety in (
+        (lost, "owner_loss", None),
+        (failed, "failure", "no_effects"),
+    ):
+        successor = _successor(ref.request_id)
+        assert successor is not None
+        view = _outcome(api, ref.work_item_id)
+        assert (view["automatic_retries_used"], view["automatic_retry_limit"]) == (1, LIMIT)
+        assert view["state"] == "waiting"
+        first, second = view["requests"]
+        assert (first["retry_kind"], first["retry_of_request_id"]) == (None, None)
+        assert first["retry_safety"] == safety
+        assert second["retry_kind"] == kind
+        assert second["retry_of_request_id"] == str(ref.request_id)
+        assert second["blocked_on"] is None
+        assert second["retry_safety"] is None
+        due = datetime.fromisoformat(second["dispatch_not_before"])
+        assert due == successor["dispatch_not_before"]
+    # The ordinary successor waits out its backoff, so the cause names the due time.
+    cause = _outcome(api, failed.work_item_id)["actionable_cause"]
+    assert cause.startswith("automatic retry scheduled for "), cause
+    assert "capacity" not in cause
+
+
+def test_scheduled_successor_shows_queued_label_and_due_time_not_needs_human(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 54292
+    item = _tracker_issue(client, github, number)
+    _tracker_fail(client, item.request_id, "model_unreachable")
+
+    successor = _successor(item.request_id)
+    assert successor is not None
+    assert (successor["status"], successor["blocked_on"]) == ("waiting", None)
+    scheduled = (
+        "Scheduled: the automatic retry starts at or after "
+        f"{utc_text(successor['dispatch_not_before'])}."
+    )
+    predecessor = _marked_body(sink, item.request_id)
+    assert "Status: RETRYING" in predecessor
+    assert (
+        "Retrying: this run failed with no side effects, so Curie admitted automatic retry 1 of 2."
+        in predecessor
+    )
+    assert scheduled in predecessor
+    assert "Cause: model_unreachable" in predecessor
+    own = _marked_body(sink, successor["id"])
+    assert "Status: QUEUED" in own
+    assert scheduled in own
+    for body in (predecessor, own):
+        assert "NEEDS HUMAN" not in body
+        assert "Could not complete:" not in body
+        assert USED_PHRASE not in body
+    assert _state_labels(sink, number) == {QUEUED_LABEL}
+    assert _needs_human_applications(sink) == 0
+
+    token = _status_rows(item.request_id)[0]["card_token"]
+    card = client.get(f"/v1/factory/cards/{token}.svg")
+    assert card.status_code == 200, card.text
+    assert "RETRYING" in card.text
+    assert "NEEDS HUMAN" not in card.text
+
+    view = _outcome(client, item.work_item_id)
+    assert view["state"] == "waiting"
+    assert view["actionable_cause"].startswith("automatic retry scheduled for ")
+    assert view["requests"][-1]["retry_kind"] == "failure"
+
+
+def test_blocked_successor_shows_queued_label_and_named_condition_not_needs_human(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 54293
+    item = _tracker_issue(client, github, number)
+    _tracker_fail(client, item.request_id, "model_usage_limited")
+
+    successor = _successor(item.request_id)
+    assert successor is not None
+    assert successor["blocked_on"] == "provider_usage_reset"
+    assert successor["dispatch_not_before"] == successor["wait_deadline"]
+    blocked = (
+        f"Blocked: the automatic retry waits for {condition_text('provider_usage_reset')} "
+        "(condition `provider_usage_reset`). If that does not happen by "
+        f"{utc_text(successor['wait_deadline'])}, the retry expires."
+    )
+    predecessor = _marked_body(sink, item.request_id)
+    own = _marked_body(sink, successor["id"])
+    assert "Status: RETRYING" in predecessor
+    assert "Status: QUEUED" in own
+    for body in (predecessor, own):
+        assert blocked in body
+        assert "NEEDS HUMAN" not in body
+        assert "capacity" not in body
+        assert USED_PHRASE not in body
+    assert _state_labels(sink, number) == {QUEUED_LABEL}
+    assert _needs_human_applications(sink) == 0
+
+    view = _outcome(client, item.work_item_id)
+    assert view["state"] == "waiting"
+    cause = view["actionable_cause"]
+    assert cause.startswith(
+        "automatic retry blocked on provider_usage_reset: it waits for "
+        f"{condition_text('provider_usage_reset')}; waiting deadline "
+    ), cause
+    assert "capacity" not in cause
+    assert view["requests"][-1]["blocked_on"] == "provider_usage_reset"
+
+
+def test_final_bound_writes_exactly_one_needs_human_with_cause_and_used_count(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 54294
+    item = _tracker_issue(client, github, number)
+    chain = [item.request_id]
+    _tracker_fail(client, item.request_id, "model_unreachable")
+    for slot in range(1, LIMIT + 1):
+        successor = _successor(chain[-1])
+        assert successor is not None
+        assert _state_labels(sink, number) == {QUEUED_LABEL}
+        assert _needs_human_applications(sink) == 0
+        assert f"automatic retry {slot} of {LIMIT}" in _marked_body(sink, chain[-1])
+        chain.append(successor["id"])
+        _make_due(successor["id"])
+        _reconcile_and_sync()
+        _tracker_fail(client, successor["id"], "model_unreachable")
+    assert _successor(chain[-1]) is None
+    assert _used(item.work_item_id) == LIMIT
+
+    final = _marked_body(sink, chain[-1])
+    assert "Status: NEEDS HUMAN" in final
+    assert "Could not complete: " in final
+    assert f"\n{LIMIT} of {LIMIT} {USED_PHRASE}.\n" in final
+    assert "Cause: model_unreachable" in final
+    assert "Retrying:" not in final
+    # Across the whole chain the used count is shown once, on the final bound.
+    bodies = [_marked_body(sink, request_id) for request_id in chain]
+    assert sum(body.count(USED_PHRASE) for body in bodies) == 1
+    for body in bodies[:-1]:
+        assert "Status: RETRYING" in body
+        assert "NEEDS HUMAN" not in body
+    assert _needs_human_applications(sink) == 1
+    assert _state_labels(sink, number) == {NEEDS_HUMAN}
+
+    view = _outcome(client, item.work_item_id)
+    assert (view["state"], view["automatic_retries_used"]) == ("failed", LIMIT)
+    assert [r["retry_kind"] for r in view["requests"]] == [None, "failure", "failure"]
+
+
+def test_blocked_successor_expiry_outcome_names_the_condition(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """Outcome sentence half of test 24, through the public outcome route."""
+
+    item = _admit(api, _agent(api, auth_headers), 54295)
+    successor = _blocked_successor(api, item)
+    _expire_wait(successor["id"])
+    _reconcile()
+    expired = _request(successor["id"])
+    view = _outcome(api, item.work_item_id)
+    assert view["state"] == "expired"
+    assert view["actionable_cause"] == (
+        "expired: retry_condition_expired, the automatic retry was still blocked on "
+        f"provider_usage_reset ({condition_text('provider_usage_reset')}) when its waiting "
+        f"deadline {expired['wait_deadline'].isoformat()} elapsed"
+    )
+    assert view["requests"][-1]["blocked_on"] == "provider_usage_reset"

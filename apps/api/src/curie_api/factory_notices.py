@@ -49,6 +49,7 @@ from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment, status_marker
 from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
 from .factory_reply_target import stored_reply_target
+from .factory_retry_policy import condition_text
 from .factory_triage_status import (
     delivered_triage,
     is_tracker_result,
@@ -131,6 +132,7 @@ _FAILURE_CLASS_BY_CAUSE = {
     "runner_timeout": "runner-timeout",
     "sandbox_terminated": "sandbox-terminated",
     "workspace_error": "workspace-error",
+    "runner_error": "runner-error",
     "authentication_required": "authentication-required",
 }
 _BACKTICK_RUN = re.compile(r"`+")
@@ -324,18 +326,24 @@ def result_section(
     detail: str | None = None,
     unchanged: bool = False,
     superseded: bool = False,
-    lost_streak: int = 0,
-    lost_retried: bool = False,
+    successor: RetrySuccessor | None = None,
+    retries_used: int = 0,
+    blocked_on: str | None = None,
     run_cost_usd: Decimal | None = None,
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
-    For ``owner_lost``, ``lost_streak`` is the WorkItem's used automatic
-    retries and ``lost_retried`` whether this request's settlement admitted a
-    successor (ADR 0206, ADR 0269); together they choose the retry or
-    exhausted sentence.
+    ``successor`` is the automatic retry this request's settlement admitted
+    (ADR 0269); with one, the result is a ``Retrying:`` notice naming its
+    state instead of a failure. ``retries_used`` is the WorkItem's used
+    allowance, rendered after the cause sentence when the caller passes it for
+    a failed or expired request with no successor. ``blocked_on`` is the
+    condition a ``retry_condition_expired`` request was still blocked on.
     ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
     """
+
+    if successor is not None:
+        return _retrying_section(cause, successor, feedback_url=feedback_url)
 
     if cause == "completed":
         if unchanged:
@@ -391,19 +399,11 @@ def result_section(
                 "was opened. This was an infrastructure failure, not a refusal of the change; "
                 "retry the run."
             )
-        elif (
-            cause == "owner_lost" and not lost_retried and lost_streak >= AUTOMATIC_RETRY_LIMIT
-        ):
+        elif cause == "retry_condition_expired" and blocked_on:
             sentence = (
-                "the worker running this request stopped responding "
-                f"{AUTOMATIC_RETRY_LIMIT + 1} times."
-            )
-        elif cause == "owner_lost" and lost_retried and 1 <= lost_streak <= AUTOMATIC_RETRY_LIMIT:
-            prefix = "Retrying: "
-            sentence = (
-                "the worker running this request stopped responding. Curie started "
-                "the work again as a new run "
-                f"(attempt {lost_streak + 1} of {AUTOMATIC_RETRY_LIMIT + 1})."
+                "the automatic retry was still waiting for "
+                f"{condition_text(blocked_on)} (condition {code_span(blocked_on)}) "
+                "when its wait expired."
             )
         elif cause == "budget_exceeded":
             token_budget = _OUTPUT_TOKEN_BUDGET_DETAIL.fullmatch(detail or "")
@@ -448,6 +448,8 @@ def result_section(
             # deferral reason: one line, and no HTML comment opener.
             sentence = _inert_line(detail)
         text = f"{prefix}{sentence}\n"
+        if retries_used > 0:
+            text += f"{retries_used} of {AUTOMATIC_RETRY_LIMIT} automatic retries used.\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
         elif cause == "approval_create_failed" and detail is not None and detail.strip():
@@ -470,6 +472,89 @@ def result_section(
     if feedback_url is not None:
         text += f"In response to {feedback_url}\n"
     return text
+
+
+@dataclass(frozen=True)
+class RetrySuccessor:
+    """The automatic retry a failed request's settlement admitted (ADR 0269).
+
+    ``slot`` is which of the WorkItem's automatic retries it spent, counted at
+    its own admission, so the sentence does not drift as later retries land.
+    """
+
+    owner_loss: bool
+    slot: int
+    dispatch_not_before: datetime
+    blocked_on: str | None
+
+
+def utc_text(value: datetime) -> str:
+    """A stored timestamp as an operator reads it on a tracker comment."""
+
+    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def retry_state_line(*, dispatch_not_before: datetime, blocked_on: str | None) -> str:
+    """Whether an automatic retry is scheduled or blocked, and until when.
+
+    A blocked retry stores its waiting deadline as ``dispatch_not_before``.
+    """
+
+    if blocked_on:
+        return (
+            f"Blocked: the automatic retry waits for {condition_text(blocked_on)} "
+            f"(condition {code_span(blocked_on)}). If that does not happen by "
+            f"{utc_text(dispatch_not_before)}, the retry expires."
+        )
+    return f"Scheduled: the automatic retry starts at or after {utc_text(dispatch_not_before)}."
+
+
+def _retrying_section(cause: str, successor: RetrySuccessor, *, feedback_url: str | None) -> str:
+    retry = f"automatic retry {successor.slot} of {AUTOMATIC_RETRY_LIMIT}"
+    if successor.owner_loss:
+        # ADR 0206: the teardown is proven, the absence of earlier effects is not.
+        text = (
+            "Retrying: the worker running this request stopped responding. Curie observed "
+            f"the sandbox teardown and admitted {retry} as a new run. Work the lost run "
+            "already did is not ruled out.\n"
+        )
+    else:
+        text = f"Retrying: this run failed with no side effects, so Curie admitted {retry}.\n"
+    state = retry_state_line(
+        dispatch_not_before=successor.dispatch_not_before, blocked_on=successor.blocked_on
+    )
+    text += f"{state}\nCause: {cause}\n"
+    failure_class = _FAILURE_CLASS_BY_CAUSE.get(cause)
+    if failure_class is not None:
+        text += f"Failure class: {failure_class}\n"
+    if feedback_url is not None:
+        text += f"In response to {feedback_url}\n"
+    return text
+
+
+async def retry_successor(
+    session: AsyncSession, request: ExecutionRequest
+) -> RetrySuccessor | None:
+    """The automatic successor of a failed ``request``, with the slot it spent."""
+
+    if request.status != "failed":
+        return None
+    successor = await automatic_successor_of(session, request)
+    if successor is None:
+        return None
+    slot = await session.scalar(
+        select(func.count(ExecutionRequest.id)).where(
+            ExecutionRequest.work_item_id == successor.work_item_id,
+            ExecutionRequest.retry_of_request_id.is_not(None),
+            ExecutionRequest.sequence <= successor.sequence,
+        )
+    )
+    return RetrySuccessor(
+        owner_loss=successor.owner_lost_retry,
+        slot=int(slot or 0),
+        dispatch_not_before=successor.dispatch_not_before,
+        blocked_on=successor.blocked_on,
+    )
 
 
 def _break_html_comments(text: str) -> str:
@@ -1191,12 +1276,13 @@ async def _render(
             and target.kind == "issue"
             and (not isinstance(pr_url, str) or not pr_url.strip())
         ):
-            streak = 0
-            retried = False
-            if cause == "owner_lost":
-                streak = work_item.automatic_retries_used
-                retried = await automatic_successor_of(session, request) is not None
-                retrying = request.status == "failed" and retried
+            successor = await retry_successor(session, request)
+            retrying = successor is not None
+            retries_used = (
+                work_item.automatic_retries_used
+                if successor is None and request.status in {"failed", "expired"}
+                else 0
+            )
             unchanged = (
                 request.status == "completed"
                 and (
@@ -1228,8 +1314,9 @@ async def _render(
                 unchanged=unchanged,
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
-                lost_streak=streak,
-                lost_retried=retrying,
+                successor=successor,
+                retries_used=retries_used,
+                blocked_on=request.blocked_on,
                 run_cost_usd=run_cost_usd,
             )
             if (
@@ -1291,14 +1378,21 @@ async def _render(
             ExecutionRequest.status == "queued",
         )
     )
-    waiting_line: str | None = None
+    waiting_lines: list[str] = []
     if request.status == "queued":
-        waiting_line = (
+        waiting_lines.append(
             "This revision is waiting on the current run. It will start when that run finishes."
         )
-    elif request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
+    elif request.status == "waiting" and request.retry_of_request_id is not None:
+        waiting_lines.append(
+            retry_state_line(
+                dispatch_not_before=request.dispatch_not_before, blocked_on=request.blocked_on
+            )
+        )
+    if request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
         word = "revision" if pending_count == 1 else "revisions"
-        waiting_line = f"{pending_count} {word} waiting on this run."
+        waiting_lines.append(f"{pending_count} {word} waiting on this run.")
+    waiting_line = " ".join(waiting_lines) or None
     transition = await session.scalar(
         select(FactoryBaseTransition)
         .where(

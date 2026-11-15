@@ -2029,6 +2029,49 @@ using the flat base backoff without charging start or capacity deferrals.
 The SQL wait retains its original deadline and bounded stage diagnostic.
 Other workspace preparation faults keep the counted `not_started` behavior.
 
+Each WorkItem has two automatic retries for its whole lifetime
+([ADR 0269](adr/0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md)),
+so an issue gets at most three full implementation attempts. A retry is a new
+execution request with its own identity, sequence, waiting deadline and
+execution deadline; the failed request is never changed. Two things spend a
+retry, and they share the same two slots:
+
+1. A request lost with its worker. Curie admits the retry once the worker
+   records the sandbox teardown
+   ([ADR 0206](adr/0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md)).
+   That proves the old sandbox is gone; it does not prove the lost run did
+   nothing.
+2. An ordinary failure whose worker reported `retry_safety` `no_effects`: no
+   side effect flag on the turn and an observed end of the turn. A `flagged`
+   or `uncertain` run never earns a retry. The cause must also be one the
+   factory policy retries, such as `model_unreachable`, `model_rate_limited`
+   or `model_error`.
+
+Curie admits the retry in the same transaction that settles the failed
+request, and reserves its slot there. Relabelling the issue, a revision, an
+operator rerun or a restart never gives a slot back. Capacity waits,
+`workspace_timeout` waits and `start_failed` spend no slot, and a cancelled or
+deleted issue, a newer queued revision, a closed lineage, a publication that
+owns the result and `budget_exceeded` all suppress an ordinary retry.
+
+A retry is either scheduled or blocked. A scheduled retry is dispatched after a
+backoff of about 30 seconds for the first retry and about 120 seconds for the
+second, each with a fixed 20 percent jitter keyed by the WorkItem, or at a
+later provider retry time when the worker reported one. A blocked retry waits
+for a named condition, such as `provider_usage_reset` or
+`runner_fault_diagnosis`, and is never dispatched while it is blocked. Nothing
+in this release releases a block, so a blocked retry ends `expired` with cause
+`retry_condition_expired` when its waiting deadline passes, unless a person
+relabels the issue first. Only a wait that was not blocked expires as
+`capacity_wait_expired`. The counted `not_started` deferrals carry across the
+retries of one WorkItem, so `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` bounds the
+whole chain, not each request.
+
+Upgrade note: the finish route now requires `retry_safety`. A worker from an
+earlier release omits it, its finish is refused with 422, and its request ends
+`expired` with cause `execution_deadline` instead of the real cause. Roll the
+workers together with the API.
+
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it
 in place; there is no separate final comment. While the run is live the
@@ -2045,8 +2088,18 @@ URL. A follow-up that needs no change, including a relabel that continues the
 open pull request, ends with `Status: SUCCEEDED` and a result starting
 `No changes needed:` that names the open pull request.
 When the run cannot complete, the result starts with `Could not complete:`
-and a plain sentence for the cause. A request lost with its worker and retried
-as a new run shows `Status: RETRYING` and its result starts with `Retrying:`.
+and a plain sentence for the cause. A request whose settlement admitted an
+automatic retry, whether it was lost with its worker or failed with no side
+effects, shows `Status: RETRYING`. Its result starts with `Retrying:`, names
+which of the two automatic retries it spent, and then says
+`Scheduled:` with the time the retry may start, or `Blocked:` with the named
+condition and the waiting deadline. A lost request also says that work the
+lost run already did is not ruled out. The waiting retry's own comment shows
+`Status: QUEUED` and the same `Scheduled:` or `Blocked:` line, and the issue
+keeps `curie-factory:queued`. When a failed or expired request has no
+retry and its WorkItem has used any, one line after the cause sentence says
+`N of 2 automatic retries used.`, so the final needs-human result names both
+the cause and the count.
 When the model provider refused the run,
 a `Provider message:` line follows with the provider's own error text, redacted
 of keys and tokens. An execute turn that ends without publishing is prompted
@@ -2074,8 +2127,9 @@ converter decodes entities and backslash escapes only in prose after parsing,
 leaving code content escaped. Within blockquotes it converts headings to
 paragraphs, rules to literal `---` paragraphs, and flattens nested quote content.
 A last `Cause:` line names the platform cause code
-(`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`, `issue_deleted`,
-`owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
+(`capacity_wait_expired`, `retry_condition_expired`, `start_failed`, `execution_deadline`,
+`issue_cancelled`, `issue_deleted`, `owner_lost`, `runner_escalated`, `runner_error`,
+`unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`, `revision_unchanged`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`,
 `publication_unrecorded`, or a
@@ -2098,9 +2152,11 @@ A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted
 credits, including an OpenRouter key's HTTP 403 spend limit, ends the run as
-`model_credit_exhausted` without retrying. An SDK `rate_limit` error or a
+`model_credit_exhausted` without retrying in the same run. An SDK `rate_limit` error or a
 subscription session, weekly or model usage limit ends the run as
-`model_usage_limited` with failure class `model-usage-limited`, without retrying.
+`model_usage_limited` with failure class `model-usage-limited`, without retrying in the
+same run. A flag clean run of either cause gets a blocked automatic retry, as
+described above.
 The status comment says that the model provider's usage limit for the credential
 was reached; re-add the factory label after the limit resets. Ordinary usage
 warnings and rejected rate-limit events keep their existing behavior. A run that
@@ -2426,14 +2482,20 @@ request, a `state` and an `actionable_cause`. The states:
   failure (its stage and a redacted reason, at most 2000 characters), and the
   request's `last_start_failure_detail` holds the same text. Later capacity
   deferrals and a worker replacement keep it; a successful start clears it.
+  An automatic retry that is still inside its backoff says
+  `automatic retry scheduled for <time>`. A blocked automatic retry says
+  `automatic retry blocked on <condition>`, what that condition waits for, and
+  its waiting deadline.
 - `running`: started, bounded by the agent's execution deadline (default 1800 s).
 - `cancellation_requested`: termination requested (`issue_cancelled`,
   `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
 - `cancelled`: the issue label was removed or the issue was closed. A pull
   request already opened is kept.
-- `expired`: `capacity_wait_expired` or `execution_deadline`. A capacity
-  wait that expires after a failed start still names the previous start
-  failure.
+- `expired`: `capacity_wait_expired`, `retry_condition_expired` or
+  `execution_deadline`. A capacity wait that expires after a failed start
+  still names the previous start failure. A `retry_condition_expired` cause
+  names the condition the automatic retry was still blocked on and its
+  waiting deadline.
 - `failed`: the cause names the terminal cause verbatim. For
   `deadline_halted`, raise `worker.deliveryBudgetSeconds`. For `start_failed`,
   the sandbox never started; the cause names the attempt count, the last
@@ -2457,6 +2519,21 @@ request that already ran keeps the generation it ran under. The fields name
 identifiers and a generation only, never a credential.
 `curie <tier> work-items --json` carries the same four fields,
 and the human detail view prints one `auth` line.
+
+Each item also reports its automatic retry allowance:
+`automatic_retries_used` (owner loss and ordinary failures together) and
+`automatic_retry_limit` (2). Each request reports its retry facts:
+`retry_of_request_id` (the request it retries, or null), `retry_kind`
+(`owner_loss`, `failure` or null), `dispatch_not_before` (the earliest
+dispatch time; a blocked retry stores its waiting deadline here),
+`blocked_on` (the named condition, or null) and `retry_safety` (the worker's
+`no_effects`, `flagged` or `uncertain` fact from its finish, or null when the
+request did not end through a worker finish). A request retried after owner
+loss before this release reports `owner_loss`
+with a null `retry_of_request_id`. Its predecessor's status card shows
+`NEEDS HUMAN` rather than `RETRYING`; the issue label still follows the newest
+request. The CLI does not print these fields; its
+`actionable_cause` already says when a request is a scheduled or blocked retry.
 
 The platform never asserts correctness: every item reports
 `correctness: {"asserted": false, "owner": "bundle"}`. Verification belongs

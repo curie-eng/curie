@@ -108,6 +108,8 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "revision_unchanged",
         "execution_deadline",
         "capacity_wait_expired",
+        "retry_condition_expired",
+        "runner_error",
         "owner_lost",
         "enrollment_fenced",
         "authentication_required",
@@ -1343,7 +1345,7 @@ def test_owner_lost_posts_one_comment(admitted: Any) -> None:
     _reconcile()
     final = _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
     assert "Cause: owner_lost" in final
-    assert "(attempt 2 of 3)" in final
+    assert "admitted automatic retry 1 of 2 as a new run" in final
 
 
 def test_runner_failure_posts_one_comment(admitted: Any) -> None:
