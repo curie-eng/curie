@@ -956,9 +956,10 @@ def cmd_rehearse(args: argparse.Namespace, runtime: pp.Runtime) -> int:
         run_type = TwoOwnerRun
         stop_after = None
         if getattr(args, "publish_probe", False):
+            from personal_park_probe import PHASE as PARK_PROBE_PHASE
             from personal_park_probe import ParkProbe
 
-            run_type, stop_after = ParkProbe, "drill"
+            run_type, stop_after = ParkProbe, PARK_PROBE_PHASE
         live = run_type(
             inputs=inputs,
             scenario=scenario,
@@ -2527,9 +2528,10 @@ class TwoOwnerRun(pp.LiveRun):
 
         def read() -> None:
             try:
-                if process.stdout is None:
+                stdout = process.stdout
+                if stdout is None:
                     return
-                for chunk in iter(lambda: process.stdout.read(65536), b""):
+                for chunk in iter(lambda: stdout.read(65536), b""):
                     self.scan.scan_stream(pto.POD_LOGS_CHANNEL, key, chunk)
                 stream.complete = process.wait(timeout=PRE_DELETE_READ_SECONDS) == 0
             except Exception:  # noqa: BLE001 - an incomplete stream fails closed

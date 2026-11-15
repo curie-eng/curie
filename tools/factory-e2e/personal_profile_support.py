@@ -1122,9 +1122,14 @@ class Ledger:
             raise Refusal("arguments_invalid", "--run-id already has a live start")
         self.record("rehearsal", "marker", True)
 
+    def _live_refused(self, db: sqlite3.Connection) -> bool:
+        """A live start is refused on a rehearsal ledger."""
+
+        return self._rehearsal(db)
+
     def begin_live(self, *, now: float, grant_expires_at: float) -> None:
         with self.transaction() as db:
-            if self._rehearsal(db):
+            if self._live_refused(db):
                 raise Refusal("rehearsal_run_id", "--run-id")
             row = db.execute(
                 "SELECT live_starts, live_started_at FROM runs WHERE run_id=?", (self.run_id,)

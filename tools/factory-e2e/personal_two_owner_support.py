@@ -938,6 +938,8 @@ _GROUP_SCHEMA = (
 )
 PRIOR_SPEND_KEY = "prior_item_output_tokens"
 ITEM_CAP_KEY = "item_output_token_cap"
+#: A rehearsal ledger the fake-model lifecycle may reserve on (``mark_zero_cost``).
+ZERO_COST_KEY = "zero_cost_lifecycle"
 _TIMING_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS timings (run_id TEXT NOT NULL, grp TEXT NOT NULL, "
     "session_digest TEXT NOT NULL, event TEXT NOT NULL, event_key TEXT NOT NULL, "
@@ -1217,6 +1219,42 @@ class TwoOwnerLedger(pps.Ledger):
 
         raise pps.Refusal("arguments_invalid", "use reserve_group")
 
+    def mark_zero_cost(self) -> None:
+        """Let this rehearsal reserve and open a window for the fake model tier only.
+
+        Refused unless the ledger is a rehearsal with no live start and no
+        reservation. Its reservations are bookkeeping for a fake runner that
+        calls no model; ``judge`` keeps every live criterion failing on it.
+        """
+
+        with self.transaction() as db:
+            if not self._rehearsal(db) or self._rows(db):
+                raise pps.Refusal("arguments_invalid", ZERO_COST_KEY)
+            row = db.execute(
+                "SELECT live_starts, live_started_at FROM runs WHERE run_id=?", (self.run_id,)
+            ).fetchone()
+            if row is None or row[0] or row[1] is not None:
+                raise pps.Refusal("arguments_invalid", ZERO_COST_KEY)
+            db.execute(
+                "INSERT OR REPLACE INTO observations(run_id,criterion,key,value_json,recorded_at) "
+                "VALUES(?,?,?,?,?)",
+                (self.run_id, "rehearsal", ZERO_COST_KEY, "true", time.time()),
+            )
+
+    def _zero_cost(self, db: sqlite3.Connection) -> bool:
+        row = db.execute(
+            "SELECT value_json FROM observations WHERE run_id=? AND criterion='rehearsal' "
+            "AND key=?",
+            (self.run_id, ZERO_COST_KEY),
+        ).fetchone()
+        return self._rehearsal(db) and row is not None and json.loads(row[0]) is True
+
+    def is_zero_cost(self) -> bool:
+        return self._zero_cost(self.db)
+
+    def _live_refused(self, db: sqlite3.Connection) -> bool:
+        return self._rehearsal(db) and not self._zero_cost(db)
+
     def reserve_group(self, name: str, *, now: float) -> list[pps.Reservation]:
         """Persist one manifest group's reservations before its native start.
 
@@ -1242,7 +1280,7 @@ class TwoOwnerLedger(pps.Ledger):
             if run is None:
                 raise pps.Refusal("ledger_missing", "--run-id")
             budget_state, live_started_at = run
-            if self._rehearsal(db):
+            if self._live_refused(db):
                 raise pps.Refusal("rehearsal_run_id", "--run-id")
             if budget_state != "ok":
                 raise pps.Refusal("budget_exceeded")
@@ -3555,7 +3593,9 @@ def judge(ledger: TwoOwnerLedger, criterion: str) -> dict[str, Any]:
     A check passes only when its value is exactly True or an int meeting its
     comparison; a missing, None or other value fails. ``all`` runs every
     criterion. A rehearsal ledger passes no live criterion: each answers
-    ``live_ledger: False``, while ``cleanup`` and ``rehearsal`` judge it.
+    ``live_ledger: False``, while ``cleanup`` and ``rehearsal`` judge it. A
+    zero-cost (fake model) rehearsal also runs each criterion's real checks
+    next to that failing ``live_ledger``, so they show what the run reached.
     ``not_met`` lists what is reported Not met and never fails the verdict;
     ``observed`` carries the recorded ``OBSERVATIONS`` keys, which never fail
     it either.
@@ -3585,8 +3625,15 @@ def judge(ledger: TwoOwnerLedger, criterion: str) -> dict[str, Any]:
         checks, counts = _judge_rehearsal(ledger)
     elif criterion not in CRITERIA:
         raise pps.Refusal("arguments_invalid", "--criterion")
-    elif ledger.is_rehearsal() and criterion != "cleanup":
+    elif ledger.is_rehearsal() and criterion != "cleanup" and not ledger.is_zero_cost():
         checks, counts = {"live_ledger": False}, {}
+    elif ledger.is_zero_cost() and criterion != "cleanup":
+        # The fake model tier runs the real checks, which can never pass live.
+        if criterion == "budget":
+            checks, counts = _judge_budget(ledger)
+        else:
+            checks, counts = _judge_expected(ledger, criterion)
+        checks = {"live_ledger": False, **checks}
     elif criterion == "budget":
         checks, counts = _judge_budget(ledger)
     elif criterion == "cleanup":

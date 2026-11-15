@@ -5368,3 +5368,50 @@ def test_capture_audit_cannot_reuse_a_prior_containers_logs(tmp_path: Path) -> N
     _capture_cluster(h)
     pt.TwoOwnerRun.capture_audit(h.run)
     assert {row["source"] for row in _rows(h, "a3")} == {"unknown"}
+
+
+# -- the zero-cost lifecycle (rehearse --publish-probe) ------------------------------
+
+
+def test_the_fake_turn_writes_native_transcripts_the_real_parser_settles(tmp_path: Path) -> None:
+    import personal_park_probe as ppp
+
+    namespace: dict[str, Any] = {}
+    exec(compile(ppp.TRANSCRIPT_BUILDER, "builder", "exec"), namespace)  # noqa: S102
+    namespace["write_native_turn"](str(tmp_path), ppp.FAKE_MODEL)
+    namespace["write_native_turn"](str(tmp_path), ppp.FAKE_MODEL)
+    files = {
+        path.relative_to(tmp_path).as_posix(): path.read_bytes()
+        for path in tmp_path.glob("curie-claude-config-*/**/*")
+        if path.is_file()
+    }
+    assert len(files) == 2 * 5
+    facts = pps.parse_native_transcripts(files)
+    roles = sorted(session.role for session in facts.sessions)
+    assert roles == sorted([pps.IMPLEMENTER, pps.PLAN_REVIEWER, pps.DIFF_REVIEWER] * 2)
+    assert not facts.malformed_lines and not facts.truncated_files
+    for session in facts.sessions:
+        assert session.models == (ppp.FAKE_MODEL,)
+        assert session.output_tokens == (6 if session.role == pps.IMPLEMENTER else 3)
+        assert not session.synthetic and not session.errors
+    assert ppp.TRANSCRIPT_BUILDER in ppp.RUNNER_PROGRAM
+    compile(ppp.RUNNER_PROGRAM, "runner", "exec")
+
+
+def test_the_zero_cost_lifecycle_takes_paid_phases_only_on_the_fake_runner(
+    tmp_path: Path,
+) -> None:
+    import personal_park_probe as ppp
+
+    h = _live(tmp_path, begin=False)
+    probe = ppp.ParkProbe.__new__(ppp.ParkProbe)
+    probe.__dict__.update(h.run.__dict__)
+    probe.no_grant_loaded = lambda: True  # type: ignore[method-assign]
+    with pytest.raises(pps.Refusal):
+        probe.require_live("attempt-a1")
+    probe.fake_runner = True
+    with pytest.raises(pps.Refusal):
+        probe.require_live("attempt-a1")  # a live ledger is never zero-cost
+    names = [name for name, _ in ppp.ParkProbe.phases(probe)]
+    assert names[-1] == ppp.PHASE and ppp.PHASE not in pt.PAID_PHASES
+    assert not set(names) & set(pt.PAID_PHASES)

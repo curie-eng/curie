@@ -460,12 +460,20 @@ never appear in it; it names grant files, which `check_grant_file` validates.
 ### Commands
 
 Use `p rehearse --publish-probe` with a separate setup descriptor and run ID
-to exercise publication correlation without inference. It uses the existing
-fake model in the real runner to write a fixture file and call `publish_changes`,
-then drives the driver's park predicate, delivered card, operator decision and
-forge publication. It records field names, conversation equality, WorkItem states
-and timings without retaining content. This diagnostic stops after the drill;
-it does not replace the full unpaid rehearsal or prove any paid criterion.
+to walk the paid lifecycle without inference. After the drill it replaces the
+owned runner template's command with the runner on its existing fake model. Each
+turn writes native-shaped transcripts under a model name that is plainly fake,
+writes a fixture file and calls `publish_changes`, so the product parks the
+session on its real publication approval and suspends it, deleting its pod. The
+ledger is marked zero-cost: a rehearsal that may reserve and open the live clocks
+but loads no grant. The probes are settled not started, then the paid phases run
+in the live order with the real capture, settlement, card, operator and forge
+code, until the first phase the fake tier cannot reach. A phase's failed checks
+are recorded under `zero-cost` and the walk goes on; a capture or settlement
+failure still fences. `p judge` on that ledger runs each criterion's real checks
+next to a failing `live_ledger`, so it never passes a live criterion. The fake
+tier has no native CLI, so no hook holds, native session binding, prompt
+interruption or real model checks happen; those need a paid run.
 
 ```sh
 p() {

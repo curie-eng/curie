@@ -4323,3 +4323,41 @@ def test_lost_capture_charges_previously_settled_usage_in_full(tmp_path: Path) -
     assert ledger.owner_spent("a") == reservation.output_tokens
     assert ledger.aggregate_spent() == reservation.output_tokens
     _refused("usage_unknown", lambda: ledger.reserve_group("b-probe", now=T0))
+
+
+# -- the zero-cost (fake model) lifecycle ledger ------------------------------------
+
+
+def test_only_a_marked_rehearsal_ledger_reserves_for_the_fake_model(tmp_path: Path) -> None:
+    rehearsal = _ledger(tmp_path / "plain", rehearsal=True)
+    _refused("rehearsal_run_id", lambda: rehearsal.begin_live(now=T0, grant_expires_at=WINDOW))
+    _refused("rehearsal_run_id", lambda: rehearsal.reserve_group("a-probe", now=T0))
+    live = _ledger(tmp_path / "live")
+    _refused("arguments_invalid", live.mark_zero_cost)
+    assert not live.is_zero_cost()
+
+    ledger = _ledger(tmp_path / "zero", rehearsal=True)
+    ledger.mark_zero_cost()
+    assert ledger.is_zero_cost() and ledger.is_rehearsal()
+    for owner in pto.OWNERS:
+        ledger.set_owner_window(owner, WINDOW)
+    ledger.begin_live(now=T0, grant_expires_at=WINDOW)
+    _settle(ledger, ledger.reserve_group("a-probe", now=T0))
+    assert len(ledger.reserve_group("a1", now=T0)) == 3
+    # Marked once reservations exist: refused.
+    _refused("arguments_invalid", ledger.mark_zero_cost)
+
+
+def test_a_zero_cost_ledger_runs_the_real_checks_and_never_passes(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path, rehearsal=True)
+    ledger.mark_zero_cost()
+    ledger.record("owners", "principal_ids_distinct", True)
+    result = pto.judge(ledger, "owners")
+    assert result["checks"]["live_ledger"] is False
+    assert result["checks"]["principal_ids_distinct"] is True
+    assert result["verdict"] == "fail"
+    plain = _ledger(tmp_path / "plain", rehearsal=True)
+    plain.record("owners", "principal_ids_distinct", True)
+    assert pto.judge(plain, "owners")["checks"] == {"live_ledger": False}
+    every = pto.judge(ledger, "all")
+    assert every["verdict"] == "fail" and every["checks"]["budget.live_ledger"] is False
