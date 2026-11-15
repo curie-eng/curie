@@ -69,6 +69,8 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NoReturn, Protocol
 
+from channel_protocol import scoped_conversation_id
+
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
@@ -939,8 +941,19 @@ def cmd_rehearse(args: argparse.Namespace, runtime: pp.Runtime) -> int:
     ledger = pto.TwoOwnerLedger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
     try:
         ledger.ensure_run(inputs.candidate, phase="rehearse")
-        live = TwoOwnerRun(
-            inputs=inputs, scenario=scenario, runtime=runtime, ledger=ledger, rehearsal=True
+        run_type = TwoOwnerRun
+        stop_after = None
+        if getattr(args, "publish_probe", False):
+            from personal_park_probe import ParkProbe
+
+            run_type, stop_after = ParkProbe, "drill"
+        live = run_type(
+            inputs=inputs,
+            scenario=scenario,
+            runtime=runtime,
+            ledger=ledger,
+            rehearsal=True,
+            stop_after=stop_after,
         )
         ledger.record("rehearsal", "schedule_check_passed", schedule["verdict"] == "pass")
         ledger.record("rehearsal", "schedule", schedule_summary(schedule))
@@ -2611,19 +2624,23 @@ class TwoOwnerRun(pp.LiveRun):
 
         def parked() -> bool:
             item = self.work_item_of(run.work_item_id)
-            mine = [
-                row
-                for row in item.get("requests") or []
-                if isinstance(row, dict) and str(row.get("id")) == run.request_id
-            ]
-            if any(row.get("terminal_at") for row in mine):
+            mine = self.request_of(item, run.sequence)
+            if mine.get("terminal_at"):
                 self.fail_paid(f"{run.group} ended before parking for approval")
             for row in self.pending_publication_approvals():
                 approval_id = str(row.get("id") or "")
                 if not approval_id or approval_id in known:
                     continue
                 approval = self.approval(approval_id)
-                if approval.get("conversation_id") == run.conversation_id:
+                if (
+                    str(approval.get("agent_id")) == self.agent_id
+                    and scoped_conversation_id(
+                        "github",
+                        str(approval.get("reply_channel") or ""),
+                        str(approval.get("conversation_id") or ""),
+                    )
+                    == run.conversation_id
+                ):
                     run.approval_id = approval_id
                     run.parked_at = pps.iso_epoch(approval.get("created_at"))
                     self.owner_ledger.record_timing(
@@ -3050,12 +3067,14 @@ class TwoOwnerRun(pp.LiveRun):
         forge = self.require_forge()
         return forge.call("GET", forge.repo_path(suffix))
 
-    def request_of(self, item: Mapping[str, Any], request_id: str) -> dict[str, Any]:
+    def request_of(self, item: Mapping[str, Any], sequence: int | None) -> dict[str, Any]:
+        if sequence is None:
+            return {}
         return next(
             (
                 row
                 for row in item.get("requests") or []
-                if isinstance(row, dict) and str(row.get("id")) == request_id
+                if isinstance(row, dict) and row.get("sequence") == sequence
             ),
             {},
         )
@@ -3424,6 +3443,7 @@ class TwoOwnerRun(pp.LiveRun):
         self.wait_until(quiescent, until=self.clock.now() + QUIESCENT_SECONDS, what="A quiescent")
         held = self.new_run("b-r1", policy=KEEP_PROMPT)
         held.request_id, held.work_item_id = run.request_id, run.work_item_id
+        held.sequence = run.sequence
         held.conversation_id = run.conversation_id
         self.reserve(held)
         self.early_watch, self.early_checked = held, float("-inf")
@@ -3462,7 +3482,7 @@ class TwoOwnerRun(pp.LiveRun):
         second = self.pod_run("a2")
 
         def completed() -> bool:
-            row = self.request_of(self.work_item_of(second.work_item_id), second.request_id)
+            row = self.request_of(self.work_item_of(second.work_item_id), second.sequence)
             return row.get("status") == "completed"
 
         with contextlib.suppress(StepFailed):
@@ -3471,7 +3491,7 @@ class TwoOwnerRun(pp.LiveRun):
             )
         item = self.work_item_of(second.work_item_id)
         checks = {
-            "a2_request_completed": self.request_of(item, second.request_id).get("status")
+            "a2_request_completed": self.request_of(item, second.sequence).get("status")
             == "completed",
             "a2_work_item_published": item.get("state") == "published",
         }
@@ -3807,6 +3827,7 @@ class TwoOwnerRun(pp.LiveRun):
         self.read_before("process", held, self.b1_head)
         repair = self.new_run("b-r2", card=4)
         repair.request_id, repair.work_item_id = held.request_id, held.work_item_id
+        repair.sequence = held.sequence
         repair.conversation_id = held.conversation_id
         self.reserve(repair)
         deletes = len(self.pod_deletions)
@@ -4010,7 +4031,7 @@ class TwoOwnerRun(pp.LiveRun):
             self.ledger.record(criterion, key, value)
 
         def completed() -> bool:
-            row = self.request_of(self.work_item_of(first.work_item_id), first.request_id)
+            row = self.request_of(self.work_item_of(first.work_item_id), first.sequence)
             return row.get("status") == "completed"
 
         done = self.observed(completed, pp.CI_WAIT_SECONDS, "B's request completed")

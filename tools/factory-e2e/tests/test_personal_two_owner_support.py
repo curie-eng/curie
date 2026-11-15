@@ -389,7 +389,7 @@ INVALID_CORPUS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
     ("prior too large", lambda doc: _set(doc, "prior_item_output_tokens", 32769)),
     ("prior bool", lambda doc: _set(doc, "prior_item_output_tokens", True)),
     ("prior string", lambda doc: _set(doc, "prior_item_output_tokens", "0")),
-    ("item cap too large", lambda doc: _set(doc, "item_output_token_cap", 49153)),
+    ("item cap too large", lambda doc: _set(doc, "item_output_token_cap", 65537)),
     ("item cap bool", lambda doc: _set(doc, "item_output_token_cap", True)),
     ("item cap exhausted", lambda doc: _set(doc, "item_output_token_cap", 0)),
     ("probe cli space", lambda doc: _set(doc, "probe_cli", "claude --x")),
@@ -599,25 +599,28 @@ def test_schedule_check_passes_the_approved_plan() -> None:
     assert result["verdict"] == "pass"
 
 
-def test_renewed_item_allowance_keeps_an_independent_run_cap(tmp_path: Path) -> None:
+@pytest.mark.parametrize("prior, cap", [(16384, 49152), (32768, 65536)])
+def test_renewed_item_allowance_keeps_an_independent_run_cap(
+    tmp_path: Path, prior: int, cap: int
+) -> None:
     document = _kit(tmp_path)
-    document.update(prior_item_output_tokens=16384, item_output_token_cap=49152)
+    document.update(prior_item_output_tokens=prior, item_output_token_cap=cap)
     inputs = _load(tmp_path, document)
-    assert inputs.item_output_token_cap == 49152 and inputs.prior_item_output_tokens == 16384
-    result = pto.schedule_check(16384, item_output_token_cap=49152)
+    assert inputs.item_output_token_cap == cap and inputs.prior_item_output_tokens == prior
+    result = pto.schedule_check(prior, item_output_token_cap=cap)
     assert result["aggregate_limit"] == 32768
-    ledger = _ledger(tmp_path, prior=16384)
-    ledger.set_item_cap(49152)
+    ledger = _ledger(tmp_path, prior=prior)
+    ledger.set_item_cap(cap)
     for group in pto.MANIFEST:
         reservations = ledger.reserve_group(group.name, now=T0)
         _settle(ledger, reservations)
-    assert ledger.aggregate_spent() == 16384 + sum(
+    assert ledger.aggregate_spent() == prior + sum(
         int(row["output_tokens"] or 0) for row in ledger.session_rows()
     )
-    assert ledger.aggregate_ceiling() == 49152
+    assert ledger.aggregate_ceiling() == cap
     assert ledger.budget_state() == "ok"
     empty = _ledger(tmp_path / "new-item")
-    empty.set_item_cap(49152)
+    empty.set_item_cap(cap)
     assert empty.aggregate_ceiling() == 32768
     assert pto.gate_decision(
         session_usage=pps.SessionUsage(1, 1, 1, pps.IMPLEMENTER_MODEL),

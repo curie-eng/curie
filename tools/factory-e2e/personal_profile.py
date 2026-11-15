@@ -488,6 +488,8 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--grant-expires-at", default=grant_default, action=_Supplied)
         if name in {"preflight", "run", "rehearse"}:
             sub.add_argument("--approve-live", default=None)
+        if name == "rehearse":
+            sub.add_argument("--publish-probe", action="store_true")
         if name in {"preflight", "run"}:
             sub.add_argument("--output-token-ceiling", default="", action=_Supplied)
         if name == "run":
@@ -3546,6 +3548,8 @@ def main(
             import personal_two_owner
 
             return personal_two_owner.run_command(args.command, args, runtime)
+        if getattr(args, "publish_probe", False):
+            raise pps.Refusal("arguments_invalid", "--publish-probe needs --scenario two-owner")
         if args.inputs_file is not None:
             raise pps.Refusal("arguments_invalid", "--inputs-file needs --scenario two-owner")
         if getattr(args, "criterion", None) in set(TWO_OWNER_CRITERIA) - set(pps.CRITERIA):

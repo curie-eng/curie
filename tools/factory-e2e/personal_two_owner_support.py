@@ -74,7 +74,7 @@ MAX_TURNS = 192
 SESSION_TURNS = 32
 #: Output tokens across the run, and the item's aggregate actual-spend guard.
 MAX_OUTPUT_TOKENS = 32768
-MAX_ITEM_OUTPUT_TOKENS = 49152
+MAX_ITEM_OUTPUT_TOKENS = 65536
 #: Output tokens in one session, checked after every response.
 SESSION_OUTPUT_TOKENS = 8192
 #: Absolute seconds one session may run before the runner is interrupted.

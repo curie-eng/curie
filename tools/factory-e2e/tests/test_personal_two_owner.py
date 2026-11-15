@@ -39,6 +39,7 @@ import personal_profile_support as pps
 import personal_two_owner as pt
 import personal_two_owner_support as pto
 import pytest
+from channel_protocol import scoped_conversation_id
 from two_owner_shared import (
     AGENT_ID,
     API_PORT,
@@ -359,6 +360,34 @@ def _connect(h: _Harness) -> None:
 # --------------------------------------------------------------------------
 # Phases: order, cut and paid phases
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("live_inputs", [False, True])
+def test_publish_probe_refuses_a_wrong_scenario_or_grant_inputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], live_inputs: bool
+) -> None:
+    argv = [
+        "rehearse",
+        "--publish-probe",
+        "--candidate",
+        CANDIDATE,
+        "--state-dir",
+        str(_private(tmp_path / "state")),
+        "--run-id",
+        RUN_ID,
+    ]
+    if live_inputs:
+        argv.extend(
+            [
+                "--scenario",
+                "two-owner",
+                "--inputs-file",
+                str(_inputs_file(tmp_path, _kit(tmp_path))),
+            ]
+        )
+    assert pp.main(argv, environ=PATH_ONLY, clock=_FakeClock()) == pps.EXIT_REFUSED
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == ("setup_inputs_carry_grants" if live_inputs else "arguments_invalid")
 
 
 def test_rehearsal_runs_every_unpaid_phase_then_the_controls_and_stops(tmp_path: Path) -> None:
@@ -4064,13 +4093,15 @@ def test_missing_approval_times_are_null_in_card_and_park_events(
         "approval",
         lambda _id: {
             "conversation_id": "issue-11",
+            "agent_id": AGENT_ID,
+            "reply_channel": REPO,
             "created_at": created_at,
         },
     )
     h.run.await_card(DRILL_PUBLICATION["reject"], "drill_reject")
     _through(h, "a1")
     run = _pod_run(h, "a1", card=1)
-    run.conversation_id = "issue-11"
+    run.conversation_id = scoped_conversation_id("github", REPO, "issue-11")
     h.run.work_item_of = lambda _id: {"state": "running", "requests": []}  # type: ignore[method-assign]
     h.run.pending_publication_approvals = lambda: [{"id": DRILL_APPROVAL["reject"]}]  # type: ignore[method-assign]
 
@@ -4136,11 +4167,19 @@ def test_pending_card_time_survives_failure_to_observe_the_work_item_park(tmp_pa
     h = _live(tmp_path)
     _through(h, "a1")
     run = _pod_run(h, "a1", card=1)
-    run.conversation_id = "issue-11"
+    run.conversation_id = scoped_conversation_id("github", REPO, "issue-11")
     h.run.work_item_of = lambda _id: {"state": "running", "requests": []}  # type: ignore[method-assign]
     h.run.pending_publication_approvals = lambda: [{"id": DRILL_APPROVAL["reject"]}]  # type: ignore[method-assign]
     h.api.route("GET", "/approvals/" + DRILL_APPROVAL["reject"])(
-        lambda _p, _h, _b: (200, {"conversation_id": "issue-11", "created_at": _stamp(5)})
+        lambda _p, _h, _b: (
+            200,
+            {
+                "conversation_id": "issue-11",
+                "agent_id": AGENT_ID,
+                "reply_channel": REPO,
+                "created_at": _stamp(5),
+            },
+        )
     )
 
     def wait(condition: Callable[[], bool], **_kwargs: Any) -> None:
@@ -4155,6 +4194,151 @@ def test_pending_card_time_survives_failure_to_observe_the_work_item_park(tmp_pa
         for row in h.ledger.timing_rows()
         if row["event"] == "approval_requested"
     ] == [("approval_requested", T0 + 5)]
+
+
+@pytest.mark.parametrize("address", [REPO, "acme-corp/issue:fixture"])
+def test_park_correlates_the_real_admission_and_approval_conversation_shapes(
+    tmp_path: Path, address: str
+) -> None:
+    h = _live(tmp_path)
+    _drill_setup(h)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    run.sequence = 1
+    # workitem_dispatch._facts_conversation scopes the admission; publication
+    # CRUD stores reply_conversation_id on Approval. WorkItemRequestOut exposes
+    # sequence, not id. These are independently produced operator DTO shapes.
+    run.conversation_id = scoped_conversation_id("github", address, "issue-11")
+    h.run.work_item_of = lambda _id: {  # type: ignore[method-assign]
+        "state": "awaiting_approval",
+        "requests": [
+            {"sequence": 0, "status": "failed", "terminal_at": _stamp(1)},
+            {"sequence": 1, "status": "running", "terminal_at": None},
+        ],
+    }
+    h.run.pending_publication_approvals = lambda: [{"id": DRILL_APPROVAL["reject"]}]  # type: ignore[method-assign]
+    h.run.approval = lambda _id: {  # type: ignore[method-assign]
+        "agent_id": AGENT_ID,
+        "reply_channel": address,
+        "conversation_id": "issue-11",
+        "created_at": _stamp(5),
+    }
+    h.run.publications = lambda: [  # type: ignore[method-assign]
+        {
+            "id": DRILL_PUBLICATION["reject"],
+            "approval_id": DRILL_APPROVAL["reject"],
+        }
+    ]
+
+    def wait(condition: Callable[[], bool], **_kwargs: Any) -> None:
+        assert condition() is True, "the real publication park must correlate"
+
+    h.run.wait_until = wait  # type: ignore[method-assign]
+    h.run.await_park(run)
+    assert run.approval_id == DRILL_APPROVAL["reject"]
+    assert run.publication_id == DRILL_PUBLICATION["reject"]
+    assert h.run.no_push[1] is True
+
+
+@pytest.mark.parametrize("mismatch", ["agent_id", "reply_channel", "conversation_id"])
+def test_park_does_not_match_another_approvals_route(tmp_path: Path, mismatch: str) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    run.conversation_id = scoped_conversation_id("github", REPO, "issue-11")
+    h.run.work_item_of = lambda _id: {"state": "awaiting_approval", "requests": []}  # type: ignore[method-assign]
+    h.run.pending_publication_approvals = lambda: [{"id": DRILL_APPROVAL["reject"]}]  # type: ignore[method-assign]
+    approval = {"agent_id": AGENT_ID, "reply_channel": REPO, "conversation_id": "issue-11"}
+    approval[mismatch] = "other"
+    h.run.approval = lambda _id: approval  # type: ignore[method-assign]
+
+    def wait(condition: Callable[[], bool], **_kwargs: Any) -> None:
+        assert condition() is False
+        raise pp.StepFailed("control remained unmatched")
+
+    h.run.wait_until = wait  # type: ignore[method-assign]
+    with pytest.raises(pp.StepFailed, match="control remained unmatched"):
+        h.run.await_park(run)
+    assert not run.approval_id
+
+
+def test_park_detects_its_terminal_request_by_the_operator_dto_sequence(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    run.sequence = 2
+    run.conversation_id = scoped_conversation_id("github", REPO, "issue-11")
+    h.run.work_item_of = lambda _id: {  # type: ignore[method-assign]
+        "state": "failed",
+        "requests": [
+            {"sequence": 1, "terminal_at": _stamp(1)},
+            {"sequence": 2, "terminal_at": _stamp(5)},
+        ],
+    }
+    h.run.pending_publication_approvals = lambda: []  # type: ignore[method-assign]
+
+    def wait(condition: Callable[[], bool], **_kwargs: Any) -> None:
+        condition()
+        pytest.fail("terminal request was not detected")
+
+    h.run.wait_until = wait  # type: ignore[method-assign]
+    with pytest.raises(pp.StepFailed, match="ended before parking"):
+        h.run.await_park(run)
+
+
+def test_completion_reads_the_operator_request_sequence_without_an_id(tmp_path: Path) -> None:
+    h = _live(tmp_path)
+    item = {
+        "requests": [
+            {"sequence": 1, "status": "completed"},
+            {"sequence": 2, "status": "running"},
+        ]
+    }
+    assert h.run.request_of(item, 1)["status"] == "completed"
+    assert h.run.request_of(item, 2)["status"] == "running"
+    assert h.run.request_of(item, 3) == {}
+    assert h.run.request_of(item, None) == {}
+
+
+def test_park_probe_retains_fields_and_equalities_without_content(tmp_path: Path) -> None:
+    from personal_park_probe import ParkProbe
+
+    h = _harness(tmp_path, cls=ParkProbe)
+    _connect(h)
+    run = h.run.new_run("a1", card=1)
+    run.conversation_id = scoped_conversation_id("github", REPO, "issue-11")
+    h.run.probe_run = run  # type: ignore[attr-defined]
+    marker = "private-summary-and-objective-never-retained"
+    h.api.route("GET", "/approvals/" + DRILL_APPROVAL["reject"])(
+        lambda _p, _h, _b: (
+            200,
+            {
+                "conversation_id": "issue-11",
+                "reply_channel": REPO,
+                "status": "pending",
+                "summary": marker,
+            },
+        )
+    )
+    h.api.route("GET", "/work-items/" + WORK_ITEM)(
+        lambda _p, _h, _b: (
+            200,
+            {
+                "state": "awaiting_approval",
+                "objective": marker,
+                "requests": [{"sequence": 1, "status": "running"}],
+            },
+        )
+    )
+    h.run.approval(DRILL_APPROVAL["reject"])
+    h.run.work_item_of(WORK_ITEM)
+    recorded = h.ledger.observations("park-probe")
+    assert recorded["conversation_equal"] is False
+    assert recorded["route_conversation_equal"] is True
+    assert recorded["request_fields"] == ["sequence", "status"]
+    assert recorded["states"] == [{"state": "awaiting_approval", "at": T0}]
+    assert marker not in json.dumps(recorded)
+    assert REPO not in json.dumps(recorded)
 
 
 def test_an_undelivered_drill_card_fails_the_live_run_before_any_reservation(

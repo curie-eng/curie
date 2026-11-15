@@ -452,12 +452,20 @@ never appear in it; it names grant files, which `check_grant_file` validates.
    checks it covers the live end.
 4. `prior_item_output_tokens` is the item's earlier actual spend (0 to 32,768).
    It counts against `item_output_token_cap` (default 32,768, explicitly approved
-   maximum 49,152). Each run still has its separate 32,768-token limit.
-   The next attempt records 16,384 prior tokens and an item cap of 49,152.
+   maximum 65,536). Each run still has its separate 32,768-token limit.
+   The next attempt records 32,768 prior tokens and an item cap of 65,536.
 5. `namespace` is at most 56 characters because the driver also owns
    `<namespace>-grants`, the custody namespace, created before helm.
 
 ### Commands
+
+Use `p rehearse --publish-probe` with a separate setup descriptor and run ID
+to exercise publication correlation without inference. It uses the existing
+fake model in the real runner to write a fixture file and call `publish_changes`,
+then drives the driver's park predicate, delivered card, operator decision and
+forge publication. It records field names, conversation equality, WorkItem states
+and timings without retaining content. This diagnostic stops after the drill;
+it does not replace the full unpaid rehearsal or prove any paid criterion.
 
 ```sh
 p() {
