@@ -41,6 +41,7 @@ from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.side_effects import PLATFORM_IDEMPOTENT_TOOLS
 from curie_runner.tracker_result import (
     CONTRACT_ATTEMPTS,
+    PUBLICATION_RECOVERY_EXPLANATION,
     REASON_ALLOWANCE_INVALID,
     REASON_BODY_INVALID,
     REASON_CONTRACT_UNKNOWN,
@@ -77,6 +78,12 @@ IMPLEMENTATION = {
     "completion_contract": "implementation",
     "result_kinds": [],
     "session_usd_allowance": None,
+}
+RECOVERY = {
+    "completion_contract": "publication_recovery",
+    "result_kinds": [],
+    "session_usd_allowance": None,
+    "execution": None,
 }
 
 # The boot env field set before #5586: the runner learns the contract from the
@@ -455,6 +462,45 @@ def test_a_blocked_session_answers_offline_without_the_capability(
     assert "127.0.0.1" not in rendered
 
 
+# --- A publication recovery process runs no model (#5429) ------------------------
+
+
+@pytest.mark.parametrize("fake_model", [False, True])
+def test_a_publication_recovery_contract_constructs_no_model_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_model: bool
+) -> None:
+    api = _Api([(200, RECOVERY)])
+    session = _boot_session(monkeypatch, tmp_path, api, fake_model=fake_model)
+    assert isinstance(session, PreflightBlockedSession)
+    assert api.contract_calls == [({}, CAPABILITY)]
+    assert _ModelSession.started == []
+    assert _FakeSession.started == []
+
+    async def turn() -> list[Any]:
+        await session.connect()
+        await session.query("publish the candidate")
+        return [message async for message in session.receive_turn()]
+
+    messages = anyio.run(turn)
+    assert [getattr(message, "result", None) for message in messages][-1] == (
+        PUBLICATION_RECOVERY_EXPLANATION
+    )
+    assert _ModelSession.started == []
+
+
+@pytest.mark.parametrize(("contract", "sessions"), [(RECOVERY, 0), (IMPLEMENTATION, 3)])
+def test_reset_and_replacement_construct_no_model_session_for_publication_recovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contract: dict[str, Any], sessions: int
+) -> None:
+    async def scenario(runner: Any) -> None:
+        await runner.reset()
+        await runner._replace_session()  # noqa: SLF001 - the replacement path is the subject
+
+    _runner_against(monkeypatch, tmp_path, _Api([(200, contract)]), scenario)
+    # The implementation control: boot, reset and replacement each construct one.
+    assert len(_ModelSession.started) == sessions
+
+
 # --- One model session per tracker result request --------------------------------
 
 
@@ -640,6 +686,43 @@ def test_every_unusable_answer_is_refused_and_never_retried(
     api = _Api([answer])
     assert _refusal(api, delay=_no_delay).reason == reason
     assert len(api.contract_calls) == 1
+
+
+def test_a_publication_recovery_answer_is_the_recovery_contract() -> None:
+    contract = _fetch(_Api([(200, RECOVERY)]))
+    assert contract.publication_recovery
+    assert not contract.tracker_result
+    assert contract.execution is None
+    assert contract.result_kinds == ()
+    assert contract.session_usd_allowance is None
+    # The bare kind, with nothing else, is the same contract.
+    assert _fetch(_Api([(200, {"completion_contract": "publication_recovery"})])) == contract
+
+
+@pytest.mark.parametrize(
+    ("answer", "reason"),
+    [
+        (
+            {
+                **RECOVERY,
+                "execution": {
+                    "tenant_id": "00000000-0000-4000-8000-000000000001",
+                    "work_item_id": "00000000-0000-4000-8000-000000000002",
+                    "execution_request_id": "00000000-0000-4000-8000-000000000003",
+                    "execution_fence": 1,
+                },
+            },
+            REASON_BODY_INVALID,
+        ),
+        ({**RECOVERY, "session_usd_allowance": 1.0}, REASON_BODY_INVALID),
+        ({**RECOVERY, "result_kinds": ["findings"]}, REASON_RESULT_KINDS_INVALID),
+        ({**RECOVERY, "result_kinds": "findings"}, REASON_RESULT_KINDS_INVALID),
+    ],
+)
+def test_a_publication_recovery_answer_carrying_anything_else_is_refused(
+    answer: dict[str, Any], reason: str
+) -> None:
+    assert _refusal(_Api([(200, answer)]), delay=_no_delay).reason == reason
 
 
 def test_a_transient_status_then_success_returns_the_contract() -> None:

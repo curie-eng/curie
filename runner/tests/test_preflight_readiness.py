@@ -34,7 +34,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from curie_runner import __main__ as boot
+from curie_runner.issue_read import ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
 from curie_runner.progress import PROGRESS_TOKEN_ENV, PROGRESS_URL_ENV
+from curie_runner.tracker_result import PUBLICATION_RECOVERY_EXPLANATION
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _MODEL = "example-provider/units-model"
@@ -55,6 +57,9 @@ _WATCHDOG_S = 30.0
 _ENTER_WATCHDOG_S = _WATCHDOG_S
 _HOLD_POLLS = int(_WATCHDOG_S / 0.05)
 _HEALTHZ_WITHIN_S = 5.0
+_CAPABILITY = "wir.example-capability.signature"
+_ISSUE_READ_PATH = "/v1/runner/work-items/issue-read"
+_CONTRACT_PATH = "/v1/runner/work-items/completion-contract"
 
 
 def _hold_record(exit_status: int) -> dict[str, Any]:
@@ -278,8 +283,13 @@ async def _harness(
     report_status: int = 201,
     fake_model: bool = False,
     script_body: Callable[[_Harness], str] | None = None,
+    contract: dict[str, Any] | None = None,
 ) -> AsyncIterator[_Harness]:
-    """Boot ``_serve`` in a thread against an in-test progress API; clean up all."""
+    """Boot ``_serve`` in a thread against an in-test progress API; clean up all.
+
+    ``contract`` injects the issue read capability and answers the completion
+    contract route beside it with that body (ADR 0277).
+    """
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as client:
         h = _Harness(
@@ -313,9 +323,15 @@ async def _harness(
             await request.read()
             return web.json_response({"recorded": True}, status=201)
 
+        async def completion_contract(request: web.Request) -> web.Response:
+            await request.read()
+            h.events.append("contract")
+            return web.json_response(contract)
+
         progress = web.Application(middlewares=[seen])
         progress.router.add_post("/v1/work-item-progress/readiness/verification", verification)
         progress.router.add_post("/v1/work-item-progress/readiness/usage", usage)
+        progress.router.add_post(_CONTRACT_PATH, completion_contract)
 
         class ModelDouble:
             """Records each construction, connect and query; answers one text turn."""
@@ -368,6 +384,9 @@ async def _harness(
                 PROGRESS_URL_ENV, str(server.make_url("/v1/work-item-progress/readiness"))
             )
             monkeypatch.setenv(PROGRESS_TOKEN_ENV, _PROGRESS_TOKEN)
+            if contract is not None:
+                monkeypatch.setenv(ISSUE_READ_URL_ENV, str(server.make_url(_ISSUE_READ_PATH)))
+                monkeypatch.setenv(ISSUE_READ_TOKEN_ENV, _CAPABILITY)
             if fake_model:
                 monkeypatch.setenv("CURIE_FAKE_MODEL", "1")
             monkeypatch.setattr(boot, "Path", _workspace_path_shim(workspace))
@@ -619,6 +638,50 @@ def test_early_turn_waits_for_shared_preflight(
 
 
 # --- initialization outcomes ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["publication_recovery", "implementation"])
+def test_a_publication_recovery_boot_is_ready_after_the_preflight_and_runs_no_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    # #5429: a recovery runtime runs the declared preflight, so its
+    # observations are recorded, then becomes ready with zero model sessions;
+    # a turn sent to it answers offline. The implementation contract is the
+    # liveness control: the same boot constructs and connects the model.
+    recovery = kind == "publication_recovery"
+    contract = {"completion_contract": kind, "result_kinds": [], "session_usd_allowance": None}
+
+    async def scenario() -> None:
+        async with _harness(tmp_path, monkeypatch, contract=contract) as h:
+            await h.wait_entered()
+            await h.wait_served(timeout=_HEALTHZ_WITHIN_S)
+            # The contract is asked only after the preflight finishes.
+            assert (await h.runner_status())["ready"] is False
+            assert "contract" not in h.events
+            h.release.touch()
+            await h.wait_ready()
+
+            assert [body for body, _ in h.verification] == [_hold_record(0)]
+            assert h.events.index("verification:201") < h.events.index("contract")
+            assert h.events.count("contract") == 1
+            assert h.model.constructed == (0 if recovery else 1)
+            assert h.model.connected == (0 if recovery else 1)
+
+            outbound = await h.turn("Start on the issue.")
+            finals = _finals(outbound)
+            assert len(finals) == 1 and outbound[-1] is finals[0], outbound
+            if recovery:
+                assert finals[0].text == PUBLICATION_RECOVERY_EXPLANATION, finals[0].text
+                assert h.model == _Model()
+            else:
+                assert finals[0].text == _ANSWER, finals[0].text
+                assert h.model.queries == 1
+
+    async def bounded() -> None:
+        with anyio.fail_after(120):
+            await scenario()
+
+    asyncio.run(bounded())
 
 
 def test_early_turn_after_unavailable_undelegated_check_is_blocked(

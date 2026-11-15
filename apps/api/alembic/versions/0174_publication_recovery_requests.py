@@ -9,6 +9,13 @@ A recovery request completes by a pull request and is always an automatic
 successor. A trigger refuses any update of the three columns, so the
 candidate identity fixed at admission never changes.
 
+``publications`` gains ``adoptable_revision_ids``: the earlier failed revisions
+on the same lineage that a recovery publication may adopt when the branch
+already holds one of their pushed commits (a predecessor whose push landed but
+whose publication still failed). The API computes it once at creation from the
+candidate's ownership chain; an ordinary publication's set is empty. A trigger
+refuses any update, so the set is part of the publication's fixed identity.
+
 The downgrade refuses before any DDL while a recovery request exists, because
 dropping the kind would turn it into an implementation request that reruns the
 model.
@@ -90,6 +97,40 @@ def upgrade() -> None:
     )
     op.execute(
         f"""
+        ALTER TABLE {S}.publications
+          ADD COLUMN adoptable_revision_ids uuid[] NOT NULL DEFAULT '{{}}'::uuid[],
+          ADD CONSTRAINT publications_adoptable_revision_ids_ck CHECK (
+            array_position(adoptable_revision_ids, NULL) IS NULL
+            AND NOT (id = ANY(adoptable_revision_ids)))
+        """
+    )
+    op.execute(
+        f"""
+        CREATE FUNCTION {S}.enforce_publications_adoptable_revision_ids()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NEW.adoptable_revision_ids IS DISTINCT FROM OLD.adoptable_revision_ids THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'publication adoptable revisions are immutable';
+            END IF;
+            RETURN NEW;
+        END;
+        $$
+        """
+    )
+    op.execute(
+        f"""
+        CREATE TRIGGER publications_adoptable_revision_ids
+        BEFORE UPDATE OF adoptable_revision_ids ON {S}.publications
+        FOR EACH ROW
+        EXECUTE FUNCTION {S}.enforce_publications_adoptable_revision_ids()
+        """
+    )
+    op.execute(
+        f"""
         CREATE TRIGGER execution_requests_recovery_identity
         BEFORE UPDATE OF execution_kind, recovery_candidate_id, recovery_candidate_sha256
         ON {S}.execution_requests
@@ -113,6 +154,12 @@ def downgrade() -> None:
     )
     if present:
         raise RuntimeError("publication_recovery_requests_present")
+    op.execute(f"DROP TRIGGER publications_adoptable_revision_ids ON {S}.publications")
+    op.execute(f"DROP FUNCTION {S}.enforce_publications_adoptable_revision_ids()")
+    op.drop_constraint(
+        "publications_adoptable_revision_ids_ck", "publications", schema=S, type_="check"
+    )
+    op.drop_column("publications", "adoptable_revision_ids", schema=S)
     op.execute(f"DROP TRIGGER execution_requests_recovery_identity ON {S}.execution_requests")
     op.execute(f"DROP FUNCTION {S}.enforce_execution_requests_recovery_identity()")
     for name in CHECKS:

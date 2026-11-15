@@ -1175,17 +1175,19 @@ async def _process_event(
             # WorkItem's issue, and the runner mounts get_issue only when
             # it is present. A refused or failed mint leaves the tool off
             # and never stops the boot; the bundle states the gap.
-            tracker_result_run = _tracker_result_run(self, owned_work_item_id, event_id)
+            fail_closed_run = _fail_closed_mint_run(self, owned_work_item_id, event_id)
             if (
                 owned_work_item_id is not None
                 and self._work_items is not None
-                and tracker_result_run is not None
+                and fail_closed_run is not None
             ):
                 # ADR 0277 (#5586): a tracker_result session cannot report its
-                # result without this capability, so its mint fails closed: no
-                # sandbox, no runner, no model session.
-                minted = await _mint_tracker_result_capability(
-                    self, tracker_result_run, owned_work_item_id, event_id
+                # result without this capability, and a publication recovery
+                # runner (#5429) learns from it to construct no model session,
+                # so their mint fails closed: no sandbox, no runner, no model
+                # session.
+                minted = await _mint_fail_closed_capability(
+                    self, fail_closed_run, owned_work_item_id, event_id
                 )
                 if minted is None:
                     return
@@ -2250,22 +2252,40 @@ def _tracker_result_run(
 ) -> WorkItemRun | None:
     """This delivery's own WorkItem run when its request is tracker_result (ADR 0277)."""
 
+    run = _fail_closed_mint_run(self, owned_work_item_id, event_id)
+    return run if run is not None and run.is_tracker_result else None
+
+
+def _fail_closed_mint_run(
+    self: Kernel, owned_work_item_id: uuid.UUID | None, event_id: str
+) -> WorkItemRun | None:
+    """This delivery's own WorkItem run when its capability mint fails closed.
+
+    A tracker_result request (ADR 0277) and a publication recovery request
+    (#5429) both need the capability before their runner boots.
+    """
+
     if owned_work_item_id is None:
         return None
     run = self._work_item_runs.get(owned_work_item_id)
-    if run is None or run.event_id != event_id or not run.is_tracker_result:
+    if (
+        run is None
+        or run.event_id != event_id
+        or not (run.is_tracker_result or run.is_publication_recovery)
+    ):
         return None
     return run
 
 
-async def _mint_tracker_result_capability(
+async def _mint_fail_closed_capability(
     self: Kernel, run: WorkItemRun, request_id: uuid.UUID, event_id: str
 ) -> tuple[str, str] | None:
-    """Mint a tracker_result run's issue read capability, failing closed.
+    """Mint a tracker_result or publication recovery run's capability, failing closed.
 
-    The capability is how the runner learns the completion contract and
-    submits the result, so a session booted without it could not do its one
-    job. Any mint fault (a refusal, a transport error, a malformed answer, its
+    The capability is how the runner learns the completion contract: a
+    tracker_result session submits its result through it, and a publication
+    recovery runner learns from it to construct no model session. Any mint
+    fault (a refusal, a transport error, a malformed answer, its
     own deadline) returns None after settling the delivery: an unstarted run
     defers its acquisition (``issue_read_unavailable``, not a capacity
     deferral) and claims no sandbox, so dispatch retries it within its waiting
@@ -2280,7 +2300,7 @@ async def _mint_tracker_result_capability(
     except Exception as exc:  # noqa: BLE001 - this gate fails closed on any fault
         reason = type(exc).__name__
     logger.warning(
-        "tracker_result issue read capability unavailable for %s: %s; starting no session",
+        "issue read capability unavailable for fail-closed run %s: %s; starting no session",
         request_id,
         reason,
     )
@@ -2289,7 +2309,7 @@ async def _mint_tracker_result_capability(
             await run.finish(
                 outcome="failed",
                 cause="runner_escalated",
-                detail="The issue read capability for this investigation is unavailable.",
+                detail="The issue read capability for this execution is unavailable.",
                 ci_fix_round=None,
                 retry_safety="uncertain",
                 retry_condition=None,
@@ -2298,7 +2318,7 @@ async def _mint_tracker_result_capability(
             await run.defer("issue_read_unavailable", capacity=False, start_failure_detail=None)
     except WorkItemConflict as conflict:
         logger.info(
-            "tracker_result capability settlement for %s refused: %s", event_id, conflict.code
+            "fail-closed capability settlement for %s refused: %s", event_id, conflict.code
         )
         if run.started and conflict.code == "not_running":
             run.finished = True

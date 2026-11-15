@@ -718,6 +718,125 @@ def test_recovery_of_an_absent_branch_is_no_content(
     assert code_host.opened == []
 
 
+# A publication recovery adopts a failed predecessor's pushed commit (#5429).
+PREDECESSOR_REVISION = uuid.UUID("99999999-9999-4999-8999-999999999999")
+PREDECESSOR_HEAD = "e" * 40
+
+
+def _predecessor_pushed(code_host: _CodeHost, *, adoptable: bool, publication_id: str) -> None:
+    """The branch holds the predecessor revision's marked commit on the approved base."""
+
+    from test_publications import _arrange_adoptable_revisions
+
+    code_host.head = PREDECESSOR_HEAD
+    code_host.commits[PREDECESSOR_HEAD] = Commit(
+        sha=PREDECESSOR_HEAD,
+        parents=(BASE_SHA,),
+        message=f"Publish\n\nCurie-Revision: {PREDECESSOR_REVISION}\n",
+    )
+    if adoptable:
+        _arrange_adoptable_revisions(publication_id, [PREDECESSOR_REVISION])
+
+
+def _prior_head(publication: dict[str, Any]) -> str:
+    head = with_session(
+        lambda session: session.scalar(
+            text("SELECT expected_prior_head FROM curie.publications WHERE id = :id"),
+            {"id": uuid.UUID(publication["id"])},
+        )
+    )
+    assert isinstance(head, str)
+    return head
+
+
+@pytest.mark.parametrize(
+    ("revision", "status"),
+    [("predecessor", 200), ("own", 409), ("unrelated", 409)],
+)
+def test_a_recovery_proves_only_the_named_adoptable_revision_marker(
+    approved: Seeded, revision: str, status: int
+) -> None:
+    client, publication, code_host = approved
+    _predecessor_pushed(code_host, adoptable=True, publication_id=publication["id"])
+    revision_id = {
+        "predecessor": str(PREDECESSOR_REVISION),
+        "own": publication["id"],
+        "unrelated": str(uuid.uuid4()),
+    }[revision]
+
+    response = client.post(
+        _url(publication["id"], "revision-commit"),
+        json={
+            "commit_sha": PREDECESSOR_HEAD,
+            "revision_id": revision_id,
+            "expected_parent": _prior_head(publication),
+        },
+        headers=WORKER_HEADERS,
+    )
+
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {"commit_sha": PREDECESSOR_HEAD, "parent_sha": BASE_SHA}
+    else:
+        assert response.json()["detail"]["code"] == "publication.revision_mismatch"
+
+
+@pytest.mark.parametrize("existing", ["none", "matching", "mismatching"])
+def test_a_recovery_adopts_or_opens_one_pull_request_for_the_predecessor_commit(
+    approved: Seeded, existing: str
+) -> None:
+    client, publication, code_host = approved
+    _predecessor_pushed(code_host, adoptable=True, publication_id=publication["id"])
+    repository = RepositoryRef("github", "github.com", "101", REPO)
+    if existing != "none":
+        code_host.existing = code_host._pull(
+            repository,
+            head_sha=PREDECESSOR_HEAD,
+            title=publication["title"] if existing == "matching" else "Another title",
+            body=publication["body"],
+            draft=publication["open_as_draft"],
+        )
+
+    response = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": PREDECESSOR_HEAD, "adopt_only": False},
+        headers=WORKER_HEADERS,
+    )
+
+    if existing == "mismatching":
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == "publication.pull_request_mismatch"
+        assert code_host.opened == []
+        return
+    assert response.status_code == 200, response.text
+    assert response.json()["head_sha"] == PREDECESSOR_HEAD
+    assert len(code_host.opened) == (1 if existing == "none" else 0)
+
+
+def test_an_ordinary_publication_never_adopts_a_predecessor_commit(approved: Seeded) -> None:
+    client, publication, code_host = approved
+    _predecessor_pushed(code_host, adoptable=False, publication_id=publication["id"])
+
+    refused = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": PREDECESSOR_HEAD, "adopt_only": False},
+        headers=WORKER_HEADERS,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.revision_mismatch"
+    assert code_host.opened == []
+    # Liveness: the same publication's own marked commit opens its pull request.
+    code_host.head = HEAD_SHA
+    own = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
+        headers=WORKER_HEADERS,
+    )
+    assert own.status_code == 200, own.text
+    assert len(code_host.opened) == 1
+
+
 @pytest.mark.parametrize(
     ("fields", "error_type"),
     [({}, "missing"), ({"adopt_only": None}, "bool_type")],

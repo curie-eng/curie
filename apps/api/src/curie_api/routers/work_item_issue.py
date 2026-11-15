@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Annotated
+from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from redis.asyncio import Redis
@@ -58,6 +58,8 @@ router = APIRouter(prefix="/work-items", tags=["work-items"])
 internal_router = APIRouter(prefix="/v1/internal/work-items", tags=["internal-work-items"])
 
 CAPABILITY_HEADER = "X-Curie-Issue-Read"
+# ``execution_requests.execution_kind`` of a publication recovery (#5429).
+_PUBLICATION_RECOVERY: Final = "publication_recovery"
 
 
 def issue_read_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -286,6 +288,10 @@ async def read_completion_contract(
     title and body, mints the request's grant and reserves the session; any
     later call is 409 ``session_already_started``, so a second runner starts
     no model. An implementation request reserves nothing and gets no grant.
+    A publication recovery request (#5429) passes the same fences as an
+    implementation request, reserves nothing, and is answered
+    ``publication_recovery`` with no execution binding, so its runner
+    constructs no model session.
     """
 
     response.headers["Cache-Control"] = "no-store"
@@ -315,6 +321,15 @@ async def read_completion_contract(
         raise _refused(refused.code) from None
     except (runtime.SourceUnavailable, IssueReadUnavailable):
         raise _tracker_unavailable() from None
+    if pair.request.execution_kind == _PUBLICATION_RECOVERY:
+        # The column CHECK pins a recovery's stored contract to
+        # implementation, so the precheck above reserved nothing.
+        return CompletionContractOut(
+            completion_contract=_PUBLICATION_RECOVERY,
+            result_kinds=[],
+            session_usd_allowance=None,
+            execution=None,
+        )
     # ADR 0278 (#5592): the runner waits for the worker's envelope for this
     # execution, and checks it against this binding, before any model work.
     execution = await requester_instruction_context.execution_binding(

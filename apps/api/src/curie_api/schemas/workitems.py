@@ -56,14 +56,19 @@ class ExecutionBindingOut(BaseModel):
 
 class CompletionContractOut(BaseModel):
     """How the execution completes (ADR 0277, #5586): by a pull request
-    (``implementation``) or by one delivered tracker result (``tracker_result``).
+    (``implementation``), by one delivered tracker result (``tracker_result``),
+    or by publishing a retained publication candidate with no model run
+    (``publication_recovery``, #5429).
 
     ``result_kinds`` are the kinds the deployed policy allows and
     ``session_usd_allowance`` the per-session model allowance in USD (the
-    agent's dollar limit, else 5); both empty for ``implementation``.
+    agent's dollar limit, else 5); both empty for ``implementation`` and
+    ``publication_recovery``. A ``publication_recovery`` answer also carries
+    no ``execution``: that process runs no model, so it waits for no requester
+    context.
     """
 
-    completion_contract: Literal["implementation", "tracker_result"]
+    completion_contract: Literal["implementation", "tracker_result", "publication_recovery"]
     result_kinds: list[str]
     session_usd_allowance: float | None
     execution: ExecutionBindingOut | None = None

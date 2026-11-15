@@ -90,6 +90,7 @@ from ..publication_verification import (
     VerifiedPublicationCommit,
     forge_failure,
     publication_base_ref,
+    publication_revision_ids,
     verify_publication_commit,
 )
 from ..repository_access import (
@@ -898,6 +899,7 @@ async def advance_publication_lineage(
                 publication,
                 commit_sha=data.head_sha,
                 base_branch=base_branch,
+                revision_ids=publication_revision_ids(publication),
             )
         lineage = await crud_lineages.advance_publication_lineage(
             session,

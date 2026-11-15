@@ -3789,6 +3789,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/publication-candidates/recovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Recovery */
+        post: operations["recovery_v1_internal_publication_candidates_recovery_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/publication-candidates/release-reader": {
         parameters: {
             query?: never;
@@ -4820,6 +4837,10 @@ export interface paths {
          *     title and body, mints the request's grant and reserves the session; any
          *     later call is 409 ``session_already_started``, so a second runner starts
          *     no model. An implementation request reserves nothing and gets no grant.
+         *     A publication recovery request (#5429) passes the same fences as an
+         *     implementation request, reserves nothing, and is answered
+         *     ``publication_recovery`` with no execution binding, so its runner
+         *     constructs no model session.
          */
         post: operations["read_completion_contract_work_items_completion_contract_post"];
         delete?: never;
@@ -7145,6 +7166,33 @@ export interface components {
             /** Objects */
             objects: components["schemas"]["CandidateObjectReceipt"][];
         };
+        /**
+         * CandidateRecovery
+         * @description The exact retained candidate a publication recovery request publishes (#5429).
+         */
+        CandidateRecovery: {
+            /** Base Commit */
+            base_commit: string;
+            /** Body */
+            body: string;
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Changed Paths */
+            changed_paths: string[];
+            /** Contains Workflow Files */
+            contains_workflow_files: boolean;
+            /** Content Sha256 */
+            content_sha256: string;
+            patch: components["schemas"]["CandidateObjectReceipt"];
+            repository: components["schemas"]["CandidateRepository"];
+            /** Target Branch */
+            target_branch: string;
+            /** Title */
+            title: string;
+        };
         /** CandidateReleaseReader */
         CandidateReleaseReader: {
             /** Holder Id */
@@ -7837,18 +7885,23 @@ export interface components {
         /**
          * CompletionContractOut
          * @description How the execution completes (ADR 0277, #5586): by a pull request
-         *     (``implementation``) or by one delivered tracker result (``tracker_result``).
+         *     (``implementation``), by one delivered tracker result (``tracker_result``),
+         *     or by publishing a retained publication candidate with no model run
+         *     (``publication_recovery``, #5429).
          *
          *     ``result_kinds`` are the kinds the deployed policy allows and
          *     ``session_usd_allowance`` the per-session model allowance in USD (the
-         *     agent's dollar limit, else 5); both empty for ``implementation``.
+         *     agent's dollar limit, else 5); both empty for ``implementation`` and
+         *     ``publication_recovery``. A ``publication_recovery`` answer also carries
+         *     no ``execution``: that process runs no model, so it waits for no requester
+         *     context.
          */
         CompletionContractOut: {
             /**
              * Completion Contract
              * @enum {string}
              */
-            completion_contract: "implementation" | "tracker_result";
+            completion_contract: "implementation" | "tracker_result" | "publication_recovery";
             execution?: components["schemas"]["ExecutionBindingOut"] | null;
             /** Result Kinds */
             result_kinds: string[];
@@ -21920,6 +21973,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CandidateOutcomeRecorded"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recovery_v1_internal_publication_candidates_recovery_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateCaptureAuthority"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateRecovery"];
                 };
             };
             /** @description Validation Error */

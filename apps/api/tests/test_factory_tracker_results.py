@@ -36,6 +36,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import test_factory_publication_recovery as recovery
 from curie_api.config import Settings, get_settings
 from curie_api.factory_tracker_result_delivery import (
     LISTING_SETTLE_SECONDS,
@@ -74,6 +75,7 @@ from curie_api.models import (
     WorkItem,
 )
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
+from fastapi.testclient import TestClient
 from forge_fakes import factory_wake
 from forge_fakes.github import LABEL, REPO_ID, GitHubAPI, _issue_event, _post
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
@@ -85,6 +87,7 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from test_factory_publication_recovery import api  # noqa: F401  (fixture)
 
 VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "tracker-result-proposal.json"
 REVISION = "3f2a9c0d4b5e6f708192a3b4c5d6e7f8091a2b3c"
@@ -2023,6 +2026,55 @@ def test_an_implementation_capability_gets_its_contract_and_cannot_submit(
     assert _request(triage)["model_session_reserved_at"] is None
     assert _tracker_result_rows(triage) == (0, 0, 0)
     assert triage.tracker.ledger.writes == 0
+
+
+def _recovery_contract(client: TestClient, request_id: uuid.UUID) -> Any:
+    """Mint the issue read capability the worker injects, then ask the contract."""
+
+    minted = client.post(
+        MINT_URL, headers=recovery.WORKER, json={"execution_request_id": str(request_id)}
+    )
+    assert minted.status_code == 200, minted.text
+    return client.post(CONTRACT_URL, headers={"X-Curie-Issue-Read": minted.json()["capability"]})
+
+
+def test_a_publication_recovery_capability_gets_the_recovery_contract(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    # #5429: the recovery runner learns it runs no model. Its implementation
+    # predecessor, asked while it ran, is the control on the same WorkItem.
+    item = recovery._item(api, recovery._agent(api, auth_headers), 54790)
+    implementation = recovery._run(api, item.request_id, item.work_item_id)
+    answered = _recovery_contract(api, item.request_id)
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["completion_contract"] == "implementation"
+    assert answered.json()["execution"]["execution_request_id"] == str(item.request_id)
+    recovery._capture(api, implementation)
+    recovery._settle(implementation.ref, "publication_failed")
+    successor = recovery._successor(item.request_id)
+    assert successor is not None
+    assert successor["execution_kind"] == "publication_recovery"
+    recovery._run(api, successor["id"], item.work_item_id)
+
+    for _ in range(2):
+        # Asking again changes nothing: the recovery reserves nothing.
+        contract = _recovery_contract(api, successor["id"])
+        assert contract.status_code == 200, contract.text
+        assert contract.headers["Cache-Control"] == "no-store"
+        assert contract.json() == {
+            "completion_contract": "publication_recovery",
+            "result_kinds": [],
+            "session_usd_allowance": None,
+            "execution": None,
+        }
+    row = recovery._request(successor["id"])
+    assert row["model_session_reserved_at"] is None
+    assert row["completion_contract"] == "implementation"
+    granted = _rows(
+        "SELECT id FROM curie.factory_tracker_result_grants WHERE execution_request_id = :id",
+        {"id": successor["id"]},
+    )
+    assert granted == []
 
 
 def test_a_submission_before_the_session_is_reserved_is_refused(

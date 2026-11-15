@@ -580,7 +580,11 @@ def _record_pull_request(
     from curie_api.crud import lineages as crud_lineages
     from curie_api.crud import publication_queries
     from curie_api.factory_rediscovery import publishing_code_host
-    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+    from curie_api.publication_verification import (
+        publication_base_ref,
+        publication_revision_ids,
+        verify_publication_commit,
+    )
     from curie_api.repository_access import lineage_repository
     from test_factory_ci_wait import _execute
 
@@ -608,7 +612,12 @@ def _record_pull_request(
             )
             base_branch = await publication_base_ref(session, code_host, stored, repository)
             proof = await verify_publication_commit(
-                code_host, repository, stored, commit_sha=pull["head_sha"], base_branch=base_branch
+                code_host,
+                repository,
+                stored,
+                commit_sha=pull["head_sha"],
+                base_branch=base_branch,
+                revision_ids=publication_revision_ids(stored),
             )
             await crud_lineages.advance_publication_lineage(
                 session,

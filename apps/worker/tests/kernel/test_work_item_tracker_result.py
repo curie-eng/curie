@@ -88,10 +88,13 @@ class _ContractWorkItems(_WorkItems):
         *,
         mint: BaseException | asyncio.Event | None = None,
         defer_refusal: str | None = None,
+        recovery_candidate_id: uuid.UUID | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.contract = contract
+        # A publication recovery grant (#5429) when a candidate is named.
+        self.recovery_candidate_id = recovery_candidate_id
         self.mint = mint
         self.defer_refusal = defer_refusal
         self.defers: list[dict[str, object]] = []
@@ -105,6 +108,13 @@ class _ContractWorkItems(_WorkItems):
         grant = await super().acquire(request_id, **kwargs)
         if grant.completion_contract != self.contract:
             grant = replace(grant, completion_contract=self.contract)
+            self.acquisitions[request_id] = grant
+        if self.recovery_candidate_id is not None:
+            grant = replace(
+                grant,
+                execution_kind="publication_recovery",
+                recovery_candidate_id=self.recovery_candidate_id,
+            )
             self.acquisitions[request_id] = grant
         return grant
 
@@ -414,13 +424,16 @@ def test_an_execution_deadline_stop_starts_no_further_turn(
 # --- Capability mint fails closed --------------------------------------------------
 
 
+@pytest.mark.parametrize("kind", ["tracker_result", "publication_recovery"])
 @pytest.mark.parametrize(
     "failure",
     ["conflict", "transport", "deadline", "unexpected"],
 )
 def test_a_failed_capability_mint_defers_without_a_sandbox_or_a_turn(
-    make_harness, monkeypatch: pytest.MonkeyPatch, failure: str
+    make_harness, monkeypatch: pytest.MonkeyPatch, failure: str, kind: str
 ) -> None:
+    # A publication recovery runner (#5429) learns from the capability to
+    # construct no model session, so its mint fails closed as well.
     async def exercise() -> None:
         mint: BaseException | asyncio.Event
         if failure == "conflict":
@@ -434,7 +447,13 @@ def test_a_failed_capability_mint_defers_without_a_sandbox_or_a_turn(
         else:
             mint = RuntimeError("unexpected mint fault")
         async with _harness(make_harness, _CountingPublicationApi()) as h:
-            items = _ContractWorkItems(TRACKER_RESULT, mint=mint)
+            items = (
+                _ContractWorkItems(TRACKER_RESULT, mint=mint)
+                if kind == "tracker_result"
+                else _ContractWorkItems(
+                    IMPLEMENTATION, mint=mint, recovery_candidate_id=uuid.uuid4()
+                )
+            )
 
             event_id = await _drive(h, items, [[_done(MUST_NOT_RUN)]])
 

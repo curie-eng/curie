@@ -94,6 +94,7 @@ def _payload(module: Any, patch: bytes = b"diff --git a/a b/a\n") -> Any:
         branch=LINEAGE_BRANCH,
         title="Update repository",
         transport=_transport(module),
+        adoptable_revision_ids=(),
     )
 
 
@@ -429,12 +430,15 @@ def test_lineage_revision_job_marks_one_commit_and_uses_exact_head_occupancy_cas
     assert "--force-with-lease=refs/heads/$BRANCH:$EXPECTED_REMOTE_HEAD" in script
     assert "git push --force " not in script
     assert f"publication-{PUBLICATION_ID.hex}" not in LINEAGE_BRANCH
+    # The recovery adoption proof (#5429) is a function defined before the head
+    # check; the ordinary path is ordered after it.
     head_check = script.index('git_with_timeout ls-remote origin "refs/heads/$BRANCH"')
-    apply = script.index('git_with_timeout apply --binary "$patch_path"')
-    commit = script.index("commit \\\n")
+    apply = script.index('git_with_timeout apply --binary "$patch_path"', head_check)
+    commit = script.index("commit \\\n", head_check)
     push = script.index("git_with_timeout push")
     success = script.index('echo "CURIE_COMMIT_SHA=$commit_sha"')
     assert head_check < apply < commit < push < success
+    assert script.index("git_with_timeout push") > head_check
     assert script.rstrip().endswith('echo "CURIE_COMMIT_SHA=$commit_sha"')
 
 
@@ -997,6 +1001,7 @@ def _publication_resources_for_commit(
     patch: bytes,
     transport: Any | None = None,
     repo_full_name: str = "acme-corp/acme-bot",
+    adoptable_revision_ids: tuple[uuid.UUID, ...] = (),
 ) -> Any:
     transport = transport or _transport(module)
     return module.build_publication_resources(
@@ -1014,6 +1019,7 @@ def _publication_resources_for_commit(
             branch=LINEAGE_BRANCH,
             title="Update repository",
             transport=transport,
+            adoptable_revision_ids=adoptable_revision_ids,
         ),
         credential=BASIC_TEST_CREDENTIAL,
         settings=_settings(module),
@@ -1696,6 +1702,238 @@ def test_generated_publish_script_refuses_an_unexpected_remote_head_before_commi
     assert "publication branch head conflict" in refused.stderr
     assert "CURIE_COMMIT_SHA=" not in refused.stdout
     assert _branch_head(remote) == head
+
+
+# A publication recovery adopts an earlier failed revision's pushed commit only
+# with proof (#5429).
+
+_PREDECESSOR_PUBLICATION = uuid.UUID("88888888-8888-4888-8888-888888888888")
+_PREDECESSOR_REVISION = uuid.UUID("99999999-9999-4999-8999-999999999999")
+_RECOVERY_PUBLICATION = uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+_RECOVERY_REVISION = uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+_UNRELATED_REVISION = uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+_OTHER_PATCH = (
+    b"diff --git a/README.md b/README.md\n"
+    b"--- a/README.md\n+++ b/README.md\n"
+    b"@@ -1 +1,2 @@\n base\n+other\n"
+)
+
+
+def _record_pushes(remote: Path) -> Path:
+    """Log every ref update the bare remote receives from now on."""
+
+    log = remote.parent / f"{remote.name}.pushes"
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text(f"#!/bin/sh\ncat >> '{log}'\n")
+    hook.chmod(0o755)
+    log.write_text("")
+    return log
+
+
+def _push_predecessor(
+    module: Any, tmp_path: Path, remote: Path, base_sha: str, *, patch: bytes = _FIRST_PATCH
+) -> str:
+    """The predecessor revision's Job pushes; its publication later fails."""
+
+    pushed = _run_generated_publish_script(
+        tmp_path,
+        _publication_resources_for_commit(
+            module,
+            publication_id=_PREDECESSOR_PUBLICATION,
+            revision_id=_PREDECESSOR_REVISION,
+            revision_number=1,
+            base_sha=base_sha,
+            expected_remote_head=None,
+            patch=patch,
+        ),
+        remote=remote,
+        ordinal="predecessor",
+    )
+    assert pushed.returncode == 0, pushed.stderr
+    return _branch_head(remote)
+
+
+def _run_recovery(
+    module: Any,
+    tmp_path: Path,
+    remote: Path,
+    base_sha: str,
+    *,
+    ordinal: str,
+    adoptable: tuple[uuid.UUID, ...] = (_PREDECESSOR_REVISION,),
+    patch: bytes = _FIRST_PATCH,
+) -> subprocess.CompletedProcess[str]:
+    return _run_generated_publish_script(
+        tmp_path,
+        _publication_resources_for_commit(
+            module,
+            publication_id=_RECOVERY_PUBLICATION,
+            revision_id=_RECOVERY_REVISION,
+            revision_number=2,
+            base_sha=base_sha,
+            expected_remote_head=None,
+            patch=patch,
+            adoptable_revision_ids=adoptable,
+        ),
+        remote=remote,
+        ordinal=ordinal,
+    )
+
+
+def _assert_adopted(
+    result: subprocess.CompletedProcess[str], remote: Path, head: str, pushes: Path
+) -> None:
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-2:] == [
+        f"CURIE_ADOPTED_REVISION={_PREDECESSOR_REVISION}",
+        f"CURIE_COMMIT_SHA={head}",
+    ]
+    assert _branch_head(remote) == head
+    assert pushes.read_text() == ""
+
+
+def _assert_refused(
+    result: subprocess.CompletedProcess[str], remote: Path, head: str, pushes: Path
+) -> None:
+    assert result.returncode == 1
+    assert "publication branch head conflict" in result.stderr
+    assert "CURIE_COMMIT_SHA=" not in result.stdout
+    assert "CURIE_ADOPTED_REVISION=" not in result.stdout
+    assert _branch_head(remote) == head
+    assert pushes.read_text() == ""
+
+
+def test_recovery_job_adopts_a_proven_predecessor_commit_without_pushing(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, base_sha = _seed_remote(tmp_path)
+    head = _push_predecessor(publication_k8s, tmp_path, remote, base_sha)
+    pushes = _record_pushes(remote)
+
+    adopted = _run_recovery(publication_k8s, tmp_path, remote, base_sha, ordinal="recovery")
+
+    _assert_adopted(adopted, remote, head, pushes)
+    resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=_RECOVERY_PUBLICATION,
+        revision_id=_RECOVERY_REVISION,
+        revision_number=2,
+        base_sha=base_sha,
+        expected_remote_head=None,
+        patch=_FIRST_PATCH,
+        adoptable_revision_ids=(_PREDECESSOR_REVISION,),
+    )
+    assert _job_env(resources)["ADOPTABLE_REVISION_IDS"] == str(_PREDECESSOR_REVISION)
+
+
+def test_recovery_job_adopts_a_predecessor_replayed_onto_a_moved_base(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, original = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    tip = _advance_seed(seed, "NOTES.md", "moved\n")
+    head = _push_predecessor(publication_k8s, tmp_path, remote, original)
+    assert _repo_git(remote, "rev-list", "--parents", "-n", "1", head).split() == [head, tip]
+    pushes = _record_pushes(remote)
+
+    adopted = _run_recovery(publication_k8s, tmp_path, remote, original, ordinal="recovery")
+
+    _assert_adopted(adopted, remote, head, pushes)
+
+
+def test_ordinary_publication_still_refuses_a_matching_predecessor_commit(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, base_sha = _seed_remote(tmp_path)
+    head = _push_predecessor(publication_k8s, tmp_path, remote, base_sha)
+    pushes = _record_pushes(remote)
+
+    refused = _run_recovery(
+        publication_k8s, tmp_path, remote, base_sha, ordinal="ordinary", adoptable=()
+    )
+    _assert_refused(refused, remote, head, pushes)
+    # Liveness: the same Job with the predecessor adoptable adopts it.
+    _assert_adopted(
+        _run_recovery(publication_k8s, tmp_path, remote, base_sha, ordinal="control"),
+        remote,
+        head,
+        pushes,
+    )
+
+
+def test_recovery_job_refuses_a_marker_outside_its_adoptable_set(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, base_sha = _seed_remote(tmp_path)
+    head = _push_predecessor(publication_k8s, tmp_path, remote, base_sha)
+    pushes = _record_pushes(remote)
+
+    refused = _run_recovery(
+        publication_k8s,
+        tmp_path,
+        remote,
+        base_sha,
+        ordinal="outside",
+        adoptable=(_UNRELATED_REVISION,),
+    )
+    _assert_refused(refused, remote, head, pushes)
+    _assert_adopted(
+        _run_recovery(publication_k8s, tmp_path, remote, base_sha, ordinal="control"),
+        remote,
+        head,
+        pushes,
+    )
+
+
+def test_recovery_job_refuses_a_predecessor_commit_with_a_different_tree(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, base_sha = _seed_remote(tmp_path)
+    head = _push_predecessor(publication_k8s, tmp_path, remote, base_sha)
+    pushes = _record_pushes(remote)
+
+    refused = _run_recovery(
+        publication_k8s, tmp_path, remote, base_sha, ordinal="tree", patch=_OTHER_PATCH
+    )
+    _assert_refused(refused, remote, head, pushes)
+    _assert_adopted(
+        _run_recovery(publication_k8s, tmp_path, remote, base_sha, ordinal="control"),
+        remote,
+        head,
+        pushes,
+    )
+
+
+def test_recovery_job_refuses_a_marked_merge_commit(publication_k8s: Any, tmp_path: Path) -> None:
+    remote, base_sha = _seed_remote(tmp_path)
+    head = _push_predecessor(publication_k8s, tmp_path, remote, base_sha)
+    seed = tmp_path / "seed"
+    side = _advance_seed(seed, "SIDE.md", "side\n")
+    # The predecessor's exact tree and marked message, on two parents.
+    merge = _repo_git(
+        remote,
+        "commit-tree",
+        f"{head}^{{tree}}",
+        "-p",
+        base_sha,
+        "-p",
+        side,
+        "-m",
+        _commit_message(remote, head).rstrip("\n"),
+    )
+    _repo_git(remote, "update-ref", f"refs/heads/{LINEAGE_BRANCH}", merge)
+    pushes = _record_pushes(remote)
+
+    refused = _run_recovery(publication_k8s, tmp_path, remote, base_sha, ordinal="merge")
+    _assert_refused(refused, remote, merge, pushes)
+    # Liveness: the single-parent commit with the same tree and marker adopts.
+    _repo_git(remote, "update-ref", f"refs/heads/{LINEAGE_BRANCH}", head)
+    _assert_adopted(
+        _run_recovery(publication_k8s, tmp_path, remote, base_sha, ordinal="control"),
+        remote,
+        head,
+        pushes,
+    )
 
 
 _AUTH_CAPTURE_WRAPPER = """#!/usr/bin/env python3

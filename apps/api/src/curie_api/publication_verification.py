@@ -131,6 +131,16 @@ async def publication_base_ref(
     return branch
 
 
+def publication_revision_ids(publication: Publication) -> frozenset[uuid.UUID]:
+    """The revision markers a commit may carry to stand for ``publication``.
+
+    Its own revision, and the earlier failed revisions it may adopt, fixed at
+    creation (migration 0174, #5429).
+    """
+
+    return frozenset((publication.id, *publication.adoptable_revision_ids))
+
+
 def _valid_commit(commit: Commit, sha: str) -> bool:
     return (
         isinstance(commit, Commit)
@@ -153,8 +163,17 @@ async def verify_publication_commit(
     *,
     commit_sha: str,
     base_branch: str,
+    revision_ids: frozenset[uuid.UUID],
 ) -> VerifiedPublicationCommit:
-    """Prove the exact revision parent, or both first-publication ancestry relations."""
+    """Prove the exact revision parent, or both first-publication ancestry relations.
+
+    The commit must carry the marker of one of ``revision_ids``, each of which
+    is the publication's own revision or one it may adopt
+    (`publication_revision_ids`); anything else is refused.
+    """
+
+    if not revision_ids or not revision_ids <= publication_revision_ids(publication):
+        raise PullRequestRefused("revision_mismatch", "the verification names another revision")
 
     lineage = publication.lineage
     if lineage is None or lineage.id != publication.lineage_id:
@@ -194,7 +213,7 @@ async def verify_publication_commit(
     refusal = revision_refusal(
         commit,
         commit_sha=commit_sha,
-        revision_id=publication.id,
+        revision_ids=revision_ids,
         expected_parent=parent_sha if first_publication else expected_prior_head,
     )
     if refusal is not None:

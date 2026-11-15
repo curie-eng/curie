@@ -635,6 +635,135 @@ def test_recovery_identity_is_immutable(api: TestClient, auth_headers: dict[str,
     assert row["recovery_candidate_id"] == uuid.UUID(reservation["candidate_id"])
 
 
+# -- adoptable revisions --------------------------------------------------------
+
+
+async def _publication_on(
+    session: AsyncSession,
+    lineage_id: uuid.UUID,
+    request_id: uuid.UUID | None,
+    *,
+    status: str,
+    revision: int,
+) -> uuid.UUID:
+    """One more terminal publication row on ``lineage_id``, by ``request_id``."""
+
+    (lineage,) = (
+        await session.execute(
+            text(
+                "SELECT agent_id, deployment_id, conversation_id, repo_full_name "
+                "FROM curie.thread_publication_lineages WHERE id = :id"
+            ),
+            {"id": lineage_id},
+        )
+    ).mappings()
+    approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO curie.approvals (id, agent_id, conversation_id, author, summary, "
+            "reply_kind, reply_channel, dedupe_key, status, purpose) VALUES "
+            "(:id, :agent, :conversation, 'U0REQUEST1', 'Publish repository changes', "
+            "'github', :channel, :dedupe, 'approved', 'publication')"
+        ),
+        {
+            "id": approval_id,
+            "agent": lineage["agent_id"],
+            "conversation": lineage["conversation_id"],
+            "channel": lineage["repo_full_name"],
+            "dedupe": f"adoptable-{publication_id.hex}",
+        },
+    )
+    await session.execute(
+        text(
+            "INSERT INTO curie.publications (id, approval_id, deployment_id, "
+            "workspace_conversation_id, lineage_id, execution_request_id, revision_number, "
+            "repo_full_name, status, base_sha, changed_paths, title, body, reply_kind, "
+            "reply_channel) VALUES (:id, :approval, :deployment, :conversation, :lineage, "
+            ":request, :revision, :repo, :status, :base_sha, "
+            "CAST('[\"README.md\"]' AS jsonb), 'Update README', "
+            "'Approved platform publication.', 'github', :repo)"
+        ),
+        {
+            "id": publication_id,
+            "approval": approval_id,
+            "deployment": lineage["deployment_id"],
+            "conversation": lineage["conversation_id"],
+            "lineage": lineage_id,
+            "request": request_id,
+            "revision": revision,
+            "repo": lineage["repo_full_name"],
+            "status": status,
+            "base_sha": BASE,
+        },
+    )
+    await session.commit()
+    return publication_id
+
+
+def _adoptable(request_id: uuid.UUID, lineage_id: uuid.UUID) -> list[uuid.UUID]:
+    from curie_api.crud.publications import adoptable_revision_ids
+
+    async def body(session: AsyncSession) -> list[uuid.UUID]:
+        request = await session.get(ExecutionRequest, request_id)
+        assert request is not None
+        return await adoptable_revision_ids(session, request, lineage_id)
+
+    return _db(body)
+
+
+def test_adoptable_revisions_follow_the_candidate_ownership_chain(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """A recovery may adopt only failed revisions its candidate's owners created (#5429)."""
+
+    run, _reservation = _captured(api, _agent(api, auth_headers), 54717)
+    origin_id = run.ref.request_id
+
+    async def publish(session: AsyncSession) -> None:
+        await _attach_own_publication(session, run.ref.work_item_id, origin_id, status="failed")
+
+    _db(publish)
+    ((origin_publication, lineage_id),) = (
+        (row["id"], row["lineage_id"])
+        for row in _rows(
+            "SELECT id, lineage_id FROM curie.publications WHERE execution_request_id = :id",
+            {"id": origin_id},
+        )
+    )
+    _reconcile()
+    first = _successor(origin_id)
+    assert first is not None and first["execution_kind"] == "publication_recovery"
+
+    # Never adoptable: a revision that never pushed, one outside the chain, and
+    # a revision of an unrelated implementation request on the same lineage.
+    stranger = _item(api, _agent(api, auth_headers), 54718)
+
+    async def others(session: AsyncSession) -> None:
+        await _publication_on(session, lineage_id, origin_id, status="denied", revision=2)
+        await _publication_on(session, lineage_id, None, status="failed", revision=3)
+        await _publication_on(session, lineage_id, stranger.request_id, status="failed", revision=4)
+
+    _db(others)
+
+    # An implementation request adopts nothing, even its own failed revision.
+    assert _adoptable(origin_id, lineage_id) == []
+    assert _adoptable(first["id"], lineage_id) == [origin_publication]
+
+    # The first recovery's own revision failed too; the next owner may adopt both.
+    first_run = _run(api, first["id"], run.ref.work_item_id)
+
+    async def recovered(session: AsyncSession) -> uuid.UUID:
+        return await _publication_on(session, lineage_id, first["id"], status="failed", revision=5)
+
+    first_publication = _db(recovered)
+    _settle(first_run.ref, "publication_failed")
+    second = _successor(first["id"])
+    assert second is not None and second["execution_kind"] == "publication_recovery"
+    assert _adoptable(second["id"], lineage_id) == [origin_publication, first_publication]
+    # Scoped to the lineage the new publication extends.
+    assert _adoptable(second["id"], uuid.uuid4()) == []
+
+
 # -- notices --------------------------------------------------------------------
 
 

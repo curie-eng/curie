@@ -186,6 +186,7 @@ from .tool_names import STATE_SERVER_NAME, platform_slack_tool_names
 from .tracker_result import (
     CONTRACT_BLOCKED_EXPLANATION,
     IMPLEMENTATION,
+    PUBLICATION_RECOVERY_EXPLANATION,
     REASON_INTERNAL_ERROR,
     SECOND_SESSION_EXPLANATION,
     BoundContract,
@@ -1558,6 +1559,14 @@ def build_runner(
                     reason,
                 )
                 preflight_block = CONTRACT_BLOCKED_EXPLANATION
+            elif bound_contract.contract.publication_recovery:
+                # #5429: this process only validates a retained publication
+                # candidate. The preflight above has run and recorded its
+                # observations; from here it is blocked like a preflight, so
+                # it never constructs a model session, waits on no requester
+                # context, and any turn sent to it answers offline.
+                logger.info("completion contract publication_recovery; the model will not start")
+                preflight_block = PUBLICATION_RECOVERY_EXPLANATION
             elif bound_contract.contract.tracker_result:
                 logger.info(
                     "completion contract tracker_result result_kinds=%s",

@@ -525,7 +525,11 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
 async def _first_parent_proof(
     session: AsyncSession, publication_id: str, head_sha: str, *, parent_sha: str | None = None
 ) -> Any:
-    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+    from curie_api.publication_verification import (
+        publication_base_ref,
+        publication_revision_ids,
+        verify_publication_commit,
+    )
 
     publication = await crud_publication_queries.get_publication(session, uuid.UUID(publication_id))
     assert publication is not None
@@ -567,7 +571,12 @@ async def _first_parent_proof(
     repository = RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
     base_branch = await publication_base_ref(session, code_host, publication, repository)
     return await verify_publication_commit(
-        code_host, repository, publication, commit_sha=head_sha, base_branch=base_branch
+        code_host,
+        repository,
+        publication,
+        commit_sha=head_sha,
+        base_branch=base_branch,
+        revision_ids=publication_revision_ids(publication),
     )
 
 

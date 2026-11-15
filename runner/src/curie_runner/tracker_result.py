@@ -6,10 +6,11 @@ sibling routes of ``/work-items/issue-read`` carry it:
 
 1. ``/work-items/completion-contract``: the runner posts an empty body once,
    at startup, and learns whether this request ends in an implementation (a
-   pull request, everything as before) or a tracker result (a published
-   ticket or a findings comment). For a tracker result that first call also
-   reserves the request's one model session; any later call is refused
-   ``session_already_started``.
+   pull request, everything as before), a tracker result (a published
+   ticket or a findings comment) or a publication recovery (#5429: the
+   process only validates a retained publication candidate and runs no
+   model). For a tracker result that first call also reserves the request's
+   one model session; any later call is refused ``session_already_started``.
 2. ``/work-items/tracker-result``: the ``submit_tracker_result`` tool posts
    the run's one result proposal there.
 
@@ -46,9 +47,10 @@ from .requester_context import ExecutionBinding
 logger = logging.getLogger(__name__)
 
 
-ContractKind = Literal["implementation", "tracker_result"]
+ContractKind = Literal["implementation", "tracker_result", "publication_recovery"]
 CONTRACT_IMPLEMENTATION: ContractKind = "implementation"
 CONTRACT_TRACKER_RESULT: ContractKind = "tracker_result"
+CONTRACT_PUBLICATION_RECOVERY: ContractKind = "publication_recovery"
 RESULT_KINDS = frozenset({"ticket", "findings"})
 
 # The built-in tools a tracker result session may not use: a subagent would
@@ -110,6 +112,12 @@ SECOND_SESSION_EXPLANATION = (
     "Could not complete: this triage run already used its one model session, "
     "so no further model round ran."
 )
+# The answer every turn gets in a publication recovery process (#5429): the
+# process exists to validate a retained candidate, never to run a model.
+PUBLICATION_RECOVERY_EXPLANATION = (
+    "Could not complete: this process only validates a retained publication "
+    "candidate and runs no model, so no model round ran."
+)
 
 Delay = Callable[[float], Awaitable[None]]
 
@@ -139,8 +147,13 @@ class CompletionContract:
     def tracker_result(self) -> bool:
         return self.kind == CONTRACT_TRACKER_RESULT
 
+    @property
+    def publication_recovery(self) -> bool:
+        return self.kind == CONTRACT_PUBLICATION_RECOVERY
+
 
 IMPLEMENTATION = CompletionContract(CONTRACT_IMPLEMENTATION)
+PUBLICATION_RECOVERY = CompletionContract(CONTRACT_PUBLICATION_RECOVERY)
 
 
 @dataclass(frozen=True)
@@ -286,6 +299,8 @@ def parse_contract(payload: Any) -> CompletionContract:
     if not isinstance(payload, dict):
         raise ContractUnavailable(REASON_BODY_INVALID)
     kind = payload.get("completion_contract")
+    if kind == CONTRACT_PUBLICATION_RECOVERY:
+        return _parse_publication_recovery(payload)
     execution = _parse_execution(payload.get("execution"))
     if kind == CONTRACT_IMPLEMENTATION:
         return (
@@ -317,6 +332,19 @@ def parse_contract(payload: Any) -> CompletionContract:
         session_usd_allowance=float(allowance),
         execution=execution,
     )
+
+
+def _parse_publication_recovery(payload: dict[str, Any]) -> CompletionContract:
+    """A publication recovery answer carries nothing else: no execution
+    binding, no result kinds and no allowance. Any of them present is a
+    contract failure, since the API never sends one for this kind."""
+
+    kinds = payload.get("result_kinds")
+    if payload.get("execution") is not None or payload.get("session_usd_allowance") is not None:
+        raise ContractUnavailable(REASON_BODY_INVALID)
+    if kinds is not None and kinds != []:
+        raise ContractUnavailable(REASON_RESULT_KINDS_INVALID)
+    return PUBLICATION_RECOVERY
 
 
 def _parse_execution(value: Any) -> ExecutionBinding | None:
@@ -426,7 +454,8 @@ async def bind_completion_contract(
 
     No capability means an implementation session and no call at all. With
     one, the contract route is called once; a tracker result contract comes
-    back with its ``submit_tracker_result`` tool.
+    back with its ``submit_tracker_result`` tool, and a publication recovery
+    contract with nothing (the process then constructs no model session).
     """
 
     if issue_read is None:

@@ -33,7 +33,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .approval_wording import approval_display, describe_approval
@@ -2777,6 +2777,11 @@ class Publication(Base):
             "AND branch_prefix NOT LIKE '%./')",
             name="publications_branch_prefix_ck",
         ),
+        CheckConstraint(
+            "array_position(adoptable_revision_ids, NULL) IS NULL "
+            "AND NOT (id = ANY(adoptable_revision_ids))",
+            name="publications_adoptable_revision_ids_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -2801,6 +2806,13 @@ class Publication(Base):
     )
     revision_number: Mapped[int | None] = mapped_column(default=None)
     expected_prior_head: Mapped[str | None] = mapped_column(default=None)
+    # The earlier failed revisions of this lineage whose pushed commit this
+    # publication may adopt instead of pushing its own (migration 0174, #5429).
+    # Computed once at creation; non-empty only for a publication recovery
+    # request's publication. A trigger refuses any update.
+    adoptable_revision_ids: Mapped[list[uuid.UUID]] = mapped_column(
+        ARRAY(UUID(as_uuid=True)), default=list, server_default=text("'{}'::uuid[]")
+    )
     repo_full_name: Mapped[str]
     status: Mapped[str] = mapped_column(server_default="pending")
     # Snapshotted from the agent policy at creation. Human policy stores false
