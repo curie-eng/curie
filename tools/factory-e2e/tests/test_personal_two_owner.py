@@ -4073,7 +4073,6 @@ def test_a1_answers_its_card_before_starting_the_other_owner(tmp_path: Path) -> 
     ):
         setattr(h.run, name, lambda *_a, name=name: events.append(name))
     h.run.record_lineage = lambda _r: True  # type: ignore[method-assign]
-    h.run.append_marker = lambda _o: True  # type: ignore[method-assign]
     h.run.pod_uid_gone = lambda _r: True  # type: ignore[method-assign]
     h.run.phase_attempt_a1()
     assert events[-3:] == ["deliver_card", "unlisted_control", "resolve_card"]
@@ -4524,14 +4523,25 @@ def _wrong_owner_setup(
     """A1 parked on card 1: A's WorkItem with A1 started, and the API's wrong-owner answers.
 
     A1's runtime has no termination receipt yet, so A's own revalidation is
-    409 ``runtime_live`` (personal_execution.revalidate).
+    409 ``runtime_live`` (personal_execution.revalidate). A's transcript row
+    is already gone: the settled rejection deleted it (ADR 0170), and the
+    transcript append creates it again, as the product's append does.
     """
 
     first = _pod_run(h, "a1", card=1, reserve=False)
     first.work_item_id, first.request_id, first.admission_key = WORK_ITEM, REQUEST_A1, REQUEST_A1
+    first.conversation_id = "thread-a"
     first.claim_labels = {pt.THREAD_HASH_LABEL: "thread-hash-a"}
-    h.run.threads["a"], h.run.markers["a"] = "thread-a", "marker-a"
-    h.run.thread_records = lambda: {"thread-a": ["record-1", "marker-a"]}  # type: ignore[method-assign]
+    transcripts: dict[str, list[str]] = {}
+
+    def append(path: str, _headers: Mapping[str, str], body: Any) -> tuple[int, Any]:
+        key = urllib.parse.unquote(path.split("/state/transcript/", 1)[1].removesuffix("/append"))
+        transcripts.setdefault(key, []).append(body["item"]["record_id"])
+        state["order"].append(f"append:{key}")
+        return 200, {"key": key}
+
+    h.api.route("POST", f"/agents/{AGENT_ID}/state/transcript/")(append)
+    h.run.thread_records = lambda: {k: list(v) for k, v in transcripts.items()}  # type: ignore[method-assign]
     h.run.request_rows = lambda _w: [  # type: ignore[method-assign]
         {"id": REQUEST_A1, "owner_principal_id": PRINCIPAL_A}
     ]
@@ -4540,7 +4550,13 @@ def _wrong_owner_setup(
         "id": REQUEST_A1,
         "terminal_cause": "publication_denied",
     }
-    state: dict[str, Any] = {"work_item_version": 3, "request_version": 5, "revalidations": []}
+    state: dict[str, Any] = {
+        "work_item_version": 3,
+        "request_version": 5,
+        "revalidations": [],
+        "order": [],
+        "transcripts": transcripts,
+    }
     request = {
         "id": REQUEST_A1,
         "sequence": 1,
@@ -5552,3 +5568,64 @@ def test_wrong_owner_controls_wait_for_a1s_rejection_to_settle(tmp_path: Path) -
     h.run.approval = lambda _a: {"status": "rejected"}  # type: ignore[method-assign]
     h.run.phase_reject_a1()
     assert order.count("row:publication_denied") == 1
+
+
+def test_as_marker_is_appended_on_its_conversation_after_a1s_rejection_settles(
+    tmp_path: Path,
+) -> None:
+    """A1's park appends nothing; the marker lands after ``publication_denied``, before controls.
+
+    The settled rejection deletes A's transcript (ADR 0170), so a marker
+    appended at A1's park is gone by the wrong-owner controls and A2's replay.
+    """
+
+    h = _live(tmp_path)
+    run = h.run.new_run("a1", card=1)
+    h.run.new_run = lambda *_a, **_k: run  # type: ignore[method-assign]
+    for name in (
+        "admit_group",
+        "await_runner",
+        "await_park",
+        "read_before",
+        "finish_park",
+        "deliver_card",
+        "unlisted_control",
+        "resolve_card",
+    ):
+        setattr(h.run, name, lambda *_a: None)
+    h.run.record_lineage = lambda _r: True  # type: ignore[method-assign]
+    h.run.pod_uid_gone = lambda _r: True  # type: ignore[method-assign]
+    appended: list[str] = []
+    h.run.append_conversation_marker = (  # type: ignore[method-assign]
+        lambda owner, thread: appended.append(thread) or True
+    )
+    h.run.phase_attempt_a1()
+    assert appended == []
+    assert "pod_marker_before" not in h.ledger.observations("restarts")
+
+    h2 = _live(tmp_path / "wrong-owner")
+    state = _wrong_owner_setup(h2)
+    order: list[str] = state["order"]
+    causes = iter([None, "publication_denied"])
+
+    def request_row(_request: str) -> dict[str, Any]:
+        cause = next(causes)
+        order.append(f"row:{cause}")
+        return {"id": REQUEST_A1, "terminal_cause": cause}
+
+    original = h2.run.admit_owner
+
+    def admit(*args: Any, **kwargs: Any) -> Any:
+        order.append("control")
+        return original(*args, **kwargs)
+
+    h2.run.request_row = request_row  # type: ignore[method-assign]
+    h2.run.admit_owner = admit  # type: ignore[method-assign]
+    h2.run.phase_wrong_owner()
+    assert order[:4] == ["row:None", "row:publication_denied", "append:thread-a", "control"]
+    assert h2.run.threads["a"] == "thread-a"
+    assert state["transcripts"] == {"thread-a": [h2.run.markers["a"]]}
+    restarts = h2.ledger.observations("restarts")
+    wrong_owner = h2.ledger.observations("wrong-owner")
+    assert restarts["pod_marker_before"] is True
+    assert wrong_owner["a_marker_unchanged"] is True

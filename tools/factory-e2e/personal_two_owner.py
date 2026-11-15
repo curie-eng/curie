@@ -29,8 +29,9 @@ reads session and token files the driver writes 0600 into the private work
 directory, and the finalizer removes them.
 
 After the drill, the paid phases (``PAID_PHASES``) follow the live timeline: a
-grant probe for A, A1 parked and rejected after its pod is deleted, the
-wrong-owner controls and rejection verification, its fresh successor A2 and
+grant probe for A, A1 parked and rejected after its pod is deleted, A's
+marker appended once that rejection has settled, the wrong-owner controls and
+rejection verification, its fresh successor A2 and
 approval, B's probe and B1 publication, a worker stop that lets B's real failing check queue the
 production repair, A's follow-up A3, the worker restart, B-r1 held at its
 prompt while A3 runs one tool, A's disconnect, the process interruption that
@@ -2961,9 +2962,22 @@ class TwoOwnerRun(pp.LiveRun):
         return next(key for key in owner.conversation_ids if key in threads)
 
     def append_marker(self, owner: Owner) -> bool:
-        """Append a synthetic marker turn to the owner's thread and read it back."""
+        """Append a synthetic marker turn to the owner's live thread and read it back."""
 
-        thread = self.owner_thread(owner)
+        return self.append_conversation_marker(owner, self.owner_thread(owner))
+
+    def append_conversation_marker(self, owner: Owner, thread: str) -> bool:
+        """Append a synthetic marker turn under the conversation key ``thread``; read it back.
+
+        The key is the WorkItem's conversation, written to directly: once a
+        terminal request has settled, the product has deleted that thread's
+        row (ADR 0170), so ``owner_thread`` would wait for a row that no longer
+        exists. The append creates the row, and the successor's fresh pod
+        replays it.
+        """
+
+        if not thread:
+            self.fail_paid(f"owner {owner.name} has no conversation key for its marker")
         record_id = uuid.uuid4().hex
         marker = f"pto-{owner.name}-{secrets.token_hex(6)}"
         stamp = (
@@ -3341,10 +3355,14 @@ class TwoOwnerRun(pp.LiveRun):
             self.fail_paid(f"owner {owner.name}'s grant probe failed: {error or 'no usage'}")
 
     def phase_attempt_a1(self) -> None:
-        """A1 parks on card 1; its lineage, marker and workspace are recorded, then its pod goes.
+        """A1 parks on card 1; its lineage and workspace are recorded, then its pod goes.
 
         A1 publishes nothing (its card is rejected), so its committed source is
-        the default branch's head on the owned forge.
+        the default branch's head on the owned forge. A's marker is not
+        appended here: the rejection ends A1 ``publication_denied`` and the
+        product deletes the thread's transcript (ADR 0170), so the marker that
+        must cross A's pod recreation is appended once that has settled
+        (``phase_wrong_owner``).
         """
 
         self.require_live("attempt-a1")
@@ -3354,7 +3372,6 @@ class TwoOwnerRun(pp.LiveRun):
         self.await_runner(run)
         self.await_park(run)
         lineage = self.record_lineage(run)
-        marker = self.append_marker(a)
         head = (
             self.safe(lambda: self.branch_head(self.default_branch), None)
             if self.default_branch
@@ -3362,14 +3379,13 @@ class TwoOwnerRun(pp.LiveRun):
         )
         self.read_before("pod", run, head if isinstance(head, str) else "")
         self.ledger.record("restarts", "pod_lineage_before", lineage)
-        self.ledger.record("restarts", "pod_marker_before", marker)
         self.finish_park(run)
         self.deliver_card(run)
         self.unlisted_control(run)
         self.resolve_card(run, "rejected")
         absent = self.pod_uid_gone(run)
         self.ledger.record("restarts", "pod_old_runtime_absent", absent)
-        self.require({"lineage": lineage, "marker": marker, "old_pod_absent": absent}, "attempt A1")
+        self.require({"lineage": lineage, "old_pod_absent": absent}, "attempt A1")
 
     def record_lineage(self, run: PodRun) -> bool:
         """Request, epoch, consumer, claim, pod and native sessions, read at the park."""
@@ -3412,6 +3428,11 @@ class TwoOwnerRun(pp.LiveRun):
         # A1's card was rejected in its own phase; the product's own settling of
         # that rejection moves A's versions and thread, so it must end first.
         self.await_rejection_settled(first)
+        # That settling deleted A's transcript (ADR 0170), so A's marker goes on
+        # the conversation now, before the controls, and A2's new pod replays it.
+        marker = self.append_conversation_marker(a, first.conversation_id)
+        self.ledger.record("restarts", "pod_marker_before", marker)
+        self.require({"marker": marker}, "A's marker after A1's settled rejection")
         thread = self.threads.get("a", "")
         before = self.thread_records().get(thread)
         controls = self.wrong_owner_controls(a, b, first.work_item_id, first.admission_key)
