@@ -231,6 +231,36 @@ class _FakeProcess:
 Route = Callable[[str, Mapping[str, str], Any], tuple[int, Any]]
 
 
+def _work_item_request(request: Mapping[str, Any]) -> dict[str, Any]:
+    """WorkItemRequestOut fields observed on the real unpaid publication path.
+
+    Admission and SQL rows retain their identifiers; the operator DTO is the
+    explicit projection in apps/api/src/curie_api/schemas/workitems.py.
+    """
+
+    fields = {
+        "sequence",
+        "status",
+        "created_at",
+        "wait_deadline",
+        "started_at",
+        "execution_deadline",
+        "terminal_at",
+        "terminal_cause",
+        "termination_observation",
+        "capacity_deferrals",
+        "last_deferral_reason",
+        "last_start_failure_detail",
+        "tenant_id",
+        "model_auth_mode",
+        "owner_principal_id",
+        "enrollment_generation",
+        "coding_instructions_selection_id",
+        "coding_instructions_evidence",
+    }
+    return {key: value for key, value in request.items() if key in fields}
+
+
 class _FakeApi:
     """``pp.JsonHttp.request`` replaying the platform API's recorded answer shapes."""
 
@@ -258,7 +288,13 @@ class _FakeApi:
         self.requests.append((method, path, dict(headers or {}), body))
         for expected, prefix, answer in self.routes:
             if method == expected and path.startswith(prefix):
-                return answer(path, headers or {}, body)
+                status, response = answer(path, headers or {}, body)
+                if method == "GET" and path.startswith("/work-items/"):
+                    for request in (
+                        response.get("requests", []) if isinstance(response, dict) else []
+                    ):
+                        assert "id" not in request, "WorkItemRequestOut has sequence, not id"
+                return status, response
         return 404, {"detail": {"code": "not_found"}}
 
 
@@ -1295,7 +1331,7 @@ def _controls_cluster(
             "model_auth_mode": "personal",
             "owner_principal_id": PRINCIPAL_A,
             "enrollment_generation": 1,
-            "requests": [dict(request)],
+            "requests": [_work_item_request(request)],
         }
 
     @api.route("GET", f"/v1/internal/work-items/{WORK_ITEM}/personal-context")
@@ -1385,6 +1421,18 @@ def test_rehearsal_controls_record_the_expected_keys(tmp_path: Path) -> None:
         **versions,
         "expected_enrollment_version": 1,
     }
+
+
+def test_work_item_fake_distinguishes_admission_and_operator_request_rows(tmp_path: Path) -> None:
+    h = _harness(tmp_path)
+    _connect(h)
+    state = _controls_cluster(h)
+    state["replicas"] = 0
+    status, admission = h.run.admit_owner(h.run.owners["a"], issue_owner=h.run.owners["a"])
+    assert status == 200 and admission["request"]["id"]
+    request = h.run.work_item_of(WORK_ITEM)["requests"][0]
+    assert request["sequence"] == admission["request"]["sequence"]
+    assert "id" not in request
 
 
 def test_rehearsal_controls_fail_when_b_adopts_a_work_item(tmp_path: Path) -> None:
@@ -1775,12 +1823,29 @@ def test_reservation_precedes_the_admission(tmp_path: Path) -> None:
     h.run.admit_group(run, h.run.owners["a"])
     assert seen == [3]
     assert run.request_id == REQUEST_A1 and run.work_item_id == WORK_ITEM
+    assert type(run.sequence) is int and run.sequence == 1
     assert run.admitted_owner is True and h.run.owners["a"].work_item_ids == [WORK_ITEM]
     # Control: a group that cannot be reserved is never admitted.
     with pytest.raises(pps.Refusal) as refused:
         h.run.admit_group(h.run.new_run("b1", card=3), h.run.owners["b"])
     assert refused.value.code == "group_out_of_order"
     assert seen == [3]
+
+
+@pytest.mark.parametrize("sequence", [None, True, "1", 1.0, "missing"])
+def test_admission_fences_an_unusable_request_sequence(tmp_path: Path, sequence: Any) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    answer = _admission_answer("a", REQUEST_A1)
+    if sequence == "missing":
+        answer["request"].pop("sequence")
+    else:
+        answer["request"]["sequence"] = sequence
+    h.api.route("POST", "/v1/internal/work-items/admissions")(lambda _p, _h, _b: (200, answer))
+    with pytest.raises(pp.StepFailed, match="admission named no integer sequence"):
+        h.run.admit_group(h.run.new_run("a1", card=1), h.run.owners["a"])
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    assert _trace(h).count("fence") == 1
 
 
 @pytest.mark.parametrize(("status", "source"), [(409, "not_started"), (503, "unknown")])
@@ -3541,6 +3606,88 @@ def test_the_repaired_head_fails_with_a_missing_required_check(tmp_path: Path) -
     assert checks["required_checks_present"] is False
 
 
+@pytest.mark.parametrize("sequences", [(1,), (2,), (1, 2)])
+def test_repair_publication_reads_request_identity_from_the_operator_dto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sequences: tuple[int, ...]
+) -> None:
+    h = _live(tmp_path)
+    first = _pod_run(h, "b1", card=3, reserve=False)
+    repair = _pod_run(h, "b-r2", card=4, reserve=False)
+    first.request_id = repair.request_id = REQUEST_B1
+    first.work_item_id = repair.work_item_id = WORK_ITEM_B
+    first.sequence = repair.sequence = 1
+    first.branch = repair.branch = BRANCH_B
+    repair.claim_labels = dict(B_CLAIM_LABELS)
+    repair.delivery = dict.fromkeys(DELIVERY_KEYS, True)
+    repair.resolved_at = T0
+    h.run.a_stop_at = T0 - 1
+    h.run.b1_head, h.run.b1_pull = HEAD_B1, 17
+    h.run.approver_checks = [True]
+    h.run.summaries["b-r2"] = [
+        {"role": role, "assistant_turns": 1, "synthetic": 0, "models": [model]}
+        for role, model in (
+            (pto.IMPLEMENTER, pps.IMPLEMENTER_MODEL),
+            (pto.DIFF_REVIEWER, pps.REVIEWER_MODEL),
+        )
+    ]
+    _feed(
+        repair,
+        {
+            MAIN: _jsonl(
+                [_reply("repair-call", 1, 20, [_tool("repair-tool")]), _result("repair-tool", 2)]
+            )
+        },
+    )
+    _repaired_setup(h, _ci_runs("success"))
+    for name in ("park_and_settle", "unlisted_control", "resolve_card"):
+        monkeypatch.setattr(h.run, name, lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        h.run,
+        "published_facts",
+        lambda *_a, **_k: {
+            "head": HEAD_B2,
+            "branch": BRANCH_B,
+            "pr": 17,
+            "succeeded": True,
+            "branch_from_api": True,
+            "pr_ready": True,
+            "tree": True,
+        },
+    )
+    monkeypatch.setattr(h.run, "branch_head", lambda _b: HEAD_B2)
+    request = {
+        "sequence": 1,
+        "status": "completed",
+        "tenant_id": TENANT,
+        "model_auth_mode": "personal",
+        "owner_principal_id": PRINCIPAL_B,
+        "enrollment_generation": 1,
+    }
+    h.api.route("GET", f"/work-items/{WORK_ITEM_B}")(
+        lambda _p, _h, _b: (
+            200,
+            {
+                "id": WORK_ITEM_B,
+                "state": "published",
+                "tenant_id": TENANT,
+                "model_auth_mode": "personal",
+                "owner_principal_id": PRINCIPAL_B,
+                "enrollment_generation": 1,
+                "requests": [_work_item_request({**request, "sequence": seq}) for seq in sequences],
+            },
+        )
+    )
+    if sequences == (1,):
+        h.run.phase_approve_b2()
+        assert h.ledger.observations("publication")["b_request_completed"] is True
+        assert "fence" not in _trace(h)
+    else:
+        with pytest.raises(pp.StepFailed, match="repair_same_request"):
+            h.run.phase_approve_b2()
+        assert "fence" in _trace(h)
+    assert h.ledger.observations("ci-repair")["repair_same_request"] is (sequences == (1,))
+
+
 # -- after the disconnect ---------------------------------------------------------
 
 
@@ -3555,7 +3702,7 @@ def _post_setup(h: _Harness, *, a_claims: list[str]) -> None:
         lambda _p, _h, _b: (409, {"detail": {"code": "enrollment_inactive"}})
     )
     h.api.route("GET", f"/work-items/{WORK_ITEM}")(
-        lambda _p, _h, _b: (200, {"requests": [{"id": REQUEST_A1, "status": "failed"}]})
+        lambda _p, _h, _b: (200, {"requests": [{"sequence": 3, "status": "failed"}]})
     )
     h.run.owner_claims = (  # type: ignore[method-assign]
         lambda owner: list(a_claims) if owner.name == "a" else ["claim-b1"]
@@ -3609,7 +3756,7 @@ def test_summary_keys_read_the_gathered_evidence(tmp_path: Path) -> None:
     h.run.settle_run(run, facts=h.run.pod_facts(run), complete=True)
     h.run.owners["a"].work_item_ids = [WORK_ITEM]
     item = _admission_answer("a", REQUEST_A1)
-    work_item = {**item["work_item"], "requests": [item["request"]]}
+    work_item = {**item["work_item"], "requests": [_work_item_request(item["request"])]}
     h.api.route("GET", f"/work-items/{WORK_ITEM}")(lambda _p, _h, _b: (200, work_item))
     h.shell.on("work-items", WORK_ITEM)(lambda _a, _s: {"item": work_item})
     h.ledger.record("owners", "installation_grant_absent", True)
@@ -4401,7 +4548,7 @@ def _wrong_owner_setup(
                 "model_auth_mode": "personal",
                 "owner_principal_id": PRINCIPAL_A,
                 "enrollment_generation": 1,
-                "requests": [dict(request)],
+                "requests": [_work_item_request(request)],
             },
         )
     )
@@ -4449,6 +4596,31 @@ def test_live_wrong_owner_controls_include_the_adoption_control(tmp_path: Path) 
     }
     # The controls read and refuse; nothing is fenced.
     assert "fence" not in _trace(h)
+
+
+def test_wrong_owner_controls_detect_another_started_operator_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _live(tmp_path)
+    _wrong_owner_setup(h)
+    original = h.api.request
+    reads = 0
+
+    def request(method: str, path: str, **kwargs: Any) -> tuple[int, Any]:
+        nonlocal reads
+        status, body = original(method, path, **kwargs)
+        if method == "GET" and path == f"/work-items/{WORK_ITEM}":
+            reads += 1
+            second = {**body["requests"][0], "sequence": 2, "status": "running"}
+            second["started_at"] = _stamp(1) if reads > 1 else None
+            body["requests"].append(second)
+        return status, body
+
+    monkeypatch.setattr(h.api, "request", request)
+    with pytest.raises(pp.StepFailed, match="adoption_no_request"):
+        h.run.phase_wrong_owner()
+    assert h.ledger.observations("wrong-owner")["adoption_no_request"] is False
+    assert "fence" in _trace(h)
 
 
 @pytest.mark.parametrize(

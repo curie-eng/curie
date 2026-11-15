@@ -2183,7 +2183,10 @@ class TwoOwnerRun(pp.LiveRun):
             run.request_id = str(uuid.UUID(str(request.get("id"))))
         except ValueError:
             self.fail_paid(f"{run.group} admission named no readable ids")
-        run.sequence = request.get("sequence") if type(request.get("sequence")) is int else None
+        sequence = request.get("sequence")
+        if type(sequence) is not int:
+            self.fail_paid(f"{run.group} admission named no integer sequence")
+        run.sequence = sequence
         run.conversation_id = str(work_item.get("conversation_id") or "")
         run.admitted_owner = pps.owner_matches(
             pps.owner_of(work_item), owner.tuple()
@@ -4005,7 +4008,7 @@ class TwoOwnerRun(pp.LiveRun):
             "repair_implementer_b": roles["implementer_session"] and roles["implementer_model"],
             "repair_diff_reviewer_b": roles["diff_reviewer_session"],
             "repair_same_request": repair.request_id == first.request_id
-            and [str(row.get("id")) for row in requests] == [first.request_id],
+            and [row.get("sequence") for row in requests] == [first.sequence],
             "repair_owner_b": self.owner_claim_checks("b", repair),
             "repair_native_execution": native,
             "b2_publication_succeeded": facts["succeeded"],
@@ -5693,8 +5696,8 @@ class TwoOwnerRun(pp.LiveRun):
             requests = self.work_item_of(work_item_id).get("requests") or []
             return [row for row in requests if isinstance(row, dict)]
 
-        def started(found: list[dict[str, Any]]) -> set[str]:
-            return {str(row.get("id")) for row in found if row.get("started_at")}
+        def started(found: list[dict[str, Any]]) -> set[int]:
+            return {row["sequence"] for row in found if row.get("started_at")}
 
         first_rows = rows()
         status, body = self.admit_owner(other, issue_owner=owner)
