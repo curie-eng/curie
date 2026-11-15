@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -1060,14 +1061,24 @@ def _blocked_successor(api: TestClient, ref: Ref) -> dict[str, Any]:
 
 
 def test_blocked_successor_expires_as_retry_condition_expired_naming_the_condition(
-    api: TestClient, auth_headers: dict[str, str]
+    api: TestClient, auth_headers: dict[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     item = _admit(api, _agent(api, auth_headers), 54264)
     _seed_history(item.work_item_id)
     successor = _blocked_successor(api, item)
     assert _history(item.work_item_id)
     _expire_wait(successor["id"])
-    _reconcile()
+    with caplog.at_level(logging.WARNING, logger="curie_api.workitem_reconciler"):
+        _reconcile()
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "curie_api.workitem_reconciler"
+        and "expired waiting" in record.getMessage()
+    ] == [
+        f"work item request {successor['id']} expired waiting for retry condition "
+        "provider_usage_reset"
+    ]
     expired = _request(successor["id"])
     assert (expired["status"], expired["terminal_cause"], expired["blocked_on"]) == (
         "expired",

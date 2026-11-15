@@ -348,7 +348,10 @@ async def _continue_unpublished(
                 continued=True,
             )
         except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
-            # Preaccept failures retain normal retry policy. An accepted stream
+            # A preaccept failure on a CI fix or approval resume wake retains the
+            # kernel retry policy. On the execute wake's own continuation the
+            # SQL lifecycle owns the retry, so the turn settles once and reports
+            # uncertain. An accepted stream
             # whose lock exit failed has already latched the no-retry fence above.
             # A requested cancel stops the continuation instead (#4191).
             status = await self._request_not_running(run)

@@ -2157,8 +2157,9 @@ subscription session, weekly or model usage limit ends the run as
 `model_usage_limited` with failure class `model-usage-limited`, without retrying in the
 same run. A flag clean run of either cause gets a blocked automatic retry, as
 described above.
-The status comment says that the model provider's usage limit for the credential
-was reached; re-add the factory label after the limit resets. Ordinary usage
+When no retry was admitted, the status comment says that the model provider's
+usage limit for the credential was reached; re-add the factory label after the
+limit resets. Ordinary usage
 warnings and rejected rate-limit events keep their existing behavior. A run that
 a relabel replaced ends with `Stopped: the label was added again, so a new run
 replaced this one.`, and the new run gets its own status comment. The

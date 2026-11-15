@@ -334,6 +334,7 @@ class WorkItemReconciler:
                         ExecutionRequest.work_item_id,
                         ExecutionRequest.version,
                         ExecutionRequest.capacity_deferrals,
+                        ExecutionRequest.blocked_on,
                         WorkItem.version.label("work_item_version"),
                     )
                     .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
@@ -352,7 +353,15 @@ class WorkItemReconciler:
                     expected_work_item_version=row.work_item_version,
                     expected_request_version=row.version,
                 )
-            if isinstance(result, lifecycle.WorkItemOutcome):
+            if not isinstance(result, lifecycle.WorkItemOutcome):
+                continue
+            if row.blocked_on is not None:
+                logger.warning(
+                    "work item request %s expired waiting for retry condition %s",
+                    row.id,
+                    row.blocked_on,
+                )
+            else:
                 logger.warning(
                     "work item request %s expired waiting for sandbox admission "
                     "after %d capacity deferrals",
