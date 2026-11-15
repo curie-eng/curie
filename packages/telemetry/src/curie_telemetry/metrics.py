@@ -685,6 +685,7 @@ _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
     "step": [
         "settle_publications",
         "expire_waiting",
+        "release_provider_gates",
         "request_deadline_cancellations",
         "request_owner_lost_cancellations",
         "publish_terminate_wakes",

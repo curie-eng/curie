@@ -87,6 +87,7 @@ from .personal_custody import (
 )
 from .personal_execution import PersonalExecution, owner_lease_ttl_ms
 from .progress import ProgressStore
+from .provider_probe import ProviderProbeLoop
 from .publication_candidate_capture import PublicationCandidateCapture
 from .publication_candidate_storage import (
     PATCH_LIMIT_BYTES as PUBLICATION_CANDIDATE_PATCH_LIMIT_BYTES,
@@ -210,6 +211,10 @@ class Runtime:
     # credential (issue 5581). Optional only so a Runtime constructed in tests
     # need not name it.
     factory_credit: FactoryCreditLoop | None = None
+    # Always built. Registers this worker's provider scope and probes its
+    # allowance while a provider gate waits on it (#5426). Optional only so a
+    # Runtime constructed in tests need not name it.
+    provider_probe: ProviderProbeLoop | None = None
     # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
     # beside the connector reconcile loop, never inside the consumer.
     action_executor: ActionExecutorLoop | None = None
@@ -1246,6 +1251,7 @@ def build(
         remediation_receipts=_build_remediation_receipts(config, engine, sink),
         factory_slack_progress=_build_factory_slack_progress(config, engine, sink),
         factory_credit=FactoryCreditLoop(engine, config),
+        provider_probe=ProviderProbeLoop(engine, config, async_redis),
         stream_retention=build_stream_retention(config, async_redis),
     )
 
@@ -1263,6 +1269,7 @@ _SUPERVISED_OPERATIONS = frozenset(
         "workspace-recovery-gc",
         "publication-candidates-gc",
         "factory-credit",
+        "provider-probe",
     }
 )
 
@@ -2102,6 +2109,13 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             launch(
                 "factory-credit",
                 lambda: rt.factory_credit.run_forever(shutdown),  # type: ignore[union-attr]
+            )
+        )
+    if getattr(rt, "provider_probe", None) is not None:
+        tasks.append(
+            launch(
+                "provider-probe",
+                lambda: rt.provider_probe.run_forever(shutdown),  # type: ignore[union-attr]
             )
         )
     if sweeper is not None:
