@@ -53,6 +53,7 @@ from claude_agent_sdk import (
     TaskNotificationMessage,
     TaskUpdatedMessage,
 )
+from curie_internal.provider_scope import ProviderScope
 from curie_telemetry import agent_metric_label, record_metric
 from opentelemetry.context import Context
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
@@ -119,6 +120,7 @@ from .tool_access import (
 from .tool_names import PLATFORM_SLACK_TOOL_NAMES
 from .translate import (
     TurnState,
+    credential_rejection_condition,
     is_credit_refusal,
     is_usage_refusal,
     map_error_classification,
@@ -442,9 +444,14 @@ class SessionRunner:
         initializer: Callable[[], Awaitable[None]] | None = None,
         session_initializer: Callable[[], Awaitable[None]] | None = None,
         cleanup_timeout_s: float = _ABANDONED_TURN_DRAIN_TIMEOUT_S,
+        provider_scope: ProviderScope | None = None,
     ) -> None:
         if not math.isfinite(cleanup_timeout_s) or cleanup_timeout_s <= 0:
             raise ValueError("runner cleanup timeout must be finite and positive")
+        # The scope of the boot credential (#5426), derived before the harness
+        # rewrote the env; None in fake model mode or when it cannot be named.
+        # Every turn's RetryCondition names it, never the credential.
+        self._provider_scope = provider_scope
         self._cleanup_timeout_s = cleanup_timeout_s
         self._final_answer = final_answer
         self._factory = session_factory
@@ -1485,6 +1492,7 @@ class SessionRunner:
             self._turn_ready = False
             state = TurnState(
                 tool_access=event.tool_access,
+                provider_scope=self._provider_scope,
                 final_answer=(
                     FinalAnswerValidation(self._final_answer)
                     if self._final_answer is not None else None
@@ -2056,7 +2064,7 @@ class SessionRunner:
                     with contextlib.suppress(Exception):
                         await self._session.interrupt()
                     self._set_failed(gen)
-                    for line in self._auth_halt_lines():
+                    for line in self._auth_halt_lines(message, state.provider_scope):
                         yield line
                     return
                 if isinstance(message, SystemMessage) and message.subtype == "init":
@@ -2997,7 +3005,7 @@ class SessionRunner:
         text = f"{notice}\n\n{final.text}" if final.text else notice
         return final.model_copy(update={"text": text})
 
-    def _auth_halt_lines(self) -> list[str]:
+    def _auth_halt_lines(self, message: object, scope: ProviderScope | None) -> list[str]:
         """The error+final pair emitted when the provider rejects the credential.
 
         Distinct from a budget halt and a generic runner error so downstream
@@ -3006,6 +3014,10 @@ class SessionRunner:
         reference the operator must fix; it carries no credential value. In
         personal mode the rejected credential is the owner's grant, so the pair
         is ``authentication-required`` naming the enrollment instead (#5377).
+
+        ``message`` is the rejecting SDK message. Its provider text decides the
+        ``credential_rejected`` RetryCondition (#5426), named by ``scope``: only
+        a documented 401 carries one, and personal mode never does.
         """
 
         if _personal_mode():
@@ -3016,11 +3028,17 @@ class SessionRunner:
         self._turn_open = False
         self._turn_ready = False
         self._status = SessionStatus.CLASSIFIED_FAILURE
+        condition = (
+            credential_rejection_condition(message, scope)
+            if isinstance(message, AssistantMessage)
+            else None
+        )
         return [
             to_ndjson_line(
                 ErrorEvent(
                     message="model credential rejected by provider (check CURIE_CREDENTIALS)",
                     classification=AUTH_REJECTED_CLASSIFICATION,
+                    retry_condition=condition,
                 )
             ),
             to_ndjson_line(
