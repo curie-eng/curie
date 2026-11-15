@@ -138,6 +138,39 @@ def needles_of(documents: Iterable[Document]) -> list[str]:
     return sorted({needle for document in documents for needle in document.needles()})
 
 
+@dataclasses.dataclass(frozen=True)
+class ProofTask:
+    slot: int
+    path: str
+    sentence_limit: int | None = None
+    line_limit: int | None = None
+    only_target_file: bool = False
+
+    def body(self, document: Document | None) -> str:
+        if document is not None and (
+            self.sentence_limit is not None or self.line_limit is not None or self.only_target_file
+        ):
+            raise ValueError("task constraints contradict or confound the preference under test")
+        body = (
+            f"Requester preferences proof, slot {self.slot}. Add a Markdown note at "
+            f"`{self.path}` describing this repository. Follow the repository's instructions "
+            "and applicable coding guidance."
+        )
+        if self.sentence_limit is not None:
+            body += f" Use at most {self.sentence_limit} sentences."
+        if self.line_limit is not None:
+            body += f" Use at most {self.line_limit} lines."
+        if self.only_target_file:
+            body += " Change no other file."
+        return body
+
+
+def proof_tasks(nonce: str) -> dict[int, ProofTask]:
+    if not _NONCE.fullmatch(nonce):
+        raise ValueError("invalid proof nonce")
+    return {slot: ProofTask(slot, f"proof-notes/rqp-{nonce}-slot{slot}.md") for slot in SLOT_PLAN}
+
+
 def hits(data: bytes, needles: Sequence[str]) -> int:
     """How many needles occur in ``data``, raw or JSON escaped."""
 

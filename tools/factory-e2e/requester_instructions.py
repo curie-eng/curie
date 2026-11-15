@@ -125,10 +125,6 @@ async def main():
     print(json.dumps(found))
 asyncio.run(main())
 """
-SLOT_ISSUE_BODY = (
-    "Requester preferences proof, slot {slot}. Add one new file `{path}` containing a "
-    "single short sentence that describes this repository. Change nothing else."
-)
 
 
 # --------------------------------------------------------------------------
@@ -1274,8 +1270,11 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
 
         def live_slots(self) -> None:
             assert self.live_inputs is not None
+            tasks = ris.proof_tasks(self.nonce)
+            for slot, (_actor, role) in ris.SLOT_PLAN.items():
+                tasks[slot].body(self.documents[role] if role is not None else None)
             for slot, (actor, role) in ris.SLOT_PLAN.items():
-                self.run_slot(slot, actor, role)
+                self.run_slot(slot, actor, role, tasks[slot])
             slots = self.ctx.ledger.slots()
             self.observe("10", "spend.slots_within_cap", len(slots) <= ris.MAX_SLOTS)
             self.observe(
@@ -1284,9 +1283,17 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 all(int(row["launches"]) <= ris.LAUNCHES_PER_SLOT for row in slots),
             )
 
-        def run_slot(self, slot: int, actor: str, role: str | None) -> None:
+        def run_slot(self, slot: int, actor: str, role: str | None, task: ris.ProofTask) -> None:
             live = self.live_inputs
             assert live is not None
+            try:
+                if task.slot != slot:
+                    raise ValueError("task constraints name another slot")
+                body = task.body(self.documents[role] if role is not None else None)
+            except ValueError as failure:
+                self.observe("10", f"preselection.slot{slot}.task_compatible", False)
+                raise poe.StepFailed(str(failure)) from None
+            self.observe("10", f"preselection.slot{slot}.task_compatible", True)
             self.configure_transcript_capture()
             if role is None:
                 status, body = self.console(
@@ -1297,13 +1304,12 @@ def requester_proof_class(e: Any) -> type[Any]:  # noqa: C901 - one scenario, on
                 self.observe(
                     "10", "document.owner_cleared", status == 200 and body.get("sha256") is None
                 )
-            path = f"proof-notes/rqp-{self.nonce}-slot{slot}.md"
             issue = self.forge.call(
                 "POST",
                 self.forge.repo_path("/issues"),
                 {
                     "title": f"Requester preferences proof {self.nonce} slot {slot}",
-                    "body": SLOT_ISSUE_BODY.format(slot=slot, path=path),
+                    "body": body,
                 },
                 ok=(201,),
             )

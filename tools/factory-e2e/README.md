@@ -963,6 +963,14 @@ the marker and must not obey the conflicting preference; slot 3 must have no
 annotation and no marker. Every reviewer scan must read at least one reviewer
 record and find nothing.
 
+The note tasks allow applicable coding guidance to add content or files. They
+are rendered from structured constraints, checked offline for every planned
+slot and checked again before issue creation. A selected-document proof task
+with a sentence limit, line limit or exclusive file constraint is refused:
+those constraints can defeat the marker or independently forbid the
+dependency preference, confounding the repository-precedence check. The
+task body is identical with and without a profile and contains no marker cue.
+
 Spend is capped as precondition 5 requires: at most 3 slots, a 5 USD cap per
 model session (`DEFAULT_MAX_USD_PER_DAY`), and at most one continuation per
 slot. The image's launch gate holds every native start until the driver

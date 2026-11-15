@@ -1162,6 +1162,50 @@ def _live_proof(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     return proof
 
 
+@pytest.mark.parametrize("slot,role", [(1, "owner"), (2, "second")])
+def test_open_tasks_are_identical_with_and_without_preferences(slot: int, role: str) -> None:
+    task = ris.proof_tasks(NONCE)[slot]
+    document = ris.make_document(role, NONCE)
+    assert task.body(document) == task.body(None)
+    assert document.marker not in task.body(document)
+    assert document.canary not in task.body(document)
+
+
+@pytest.mark.parametrize("slot,role", [(1, "owner"), (2, "second")])
+@pytest.mark.parametrize(
+    "constraints",
+    [{"sentence_limit": 1}, {"line_limit": 1}, {"only_target_file": True}],
+)
+def test_task_renderer_refuses_constraints_that_defeat_preferences(
+    slot: int, role: str, constraints: dict[str, Any]
+) -> None:
+    task = ris.ProofTask(slot, "proof-notes/note.md", **constraints)
+    with pytest.raises(ValueError, match="task constraints"):
+        task.body(ris.make_document(role, NONCE))
+
+
+@pytest.mark.parametrize("slot,actor,role", [(1, "owner", "owner"), (2, "second", "second")])
+def test_conflicting_task_cannot_reach_issue_creation_or_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slot: int, actor: str, role: str
+) -> None:
+    proof = _live_proof(tmp_path, monkeypatch)
+    proof.documents[role] = ris.make_document(role, NONCE)
+    calls: list[str] = []
+    proof.forge = SimpleNamespace(call=lambda *args, **kwargs: calls.append("issue"))
+    proof.github = lambda *args, **kwargs: calls.append("label")
+    task = ris.ProofTask(slot, "proof-notes/note.md", sentence_limit=1, only_target_file=True)
+    try:
+        with pytest.raises(poe.StepFailed, match="task constraints"):
+            proof.run_slot(slot, actor, role, task)
+        assert calls == []
+        assert proof.ctx.ledger.slots() == []
+        assert (
+            proof.ctx.ledger.observations("10")[f"preselection.slot{slot}.task_compatible"] is False
+        )
+    finally:
+        proof.ctx.ledger.close()
+
+
 def test_live_publication_prefix_is_accepted_by_the_api(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
