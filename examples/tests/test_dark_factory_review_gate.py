@@ -874,6 +874,7 @@ def test_decision_followup_eval_grades_the_answer(case_id: str) -> None:
         "",
         "Done.",
         "No changes needed:",
+        "No changes needed: Decisions entry 1.",
         case.input,
         "No changes needed: the pull request is already complete; I answered "
         "by citing Decisions entry 1. Nothing in the question asked for a code change.",
