@@ -1253,6 +1253,8 @@ class TwoOwnerRun(pp.LiveRun):
         self.paid_failure: str | None = None
         self.deleted_uids: set[str] = set()
         self.runner_log_instances: set[tuple[str, int]] = set()
+        # Log reader threads raise a run's observed restart count under it.
+        self.restart_lock = threading.Lock()
         self.watch_stop = threading.Event()
         self.watch_thread: threading.Thread | None = None
         self.watch_ledger: pto.TwoOwnerLedger | None = None
@@ -2527,6 +2529,7 @@ class TwoOwnerRun(pp.LiveRun):
             functools.partial(pp.stop_process, process),
         )
         key = f"{run.pod_uid}:{container}:{len(run.logs)}"
+        runner_follow = container == pps.RUNNER_CONTAINER and "--follow" in flags
 
         def read() -> None:
             try:
@@ -2536,6 +2539,10 @@ class TwoOwnerRun(pp.LiveRun):
                 for chunk in iter(lambda: stdout.read(65536), b""):
                     self.scan.scan_stream(pto.POD_LOGS_CHANNEL, key, chunk)
                 stream.complete = process.wait(timeout=PRE_DELETE_READ_SECONDS) == 0
+                if runner_follow:
+                    # The follow ends with the instance it followed; a restart
+                    # is seen here, before ``done`` lets anyone count the streams.
+                    self.observe_runner_restarts(run)
             except Exception:  # noqa: BLE001 - an incomplete stream fails closed
                 stream.complete = False
             finally:
@@ -2547,6 +2554,23 @@ class TwoOwnerRun(pp.LiveRun):
 
         threading.Thread(target=read, daemon=True).start()
         threading.Thread(target=drain, daemon=True).start()
+
+    def observe_runner_restarts(self, run: PodRun) -> None:
+        """Re-read the runner's ``restartCount`` while its pod exists; only ever raise it.
+
+        A count above the instance the follows opened on is a new runner
+        instance they never covered, so ``(pod_uid, restart_count)`` is then
+        not in ``runner_log_instances`` and the run reads as uncaptured. A pod
+        already gone (or replaced under the same name) changes nothing.
+        """
+
+        pod = self.safe(lambda: self.kube.json("get", "pod", run.pod), None)
+        if not isinstance(pod, dict) or (pod.get("metadata") or {}).get("uid") != run.pod_uid:
+            return
+        count = self.runner_restarts(pod)
+        # Not ``guard``: the watchdog may hold it while it deletes this pod.
+        with self.restart_lock:
+            run.restart_count = max(run.restart_count, count)
 
     def finish_runner_logs(self, run: PodRun, *, wait: bool = True) -> bool:
         """Count the run's log streams once they ended; True when every one ended cleanly.
@@ -2725,6 +2749,9 @@ class TwoOwnerRun(pp.LiveRun):
                             not run.pod_uid or (pod.get("metadata") or {}).get("uid") == run.pod_uid
                         )
                     ]
+                    for pod in pods:
+                        with self.restart_lock:
+                            run.restart_count = max(run.restart_count, self.runner_restarts(pod))
                     names = self.capture_before_deletion(pods, workload="runner", step="remove-pod")
                     captured = run.pod in names
             if (run.pod_uid, run.restart_count) not in self.runner_log_instances:

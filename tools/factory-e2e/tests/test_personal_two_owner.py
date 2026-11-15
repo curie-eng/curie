@@ -4982,19 +4982,32 @@ def test_a_failed_or_timed_out_log_read_never_holds_the_removal(tmp_path: Path) 
 
 
 def _followed(
-    h: _Harness, monkeypatch: pytest.MonkeyPatch, run: pt.PodRun, exit_code: int, restarts: int = 0
+    h: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    run: pt.PodRun,
+    exit_code: int,
+    restarts: int = 0,
+    later_restarts: int | None = None,
 ) -> list[list[str]]:
-    """Open the run's log streams on a real child that prints one line and exits."""
+    """Open the run's log streams on a real child that prints one line and exits.
 
-    h.shell.on("get", "pod", run.pod)(
-        lambda _a, _i: {
+    The pod reads ``restarts`` when the streams open and ``later_restarts``
+    (by default the same) on every later read.
+    """
+
+    reads = iter([restarts])
+
+    def pod(_argv: Sequence[str], _input: Any) -> dict[str, Any]:
+        count = next(reads, restarts if later_restarts is None else later_restarts)
+        return {
             "metadata": {"name": run.pod, "uid": run.pod_uid},
             "spec": {"containers": [{"name": pps.RUNNER_CONTAINER}]},
             "status": {
-                "containerStatuses": [{"name": pps.RUNNER_CONTAINER, "restartCount": restarts}]
+                "containerStatuses": [{"name": pps.RUNNER_CONTAINER, "restartCount": count}]
             },
         }
-    )
+
+    h.shell.on("get", "pod", run.pod)(pod)
     commands: list[list[str]] = []
 
     def spawn(argv: Sequence[str]) -> subprocess.Popen[bytes]:
@@ -5082,6 +5095,31 @@ def test_a_restart_after_the_streams_opened_is_not_covered_by_them(
     with pytest.raises(pp.StepFailed, match="runner vanished before capture"):
         h.run.finish_park(run)
     assert (run.pod_uid, 1) in h.run.runner_log_instances
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+
+
+def test_the_driver_sees_a_runner_restart_its_follow_never_covered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The follow attached to instance 0; the container restarted, then the product removed the pod.
+
+    The driver re-reads ``restartCount`` when the follow ends while the pod
+    still exists, so instance 1 (never scanned) is uncaptured, not settled.
+    """
+
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    assert run.restart_count == 0
+    commands = _followed(h, monkeypatch, run, 0, later_restarts=1)
+    assert [argv[-1] for argv in commands] == ["--follow"]
+    assert run.log_instance == 0
+    assert run.restart_count == 1
+    _suspended(h, run)
+    with pytest.raises(pp.StepFailed, match="runner vanished before capture"):
+        h.run.finish_park(run)
+    assert (run.pod_uid, 0) in h.run.runner_log_instances
+    assert (run.pod_uid, 1) not in h.run.runner_log_instances
     assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
 
 
