@@ -1555,6 +1555,8 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         model_auth_mode="service",
         coding_instructions_state="absent",
         coding_instructions_absence_reason="historical",
+        # The database default an inserted row would carry.
+        automatic_retries_used=0,
     )
     request = ExecutionRequest(
         id=uuid.uuid4(),
@@ -1575,6 +1577,9 @@ def test_expired_admission_wait_does_not_claim_observed_capacity_exhaustion() ->
         requester=REQUESTER,
         model_auth_mode="service",
         coding_instructions_evidence="none",
+        # The database defaults an inserted row would carry.
+        dispatch_not_before=now,
+        owner_lost_retry=False,
     )
     outcome = derive_outcome(
         item,
@@ -1617,6 +1622,8 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         model_auth_mode="service",
         coding_instructions_state="absent",
         coding_instructions_absence_reason="historical",
+        # The database default an inserted row would carry.
+        automatic_retries_used=0,
     )
     request = ExecutionRequest(
         id=uuid.uuid4(),
@@ -1636,6 +1643,9 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         requester=REQUESTER,
         model_auth_mode="service",
         coding_instructions_evidence="none",
+        # The database defaults an inserted row would carry.
+        dispatch_not_before=now,
+        owner_lost_retry=False,
     )
 
     outcome = derive_outcome(
