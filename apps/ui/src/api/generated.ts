@@ -4047,6 +4047,11 @@ export interface paths {
         /**
          * Verify Publication Revision
          * @description Prove the marked revision and its authoritative publication parent.
+         *
+         *     The named revision is the publication's own, or for a publication recovery
+         *     one of the earlier failed revisions it may adopt (#5429). Only that one
+         *     revision's marker is accepted, so a caller proving its own push never
+         *     accepts a predecessor's commit by accident.
          */
         post: operations["verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post"];
         delete?: never;
