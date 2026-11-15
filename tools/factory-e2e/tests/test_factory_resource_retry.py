@@ -77,7 +77,6 @@ import secrets
 import shutil
 import subprocess
 import tempfile
-import time
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -87,6 +86,7 @@ from typing import Any
 import factory_e2e as fe
 import personal_owner_enforcement_support as poe
 import pytest
+import resource_retry_support as rrs
 import tls_code_host as tch
 import yaml
 
@@ -732,11 +732,14 @@ class Live:
                         left.append(f"{resource}/{item['metadata']['name']}")
             return sorted(set(left))
 
-        deadline = time.monotonic() + 900
         left = remaining()
-        while left and time.monotonic() < deadline:
-            time.sleep(5)
-            left = remaining()
+
+        def cleared() -> bool:
+            left[:] = remaining()
+            return not left
+
+        if left:
+            rrs.poll_until(cleared, timeout=900, interval=5)
         if left:
             problems.append("still present after teardown: " + ", ".join(left))
         if problems:
@@ -1204,16 +1207,12 @@ class Live:
 def wait_for(
     what: str, timeout: float, probe: Callable[[], Any], observed: Callable[[], Any]
 ) -> Any:
-    deadline = time.monotonic() + timeout
-    while True:
-        value = probe()
-        if value:
-            return value
-        if time.monotonic() > deadline:
-            raise AssertionError(
-                f"timed out after {int(timeout)}s waiting for {what}; observed {observed()}"
-            )
-        time.sleep(3)
+    value = rrs.poll_until(probe, timeout=timeout, interval=3)
+    if not value:
+        raise AssertionError(
+            f"timed out after {int(timeout)}s waiting for {what}; observed {observed()}"
+        )
+    return value
 
 
 # --------------------------------------------------------------------------
@@ -1328,9 +1327,9 @@ def prove_phase(live: Live, phase: Phase) -> None:
     deferrals = successor["start_deferrals"]
     probed = False
     versions = {successor["version"]}
-    window_end = time.monotonic() + GATE_WINDOW_SECONDS
-    while time.monotonic() < window_end:
-        time.sleep(3)
+
+    def still_gated() -> None:
+        nonlocal probed
         current = next(r for r in rows() if r["id"] == successor["id"])
         assert (
             current["status"] == "waiting"
@@ -1342,6 +1341,8 @@ def prove_phase(live: Live, phase: Phase) -> None:
         if current.get("last_deferral_reason") == "resource_gate_unmet":
             versions.add(current["version"])
             probed = probed or len(versions) > 1
+
+    rrs.observe_for(GATE_WINDOW_SECONDS, still_gated, interval=3)
     assert probed, (
         f"no resource_gate_unmet probe was observed within {GATE_WINDOW_SECONDS}s: "
         f"{_brief(next(r for r in rows() if r['id'] == successor['id']))}"
@@ -1399,7 +1400,16 @@ def prove_phase(live: Live, phase: Phase) -> None:
         brief,
     )
     live.log(f"{phase.dimension}: successor ended {ended['status']} ({ended['terminal_cause']})")
-    time.sleep(SETTLE_SECONDS)
+
+    def no_further_attempt() -> None:
+        current = rows()
+        assert len(current) == 2, (
+            f"exactly one fresh attempt was expected; the work item holds {len(current)} "
+            f"requests: {[_brief(r) for r in current]}"
+        )
+
+    # A third request would be admitted within a probe period of the end.
+    rrs.observe_for(SETTLE_SECONDS, no_further_attempt, interval=5)
     final = rows()
     assert len(final) == 2, (
         f"exactly one fresh attempt was expected; the work item holds {len(final)} requests: "
