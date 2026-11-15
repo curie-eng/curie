@@ -373,11 +373,25 @@ def test_a_recovery_request_never_buys_an_implementation_run(
     else:
         _lose_owner(api, recovery["id"], started=True)
         _lose_owner(api, control.ref.request_id, started=True)
-    # A recovery request's own non-publication failure admits nothing.
-    assert _successor(recovery["id"]) is None
-    assert _used(run.ref.work_item_id) == 1
-    assert len(_requests(run.ref.work_item_id)) == 2
-    assert _candidate(reservation)["owner_request_id"] == recovery["id"]
+    if origin == "ordinary":
+        # A recovery request's own non-publication failure admits nothing.
+        assert _successor(recovery["id"]) is None
+        assert _used(run.ref.work_item_id) == 1
+        assert len(_requests(run.ref.work_item_id)) == 2
+        assert _candidate(reservation)["owner_request_id"] == recovery["id"]
+    else:
+        # A recovery lost with its worker recovers the same candidate again,
+        # spending the second shared slot.
+        again = _successor(recovery["id"])
+        assert again is not None
+        assert again["execution_kind"] == "publication_recovery"
+        assert again["owner_lost_retry"] is True
+        assert again["recovery_candidate_id"] == recovery["recovery_candidate_id"]
+        assert _used(run.ref.work_item_id) == 2
+        assert _candidate(reservation)["owner_request_id"] == again["id"]
+    assert [row["execution_kind"] for row in _requests(run.ref.work_item_id)].count(
+        "implementation"
+    ) == 1
     # The same failure of an implementation request admits its ordinary successor.
     successor = _successor(control.ref.request_id)
     assert successor is not None

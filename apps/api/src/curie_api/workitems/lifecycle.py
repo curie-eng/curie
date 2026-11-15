@@ -3273,10 +3273,15 @@ async def _admit_automatic_successor(
         and disposition is not None
         and disposition.kind == DispositionKind.PUBLICATION_RECOVERY
     ):
-        return await _admit_publication_recovery(session, work_item, predecessor)
+        return await _admit_publication_recovery(session, work_item, predecessor, owner_lost=False)
     if predecessor.execution_kind == "publication_recovery":
-        # A publication failure never buys an implementation run (#5429): a
-        # recovery request's other failures and its owner loss admit nothing.
+        # A publication failure never buys an implementation run (#5429). A
+        # recovery lost with its worker recovers the same candidate again
+        # inside the shared allowance; its other failures admit nothing.
+        if origin == "owner_loss" and predecessor.terminal_cause == "owner_lost":
+            return await _admit_publication_recovery(
+                session, work_item, predecessor, owner_lost=True
+            )
         return False
     if origin == "owner_loss":
         if predecessor.terminal_cause != "owner_lost":
@@ -3363,7 +3368,7 @@ async def _admit_automatic_successor(
 
 
 async def _admit_publication_recovery(
-    session: AsyncSession, work_item: WorkItem, predecessor: ExecutionRequest
+    session: AsyncSession, work_item: WorkItem, predecessor: ExecutionRequest, *, owner_lost: bool
 ) -> bool:
     """Admit one publication recovery successor for a failed publication (#5429).
 
@@ -3431,7 +3436,7 @@ async def _admit_publication_recovery(
                 reserve_automatic_retry=True,
                 # The same copied facts as an ordinary automatic successor.
                 columns={
-                    "owner_lost_retry": False,
+                    "owner_lost_retry": owner_lost,
                     "objective": predecessor.objective,
                     "requester": predecessor.requester,
                     "reply_kind": predecessor.reply_kind,
