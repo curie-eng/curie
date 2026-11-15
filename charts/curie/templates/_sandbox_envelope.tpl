@@ -1,13 +1,4 @@
-{{/*
-Sandbox resource profiles (#4889, ADR-0059 "every ceiling is an
-operator-overridable chart value").
-
-curie.sandboxProfileName: (dict "root" $ "agent" <name, "" for the generic
-template>) -> the profile name for that template:
-  1. agentSandbox.agentResourceProfiles.<agent> when set;
-  2. `factory` when factory.enabled and factory.sandboxEgress.<agent> is true;
-  3. `standard` otherwise (always for the generic template).
-*/}}
+{{/* Sandbox resource profiles (#4889, ADR-0059). curie.sandboxProfileName (dict "root" $ "agent" <name or "">): agentSandbox.agentResourceProfiles.<agent>, else `factory` when factory.enabled and factory.sandboxEgress.<agent>, else `standard`. */}}
 {{- define "curie.sandboxProfileName" -}}
 {{- $root := .root -}}
 {{- $agent := .agent -}}
@@ -24,13 +15,7 @@ standard
 {{- end -}}
 {{- end -}}
 
-{{/*
-curie.sandboxEnvelope.bytes: a quantity -> its byte count as a decimal string,
-or "" when the form is not one this render-time check compares. Only bare
-integers and the binary suffixes Ki, Mi, Gi and Ti are compared; decimal SI
-(1G), fractions, exponents, `m`, Pi and Ei are left to the API server, which
-still refuses request > limit at pod create.
-*/}}
+{{/* curie.sandboxEnvelope.bytes: quantity to byte count string, or "" for forms not compared here. Only bare integers and Ki, Mi, Gi, Ti are compared; the rest is left to the API server. */}}
 {{- define "curie.sandboxEnvelope.bytes" -}}
 {{- $q := toString . -}}
 {{- if regexMatch "^(0|[1-9][0-9]*)(Ki|Mi|Gi|Ti)?$" $q -}}
@@ -49,40 +34,7 @@ is zero or it starts with "-", else "".
 {{- if or (hasPrefix "-" $q) (regexMatch "^\\+?(0+\\.?0*|\\.0+)([eE][+-]?[0-9]+|[A-Za-z]*)$" $q) -}}true{{- end -}}
 {{- end -}}
 
-{{/*
-curie.sandboxEnvelope: (dict "root" $ "agent" <name or "">) -> JSON
-  {"profile", "resources": {"requests", "limits"}, "workspaceSizeLimit",
-   "workspaceSizeKey", "writable": [one sizeLimit per runner.hardening.writablePaths entry],
-   "writableKeys", "writableEphemeral",
-   "scratchVolume": {"type", "storageClassName"}}
-
-writable stays a list of size strings. writableKeys is the winning values key
-for each path, and writableEphemeral is true only for the path equal to
-runner.hardening.home. Workspace is ephemeral-eligible; workspaceSizeKey is the
-winning workspace key (empty when the workspace volume is off). scratchVolume
-comes from the selected profile. A missing scratchVolume, including under
---reuse-values, or a scratchVolume map with no type key, means type emptyDir
-and an empty storage class. A present type key is used as its string, including
-an empty string. Allowed types are emptyDir and ephemeral.
-
-The profile catalog (agentSandbox.resourceProfiles) is consulted only for a
-field no explicit value supplies, so a values set without the catalog (a
-release made by a chart <= 0.14.0, reused with --reuse-values) renders from its
-explicit generic keys. Precedence:
-  resources, per pair (cpu, memory, ephemeral-storage): when either
-    agentSandbox.runner.resources.requests.<r> or .limits.<r> is set, the pair
-    comes from those generic keys for EVERY template, the unset side from the
-    `standard` profile; otherwise both sides come from the selected profile.
-  workspace: agentSandbox.workspaceSizeLimits.<agent> > runner.workspace.sizeLimit
-    > profile workspaceSizeLimit (only while runner.workspace.enabled).
-  writable path: runner.hardening.writablePathSizeLimit (every path) > profile
-    homeSizeLimit for runner.hardening.home, tmpSizeLimit for /tmp,
-    writablePathSizeLimit for any other path (only while hardening.enabled).
-Every needed field must resolve (ADR-0059: finite bounds), and memory and
-ephemeral-storage requests must not exceed their limits (see
-curie.sandboxEnvelope.bytes for the forms compared); each failure names the
-template, the profile and the keys to set.
-*/}}
+{{/* curie.sandboxEnvelope: (dict "root" $ "agent" <name or "">) -> JSON {profile, resources, workspaceSizeLimit, workspaceSizeKey, writable, writableKeys, writableEphemeral (true only for runner.hardening.home), scratchVolume {type, storageClassName}}. A missing scratchVolume or type means emptyDir; allowed types are emptyDir and ephemeral. The profile catalog is consulted only for a field no explicit value supplies, so a catalog-less values set (--reuse-values from chart <= 0.14.0) renders from generic keys. Resources, per pair: if either agentSandbox.runner.resources.requests.<r> or .limits.<r> is set, the pair comes from the generic keys for EVERY template (unset side from `standard`), else from the profile. Workspace: agentSandbox.workspaceSizeLimits.<agent>, runner.workspace.sizeLimit, then profile. Writable path: runner.hardening.writablePathSizeLimit, then profile. Every field must resolve (ADR-0059); requests must not exceed limits. */}}
 {{- define "curie.sandboxEnvelope" -}}
 {{- $root := .root -}}
 {{- $agent := .agent -}}
@@ -253,12 +205,7 @@ before any template renders from it.
 {{- end -}}
 {{- end -}}
 
-{{/*
-curie.sandboxEnvelope.summary: (dict "root" $ "env" <curie.sandboxEnvelope
-fromJson>) -> one NOTES line body naming every effective limit separately:
-"memory <req>/<limit>, cpu <req>/<limit>, ephemeral-storage <req>/<limit>,
-workspace <size>, home <size>, tmp <size>" ("none" where no volume renders).
-*/}}
+{{/* curie.sandboxEnvelope.summary: (dict "root" $ "env" <envelope fromJson>) -> one NOTES line body naming every effective limit ("none" where no volume renders). */}}
 {{- define "curie.sandboxEnvelope.summary" -}}
 {{- $env := .env -}}
 {{- $h := .root.Values.agentSandbox.runner.hardening | default dict -}}
@@ -275,13 +222,7 @@ workspace <size>, home <size>, tmp <size>" ("none" where no volume renders).
 {{- printf "memory %v/%v, cpu %v/%v, ephemeral-storage %v/%v, workspace %s, home %s, tmp %s" (get $req "memory") (get $lim "memory") (get $req "cpu") (get $lim "cpu") (get $req "ephemeral-storage") (get $lim "ephemeral-storage") (toString ($env.workspaceSizeLimit | default "none")) $home $tmp -}}
 {{- end -}}
 
-{{/*
-curie.sandboxEnvelope.differing: root -> JSON list of {"agent", "env"} for
-every per-agent pool whose effective envelope differs from the generic
-template's (#4889 A6). The comparison includes resources, workspace size,
-writable sizes, the scratch volume (type and class), and the winning size-key
-fields. Used by NOTES.
-*/}}
+{{/* curie.sandboxEnvelope.differing: root -> JSON list of {agent, env} for per-agent pools whose envelope differs from the generic template's (#4889 A6). Used by NOTES. */}}
 {{- define "curie.sandboxEnvelope.differing" -}}
 {{- $root := . -}}
 {{- $generic := include "curie.sandboxEnvelope" (dict "root" $root "agent" "") | fromJson -}}
@@ -296,17 +237,7 @@ fields. Used by NOTES.
 {{- toJson $out -}}
 {{- end -}}
 
-{{/*
-curie.api.resources: root -> YAML of api.resources with limits.memory resolved
-(#4939). Shared by the API Deployment and the schema-migrate Job.
-  1. an explicit non-empty api.resources.limits.memory wins for every install;
-  2. else agentSandbox.resourceProfiles.<profile>.apiMemoryLimit, where the
-     profile is `factory` when factory.enabled is true, else `standard`.
-Every other key an operator set is kept. A release made by an older chart and
-reused with --reuse-values carries an explicit limit from its own values.yaml,
-so it resolves at step 1 even without a profile catalog. A limit that resolves
-to nothing fails the render (ADR-0059: finite bounds).
-*/}}
+{{/* curie.api.resources: root -> api.resources with limits.memory resolved (#4939), shared by the API Deployment and schema-migrate Job: explicit api.resources.limits.memory wins, else the profile's apiMemoryLimit (`factory` when factory.enabled, else `standard`); resolving to nothing fails the render (ADR-0059). */}}
 {{- define "curie.api.resources" -}}
 {{- $root := . -}}
 {{- $res := deepCopy ($root.Values.api.resources | default dict) -}}
