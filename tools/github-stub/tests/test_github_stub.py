@@ -799,9 +799,9 @@ def test_concurrent_issue_pull_and_label_creates_keep_distinct_ids(stub: Any) ->
     """Issue, pull, and label-event ids stay unique when creates run together.
 
     Review and review-comment routes only list objects. They hand out no ids.
-    Issue and label-event allocation scans the stored rows, so those tables
-    start full. Pull creation resolves git refs between the id read and the
-    insert, which is enough for concurrent creates to share an id.
+    Issue, pull, and label-event allocation each scan a full table, so those
+    tables start full. A pull id chosen before the insert can then be shared
+    by the three posts in a batch, and the later insert replaces the earlier row.
     """
 
     batches = 8
@@ -834,6 +834,21 @@ def test_concurrent_issue_pull_and_label_creates_keep_distinct_ids(stub: Any) ->
                 "actor": {"login": "octocat"},
             }
             for index in range(2, 2001)
+        ],
+    )
+    _seed_objects(
+        stub,
+        "pull",
+        [
+            {
+                "id": index,
+                "number": index,
+                "title": "stored",
+                "state": "open",
+                "head": {"ref": "main"},
+                "base": {"ref": "main"},
+            }
+            for index in range(1, 2001)
         ],
     )
     with _tls_client(stub) as reader:

@@ -1042,10 +1042,18 @@ class GithubStub:
                         ]
                 return 200, self._page(pulls, query)
             if method == "POST":
+                repository = self._repository_row()
+                # Resolve git refs before the write lock. _insert_new holds that
+                # lock only for the id allocation and the insert.
+                resolved = self._fresh_pull(
+                    {
+                        "head": {"ref": body["head"].split(":")[-1], "repo": repository},
+                        "base": {"ref": body["base"], "repo": repository},
+                    }
+                )
 
                 def build(number: int) -> dict[str, Any]:
-                    repository = self._repository_row()
-                    pull = {
+                    return {
                         "id": number,
                         "node_id": f"PR_stub{number}",
                         "number": number,
@@ -1055,10 +1063,9 @@ class GithubStub:
                         "body": body.get("body", ""),
                         "user": BOT,
                         "html_url": f"{self.base_url}/{REPOSITORY}/pull/{number}",
-                        "head": {"ref": body["head"].split(":")[-1], "repo": repository},
-                        "base": {"ref": body["base"], "repo": repository},
+                        "head": resolved["head"],
+                        "base": resolved["base"],
                     }
-                    return self._fresh_pull(pull)
 
                 return 201, self._insert_new("pull", build)
         if tail.startswith("pulls/"):
