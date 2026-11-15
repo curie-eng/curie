@@ -180,6 +180,9 @@ SETTLE_SECONDS = 120.0
 #: ``kubectl logs`` per container instance): a read that fails or times out fails
 #: the pod_logs channel and the removal goes ahead (``capture_before_deletion``).
 PRE_DELETE_READ_SECONDS = 10.0
+#: The bound on the pod read a log reader makes when its runner follow ends,
+#: well under ``PRE_DELETE_READ_SECONDS`` so it never holds a stream's ``done``.
+RESTART_READ_SECONDS = 3.0
 QUIESCENT_SECONDS = 300.0
 RESTART_SECONDS = 300.0
 RUNS_STREAM = "curie:runs"
@@ -538,7 +541,11 @@ class PodRun(pp.Attempt):
     reviewed: dict[str, Any] | None = None
     workspace_first: dict[str, Any] | None = None
     epoch: int | None = None
+    #: The runner's restartCount when the driver adopted this pod: the
+    #: recovery baseline (``await_recovery``). Re-reads never change it.
     restart_count: int = 0
+    #: The highest runner restartCount observed while this run's pod lived.
+    observed_restarts: int = 0
     branch_known: bool = False
     resolved_at: float = 0.0
     ending: bool = False
@@ -2000,7 +2007,7 @@ class TwoOwnerRun(pp.LiveRun):
                 run.pod,
                 workload="runner",
                 step="emergency-stop",
-                captured=(run.pod_uid, run.restart_count) in self.runner_log_instances,
+                captured=self.runner_captured(run),
             )
             for event in ("fence", "pod_delete_requested"):
                 self.safe(
@@ -2542,6 +2549,7 @@ class TwoOwnerRun(pp.LiveRun):
                 if runner_follow:
                     # The follow ends with the instance it followed; a restart
                     # is seen here, before ``done`` lets anyone count the streams.
+                    # The read is bounded and leaves the count as it was on failure.
                     self.observe_runner_restarts(run)
             except Exception:  # noqa: BLE001 - an incomplete stream fails closed
                 stream.complete = False
@@ -2556,21 +2564,51 @@ class TwoOwnerRun(pp.LiveRun):
         threading.Thread(target=drain, daemon=True).start()
 
     def observe_runner_restarts(self, run: PodRun) -> None:
-        """Re-read the runner's ``restartCount`` while its pod exists; only ever raise it.
+        """Re-read the runner's ``restartCount`` while its pod exists into ``observed_restarts``.
 
-        A count above the instance the follows opened on is a new runner
-        instance they never covered, so ``(pod_uid, restart_count)`` is then
-        not in ``runner_log_instances`` and the run reads as uncaptured. A pod
-        already gone (or replaced under the same name) changes nothing.
+        Only ever raises it, and never touches ``restart_count`` (the recovery
+        baseline). A pod already gone (or replaced under the same name), or a
+        read that fails within ``RESTART_READ_SECONDS``, changes nothing.
         """
 
-        pod = self.safe(lambda: self.kube.json("get", "pod", run.pod), None)
+        pod = self.safe(
+            lambda: self.kube.json("get", "pod", run.pod, timeout=RESTART_READ_SECONDS), None
+        )
         if not isinstance(pod, dict) or (pod.get("metadata") or {}).get("uid") != run.pod_uid:
             return
-        count = self.runner_restarts(pod)
+        self.note_restarts(run, self.runner_restarts(pod))
+
+    def note_restarts(self, run: PodRun, count: int) -> None:
         # Not ``guard``: the watchdog may hold it while it deletes this pod.
         with self.restart_lock:
-            run.restart_count = max(run.restart_count, count)
+            run.observed_restarts = max(run.observed_restarts, count)
+
+    def runner_captured(self, run: PodRun) -> bool:
+        """Every runner instance this run owned was followed to its end or read before removal.
+
+        The run owns its pod's instances from its baseline (``restart_count``)
+        through the highest count observed while it lived, short of an instance
+        another run adopted on the same pod (an in-place recovery's successor
+        owns the restarted container and is judged on it). A restart whose
+        instance nobody followed or read leaves the run uncaptured.
+        """
+
+        if not run.pod_uid:
+            return False
+        last = max(run.restart_count, run.observed_restarts)
+        adopted = [
+            other.restart_count
+            for other in self.pods
+            if other is not run
+            and other.pod_uid == run.pod_uid
+            and other.restart_count > run.restart_count
+        ]
+        if adopted:
+            last = min(last, min(adopted) - 1)
+        return all(
+            (run.pod_uid, instance) in self.runner_log_instances
+            for instance in range(run.restart_count, last + 1)
+        )
 
     def finish_runner_logs(self, run: PodRun, *, wait: bool = True) -> bool:
         """Count the run's log streams once they ended; True when every one ended cleanly.
@@ -2750,11 +2788,10 @@ class TwoOwnerRun(pp.LiveRun):
                         )
                     ]
                     for pod in pods:
-                        with self.restart_lock:
-                            run.restart_count = max(run.restart_count, self.runner_restarts(pod))
+                        self.note_restarts(run, self.runner_restarts(pod))
                     names = self.capture_before_deletion(pods, workload="runner", step="remove-pod")
                     captured = run.pod in names
-            if (run.pod_uid, run.restart_count) not in self.runner_log_instances:
+            if not self.runner_captured(run):
                 self.unknown_runner(run)
                 self.fail_paid(f"{run.group}: runner vanished before capture")
         with self.guard:
@@ -6622,11 +6659,7 @@ class TwoOwnerRun(pp.LiveRun):
         try:
             for namespace in (self.inputs.namespace, self.grant_namespace):
                 self.capture_namespace(self.kube_in(namespace), receipts)
-            for run in self.pods:
-                self.finish_runner_logs(run, wait=False)
-                identity = (run.pod_uid, run.restart_count)
-                if run.pod_uid and identity not in self.runner_log_instances:
-                    self.unknown_runner(run)
+            self.audit_runner_captures()
             self.capture_api(receipts)
             self.capture_traces(backend, receipts)
         except Exception:  # noqa: BLE001 - an audit that cannot finish fails its channels
@@ -6635,6 +6668,14 @@ class TwoOwnerRun(pp.LiveRun):
         finally:
             self.ledger.record("cleanup", "traces_backend", backend)
             self.ledger.record("cleanup", "capture_audit", receipts)
+
+    def audit_runner_captures(self) -> None:
+        """Count each run's ended streams; a run missing an instance it owned is unknown."""
+
+        for run in self.pods:
+            self.finish_runner_logs(run, wait=False)
+            if run.pod_uid and not self.runner_captured(run):
+                self.unknown_runner(run)
 
     def capture(
         self, channel: str, receipts: dict[str, dict[str, Any]], read: Callable[[], bytes | None]

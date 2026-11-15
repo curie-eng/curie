@@ -380,12 +380,12 @@ class TokenScan:
         is scanned again with this chunk; only new bytes are counted.
         """
 
-        with self._lock:
-            joined = self._tails.get((channel, key), b"") + data
-        hit = self.scrubber.found(joined)
         keep = max(0, self.scrubber.longest() - 1)
         with self._lock:
+            # One swap: the tail this chunk joins and the tail it leaves.
+            joined = self._tails.get((channel, key), b"") + data
             self._tails[(channel, key)] = joined[-keep:] if keep else b""
+        hit = self.scrubber.found(joined)
         self._count(channel, len(data), hit)
         return hit
 

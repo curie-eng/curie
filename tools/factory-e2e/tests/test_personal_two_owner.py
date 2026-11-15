@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import datetime as dt
+import functools
 import hashlib
 import io
 import json
@@ -5114,13 +5115,131 @@ def test_the_driver_sees_a_runner_restart_its_follow_never_covered(
     commands = _followed(h, monkeypatch, run, 0, later_restarts=1)
     assert [argv[-1] for argv in commands] == ["--follow"]
     assert run.log_instance == 0
-    assert run.restart_count == 1
+    # The observed count rises; the adoption baseline does not.
+    assert (run.restart_count, run.observed_restarts) == (0, 1)
     _suspended(h, run)
     with pytest.raises(pp.StepFailed, match="runner vanished before capture"):
         h.run.finish_park(run)
     assert (run.pod_uid, 0) in h.run.runner_log_instances
     assert (run.pod_uid, 1) not in h.run.runner_log_instances
     assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+
+
+def test_a_failed_restart_read_leaves_the_follow_complete_and_the_count_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-read is bounded and best effort: a failed GET changes nothing it judges."""
+
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    reads: list[int] = []
+
+    def read(_argv: Sequence[str], _input: Any) -> Any:
+        reads.append(1)
+        if len(reads) == 1:
+            return {
+                "metadata": {"name": run.pod, "uid": run.pod_uid},
+                "spec": {"containers": [{"name": pps.RUNNER_CONTAINER}]},
+                "status": {"containerStatuses": [{"name": pps.RUNNER_CONTAINER}]},
+            }
+        return pp.Completed(1, "", "timed out")
+
+    h.shell.on("get", "pod", run.pod)(read)
+
+    def spawn(argv: Sequence[str]) -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            [sys.executable, "-c", "print('runner log')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    monkeypatch.setattr(h.shell, "spawn", spawn)
+    pt.TwoOwnerRun.open_runner_logs(h.run, run)
+    for stream in run.logs:
+        assert stream.done.wait(timeout=5)
+    assert len(reads) == 2
+    assert all(stream.complete for stream in run.logs)
+    assert run.observed_restarts == 0
+    timeouts = [c.timeout for c in h.shell.calls if c.argv[-4:] == ["pod", run.pod, "-o", "json"]]
+    assert timeouts[-1] == pt.RESTART_READ_SECONDS < pt.PRE_DELETE_READ_SECONDS
+
+
+def test_an_in_place_recovery_keeps_its_baseline_and_counts_both_followed_instances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM restarts B-r1's container in place, which ends its follow; B-r2 adopts it.
+
+    The follow's re-read sees restartCount 1. Recovery in place is still
+    detected against the adoption baseline (0), and the audit counts B-r1 on
+    its own instance (read before the signal and followed to its end) and B-r2
+    on the restarted one it followed, so neither is rewritten unknown.
+    """
+
+    h = _live(tmp_path)
+    held = _interruption_setup(h)
+    h.shell.on("exec", held.pod, "python3")(lambda _a, _s: _witness())
+    restarts = {"count": 0}
+
+    def pod(_argv: Sequence[str], _input: Any) -> dict[str, Any]:
+        return {
+            "metadata": {"name": held.pod, "uid": held.pod_uid},
+            "spec": {"containers": [{"name": pps.RUNNER_CONTAINER}]},
+            "status": {
+                "containerStatuses": [
+                    {
+                        "name": pps.RUNNER_CONTAINER,
+                        "restartCount": restarts["count"],
+                        "state": {"running": {"startedAt": _stamp(0)}},
+                    }
+                ]
+            },
+        }
+
+    h.shell.on("get", "pod", held.pod)(pod)
+    children: list[subprocess.Popen[bytes]] = []
+
+    def spawn(argv: Sequence[str]) -> subprocess.Popen[bytes]:
+        # B-r1's follow lives until its container restarts; B-r2's end at once.
+        code = "import sys;print('runner log');sys.stdin.read()" if not children else "print(1)"
+        child = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(h.shell, "spawn", spawn)
+    pt.TwoOwnerRun.open_runner_logs(h.run, held)
+    h.run.open_runner_logs = functools.partial(  # type: ignore[method-assign]
+        pt.TwoOwnerRun.open_runner_logs, h.run
+    )
+
+    def interrupt(pod_name: str, hold: Mapping[str, Any]) -> dict[str, Any]:
+        # PID 1 got SIGTERM: the runner container restarts in the same pod,
+        # and the follow on the old instance ends.
+        restarts["count"] = 1
+        assert children[0].stdin is not None
+        children[0].stdin.close()
+        for stream in held.logs:
+            assert stream.done.wait(timeout=5)
+        return {"action": "signal_processes", "native_identity_matched": True, "native_gone": True}
+
+    h.run.interrupt_native_process = interrupt  # type: ignore[method-assign]
+    h.run.phase_process_interruption()
+    repair = h.run.pod_run("b-r2")
+    assert h.ledger.observations("restarts")["process_recovery"] == "in_place"
+    assert (held.restart_count, held.observed_restarts) == (0, 1)
+    assert (repair.pod_uid, repair.restart_count, repair.log_instance) == (held.pod_uid, 1, 1)
+    for stream in repair.logs:
+        assert stream.done.wait(timeout=5)
+    h.run.audit_runner_captures()
+    assert {(held.pod_uid, 0), (held.pod_uid, 1)} <= h.run.runner_log_instances
+    assert h.run.runner_captured(held) and h.run.runner_captured(repair)
+    assert "unknown" not in {row["source"] for row in _rows(h, "b-r1")}
+    assert h.run.settled_known("b-r1")
 
 
 def test_remove_pod_captures_the_runner_pod_before_deleting_it(tmp_path: Path) -> None:
