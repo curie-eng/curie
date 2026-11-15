@@ -5025,6 +5025,8 @@ def test_a_parked_session_settles_from_the_log_stream_after_the_product_removes_
     assert receipt["sources"] == 1 and receipt["failures"] == 0
     assert receipt["uncaptured"] == []
     assert [item["step"] for item in receipt["before_deletion"]] == ["followed-to-end"]
+    # The cleanup judge counts that pod as captured before its removal.
+    assert pto.removals_recorded(receipt)
     assert h.runtime.scan.as_json()["pod_logs"]["scanned_bytes"] > 0
     assert not _pod_deletes(h, run.pod)
     events = {row["event"] for row in h.ledger.timing_rows()}

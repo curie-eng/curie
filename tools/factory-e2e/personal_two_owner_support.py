@@ -3067,9 +3067,18 @@ CAPTURE_CHANNELS = (
 REMOVAL_RECORDS = ("before_deletion", "uncaptured")
 #: What a removed pod ran: the worker or a runner.
 POD_WORKLOADS = ("worker", "runner")
-#: The removals that capture first: a worker scale-down, a runner pod deletion
-#: and the planned fence (the live end, the rehearsal cut and finalize).
-CAPTURED_REMOVALS = ("stop-worker", "remove-pod", "fence", "disconnect", "process-interruption")
+#: The removals that capture first: a worker scale-down, a runner pod deletion,
+#: the planned fence (the live end, the rehearsal cut and finalize), and a runner
+#: pod the product removed (an approval suspension) whose logs were followed to
+#: their end (``followed-to-end``).
+CAPTURED_REMOVALS = (
+    "stop-worker",
+    "remove-pod",
+    "fence",
+    "disconnect",
+    "process-interruption",
+    "followed-to-end",
+)
 #: Every removal step; the stop path's two capture nothing.
 REMOVAL_STEPS = (*CAPTURED_REMOVALS, "emergency-stop", "emergency-fence", "capture-missing")
 #: Forge file contents read at published heads (``TwoOwnerRun.forge_file``).
