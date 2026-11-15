@@ -1719,7 +1719,9 @@ def _triage(
 
     context = client.portal.call(go)
     minted = client.post(
-        MINT_URL, headers=WORKER_HEADERS, json={"execution_request_id": str(request_id)}
+        MINT_URL,
+        headers=WORKER_HEADERS,
+        json={"execution_request_id": str(request_id), "publication_recovery": False},
     )
     assert minted.status_code == 200, minted.text
     return _Triage(
@@ -2028,12 +2030,23 @@ def test_an_implementation_capability_gets_its_contract_and_cannot_submit(
     assert triage.tracker.ledger.writes == 0
 
 
-def _recovery_contract(client: TestClient, request_id: uuid.UUID) -> Any:
+def _mint(client: TestClient, request_id: uuid.UUID, *, publication_recovery: bool) -> Any:
+    return client.post(
+        MINT_URL,
+        headers=recovery.WORKER,
+        json={
+            "execution_request_id": str(request_id),
+            "publication_recovery": publication_recovery,
+        },
+    )
+
+
+def _recovery_contract(
+    client: TestClient, request_id: uuid.UUID, *, publication_recovery: bool
+) -> Any:
     """Mint the issue read capability the worker injects, then ask the contract."""
 
-    minted = client.post(
-        MINT_URL, headers=recovery.WORKER, json={"execution_request_id": str(request_id)}
-    )
+    minted = _mint(client, request_id, publication_recovery=publication_recovery)
     assert minted.status_code == 200, minted.text
     return client.post(CONTRACT_URL, headers={"X-Curie-Issue-Read": minted.json()["capability"]})
 
@@ -2045,10 +2058,13 @@ def test_a_publication_recovery_capability_gets_the_recovery_contract(
     # predecessor, asked while it ran, is the control on the same WorkItem.
     item = recovery._item(api, recovery._agent(api, auth_headers), 54790)
     implementation = recovery._run(api, item.request_id, item.work_item_id)
-    answered = _recovery_contract(api, item.request_id)
+    answered = _recovery_contract(api, item.request_id, publication_recovery=False)
     assert answered.status_code == 200, answered.text
     assert answered.json()["completion_contract"] == "implementation"
     assert answered.json()["execution"]["execution_request_id"] == str(item.request_id)
+    # Only a publication recovery request may mint the recovery capability.
+    refused = _mint(api, item.request_id, publication_recovery=True)
+    assert refused.status_code == 409, refused.text
     recovery._capture(api, implementation)
     recovery._settle(implementation.ref, "publication_failed")
     successor = recovery._successor(item.request_id)
@@ -2058,7 +2074,7 @@ def test_a_publication_recovery_capability_gets_the_recovery_contract(
 
     for _ in range(2):
         # Asking again changes nothing: the recovery reserves nothing.
-        contract = _recovery_contract(api, successor["id"])
+        contract = _recovery_contract(api, successor["id"], publication_recovery=True)
         assert contract.status_code == 200, contract.text
         assert contract.headers["Cache-Control"] == "no-store"
         assert contract.json() == {
@@ -2067,6 +2083,13 @@ def test_a_publication_recovery_capability_gets_the_recovery_contract(
             "session_usd_allowance": None,
             "execution": None,
         }
+    # A CI fix or review turn on the same running recovery request mints an
+    # ordinary capability and gets the ordinary workflow contract, bound to
+    # this request, so its runner starts the model (ADR 0269 point 5).
+    ci_fix = _recovery_contract(api, successor["id"], publication_recovery=False)
+    assert ci_fix.status_code == 200, ci_fix.text
+    assert ci_fix.json()["completion_contract"] == "implementation"
+    assert ci_fix.json()["execution"]["execution_request_id"] == str(successor["id"])
     row = recovery._request(successor["id"])
     assert row["model_session_reserved_at"] is None
     assert row["completion_contract"] == "implementation"

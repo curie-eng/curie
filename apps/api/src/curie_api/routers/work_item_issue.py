@@ -17,6 +17,7 @@ from typing import Annotated, Final
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy import select
 
 from curie_api.schemas.workitems import (
     CompletionContractOut,
@@ -51,6 +52,7 @@ from ..issue_read import (
     read_issue_authority,
 )
 from ..issue_read_token import IssueReadClaims, mint, verify_claims
+from ..models import ExecutionRequest
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +110,19 @@ async def mint_issue_read_context(
         raise issue_read_error(
             409, "invalid_context", "the execution cannot read its issue"
         ) from None
+    if data.publication_recovery and (
+        await session.scalar(
+            select(ExecutionRequest.execution_kind).where(
+                ExecutionRequest.id == data.execution_request_id
+            )
+        )
+        != _PUBLICATION_RECOVERY
+    ):
+        # Only a publication recovery request's own execute delivery may
+        # learn that its runner constructs no model session (#5429).
+        raise issue_read_error(
+            409, "invalid_context", "the execution is not a publication recovery"
+        )
     now = int(time.time())
     exp = now + CAPABILITY_TTL_SECONDS
     if authority.execution_deadline is not None:
@@ -120,6 +135,7 @@ async def mint_issue_read_context(
         tracker_host=authority.issue.host,
         tracker_scope_id=authority.issue.scope_id,
         tracker_issue_id=authority.issue.issue_id,
+        publication_recovery=data.publication_recovery,
         iat=now,
         exp=exp,
     )
@@ -321,9 +337,13 @@ async def read_completion_contract(
         raise _refused(refused.code) from None
     except (runtime.SourceUnavailable, IssueReadUnavailable):
         raise _tracker_unavailable() from None
-    if pair.request.execution_kind == _PUBLICATION_RECOVERY:
-        # The column CHECK pins a recovery's stored contract to
-        # implementation, so the precheck above reserved nothing.
+    if claims.publication_recovery:
+        # Minted only for a publication recovery request's execute delivery,
+        # whose kind cannot change. A CI fix or review turn on the same
+        # request mints an ordinary capability and gets the ordinary
+        # workflow contract below (ADR 0269 point 5). The column CHECK pins a
+        # recovery's stored contract to implementation, so the precheck
+        # above reserved nothing.
         return CompletionContractOut(
             completion_contract=_PUBLICATION_RECOVERY,
             result_kinds=[],

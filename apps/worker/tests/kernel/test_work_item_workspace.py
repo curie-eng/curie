@@ -337,7 +337,9 @@ class _WorkItems(AbsentRequesterContext):
         self.deadline_holds.discard(request_id)
         return WorkItemHeartbeat(status="running", terminal_cause=None, work_item_cancelled=False)
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         self.calls.append("issue_read_context")
         return f"{WORK_ITEM_REPO}#7", f"wir.capability-for-{request_id}"
 

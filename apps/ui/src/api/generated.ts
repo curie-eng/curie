@@ -9719,6 +9719,8 @@ export interface components {
              * Format: uuid
              */
             execution_request_id: string;
+            /** Publication Recovery */
+            publication_recovery: boolean;
         };
         /**
          * IssueReadResult

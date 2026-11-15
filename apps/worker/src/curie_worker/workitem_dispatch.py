@@ -660,17 +660,25 @@ class WorkItemDispatchClient:
                 "work-item request view returned an unusable body"
             ) from exc
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         """The execution scoped issue read capability (ADR 0187).
 
         Returns the issue the capability names, as its tracker's display
         reference (``owner/repo#number`` on GitHub, ``PROJ-12`` on Jira), and
         the capability itself. The worker never reads the issue.
+        ``publication_recovery`` is true only for a publication recovery
+        request's own execute delivery, whose runner then constructs no model
+        session (#5429); any later turn on that request mints false.
         """
 
         body = await self._post(
             "/v1/internal/work-items/issue-read/context",
-            {"execution_request_id": str(request_id)},
+            {
+                "execution_request_id": str(request_id),
+                "publication_recovery": publication_recovery,
+            },
         )
         try:
             if uuid.UUID(str(body["execution_request_id"])) != request_id:

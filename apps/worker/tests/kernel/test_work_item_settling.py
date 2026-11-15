@@ -1545,7 +1545,7 @@ def _issue_read_context(body: dict[str, Any]) -> tuple[str, str]:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example-token", client=http
             )
-            return await client.issue_read_context(request_id)
+            return await client.issue_read_context(request_id, publication_recovery=False)
 
     return asyncio.run(go())
 

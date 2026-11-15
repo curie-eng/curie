@@ -128,13 +128,17 @@ class _ContractWorkItems(_WorkItems):
         self.starts[request_id] = started
         return started
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         self.calls.append("issue_read_context")
         if isinstance(self.mint, asyncio.Event):
             await self.mint.wait()
         elif isinstance(self.mint, BaseException):
             raise self.mint
-        return await super().issue_read_context(request_id)
+        return await super().issue_read_context(
+            request_id, publication_recovery=publication_recovery
+        )
 
     async def defer(
         self, request_id: uuid.UUID, *, reason: str, capacity: bool, **_: object

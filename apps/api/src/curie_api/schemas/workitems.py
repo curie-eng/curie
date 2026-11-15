@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Any, Literal
 
 from curie_internal.requester_coding_instructions import AbsenceReason
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictBool
 
 from curie_api.factory_retry_policy import RetrySafety
 
@@ -15,6 +15,10 @@ class IssueReadContextMint(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     execution_request_id: uuid.UUID
+    # True only for a publication recovery request's own execute delivery
+    # (#5429): its runner learns from the capability to construct no model
+    # session. A later CI fix or review turn on the same request mints false.
+    publication_recovery: StrictBool
 
 
 class IssueReadContext(BaseModel):

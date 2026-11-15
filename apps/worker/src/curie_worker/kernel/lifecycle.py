@@ -1202,8 +1202,11 @@ async def _process_event(
                 )
             elif owned_work_item_id is not None and self._work_items is not None:
                 try:
+                    # Any delivery here is an ordinary turn: a CI fix or
+                    # review turn on a publication recovery request runs its
+                    # model as a bounded workflow turn (#5429, ADR 0269).
                     issue, capability = await self._work_items.issue_read_context(
-                        owned_work_item_id
+                        owned_work_item_id, publication_recovery=False
                     )
                 except (WorkItemConflict, WorkItemTransportError) as exc:
                     logger.warning(
@@ -2296,7 +2299,9 @@ async def _mint_fail_closed_capability(
     assert self._work_items is not None
     try:
         async with asyncio.timeout(_TRACKER_RESULT_MINT_TIMEOUT_S):
-            return await self._work_items.issue_read_context(request_id)
+            return await self._work_items.issue_read_context(
+                request_id, publication_recovery=run.is_publication_recovery
+            )
     except Exception as exc:  # noqa: BLE001 - this gate fails closed on any fault
         reason = type(exc).__name__
     logger.warning(

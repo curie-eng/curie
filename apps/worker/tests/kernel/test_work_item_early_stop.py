@@ -289,7 +289,9 @@ class _WorkItems(AbsentRequesterContext):
         if self.after_finish is not None:
             await self.after_finish()
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         return "acme widgets issue 7", f"wir.capability-for-{request_id}"
 
     async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:

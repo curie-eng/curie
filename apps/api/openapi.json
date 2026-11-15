@@ -11420,10 +11420,15 @@
             "format": "uuid",
             "title": "Execution Request Id",
             "type": "string"
+          },
+          "publication_recovery": {
+            "title": "Publication Recovery",
+            "type": "boolean"
           }
         },
         "required": [
-          "execution_request_id"
+          "execution_request_id",
+          "publication_recovery"
         ],
         "title": "IssueReadContextMint",
         "type": "object"

@@ -306,7 +306,9 @@ class _Stage:
     async def read_binding(self, request_id: uuid.UUID) -> Any:
         """The binding the runner reads from its real completion contract now."""
 
-        _issue, capability = await self.dispatch.issue_read_context(request_id)
+        _issue, capability = await self.dispatch.issue_read_context(
+            request_id, publication_recovery=False
+        )
         urls = sibling_urls(f"{self.services.api_url}/work-items/issue-read")
         contract = await fetch_completion_contract(urls.completion_contract, capability)
         assert contract.execution is not None
@@ -844,7 +846,9 @@ def _joined(
         run = await stage.acquired(selected=True)
         model = _Model(stage, run)
         collector = _Collector()
-        _issue, capability = await stage.dispatch.issue_read_context(run.request_id)
+        _issue, capability = await stage.dispatch.issue_read_context(
+            run.request_id, publication_recovery=False
+        )
         monkeypatch.setenv(ISSUE_READ_URL_ENV, f"{stage.services.api_url}/work-items/issue-read")
         monkeypatch.setenv(ISSUE_READ_TOKEN_ENV, capability)
         async with (

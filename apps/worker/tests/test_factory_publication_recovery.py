@@ -33,6 +33,7 @@ was admitted.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import shutil
 import uuid
@@ -45,11 +46,13 @@ import httpx
 import pytest
 from aiohttp.test_utils import TestServer
 from channel_protocol.work_item_events import execute_event_id
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from curie_runner import RunTracer, SideEffectClassifier, workspace_snapshot
 from curie_runner.fake import FakeModelSession
 from curie_runner.server import bind_status_attestation
 from curie_runner.server import create_app as create_runner_app
 from curie_runner.session import SessionRunner
+from curie_runner.tracker_result import BoundContract, bind_completion_contract
 from curie_worker.approvals import ApprovalClient
 from curie_worker.binding import FactoryWake
 from curie_worker.kernel.publication_recovery import RECOVERY_REFUSED_CAUSE
@@ -63,6 +66,7 @@ from curie_worker.publication_candidates import PublicationCandidateClient
 from curie_worker.runner_client import RunnerClient, RunnerWorkspaceSnapshot
 from curie_worker.workitem_dispatch import WorkItemRun
 
+from apps.worker.tests import factory_retry_fixtures
 from apps.worker.tests.factory_retry_fixtures import (
     FactoryRetryCase,
     Item,
@@ -512,6 +516,109 @@ def test_a_refused_recovery_finishes_terminal_with_its_code(
             assert await case.used(retained.item.work_item_id) == 1
             predecessor = await case.row(retained.item.request_id)
             assert {key: predecessor[key] for key in _SETTLED} == retained.settled
+        finally:
+            await owned.close()
+            await _drop_candidates(case)
+
+    case.run(exercise())
+
+
+# -- e: a CI fix on a recovery request is an ordinary bounded workflow turn ----------------
+
+
+def _checks_fixed() -> list[Any]:
+    """A model turn that ends cleanly, as the CI fix runner's model answers it."""
+
+    return [
+        AssistantMessage(content=[TextBlock(text="The checks are fixed.")], model="fake-model"),
+        ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="fake-session",
+            result="The checks are fixed.",
+            usage=None,
+        ),
+    ]
+
+
+def test_a_ci_fix_on_a_recovery_request_starts_the_model_with_the_ordinary_contract(
+    candidate_env: Path,
+    factory_retry: FactoryRetryCase,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 0269 point 5: only the recovery execute wake is model free.
+
+    The recovery publishes its candidate with no model turn; a CI fix round on
+    the same running request then cold-claims a fresh sandbox, whose runner
+    reads the ordinary implementation contract bound to that request and runs
+    its model.
+    """
+
+    case = factory_retry
+    mints: list[tuple[uuid.UUID, bool]] = []
+    contracts: list[BoundContract] = []
+    work_items = case.h.kernel._work_items
+    assert work_items is not None
+    mint = work_items.issue_read_context
+
+    async def recorded_mint(request_id: uuid.UUID, *, publication_recovery: bool) -> Any:
+        mints.append((request_id, publication_recovery))
+        return await mint(request_id, publication_recovery=publication_recovery)
+
+    async def recorded_bind(issue_read: Any) -> BoundContract:
+        bound = await bind_completion_contract(issue_read)
+        contracts.append(bound)
+        return bound
+
+    monkeypatch.setattr(work_items, "issue_read_context", recorded_mint)
+    monkeypatch.setattr(factory_retry_fixtures, "bind_completion_contract", recorded_bind)
+
+    async def exercise() -> None:
+        owned = _Owned()
+        try:
+            retained = await _retained_failure(case, owned, tmp_path)
+            _wire(case, owned, lose_first_create=False)
+            recovering, fixing = await case.real_runners(
+                2, script=_checks_fixed, preflight_workspace=retained.base_checkout
+            )
+
+            await case.publish_wake(retained.successor_id)
+            await case.settle()
+            (publication,) = await _publications(case, retained.successor_id)
+            assert recovering.turns == 0
+            assert mints == [(retained.successor_id, True)]
+            (recovery,) = contracts
+            assert recovery.contract.publication_recovery
+            assert recovery.contract.execution is None
+
+            # The publication's outcome reached durable history, as after its
+            # approval and Job; this harness runs neither, so SQL stands in.
+            await case.execute(
+                "UPDATE curie.publications SET status = 'succeeded', "
+                "outcome_history_ready_at = clock_timestamp() WHERE id = :id",
+                {"id": publication["id"]},
+            )
+            recovered = dataclasses.replace(retained.item, request_id=retained.successor_id)
+            case.enqueue(case.ci_fix_turn(recovered, round_=2))
+            await case.finished(retained.successor_id)
+            await case.settle()
+
+            # The CI fix minted an ordinary capability for the same request,
+            # its runner read the bounded workflow contract bound to that
+            # request, and the model ran.
+            assert mints == [(retained.successor_id, True), (retained.successor_id, False)]
+            _, ci_fix = contracts
+            assert ci_fix.contract.kind == "implementation"
+            assert ci_fix.contract.execution is not None
+            assert ci_fix.contract.execution.execution_request_id == str(retained.successor_id)
+            assert fixing.turns >= 1
+            assert recovering.turns == 0
+            (published,) = await _publications(case, retained.successor_id)
+            assert published["id"] == publication["id"]
         finally:
             await owned.close()
             await _drop_candidates(case)
