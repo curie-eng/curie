@@ -2059,14 +2059,29 @@ owns the result and `budget_exceeded` all suppress an ordinary retry.
 
 A retry is either scheduled or blocked. A scheduled retry is dispatched after a
 backoff of about 30 seconds for the first retry and about 120 seconds for the
-second, each with a fixed 20 percent jitter keyed by the WorkItem, or at a
-later provider retry time when the worker reported one. A blocked retry waits
-for a named condition, such as `provider_usage_reset` or
-`runner_fault_diagnosis`, and is never dispatched while it is blocked. Nothing
-in this release releases a block, so a blocked retry ends `expired` with cause
-`retry_condition_expired` when its waiting deadline passes, unless a person
-relabels the issue first. Only a wait that was not blocked expires as
-`capacity_wait_expired`. The counted `not_started` deferrals carry across the
+second, each with a fixed 20 percent jitter keyed by the WorkItem, or later
+when the worker reported a provider time. A provider rate limit or usage reset
+time is used plus 60 seconds. A blocked retry waits for a named condition, such
+as `provider_usage_reset` or `runner_fault_diagnosis`, and is never dispatched
+while it is blocked. A provider rate limit that names no reset time is blocked
+on `provider_rate_limit`, which nothing releases before its deadline.
+
+Three provider waits can be released before their deadline. A retry blocked
+on `provider_credential` is released once the worker runs with a different
+credential for the same provider and a read-only probe of that credential
+authenticated after the failure. A retry blocked on `provider_credit` or
+`provider_usage_reset` is released once the same credential is still in use, a
+probe shows a strictly greater credit limit than before the failure, and some
+of it remains. The probe must be at most two minutes old, and only OpenRouter
+keys have such a probe today. A falling usage figure, a refund, an unlimited
+key, an unrelated deployment change or a provider without a probe never
+releases a wait. The reconciler rechecks the evidence, the WorkItem and the
+failed request's condition in the same transaction that lifts the block, and
+the released retry is dispatched in that same pass. Releasing spends no retry
+and keeps the waiting deadline. Every other block, and every provider wait
+nothing released, ends `expired` with cause `retry_condition_expired` when its
+waiting deadline passes, unless a person relabels the issue first. Only a wait
+that was not blocked expires as `capacity_wait_expired`. The counted `not_started` deferrals carry across the
 retries of one WorkItem, so `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` bounds the
 whole chain, not each request.
 

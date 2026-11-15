@@ -2310,6 +2310,7 @@
         "step": [
           "settle_publications",
           "expire_waiting",
+          "release_provider_gates",
           "request_deadline_cancellations",
           "request_owner_lost_cancellations",
           "publish_terminate_wakes",
@@ -2326,7 +2327,7 @@
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 16
+      "cardinality_bound": 17
     },
     "curie.work_item.reconciler.step.consecutive_failures": {
       "type": "gauge",
@@ -2340,6 +2341,7 @@
         "step": [
           "settle_publications",
           "expire_waiting",
+          "release_provider_gates",
           "request_deadline_cancellations",
           "request_owner_lost_cancellations",
           "publish_terminate_wakes",
@@ -2356,7 +2358,7 @@
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 16
+      "cardinality_bound": 17
     },
     "curie.eval.process": {
       "type": "counter",
