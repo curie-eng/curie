@@ -475,6 +475,8 @@ class RunnerLog:
     process: subprocess.Popen[bytes]
     done: threading.Event = dataclasses.field(default_factory=threading.Event)
     complete: bool = False
+    #: A ``--follow`` stream: it ends only with the instance it followed.
+    follow: bool = False
 
 
 @dataclasses.dataclass(repr=False)
@@ -2528,7 +2530,7 @@ class TwoOwnerRun(pp.LiveRun):
                 *flags,
             ]
         )
-        stream = RunnerLog(container, process)
+        stream = RunnerLog(container, process, follow="--follow" in flags)
         run.logs.append(stream)
         self.processes.append(process)
         self.finalizer.register(
@@ -2609,6 +2611,23 @@ class TwoOwnerRun(pp.LiveRun):
             (run.pod_uid, instance) in self.runner_log_instances
             for instance in range(run.restart_count, last + 1)
         )
+
+    def settle_ended_follows(self, run: PodRun) -> None:
+        """Name the followed runner instance captured once its runner follows ended cleanly.
+
+        A follow ends only with the instance it followed (a restart or the
+        pod's removal), so while the pod still exists a clean end covers
+        ``log_instance`` even though the other containers' streams still run.
+        ``finish_runner_logs`` still counts every stream once they all end.
+        """
+
+        follows = [
+            stream
+            for stream in run.logs
+            if stream.follow and stream.container == pps.RUNNER_CONTAINER
+        ]
+        if run.pod_uid and follows and all(s.done.is_set() and s.complete for s in follows):
+            self.runner_log_instances.add((run.pod_uid, run.log_instance))
 
     def finish_runner_logs(self, run: PodRun, *, wait: bool = True) -> bool:
         """Count the run's log streams once they ended; True when every one ended cleanly.
@@ -2777,6 +2796,9 @@ class TwoOwnerRun(pp.LiveRun):
                 # session): only the streams that followed it hold its logs.
                 self.finish_runner_logs(run)
             else:
+                # A follow that ended at a restart covers its instance; the
+                # pre-delete read below covers the current and previous ones.
+                self.settle_ended_follows(run)
                 listed = self.listed_before_deletion(
                     "get", "pods", "--field-selector", f"metadata.name={run.pod}"
                 )
@@ -6761,6 +6783,7 @@ class TwoOwnerRun(pp.LiveRun):
                 continue
             reads = pto.container_log_reads({"items": [pod]})
             complete = bool(reads)
+            previous_runner = (name, pps.RUNNER_CONTAINER, True) in reads
             for _pod, container, previous in reads:
                 flags = ("--previous",) if previous else ()
                 read = functools.partial(
@@ -6777,7 +6800,11 @@ class TwoOwnerRun(pp.LiveRun):
             if complete and workload == "runner":
                 uid = str((pod.get("metadata") or {}).get("uid") or "")
                 if uid:
-                    self.runner_log_instances.add((uid, self.runner_restarts(pod)))
+                    # The current instance, and the previous one when it was read.
+                    count = self.runner_restarts(pod)
+                    self.runner_log_instances.add((uid, count))
+                    if previous_runner and count > 0:
+                        self.runner_log_instances.add((uid, count - 1))
             self.note_removal(name, workload=workload, step=step, captured=complete)
             if complete:
                 named.add(name)

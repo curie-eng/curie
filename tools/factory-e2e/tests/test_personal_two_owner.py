@@ -4914,7 +4914,12 @@ def _removed(pod: str, workload: str, step: str) -> dict[str, str]:
 
 
 def _removal_cluster(
-    h: _Harness, *, deleted: bytes = b"", draining: bool = False, failing: Sequence[str] = ()
+    h: _Harness,
+    *,
+    deleted: bytes = b"",
+    draining: bool = False,
+    failing: Sequence[str] = (),
+    runner_restarts: int = 0,
 ) -> list[str]:
     """The worker pod and A1's runner pod, their logs, the scale-down and the deletes.
 
@@ -4945,7 +4950,14 @@ def _removal_cluster(
         },
         "status": {
             "initContainerStatuses": [_status("setup", state="terminated")],
-            "containerStatuses": [_status("runner", state="running")],
+            "containerStatuses": [
+                _status(
+                    "runner",
+                    state="running",
+                    restarts=runner_restarts,
+                    last=bool(runner_restarts),
+                )
+            ],
         },
     }
     order: list[str] = []
@@ -5290,6 +5302,40 @@ def test_an_in_place_recovery_keeps_its_baseline_and_counts_both_followed_instan
     assert h.run.runner_captured(held) and h.run.runner_captured(repair)
     assert "unknown" not in {row["source"] for row in _rows(h, "b-r1")}
     assert h.run.settled_known("b-r1")
+
+
+@pytest.mark.parametrize("restarts", [1, 2])
+def test_a_present_pod_counts_its_ended_follow_and_both_pre_delete_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restarts: int
+) -> None:
+    """The follow of instance 0 ended at a restart; the pod is still there.
+
+    Removal settles the ended follow before it decides capture (instance 0),
+    and the pre-delete read of the runner's current and previous logs names
+    both of those instances, so every instance the run owned is captured and
+    its usage stays settled. With two restarts each half alone falls short.
+    """
+
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    _followed(h, monkeypatch, run, 0, later_restarts=restarts)
+    assert (run.restart_count, run.observed_restarts, run.log_instance) == (0, restarts, 0)
+    assert all(stream.complete for stream in run.logs)
+    order = _removal_cluster(h, runner_restarts=restarts)
+    h.run.pod_uid_present = lambda _name, _uid: "delete-pod-a1" not in order  # type: ignore[method-assign]
+    run.eof.set()
+    h.run.remove_pod(run)
+    assert order == [
+        "logs:pod-a1/setup",
+        "logs:pod-a1/runner",
+        "logs:pod-a1/runner/previous",
+        "delete-pod-a1",
+    ]
+    assert {(run.pod_uid, n) for n in range(restarts + 1)} <= h.run.runner_log_instances
+    assert h.run.runner_captured(run)
+    assert "unknown" not in {row["source"] for row in _rows(h, "a1")}
+    assert run.stopped and h.run.paid_failure is None
 
 
 def test_remove_pod_captures_the_runner_pod_before_deleting_it(tmp_path: Path) -> None:
