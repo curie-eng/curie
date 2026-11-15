@@ -465,6 +465,14 @@ class GateStream:
         pp.stop_process(self.process)
 
 
+@dataclasses.dataclass
+class RunnerLog:
+    container: str
+    process: subprocess.Popen[bytes]
+    done: threading.Event = dataclasses.field(default_factory=threading.Event)
+    complete: bool = False
+
+
 @dataclasses.dataclass(repr=False)
 class PodRun(pp.Attempt):
     """One reservation group on one runner container, as the driver gates it.
@@ -535,6 +543,10 @@ class PodRun(pp.Attempt):
     ending: bool = False
     settled: bool = False
     closed: bool = False
+    logs: list[RunnerLog] = dataclasses.field(default_factory=list)
+    log_instance: int = 0
+    logs_finished: bool = False
+    logs_complete: bool = False
 
     def __repr__(self) -> str:
         return f"<pod run {self.group}>"
@@ -2440,11 +2452,133 @@ class TwoOwnerRun(pp.LiveRun):
             and custody
         ):
             self.fail_paid(f"{run.group} claim does not deliver the owner's own grant")
+        self.open_runner_logs(run)
         self.open_harvest(run)
         run.gate = self.open_gate(run)
         run.limits = pto.subagent_limits(run.group)
         run.gate.send({"limits": dict(run.limits)})
         run.limits_sent_at = self.clock.now()
+
+    def open_runner_logs(self, run: PodRun) -> None:
+        """Follow every container log of the runner pod from its start, scanned as it streams.
+
+        The product suspends a session parked on an approval and deletes its
+        pod (``Sandbox.suspend``), so a read after the park finds nothing. The
+        runner container's current instance is followed until it ends; a
+        container that already restarted also gets its previous instance read.
+        ``finish_runner_logs`` names the instance captured only when every
+        stream of it ended cleanly.
+        """
+
+        pod = self.kube.json("get", "pod", run.pod)
+        if (pod.get("metadata") or {}).get("uid") != run.pod_uid:
+            self.fail_paid(f"{run.group}: runner changed before log capture")
+        spec, status = pod.get("spec") or {}, pod.get("status") or {}
+        restarts = {
+            item.get("name"): int(item.get("restartCount") or 0)
+            for item in [
+                *(status.get("initContainerStatuses") or []),
+                *(status.get("containerStatuses") or []),
+            ]
+        }
+        containers = [*(spec.get("initContainers") or []), *(spec.get("containers") or [])]
+        if not any(container.get("name") == pps.RUNNER_CONTAINER for container in containers):
+            self.fail_paid(f"{run.group}: runner log sources missing")
+        run.log_instance = self.runner_restarts(pod)
+        for container in containers:
+            name = str(container["name"])
+            variants: list[tuple[str, ...]] = [("--follow",)]
+            if restarts.get(name, 0):
+                variants.append(("--previous",))
+            for flags in variants:
+                self.follow_log(run, name, flags)
+        self.owner_ledger.record_timing(
+            run.group,
+            "",
+            "pod_log_capture_started",
+            "follow",
+            self.clock.now(),
+            observed_at=self.clock.now(),
+        )
+
+    def follow_log(self, run: PodRun, container: str, flags: tuple[str, ...]) -> None:
+        process = self.shell.spawn(
+            [
+                "kubectl",
+                "--context",
+                self.inputs.context,
+                "--namespace",
+                self.inputs.namespace,
+                "logs",
+                run.pod,
+                "-c",
+                container,
+                *flags,
+            ]
+        )
+        stream = RunnerLog(container, process)
+        run.logs.append(stream)
+        self.processes.append(process)
+        self.finalizer.register(
+            f"stop-runner-log-{run.group}-{len(run.logs)}",
+            functools.partial(pp.stop_process, process),
+        )
+        key = f"{run.pod_uid}:{container}:{len(run.logs)}"
+
+        def read() -> None:
+            try:
+                if process.stdout is None:
+                    return
+                for chunk in iter(lambda: process.stdout.read(65536), b""):
+                    self.scan.scan_stream(pto.POD_LOGS_CHANNEL, key, chunk)
+                stream.complete = process.wait(timeout=PRE_DELETE_READ_SECONDS) == 0
+            except Exception:  # noqa: BLE001 - an incomplete stream fails closed
+                stream.complete = False
+            finally:
+                stream.done.set()
+
+        def drain() -> None:
+            for chunk in process.stderr if process.stderr is not None else []:
+                self.scan.scan("children", chunk)
+
+        threading.Thread(target=read, daemon=True).start()
+        threading.Thread(target=drain, daemon=True).start()
+
+    def finish_runner_logs(self, run: PodRun, *, wait: bool = True) -> bool:
+        """Count the run's log streams once they ended; True when every one ended cleanly.
+
+        Only the runner instance the streams followed (``log_instance``) is
+        named captured: a restart after they opened is not covered by them.
+        """
+
+        if not run.logs:
+            return False
+        if run.logs_finished:
+            return run.logs_complete
+        if wait:
+            with contextlib.suppress(StepFailed):
+                self.wait_until(
+                    lambda: all(stream.done.is_set() for stream in run.logs),
+                    until=self.clock.now() + PRE_DELETE_READ_SECONDS,
+                    what=f"{run.group} runner log end",
+                    every=0.1,
+                )
+        if not all(stream.done.is_set() for stream in run.logs):
+            if not wait:
+                return False
+            for stream in run.logs:
+                pp.stop_process(stream.process)
+        failures = sum(not (stream.done.is_set() and stream.complete) for stream in run.logs)
+        with self.guard:
+            receipt = self.capture_receipts[pto.POD_LOGS_CHANNEL]
+            receipt["sources"] += len(run.logs) - failures
+            receipt["failures"] += failures
+        run.logs_finished = True
+        run.logs_complete = not failures
+        if run.logs_complete:
+            self.runner_log_instances.add((run.pod_uid, run.log_instance))
+            self.note_removal(run.pod, workload="runner", step="followed-to-end", captured=True)
+        return run.logs_complete
 
     def open_harvest(self, run: PodRun) -> None:
         """``pps.HARVEST_PROGRAM`` in the runner container, fed under the run's lock."""
@@ -2570,18 +2704,25 @@ class TwoOwnerRun(pp.LiveRun):
         # None: nothing listed (an unread listing already failed pod_logs).
         captured: bool | None = None
         if run.pod and identity not in self.deleted_uids:
-            listed = self.listed_before_deletion(
-                "get", "pods", "--field-selector", f"metadata.name={run.pod}"
-            )
-            if listed is not None:
-                pods = [
-                    pod
-                    for pod in self.listed_items(listed)
-                    if (pod.get("metadata") or {}).get("name") == run.pod
-                    and (not run.pod_uid or (pod.get("metadata") or {}).get("uid") == run.pod_uid)
-                ]
-                names = self.capture_before_deletion(pods, workload="runner", step="remove-pod")
-                captured = run.pod in names
+            if self.pod_uid_gone(run):
+                # The product removed it (an approval park suspends the
+                # session): only the streams that followed it hold its logs.
+                self.finish_runner_logs(run)
+            else:
+                listed = self.listed_before_deletion(
+                    "get", "pods", "--field-selector", f"metadata.name={run.pod}"
+                )
+                if listed is not None:
+                    pods = [
+                        pod
+                        for pod in self.listed_items(listed)
+                        if (pod.get("metadata") or {}).get("name") == run.pod
+                        and (
+                            not run.pod_uid or (pod.get("metadata") or {}).get("uid") == run.pod_uid
+                        )
+                    ]
+                    names = self.capture_before_deletion(pods, workload="runner", step="remove-pod")
+                    captured = run.pod in names
             if (run.pod_uid, run.restart_count) not in self.runner_log_instances:
                 self.unknown_runner(run)
                 self.fail_paid(f"{run.group}: runner vanished before capture")
@@ -2601,6 +2742,7 @@ class TwoOwnerRun(pp.LiveRun):
         self.wait_until(
             lambda: self.pod_uid_gone(run), until=until, what=f"{run.group} pod removal", every=2.0
         )
+        self.finish_runner_logs(run)
         run.gone_at = self.clock.now()
         self.owner_ledger.record_timing(
             run.group, "", "pod_deleted", "removed", run.gone_at, observed_at=run.gone_at
@@ -6379,6 +6521,7 @@ class TwoOwnerRun(pp.LiveRun):
             for namespace in (self.inputs.namespace, self.grant_namespace):
                 self.capture_namespace(self.kube_in(namespace), receipts)
             for run in self.pods:
+                self.finish_runner_logs(run, wait=False)
                 identity = (run.pod_uid, run.restart_count)
                 if run.pod_uid and identity not in self.runner_log_instances:
                     self.unknown_runner(run)

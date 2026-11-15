@@ -25,6 +25,8 @@ import hashlib
 import io
 import json
 import signal
+import subprocess
+import sys
 import tarfile
 import threading
 import urllib.parse
@@ -1597,6 +1599,7 @@ class _Live(pt.TwoOwnerRun):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.trace: list[str] = []
+        self.followed: list[str] = []
         self.gates: list[_FakeGate] = []
         # Which fence ran: the planned one or the stop path's.
         self.fences: list[str] = []
@@ -1615,6 +1618,10 @@ class _Live(pt.TwoOwnerRun):
     def delivery_checks(self, owner: pt.Owner, claim: str) -> dict[str, bool]:
         self.trace.append(f"delivery-{owner.name}")
         return dict.fromkeys(DELIVERY_KEYS, True)
+
+    def open_runner_logs(self, run: pt.PodRun) -> None:
+        # The real streams are tested below on real children; here no log follows.
+        self.followed.append(run.group)
 
     def open_harvest(self, run: pt.PodRun) -> None:
         run.harvest = pps.HarvestState(self.scan)
@@ -2295,6 +2302,8 @@ def test_reservation_precedes_the_interruption_call(tmp_path: Path) -> None:
         assert restarts[key] is True, key
     assert h.ledger.observations("disconnect")["b_tool_after_a_stop"] is True
     assert [row["output_tokens"] for row in _rows(h, "b-r1")] == [0]
+    # The recovered runtime's logs are followed from its adoption, like every runner's.
+    assert h.run.followed == ["b-r2"]
 
 
 def test_no_interruption_when_the_held_prompt_did_not_settle_to_zero(tmp_path: Path) -> None:
@@ -4947,6 +4956,108 @@ def test_a_failed_or_timed_out_log_read_never_holds_the_removal(tmp_path: Path) 
     }
     verdict = pto.scan_checks(scans, receipts, rehearsal=False, traces_backend="in_cluster")
     assert verdict["capture_audit_complete"] is False
+
+
+def _followed(
+    h: _Harness, monkeypatch: pytest.MonkeyPatch, run: pt.PodRun, exit_code: int, restarts: int = 0
+) -> list[list[str]]:
+    """Open the run's log streams on a real child that prints one line and exits."""
+
+    h.shell.on("get", "pod", run.pod)(
+        lambda _a, _i: {
+            "metadata": {"name": run.pod, "uid": run.pod_uid},
+            "spec": {"containers": [{"name": pps.RUNNER_CONTAINER}]},
+            "status": {
+                "containerStatuses": [{"name": pps.RUNNER_CONTAINER, "restartCount": restarts}]
+            },
+        }
+    )
+    commands: list[list[str]] = []
+
+    def spawn(argv: Sequence[str]) -> subprocess.Popen[bytes]:
+        commands.append(list(argv))
+        return subprocess.Popen(
+            [sys.executable, "-c", f"import sys;print('runner log');sys.exit({exit_code})"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    monkeypatch.setattr(h.shell, "spawn", spawn)
+    pt.TwoOwnerRun.open_runner_logs(h.run, run)
+    for stream in run.logs:
+        assert stream.done.wait(timeout=5)
+    return commands
+
+
+def _suspended(h: _Harness, run: pt.PodRun) -> None:
+    """A1 parked and the product suspended it: transcript complete, the pod already gone."""
+
+    _feed(run, {MAIN: _jsonl([_reply("msg-one", 1, 2, [])])}, at=T0 + 2)
+    run.parked_at = T0 + 1
+    run.eof.set()
+    h.run.pod_uid_present = lambda _name, _uid: False  # type: ignore[method-assign]
+
+
+def test_a_parked_session_settles_from_the_log_stream_after_the_product_removes_the_pod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    commands = _followed(h, monkeypatch, run, 0)
+    assert commands == [
+        [
+            "kubectl", "--context", CONTEXT, "--namespace", NAMESPACE,
+            "logs", run.pod, "-c", pps.RUNNER_CONTAINER, "--follow",
+        ]
+    ]  # fmt: skip
+    _suspended(h, run)
+    h.run.finish_park(run)
+    assert h.run.settled_known("a1")
+    rows = _rows(h, "a1")
+    assert all(row["source"] != "unknown" for row in rows)
+    assert sum(int(row["output_tokens"] or 0) for row in rows) == 2
+    # The probe's five tokens plus the parked session's two, from its transcript.
+    assert h.ledger.owner_spent("a") == 7
+    receipt = h.run.capture_receipts["pod_logs"]
+    assert receipt["sources"] == 1 and receipt["failures"] == 0
+    assert receipt["uncaptured"] == []
+    assert [item["step"] for item in receipt["before_deletion"]] == ["followed-to-end"]
+    assert h.runtime.scan.as_json()["pod_logs"]["scanned_bytes"] > 0
+    assert not _pod_deletes(h, run.pod)
+    events = {row["event"] for row in h.ledger.timing_rows()}
+    assert "pod_log_capture_started" in events
+
+
+def test_a_failed_log_stream_charges_a_suspended_session_as_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    _followed(h, monkeypatch, run, 23)
+    _suspended(h, run)
+    with pytest.raises(pp.StepFailed, match="runner vanished before capture"):
+        h.run.finish_park(run)
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
+    assert h.run.capture_receipts["pod_logs"]["failures"] > 0
+    assert (run.pod_uid, run.restart_count) not in h.run.runner_log_instances
+
+
+def test_a_restart_after_the_streams_opened_is_not_covered_by_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1", card=1)
+    commands = _followed(h, monkeypatch, run, 0, restarts=1)
+    assert [argv[-1] for argv in commands] == ["--follow", "--previous"]
+    run.restart_count = 2
+    _suspended(h, run)
+    with pytest.raises(pp.StepFailed, match="runner vanished before capture"):
+        h.run.finish_park(run)
+    assert (run.pod_uid, 1) in h.run.runner_log_instances
+    assert {row["source"] for row in _rows(h, "a1")} == {"unknown"}
 
 
 def test_remove_pod_captures_the_runner_pod_before_deleting_it(tmp_path: Path) -> None:

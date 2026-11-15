@@ -74,7 +74,7 @@ MAX_TURNS = 192
 SESSION_TURNS = 32
 #: Output tokens across the run, and the item's aggregate actual-spend guard.
 MAX_OUTPUT_TOKENS = 32768
-MAX_ITEM_OUTPUT_TOKENS = 65536
+MAX_ITEM_OUTPUT_TOKENS = 81920
 #: Output tokens in one session, checked after every response.
 SESSION_OUTPUT_TOKENS = 8192
 #: Absolute seconds one session may run before the runner is interrupted.
@@ -516,7 +516,7 @@ def load_inputs_file(path: Path, *, mode: Literal["setup", "live"], now: float) 
     resolved path, inode and content digest (``duplicate_owner_grant``; the
     digests are compared in memory and dropped), each ``usable_until`` at least
     LIVE_SECONDS + CLEANUP_SECONDS after ``now`` (``lifetime_insufficient``),
-    and an integer ``prior_item_output_tokens`` from 0 to MAX_OUTPUT_TOKENS.
+    and an integer ``prior_item_output_tokens`` below MAX_ITEM_OUTPUT_TOKENS.
     """
 
     if mode not in ("setup", "live"):
@@ -543,7 +543,7 @@ def load_inputs_file(path: Path, *, mode: Literal["setup", "live"], now: float) 
     if not isinstance(probe_cli, str) or not _PLAIN_VALUE.fullmatch(probe_cli):
         raise pps.Refusal("inputs_invalid", "probe_cli")
     prior = document.get("prior_item_output_tokens", 0 if mode == "setup" else None)
-    if type(prior) is not int or not 0 <= prior <= MAX_OUTPUT_TOKENS:
+    if type(prior) is not int or not 0 <= prior < MAX_ITEM_OUTPUT_TOKENS:
         raise pps.Refusal("inputs_invalid", "prior_item_output_tokens")
     item_cap = document.get("item_output_token_cap", MAX_OUTPUT_TOKENS)
     if type(item_cap) is not int or not prior < item_cap <= MAX_ITEM_OUTPUT_TOKENS:
@@ -764,9 +764,9 @@ def schedule_check(
     """
 
     if type(prior_item_output_tokens) is not int or not (
-        0 <= prior_item_output_tokens <= MAX_OUTPUT_TOKENS
+        0 <= prior_item_output_tokens < MAX_ITEM_OUTPUT_TOKENS
     ):
-        raise _impossible("prior spend outside 0..32768")
+        raise _impossible(f"prior spend outside 0..{MAX_ITEM_OUTPUT_TOKENS - 1}")
     if (
         type(item_output_token_cap) is not int
         or not prior_item_output_tokens < item_output_token_cap <= MAX_ITEM_OUTPUT_TOKENS
@@ -959,6 +959,7 @@ TIMING_EVENTS = frozenset(
         "resolution_finished",
         "runner_turn_end_observed",
         "pod_deleted",
+        "pod_log_capture_started",
         "pr_open",
         "watchdog_fence",
         "fence",
@@ -1094,7 +1095,7 @@ class TwoOwnerLedger(pps.Ledger):
     def set_prior_spend(self, tokens: int) -> None:
         """Record the inputs file's prior item spend before the first reservation."""
 
-        if type(tokens) is not int or not 0 <= tokens <= MAX_OUTPUT_TOKENS:
+        if type(tokens) is not int or not 0 <= tokens < MAX_ITEM_OUTPUT_TOKENS:
             raise pps.Refusal("arguments_invalid", PRIOR_SPEND_KEY)
         with self.transaction() as db:
             if self._recorded(db, PRIOR_SPEND_KEY) is None and self._rows(db):
@@ -1107,7 +1108,7 @@ class TwoOwnerLedger(pps.Ledger):
         value = self._recorded(self.db, PRIOR_SPEND_KEY)
         if value is None:
             return 0
-        if type(value) is not int or not 0 <= value <= MAX_OUTPUT_TOKENS:
+        if type(value) is not int or not 0 <= value < MAX_ITEM_OUTPUT_TOKENS:
             raise pps.Refusal("ledger_unsafe", PRIOR_SPEND_KEY)
         return value
 

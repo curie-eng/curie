@@ -450,10 +450,10 @@ never appear in it; it names grant files, which `check_grant_file` validates.
    caller. Each must be at least 10,200 s (live plus cleanup) after now, else
    `lifetime_insufficient`; the run records the window and the budget judge
    checks it covers the live end.
-4. `prior_item_output_tokens` is the item's earlier actual spend (0 to 32,768).
+4. `prior_item_output_tokens` is the item's earlier actual spend (0 to 81,919).
    It counts against `item_output_token_cap` (default 32,768, explicitly approved
-   maximum 65,536). Each run still has its separate 32,768-token limit.
-   The next attempt records 32,768 prior tokens and an item cap of 65,536.
+   maximum 81,920). Each run still has its separate 32,768-token limit.
+   The next attempt records 49,152 prior tokens and an item cap of 81,920.
 5. `namespace` is at most 56 characters because the driver also owns
    `<namespace>-grants`, the custody namespace, created before helm.
 

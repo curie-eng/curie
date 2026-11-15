@@ -386,10 +386,10 @@ INVALID_CORPUS: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
     ("bad context", lambda doc: _set(doc, "target.context", "has space")),
     ("prior missing", lambda doc: _drop(doc, "prior_item_output_tokens")),
     ("prior negative", lambda doc: _set(doc, "prior_item_output_tokens", -1)),
-    ("prior too large", lambda doc: _set(doc, "prior_item_output_tokens", 32769)),
+    ("prior too large", lambda doc: _set(doc, "prior_item_output_tokens", 81920)),
     ("prior bool", lambda doc: _set(doc, "prior_item_output_tokens", True)),
     ("prior string", lambda doc: _set(doc, "prior_item_output_tokens", "0")),
-    ("item cap too large", lambda doc: _set(doc, "item_output_token_cap", 65537)),
+    ("item cap too large", lambda doc: _set(doc, "item_output_token_cap", 81921)),
     ("item cap bool", lambda doc: _set(doc, "item_output_token_cap", True)),
     ("item cap exhausted", lambda doc: _set(doc, "item_output_token_cap", 0)),
     ("probe cli space", lambda doc: _set(doc, "probe_cli", "claude --x")),
@@ -599,7 +599,7 @@ def test_schedule_check_passes_the_approved_plan() -> None:
     assert result["verdict"] == "pass"
 
 
-@pytest.mark.parametrize("prior, cap", [(16384, 49152), (32768, 65536)])
+@pytest.mark.parametrize("prior, cap", [(16384, 49152), (32768, 65536), (49152, 81920)])
 def test_renewed_item_allowance_keeps_an_independent_run_cap(
     tmp_path: Path, prior: int, cap: int
 ) -> None:
@@ -700,7 +700,7 @@ IMPOSSIBLE: list[tuple[str, int, Callable[[], dict[str, Any]], str]] = [
     ),
     ("prior spend leaves the aggregate short", 8313, dict, "a3: share 2699"),
     ("prior spend far over", 20000, dict, "b1: share 1234"),
-    ("prior spend over the ceiling", 32769, dict, "prior spend"),
+    ("prior spend over the ceiling", 81920, dict, "prior spend"),
     (
         "turn share under 16",
         0,
