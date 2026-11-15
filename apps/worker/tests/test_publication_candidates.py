@@ -48,7 +48,6 @@ import secrets
 import shutil
 import subprocess
 import sys
-import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import ExitStack
@@ -70,6 +69,7 @@ from curie_runner.fake import FakeModelSession
 from curie_runner.server import bind_status_attestation
 from curie_runner.server import create_app as create_runner_app
 from curie_runner.session import SessionRunner
+from curie_test_support.static_shell import wait_until
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import run as worker_run
 from curie_worker.binding import RUNNER_TOKEN_ENV, FactoryWake
@@ -558,10 +558,10 @@ class _Stage:
                 if isinstance(frame, Final):
                     final = frame
         assert final is not None
-        deadline = time.monotonic() + 10
-        while self.runner.turn_active:
-            assert time.monotonic() < deadline, "the runner never ended the turn"
-            await asyncio.sleep(0.02)
+        runner = self.runner
+        await asyncio.to_thread(
+            wait_until, lambda: not runner.turn_active, 10, "the runner never ended the turn"
+        )
         self.expected_tree = _tree(self.checkout)
         self.local_head = _git(self.checkout, "rev-parse", "HEAD").strip()
 
