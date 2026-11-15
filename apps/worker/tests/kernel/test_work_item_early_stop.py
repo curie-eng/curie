@@ -32,6 +32,7 @@ from aci_protocol import (
     QueuedTurn,
     ReplyHandle,
     SessionStatus,
+    SideEffectFlag,
     TextDelta,
     ToolNote,
     TurnSource,
@@ -615,10 +616,16 @@ def test_issue_4752_unpublished_revision_uses_the_recorded_pull_request(
 
 
 @pytest.mark.parametrize("case_id", ["answers-recorded-decision", "admits-unrecorded-decision"])
-@pytest.mark.parametrize("tool", ["Read", PROGRESS_TOOL])
+@pytest.mark.parametrize(
+    ("tool", "prefixed"),
+    [
+        ("Read", True), (PROGRESS_TOOL, True), ("Read", False),
+        (PROGRESS_TOOL, False), ("Bash", False), ("Bash", True),
+    ],
+)
 @pytest.mark.parametrize("status", [SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT])
 def test_decision_followup_preserves_the_graded_terminal_answer(
-    make_harness, case_id: str, tool: str, status: SessionStatus
+    make_harness, case_id: str, tool: str, prefixed: bool, status: SessionStatus
 ) -> None:
     from curie_api.factory_comment_text import marker_for
     from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
@@ -631,6 +638,8 @@ def test_decision_followup_preserves_the_graded_terminal_answer(
     case = next(case for case in suite.cases if case.id == case_id)
     fixtures = json.loads((root / "cli/tests/data/eval_falsifiability_fixtures.json").read_text())
     answer = fixtures["exemplars"][f"dark-factory/{case_id}"]
+    first_reply = answer if prefixed else answer.removeprefix("No changes needed:").strip()
+    skips_continuation = prefixed and tool != "Bash"
     summary = (
         "No changes needed: the pull request is already complete; I answered "
         "by citing Decisions entry 1. Nothing in the question asked for a code change."
@@ -644,7 +653,7 @@ def test_decision_followup_preserves_the_graded_terminal_answer(
             items = _WorkItems()
             h.kernel._work_items = items
             h.runner.turn_scripts = [
-                [_tool(tool), TextDelta(text=answer), Final(text=answer, status=status)],
+                [_tool(tool), TextDelta(text=first_reply), Final(text=first_reply, status=status)],
                 [_done(summary)],
             ]
             event = _turn(f"work-item-{uuid.uuid4()}-execute-1", case.input)
@@ -655,7 +664,12 @@ def test_decision_followup_preserves_the_graded_terminal_answer(
             assert isinstance(detail, str)
             assert case.grader.grade(detail), detail
             assert not case.grader.grade(summary)
-            assert detail == answer
+            if skips_continuation:
+                assert detail == answer
+            else:
+                assert first_reply in detail
+                assert summary in detail
+                assert detail.index(first_reply) < detail.index(summary)
             request_id = next(iter(items.starts))
             body = status_body(
                 request_id=request_id,
@@ -673,7 +687,8 @@ def test_decision_followup_preserves_the_graded_terminal_answer(
             assert f"> {answer}" in body
             assert body.count(FINAL_MARKER) == 1
             assert body.count(marker_for(request_id)) == 1
-            assert h.runner.opened == [case.input]
+            assert len(h.runner.opened) == (1 if skips_continuation else 2)
+            assert h.runner.opened[0] == case.input
             assert publications.creates == []
             assert await h.kernel._markers.is_terminal(event.event_id)
 
@@ -706,6 +721,58 @@ def test_a_missing_lineage_or_no_change_outcome_still_gets_a_continuation(
 
     asyncio.run(exercise())
 
+
+@pytest.mark.parametrize(
+    ("tool", "flagged"),
+    [
+        ("Edit", False), ("Edit", True), ("Write", False), ("Write", True),
+        ("Bash", False), ("Bash", True), ("Read", True),
+    ],
+)
+def test_a_no_change_reply_after_a_potential_write_still_gets_a_continuation(
+    make_harness, tool: str, flagged: bool
+) -> None:
+    async def exercise() -> None:
+        first: list[OutboundEvent] = [_tool(tool)]
+        if flagged:
+            first.append(SideEffectFlag(detail="A workspace change was observed.", tool=tool))
+        first.append(_done("No changes needed: the existing pull request still applies."))
+        continuation = "Could not complete: edited files still require publication."
+        opened, items, terminal = await _run_execute(
+            make_harness,
+            [first, [_tool(PROGRESS_TOOL), _done(continuation)]],
+            publication_creator=_PublicationApi(_revision_lineage(PR_URL, "1700000000.000001")),
+        )
+        assert len(opened) == 2
+        assert "publish_changes" in opened[1]
+        assert items.finishes[0]["detail"] == continuation
+        assert terminal
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("pr_url", "reply"),
+    [
+        (None, "No changes needed: no change was requested."),
+        (PR_URL, "Could not complete: repository evidence is unavailable."),
+        (PR_URL, "The requested revision is ready for publication."),
+    ],
+)
+def test_an_unprefixed_reply_keeps_other_continuation_outcomes(
+    make_harness, pr_url: str | None, reply: str
+) -> None:
+    async def exercise() -> None:
+        opened, items, terminal = await _run_execute(
+            make_harness,
+            [[_tool("Read"), _done("Decision 1 records the transaction cost.")], [_done(reply)]],
+            publication_creator=_PublicationApi(_revision_lineage(pr_url, "1700000000.000001")),
+        )
+        assert len(opened) == 2
+        assert items.finishes[0]["detail"] == reply
+        assert terminal
+
+    asyncio.run(exercise())
 
 def _patch_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
