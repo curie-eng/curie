@@ -3584,8 +3584,18 @@ class TwoOwnerRun(pp.LiveRun):
         run = self.pod_run("b1")
 
         def quiescent() -> bool:
+            # A suspended session keeps its claim but no pod (ADR 0217): quiescent
+            # is no A runner pod and no running A request, not no A claim.
             rows = self.request_rows(self.pod_run("a2").work_item_id)
-            return not self.owner_claims(a) and all(row.get("status") != "running" for row in rows)
+            claims = self.owner_claims(a)
+            pods = self.claim_pods(claims)
+            running = sum(row.get("status") == "running" for row in rows)
+            self.ledger.record(
+                "diagnostics",
+                "a_quiescent",
+                {"claims": len(claims), "runner_pods": len(pods), "running_requests": running},
+            )
+            return not pods and not running
 
         self.wait_until(quiescent, until=self.clock.now() + QUIESCENT_SECONDS, what="A quiescent")
         held = self.new_run("b-r1", policy=KEEP_PROMPT)
@@ -3978,6 +3988,8 @@ class TwoOwnerRun(pp.LiveRun):
         repair.conversation_id = held.conversation_id
         self.reserve(repair)
         deletes = len(self.pod_deletions)
+        # B1's suspended claim may still be listed (ADR 0217); a successor is a new one.
+        claims_before = set(self.owner_claims(b))
         witness = self.interrupt_native_process(held.pod, held.kept)
         # The held native process is gone: no clock acts on B-r1 again.
         held.stopped = True
@@ -4007,7 +4019,7 @@ class TwoOwnerRun(pp.LiveRun):
             {
                 "old_epoch": epoch,
                 "old_claim_still_bound_to_request": after.get("runtime_claim_name") == held.claim,
-                "successor_claim_observed": claims != [held.claim],
+                "successor_claim_observed": set(claims) != claims_before,
                 "driver_pod_delete_calls": sum(
                     1 for name, uid, _at in self.pod_deletions[deletes:] if uid == held.pod_uid
                 ),
@@ -4066,7 +4078,8 @@ class TwoOwnerRun(pp.LiveRun):
             "process_identity_matched": witness.get("native_identity_matched") is True,
             "process_no_pod_delete": verdict["interruption_process_only"],
             "process_claim_still_bound": row.get("runtime_claim_name") == held.claim,
-            "process_no_successor_claim": self.owner_claims(b) == [held.claim],
+            "process_no_successor_claim": held.claim in claims_before
+            and set(self.owner_claims(b)) == claims_before,
             "process_same_request_epoch": row.get("id") == held.request_id
             and type(epoch) is int
             and row.get("runtime_epoch") == epoch,
@@ -4322,8 +4335,9 @@ class TwoOwnerRun(pp.LiveRun):
         what ``poes.process_interruption_checks`` reads, read right after the
         signals: ``old_epoch`` (the request row before), ``confirmed_epoch``
         and ``old_claim_still_bound_to_request`` (the row after),
-        ``successor_claim_observed`` (any claim of the owner other than the
-        held one, before or after) and ``driver_pod_delete_calls`` (deletes of
+        ``successor_claim_observed`` (a claim of the owner new since the
+        signal, or another of its claims with a pod) and
+        ``driver_pod_delete_calls`` (deletes of
         this pod uid in the driver's log meanwhile). An unknown hold, an
         unreadable witness, a mismatched identity or a successor claim fails
         the phase, fenced.
@@ -4372,7 +4386,11 @@ class TwoOwnerRun(pp.LiveRun):
             "confirmed_epoch": after.get("runtime_epoch"),
             "old_claim_still_bound_to_request": bool(held.claim)
             and after.get("runtime_claim_name") == held.claim,
-            "successor_claim_observed": bool((claims_before | claims_after) - {held.claim}),
+            # B1's suspended claim stays listed with no pod (ADR 0217): a successor
+            # is a claim new since the signal, or another claim with a live pod.
+            "successor_claim_observed": bool(claims_after - claims_before)
+            or held.claim not in claims_before
+            or bool(self.claim_pods(sorted((claims_before | claims_after) - {held.claim}))),
             "driver_pod_delete_calls": sum(
                 1 for _name, uid, _at in self.pod_deletions[deletes:] if uid == held.pod_uid
             ),
@@ -6074,6 +6092,17 @@ class TwoOwnerRun(pp.LiveRun):
             "get", pp.CLAIM_RESOURCE, "-l", f"{pp.CLAIM_AGENT_LABEL}={self.agent}"
         )
         return self.claim_names(listed)
+
+    def claim_pods(self, claims: Sequence[str]) -> list[str]:
+        """The pods of ``claims``, Terminating ones included; none without a claim."""
+
+        if not claims:
+            return []
+        listed = self.kube.json("get", "pods", "-l", self.claim_pod_selector(claims))
+        return sorted(
+            str((item.get("metadata") or {}).get("name") or "")
+            for item in self.listed_items(listed)
+        )
 
     def claim_names(self, listed: Any) -> list[str]:
         names = sorted(

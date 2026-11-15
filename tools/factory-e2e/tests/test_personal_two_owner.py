@@ -5415,3 +5415,61 @@ def test_the_zero_cost_lifecycle_takes_paid_phases_only_on_the_fake_runner(
     names = [name for name, _ in ppp.ParkProbe.phases(probe)]
     assert names[-1] == ppp.PHASE and ppp.PHASE not in pt.PAID_PHASES
     assert not set(names) & set(pt.PAID_PHASES)
+
+
+# -- a suspended session keeps its claim but no pod (ADR 0217) ------------------------
+
+
+def _claim_pods(h: _Harness, pods: Mapping[str, list[str]]) -> None:
+    """``get pods -l <claim label> in (...)``: the pods of the listed claims."""
+
+    def answer(argv: Sequence[str], _input: Any) -> dict[str, Any]:
+        selector = argv[argv.index("-l") + 1]
+        return {
+            "items": [
+                {"metadata": {"name": name}}
+                for claim, names in pods.items()
+                if claim in selector
+                for name in names
+            ]
+        }
+
+    h.shell.handlers.insert(0, (("get", "pods", "-l"), answer))
+
+
+@pytest.mark.parametrize("pod", [[], ["pod-a2"]])
+def test_a_suspended_claim_without_a_pod_leaves_a_quiescent(tmp_path: Path, pod: list[str]) -> None:
+    h = _live(tmp_path)
+    _through(h, "a3")
+    resolved = _approve_b1_setup(h)
+    h.run.owner_claims = lambda owner: ["claim-a2"] if owner.name == "a" else []  # type: ignore[method-assign]
+    _claim_pods(h, {"claim-a2": pod})
+    if pod:
+        with pytest.raises(pp.StepFailed, match="A quiescent"):
+            h.run.phase_approve_b1()
+        assert resolved == []
+        return
+    h.run.phase_approve_b1()
+    assert resolved == [("b1", "approved", 1, True)]
+    assert h.ledger.observations("diagnostics")["a_quiescent"] == {
+        "claims": 1,
+        "runner_pods": 0,
+        "running_requests": 0,
+    }
+
+
+@pytest.mark.parametrize("pod", [[], ["pod-b1"]])
+def test_b1s_suspended_claim_is_no_successor_unless_it_has_a_pod(
+    tmp_path: Path, pod: list[str]
+) -> None:
+    h = _live(tmp_path)
+    held = _interruption_setup(h)
+    h.run.owner_claims = lambda _owner: ["claim-b1-suspended", held.claim]  # type: ignore[method-assign]
+    _claim_pods(h, {"claim-b1-suspended": pod})
+    h.shell.on("exec", held.pod, "python3")(lambda _a, _s: _witness())
+    if pod:
+        with pytest.raises(pp.StepFailed, match="successor claim"):
+            h.run.interrupt_native_process(held.pod, held.kept or {})
+        return
+    facts = h.run.interrupt_native_process(held.pod, held.kept or {})
+    assert facts["successor_claim_observed"] is False
