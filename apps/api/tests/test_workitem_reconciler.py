@@ -66,6 +66,7 @@ REQUESTER = "U0REQUEST1"
 RECONCILER_STEPS = (
     "_settle_publications",
     "_expire_waiting",
+    "_release_provider_gates",
     "_request_deadline_cancellations",
     "_request_owner_lost_cancellations",
     "_publish_terminate_wakes",

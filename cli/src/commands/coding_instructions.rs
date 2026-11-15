@@ -43,13 +43,7 @@ impl CliOutput for CodingInstructionsOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
             Self::Document(status) => serde_json::to_value(status).unwrap_or_default(),
-            Self::DryRun(plan) => {
-                let mut value = plan.to_json();
-                value["application"] =
-                    serde_json::to_value(CodingInstructionsApplication::Unavailable)
-                        .unwrap_or_default();
-                value
-            }
+            Self::DryRun(plan) => plan.to_json(),
         }
     }
 
@@ -66,13 +60,20 @@ impl CliOutput for CodingInstructionsOutput {
                         "disabled"
                     }
                 ));
-                ui.payload("application to factory runs: unavailable");
+                ui.payload(application_line(status.application));
                 if let Some(text) = &status.text {
                     ui.payload(&terminal_text(text));
                 }
             }
             Self::DryRun(plan) => plan.render(ui),
         }
+    }
+}
+
+fn application_line(application: CodingInstructionsApplication) -> &'static str {
+    match application {
+        CodingInstructionsApplication::Available => "application to factory runs: available",
+        CodingInstructionsApplication::Unavailable => "application to factory runs: unavailable",
     }
 }
 
@@ -156,7 +157,6 @@ fn dry_run_plan(opts: &CodingInstructionsOpts, api_url: &str) -> DryRunPlan {
             format!("DELETE {url}?expected_revision={expected_revision}")
         }
     });
-    lines.push("application to factory runs: unavailable".to_string());
     DryRunPlan { lines }
 }
 

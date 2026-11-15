@@ -553,11 +553,52 @@
       "expected": {
         "disposition": "retry_backoff",
         "condition": "provider_rate_limit",
-        "not_before": "2030-01-01T00:00:00Z",
+        "not_before": "2030-01-01T00:01:00Z",
         "policy_successor": true,
         "successor": true,
         "blocked_on": null,
         "timing": "provider_time"
+      }
+    },
+    {
+      "id": "model_rate_limited_without_provider_time_waits_blocked",
+      "row": "model_rate_limited",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "rate-limit",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "rate-limit",
+          "retry_condition": {
+            "reason": "rate_limited"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_rate_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "rate_limited",
+          "retry_at": null,
+          "scope_key": null
+        }
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_rate_limit",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_rate_limit",
+        "timing": "blocked"
       }
     },
     {
@@ -639,7 +680,7 @@
       "expected": {
         "disposition": "retry_backoff",
         "condition": "provider_rate_limit",
-        "not_before": "2030-01-01T00:00:00Z",
+        "not_before": "2030-01-01T00:01:00Z",
         "policy_successor": true,
         "successor": true,
         "blocked_on": null,

@@ -48,6 +48,7 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from curie_api import models
 from curie_api.config import get_settings
 from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_internal.provider_scope import ProviderScope
 from curie_internal.turn_queue import to_stream_fields
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
@@ -209,14 +210,20 @@ def _provider_unreachable() -> list[Any]:
 
 
 def _real_runner_app(
-    index: int, paths: list[str], boot_env: Callable[[], dict[str, str] | None]
+    index: int,
+    paths: list[str],
+    boot_env: Callable[[], dict[str, str] | None],
+    script: Callable[[], list[Any]] = _provider_unreachable,
+    provider_scope: ProviderScope | None = None,
 ) -> web.Application:
     """The production runner app over a scripted model, recording each path asked.
 
     ``boot_env`` answers the environment of the claim that took this runner.
+    ``script`` answers each model turn's SDK messages, and ``provider_scope`` is
+    the boot credential scope the runner's own entry point would derive.
     """
 
-    session = FakeModelSession(script_factory=_provider_unreachable)
+    session = FakeModelSession(script_factory=script)
     gate = RequesterContextGate()
     booting = asyncio.Lock()
     app = create_runner_app(
@@ -228,6 +235,7 @@ def _real_runner_app(
             tracer=RunTracer(None),
             classifier=SideEffectClassifier(),
             trace_name=f"factory-retry-{index}",
+            provider_scope=provider_scope,
         ),
         requester_context=gate,
     )
@@ -807,11 +815,19 @@ class FactoryRetryCase(StartWaitCase):
         assert isinstance(hold, asyncio.Event)
         hold.set()
 
-    async def real_runners(self, count: int) -> list[RealRunner]:
+    async def real_runners(
+        self,
+        count: int,
+        *,
+        script: Callable[[], list[Any]] = _provider_unreachable,
+        provider_scope: ProviderScope | None = None,
+    ) -> list[RealRunner]:
         """Serve real runner apps, one for each sandbox the case claims next.
 
-        Each runs the production session over a scripted model whose turn ends
-        in the provider error the runner reports as an unreachable model.
+        Each runs the production session over a scripted model. By default its
+        turn ends in the provider error the runner reports as an unreachable
+        model; ``script`` replaces those SDK messages, and ``provider_scope``
+        is the scope the runner names on its retry conditions.
         """
 
         served: list[RealRunner] = []
@@ -823,7 +839,11 @@ class FactoryRetryCase(StartWaitCase):
             position = unpooled + len(cluster.runner_ports)
             server = TestServer(
                 _real_runner_app(
-                    index, paths, lambda position=position: cluster.claim_envs[position]
+                    index,
+                    paths,
+                    lambda position=position: cluster.claim_envs[position],
+                    script,
+                    provider_scope,
                 )
             )
             await server.start_server()

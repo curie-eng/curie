@@ -604,8 +604,6 @@ def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
                     wait_deadline=datetime.now(UTC) + timedelta(hours=1),
                     repository_path="acme/widgets",
                     context=FactoryContext(
-                    resource_gate=None,
-                    predecessor_claim_name=None,
                         agent_id=run.agent_id,
                         tenant_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
                         binding_id=uuid.uuid4(),
@@ -613,6 +611,8 @@ def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
                         address="acme/widgets",
                         adapter=None,
                     ),
+                    resource_gate=None,
+                    predecessor_claim_name=None,
                 ),
                 wake=FactoryWake(
                     kind="github", address="acme/widgets", adapter=None,

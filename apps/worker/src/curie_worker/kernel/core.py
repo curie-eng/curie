@@ -71,6 +71,7 @@ from .work_items import _SettlingWorkItem
 if TYPE_CHECKING:
     from ..factory_steering import FactorySteeringClient
     from ..personal_execution import PersonalExecution
+    from ..publication_candidate_capture import PublicationCandidateCapture
 
 
 class Kernel:
@@ -111,6 +112,7 @@ class Kernel:
         progress: ProgressStore | None = None,
         bundles: BundleReader | None = None,
         recovery: WorkspaceRecoveryCapture | None = None,
+        publication_candidates: PublicationCandidateCapture | None = None,
         factory_steering: FactorySteeringClient | None = None,
         personal_execution: PersonalExecution | None = None,
     ) -> None:
@@ -151,6 +153,10 @@ class Kernel:
         # The terminal recovery capture (ADR 0251, #5143). None, the default and
         # the disabled configuration, keeps every release on the plain path.
         self._recovery = recovery
+        # The publication candidate capture (#5428). None, the default and the
+        # disabled configuration, validates every publication snapshot exactly
+        # as before; wired, a started WorkItem run's snapshot is retained first.
+        self._publication_candidates = publication_candidates
         # The inbound-attachment lane (#2567), optional on exactly the same
         # terms as the workspace lane above: a deployment that has not wired it
         # runs every turn unchanged rather than discovering a missing attribute.
@@ -299,6 +305,7 @@ class Kernel:
     _attempt = attempt._attempt
     _attempt_turn = attempt._attempt_turn
     _require_tool_access = attempt._require_tool_access
+    _retain_and_validate_publication_snapshot = attempt._retain_and_validate_publication_snapshot
     _consume = attempt._consume
     _start_progress_pump = attempt._start_progress_pump
     _apply_frame = attempt._apply_frame

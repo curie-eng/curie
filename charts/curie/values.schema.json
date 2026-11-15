@@ -571,6 +571,13 @@
                 "enabled": {"type": "boolean"},
                 "maxBytes": {"type": ["integer", "null"], "minimum": 1}
               }
+            },
+            "publicationCandidates": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "maxBytes": {"type": "integer", "minimum": 1}
+              }
             }
           }
         },

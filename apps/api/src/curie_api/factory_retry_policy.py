@@ -154,7 +154,9 @@ def decide(facts: RetryFacts) -> Disposition:
     if cause in _PROVIDER_TRANSIENT:
         if not clean:
             return _TERMINAL
-        if reason in (None, "rate_limited", "transient_service"):
+        if reason == "rate_limited":
+            return _rate_limited(facts)
+        if reason in (None, "transient_service"):
             at = facts.condition_retry_at
             return Disposition(
                 DispositionKind.RETRY_BACKOFF,
@@ -215,6 +217,23 @@ def decide(facts: RetryFacts) -> Disposition:
         return Disposition(DispositionKind.TERMINAL_SUCCESS)
     # owner_lost, every refusal, every limit Curie owns and every unknown cause.
     return _TERMINAL
+
+
+def _rate_limited(facts: RetryFacts) -> Disposition:
+    # A typed throttle reset is scheduled with the reset grace. Without one the
+    # retry waits blocked: no probe verifies a rate window, so a guessed timer
+    # would only spend the retry early.
+    at = facts.condition_retry_at
+    if at is None:
+        return Disposition(
+            DispositionKind.CONDITION_WAIT, condition="provider_rate_limit", successor=True
+        )
+    return Disposition(
+        DispositionKind.RETRY_BACKOFF,
+        condition="provider_rate_limit",
+        not_before=at + RESET_GRACE,
+        successor=True,
+    )
 
 
 def _usage_reset(facts: RetryFacts) -> Disposition:

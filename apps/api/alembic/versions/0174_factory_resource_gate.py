@@ -16,7 +16,7 @@ losing one only means a later limit failure admits no successor, the safe
 direction.
 
 Revision ID: 0174
-Revises: 0172
+Revises: 0173
 """
 
 from collections.abc import Sequence
@@ -25,7 +25,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0174"
-down_revision: str = "0172"
+down_revision: str = "0173"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 S = "curie"

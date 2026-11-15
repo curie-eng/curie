@@ -738,8 +738,8 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         factory["sandboxEgress"] = {f"acme-{letter}": True for letter in ("a", "b")}
         # Two factory agents, each with a sandbox per tracker thread, can be
         # live at once. The factory profile requests 8Gi memory per sandbox,
-        # and the default resourceQuota.hard.requestsMemory (8Gi) admits one,
-        # beside Langfuse and ClickHouse on one CI kind node. This test proves
+        # and the default resourceQuota.hard.requestsMemory (10Gi) still admits
+        # one, beside Langfuse and ClickHouse on one CI kind node. This test proves
         # admitted-agent identity, not sandbox sizing; the factory envelope has
         # its own runtime proof (#4889).
         values.setdefault("agentSandbox", {})["agentResourceProfiles"] = {

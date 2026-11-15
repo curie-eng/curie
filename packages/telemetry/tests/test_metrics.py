@@ -46,6 +46,7 @@ _PROMETHEUS_HISTORY_METRIC = "curie_history_persistence_failure_total"
 _RECONCILER_STEPS = [
     "settle_publications",
     "expire_waiting",
+    "release_provider_gates",
     "request_deadline_cancellations",
     "request_owner_lost_cancellations",
     "publish_terminate_wakes",

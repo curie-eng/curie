@@ -367,21 +367,38 @@ class RuntimePair:
 async def load_pair(
     session: AsyncSession, request_id: uuid.UUID, *, lock: bool = False
 ) -> RuntimePair | None:
-    """The request and its WorkItem; ``lock`` takes the request row lock."""
+    """The request and its WorkItem.
 
-    query = (
-        select(WorkItem, ExecutionRequest)
-        .select_from(ExecutionRequest)
-        .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
-        .where(ExecutionRequest.id == request_id)
-        .execution_options(populate_existing=True)
-    )
-    if lock:
-        query = query.with_for_update(of=ExecutionRequest)
-    row = (await session.execute(query)).one_or_none()
+    ``lock`` takes both row locks in the order every `workitems/lifecycle.py`
+    transition takes them, the WorkItem's and then the request's, through the
+    lifecycle's own helpers. The reverse order deadlocks against the worker's
+    start transition: a grant insert under the request lock needs the
+    WorkItem row through its foreign key (#5687).
+    """
+
+    # Deferred: lifecycle imports this module.
+    from .workitems.lifecycle import lock_request, lock_work_item
+
+    row = (
+        await session.execute(
+            select(WorkItem, ExecutionRequest)
+            .select_from(ExecutionRequest)
+            .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
+            .where(ExecutionRequest.id == request_id)
+            .execution_options(populate_existing=True)
+        )
+    ).one_or_none()
     if row is None:
         return None
-    return RuntimePair(work_item=row[0], request=row[1])
+    if not lock:
+        return RuntimePair(work_item=row[0], request=row[1])
+    work_item = await lock_work_item(session, row[0].id)
+    if work_item is None:
+        return None
+    request = await lock_request(session, work_item_id=work_item.id, request_id=request_id)
+    if request is None:
+        return None
+    return RuntimePair(work_item=work_item, request=request)
 
 
 def names_issue(pair: RuntimePair, issue: TrackerIssueRef) -> bool:
@@ -445,7 +462,8 @@ async def reserve_session(
 ) -> ContractView:
     """Reserve the tracker result request's one model session and mint its grant.
 
-    Under the request row lock, in one committed transaction: refuses
+    Under the WorkItem and request row locks (taken in that order, as the
+    lifecycle takes them), in one committed transaction: refuses
     `SESSION_ALREADY_STARTED` when the session is reserved (or a grant
     exists), `INVALID_CONTEXT` when the request can no longer run or its
     deployed policy cannot be read; otherwise inserts the grant (the content
@@ -573,9 +591,9 @@ async def seal_submission(
 ) -> uuid.UUID:
     """Seal the first accepted submission for the request's grant.
 
-    Takes the request row lock, then the grant row lock (the order the
-    lifecycle takes them when it seals exhaustion findings), refuses
-    `RESULT_ALREADY_SUBMITTED` when a delivery already exists, and holds both
+    Takes the WorkItem and request row locks, then the grant row lock (the
+    order the lifecycle takes them when it seals exhaustion findings), refuses
+    `RESULT_ALREADY_SUBMITTED` when a delivery already exists, and holds all three
     through `submit_result` under the request's current runtime epoch, so a
     concurrent submission or exhaustion seal sees this one. Raises
     `RuntimeRefused` or `TrackerResultRefused`; returns the delivery id.

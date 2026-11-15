@@ -668,7 +668,7 @@ def phase_coding_instructions(s: Settings, ev: Evidence, token: str) -> None:
         and written["sha256"] == digest
         and written["byte_length"] == len(normalized.encode("utf-8"))
         and written["format_version"] == 1
-        and written["application"] == "unavailable",
+        and written["application"] == "available",
     )
     found = cli("get")
     ev.check("coding instructions get returns the stored revision and digest", found == written)
@@ -693,8 +693,11 @@ def phase_coding_instructions(s: Settings, ev: Evidence, token: str) -> None:
     cleared = cli("clear", "--expected-revision", "1")
     ev.check(
         "coding instructions clear retains the advanced revision without text",
-        cleared["revision"] == 2 and cleared["text"] is None and cleared["sha256"] is None
-        and cleared["byte_length"] == 0 and cleared["application"] == "unavailable",
+        cleared["revision"] == 2
+        and cleared["text"] is None
+        and cleared["sha256"] is None
+        and cleared["byte_length"] == 0
+        and cleared["application"] == "available",
     )
     ev.check("cleared coding instructions remain cleared", cli("get") == cleared)
 

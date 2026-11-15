@@ -4851,12 +4851,12 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "Manage your own coding instructions using a Console principal session. The content reaches the model provider and must not contain credentials. Application to factory runs is unavailable",
+          "about": "Manage your own coding instructions using a Console principal session. The content reaches the model provider and must not contain credentials. The response reports whether this deployment applies them to factory runs",
           "hidden": false,
           "name": "coding-instructions",
           "subcommands": [
             {
-              "about": "Read your coding instructions and current revision. Application to factory runs is unavailable",
+              "about": "Read your coding instructions and current revision. The response reports whether this deployment applies them to factory runs",
               "args": [
                 {
                   "global": false,
@@ -4915,7 +4915,7 @@ export const commandManifest = {
               "name": "get"
             },
             {
-              "about": "Replace your coding instructions from a UTF-8 file, preserving its whitespace. An empty file clears the document. The content reaches the model provider and must not contain credentials. Application to factory runs is unavailable",
+              "about": "Replace your coding instructions from a UTF-8 file, preserving its whitespace. An empty file clears the document. The content reaches the model provider and must not contain credentials. The response reports whether this deployment applies them to factory runs",
               "args": [
                 {
                   "global": false,

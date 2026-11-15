@@ -16,7 +16,7 @@
 #   4. Sandbox-class pods and Succeeded pods are not subtracted.
 #   5. Quantity parsing: "1500m", "0.5", "2" cpu; Gi/Mi/plain memory.
 #   8. Shipped defaults: the ceiling reads the real values.yaml requests,
-#      limits and hard, and is 8 (limitsCpu 8 / 1 cpu limit), not 42.
+#      limits and hard, and is 8 (limitsCpu 8 / 1 cpu limit), not 53.
 #   9. Exponent memory quantities parse; an unsupported form fails loudly.
 #  10. NOTES with lookup stubbed to fixture Nodes/Pods renders the capacity
 #      block under --set placement=null (placement read via the helper); with
@@ -267,6 +267,8 @@ grep -q "Kernel isolation" "$NOTES_OUT" || fail "7 NOTES render lacks the sandbo
 if grep -q "Sandbox capacity" "$NOTES_OUT"; then
   fail "7 NOTES printed a capacity block with no nodes from lookup"
 fi
+grep -qF "Beside one factory sandbox the quota admits 6 standard sandboxes. limits.cpu binds before requests.memory. requests.memory would allow 10 and limits.cpu would allow 6." "$NOTES_OUT" \
+  || fail "7 NOTES headroom line does not admit six standard sandboxes beside one factory sandbox"
 
 # 9. An unsupported memory quantity fails rendering loudly, naming it.
 BAD_CHART="$TMP/bad-chart"

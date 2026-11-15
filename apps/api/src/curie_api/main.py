@@ -112,6 +112,8 @@ from .routers import (
     observability,
     personal_enrollments,
     provider_installations,
+    publication_candidates,
+    publication_candidates_access,
     publication_code_host,
     publication_precheck,
     publication_ui_evidence,
@@ -785,6 +787,8 @@ def create_app(
     app.include_router(cluster_message_replies.internal_router)
     app.include_router(workspace_recovery.router)
     app.include_router(workspace_recovery_access.router)
+    app.include_router(publication_candidates.router)
+    app.include_router(publication_candidates_access.router)
     app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(provider_installations.router)

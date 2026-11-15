@@ -4631,6 +4631,1028 @@
         "title": "CancelBody",
         "type": "object"
       },
+      "CandidateAcknowledged": {
+        "additionalProperties": false,
+        "properties": {
+          "released": {
+            "default": true,
+            "title": "Released",
+            "type": "boolean"
+          }
+        },
+        "title": "CandidateAcknowledged",
+        "type": "object"
+      },
+      "CandidateAcquireReader": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "holder_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Holder Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "candidate_id",
+          "holder_id"
+        ],
+        "title": "CandidateAcquireReader",
+        "type": "object"
+      },
+      "CandidateCaptureAuthority": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "request_id",
+          "runtime_epoch",
+          "dispatch_generation"
+        ],
+        "title": "CandidateCaptureAuthority",
+        "type": "object"
+      },
+      "CandidateCaptureContext": {
+        "additionalProperties": false,
+        "properties": {
+          "base_commit": {
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/CandidateRepository"
+          },
+          "target_branch": {
+            "title": "Target Branch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "base_commit",
+          "target_branch"
+        ],
+        "title": "CandidateCaptureContext",
+        "type": "object"
+      },
+      "CandidateCaptureFailure": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "tombstoned",
+            "default": "tombstoned",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_id"
+        ],
+        "title": "CandidateCaptureFailure",
+        "type": "object"
+      },
+      "CandidateClaimCollection": {
+        "additionalProperties": false,
+        "properties": {
+          "collector_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Collector Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 100,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "collector_id"
+        ],
+        "title": "CandidateClaimCollection",
+        "type": "object"
+      },
+      "CandidateCollectionClaim": {
+        "additionalProperties": false,
+        "properties": {
+          "claim_id": {
+            "format": "uuid",
+            "title": "Claim Id",
+            "type": "string"
+          },
+          "claimed_until": {
+            "format": "date-time",
+            "title": "Claimed Until",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "object_id": {
+            "format": "uuid",
+            "title": "Object Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "object_id",
+          "key",
+          "claim_id",
+          "version",
+          "claimed_until"
+        ],
+        "title": "CandidateCollectionClaim",
+        "type": "object"
+      },
+      "CandidateCollectionClaims": {
+        "additionalProperties": false,
+        "properties": {
+          "claims": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateCollectionClaim"
+            },
+            "title": "Claims",
+            "type": "array"
+          }
+        },
+        "required": [
+          "claims"
+        ],
+        "title": "CandidateCollectionClaims",
+        "type": "object"
+      },
+      "CandidateComplete": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateObjectReceipt"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Receipts",
+            "type": "array"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "candidate_id",
+          "receipts"
+        ],
+        "title": "CandidateComplete",
+        "type": "object"
+      },
+      "CandidateCompletion": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "title": "Completed At",
+            "type": "string"
+          },
+          "status": {
+            "const": "complete",
+            "default": "complete",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_id",
+          "completed_at"
+        ],
+        "title": "CandidateCompletion",
+        "type": "object"
+      },
+      "CandidateFail": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "upload_failed",
+              "capture_failed",
+              "capture_timeout"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "candidate_id",
+          "reason"
+        ],
+        "title": "CandidateFail",
+        "type": "object"
+      },
+      "CandidateFinalizeCollection": {
+        "additionalProperties": false,
+        "properties": {
+          "claim_id": {
+            "format": "uuid",
+            "title": "Claim Id",
+            "type": "string"
+          },
+          "collector_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Collector Id",
+            "type": "string"
+          },
+          "object_id": {
+            "format": "uuid",
+            "title": "Object Id",
+            "type": "string"
+          },
+          "version": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "collector_id",
+          "object_id",
+          "claim_id",
+          "version"
+        ],
+        "title": "CandidateFinalizeCollection",
+        "type": "object"
+      },
+      "CandidateFinalized": {
+        "additionalProperties": false,
+        "properties": {
+          "finalized": {
+            "default": true,
+            "title": "Finalized",
+            "type": "boolean"
+          }
+        },
+        "title": "CandidateFinalized",
+        "type": "object"
+      },
+      "CandidateObjectDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "base",
+              "patch"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "size_bytes",
+          "sha256"
+        ],
+        "title": "CandidateObjectDeclaration",
+        "type": "object"
+      },
+      "CandidateObjectReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "base",
+              "patch"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "size_bytes",
+          "sha256",
+          "key"
+        ],
+        "title": "CandidateObjectReceipt",
+        "type": "object"
+      },
+      "CandidateOutcome": {
+        "additionalProperties": false,
+        "properties": {
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "reason": {
+            "enum": [
+              "capture_timeout",
+              "capture_failed",
+              "base_unavailable",
+              "base_digest_mismatch",
+              "base_mismatch",
+              "ledger_unavailable",
+              "upload_failed",
+              "patch_too_large"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "reason"
+        ],
+        "title": "CandidateOutcome",
+        "type": "object"
+      },
+      "CandidateOutcomeRecorded": {
+        "additionalProperties": false,
+        "properties": {
+          "recorded": {
+            "title": "Recorded",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "recorded"
+        ],
+        "title": "CandidateOutcomeRecorded",
+        "type": "object"
+      },
+      "CandidatePublic": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "base": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CandidatePublicBase"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "changed_path_count": {
+            "maximum": 4096.0,
+            "minimum": 0.0,
+            "title": "Changed Path Count",
+            "type": "integer"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "final_disposition_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Disposition At"
+          },
+          "origin_request_id": {
+            "format": "uuid",
+            "title": "Origin Request Id",
+            "type": "string"
+          },
+          "owner_request_id": {
+            "format": "uuid",
+            "title": "Owner Request Id",
+            "type": "string"
+          },
+          "owner_transferred_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Transferred At"
+          },
+          "patch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CandidatePublicPatch"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "previous_owner_request_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Owner Request Id"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "staging",
+              "complete",
+              "tombstoned"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_id",
+          "origin_request_id",
+          "owner_request_id",
+          "previous_owner_request_id",
+          "owner_transferred_at",
+          "runtime_epoch",
+          "status",
+          "created_at",
+          "completed_at",
+          "final_disposition_at",
+          "expires_at",
+          "available",
+          "changed_path_count",
+          "patch",
+          "base"
+        ],
+        "title": "CandidatePublic",
+        "type": "object"
+      },
+      "CandidatePublicBase": {
+        "additionalProperties": false,
+        "properties": {
+          "base_commit": {
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "size_bytes",
+          "sha256",
+          "base_commit"
+        ],
+        "title": "CandidatePublicBase",
+        "type": "object"
+      },
+      "CandidatePublicList": {
+        "additionalProperties": false,
+        "properties": {
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/CandidatePublic"
+            },
+            "maxItems": 3,
+            "title": "Candidates",
+            "type": "array"
+          },
+          "capture_outcome": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capture Outcome"
+          },
+          "capture_outcome_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capture Outcome At"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "capture_outcome",
+          "capture_outcome_at",
+          "candidates"
+        ],
+        "title": "CandidatePublicList",
+        "type": "object"
+      },
+      "CandidatePublicPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "size_bytes",
+          "sha256"
+        ],
+        "title": "CandidatePublicPatch",
+        "type": "object"
+      },
+      "CandidateReader": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "holder_id": {
+            "title": "Holder Id",
+            "type": "string"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "title": "Lease Id",
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateObjectReceipt"
+            },
+            "title": "Objects",
+            "type": "array"
+          }
+        },
+        "required": [
+          "lease_id",
+          "candidate_id",
+          "holder_id",
+          "expires_at",
+          "objects"
+        ],
+        "title": "CandidateReader",
+        "type": "object"
+      },
+      "CandidateReleaseReader": {
+        "additionalProperties": false,
+        "properties": {
+          "holder_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Holder Id",
+            "type": "string"
+          },
+          "lease_id": {
+            "format": "uuid",
+            "title": "Lease Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_id",
+          "holder_id"
+        ],
+        "title": "CandidateReleaseReader",
+        "type": "object"
+      },
+      "CandidateRepository": {
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Host",
+            "type": "string"
+          },
+          "path": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Path",
+            "type": "string"
+          },
+          "project_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "provider": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "host",
+          "project_id",
+          "path"
+        ],
+        "title": "CandidateRepository",
+        "type": "object"
+      },
+      "CandidateReservation": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "capture_deadline": {
+            "format": "date-time",
+            "title": "Capture Deadline",
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateObjectReceipt"
+            },
+            "title": "Objects",
+            "type": "array"
+          },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          },
+          "staging_expires_at": {
+            "format": "date-time",
+            "title": "Staging Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_id",
+          "objects",
+          "capture_deadline",
+          "staging_expires_at",
+          "replayed"
+        ],
+        "title": "CandidateReservation",
+        "type": "object"
+      },
+      "CandidateReserve": {
+        "additionalProperties": false,
+        "properties": {
+          "base_archive_limit_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Base Archive Limit Bytes",
+            "type": "integer"
+          },
+          "base_commit": {
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "body": {
+            "maxLength": 65536,
+            "pattern": "^[^\\x00]*$",
+            "title": "Body",
+            "type": "string"
+          },
+          "capture_budget_seconds": {
+            "default": 60.0,
+            "exclusiveMinimum": 0.0,
+            "maximum": 60.0,
+            "title": "Capture Budget Seconds",
+            "type": "number"
+          },
+          "changed_paths": {
+            "items": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "pattern": "^[^\\x00]+$",
+              "type": "string"
+            },
+            "maxItems": 4096,
+            "title": "Changed Paths",
+            "type": "array"
+          },
+          "contains_workflow_files": {
+            "title": "Contains Workflow Files",
+            "type": "boolean"
+          },
+          "dedupe_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Dedupe Key",
+            "type": "string"
+          },
+          "dispatch_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Dispatch Generation",
+            "type": "integer"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateObjectDeclaration"
+            },
+            "maxItems": 2,
+            "minItems": 1,
+            "title": "Objects",
+            "type": "array"
+          },
+          "patch_limit_bytes": {
+            "maximum": 900000.0,
+            "minimum": 1.0,
+            "title": "Patch Limit Bytes",
+            "type": "integer"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/CandidateRepository"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          },
+          "target_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Target Branch",
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 256,
+            "pattern": "^[^\\x00]*$",
+            "title": "Title",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "request_id",
+          "runtime_epoch",
+          "dispatch_generation",
+          "dedupe_key",
+          "repository",
+          "base_commit",
+          "target_branch",
+          "base_archive_limit_bytes",
+          "patch_limit_bytes",
+          "changed_paths",
+          "contains_workflow_files",
+          "title",
+          "body",
+          "objects"
+        ],
+        "title": "CandidateReserve",
+        "type": "object"
+      },
       "CanvasCell": {
         "description": "One table cell. ``section_id`` is set only when the cell is editable.",
         "properties": {
@@ -6021,7 +7043,10 @@
       "CodingInstructionsOut": {
         "properties": {
           "application": {
-            "const": "unavailable",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
             "title": "Application",
             "type": "string"
           },
@@ -35228,6 +36253,537 @@
         ]
       }
     },
+    "/v1/internal/publication-candidates/acquire-reader": {
+      "post": {
+        "operationId": "acquire_reader_v1_internal_publication_candidates_acquire_reader_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateAcquireReader"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateReader"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acquire Reader",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
+    "/v1/internal/publication-candidates/claim-collection": {
+      "post": {
+        "operationId": "claim_collection_v1_internal_publication_candidates_claim_collection_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateClaimCollection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateCollectionClaims"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Collection",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
+    "/v1/internal/publication-candidates/complete": {
+      "post": {
+        "operationId": "complete_v1_internal_publication_candidates_complete_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateComplete"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateCompletion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
+    "/v1/internal/publication-candidates/context": {
+      "post": {
+        "operationId": "context_v1_internal_publication_candidates_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateCaptureAuthority"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateCaptureContext"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Context",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
+    "/v1/internal/publication-candidates/fail": {
+      "post": {
+        "operationId": "fail_v1_internal_publication_candidates_fail_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateFail"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateCaptureFailure"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fail",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
+    "/v1/internal/publication-candidates/finalize-collection": {
+      "post": {
+        "operationId": "finalize_collection_v1_internal_publication_candidates_finalize_collection_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateFinalizeCollection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateFinalized"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Finalize Collection",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
+    "/v1/internal/publication-candidates/outcome": {
+      "post": {
+        "operationId": "outcome_v1_internal_publication_candidates_outcome_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateOutcome"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateOutcomeRecorded"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Outcome",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
+    "/v1/internal/publication-candidates/release-reader": {
+      "post": {
+        "operationId": "release_reader_v1_internal_publication_candidates_release_reader_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateReleaseReader"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateAcknowledged"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Release Reader",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
+    "/v1/internal/publication-candidates/reserve": {
+      "post": {
+        "operationId": "reserve_v1_internal_publication_candidates_reserve_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateReserve"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateReservation"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reserve",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
     "/v1/internal/publications": {
       "post": {
         "operationId": "create_publication_v1_internal_publications_post",
@@ -39087,6 +40643,65 @@
         "summary": "Get Work Item",
         "tags": [
           "work-items"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/publication-candidates": {
+      "get": {
+        "operationId": "list_candidates_work_items__work_item_id__publication_candidates_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidatePublicList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Candidates",
+        "tags": [
+          "publication-candidates"
         ]
       }
     },

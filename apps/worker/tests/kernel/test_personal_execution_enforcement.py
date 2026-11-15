@@ -517,10 +517,10 @@ class _PgWorkItems(_WorkItems):
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path=WORK_ITEM_REPO,
             context=factory_context(self.owner.agent_id, wake).model_copy(
-            resource_gate=None,
-            predecessor_claim_name=None,
                 update={"tenant_id": self.owner.tenant_id, "binding_id": _BINDING_ID}
             ),
+            resource_gate=None,
+            predecessor_claim_name=None,
         )
         self.acquisitions[request_id] = grant
         hook, self.after_acquire = self.after_acquire, None

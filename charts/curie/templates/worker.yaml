@@ -333,6 +333,8 @@ spec:
             # value from the same helper.
             - name: CURIE_WORKSPACE_RECOVERY_ENABLED
               value: {{ include "curie.workspaceRecoveryEnabled" . | quote }}
+            - name: CURIE_PUBLICATION_CANDIDATES_ENABLED
+              value: {{ include "curie.publicationCandidatesEnabled" . | quote }}
             - name: CURIE_WORKSPACE_MAX_MEMBERS
               value: {{ .Values.worker.workspace.maxMembers | quote }}
             - name: CURIE_WORKSPACE_MAX_COMPRESSION_RATIO

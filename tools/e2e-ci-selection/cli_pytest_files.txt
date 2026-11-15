@@ -30,6 +30,7 @@ apps/worker/tests/test_delivery_lease.py
 apps/worker/tests/test_hook_approval_proof_thread_key.py
 apps/worker/tests/test_progress.py
 apps/worker/tests/test_protected_process_migration.py
+apps/worker/tests/test_publication_candidates_live.py
 apps/worker/tests/test_publication_validation.py
 apps/worker/tests/test_stream_retention.py
 apps/worker/tests/test_workspace_recovery_storage.py

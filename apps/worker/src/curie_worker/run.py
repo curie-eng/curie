@@ -87,6 +87,17 @@ from .personal_custody import (
 )
 from .personal_execution import PersonalExecution, owner_lease_ttl_ms
 from .progress import ProgressStore
+from .provider_probe import ProviderProbeLoop
+from .publication_candidate_capture import PublicationCandidateCapture
+from .publication_candidate_storage import (
+    PATCH_LIMIT_BYTES as PUBLICATION_CANDIDATE_PATCH_LIMIT_BYTES,
+)
+from .publication_candidate_storage import (
+    CandidateObjectStore,
+    CandidateWriter,
+    build_candidate_collector,
+)
+from .publication_candidates import PublicationCandidateClient
 from .publication_clients import (
     PublicationCodeHostClient,
     PublicationCredentialClient,
@@ -200,6 +211,10 @@ class Runtime:
     # credential (issue 5581). Optional only so a Runtime constructed in tests
     # need not name it.
     factory_credit: FactoryCreditLoop | None = None
+    # Always built. Registers this worker's provider scope and probes its
+    # allowance while a provider gate waits on it (#5426). Optional only so a
+    # Runtime constructed in tests need not name it.
+    provider_probe: ProviderProbeLoop | None = None
     # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
     # beside the connector reconcile loop, never inside the consumer.
     action_executor: ActionExecutorLoop | None = None
@@ -210,6 +225,8 @@ class Runtime:
     e2e_reaper: E2EReaperLoop | None = None
     # None unless workspace recovery is on with the internal token (ADR 0251).
     workspace_recovery_gc: RecoveryCollector | None = None
+    # None unless publication candidates are on with the internal token (#5428).
+    publication_candidates_gc: RecoveryCollector | None = None
     deploy_notice_consumer: DeployNoticeConsumer | None = None
     # Trims settled entries off the runs and eval streams (ADR 0184). Optional
     # only so a Runtime constructed elsewhere need not name it.
@@ -881,6 +898,44 @@ def build(
                 runner=runner,
                 coordinator=workspace,
             )
+    candidates_gc: RecoveryCollector | None = None
+    candidate_capture: PublicationCandidateCapture | None = None
+    if config.publication_candidates_enabled and config.internal_worker_token:
+        candidates_s3 = build_recovery_s3_client(
+            endpoint_url=config.s3_endpoint_url,
+            access_key=config.s3_access_key,
+            secret_key=config.s3_secret_key,
+            region=config.s3_region,
+        )
+        owner.register_close(
+            "publication-candidates-s3", lambda: _close_sync(candidates_s3.close), order=70
+        )
+        candidate_ledger = PublicationCandidateClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
+        candidate_store = CandidateObjectStore(client=candidates_s3, bucket=config.workspace_bucket)
+        candidates_gc = build_candidate_collector(
+            ledger=candidate_ledger, store=candidate_store, collector_id=config.consumer_name
+        )
+        # The pre-validation capture (#5428). The config refuses candidates
+        # without managed workspaces, so the coordinator is always built here.
+        if workspace is not None:
+            candidate_capture = PublicationCandidateCapture(
+                ledger=candidate_ledger,
+                writer=CandidateWriter(
+                    ledger=candidate_ledger,
+                    store=candidate_store,
+                    scratch_root=Path(config.workspace_scratch_root) / "candidates",
+                    base_archive_limit_bytes=config.workspace_max_archive_bytes,
+                    patch_limit_bytes=min(
+                        PUBLICATION_CANDIDATE_PATCH_LIMIT_BYTES,
+                        config.publication_patch_max_bytes,
+                    ),
+                ),
+                coordinator=workspace,
+            )
     attachment_access_client = None
     broker_server = None
     if config.attachment_enabled and config.attachment_mode == "lazy":
@@ -998,6 +1053,7 @@ def build(
         identity_authority=identity_authority,
         workspace=workspace,
         recovery=recovery_capture,
+        publication_candidates=candidate_capture,
         attachments=attachments,
         attachment_access=attachment_access_client,
         # ADR 0205: the thread attachment ledger, behind the internal worker
@@ -1175,6 +1231,7 @@ def build(
         ),
         e2e_reaper=_build_e2e_reaper(config, work_items),
         workspace_recovery_gc=recovery_gc,
+        publication_candidates_gc=candidates_gc,
         cron_loop=CronSchedulerLoop(
             source_guard=CronHookSourceGuard(source_gate, engine),
             engine=engine,
@@ -1194,6 +1251,7 @@ def build(
         remediation_receipts=_build_remediation_receipts(config, engine, sink),
         factory_slack_progress=_build_factory_slack_progress(config, engine, sink),
         factory_credit=FactoryCreditLoop(engine, config),
+        provider_probe=ProviderProbeLoop(engine, config, async_redis),
         stream_retention=build_stream_retention(config, async_redis),
     )
 
@@ -1209,7 +1267,9 @@ _SUPERVISED_OPERATIONS = frozenset(
         "publications",
         "e2e-reaper",
         "workspace-recovery-gc",
+        "publication-candidates-gc",
         "factory-credit",
+        "provider-probe",
     }
 )
 
@@ -2016,6 +2076,15 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
                 lambda: recovery_gc.run_forever(shutdown, interval_s=interval_s),
             )
         )
+    candidates_gc = getattr(rt, "publication_candidates_gc", None)
+    if candidates_gc is not None:
+        candidates_interval_s = config.publication_candidates_collect_interval_s
+        tasks.append(
+            launch(
+                "publication-candidates-gc",
+                lambda: candidates_gc.run_forever(shutdown, interval_s=candidates_interval_s),
+            )
+        )
     if rt.cron_loop is not None:
         tasks.append(launch("cron", lambda: rt.cron_loop.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "publication_loop", None) is not None:
@@ -2040,6 +2109,13 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             launch(
                 "factory-credit",
                 lambda: rt.factory_credit.run_forever(shutdown),  # type: ignore[union-attr]
+            )
+        )
+    if getattr(rt, "provider_probe", None) is not None:
+        tasks.append(
+            launch(
+                "provider-probe",
+                lambda: rt.provider_probe.run_forever(shutdown),  # type: ignore[union-attr]
             )
         )
     if sweeper is not None:

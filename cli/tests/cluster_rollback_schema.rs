@@ -339,12 +339,19 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         .expect("the factory retry allowance revision is packaged");
     assert_eq!(retry_allowance.parents, vec![String::from("0171")]);
     assert_eq!(retry_allowance.kind, "expand");
+    let publication_candidates = target
+        .revisions
+        .iter()
+        .find(|node| node.revision == "0173")
+        .expect("the publication candidate revision is packaged");
+    assert_eq!(publication_candidates.parents, vec![String::from("0172")]);
+    assert_eq!(publication_candidates.kind, "expand");
     let resource_gate = target
         .revisions
         .iter()
         .find(|node| node.revision == "0174")
         .expect("the factory resource gate revision is packaged");
-    assert_eq!(resource_gate.parents, vec![String::from("0172")]);
+    assert_eq!(resource_gate.parents, vec![String::from("0173")]);
     assert_eq!(resource_gate.kind, "expand");
 
     let pending =
@@ -370,7 +377,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             "0121", "0122", "0123", "0140", "0130", "0131", "0136", "0132", "0133", "0137", "0138",
             "0139", "0141", "0143", "0144", "0145", "0146", "0147", "0148", "0149", "0151", "0152",
             "0153", "0154", "0156", "0157", "0158", "0159", "0160", "0162", "0163", "0164", "0165",
-            "0166", "0167", "0168", "0169", "0170", "0171", "0172", "0174"
+            "0166", "0167", "0168", "0169", "0170", "0171", "0172", "0173", "0174"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -443,7 +450,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             "0130", "0131", "0136", "0132", "0133", "0137", "0138", "0139", "0141", "0143", "0144",
             "0145", "0146", "0147", "0148", "0149", "0151", "0152", "0153", "0154", "0156", "0157",
             "0158", "0159", "0160", "0162", "0163", "0164", "0165", "0166", "0167", "0168", "0169",
-            "0170", "0171", "0172", "0174"
+            "0170", "0171", "0172", "0173", "0174"
         ]
     );
 
@@ -516,7 +523,8 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             "0106", "0108", "0120", "0121", "0122", "0123", "0140", "0130", "0131", "0136", "0132",
             "0133", "0137", "0138", "0139", "0141", "0143", "0144", "0145", "0146", "0147", "0148",
             "0149", "0151", "0152", "0153", "0154", "0156", "0157", "0158", "0159", "0160", "0162",
-            "0163", "0164", "0165", "0166", "0167", "0168", "0169", "0170", "0171", "0172", "0174"
+            "0163", "0164", "0165", "0166", "0167", "0168", "0169", "0170", "0171", "0172", "0173",
+            "0174"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -591,7 +599,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             "0108", "0120", "0121", "0122", "0123", "0140", "0130", "0131", "0136", "0132", "0133",
             "0137", "0138", "0139", "0141", "0143", "0144", "0145", "0146", "0147", "0148", "0149",
             "0151", "0152", "0153", "0154", "0156", "0157", "0158", "0159", "0160", "0162", "0163",
-            "0164", "0165", "0166", "0167", "0168", "0169", "0170", "0171", "0172", "0174"
+            "0164", "0165", "0166", "0167", "0168", "0169", "0170", "0171", "0172", "0173", "0174"
         ]
     );
     let contracts: Vec<&str> = pending

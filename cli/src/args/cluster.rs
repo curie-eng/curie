@@ -207,7 +207,7 @@ pub(crate) enum ClusterAction {
     },
     /// Manage your own coding instructions using a Console principal session.
     /// The content reaches the model provider and must not contain credentials.
-    /// Application to factory runs is unavailable.
+    /// The response reports whether this deployment applies them to factory runs.
     CodingInstructions {
         #[command(subcommand)]
         action: ClusterCodingInstructionsAction,

@@ -26,6 +26,7 @@ from aiohttp import web
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, SdkMcpTool
 from claude_agent_sdk.types import McpSdkServerConfig
 from curie_internal.connector_endpoints import UPLOADS_ENV
+from curie_internal.provider_scope import ProviderScope, provider_scope
 from curie_telemetry import bootstrap_service_telemetry
 from plugin_format import CHANNEL_READ_SERVER_NAME
 
@@ -804,6 +805,7 @@ def build_runner(
     history_capacity_exceeded: bool = False,
     memory_facts_preamble: str | None = None,
     memory_guidance: str | None = None,
+    scope: ProviderScope | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -819,6 +821,9 @@ def build_runner(
     ``memory_facts_preamble`` is the rendered remembered-facts block and
     ``memory_guidance`` the operator's stored guidance text (None falls back to
     ``DEFAULT_GUIDANCE``), both loaded at boot (#1461).
+
+    ``scope`` is the boot credential's provider scope (#5426), derived before
+    the harness rewrote the env; None in fake model mode.
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -1705,6 +1710,7 @@ def build_runner(
             channel_kind=config.channel_kind,
             initializer=initialize,
             session_initializer=initialize_session if issue_read is not None else None,
+            provider_scope=scope,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
@@ -2144,7 +2150,12 @@ def _serve() -> None:
     # Raises on an unsupported credential so the process fails visibly before the
     # port is up rather than after a real call.
     override = None
+    # The provider scope is read off the boot env before the spawn env builder
+    # rewrites it (#5426): afterwards the SDK credential name is set, and the
+    # declared credential reference can no longer be told apart from it.
+    boot_scope: ProviderScope | None = None
     if not fake_model:
+        boot_scope = provider_scope(os.environ)
         try:
             override = harness.build_spawn_env(os.environ)
         except UnsupportedCredentialError as exc:
@@ -2179,6 +2190,7 @@ def _serve() -> None:
         history_capacity_exceeded=fetches.history_capacity_exceeded,
         memory_facts_preamble=fetches.memory_facts_preamble,
         memory_guidance=fetches.memory_guidance,
+        scope=boot_scope,
     )
 
     def publication_proposal() -> tuple[str | None, str | None]:

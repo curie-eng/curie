@@ -135,6 +135,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0170"] == KIND_EXPAND
     assert kinds["0171"] == KIND_EXPAND
     assert kinds["0172"] == KIND_EXPAND
+    assert kinds["0173"] == KIND_EXPAND
     assert kinds["0174"] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
@@ -222,6 +223,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0170",
             "0171",
             "0172",
+            "0173",
             "0174",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
@@ -280,6 +282,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0170",
             "0171",
             "0172",
+            "0173",
             "0174",
         }
     assert current_revision() == "0174"
@@ -430,6 +433,7 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0170", window, known) is False
     assert can_serve("0171", window, known) is False
     assert can_serve("0172", window, known) is False
+    assert can_serve("0173", window, known) is False
     assert can_serve("0174", window, known) is True
 
 

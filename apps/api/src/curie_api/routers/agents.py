@@ -620,6 +620,11 @@ async def delete_agent(agent_id: uuid.UUID, session: SessionDep) -> None:
             status.HTTP_409_CONFLICT,
             {"code": "workspace_recovery.retained_objects"},
         ) from None
+    except crud_agents.PublicationCandidatesRetained:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": "publication_candidates.retained_objects"},
+        ) from None
 
 
 # --- the channel-binding subresource (ADR-0118, #1525) ------------------------
