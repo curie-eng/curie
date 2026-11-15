@@ -716,7 +716,8 @@ def test_adoptable_revisions_follow_the_candidate_ownership_chain(
 ) -> None:
     """A recovery may adopt only failed revisions its candidate's owners created (#5429)."""
 
-    run, _reservation = _captured(api, _agent(api, auth_headers), 54717)
+    agent_id = _agent(api, auth_headers)
+    run, _reservation = _captured(api, agent_id, 54717)
     origin_id = run.ref.request_id
 
     async def publish(session: AsyncSession) -> None:
@@ -736,7 +737,7 @@ def test_adoptable_revisions_follow_the_candidate_ownership_chain(
 
     # Never adoptable: a revision that never pushed, one outside the chain, and
     # a revision of an unrelated implementation request on the same lineage.
-    stranger = _item(api, _agent(api, auth_headers), 54718)
+    stranger = _item(api, agent_id, 54718)
 
     async def others(session: AsyncSession) -> None:
         await _publication_on(session, lineage_id, origin_id, status="denied", revision=2)

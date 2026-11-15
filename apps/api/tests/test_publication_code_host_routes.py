@@ -218,8 +218,10 @@ class _CodeHost:
     async def open_pull_request(self, repository: RepositoryRef, **fields: Any) -> PullRequest:
         self.calls.append("open_pull_request")
         self.opened.append(fields)
+        # A pull request opens on whatever the branch holds.
         return self._pull(
             repository,
+            head_sha=self.head if self.head is not None else HEAD_SHA,
             title=fields["title"],
             body=fields["body"],
             base_ref=fields["base_ref"],

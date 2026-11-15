@@ -1912,6 +1912,11 @@ def test_recovery_job_refuses_a_marked_merge_commit(publication_k8s: Any, tmp_pa
     # The predecessor's exact tree and marked message, on two parents.
     merge = _repo_git(
         remote,
+        # The bare origin has no configured identity of its own.
+        "-c",
+        "user.name=Predecessor",
+        "-c",
+        "user.email=predecessor@example.com",
         "commit-tree",
         f"{head}^{{tree}}",
         "-p",
