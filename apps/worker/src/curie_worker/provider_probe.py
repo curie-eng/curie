@@ -61,7 +61,6 @@ READ_DEADLINE_SECONDS = 10.0
 PROBE_INTERVAL_MS = 30_000
 _TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 _SCHEMA_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_PROBED_BLOCKS = ("provider_credit", "provider_usage_reset", "provider_credential")
 _ALLOWANCE_REASONS = frozenset({"credit_exhausted", "usage_reset"})
 _CREDENTIAL_REASON = "credential_rejected"
 
@@ -96,19 +95,20 @@ async def read_openrouter_allowance(
     return parse_openrouter_key(status, body)
 
 
-def _gates_sql(schema: str) -> str:
-    blocks = ", ".join(f"'{block}'" for block in _PROBED_BLOCKS)
-    return (
-        "SELECT DISTINCT p.retry_condition_reason, p.retry_condition_scope_key "
-        f"FROM {schema}.execution_requests s "
-        f"JOIN {schema}.execution_requests p ON p.id = s.retry_of_request_id "
-        "WHERE s.status = 'waiting' "
-        "AND s.started_at IS NULL "
-        f"AND s.blocked_on IN ({blocks}) "
-        "AND s.wait_deadline > now() "
-        "AND p.retry_condition_scope_key IS NOT NULL "
-        "AND p.retry_condition_retry_at IS NULL"
-    )
+# Waiting successors blocked on a provider wait a probe can verify, with their
+# predecessor's failed scope. Written out in full so the worker SQL inventory
+# can plan it against the migrated schema.
+_GATES_SQL = (
+    "SELECT DISTINCT p.retry_condition_reason, p.retry_condition_scope_key "
+    "FROM {schema}.execution_requests s "
+    "JOIN {schema}.execution_requests p ON p.id = s.retry_of_request_id "
+    "WHERE s.status = 'waiting' "
+    "AND s.started_at IS NULL "
+    "AND s.blocked_on IN ('provider_credit', 'provider_usage_reset', 'provider_credential') "
+    "AND s.wait_deadline > now() "
+    "AND p.retry_condition_scope_key IS NOT NULL "
+    "AND p.retry_condition_retry_at IS NULL"
+)
 
 
 class ProviderProbeLoop:
@@ -235,7 +235,7 @@ class ProviderProbeLoop:
         if _SCHEMA_NAME.fullmatch(schema) is None:
             raise ValueError("db_schema is not a safe identifier")
         async with self._engine.connect() as connection:
-            rows = (await connection.execute(text(_gates_sql(schema)))).all()
+            rows = (await connection.execute(text(_GATES_SQL.format(schema=schema)))).all()
         for reason, failed_scope in rows:
             if reason in _ALLOWANCE_REASONS and failed_scope == scope.scope_key:
                 return True
