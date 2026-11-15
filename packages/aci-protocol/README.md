@@ -24,9 +24,9 @@ string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
-## Contract surface (v0.5.25)
+## Contract surface (v0.5.26)
 
-`PROTOCOL_VERSION = "0.5.25"` is embedded in the schema and in every outbound
+`PROTOCOL_VERSION = "0.5.26"` is embedded in the schema and in every outbound
 event.
 
 `QueuedTurn.reply_handle` may be absent only when `source` is `cron` and
@@ -154,8 +154,32 @@ implements no Slack read operation or runtime lifecycle.
 - `final` = `{version, text, status}` where `status` is `SessionStatus`;
   optional `text_mode: "verbatim"` marks a validated answer for literal
   delivery (ADR 0227)
-- `error` = `{version, message, classification?}`
+- `error` = `{version, message, classification?, retry_condition?}`; the
+  optional `retry_condition` is provider-derived evidence for a wait, never
+  authorization, and missing or null means no trusted retry condition
 - `side_effect_flag` = `{version, tool?, detail?}`
+
+**Error retry condition** (`RetryCondition`, `RetryReason`)
+
+`ErrorEvent.retry_condition` is an optional `RetryCondition` defaulting to null.
+A present object requires `reason`, one of `rate_limited`, `usage_reset`,
+`credit_exhausted`, `credential_rejected` or `transient_service`; an unknown
+value is refused, never read as absent. `retry_at` is an optional absolute
+provider-derived UTC instant spelled `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`
+(`RETRY_AT_PATTERN`); naive values, numeric offsets including `+00:00`, and
+every other spelling are refused. The scheduler adds its own separate 60 second
+reset grace. `scope_key` is an optional opaque credential-scope digest,
+`sha256:` followed by 64 lowercase hex digits (`RETRY_SCOPE_KEY_PATTERN`), never
+a credential value, account name or provider message; the grammar check is not
+a secret detector. The carrier is evidence for a wait, never authorization, an
+approval, an increased limit or permission to replay an effect, and nothing
+infers a reset from `classification`. A malformed present carrier fails the
+whole frame on decode in Python and Rust; generated TypeScript enforces the
+shape but not the string grammars. Python normalizes the `retry_at` fraction
+spelling on re-encode (`.5Z` becomes `.500000Z` and a zero fraction is dropped)
+while generated Rust keeps the received string; both name the same instant.
+The shared vector `tests/vectors/aci-error-retry-condition.json` is read by all
+three lanes.
 
 **Session status** (`SessionStatus`): `done`, `idle-awaiting-input`,
 `classified-failure`.
@@ -185,11 +209,14 @@ compiles the generated Rust (`cargo test`) and TypeScript (`tsc --noEmit`).
 
 ## Generated artifacts
 
-- `schema/aci-protocol.schema.json` (committed) via `python -m aci_protocol.schema_export`
-- `generated/rust/` (committed) via `python -m aci_protocol.rust_export`, a
-  standalone serde crate proven by `cargo test`
-- `generated/ts/aci-protocol.ts` (committed) via `json-schema-to-typescript`
-  from the committed schema, proven by `tsc --noEmit`
+1. `schema/aci-protocol.schema.json` (committed) via `python -m aci_protocol.schema_export`
+2. `generated/rust/` (committed) via `python -m aci_protocol.rust_export`, a
+   standalone serde crate proven by `cargo test`
+3. `generated/ts/aci-protocol.ts` (committed) via `json-schema-to-typescript`
+   from the committed schema, proven by `tsc --noEmit`
+4. `generated/ts/retry-condition-vectors.ts` (committed) via
+   `python -m aci_protocol.ts_vector_export` from the shared vector
+   `tests/vectors/aci-error-retry-condition.json`, proven by `tsc --noEmit`
 
 ## Decisions made under ambiguity (section 0 was underspecified here)
 

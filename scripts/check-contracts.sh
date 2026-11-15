@@ -19,6 +19,7 @@ identity_schema="docs/interfaces/http-identity/http-identity-v1.schema.json"
 role_filter_schema="docs/interfaces/agent-access/agent-role-filter-v1.schema.json"
 env_example=".env.example"
 ts_out="packages/aci-protocol/generated/ts/aci-protocol.ts"
+ts_vectors_out="packages/aci-protocol/generated/ts/retry-condition-vectors.ts"
 rust_crate="packages/aci-protocol/generated/rust"
 
 echo "== regenerating JSON Schemas =="
@@ -44,6 +45,9 @@ echo "== regenerating TypeScript types =="
 pnpm --dir tools/contract-codegen exec json2ts "$repo_root/$aci_schema" \
   --unreachableDefinitions -o "$repo_root/$ts_out"
 
+echo "== regenerating TypeScript retry-condition vectors =="
+uv run python -m aci_protocol.ts_vector_export
+
 echo "== compiling generated Rust =="
 cargo check --manifest-path "$rust_crate/Cargo.toml"
 
@@ -55,7 +59,7 @@ echo "== checking for drift =="
 if ! git diff --exit-code -- \
   "$aci_schema" "$aci_wire_lock" "$channel_schema" "$plugin_schema" "$eval_schema" \
   "$identity_openapi" "$identity_schema" "$role_filter_schema" \
-  "$env_example" "$ts_out" "$rust_crate/src/lib.rs"; then
+  "$env_example" "$ts_out" "$ts_vectors_out" "$rust_crate/src/lib.rs"; then
   echo "ERROR: committed contract artifacts drifted from the models." >&2
   echo "The files above were regenerated and differ. Review, then commit them." >&2
   exit 1

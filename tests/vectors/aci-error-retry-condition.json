@@ -1,0 +1,527 @@
+{
+  "comment": "Single source of truth for the optional ErrorEvent.retry_condition carrier (aci_protocol.events.RetryCondition) across the Python decoder, the generated Rust crate and the generated TypeScript types. Frames omit version: each reader stamps its own PROTOCOL_VERSION, so the version gate stays the only version check. Every accept frame must decode, and expected_retry_condition is the decoded carrier in canonical spelling (null, or the full reason, retry_at and scope_key object with null for an absent member), so the Python normalized dump and the Rust verbatim string agree. strict_construction refuse marks the one accept frame that tolerant decoders read but strict producer construction refuses (an unknown nested key). Every refuse frame must fail decode on its retry_condition alone; violation type is a shape TypeScript types also refuse, violation grammar is a well-typed string only the Python and Rust guards refuse. The scope_key digests are the sha256 of the example texts 'example credential scope' and 'example credential scope two', never a credential, account name or provider message. Read by packages/aci-protocol/tests/test_retry_condition.py (through aci_protocol.ts_vector_export.load_retry_condition_vector), by the retry_condition_tests module of packages/aci-protocol/generated/rust/src/lib.rs (rendered by packages/aci-protocol/src/aci_protocol/rust_export.py) and by packages/aci-protocol/src/aci_protocol/ts_vector_export.py, which renders packages/aci-protocol/generated/ts/retry-condition-vectors.ts for tsc. Every loader rejects unknown top-level and per-case keys, so a key one lane cannot see cannot pass vacuously. Changing a case here changes all three lanes.",
+  "accept": [
+    {
+      "name": "absent_carrier",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "rate-limit"
+      },
+      "expected_retry_condition": null
+    },
+    {
+      "name": "null_carrier",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "rate-limit",
+        "retry_condition": null
+      },
+      "expected_retry_condition": null
+    },
+    {
+      "name": "reason_only_transient_service",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "server-error",
+        "retry_condition": {
+          "reason": "transient_service"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "transient_service",
+        "retry_at": null,
+        "scope_key": null
+      }
+    },
+    {
+      "name": "rate_limited_with_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "rate-limit",
+        "retry_condition": {
+          "reason": "rate_limited",
+          "retry_at": "2026-11-14T17:05:30Z"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "rate_limited",
+        "retry_at": "2026-11-14T17:05:30Z",
+        "scope_key": null
+      }
+    },
+    {
+      "name": "complete_usage_reset",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-usage-limited",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00Z",
+          "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "usage_reset",
+        "retry_at": "2026-11-14T17:00:00Z",
+        "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+      }
+    },
+    {
+      "name": "credit_exhausted_with_scope_key",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-credit-exhausted",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": "sha256:ae382d780c0bf420cc17b0059941e2a6cb15c072bf9abbb07eac35182ad08a74"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "credit_exhausted",
+        "retry_at": null,
+        "scope_key": "sha256:ae382d780c0bf420cc17b0059941e2a6cb15c072bf9abbb07eac35182ad08a74"
+      }
+    },
+    {
+      "name": "credential_rejected_reason_only",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "classification": "model-credential-rejected",
+        "retry_condition": {
+          "reason": "credential_rejected"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "credential_rejected",
+        "retry_at": null,
+        "scope_key": null
+      }
+    },
+    {
+      "name": "six_digit_fraction",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00.500000Z",
+          "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "usage_reset",
+        "retry_at": "2026-11-14T17:00:00.500000Z",
+        "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+      }
+    },
+    {
+      "name": "leap_day",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2028-02-29T00:00:00Z"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "usage_reset",
+        "retry_at": "2028-02-29T00:00:00Z",
+        "scope_key": null
+      }
+    },
+    {
+      "name": "past_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "rate_limited",
+          "retry_at": "2020-01-01T00:00:00Z"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "rate_limited",
+        "retry_at": "2020-01-01T00:00:00Z",
+        "scope_key": null
+      }
+    },
+    {
+      "name": "explicit_null_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": null,
+          "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "usage_reset",
+        "retry_at": null,
+        "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+      }
+    },
+    {
+      "name": "explicit_null_scope_key",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "rate_limited",
+          "retry_at": "2026-11-14T17:00:00Z",
+          "scope_key": null
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "rate_limited",
+        "retry_at": "2026-11-14T17:00:00Z",
+        "scope_key": null
+      }
+    },
+    {
+      "name": "unknown_nested_key_ignored",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "rate_limited",
+          "future_member": "example"
+        }
+      },
+      "expected_retry_condition": {
+        "reason": "rate_limited",
+        "retry_at": null,
+        "scope_key": null
+      },
+      "strict_construction": "refuse"
+    }
+  ],
+  "refuse": [
+    {
+      "name": "naive_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "positive_offset_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T19:00:00+02:00"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "zero_offset_spelling_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00+00:00"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "space_separator_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14 17:00:00Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "missing_seconds_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "date_only_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "impossible_day_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-02-30T00:00:00Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "century_non_leap_day_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2100-02-29T00:00:00Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "hour_24_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T24:00:00Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "leap_second_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-12-31T23:59:60Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "year_zero_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "0000-01-01T00:00:00Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "lowercase_t_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14t17:00:00Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "lowercase_z_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "empty_fraction_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00.Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "seven_fraction_digits_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": "2026-11-14T17:00:00.1234567Z"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "numeric_retry_at",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": 1794243600
+        }
+      },
+      "violation": "type"
+    },
+    {
+      "name": "unknown_reason",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "quota_raised"
+        }
+      },
+      "violation": "type"
+    },
+    {
+      "name": "classification_token_reason",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "rate-limit"
+        }
+      },
+      "violation": "type"
+    },
+    {
+      "name": "missing_reason",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "retry_at": "2026-11-14T17:00:00Z"
+        }
+      },
+      "violation": "type"
+    },
+    {
+      "name": "null_reason",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": null
+        }
+      },
+      "violation": "type"
+    },
+    {
+      "name": "string_carrier",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": "rate_limited"
+      },
+      "violation": "type"
+    },
+    {
+      "name": "uppercase_hex_scope_key",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": "sha256:CEFC1AB876B7698F6E62B340AD59741BE655F061976D9337F3EACEEC751CEABA"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "short_scope_key",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": "sha256:cefc1ab876b7698f"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "unprefixed_scope_key",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "account_name_scope_key",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": "operator@example.com"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "trailing_newline_scope_key",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba\n"
+        }
+      },
+      "violation": "grammar"
+    },
+    {
+      "name": "numeric_scope_key",
+      "frame": {
+        "type": "error",
+        "message": "Example provider error.",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "scope_key": 42
+        }
+      },
+      "violation": "type"
+    }
+  ]
+}

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.25";
+pub const PROTOCOL_VERSION: &str = "0.5.26";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -69,6 +69,114 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer)
+}
+
+fn retry_at_number(digits: &[u8]) -> Option<u32> {
+    digits.iter().try_fold(0u32, |total, byte| {
+        if byte.is_ascii_digit() {
+            Some(total * 10 + u32::from(byte - b'0'))
+        } else {
+            None
+        }
+    })
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Whether `value` is the one spelling the ACI accepts for
+/// `RetryCondition.retry_at`: `YYYY-MM-DDTHH:MM:SS`, an optional dot with one
+/// to six fraction digits, then `Z`, naming a real Gregorian date and time.
+fn is_utc_retry_at(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+    let fraction_ok = match &bytes[19..] {
+        [b'Z'] => true,
+        [b'.', digits @ .., b'Z'] => {
+            (1..=6).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    };
+    if !fraction_ok {
+        return false;
+    }
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        retry_at_number(&bytes[0..4]),
+        retry_at_number(&bytes[5..7]),
+        retry_at_number(&bytes[8..10]),
+        retry_at_number(&bytes[11..13]),
+        retry_at_number(&bytes[14..16]),
+        retry_at_number(&bytes[17..19]),
+    ) else {
+        return false;
+    };
+    year >= 1
+        && (1..=12).contains(&month)
+        && (1..=days_in_month(year, month)).contains(&day)
+        && hour < 24
+        && minute < 60
+        && second < 60
+}
+
+/// Whether `value` is `sha256:` followed by exactly 64 lowercase hex digits,
+/// the one spelling the ACI accepts for `RetryCondition.scope_key`.
+fn is_retry_scope_key(value: &str) -> bool {
+    match value.strip_prefix("sha256:") {
+        Some(digest) => {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        }
+        None => false,
+    }
+}
+
+fn deserialize_optional_utc_retry_at<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Ok(value) = Option::<String>::deserialize(deserializer) else {
+        return Err(serde::de::Error::custom("retry_at must be a string or null"));
+    };
+    match value {
+        Some(text) if !is_utc_retry_at(&text) => Err(serde::de::Error::custom(
+            "retry_at must be an RFC 3339 UTC timestamp spelled YYYY-MM-DDTHH:MM:SS[.ffffff]Z",
+        )),
+        other => Ok(other),
+    }
+}
+
+fn deserialize_optional_scope_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Ok(value) = Option::<String>::deserialize(deserializer) else {
+        return Err(serde::de::Error::custom("scope_key must be a string or null"));
+    };
+    match value {
+        Some(text) if !is_retry_scope_key(&text) => Err(serde::de::Error::custom(
+            "scope_key must be sha256: followed by 64 lowercase hex digits",
+        )),
+        other => Ok(other),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -503,6 +611,29 @@ pub enum InboundMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RetryReason {
+    #[serde(rename = "rate_limited")]
+    RateLimited,
+    #[serde(rename = "usage_reset")]
+    UsageReset,
+    #[serde(rename = "credit_exhausted")]
+    CreditExhausted,
+    #[serde(rename = "credential_rejected")]
+    CredentialRejected,
+    #[serde(rename = "transient_service")]
+    TransientService,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetryCondition {
+    pub reason: RetryReason,
+    #[serde(default, deserialize_with = "deserialize_optional_utc_retry_at")]
+    pub retry_at: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_scope_key")]
+    pub scope_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OutboundEvent {
     #[serde(rename = "text_delta")]
@@ -552,6 +683,8 @@ pub enum OutboundEvent {
         message: String,
         #[serde(default)]
         classification: Option<String>,
+        #[serde(default)]
+        retry_condition: Option<RetryCondition>,
     },
     #[serde(rename = "side_effect_flag")]
     SideEffectFlag {
@@ -803,13 +936,221 @@ mod attachment_access_tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.26","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.27","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.25","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.26","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod retry_condition_tests {
+    use super::*;
+
+    // Frames in the shared vector omit `version`; each lane stamps its own
+    // PROTOCOL_VERSION so the version gate stays the only version check.
+    const VECTOR: &str =
+        include_str!("../../../../../tests/vectors/aci-error-retry-condition.json");
+
+    fn check_keys(
+        value: &serde_json::Value,
+        required: &[&str],
+        optional: &[&str],
+    ) -> Result<(), String> {
+        let object = value
+            .as_object()
+            .ok_or("vector entries must be JSON objects")?;
+        if let Some(key) = object
+            .keys()
+            .find(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
+        {
+            return Err(format!("unknown vector key {key}"));
+        }
+        if let Some(key) = required.iter().find(|key| !object.contains_key(**key)) {
+            return Err(format!("missing vector key {key}"));
+        }
+        Ok(())
+    }
+
+    fn case_list<'a>(
+        vector: &'a serde_json::Value,
+        list: &str,
+    ) -> Result<&'a [serde_json::Value], String> {
+        match vector[list].as_array() {
+            Some(cases) => Ok(cases.as_slice()),
+            None => Err(format!("vector list {list} must be an array")),
+        }
+    }
+
+    // Fails closed: a key one lane cannot see must not pass vacuously.
+    fn checked(vector: &serde_json::Value) -> Result<(), String> {
+        check_keys(vector, &["comment", "accept", "refuse"], &[])?;
+        for case in case_list(vector, "accept")? {
+            check_keys(
+                case,
+                &["name", "frame", "expected_retry_condition"],
+                &["strict_construction"],
+            )?;
+        }
+        for case in case_list(vector, "refuse")? {
+            check_keys(case, &["name", "frame", "violation"], &[])?;
+        }
+        Ok(())
+    }
+
+    fn load(text: &str) -> Result<serde_json::Value, String> {
+        let vector: serde_json::Value =
+            serde_json::from_str(text).map_err(|error| error.to_string())?;
+        checked(&vector)?;
+        Ok(vector)
+    }
+
+    fn shared_vector() -> serde_json::Value {
+        load(VECTOR).unwrap_or_else(|error| panic!("the shared vector is malformed: {error}"))
+    }
+
+    fn case_name(case: &serde_json::Value) -> &str {
+        case["name"].as_str().expect("vector case names are strings")
+    }
+
+    fn stamped(case: &serde_json::Value) -> serde_json::Value {
+        let mut frame = case["frame"].clone();
+        frame["version"] = serde_json::Value::from(PROTOCOL_VERSION);
+        frame
+    }
+
+    #[test]
+    fn vector_loader_refuses_unknown_and_missing_keys() {
+        assert!(load(VECTOR).is_ok());
+        let valid = serde_json::json!({
+            "comment": "",
+            "accept": [{"name": "x", "frame": {}, "expected_retry_condition": null}],
+            "refuse": [{"name": "y", "frame": {}, "violation": "type"}]
+        });
+        assert!(checked(&valid).is_ok());
+        let mutations: [fn(&mut serde_json::Value); 5] = [
+            |vector| vector["extra"] = serde_json::Value::from(1),
+            |vector| vector["accept"][0]["extra"] = serde_json::Value::from(1),
+            |vector| vector["refuse"][0]["extra"] = serde_json::Value::from(1),
+            |vector| {
+                vector["accept"][0]
+                    .as_object_mut()
+                    .expect("vector cases are JSON objects")
+                    .remove("expected_retry_condition");
+            },
+            |vector| {
+                vector
+                    .as_object_mut()
+                    .expect("the vector is a JSON object")
+                    .remove("comment");
+            },
+        ];
+        for mutate in mutations {
+            let mut vector = valid.clone();
+            mutate(&mut vector);
+            assert!(checked(&vector).is_err(), "{vector}");
+        }
+    }
+
+    #[test]
+    fn accepted_frames_decode_to_the_expected_retry_condition() {
+        let vector = shared_vector();
+        let accepted = case_list(&vector, "accept").unwrap();
+        assert!(!accepted.is_empty());
+        for case in accepted {
+            let name = case_name(case);
+            if let Some(mode) = case.get("strict_construction") {
+                assert_eq!(mode.as_str(), Some("refuse"), "{name}");
+            }
+            let event: OutboundEvent = serde_json::from_value(stamped(case))
+                .unwrap_or_else(|error| panic!("{name} must decode: {error}"));
+            let OutboundEvent::ErrorEvent {
+                retry_condition, ..
+            } = &event
+            else {
+                panic!("{name} must decode as an error event");
+            };
+            assert_eq!(
+                serde_json::to_value(retry_condition).unwrap(),
+                case["expected_retry_condition"],
+                "{name}"
+            );
+            let encoded = serde_json::to_string(&event).unwrap();
+            let decoded: OutboundEvent = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(event, decoded, "{name}");
+        }
+    }
+
+    #[test]
+    fn refused_frames_fail_to_decode_on_their_carrier() {
+        let vector = shared_vector();
+        let refused = case_list(&vector, "refuse").unwrap();
+        assert!(!refused.is_empty());
+        for case in refused {
+            let name = case_name(case);
+            assert!(
+                matches!(case["violation"].as_str(), Some("type" | "grammar")),
+                "{name}"
+            );
+            let error = serde_json::from_value::<OutboundEvent>(stamped(case))
+                .expect_err(name)
+                .to_string();
+            for member in ["retry_at", "scope_key"] {
+                let carrier = &case["frame"]["retry_condition"];
+                if let Some(text) = carrier.get(member).and_then(serde_json::Value::as_str) {
+                    assert!(!error.contains(text), "{name} must not quote the value");
+                }
+            }
+            let mut without_carrier = stamped(case);
+            without_carrier
+                .as_object_mut()
+                .expect("vector frames are JSON objects")
+                .remove("retry_condition");
+            assert!(
+                serde_json::from_value::<OutboundEvent>(without_carrier).is_ok(),
+                "{name} must fail only on its retry condition"
+            );
+        }
+    }
+
+    #[test]
+    fn previous_error_reader_ignores_the_retry_condition() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct PreviousErrorEvent {
+            // A previous reader gated its version exactly as the current one does.
+            #[serde(deserialize_with = "require_compatible_protocol_version")]
+            version: String,
+            message: String,
+            #[serde(default)]
+            classification: Option<String>,
+        }
+        let vector = shared_vector();
+        let complete = case_list(&vector, "accept")
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "complete_usage_reset")
+            .expect("the vector carries a complete retry condition");
+        let with_carrier = stamped(complete);
+        assert!(with_carrier["retry_condition"].is_object());
+        let mut without_carrier = with_carrier.clone();
+        without_carrier
+            .as_object_mut()
+            .expect("vector frames are JSON objects")
+            .remove("retry_condition");
+        let before: PreviousErrorEvent = serde_json::from_value(without_carrier).unwrap();
+        let after: PreviousErrorEvent = serde_json::from_value(with_carrier.clone()).unwrap();
+        assert_eq!(before, after);
+        let current: OutboundEvent = serde_json::from_value(with_carrier).unwrap();
+        assert!(matches!(
+            current,
+            OutboundEvent::ErrorEvent {
+                retry_condition: Some(_),
+                ..
+            }
+        ));
     }
 }
