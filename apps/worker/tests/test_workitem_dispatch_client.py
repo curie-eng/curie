@@ -232,8 +232,10 @@ def test_acquire_sends_wake_and_initial_authority_explicitly() -> None:
 
 
 def _running_body() -> dict[str, object]:
+    # The running lookup carries no execution kind: only acquire grants one.
+    acquire_only = {"execution_kind", "recovery_candidate_id"}
     return {
-        **BASE,
+        **{key: value for key, value in BASE.items() if key not in acquire_only},
         "request_id": str(REQUEST_ID),
         "agent_id": str(AGENT_ID),
         "runtime_epoch": 7,

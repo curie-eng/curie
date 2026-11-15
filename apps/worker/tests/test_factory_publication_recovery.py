@@ -101,6 +101,8 @@ def candidate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[P
         "S3_ENDPOINT_URL": os.environ.get("TEST_S3_ENDPOINT_URL")
         or os.environ.get("S3_ENDPOINT_URL", "http://127.0.0.1:29000"),
         "CURIE_WORKSPACE_SCRATCH_ROOT": str(scratch),
+        # The capture declares this limit; the API refuses any other.
+        "CURIE_WORKSPACE_MAX_ARCHIVE_BYTES": str(BASE_ARCHIVE_LIMIT),
     }.items():
         monkeypatch.setenv(key, value)
     yield scratch

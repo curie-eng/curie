@@ -82,8 +82,9 @@ CONTRACT = "0041"
 # Refusal posts require 0170, which stays below this floor.
 # Triage handoff storage requires 0171, which stays below this floor.
 # Factory retry allowance columns require 0172, which stays below this floor.
-# Publication candidate retention requires 0173.
-APP_SCHEMA_MIN = "0173"
+# Publication candidate retention requires 0173, which stays below this floor.
+# Publication recovery requests require 0174.
+APP_SCHEMA_MIN = "0174"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -116,7 +117,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
-    assert HEAD == "0173"
+    assert HEAD == "0174"
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
     # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
@@ -136,6 +137,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0171"] == KIND_EXPAND
     assert kinds["0172"] == KIND_EXPAND
     assert kinds["0173"] == KIND_EXPAND
+    assert kinds["0174"] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
@@ -223,6 +225,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0171",
             "0172",
             "0173",
+            "0174",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -281,8 +284,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0171",
             "0172",
             "0173",
+            "0174",
         }
-    assert current_revision() == "0173"
+    assert current_revision() == "0174"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -398,8 +402,9 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # floor. Refusal posts require 0170, which stays below this floor.
     # Triage handoff storage requires 0171, which stays below this floor.
     # Factory retry allowance columns require 0172, which stays below this floor.
-    # Publication candidate retention requires 0173.
-    for revision in sorted(known - {"0173"}):
+    # Publication candidate retention requires 0173, which stays below this floor.
+    # Publication recovery requests require 0174.
+    for revision in sorted(known - {"0174"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -430,7 +435,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0170", window, known) is False
     assert can_serve("0171", window, known) is False
     assert can_serve("0172", window, known) is False
-    assert can_serve("0173", window, known) is True
+    assert can_serve("0173", window, known) is False
+    assert can_serve("0174", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
