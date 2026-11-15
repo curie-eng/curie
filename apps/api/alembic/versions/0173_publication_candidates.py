@@ -1,7 +1,7 @@
 """Bounded private publication candidate metadata (#5428).
 
 Revision ID: 0173
-Revises: 0171
+Revises: 0172
 """
 
 from collections.abc import Sequence
@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0173"
-down_revision: str = "0171"
+down_revision: str = "0172"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

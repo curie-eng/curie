@@ -781,9 +781,10 @@ print(json.dumps(graph))
         // 0168, which stays below this floor. Requester selection columns
         // require 0169, which stays below this floor. Refusal posts require 0170,
         // which stays below this floor. Triage handoff storage requires 0171, which
-        // stays below this floor. Factory retry allowance columns require 0172.
-        assert_eq!(candidate.schema_min, "0172");
-        assert_eq!(candidate.schema_head, "0172");
+        // stays below this floor. Factory retry allowance columns require 0172,
+        // which stays below this floor. Publication candidate retention requires 0173.
+        assert_eq!(candidate.schema_min, "0173");
+        assert_eq!(candidate.schema_head, "0173");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -843,7 +844,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0169", &current));
         assert!(!live_in_window("0170", &current));
         assert!(!live_in_window("0171", &current));
-        assert!(live_in_window("0172", &current));
+        assert!(!live_in_window("0172", &current));
+        assert!(live_in_window("0173", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
