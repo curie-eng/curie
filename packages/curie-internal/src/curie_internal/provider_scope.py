@@ -102,12 +102,12 @@ def _declared_names(raw: str) -> tuple[str, ...] | None:
     return keys
 
 
-def provider_scope(env: Mapping[str, str]) -> ProviderScope | None:
-    """Derive the scope of the credential ``env`` authenticates with, or None.
+def scope_credential(env: Mapping[str, str]) -> str | None:
+    """The credential ``provider_scope`` derives its scope from, or None.
 
-    None means no scope can be named safely: personal mode, an explicit SDK
-    credential, a refused or empty credential declaration, an unknown base URL
-    host, or a bare ``sk-`` key.
+    None means personal mode, an explicit SDK credential, a refused credential
+    declaration, or no non-empty declared credential. The caller must never log
+    or store the returned value.
     """
 
     if env.get(CURIE_MODEL_AUTH_MODE, "").strip().lower() == "personal":
@@ -117,7 +117,18 @@ def provider_scope(env: Mapping[str, str]) -> ProviderScope | None:
     names = _declared_names(env.get(CURIE_MODEL_ENV_KEY, ""))
     if names is None:
         return None
-    credential = next((env[name] for name in names if env.get(name)), "")
+    return next((env[name] for name in names if env.get(name)), None)
+
+
+def provider_scope(env: Mapping[str, str]) -> ProviderScope | None:
+    """Derive the scope of the credential ``env`` authenticates with, or None.
+
+    None means no scope can be named safely: personal mode, an explicit SDK
+    credential, a refused or empty credential declaration, an unknown base URL
+    host, or a bare ``sk-`` key.
+    """
+
+    credential = scope_credential(env)
     if not credential:
         return None
     if credential.startswith("sk-or-"):

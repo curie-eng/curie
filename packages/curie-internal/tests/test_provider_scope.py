@@ -16,6 +16,7 @@ from curie_internal.provider_scope import (
     ProviderScope,
     parse_openrouter_key,
     provider_scope,
+    scope_credential,
     scope_key,
 )
 
@@ -136,6 +137,7 @@ def test_provider_scope_derives(
     env: dict[str, str], provider: str, host: str, credential: str
 ) -> None:
     assert provider_scope(env) == _scope(provider, host, credential)
+    assert scope_credential(env) == credential
 
 
 @pytest.mark.parametrize(
@@ -205,6 +207,53 @@ def test_provider_scope_derives(
     ],
 )
 def test_provider_scope_refuses(env: dict[str, str]) -> None:
+    assert provider_scope(env) is None
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        pytest.param(
+            {"CURIE_MODEL_AUTH_MODE": "personal", "CURIE_CREDENTIALS": OR_KEY}, id="personal"
+        ),
+        pytest.param({"ANTHROPIC_API_KEY": ANT_KEY, "CURIE_CREDENTIALS": OR_KEY}, id="sdk-key"),
+        pytest.param(
+            {"CLAUDE_CODE_OAUTH_TOKEN": ANT_OAT, "CURIE_CREDENTIALS": OR_KEY}, id="sdk-token"
+        ),
+        pytest.param(
+            {"CURIE_MODEL_ENV_KEY": "CURIE_SANDBOX_TOKEN", "CURIE_SANDBOX_TOKEN": OR_KEY},
+            id="curie-target",
+        ),
+        pytest.param({"CURIE_MODEL_ENV_KEY": "[]", "CURIE_CREDENTIALS": OR_KEY}, id="empty-list"),
+        pytest.param({"CURIE_CREDENTIALS": ""}, id="empty-credential"),
+        pytest.param({}, id="no-credential"),
+        pytest.param(
+            {"CURIE_MODEL_ENV_KEY": "PROVIDER_KEY", "CURIE_CREDENTIALS": OR_KEY},
+            id="declared-name-unset",
+        ),
+    ],
+)
+def test_scope_credential_refuses_what_the_scope_refuses(env: dict[str, str]) -> None:
+    assert scope_credential(env) is None
+    assert provider_scope(env) is None
+
+
+@pytest.mark.parametrize(
+    ("env", "credential"),
+    [
+        pytest.param({"CURIE_CREDENTIALS": "sk-" + "0" * 48}, "sk-" + "0" * 48, id="bare-sk"),
+        pytest.param(
+            {"CURIE_CREDENTIALS": ANT_KEY, "ANTHROPIC_BASE_URL": "https://api.example.test/x"},
+            ANT_KEY,
+            id="other-base-url-host",
+        ),
+    ],
+)
+def test_scope_credential_is_resolved_before_the_provider_is(
+    env: dict[str, str], credential: str
+) -> None:
+    # The credential resolves even where no provider can be named for it.
+    assert scope_credential(env) == credential
     assert provider_scope(env) is None
 
 
