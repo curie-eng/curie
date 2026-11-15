@@ -1440,6 +1440,30 @@ class TwoOwnerLedger(pps.Ledger):
 # --------------------------------------------------------------------------
 
 
+#: How many failed-feed exception classes a capture keeps for its diagnostic.
+FEED_ERRORS_KEPT = 5
+
+
+def capture_stall(
+    harvest: pps.HarvestState, parked_at: float | None, *, eof: bool
+) -> dict[str, Any]:
+    """Content-free facts on a capture that never became terminal after the park. Pure."""
+
+    synced = harvest.synced_at
+    return {
+        "gaps": harvest.gaps,
+        "bad_lines": harvest.bad_lines,
+        "feed_errors": list(getattr(harvest, "feed_errors", [])),
+        "synced_after_park": None
+        if synced is None or not parked_at
+        else round(synced - parked_at, 3),
+        "complete": harvest.complete,
+        "eof": eof,
+        "ended": harvest.ended,
+        "files": len(harvest.files),
+    }
+
+
 class TimingHarvest(pps.HarvestState):
     def __init__(
         self,
@@ -1456,6 +1480,9 @@ class TimingHarvest(pps.HarvestState):
         self.timing_offsets = {path: len(data) for path, data in (baseline or {}).items()}
         self.timing_started: set[str] = set()
         self.not_before = not_before
+        #: The exception classes of lines the reader could not feed (at most
+        #: ``FEED_ERRORS_KEPT``), so a stalled capture says why. Never content.
+        self.feed_errors: list[str] = []
 
     def feed(self, line: bytes) -> None:
         super().feed(line)

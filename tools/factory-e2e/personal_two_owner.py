@@ -2692,8 +2692,10 @@ class TwoOwnerRun(pp.LiveRun):
                     with run.harvest_lock:
                         try:
                             state.feed(line)
-                        except Exception:  # noqa: BLE001
+                        except Exception as exc:  # noqa: BLE001
                             state.bad_lines += 1
+                            if len(state.feed_errors) < pto.FEED_ERRORS_KEPT:
+                                state.feed_errors.append(type(exc).__name__)
                             self.safe(
                                 lambda: ledger.record(
                                     "diagnostics", f"timing_failure_{run.group}", True
@@ -2936,9 +2938,16 @@ class TwoOwnerRun(pp.LiveRun):
             with run.harvest_lock:
                 return bool(run.parked_at) and harvest.terminal_after(run.parked_at)
 
-        with contextlib.suppress(StepFailed):
+        try:
             self.wait_until(
                 terminal, until=self.clock.now() + SETTLE_SECONDS, what=f"{run.group} capture"
+            )
+        except StepFailed:
+            with run.harvest_lock:
+                stall = pto.capture_stall(harvest, run.parked_at, eof=run.eof.is_set())
+            self.safe(
+                lambda: self.ledger.record("diagnostics", f"capture_stall_{run.group}", stall),
+                None,
             )
         with run.harvest_lock:
             run.reviewed = pps.workspace_record(harvest.workspace)

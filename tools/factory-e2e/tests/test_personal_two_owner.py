@@ -27,6 +27,7 @@ import io
 import json
 import posixpath
 import signal
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -4293,6 +4294,50 @@ def test_capture_needs_a_known_park_time_after_its_size_report(
     with pytest.raises(pp.StepFailed, match="usage unknown or unmapped"):
         h.run.finish_park(run)
     assert all(row["source"] == "unknown" for row in _rows(h, "a1"))
+    # The stalled capture says why, without content: its last size report
+    # came before the park (or the park time was unknown).
+    stall = h.ledger.observations("diagnostics")["capture_stall_a1"]
+    assert stall == {
+        "gaps": 0,
+        "bad_lines": 0,
+        "feed_errors": [],
+        "synced_after_park": -1.0 if parked_at else None,
+        "complete": True,
+        "eof": False,
+        "ended": False,
+        "files": 1,
+    }
+
+
+def test_a_line_the_reader_cannot_feed_is_kept_as_its_error_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real harvest reader keeps each failed line's exception class, never its content."""
+
+    h = _live(tmp_path)
+    _through(h, "a1")
+    run = _pod_run(h, "a1")
+    lines = pto.FEED_ERRORS_KEPT + 2
+
+    def spawn(argv: Sequence[str]) -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            [sys.executable, "-c", f"print('{{}}\\n' * {lines}, end='')"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def locked(self: pto.TimingHarvest, line: bytes) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(h.shell, "spawn", spawn)
+    monkeypatch.setattr(pto.TimingHarvest, "feed", locked)
+    pt.TwoOwnerRun.open_harvest(h.run, run)
+    assert run.eof.wait(timeout=5)
+    assert run.harvest is not None
+    assert run.harvest.bad_lines == lines
+    stall = pto.capture_stall(run.harvest, T0, eof=True)
+    assert stall["feed_errors"] == ["OperationalError"] * pto.FEED_ERRORS_KEPT
+    assert stall["complete"] is False
 
 
 def test_known_park_time_accepts_a_later_complete_size_report(tmp_path: Path) -> None:
