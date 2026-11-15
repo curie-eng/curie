@@ -2679,6 +2679,38 @@ true
 {{- $cap | int64 -}}
 {{- end -}}
 
+{{/*
+Publication candidate retention (#5428): off by default. Enabling it requires
+managed workspaces, because a candidate retains the claim's trusted base, and a
+positive integer installation-wide byte cap. Read through `default dict` for
+--reuse-values from a release that predates the key. The one helper both the
+API and the worker include, so a bad setting fails the render instead of
+starting a worker that refuses to boot.
+*/}}
+{{- define "curie.publicationCandidatesEnabled" -}}
+{{- $candidates := dig "workspace" "publicationCandidates" dict (.Values.worker | default dict) -}}
+{{- if get $candidates "enabled" -}}
+{{- if not (dig "runner" "workspace" "enabled" false (.Values.agentSandbox | default dict)) -}}
+{{- fail "worker.workspace.publicationCandidates.enabled=true requires agentSandbox.runner.workspace.enabled=true (#5428): a candidate retains the managed workspace's trusted base" -}}
+{{- end -}}
+{{- $_ := include "curie.publicationCandidateMaxBytes" . -}}
+true
+{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "curie.publicationCandidateMaxBytes" -}}
+{{- $candidates := dig "workspace" "publicationCandidates" dict (.Values.worker | default dict) -}}
+{{- $cap := get $candidates "maxBytes" -}}
+{{- if or (kindIs "invalid" $cap) (kindIs "string" $cap) (not (or (kindIs "float64" $cap) (kindIs "int64" $cap) (kindIs "int" $cap))) -}}
+{{- fail "worker.workspace.publicationCandidates.enabled=true requires worker.workspace.publicationCandidates.maxBytes to be a positive integer (#5428): the installation-wide cap counts every candidate byte" -}}
+{{- end -}}
+{{- $number := float64 $cap -}}
+{{- if or (le $number 0.0) (ne $number (floor $number)) -}}
+{{- fail "worker.workspace.publicationCandidates.maxBytes must be a positive integer (#5428): the installation-wide cap counts every candidate byte" -}}
+{{- end -}}
+{{- $cap | int64 -}}
+{{- end -}}
+
 {{/* Code host trust (ADR 0197): renders nothing when no ConfigMap is named. */}}
 {{- define "curie.codeHostTrust.name" -}}
 {{- dig "caBundle" "configMapRef" "name" "" (.Values.codeHostTrust | default dict) -}}

@@ -225,6 +225,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # the API reads the same enable switch. Neither reaches the sandbox.
         "CURIE_WORKSPACE_RECOVERY_ENABLED",
         "CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S",
+        # The worker's publication candidate switch and collector interval
+        # (#5428); the API reads the same enable switch. Neither reaches the
+        # sandbox.
+        "CURIE_PUBLICATION_CANDIDATES_ENABLED",
+        "CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S",
         # WorkspaceClaimCoordinator injects these exact-object handoff values
         # into a claim for the workspace-init container
         # to consume. They are substrate-local delivery inputs, not fields read

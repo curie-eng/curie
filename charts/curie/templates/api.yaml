@@ -275,6 +275,20 @@ spec:
             - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
               value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
             {{- end }}
+            {{- if eq (include "curie.publicationCandidatesEnabled" .) "true" }}
+            # Publication candidate retention (#5428). The ledger compares the
+            # worker's archive limit with its own; the recovery block above
+            # already renders that limit when recovery is on, and one name is
+            # never rendered twice.
+            - name: CURIE_PUBLICATION_CANDIDATES_ENABLED
+              value: "true"
+            - name: CURIE_PUBLICATION_CANDIDATE_MAX_BYTES
+              value: {{ include "curie.publicationCandidateMaxBytes" . | quote }}
+            {{- if ne (include "curie.workspaceRecoveryEnabled" .) "true" }}
+            - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
+              value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
+            {{- end }}
+            {{- end }}
             # The automated remediation switch (AUTOMATED-REMEDIATION-1). The
             # worker renders the same value from the same helper, which fails
             # the render when it is on and the executor is off.

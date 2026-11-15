@@ -1207,6 +1207,17 @@ class WorkerConfig(BaseSettings):
     workspace_recovery_collect_interval_s: float = Field(
         default=30.0, gt=0, validation_alias="CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S"
     )
+    # Publication candidate retention (#5428). Off by default; when on (which
+    # requires the internal worker token and managed workspaces), a started
+    # WorkItem run's publication snapshot and trusted base are retained as a
+    # private, non-authorizing candidate before validation, and the worker
+    # supervises the candidate object collector. Separate from recovery.
+    publication_candidates_enabled: bool = Field(
+        default=False, validation_alias="CURIE_PUBLICATION_CANDIDATES_ENABLED"
+    )
+    publication_candidates_collect_interval_s: float = Field(
+        default=30.0, gt=0, validation_alias="CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S"
+    )
     # The inbound-attachment lane's resource envelope (#2567). These are the
     # operator's handles on ``AttachmentLimits``, whose own defaults these
     # literals mirror -- the chart templates the same three numbers into the
@@ -1289,6 +1300,22 @@ class WorkerConfig(BaseSettings):
             if not self.workspace_enabled:
                 raise ValueError(
                     "CURIE_WORKSPACE_RECOVERY_ENABLED requires CURIE_WORKSPACE_ENABLED"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_publication_candidate_capture(self) -> WorkerConfig:
+        # The candidate capture (#5428) authenticates its ledger calls with the
+        # worker token and retains the claim's trusted base, which only managed
+        # workspaces have. Refused before operation, not discovered per run.
+        if self.publication_candidates_enabled:
+            if not self.internal_worker_token:
+                raise ValueError(
+                    "CURIE_PUBLICATION_CANDIDATES_ENABLED requires CURIE_INTERNAL_WORKER_TOKEN"
+                )
+            if not self.workspace_enabled:
+                raise ValueError(
+                    "CURIE_PUBLICATION_CANDIDATES_ENABLED requires CURIE_WORKSPACE_ENABLED"
                 )
         return self
 

@@ -28,6 +28,8 @@ from ..models import (
     AgentVersion,
     ChannelIdentity,
     Deployment,
+    PublicationCandidateGroup,
+    PublicationCandidateOutcome,
     WorkItem,
     WorkspaceRecoveryGroup,
 )
@@ -129,6 +131,10 @@ class RecoveryRetained(Exception):
     pass
 
 
+class PublicationCandidatesRetained(Exception):
+    pass
+
+
 async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     await session.scalar(select(Agent).where(Agent.id == agent_id).with_for_update())
     item_ids = list(await session.scalars(
@@ -140,11 +146,22 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
         .where(WorkspaceRecoveryGroup.work_item_id.in_(item_ids)).limit(1)
     ):
         raise RecoveryRetained()
+    if item_ids and await session.scalar(
+        select(PublicationCandidateGroup.work_item_id)
+        .where(PublicationCandidateGroup.work_item_id.in_(item_ids)).limit(1)
+    ):
+        raise PublicationCandidatesRetained()
     # Remove child rows first, then the agent. Bulk deletes bypass the ORM
     # relationship cascade (which would emit an async lazy-load during flush) and
     # match the FK ondelete=CASCADE already declared on every child table. Bundle
     # objects in RustFS are intentionally left in place (out of scope).
     await session.execute(delete(AgentChannel).where(AgentChannel.agent_id == agent_id))
+    # A capture outcome is metadata, not a retained object, so it goes with its WorkItem.
+    if item_ids:
+        await session.execute(
+            delete(PublicationCandidateOutcome)
+            .where(PublicationCandidateOutcome.work_item_id.in_(item_ids))
+        )
     await session.execute(delete(WorkItem).where(WorkItem.agent_id == agent_id))
     await session.execute(delete(Deployment).where(Deployment.agent_id == agent_id))
     await session.execute(delete(AgentVersion).where(AgentVersion.agent_id == agent_id))
