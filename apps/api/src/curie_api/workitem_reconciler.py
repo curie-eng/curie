@@ -38,6 +38,7 @@ from . import (
     factory_ci_recovery,
     factory_label_reconcile,
     factory_notices,
+    factory_provider_gate,
     factory_review_feedback,
     factory_tracker_intake,
 )
@@ -160,6 +161,9 @@ class WorkItemReconciler:
         for name, step in (
             ("settle_publications", self._settle_publications),
             ("expire_waiting", self._expire_waiting),
+            # After expiry, so a passed deadline wins over a verified repair, and
+            # before the execute wakes, so a released request is woken this pass.
+            ("release_provider_gates", self._release_provider_gates),
             ("request_deadline_cancellations", self._request_deadline_cancellations),
             (
                 "request_owner_lost_cancellations",
@@ -368,6 +372,57 @@ class WorkItemReconciler:
                     row.id,
                     row.capacity_deferrals,
                 )
+
+    async def _release_provider_gates(self) -> None:
+        """Lift each provider block a fresh ledger read verifies (#5426).
+
+        Each candidate is read and released in its own session and transaction;
+        the release repeats the ledger read under the WorkItem lock.
+        """
+
+        async with self._sessionmaker() as session:
+            found = await factory_provider_gate.candidates(
+                session, limit=self._settings.work_item_batch_limit
+            )
+            await session.rollback()
+        for candidate in found:
+            await self._release_provider_gate(candidate)
+
+    async def _release_provider_gate(self, candidate: factory_provider_gate.GateCandidate) -> None:
+        prefix = self._settings.worker_key_prefix
+        async with self._sessionmaker() as session:
+
+            async def recheck() -> bool:
+                now = await lifecycle.database_now(session)
+                return await factory_provider_gate.cleared(
+                    self._valkey, prefix, candidate.facts, now
+                )
+
+            # A read without locks first, so an unverified block opens no lock.
+            if not await recheck():
+                await session.rollback()
+                return
+            result = await lifecycle.release_retry_condition(
+                session,
+                work_item_id=candidate.work_item_id,
+                request_id=candidate.request_id,
+                expected_work_item_version=candidate.work_item_version,
+                expected_request_version=candidate.request_version,
+                recheck=recheck,
+            )
+        if result.released:
+            logger.info(
+                "work item request %s released from retry condition %s",
+                result.request_id,
+                result.condition,
+            )
+        else:
+            logger.info(
+                "work item request %s stays blocked on retry condition %s: %s",
+                result.request_id,
+                result.condition,
+                result.refusal,
+            )
 
     async def _request_deadline_cancellations(self) -> None:
         async with self._sessionmaker() as session:

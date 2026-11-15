@@ -8,7 +8,7 @@ and avoid attaching unrelated pending work.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -1467,6 +1467,148 @@ async def expire_waiting(
     request = await reload_request(session, request_id)
     await settle_terminal(session, work_item, request, detail=None)
     return await outcome(session, work_item, request)
+
+
+ConditionReleaseRefusal = Literal[
+    "not_found",
+    "work_item_cancelled",
+    "readmit_pending",
+    "stale_version",
+    "not_waiting",
+    "already_started",
+    "not_blocked",
+    "waiting_deadline_elapsed",
+    "condition_mismatch",
+    "not_cleared",
+]
+
+
+@dataclass(frozen=True)
+class ConditionRelease:
+    """What one ``release_retry_condition`` call did.
+
+    ``refusal`` is None when the block was lifted. ``condition`` names the
+    block the request carried when it was read, when one was read.
+    """
+
+    request_id: uuid.UUID
+    condition: str | None
+    refusal: ConditionReleaseRefusal | None
+
+    @property
+    def released(self) -> bool:
+        return self.refusal is None
+
+
+async def _condition_release(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    condition: str | None,
+    refusal: ConditionReleaseRefusal | None,
+) -> ConditionRelease:
+    await session.commit()
+    return ConditionRelease(request_id=request_id, condition=condition, refusal=refusal)
+
+
+async def release_retry_condition(
+    session: AsyncSession,
+    *,
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    expected_work_item_version: int,
+    expected_request_version: int,
+    recheck: Callable[[], Awaitable[bool]],
+) -> ConditionRelease:
+    """Lift a verified provider block from a waiting automatic successor (#5426).
+
+    In one transaction with the WorkItem and request locked: refuse a cancelled
+    WorkItem, a pending relabel, a stale version, a request that is not
+    waiting, already started, not blocked, or past its waiting deadline by
+    database time, and a block that the factory policy no longer derives from
+    the predecessor's persisted cause, safety fact and condition. Only then is
+    ``recheck`` (a fresh read of the verifying evidence) awaited, and only its
+    True clears ``blocked_on`` and makes the request due now, by a version
+    compare-and-set. The allowance count, the waiting deadline, the
+    predecessor and every other request are left alone, and the count is not
+    consulted: admitting this successor is what spent its slot. A second call
+    finds no block and changes nothing.
+    """
+
+    work_item = await lock_work_item(session, work_item_id)
+    if work_item is None:
+        return await _condition_release(session, request_id, None, "not_found")
+    if work_item.cancelled_at is not None:
+        return await _condition_release(session, request_id, None, "work_item_cancelled")
+    if work_item.readmit_request_id is not None:
+        return await _condition_release(session, request_id, None, "readmit_pending")
+    if work_item.version != expected_work_item_version:
+        return await _condition_release(session, request_id, None, "stale_version")
+    request = await lock_request(session, work_item_id=work_item_id, request_id=request_id)
+    if request is None:
+        return await _condition_release(session, request_id, None, "not_found")
+    condition = request.blocked_on
+    if request.version != expected_request_version:
+        return await _condition_release(session, request_id, condition, "stale_version")
+    if request.status != "waiting":
+        return await _condition_release(session, request_id, condition, "not_waiting")
+    if request.started_at is not None:
+        return await _condition_release(session, request_id, condition, "already_started")
+    if condition is None:
+        return await _condition_release(session, request_id, None, "not_blocked")
+    deadline = request.wait_deadline
+    if deadline is None or await database_now(session) >= deadline:
+        return await _condition_release(session, request_id, condition, "waiting_deadline_elapsed")
+    predecessor: ExecutionRequest | None = None
+    if request.retry_of_request_id is not None:
+        predecessor = await session.scalar(
+            select(ExecutionRequest)
+            .where(
+                ExecutionRequest.id == request.retry_of_request_id,
+                ExecutionRequest.work_item_id == work_item_id,
+            )
+            .execution_options(populate_existing=True)
+        )
+    if predecessor is None or predecessor.status != "failed":
+        return await _condition_release(session, request_id, condition, "condition_mismatch")
+    safety = predecessor.retry_safety
+    disposition = factory_retry_policy.decide(
+        RetryFacts(
+            cause=predecessor.terminal_cause or "",
+            safety=(
+                cast(RetrySafety, safety)
+                if safety in ("no_effects", "flagged", "uncertain")
+                else None
+            ),
+            condition_reason=predecessor.retry_condition_reason,
+            condition_retry_at=predecessor.retry_condition_retry_at,
+        )
+    )
+    if not disposition.successor or disposition.condition != condition:
+        return await _condition_release(session, request_id, condition, "condition_mismatch")
+    if not await recheck():
+        return await _condition_release(session, request_id, condition, "not_cleared")
+    changed_id: uuid.UUID | None = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request_id,
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.version == expected_request_version,
+            ExecutionRequest.status == "waiting",
+            ExecutionRequest.started_at.is_(None),
+            ExecutionRequest.blocked_on == condition,
+            ExecutionRequest.wait_deadline > func.clock_timestamp(),
+        )
+        .values(
+            blocked_on=None,
+            dispatch_not_before=func.clock_timestamp(),
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        return await _condition_release(session, request_id, condition, "stale_version")
+    return await _condition_release(session, request_id, condition, None)
 
 
 async def adopt_orphan_publication_lineage(
