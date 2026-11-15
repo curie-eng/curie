@@ -24,11 +24,13 @@ import datetime as dt
 import hashlib
 import io
 import json
+import posixpath
 import signal
 import subprocess
 import sys
 import tarfile
 import threading
+import types
 import urllib.parse
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -5396,6 +5398,44 @@ def test_the_fake_turn_writes_native_transcripts_the_real_parser_settles(tmp_pat
         assert not session.synthetic and not session.errors
     assert ppp.TRANSCRIPT_BUILDER in ppp.RUNNER_PROGRAM
     compile(ppp.RUNNER_PROGRAM, "runner", "exec")
+
+
+def test_the_fake_turn_waits_for_the_drivers_limits_before_working(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Like a native prompt hold: no transcript or publication before capture is attached."""
+
+    import time as time_module
+
+    import personal_park_probe as ppp
+
+    program = ppp.RUNNER_PROGRAM
+    turn = program[program.index("def publication_turn") :]
+    body = turn[: turn.index("fake.FakeModelSession._default_script")]
+    events: list[str] = []
+    checks = iter([False, False, True])
+
+    def exists(path: str) -> bool:
+        assert path == f"{pto.GATE_DIR}/{pto.GATE_LIMITS_FILE}"
+        present = next(checks)
+        events.append(f"limits:{present}")
+        return present
+
+    monkeypatch.setattr(time_module, "sleep", lambda _s: events.append("wait"))
+    fake_os = types.SimpleNamespace(
+        environ={}, path=types.SimpleNamespace(join=posixpath.join, exists=exists)
+    )
+    namespace: dict[str, Any] = {
+        "os": fake_os,
+        "write_native_turn": lambda _root, _model: events.append("work"),
+        "fake": types.SimpleNamespace(
+            _assistant=lambda *_a: None, _FileWrite=lambda *_a: None, _result=lambda: None
+        ),
+        "ToolUseBlock": lambda **_k: None,
+    }
+    exec(compile(body, "turn", "exec"), namespace)  # noqa: S102
+    namespace["publication_turn"](None)
+    assert events == ["limits:False", "wait", "limits:False", "wait", "limits:True", "work"]
 
 
 def test_the_zero_cost_lifecycle_takes_paid_phases_only_on_the_fake_runner(

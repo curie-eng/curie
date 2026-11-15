@@ -26,6 +26,8 @@ from channel_protocol import scoped_conversation_id
 #: The model every fake transcript names; no live criterion accepts it.
 FAKE_MODEL = "zero-cost-fake-model"
 
+#: How long a fake turn waits for the driver's subagent limits before working.
+LIMITS_WAIT_SECONDS = 180
 #: Writes one turn's native-shaped transcripts under ``root`` (the runner's /tmp).
 #: Shared by the runner program and the tests, which parse what it writes.
 TRANSCRIPT_BUILDER = r"""
@@ -85,6 +87,14 @@ from claude_agent_sdk import ToolUseBlock
     + TRANSCRIPT_BUILDER
     + f"""
 def publication_turn(self):
+    # A native prompt is held until the driver opened capture and wrote the
+    # subagent limits; the fake has no hook, so it waits for those limits.
+    import time
+    limits = os.path.join(os.environ.get("PTO_GATE_DIR") or {pto.GATE_DIR!r},
+                          {pto.GATE_LIMITS_FILE!r})
+    deadline = time.monotonic() + {LIMITS_WAIT_SECONDS}
+    while not os.path.exists(limits) and time.monotonic() < deadline:
+        time.sleep(0.2)
     write_native_turn("/tmp", {FAKE_MODEL!r})
     path = "/workspace/NONCE.md"
     content = "Unpaid publication correlation control.\\n"
