@@ -22,7 +22,7 @@ class CodingInstructionsOut(BaseModel):
     text: str | None = Field(repr=False)
     updated_at: datetime | None
     tenant_enabled: bool
-    application: Literal["unavailable"]
+    application: Literal["available", "unavailable"]
 
 
 class CodingInstructionsPolicyWrite(BaseModel):

@@ -7171,9 +7171,9 @@ export interface components {
         CodingInstructionsOut: {
             /**
              * Application
-             * @constant
+             * @enum {string}
              */
-            application: "unavailable";
+            application: "available" | "unavailable";
             /** Byte Length */
             byte_length: number;
             /**

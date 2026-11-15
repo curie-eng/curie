@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/coding-instructions/v1.0.json",
+  "$id": "https://schemas.curietech.ai/cli/coding-instructions/v1.1.json",
   "title": "curie cluster coding-instructions --json",
-  "description": "The owner coding instructions response or an offline request plan. Application to factory runs is unavailable.",
+  "description": "The owner coding instructions response or an offline request plan. A live response reports whether this deployment applies the document to factory runs. A dry-run plan does not invent that state.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -10,9 +10,9 @@
       "properties": {
         "dry_run": { "const": true },
         "plan": { "type": "array", "items": { "type": "string" } },
-        "application": { "const": "unavailable" }
+        "application": { "enum": ["available", "unavailable"] }
       },
-      "required": ["dry_run", "plan", "application"]
+      "required": ["dry_run", "plan"]
     },
     "document": {
       "type": "object",
@@ -36,7 +36,7 @@
         "text": { "type": ["string", "null"] },
         "updated_at": { "type": ["string", "null"], "format": "date-time" },
         "tenant_enabled": { "type": "boolean" },
-        "application": { "const": "unavailable" }
+        "application": { "enum": ["available", "unavailable"] }
       },
       "required": [
         "revision",

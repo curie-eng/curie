@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Literal
 from uuid import UUID
 
 from curie_internal.requester_coding_instructions import (
@@ -15,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .config import get_settings
 from .models import RequesterCodingPolicy, RequesterCodingProfile, Tenant
 from .schemas.coding_instructions import CodingInstructionsOut
 
@@ -24,6 +26,14 @@ class ProfileRefusal(ValueError):
         self.code = code
         self.current_revision = current_revision
         super().__init__(code)
+
+
+def application_label() -> Literal["available", "unavailable"]:
+    """The deployment switch admission already reads. Not a stored profile field."""
+
+    if get_settings().requester_coding_instructions_apply:
+        return "available"
+    return "unavailable"
 
 
 async def tenant_enabled(session: AsyncSession, tenant_id: UUID) -> bool:
@@ -47,7 +57,7 @@ async def read_profile(
     enabled = await tenant_enabled(session, tenant_id)
     return CodingInstructionsOut(
         format_version=1,
-        application="unavailable",
+        application=application_label(),
         revision=0 if row is None else row.revision,
         sha256=None if row is None else row.sha256,
         text=None if row is None else row.text,
