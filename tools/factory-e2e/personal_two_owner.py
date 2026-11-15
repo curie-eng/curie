@@ -2959,8 +2959,16 @@ class TwoOwnerRun(pp.LiveRun):
                 and bool(run.parked_at)
                 and harvest.terminal_after(run.parked_at)
             )
+            # Every park: how far the last size report before the stream ended
+            # trails the park (about when the product's suspension killed the
+            # pod), so the stall risk is measured, not guessed.
+            margin = pto.capture_stall(harvest, run.parked_at, eof=run.eof.is_set())
             process_max = harvest.process_max
             credential = harvest.credential_evidence()
+        self.safe(
+            lambda: self.ledger.record("diagnostics", f"capture_margin_{run.group}", margin),
+            None,
+        )
         self.note("owners", "one_native_session", run.owner, process_max <= 1)
         self.ledger.record("diagnostics", f"runner_credential_{run.group}", credential)
         self.settle_run(run, facts=self.pod_facts(run), complete=complete)

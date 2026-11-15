@@ -1486,6 +1486,47 @@ def test_harvester_program_streams_recorded_shapes(tmp_path: Path) -> None:
     assert {s.role for s in facts.sessions} == {pps.IMPLEMENTER, *pps.REVIEWER_ROLES}
 
 
+def test_harvester_reports_sizes_between_its_slow_scans(tmp_path: Path) -> None:
+    """A size report every ``sync_interval``; git and /proc scans only every ``interval``.
+
+    A parked runner's pod can be deleted within a second of the park, and a
+    capture is terminal only on a size report taken after the park, so the
+    reports cannot wait on the slow scans' interval.
+    """
+
+    nonce = "0f0f1e1e2d2d3c3c"
+    _fake_pod(tmp_path, nonce)
+    calls = tmp_path / "git-calls"
+    counted = tmp_path / "gitbin" / "counted-git"
+    counted.write_text(f'#!/bin/sh\necho x >> {calls}\nexec {tmp_path / "gitbin" / "git"} "$@"\n')
+    counted.chmod(0o755)
+    config = pps.harvest_config(
+        nonce=nonce,
+        tmp_root=str(tmp_path / "tmp"),
+        review_dir=str(tmp_path / "tmp" / "dark-factory-review"),
+        workspace=str(tmp_path / "workspace"),
+        proc_root=str(tmp_path / "proc"),
+        git=str(counted),
+        interval=60.0,
+        sync_interval=0.01,
+        max_seconds=0.3,
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", pps.HARVEST_PROGRAM, config],
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    kinds = [json.loads(line)["kind"] for line in result.stdout.splitlines()]
+    assert kinds[-1] == "end"
+    assert kinds.count("sync") >= 5
+    # One slow round in the whole run: rev-parse and status, once each.
+    assert calls.read_text().count("x") == 2
+    assert pps.HARVEST_SYNC_SECONDS <= 0.1
+    assert json.loads(pps.harvest_config(nonce=nonce))["sync_interval"] == pps.HARVEST_SYNC_SECONDS
+
+
 def _file_record(path: str, offset: int, data: bytes) -> bytes:
     return json.dumps(
         {"kind": "file", "path": path, "offset": offset, "data": base64.b64encode(data).decode()}

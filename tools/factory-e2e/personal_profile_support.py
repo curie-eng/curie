@@ -1930,6 +1930,9 @@ def settle_attempt(
 # /proc/<pid>/environ; the value never leaves the program. It reads no other
 # variable and no credential file, and the git children get a fresh minimal
 # environment.
+#: Seconds between the harvester's size reports (``harvest_config``).
+HARVEST_SYNC_SECONDS = 0.05
+
 HARVEST_PROGRAM = r"""
 import base64, glob, hashlib, json, os, subprocess, sys, time
 cfg = json.loads(sys.argv[1])
@@ -2101,22 +2104,25 @@ def processes():
             continue
     return {"kind": "process", "count": len(found), "processes": found}
 deadline = time.monotonic() + float(cfg["max_seconds"])
+slow_due = 0.0
 emit(container_credential())
 while True:
     scan_files()
     emit({"kind": "sync", "sizes": dict(offsets), "at": round(time.time(), 3)})
-    scan_reviews()
-    record = workspace()
-    if record != state["workspace"]:
-        state["workspace"] = record
-        emit(record)
-    record = processes()
-    if record != state["process"]:
-        state["process"] = record
-        emit(record)
+    if cfg.get("once") or time.monotonic() >= slow_due:
+        scan_reviews()
+        record = workspace()
+        if record != state["workspace"]:
+            state["workspace"] = record
+            emit(record)
+        record = processes()
+        if record != state["process"]:
+            state["process"] = record
+            emit(record)
+        slow_due = time.monotonic() + float(cfg["interval"])
     if cfg.get("once") or time.monotonic() >= deadline:
         break
-    time.sleep(float(cfg["interval"]))
+    time.sleep(float(cfg["sync_interval"]))
 emit({"kind": "end"})
 """
 
@@ -2130,9 +2136,20 @@ def harvest_config(
     proc_root: str = "/proc",
     git: str = "git",
     interval: float = 0.5,
+    sync_interval: float = HARVEST_SYNC_SECONDS,
     max_seconds: float = LIVE_SECONDS,
     once: bool = False,
 ) -> str:
+    """The harvester's config: transcripts and a size report every ``sync_interval``.
+
+    The workspace, review and process scans (git subprocesses and a /proc walk)
+    run only every ``interval``. The size report is what proves a capture
+    complete after a moment (``HarvestState.terminal_after``), and the product
+    can delete a parked runner's pod within a second of the park, so it is
+    taken often enough that the last one before the container dies follows
+    the park.
+    """
+
     return json.dumps(
         {
             "credential_name": PERSONAL_GRANT_ENV,
@@ -2142,6 +2159,7 @@ def harvest_config(
             "proc_root": proc_root,
             "git": git,
             "interval": interval,
+            "sync_interval": sync_interval,
             "max_seconds": max_seconds,
             "once": once,
             "nonce": nonce,

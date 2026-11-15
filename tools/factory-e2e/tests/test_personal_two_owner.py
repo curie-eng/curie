@@ -4350,6 +4350,11 @@ def test_known_park_time_accepts_a_later_complete_size_report(tmp_path: Path) ->
     h.run.remove_pod = lambda _run: run.eof.set()  # type: ignore[method-assign]
     h.run.finish_park(run)
     assert h.run.settled_known("a1")
+    # Every park records how far its last size report trails the park.
+    margin = h.ledger.observations("diagnostics")["capture_margin_a1"]
+    assert margin["synced_after_park"] == 1.0
+    assert margin["complete"] is True and margin["eof"] is True
+    assert "capture_stall_a1" not in h.ledger.observations("diagnostics")
 
 
 def test_observed_stop_is_saved_even_when_usage_capture_cannot_complete(tmp_path: Path) -> None:
