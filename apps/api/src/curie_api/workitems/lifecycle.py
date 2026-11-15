@@ -3255,7 +3255,8 @@ async def _admit_automatic_successor(
     exactly one model session, ADR 0277 decision 8). Owner loss keeps its
     teardown based exception: it needs no safety fact and adds no delay. An
     ordinary failure needs the worker's proved ``no_effects``, a policy
-    disposition that allows a successor, and no queued newer revision.
+    disposition that allows a successor, and no queued newer revision. A
+    publication failure instead goes to ``_admit_publication_recovery``.
     """
 
     if (
@@ -3266,6 +3267,16 @@ async def _admit_automatic_successor(
         or work_item.automatic_retries_used >= AUTOMATIC_RETRY_LIMIT
         or predecessor.terminal_cause == "budget_exceeded"
     ):
+        return False
+    if (
+        origin == "ordinary"
+        and disposition is not None
+        and disposition.kind == DispositionKind.PUBLICATION_RECOVERY
+    ):
+        return await _admit_publication_recovery(session, work_item, predecessor)
+    if predecessor.execution_kind == "publication_recovery":
+        # A publication failure never buys an implementation run (#5429): a
+        # recovery request's other failures and its owner loss admit nothing.
         return False
     if origin == "owner_loss":
         if predecessor.terminal_cause != "owner_lost":
@@ -3348,6 +3359,112 @@ async def _admit_automatic_successor(
     # The WorkItem is locked and its count was checked above, so the
     # reservation holds.
     assert admitted
+    return True
+
+
+async def _admit_publication_recovery(
+    session: AsyncSession, work_item: WorkItem, predecessor: ExecutionRequest
+) -> bool:
+    """Admit one publication recovery successor for a failed publication (#5429).
+
+    Called from ``_admit_automatic_successor`` after its common refusals, in
+    the predecessor's settling transaction. The successor reruns no model, so
+    only a worker reported ``uncertain`` effect refuses; ``no_effects``,
+    ``flagged`` and an API settlement with no worker fact are allowed. The
+    predecessor's own settled publication is the failure being recovered, so
+    only a publication still in flight on the request, lineage or conversation,
+    or a ready applied base move, owns the terminus. A closed lineage, a queued
+    newer revision or no exact retained candidate admits nothing.
+
+    The successor is admitted and the candidate handed to it in one savepoint:
+    a refused transfer rolls back the request and its allowance slot together.
+    """
+
+    from .. import publication_candidates
+
+    if predecessor.retry_safety == "uncertain" or not get_settings().publication_candidates_enabled:
+        return False
+    scope = Publication.workspace_conversation_id == work_item.conversation_id
+    if work_item.publication_lineage_id is not None:
+        scope = or_(scope, Publication.lineage_id == work_item.publication_lineage_id)
+    in_flight = await session.scalar(
+        select(Publication.id)
+        .where(
+            or_(Publication.execution_request_id == predecessor.id, scope),
+            Publication.status.in_(IN_FLIGHT_PUBLICATION),
+        )
+        .limit(1)
+    )
+    if (
+        in_flight is not None
+        or await _applied_base_transition(session, work_item, predecessor, ready=True) is not None
+        or await _lineage_closed_for(session, work_item, predecessor.reply_target_pr_number)
+    ):
+        return False
+    queued = await session.scalar(
+        select(ExecutionRequest.id)
+        .where(ExecutionRequest.work_item_id == work_item.id, ExecutionRequest.status == "queued")
+        .limit(1)
+    )
+    if queued is not None:
+        return False
+    try:
+        candidate = await publication_candidates.recovery_candidate(session, work_item, predecessor)
+    except publication_candidates.CandidateRefusal:
+        return False
+    if candidate is None:
+        return False
+
+    now = await database_now(session)
+    wait_deadline = now + timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+    slot = work_item.automatic_retries_used + 1
+    due = now + timedelta(seconds=automatic_retry_delay_seconds(work_item.id, slot))
+    request_id = uuid.uuid4()
+    try:
+        async with session.begin_nested():
+            admitted = await _insert_waiting_request(
+                session,
+                work_item,
+                request_id=request_id,
+                wait_deadline=wait_deadline,
+                expected_work_item_version=work_item.version,
+                reserve_automatic_retry=True,
+                # The same copied facts as an ordinary automatic successor.
+                columns={
+                    "owner_lost_retry": False,
+                    "objective": predecessor.objective,
+                    "requester": predecessor.requester,
+                    "reply_kind": predecessor.reply_kind,
+                    "reply_address": predecessor.reply_address,
+                    "reply_conversation_id": predecessor.reply_conversation_id,
+                    "reply_target_kind": predecessor.reply_target_kind,
+                    "reply_target_pr_number": predecessor.reply_target_pr_number,
+                    "reply_target_comment_id": predecessor.reply_target_comment_id,
+                    "reply_target_url": predecessor.reply_target_url,
+                    "start_deferrals": predecessor.start_deferrals,
+                    "retry_of_request_id": predecessor.id,
+                    "retry_origin_request_id": (
+                        predecessor.retry_origin_request_id or predecessor.id
+                    ),
+                    "dispatch_not_before": due,
+                    "blocked_on": None,
+                    "execution_kind": "publication_recovery",
+                    "recovery_candidate_id": candidate.id,
+                    "recovery_candidate_sha256": candidate.content_sha256,
+                },
+            )
+            # The WorkItem is locked and its count was checked by the caller.
+            assert admitted
+            await publication_candidates.transfer_ownership(
+                session,
+                work_item_id=work_item.id,
+                candidate_id=candidate.id,
+                to_request_id=request_id,
+            )
+    except publication_candidates.CandidateRefusal:
+        # Nothing of the admission stands; reload the rolled back WorkItem.
+        await reload_work_item(session, work_item.id)
+        return False
     return True
 
 

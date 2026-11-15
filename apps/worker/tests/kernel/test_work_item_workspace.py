@@ -246,6 +246,8 @@ class _WorkItems(AbsentRequesterContext):
             conversation_id=factory_conversation(wake),
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path=WORK_ITEM_REPO,
+            execution_kind="implementation",
+            recovery_candidate_id=None,
             context=factory_context(AGENT_ID, wake),
         )
         self.acquisitions[request_id] = grant

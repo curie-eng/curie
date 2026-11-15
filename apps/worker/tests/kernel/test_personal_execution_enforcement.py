@@ -516,6 +516,8 @@ class _PgWorkItems(_WorkItems):
             conversation_id=factory_conversation(wake),
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path=WORK_ITEM_REPO,
+            execution_kind="implementation",
+            recovery_candidate_id=None,
             context=factory_context(self.owner.agent_id, wake).model_copy(
                 update={"tenant_id": self.owner.tenant_id, "binding_id": _BINDING_ID}
             ),

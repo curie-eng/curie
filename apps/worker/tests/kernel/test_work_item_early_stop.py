@@ -204,6 +204,8 @@ class _WorkItems(AbsentRequesterContext):
             conversation_id=factory_conversation(wake),
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path=WORK_ITEM_REPO,
+            execution_kind="implementation",
+            recovery_candidate_id=None,
             context=factory_context(AGENT_ID, wake),
         )
         self.acquisitions[request_id] = grant
@@ -1007,7 +1009,7 @@ def test_a_snapshot_base_mismatch_names_both_commits_on_the_factory_run(
             assert len(items.finishes) == 1
             finish = items.finishes[0]
             assert finish["outcome"] == "failed"
-            assert finish["cause"] == "approval_create_failed"
+            assert finish["cause"] == "publication_refused"
             detail = finish["detail"]
             assert isinstance(detail, str)
             assert detail
@@ -1140,7 +1142,7 @@ def test_dependency_publication_refusal_reaches_the_factory_finish(
                 assert len(items.finishes) == 1
                 finish = items.finishes[0]
                 assert finish["outcome"] == "failed"
-                assert finish["cause"] == "approval_create_failed"
+                assert finish["cause"] == "publication_refused"
                 detail = finish["detail"]
                 assert isinstance(detail, str)
                 assert detail.startswith("publication snapshot failed: ")
@@ -1537,11 +1539,17 @@ def test_snapshot_read_skips_backoff_that_would_spend_its_five_second_reserve(
     assert delays == expected_delays
 
 
+@pytest.mark.parametrize("refused", [True, False])
 def test_snapshot_validation_refusal_is_not_retried_and_keeps_its_prefix(
-    make_harness, monkeypatch: pytest.MonkeyPatch
+    make_harness, monkeypatch: pytest.MonkeyPatch, refused: bool
 ) -> None:
+    """A policy refusal finishes ``publication_refused`` (terminal, #5429); a
+    validation fault keeps ``approval_create_failed``. Neither is retried."""
+
+    from curie_worker.publication_validation import PublicationValidationRefused
     from curie_worker.workspace import WorkspacePreparationError
 
+    error = PublicationValidationRefused if refused else WorkspacePreparationError
     delays = _patch_snapshot_backoff(monkeypatch)
 
     async def exercise() -> None:
@@ -1566,7 +1574,7 @@ def test_snapshot_validation_refusal_is_not_retried_and_keeps_its_prefix(
             def refuse(*_args: object, **_kwargs: object) -> None:
                 nonlocal validations
                 validations += 1
-                raise WorkspacePreparationError("publication-validation", "protected path blocked")
+                raise error("publication-validation", "protected path blocked")
 
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
             monkeypatch.setattr(
@@ -1580,7 +1588,9 @@ def test_snapshot_validation_refusal_is_not_retried_and_keeps_its_prefix(
             assert publications.creates == []
             assert len(items.finishes) == 1
             finish = items.finishes[0]
-            assert finish["cause"] == "approval_create_failed"
+            assert finish["cause"] == (
+                "publication_refused" if refused else "approval_create_failed"
+            )
             detail = finish["detail"]
             assert isinstance(detail, str)
             assert detail.startswith("publication snapshot failed: ")

@@ -200,6 +200,10 @@ class AcquireGrant:
     repository_path: str
     context: FactoryContext
     completion_contract: CompletionContractName
+    # What the request runs, and the retained candidate a publication recovery
+    # publishes (#5429), read from the request row.
+    execution_kind: ExecutionKindName
+    recovery_candidate_id: uuid.UUID | None
 
 
 class FactoryWake(BaseModel):
@@ -335,6 +339,17 @@ def _snapshot_values(facts: Any) -> dict[str, str | None]:
         "reply_conversation_id": facts.reply_conversation_id,
         **reply,
     }
+
+
+ExecutionKindName = Literal["implementation", "publication_recovery"]
+
+
+def _execution_kind(row: ExecutionRequest) -> ExecutionKindName:
+    """The request's stored execution kind (the column CHECK admits two)."""
+
+    kind = row.execution_kind
+    assert kind in ("implementation", "publication_recovery"), kind
+    return cast(ExecutionKindName, kind)
 
 
 def _contract_name(row: ExecutionRequest) -> CompletionContractName:
@@ -1331,6 +1346,8 @@ async def acquire(
         repository_path=work_item.repository_path,
         context=current,
         completion_contract=_contract_name(request),
+        execution_kind=_execution_kind(request),
+        recovery_candidate_id=request.recovery_candidate_id,
     )
     await session.commit()
     return grant

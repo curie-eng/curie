@@ -53,6 +53,13 @@ CompletionContract = Literal["implementation", "tracker_result"]
 CONTRACT_IMPLEMENTATION: CompletionContract = "implementation"
 CONTRACT_TRACKER_RESULT: CompletionContract = "tracker_result"
 
+# What an execute wake does (ADR 0269, #5429): an implementation request opens
+# model turns; a publication_recovery request boots the validation runtime and
+# publishes its one retained candidate without any model turn.
+ExecutionKind = Literal["implementation", "publication_recovery"]
+EXECUTION_IMPLEMENTATION: ExecutionKind = "implementation"
+EXECUTION_PUBLICATION_RECOVERY: ExecutionKind = "publication_recovery"
+
 # What the worker observed about a finished turn's effects. The API admits an
 # automatic successor only for ``no_effects``.
 RetrySafety = Literal["no_effects", "flagged", "uncertain"]
@@ -88,6 +95,10 @@ class WorkItemAcquireGrant:
     wait_deadline: datetime
     repository_path: str
     context: FactoryContext
+    # Fixed at admission (#5429). A publication_recovery request names the one
+    # retained candidate it publishes; an implementation request names none.
+    execution_kind: ExecutionKind
+    recovery_candidate_id: uuid.UUID | None
     # How the request completes (ADR 0277, #5586): an implementation request
     # ends in a pull request, a tracker_result request in one tracker result.
     # An API that predates the field sends none, which means implementation.
@@ -255,6 +266,24 @@ def _completion_contract(body: dict[str, Any]) -> CompletionContract:
     raise ValueError("unknown completion contract")
 
 
+def _execution_kind(body: dict[str, Any]) -> tuple[ExecutionKind, uuid.UUID | None]:
+    """The request's execution kind and recovery candidate, read strictly.
+
+    Both are required. An unknown kind, a recovery without a candidate, or an
+    implementation that names one is an unusable body: a recovery run must
+    never be read as an implementation that opens a model turn.
+    """
+
+    kind = body["execution_kind"]
+    raw_candidate = body["recovery_candidate_id"]
+    candidate = None if raw_candidate is None else uuid.UUID(str(raw_candidate))
+    if kind == EXECUTION_IMPLEMENTATION and candidate is None:
+        return EXECUTION_IMPLEMENTATION, None
+    if kind == EXECUTION_PUBLICATION_RECOVERY and candidate is not None:
+        return EXECUTION_PUBLICATION_RECOVERY, candidate
+    raise ValueError("unknown execution kind or recovery candidate")
+
+
 def _parse_datetime(value: object) -> datetime:
     if not isinstance(value, str) or not value:
         raise WorkItemTransportError("work-item dispatch returned an unusable timestamp")
@@ -299,6 +328,7 @@ class WorkItemDispatchClient:
             },
         )
         try:
+            execution_kind, recovery_candidate_id = _execution_kind(body)
             return WorkItemAcquireGrant(
                 generation=_required_positive_int(body["generation"]),
                 work_item_id=uuid.UUID(str(body["work_item_id"])),
@@ -306,6 +336,8 @@ class WorkItemDispatchClient:
                 wait_deadline=_parse_datetime(body["wait_deadline"]),
                 repository_path=_required_string(body["repository_path"]),
                 context=FactoryContext.model_validate(body["context"]),
+                execution_kind=execution_kind,
+                recovery_candidate_id=recovery_candidate_id,
                 completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -774,6 +806,15 @@ class WorkItemRun:
         # before the capability mint and the sandbox claim. Only ever widened
         # to tracker_result afterwards, never narrowed (see ``start``).
         self.completion_contract: CompletionContract = grant.completion_contract
+        # Fixed at admission and learned only at acquire (#5429). A run adopted
+        # from its running row is a continuation (an approval resume or a CI
+        # round), never the execute wake a recovery runs on, so it has none.
+        self.execution_kind: ExecutionKind | None = (
+            grant.execution_kind if isinstance(grant, WorkItemAcquireGrant) else None
+        )
+        self.recovery_candidate_id: uuid.UUID | None = (
+            grant.recovery_candidate_id if isinstance(grant, WorkItemAcquireGrant) else None
+        )
         self.event_id = event_id
         self.thread_key = thread_key
         self.started = False
@@ -864,6 +905,12 @@ class WorkItemRun:
             name=f"work-item-heartbeat-{self.request_id}",
         )
         return grant
+
+    @property
+    def is_publication_recovery(self) -> bool:
+        """Publish the one retained candidate with no model turn (ADR 0269, #5429)."""
+
+        return self.execution_kind == EXECUTION_PUBLICATION_RECOVERY
 
     @property
     def is_tracker_result(self) -> bool:

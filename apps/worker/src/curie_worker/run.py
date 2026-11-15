@@ -94,6 +94,7 @@ from .publication_candidate_storage import (
 )
 from .publication_candidate_storage import (
     CandidateObjectStore,
+    CandidateReader,
     CandidateWriter,
     build_candidate_collector,
 )
@@ -900,6 +901,7 @@ def build(
             )
     candidates_gc: RecoveryCollector | None = None
     candidate_capture: PublicationCandidateCapture | None = None
+    candidate_reader: CandidateReader | None = None
     if config.publication_candidates_enabled and config.internal_worker_token:
         candidates_s3 = build_recovery_s3_client(
             endpoint_url=config.s3_endpoint_url,
@@ -935,6 +937,19 @@ def build(
                     ),
                 ),
                 coordinator=workspace,
+            )
+            # The reader a publication recovery run reads its candidate
+            # through (#5429). Signed reads go to a bare transport, never an
+            # httpx client, whose logger would record the signed URL.
+            candidate_read_transport = httpx.AsyncHTTPTransport()
+            owner.register_close(
+                "publication-candidates-read", candidate_read_transport.aclose, order=30
+            )
+            candidate_reader = CandidateReader(
+                ledger=candidate_ledger,
+                store=candidate_store,
+                transport=candidate_read_transport,
+                reference_ttl_seconds=config.workspace_reference_ttl_seconds,
             )
     attachment_access_client = None
     broker_server = None
@@ -1054,6 +1069,7 @@ def build(
         workspace=workspace,
         recovery=recovery_capture,
         publication_candidates=candidate_capture,
+        publication_candidate_reader=candidate_reader,
         attachments=attachments,
         attachment_access=attachment_access_client,
         # ADR 0205: the thread attachment ledger, behind the internal worker

@@ -1465,6 +1465,29 @@ class ExecutionRequest(Base):
             "OR (retry_condition_retry_at IS NULL AND retry_condition_scope_key IS NULL)",
             name="execution_requests_retry_condition_ck",
         ),
+        # Migration 0174 (#5429): a publication recovery request names one
+        # retained candidate by id and digest; a trigger keeps them immutable.
+        CheckConstraint(
+            "execution_kind IN ('implementation', 'publication_recovery')",
+            name="execution_requests_execution_kind_ck",
+        ),
+        CheckConstraint(
+            "(recovery_candidate_id IS NULL) = (recovery_candidate_sha256 IS NULL)",
+            name="execution_requests_recovery_candidate_pair_ck",
+        ),
+        CheckConstraint(
+            "(execution_kind = 'publication_recovery') = (recovery_candidate_id IS NOT NULL)",
+            name="execution_requests_recovery_candidate_kind_ck",
+        ),
+        CheckConstraint(
+            "execution_kind <> 'publication_recovery' "
+            "OR (completion_contract = 'implementation' AND retry_of_request_id IS NOT NULL)",
+            name="execution_requests_recovery_shape_ck",
+        ),
+        CheckConstraint(
+            "recovery_candidate_sha256 IS NULL OR recovery_candidate_sha256 ~ '^[0-9a-f]{64}$'",
+            name="execution_requests_recovery_candidate_sha_ck",
+        ),
         UniqueConstraint(
             "work_item_id",
             "sequence",
@@ -1617,6 +1640,16 @@ class ExecutionRequest(Base):
         DateTime(timezone=True), default=None
     )
     retry_condition_scope_key: Mapped[str | None] = mapped_column(Text, default=None)
+    # What the request runs (migration 0174, #5429): an ``implementation`` runs
+    # the model; a ``publication_recovery`` successor verifies and publishes the
+    # retained candidate it names, with no model run. Fixed at admission.
+    execution_kind: Mapped[str] = mapped_column(
+        Text, default="implementation", server_default="implementation"
+    )
+    recovery_candidate_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    recovery_candidate_sha256: Mapped[str | None] = mapped_column(String(64), default=None)
     # Where the factory status reply lands (ADR 0197 decision fact 4): the
     # tracker issue, a pull request conversation, or one review thread. A
     # revision answers on its pull request; every other request on the issue.

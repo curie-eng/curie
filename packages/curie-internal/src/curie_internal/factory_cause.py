@@ -97,6 +97,17 @@ _CAUSE_TEXT = {
         "the agent tried to publish its change, but no valid publication was recorded. "
         "The Details line below gives the reason; the pull request, if any, is unchanged."
     ),
+    # A policy refusal of the snapshot is terminal and buys no recovery (#5429).
+    "publication_refused": (
+        "publication policy refused the finished change, so no pull request was opened. "
+        "Read the details for the reason, fix it, then retry."
+    ),
+    # Publication recovery from a retained candidate (#5429).
+    "publication_recovery_refused": (
+        "Curie did not publish the retained change, because its base, its content or the "
+        "current publication policy no longer allows it. No model ran and no pull request "
+        "was opened. The Details line below gives the reason."
+    ),
     "ci_failed": (
         "the pull request's checks still failed after 3 rounds of fixes. The pull "
         "request stays open for a person."

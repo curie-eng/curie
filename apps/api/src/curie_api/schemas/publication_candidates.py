@@ -189,6 +189,27 @@ class CandidateFinalized(CandidateMessage):
     finalized: bool = True
 
 
+class CandidateRecovery(CandidateMessage):
+    """The exact retained candidate a publication recovery request publishes (#5429)."""
+
+    candidate_id: uuid.UUID
+    content_sha256: Sha256
+    repository: CandidateRepository
+    base_commit: CommitSha
+    target_branch: Annotated[str, Field(min_length=1, max_length=1024, pattern=r"\S")]
+    changed_paths: Annotated[list[ChangedPath], Field(max_length=4096)]
+    contains_workflow_files: StrictBool
+    title: Annotated[str, Field(max_length=256, pattern=r"^[^\x00]*$")]
+    body: Annotated[str, Field(max_length=65536, pattern=r"^[^\x00]*$")]
+    patch: CandidateObjectReceipt
+
+    @model_validator(mode="after")
+    def _patch_only(self) -> Self:
+        if self.patch.kind != "patch":
+            raise ValueError("a recovery names its patch object")
+        return self
+
+
 class CandidatePublicPatch(CandidateMessage):
     size_bytes: Annotated[StrictInt, Field(ge=0)]
     sha256: Sha256

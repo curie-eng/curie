@@ -2486,6 +2486,8 @@ class _FactoryWorkItems(AbsentRequesterContext):
             conversation_id=factory_conversation(wake),
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path="acme-corp/widgets",
+            execution_kind="implementation",
+            recovery_candidate_id=None,
             context=factory_context(uuid.UUID("11111111-1111-4111-8111-111111114180"), wake),
         )
 

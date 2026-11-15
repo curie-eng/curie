@@ -1834,7 +1834,13 @@ async def _process_event(
                             await self._finish_or_settle(
                                 run,
                                 outcome="failed",
-                                cause="approval_create_failed",
+                                # #5429: a policy refusal of the snapshot is
+                                # terminal and admits no publication recovery.
+                                cause=(
+                                    "publication_refused"
+                                    if outcome.publication_snapshot_refused
+                                    else "approval_create_failed"
+                                ),
                                 detail=pause.failure_detail,
                                 ci_fix_round=None,
                                 retry_safety=failures.retry_safety(

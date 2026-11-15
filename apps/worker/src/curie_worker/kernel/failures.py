@@ -245,6 +245,9 @@ class TurnOutcome:
     approval_display: str | None = None
     publication_snapshot: RunnerWorkspaceSnapshot | None = None
     publication_snapshot_error: str | None = None
+    # The snapshot error is a publication policy refusal, not a fault (#5429):
+    # the run finishes ``publication_refused``, which admits no recovery.
+    publication_snapshot_refused: bool = False
     ui_evidence: UiEvidenceCapture | None = None
     review_origin_key: str | None = None
     # The repository this turn attached because its own message named it

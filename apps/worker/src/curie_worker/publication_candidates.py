@@ -47,6 +47,11 @@ class PublicationCandidateClient:
     async def fail(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post("fail", payload)
 
+    async def recovery(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The recovery request's own candidate, under its live authority (#5429)."""
+
+        return await self._post("recovery", payload)
+
     async def acquire_reader(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._post("acquire-reader", payload)
 

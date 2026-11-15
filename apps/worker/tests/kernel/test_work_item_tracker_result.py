@@ -507,6 +507,8 @@ _ACQUIRE_BODY: dict[str, object] = {
     "wait_deadline": "2099-01-01T00:00:00+00:00",
     "repository_path": WORK_ITEM_REPO,
     "context": _CONTEXT.model_dump(mode="json"),
+    "execution_kind": "implementation",
+    "recovery_candidate_id": None,
 }
 _START_BODY: dict[str, object] = {
     "runtime_epoch": 3,

@@ -125,6 +125,8 @@ class Api:
                     "wait_deadline": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                     "repository_path": "acme-corp/widgets",
                     "context": factory_context(AGENT_ID, wake).model_dump(mode="json"),
+                    "execution_kind": "implementation",
+                    "recovery_candidate_id": None,
                 }
             else:
                 assert body["context"] == self.acquire_grant["context"]

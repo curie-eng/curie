@@ -527,6 +527,7 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publication-candidates/release-reader",
     "/v1/internal/publication-candidates/claim-collection",
     "/v1/internal/publication-candidates/finalize-collection",
+    "/v1/internal/publication-candidates/recovery",
     "/v1/internal/workspaces/{deployment_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/selection",
     "/v1/internal/work-items/admissions",

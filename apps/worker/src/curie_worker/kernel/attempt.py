@@ -50,7 +50,7 @@ from ..capacity_wait import (
     current_order,
 )
 from ..delivery_lease import DeliveryLease
-from ..publication_validation import validate_snapshot_against_base
+from ..publication_validation import PublicationValidationRefused, validate_snapshot_against_base
 from ..reply_sink import (
     TargetRoute,
 )
@@ -105,6 +105,7 @@ from . import (
     failures,
     memory,
     publication,
+    publication_recovery,
     routing,
     workspace,
 )
@@ -837,6 +838,22 @@ async def _attempt_turn(
         await self._reply_for(qevent, route, "Folded into the in-progress reply above.")
         return failures.TurnOutcome(terminal_ok=True, steered=True)
 
+    if routed.turn is None and routed.handle is not None:
+        # #5429: a publication recovery route opened no runner turn. Its one
+        # retained candidate is validated and returned as the publish outcome,
+        # which already carries the snapshot the block below would read.
+        return await publication_recovery._attempt_recovery(
+            self,
+            qevent,
+            thread_key,
+            routed.handle,
+            (
+                None
+                if remaining_s is None
+                else remaining_s - (clock.time.monotonic() - attempt_started)
+            ),
+        )
+
     assert routed.handle is not None and routed.turn is not None
     hook_carry = constants._HOOK_RUN_CARRY.get()
     if hook_carry is not None:
@@ -1021,6 +1038,9 @@ async def _attempt_turn(
                     )
                 except WorkspacePreparationError as exc:
                     outcome.publication_snapshot_error = f"publication snapshot failed: {exc}"
+                    outcome.publication_snapshot_refused = isinstance(
+                        exc, PublicationValidationRefused
+                    )
         return outcome
     finally:
         self._unregister_run(agent_id, thread_key)
