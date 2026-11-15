@@ -650,14 +650,24 @@ def test_runner_escalation_posts_one_comment_and_completed_needs_a_pull_request(
     refused = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers=headers,
-        json={"runtime_epoch": epoch, "outcome": "completed", "cause": "completed"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "completed",
+            "cause": "completed",
+            "retry_safety": "uncertain",
+        },
     )
     assert refused.status_code == 409, refused.text
     assert _request(number)["status"] == "running"
     failed = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers=headers,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "runner_escalated"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "runner_escalated",
+            "retry_safety": "uncertain",
+        },
     )
     assert failed.status_code == 200, failed.text
     terminal = _request(number)
@@ -811,6 +821,7 @@ def test_an_unadopted_pr_notice_names_the_database_selected_conversation_pr(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "pull_request_not_adopted",
+            "retry_safety": "uncertain",
             "detail": f"Continue this pull request: {worker_url}",
         },
     )
@@ -857,6 +868,7 @@ def test_approval_create_failure_posts_terminal_issue_notice_and_clears_running_
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "approval_create_failed",
+            "retry_safety": "uncertain",
         },
     )
     assert failed.status_code == 200, failed.text
@@ -887,6 +899,7 @@ def test_approval_create_failure_after_first_publication_ends_ci_fix_round(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "approval_create_failed",
+            "retry_safety": "uncertain",
         },
     )
     assert failed.status_code == 200, failed.text
@@ -913,6 +926,7 @@ def test_credit_exhausted_finish_comments_the_redacted_provider_message(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "model_credit_exhausted",
+            "retry_safety": "uncertain",
             "detail": f"model error: unknown: API Error: 402 requires more credits {key}",
         },
     )
@@ -946,7 +960,13 @@ def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
     finished = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": cause, "detail": detail},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": cause,
+            "retry_safety": "uncertain",
+            "detail": detail,
+        },
     )
     assert finished.status_code == 200, finished.text
     terminal = _request(number)
@@ -988,6 +1008,7 @@ def test_an_early_stop_finish_defers_to_an_in_flight_publication(admitted: Any, 
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": cause,
+            "retry_safety": "uncertain",
             "detail": "stopping",
         },
     )
@@ -1048,6 +1069,7 @@ def _finish_unpublished(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": cause,
+            "retry_safety": "uncertain",
             "detail": detail,
         },
     )
@@ -1333,7 +1355,12 @@ def test_runner_failure_posts_one_comment(admitted: Any) -> None:
     failed = client.post(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "runner_failed"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "runner_failed",
+            "retry_safety": "uncertain",
+        },
     )
     assert failed.status_code == 200, failed.text
     terminal = _request(number)
@@ -2398,6 +2425,8 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(
                     detail="No changes needed: the request is already covered.",
                     ci_fix_round=None,
                     extra_where=(),
+                    retry_safety=None,
+                    retry_condition=None,
                 )
                 assert isinstance(result, WorkItemConflict), result
                 assert result.code == "stale_version"
@@ -2612,6 +2641,7 @@ def test_factory_notices_publication_unrecorded_finish_comments_its_details_once
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "publication_unrecorded",
+            "retry_safety": "uncertain",
             "detail": detail,
         },
     )
@@ -2652,6 +2682,7 @@ def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "model_usage_limited",
+            "retry_safety": "uncertain",
             "detail": "You've hit your session limit · resets 3pm (UTC)",
         },
     )
@@ -2683,6 +2714,7 @@ def test_factory_notices_model_unreachable_finish_comments_the_network_remedy(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "model_unreachable",
+            "retry_safety": "uncertain",
             "detail": "model error: server_error: API Error: Connection refused (ECONNREFUSED)",
         },
     )

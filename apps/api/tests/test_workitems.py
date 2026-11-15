@@ -744,6 +744,8 @@ def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> 
                 cause=" ",
                 expected_work_item_version=2,
                 expected_request_version=2,
+                retry_safety=None,
+                retry_condition=None,
             ),
             "illegal_transition",
         )
@@ -777,6 +779,8 @@ def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> 
             request_id=request.id,
             expected_work_item_version=opened.work_item.version,
             expected_request_version=opened.request.version,
+            retry_safety=None,
+            retry_condition=None,
         )
         assert isinstance(completed, workitems.WorkItemOutcome), completed
         assert completed.request is not None
@@ -790,6 +794,8 @@ def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> 
                 cause="rewrite",
                 expected_work_item_version=completed.work_item.version,
                 expected_request_version=3,
+                retry_safety=None,
+                retry_condition=None,
             ),
             "illegal_transition",
         )
@@ -803,6 +809,8 @@ def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> 
             cause="fixture_machine_failure",
             expected_work_item_version=second.work_item.version,
             expected_request_version=second.request.version,
+            retry_safety=None,
+            retry_condition=None,
         )
         assert isinstance(failed, workitems.WorkItemOutcome), failed
         assert failed.request is not None
@@ -1414,6 +1422,8 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
             request_id=terminal.request.id,
             expected_work_item_version=terminal.work_item.version,
             expected_request_version=terminal.request.version,
+            retry_safety=None,
+            retry_condition=None,
         )
         assert isinstance(terminal, workitems.WorkItemOutcome), terminal
         sealed = await workitems.request_cancellation(
@@ -1461,6 +1471,8 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
                 request_id=requested.request.id,
                 expected_work_item_version=4,
                 expected_request_version=3,
+                retry_safety=None,
+                retry_condition=None,
             ),
             await workitems.fail_execution(
                 session,
@@ -1469,6 +1481,8 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
                 cause="fixture failure",
                 expected_work_item_version=4,
                 expected_request_version=3,
+                retry_safety=None,
+                retry_condition=None,
             ),
             await workitems.link_publication_lineage(
                 session,
@@ -1528,6 +1542,8 @@ def test_elapsed_execution_is_observed_before_reuse_and_can_be_cancelled_explici
                 request_id=request_id,
                 expected_work_item_version=2,
                 expected_request_version=2,
+                retry_safety=None,
+                retry_condition=None,
             ),
             workitems.fail_execution(
                 session,
@@ -1536,6 +1552,8 @@ def test_elapsed_execution_is_observed_before_reuse_and_can_be_cancelled_explici
                 cause="fixture failure",
                 expected_work_item_version=2,
                 expected_request_version=2,
+                retry_safety=None,
+                retry_condition=None,
             ),
             workitems.link_publication_lineage(
                 session,
@@ -1955,10 +1973,16 @@ def test_terminal_and_link_races_cannot_win_after_sticky_cancellation(
                     "expected_request_version": 2,
                 }
                 if operation == "complete":
-                    return await workitems.complete_execution(session, **common)
+                    return await workitems.complete_execution(
+                        session, retry_safety=None, retry_condition=None, **common
+                    )
                 if operation == "fail":
                     return await workitems.fail_execution(
-                        session, cause="fixture failure", **common
+                        session,
+                        cause="fixture failure",
+                        retry_safety=None,
+                        retry_condition=None,
+                        **common,
                     )
                 assert lineage_id is not None
                 return await workitems.link_publication_lineage(
@@ -2594,6 +2618,8 @@ def test_an_opened_pull_request_completes_after_the_execution_deadline(
             request_id=request_id,
             expected_work_item_version=2,
             expected_request_version=2,
+            retry_safety=None,
+            retry_condition=None,
         )
         assert isinstance(completed, workitems.WorkItemOutcome), completed
         assert completed.request is not None
@@ -2645,6 +2671,8 @@ def test_a_terminal_work_item_expires_only_its_own_transcript(clean_db: None) ->
             cause="runner_escalated",
             expected_work_item_version=running.work_item.version,
             expected_request_version=request.version + 1,
+            retry_safety=None,
+            retry_condition=None,
         )
         _conflict(stale, "stale_version")
         assert await _transcript_threads(session, agent_id) == {CONVERSATION, other_thread}
@@ -2656,6 +2684,8 @@ def test_a_terminal_work_item_expires_only_its_own_transcript(clean_db: None) ->
             cause="runner_escalated",
             expected_work_item_version=running.work_item.version,
             expected_request_version=request.version,
+            retry_safety=None,
+            retry_condition=None,
         )
         assert isinstance(failed, workitems.WorkItemOutcome), failed
         assert failed.request is not None and failed.request.status == "failed"
@@ -2985,6 +3015,15 @@ async def _owner_lost_retry(session: AsyncSession, request_id: uuid.UUID) -> boo
     return value
 
 
+async def _retries_used(session: AsyncSession, work_item_id: uuid.UUID) -> int:
+    value = await session.scalar(
+        text("SELECT automatic_retries_used FROM curie.work_items WHERE id = :id"),
+        {"id": work_item_id},
+    )
+    assert isinstance(value, int)
+    return value
+
+
 async def _snapshotted_waiting(
     session: AsyncSession, agent_id: uuid.UUID
 ) -> tuple[uuid.UUID, uuid.UUID]:
@@ -3034,7 +3073,7 @@ def test_an_owner_lost_request_is_followed_by_one_successor(clean_db: None) -> N
 
 
 def test_the_third_consecutive_owner_lost_admits_no_successor(clean_db: None) -> None:
-    """AC2: losses one and two are retried; the third leaves the WorkItem terminal."""
+    """Losses one and two spend the shared allowance; the third is terminal (ADR 0269)."""
 
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent(session)
@@ -3048,6 +3087,7 @@ def test_the_third_consecutive_owner_lost_admits_no_successor(clean_db: None) ->
             assert (successor.status, successor.sequence) == ("waiting", loss + 1)
             assert {c: successor[c] for c in SNAPSHOT_COLUMNS} == SNAPSHOT
             assert await _owner_lost_retry(session, successor.id) is True
+            assert await _retries_used(session, item_id) == loss
             assert await _transcript_threads(session, agent_id) == {CONVERSATION}
             current = successor.id
 
@@ -3058,16 +3098,21 @@ def test_the_third_consecutive_owner_lost_admits_no_successor(clean_db: None) ->
             (2, "failed", "owner_lost"),
             (3, "failed", "owner_lost"),
         ]
+        assert await _retries_used(session, item_id) == 2
         # Nothing continues the WorkItem now, so its history expires.
         assert await _transcript_threads(session, agent_id) == set()
 
     with_session(body)
 
 
-def test_a_different_terminal_between_losses_resets_the_owner_lost_count(
+def test_a_different_terminal_between_losses_does_not_replenish_the_allowance(
     clean_db: None,
 ) -> None:
-    """AC2: only consecutive owner_lost terminals count toward the limit."""
+    """ADR 0269: owner loss spends a WorkItem lifetime allowance, never a streak.
+
+    Another cause between losses and a fresh admission do not reset it, so the
+    loss after them admits nothing.
+    """
 
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent(session)
@@ -3081,7 +3126,7 @@ def test_a_different_terminal_between_losses_resets_the_owner_lost_count(
         third = rows[-1]
         assert third.status == "waiting", third
 
-        # The retried run fails for its own reason: the streak ends here.
+        # The retried run fails for its own reason; that refunds nothing.
         await _start_by_id(session, third.id)
         row = await _versions(session, third.id)
         failed = await workitems.fail_execution(
@@ -3091,6 +3136,8 @@ def test_a_different_terminal_between_losses_resets_the_owner_lost_count(
             cause="runner_escalated",
             expected_work_item_version=row.work_version,
             expected_request_version=row.request_version,
+            retry_safety=None,
+            retry_condition=None,
         )
         assert isinstance(failed, workitems.WorkItemOutcome), failed
         assert len(await _requests(session, item_id)) == 3
@@ -3105,7 +3152,8 @@ def test_a_different_terminal_between_losses_resets_the_owner_lost_count(
         )
         assert isinstance(fresh, workitems.WorkItemOutcome), fresh
         await _set_snapshot(session, fresh_id)
-        # Three owner_lost terminals on the WorkItem, but only one in a row.
+        # A separately authorized admission spends no slot and refunds none.
+        assert await _retries_used(session, item_id) == 2
         await _lose(session, fresh_id)
 
         rows = await _requests(session, item_id)
@@ -3114,9 +3162,8 @@ def test_a_different_terminal_between_losses_resets_the_owner_lost_count(
             (2, "failed", "owner_lost"),
             (3, "failed", "runner_escalated"),
             (4, "failed", "owner_lost"),
-            (5, "waiting", None),
         ]
-        assert await _owner_lost_retry(session, rows[-1].id) is True
+        assert await _retries_used(session, item_id) == 2
 
     with_session(body)
 

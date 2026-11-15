@@ -149,7 +149,12 @@ def _execute(statement: str, params: dict[str, Any]) -> None:
 def _finish_failed(
     client: Any, request_id: uuid.UUID, epoch: int, cause: str, detail: str | None = None
 ) -> None:
-    body: dict[str, Any] = {"runtime_epoch": epoch, "outcome": "failed", "cause": cause}
+    body: dict[str, Any] = {
+        "runtime_epoch": epoch,
+        "outcome": "failed",
+        "cause": cause,
+        "retry_safety": "uncertain",
+    }
     if detail is not None:
         body["detail"] = detail
     finished = client.post(

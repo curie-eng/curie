@@ -718,6 +718,8 @@ def test_heartbeat_and_finish_refuse_a_stale_runtime_epoch(
             cause="completed",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert _code(stale_finish) == "stale_owner"
         after = await _request_row(session, facts.request_id)
@@ -1042,6 +1044,7 @@ def _auth_routes() -> list[tuple[str, str, dict[str, Any] | None]]:
                 "runtime_epoch": 1,
                 "outcome": "completed",
                 "cause": "completed",
+                "retry_safety": "uncertain",
             },
         ),
         (
@@ -1188,6 +1191,7 @@ def test_http_admit_replay_acquire_start_heartbeat_and_stale_finish(
             "runtime_epoch": 9,
             "outcome": "completed",
             "cause": "completed",
+            "retry_safety": "uncertain",
         },
         headers=WORKER_HEADERS,
     )
@@ -3578,6 +3582,8 @@ async def _finish_as_worker(
         cause=cause,
         detail=None,
         ci_fix_round=None,
+        retry_safety="uncertain",
+        retry_condition=None,
     )
 
 

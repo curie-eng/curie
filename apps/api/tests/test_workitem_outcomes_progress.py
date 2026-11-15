@@ -218,6 +218,8 @@ def _fail(request_id: uuid.UUID, epoch: int) -> None:
             cause="deadline_halted",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert getattr(result, "code", None) is None, result
 

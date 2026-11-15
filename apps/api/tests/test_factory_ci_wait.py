@@ -384,6 +384,7 @@ def _finish(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": cause,
+            "retry_safety": "uncertain",
             "ci_fix_round": ci_fix_round,
         },
     )
@@ -3072,6 +3073,7 @@ def test_ci_fix_unpublished_terminal_notice_quotes_the_explanation(admitted: Any
             "runtime_epoch": _epoch(published["id"]),
             "outcome": "failed",
             "cause": "ci_fix_unpublished",
+            "retry_safety": "uncertain",
             "ci_fix_round": 2,
             "detail": detail,
         },

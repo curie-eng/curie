@@ -10,7 +10,7 @@ from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, StrictBool, model_validator
 
-from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
+from curie_api.workitems.lifecycle import RetryConditionFact, WorkItemConflict, WorkItemOutcome
 
 from .. import personal_execution, workitem_dispatch
 from ..auth import require_internal_worker_token
@@ -19,6 +19,7 @@ from ..deps import LivenessSessionDep, SessionDep
 from ..factory_tracker_result_runtime import CompletionContractName
 from ..forges.types import RepositoryRef, TrackerIssueRef
 from ..personal_execution import ModelAuthMode, OwnerContext
+from ..wirebody import RetryConditionBody
 from ..workitem_dispatch import DispatchConflict
 
 router = APIRouter(
@@ -157,6 +158,11 @@ class FinishBody(BaseModel):
     # The CI fix round whose turn ended unpublished (#4330). Required for
     # ``ci_fix_unpublished`` and refused for every other cause.
     ci_fix_round: int | None = Field(default=None, ge=CI_FIRST_FIX_ROUND, le=CI_MAX_ROUNDS)
+    # The worker's typed safety fact for this turn (ADR 0269). Required with
+    # no default: a missing fact is refused, never read as clean.
+    retry_safety: Literal["no_effects", "flagged", "uncertain"]
+    # The provider retry condition the worker received, decoded tolerantly.
+    retry_condition: RetryConditionBody | None = None
 
     @model_validator(mode="after")
     def _round_matches_cause(self) -> Self:
@@ -575,6 +581,16 @@ async def finish_work_item_request(
         cause=body.cause,
         detail=body.detail,
         ci_fix_round=body.ci_fix_round,
+        retry_safety=body.retry_safety,
+        retry_condition=(
+            None
+            if body.retry_condition is None
+            else RetryConditionFact(
+                reason=body.retry_condition.reason.value,
+                retry_at=body.retry_condition.retry_at,
+                scope_key=body.retry_condition.scope_key,
+            )
+        ),
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

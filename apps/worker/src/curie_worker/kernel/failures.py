@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from aci_protocol import (
     QueuedTurn,
+    RetryCondition,
     SessionStatus,
     ToolAccess,
 )
@@ -19,6 +20,7 @@ from ..runner_client import (
 from ..sandbox.types import (
     SandboxTermination,
 )
+from ..workitem_dispatch import RetrySafety
 
 if TYPE_CHECKING:
     from ..ui_evidence import UiEvidenceCapture
@@ -50,6 +52,25 @@ def _escalation_cause(failure: TurnOutcome | None) -> str:
     if failure is None or failure.classification is None:
         return "runner_escalated"
     return constants._ESCALATION_CAUSES.get(failure.classification, "runner_escalated")
+
+
+def retry_safety(
+    turn: TurnOutcome | None, *, marker_flagged: bool, own_execute_turn: bool
+) -> RetrySafety:
+    """The safety fact a finish reports about the turn it ends.
+
+    ``no_effects`` is a positive observation: the kernel saw the run's own
+    execute turn end with no side effect flag, no durable marker and no
+    execution uncertainty. Anything short of that is never reported as clean.
+    """
+
+    if turn is not None and turn.execution_uncertain:
+        return "uncertain"
+    if marker_flagged or (turn is not None and turn.saw_side_effect):
+        return "flagged"
+    if turn is None or not turn.runner_ended or not own_execute_turn:
+        return "uncertain"
+    return "no_effects"
 
 
 def _sandbox_termination_detail(termination: SandboxTermination) -> str:
@@ -235,6 +256,13 @@ class TurnOutcome:
     tools_called: frozenset[str] = frozenset()
     assistant_text: str = ""
     continued: bool = False
+    # The kernel observed this turn end: the runner's final frame was applied,
+    # or, on a stream that carried no error frame, the runner accepted the
+    # timeout stop or the pod termination was observed.
+    runner_ended: bool = False
+    # The provider retry condition the runner put on an error frame, reported
+    # unchanged at finish. None when the stream carried none.
+    retry_condition: RetryCondition | None = None
 
 
 class _FactoryExecutionEnded(Exception):

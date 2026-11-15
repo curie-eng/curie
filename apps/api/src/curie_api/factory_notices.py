@@ -89,11 +89,7 @@ from .models import (
 )
 from .publication_truth import conversation_pr_lineage_id
 from .repo_full_name import repo_url_path
-from .workitems.lifecycle import (
-    OWNER_LOST_RETRY_LIMIT,
-    owner_lost_streak,
-    owner_lost_successor_admitted,
-)
+from .workitems.lifecycle import AUTOMATIC_RETRY_LIMIT, automatic_successor_of
 
 logger = logging.getLogger(__name__)
 
@@ -334,9 +330,10 @@ def result_section(
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
-    For ``owner_lost``, ``lost_streak`` is the consecutive losses through
-    this request and ``lost_retried`` whether its settlement admitted a
-    successor (ADR 0206); together they choose the retry or exhausted sentence.
+    For ``owner_lost``, ``lost_streak`` is the WorkItem's used automatic
+    retries and ``lost_retried`` whether this request's settlement admitted a
+    successor (ADR 0206, ADR 0269); together they choose the retry or
+    exhausted sentence.
     ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
     """
 
@@ -394,17 +391,19 @@ def result_section(
                 "was opened. This was an infrastructure failure, not a refusal of the change; "
                 "retry the run."
             )
-        elif cause == "owner_lost" and lost_streak == OWNER_LOST_RETRY_LIMIT:
+        elif (
+            cause == "owner_lost" and not lost_retried and lost_streak >= AUTOMATIC_RETRY_LIMIT
+        ):
             sentence = (
                 "the worker running this request stopped responding "
-                f"{OWNER_LOST_RETRY_LIMIT} times."
+                f"{AUTOMATIC_RETRY_LIMIT + 1} times."
             )
-        elif cause == "owner_lost" and lost_retried and 1 <= lost_streak < OWNER_LOST_RETRY_LIMIT:
+        elif cause == "owner_lost" and lost_retried and 1 <= lost_streak <= AUTOMATIC_RETRY_LIMIT:
             prefix = "Retrying: "
             sentence = (
                 "the worker running this request stopped responding. Curie started "
                 "the work again as a new run "
-                f"(attempt {lost_streak + 1} of {OWNER_LOST_RETRY_LIMIT})."
+                f"(attempt {lost_streak + 1} of {AUTOMATIC_RETRY_LIMIT + 1})."
             )
         elif cause == "budget_exceeded":
             token_budget = _OUTPUT_TOKEN_BUDGET_DETAIL.fullmatch(detail or "")
@@ -1195,13 +1194,9 @@ async def _render(
             streak = 0
             retried = False
             if cause == "owner_lost":
-                streak = await owner_lost_streak(
-                    session, work_item.id, through_sequence=request.sequence
-                )
-                retried = await owner_lost_successor_admitted(session, request)
-                retrying = (
-                    request.status == "failed" and retried and 1 <= streak < OWNER_LOST_RETRY_LIMIT
-                )
+                streak = work_item.automatic_retries_used
+                retried = await automatic_successor_of(session, request) is not None
+                retrying = request.status == "failed" and retried
             unchanged = (
                 request.status == "completed"
                 and (

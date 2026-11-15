@@ -562,6 +562,8 @@ class WorkItemReconciler:
                             cause=settlement.cause,
                             expected_work_item_version=settlement.work_item_version,
                             expected_request_version=settlement.request_version,
+                            retry_safety=None,
+                            retry_condition=None,
                         )
                         continue
                     # No network call under the claim's row lock.

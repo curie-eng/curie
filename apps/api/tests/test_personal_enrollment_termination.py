@@ -275,7 +275,12 @@ def _finish(api: TestClient, request_id: UUID, epoch: int) -> httpx.Response:
 
     return api.post(
         f"{support.INTERNAL_PREFIX}/requests/{request_id}/finish",
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "early_stop"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "early_stop",
+            "retry_safety": "uncertain",
+        },
         headers=WORKER_HEADERS,
     )
 
@@ -915,7 +920,12 @@ def test_authentication_required_failure_keeps_owner_and_transcript(
 
     finished = api.post(
         f"{support.INTERNAL_PREFIX}/requests/{personal.request_id}/finish",
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": "authentication_required"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "authentication_required",
+            "retry_safety": "uncertain",
+        },
         headers=WORKER_HEADERS,
     )
     assert finished.status_code == 200, finished.text

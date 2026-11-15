@@ -726,6 +726,8 @@ def test_finish_committed_before_response_loss_settles_without_rerunning(
                     "cause": "model_error",
                     "detail": "Provider turn ended",
                     "ci_fix_round": None,
+                    "retry_safety": "flagged",
+                    "retry_condition": None,
                 }
                 finish_attempts = [body for path, body in api.posts if path.endswith("/finish")]
                 assert len(finish_attempts) == (failed_attempts + 2 if deferred else 2)

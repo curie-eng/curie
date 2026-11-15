@@ -662,6 +662,8 @@ class _Stage:
             cause="runner_failed",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert self.work_item_id is not None
         return _Source(self.work_item_id, request_id, started.runtime_epoch, grant.generation)
@@ -812,7 +814,13 @@ class _Stage:
         run = self.run
         assert run is not None
         await self.h.kernel._finish_or_settle(
-            run, outcome="failed", cause="runner_failed", detail=None, ci_fix_round=None
+            run,
+            outcome="failed",
+            cause="runner_failed",
+            detail=None,
+            ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert run.finished
         self.request_after_finish = await self.request_row(run.request_id)
@@ -1726,7 +1734,13 @@ async def _fault_cancelled_finish(stage: _Stage, _monkeypatch: pytest.MonkeyPatc
     await _cancel_work_item(stage)
     with pytest.raises(WorkItemConflict) as refused:
         await stage.h.kernel._finish_or_settle(
-            run, outcome="failed", cause="runner_failed", detail=None, ci_fix_round=None
+            run,
+            outcome="failed",
+            cause="runner_failed",
+            detail=None,
+            ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
     assert refused.value.code == "work_item_cancelled"
     # kernel/completion.py's handling of this refusal (#3208).

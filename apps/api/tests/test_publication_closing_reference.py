@@ -382,6 +382,7 @@ def test_deleted_jira_issue_names_the_issue_on_publication_create(
             "runtime_epoch": payload["work_item_runtime_epoch"],
             "outcome": "failed",
             "cause": "approval_create_failed",
+            "retry_safety": "uncertain",
             "detail": None,
         },
     )

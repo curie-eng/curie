@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from curie_internal.requester_coding_instructions import EvidenceState
@@ -22,9 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
-from .. import transcripts
+from .. import factory_retry_policy, transcripts
 from ..config import get_settings
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
+from ..factory_retry_policy import Disposition, DispositionKind, RetryFacts, RetrySafety
 from ..factory_tracker_result_delivery import DeliveryOrigin, DeliveryState, seal_platform_findings
 from ..factory_tracker_result_runtime import (
     CONTRACT_IMPLEMENTATION,
@@ -111,8 +113,12 @@ AWAITING_PUBLICATION = (*IN_FLIGHT_PUBLICATION, "succeeded")
 _UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop", "revision_unchanged"})
 # Longest provider message a factory notice keeps (#3073).
 _NOTICE_DETAIL_MAX = 4000
-# Consecutive owner_lost requests a WorkItem runs before a person is needed (ADR 0206).
-OWNER_LOST_RETRY_LIMIT = 3
+# Automatic fresh requests a WorkItem may receive over its lifetime, shared by
+# owner loss and ordinary failures (ADR 0269).
+AUTOMATIC_RETRY_LIMIT = 2
+# Backoff before each slot's successor, and the deterministic jitter around it.
+AUTOMATIC_RETRY_DELAYS_S = (30, 120)
+AUTOMATIC_RETRY_JITTER = 0.2
 # Started terminal statuses whose runtime teardown an enrollment fence can owe
 # (#5377). A force-settled ``cancelled`` request owes one too, by its own path.
 TEARDOWN_TERMINAL_STATUSES = ("completed", "failed", "expired")
@@ -123,6 +129,33 @@ TEARDOWN_TERMINAL_STATUSES = ("completed", "failed", "expired")
 _RESUMABLE_PERSONAL_CAUSES = frozenset(
     {"enrollment_fenced", "authentication_required", "start_failed"}
 )
+
+
+@dataclass(frozen=True)
+class RetryConditionFact:
+    """The provider retry condition a worker carried to settlement (#5424).
+
+    Already validated against the ACI grammar at the wire boundary; this is
+    the typed fact the lifecycle persists and the policy reads.
+    """
+
+    reason: str
+    retry_at: datetime | None
+    scope_key: str | None
+
+
+def automatic_retry_delay_seconds(work_item_id: uuid.UUID, slot: int) -> float:
+    """The backoff before slot ``slot``'s successor, jittered by WorkItem identity.
+
+    Keyed by the WorkItem and slot so a replayed settlement computes the same
+    delay, and different WorkItems do not wake together.
+    """
+
+    base = AUTOMATIC_RETRY_DELAYS_S[slot - 1]
+    digest = sha256(f"{work_item_id}:{slot}".encode()).digest()
+    unit = int.from_bytes(digest[:8], "big") / 2**64
+    return base * (1 - AUTOMATIC_RETRY_JITTER + 2 * AUTOMATIC_RETRY_JITTER * unit)
+
 
 _NO_READMIT: dict[str, Any] = {
     "readmit_request_id": None,
@@ -825,19 +858,28 @@ async def _insert_waiting_request(
     base_settle_until: datetime | None = None,
     completion_contract: CompletionContractName = CONTRACT_IMPLEMENTATION,
     result_policy_digest: str | None = None,
+    reserve_automatic_retry: bool,
 ) -> bool:
     """Allocate the next sequence and insert a waiting request; the caller commits.
 
     False when the WorkItem moved past ``expected_work_item_version`` or was
-    cancelled. An ``IntegrityError`` leaves the savepoint rolled back. The
-    request snapshots ``work_item``'s owner tuple, so ``work_item`` is the
-    locked row and ``columns`` never names an owner fact (#5376). The
+    cancelled, or, with ``reserve_automatic_retry``, when its automatic
+    allowance is spent. An ``IntegrityError`` leaves the savepoint rolled
+    back. The request snapshots ``work_item``'s owner tuple, so ``work_item``
+    is the locked row and ``columns`` never names an owner fact (#5376). The
     completion contract and its policy digest are admission's selection
-    (ADR 0277, #5586).
+    (ADR 0277, #5586). The allowance slot is reserved in the same statement
+    that bumps the version and sequence, so no successor exists without its
+    slot (ADR 0269).
     """
 
     assert_no_owner_columns(columns or {})
     sequence = work_item.next_sequence
+    allowance: tuple[ColumnElement[bool], ...] = ()
+    reservation: dict[str, Any] = {}
+    if reserve_automatic_retry:
+        allowance = (WorkItem.automatic_retries_used < AUTOMATIC_RETRY_LIMIT,)
+        reservation = {"automatic_retries_used": WorkItem.automatic_retries_used + 1}
     async with session.begin_nested():
         changed_id: uuid.UUID | None = await session.scalar(
             update(WorkItem)
@@ -845,11 +887,13 @@ async def _insert_waiting_request(
                 WorkItem.id == work_item.id,
                 WorkItem.version == expected_work_item_version,
                 WorkItem.cancelled_at.is_(None),
+                *allowance,
             )
             .values(
                 version=WorkItem.version + 1,
                 next_sequence=WorkItem.next_sequence + 1,
                 updated_at=func.clock_timestamp(),
+                **reservation,
             )
             .returning(WorkItem.id)
         )
@@ -924,6 +968,7 @@ async def create_execution_request(
             expected_work_item_version=expected_work_item_version,
             completion_contract=completion_contract,
             result_policy_digest=result_policy_digest,
+            reserve_automatic_retry=False,
         )
     except IntegrityError:
         work_item = await reload_work_item(session, work_item_id)
@@ -1404,7 +1449,13 @@ async def expire_waiting(
         .values(
             status="expired",
             terminal_at=now,
-            terminal_cause="capacity_wait_expired",
+            # A request blocked on a typed condition names that wait (ADR 0269);
+            # blocked_on stays on the row so the condition is still readable.
+            terminal_cause=(
+                "retry_condition_expired"
+                if request.blocked_on is not None
+                else "capacity_wait_expired"
+            ),
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -1705,7 +1756,18 @@ async def terminalize_execution(
     detail: str | None,
     ci_fix_round: int | None,
     extra_where: Sequence[ColumnElement[bool]],
+    retry_safety: RetrySafety | None,
+    retry_condition: RetryConditionFact | None,
 ) -> WorkItemResult:
+    """Settle a running request completed or failed.
+
+    ``retry_safety`` and ``retry_condition`` are the worker's typed facts
+    (ADR 0269); a settlement the API makes itself passes None for both. They
+    are written by the terminal UPDATE, and a failed request whose facts the
+    factory policy allows may admit its automatic successor in this same
+    transaction, before terminal settlement.
+    """
+
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
         return await _conflict(
@@ -1863,6 +1925,12 @@ async def terminalize_execution(
             status=status,
             terminal_at=now,
             terminal_cause=cause.strip(),
+            retry_safety=retry_safety,
+            retry_condition_reason=None if retry_condition is None else retry_condition.reason,
+            retry_condition_retry_at=None if retry_condition is None else retry_condition.retry_at,
+            retry_condition_scope_key=(
+                None if retry_condition is None else retry_condition.scope_key
+            ),
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
         )
@@ -1888,6 +1956,21 @@ async def terminalize_execution(
         await seal_platform_findings(
             session, request=request, work_item=work_item, limit="budget", settings=get_settings()
         )
+    if request.status == "failed":
+        disposition = factory_retry_policy.decide(
+            RetryFacts(
+                cause=request.terminal_cause or "",
+                safety=retry_safety,
+                condition_reason=None if retry_condition is None else retry_condition.reason,
+                condition_retry_at=None if retry_condition is None else retry_condition.retry_at,
+            )
+        )
+        # Before settlement, so the successor keeps the transcript (ADR 0269).
+        work_item = await reload_work_item(session, work_item_id)
+        if await _admit_automatic_successor(
+            session, work_item, request, origin="ordinary", disposition=disposition
+        ):
+            work_item = await reload_work_item(session, work_item_id)
     await settle_terminal(session, work_item, request, detail=detail)
     return await outcome(session, work_item, request)
 
@@ -1899,6 +1982,8 @@ async def complete_execution(
     request_id: uuid.UUID,
     expected_work_item_version: int,
     expected_request_version: int,
+    retry_safety: RetrySafety | None,
+    retry_condition: RetryConditionFact | None,
 ) -> WorkItemResult:
     return await terminalize_execution(
         session,
@@ -1911,6 +1996,8 @@ async def complete_execution(
         detail=None,
         ci_fix_round=None,
         extra_where=(),
+        retry_safety=retry_safety,
+        retry_condition=retry_condition,
     )
 
 
@@ -1922,6 +2009,8 @@ async def fail_execution(
     cause: str,
     expected_work_item_version: int,
     expected_request_version: int,
+    retry_safety: RetrySafety | None,
+    retry_condition: RetryConditionFact | None,
 ) -> WorkItemResult:
     return await terminalize_execution(
         session,
@@ -1934,6 +2023,8 @@ async def fail_execution(
         detail=None,
         ci_fix_round=None,
         extra_where=(),
+        retry_safety=retry_safety,
+        retry_condition=retry_condition,
     )
 
 
@@ -2061,6 +2152,8 @@ async def settle_ci_verdict(
                 detail=detail,
                 ci_fix_round=None,
                 extra_where=(),
+                retry_safety=None,
+                retry_condition=None,
             )
         if isinstance(result, WorkItemOutcome):
             await session.execute(
@@ -2087,6 +2180,8 @@ async def settle_ci_verdict(
         detail=detail,
         ci_fix_round=None,
         extra_where=(),
+        retry_safety=None,
+        retry_condition=None,
     )
 
 
@@ -2977,110 +3072,139 @@ async def record_runtime_termination_where(
             settings=get_settings(),
         )
     # Before settlement, so the successor keeps the transcript (ADR 0206).
-    if await _admit_owner_lost_successor(session, work_item, request):
+    if await _admit_automatic_successor(
+        session, work_item, request, origin="owner_loss", disposition=None
+    ):
         work_item = await reload_work_item(session, work_item_id)
     await settle_terminal(session, work_item, request, detail=None)
     return await outcome(session, work_item, request)
 
 
-async def owner_lost_streak(
+async def automatic_successor_of(
+    session: AsyncSession, request: ExecutionRequest
+) -> ExecutionRequest | None:
+    """The automatic successor admitted when ``request`` settled, if any (ADR 0269)."""
+
+    row: ExecutionRequest | None = await session.scalar(
+        select(ExecutionRequest).where(ExecutionRequest.retry_of_request_id == request.id)
+    )
+    return row
+
+
+async def _admit_automatic_successor(
     session: AsyncSession,
-    work_item_id: uuid.UUID,
+    work_item: WorkItem,
+    predecessor: ExecutionRequest,
     *,
-    through_sequence: int | None = None,
-) -> int:
-    """Consecutive owner_lost terminals on a WorkItem, newest first (ADR 0206).
-
-    Requests that have not ended, such as a queued revision, are skipped.
-    ``through_sequence`` counts back from that request instead of the newest.
-    """
-
-    query = (
-        select(ExecutionRequest.terminal_cause)
-        .where(
-            ExecutionRequest.work_item_id == work_item_id,
-            ExecutionRequest.terminal_at.is_not(None),
-        )
-        .order_by(ExecutionRequest.sequence.desc())
-    )
-    if through_sequence is not None:
-        query = query.where(ExecutionRequest.sequence <= through_sequence)
-    streak = 0
-    for cause in await session.scalars(query):
-        if cause != "owner_lost":
-            break
-        streak += 1
-    return streak
-
-
-async def owner_lost_successor_admitted(session: AsyncSession, request: ExecutionRequest) -> bool:
-    """Whether settling this owner_lost request admitted its successor.
-
-    The successor is inserted in the settling transaction, so its created_at
-    (that transaction's start) is not after the request's terminal_at. A later
-    loss's successor is created in a later transaction.
-    """
-
-    if request.terminal_at is None:
-        return False
-    found = await session.scalar(
-        select(ExecutionRequest.id)
-        .where(
-            ExecutionRequest.work_item_id == request.work_item_id,
-            ExecutionRequest.sequence > request.sequence,
-            ExecutionRequest.owner_lost_retry.is_(True),
-            ExecutionRequest.created_at <= request.terminal_at,
-        )
-        .limit(1)
-    )
-    return found is not None
-
-
-async def _admit_owner_lost_successor(
-    session: AsyncSession, work_item: WorkItem, lost: ExecutionRequest
+    origin: Literal["owner_loss", "ordinary"],
+    disposition: Disposition | None,
 ) -> bool:
-    """Admit a new waiting request for work its lost owner took down (ADR 0206).
+    """Admit one fresh waiting request for a failed request (ADR 0206, ADR 0269).
 
-    Call with the WorkItem locked, after ``lost`` settled failed/owner_lost and
-    in the same transaction. The successor re-runs the lost request's snapshot
-    on the WorkItem's recorded base. A cancelled WorkItem, a pending relabel, a
-    closed pull request lineage, a request waiting on its publication, or the
-    third loss in a row admits nothing. Nor does a tracker result request: it
-    starts exactly one model session (ADR 0277 decision 8).
+    Call with the WorkItem locked at its current version, after
+    ``predecessor`` settled failed, in the same transaction and before
+    terminal settlement. The successor re-runs the predecessor's snapshot on
+    the WorkItem's recorded base and spends one slot of the WorkItem's shared
+    automatic allowance, reserved in the same statement that allocates it.
+
+    Every origin refuses a cancelled WorkItem, a pending relabel, a closed
+    pull request lineage, a request its publication still owns, a Curie
+    budget refusal, a spent allowance and a tracker result request (it starts
+    exactly one model session, ADR 0277 decision 8). Owner loss keeps its
+    teardown based exception: it needs no safety fact and adds no delay. An
+    ordinary failure needs the worker's proved ``no_effects``, a policy
+    disposition that allows a successor, and no queued newer revision.
     """
 
     if (
-        lost.status != "failed"
-        or lost.terminal_cause != "owner_lost"
-        or lost.completion_contract == CONTRACT_TRACKER_RESULT
+        predecessor.status != "failed"
+        or predecessor.completion_contract == CONTRACT_TRACKER_RESULT
         or work_item.cancelled_at is not None
         or work_item.readmit_request_id is not None
-        or await _publication_owns_terminus(session, work_item, lost)
-        or await _lineage_closed_for(session, work_item, lost.reply_target_pr_number)
-        or await owner_lost_streak(session, work_item.id) >= OWNER_LOST_RETRY_LIMIT
+        or work_item.automatic_retries_used >= AUTOMATIC_RETRY_LIMIT
+        or predecessor.terminal_cause == "budget_exceeded"
     ):
         return False
-    budget = timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+    if origin == "owner_loss":
+        if predecessor.terminal_cause != "owner_lost":
+            return False
+    elif (
+        predecessor.terminal_cause == "owner_lost"
+        or predecessor.retry_safety != "no_effects"
+        or disposition is None
+        or not disposition.successor
+    ):
+        return False
+    if await _publication_owns_terminus(
+        session, work_item, predecessor
+    ) or await _lineage_closed_for(session, work_item, predecessor.reply_target_pr_number):
+        return False
+    if origin == "ordinary":
+        queued = await session.scalar(
+            select(ExecutionRequest.id)
+            .where(
+                ExecutionRequest.work_item_id == work_item.id,
+                ExecutionRequest.status == "queued",
+            )
+            .limit(1)
+        )
+        if queued is not None:
+            return False
+
+    now = await database_now(session)
+    wait_deadline = now + timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+    slot = work_item.automatic_retries_used + 1
+    dispatch_not_before = now
+    blocked_on: str | None = None
+    if origin == "ordinary":
+        assert disposition is not None
+        due = now + timedelta(seconds=automatic_retry_delay_seconds(work_item.id, slot))
+        provider_time = disposition.not_before
+        if provider_time is not None and provider_time > due:
+            due = provider_time
+        if disposition.kind == DispositionKind.RETRY_BACKOFF:
+            # Without a provider time the successor is always scheduled.
+            blocked = provider_time is not None and due >= wait_deadline
+        elif disposition.kind == DispositionKind.CONDITION_WAIT:
+            # Only a provider time can schedule a condition; otherwise it blocks.
+            blocked = provider_time is None or due >= wait_deadline
+        else:
+            return False
+        if blocked:
+            if not disposition.condition:
+                return False
+            blocked_on = disposition.condition
+            dispatch_not_before = wait_deadline
+        else:
+            dispatch_not_before = due
     admitted = await _insert_waiting_request(
         session,
         work_item,
         request_id=uuid.uuid4(),
-        wait_deadline=await database_now(session) + budget,
+        wait_deadline=wait_deadline,
         expected_work_item_version=work_item.version,
+        reserve_automatic_retry=True,
         columns={
-            "owner_lost_retry": True,
-            "objective": lost.objective,
-            "requester": lost.requester,
-            "reply_kind": lost.reply_kind,
-            "reply_address": lost.reply_address,
-            "reply_conversation_id": lost.reply_conversation_id,
-            "reply_target_kind": lost.reply_target_kind,
-            "reply_target_pr_number": lost.reply_target_pr_number,
-            "reply_target_comment_id": lost.reply_target_comment_id,
-            "reply_target_url": lost.reply_target_url,
+            "owner_lost_retry": origin == "owner_loss",
+            "objective": predecessor.objective,
+            "requester": predecessor.requester,
+            "reply_kind": predecessor.reply_kind,
+            "reply_address": predecessor.reply_address,
+            "reply_conversation_id": predecessor.reply_conversation_id,
+            "reply_target_kind": predecessor.reply_target_kind,
+            "reply_target_pr_number": predecessor.reply_target_pr_number,
+            "reply_target_comment_id": predecessor.reply_target_comment_id,
+            "reply_target_url": predecessor.reply_target_url,
+            # Counted starts span the automatic chain (#5155, ADR 0269).
+            "start_deferrals": predecessor.start_deferrals,
+            "retry_of_request_id": predecessor.id,
+            "retry_origin_request_id": predecessor.retry_origin_request_id or predecessor.id,
+            "dispatch_not_before": dispatch_not_before,
+            "blocked_on": blocked_on,
         },
     )
-    # The WorkItem is locked and was checked above, so its version holds.
+    # The WorkItem is locked and its count was checked above, so the
+    # reservation holds.
     assert admitted
     return True
 

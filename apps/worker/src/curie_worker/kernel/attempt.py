@@ -57,6 +57,7 @@ from ..reply_sink import (
 from ..runner_client import (
     FinalAnswerProtocolError,
     RunnerError,
+    RunnerFrameInvalid,
     RunnerSnapshotReadError,
     RunnerStreamTimeout,
     TurnStream,
@@ -1116,6 +1117,7 @@ async def _consume(
     pump = await self._start_progress_pump(qevent, route)
     stream_started_at = datetime.now(UTC)
     stream_reading = True
+    termination: SandboxTermination | None = None
     try:
         # ``async with`` releases the aiohttp response on every exit path
         # (normal end, apply-frame error, or a mid-stream transport drop), so
@@ -1214,6 +1216,16 @@ async def _consume(
             classification=classification,
             error_message=acc.error_message,
             text=acc.rendered(),
+            # An observed end is a fact, never the classification string: an
+            # error frame's classification outranks the transport one above,
+            # and a stream that carried an error frame and then dropped did
+            # not end in a way the kernel saw.
+            runner_ended=not acc.saw_error_event
+            and (
+                (isinstance(exc, RunnerStreamTimeout) and exc.timeout_result == "accepted")
+                or termination is not None
+            ),
+            retry_condition=acc.retry_condition,
         )
     except ActionBackendError as exc:
         # The ledger refused a write (ADR-0117). The change to the world has
@@ -1233,6 +1245,24 @@ async def _consume(
             terminal_ok=False,
             saw_side_effect=acc.saw_side_effect,
             classification="ledger-error",
+            error_message=acc.error_message,
+            text=acc.rendered(),
+            retry_condition=acc.retry_condition,
+        )
+    except RunnerFrameInvalid as exc:
+        # The runner wrote a frame this worker cannot decode. Only a started
+        # factory run on its own execute wake settles here: nothing proves what
+        # the turn did, so it ends failed and uncertain and the SQL lifecycle
+        # admits no successor. Every other turn keeps the loud path, where the
+        # entry stays pending.
+        if self._started_execute_run(constants._OWNED_WORK_ITEM.get(), qevent.event_id) is None:
+            raise
+        logger.warning("turn stream undecodable for %s: %s", qevent.event_id, exc)
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            saw_side_effect=acc.saw_side_effect,
+            execution_uncertain=True,
+            classification=constants.UNCLASSIFIED_ERROR_CLASSIFICATION,
             error_message=acc.error_message,
             text=acc.rendered(),
         )
@@ -1294,9 +1324,12 @@ async def _apply_frame(
             await self._markers.mark_side_effect(qevent.event_id)
         await self._record_action(frame, acc, qevent, agent_id)
     elif isinstance(frame, ErrorEvent):
+        acc.saw_error_event = True
         if frame.classification:
             acc.classification = failures.map_error_classification(frame.classification)
         acc.error_message = frame.message or acc.error_message
+        if frame.retry_condition is not None:
+            acc.retry_condition = frame.retry_condition
     elif isinstance(frame, Final):
         acc.status = frame.status
         acc.final_text = frame.text
@@ -1412,6 +1445,8 @@ async def _finish(
             status=acc.status,
             tools_called=frozenset(acc.tools_called),
             assistant_text=acc.rendered(),
+            runner_ended=True,
+            retry_condition=acc.retry_condition,
         )
     if acc.status is SessionStatus.AWAITING_APPROVAL:
         # Terminal for this turn, but the placeholder edit is deferred to
@@ -1430,6 +1465,8 @@ async def _finish(
             approval_display=acc.approval_display,
             tools_called=frozenset(acc.tools_called),
             assistant_text=acc.rendered(),
+            runner_ended=True,
+            retry_condition=acc.retry_condition,
         )
     # classified-failure, or the stream ended with no final at all.
     return failures.TurnOutcome(
@@ -1440,6 +1477,10 @@ async def _finish(
         text=acc.rendered(),
         status=acc.status,
         tools_called=frozenset(acc.tools_called),
+        # Only an applied final frame is an observed end; a stream that
+        # closed without one is not.
+        runner_ended=acc.status is not None,
+        retry_condition=acc.retry_condition,
     )
 
 

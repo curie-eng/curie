@@ -307,6 +307,7 @@ _ESCALATION_CAUSES = {
     "server-error": "model_error",
     "model-unreachable": "model_unreachable",
     "budget-exceeded": "budget_exceeded",
+    "runner-error": "runner_error",
     "runner-timeout": "runner_timeout",
     "runner-timeout-unconfirmed": "runner_timeout",
     "sandbox-terminated": "sandbox_terminated",

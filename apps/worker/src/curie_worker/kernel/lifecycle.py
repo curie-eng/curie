@@ -852,6 +852,8 @@ async def _process_event(
                                 cause="runner_escalated",
                                 detail="Factory execution authority is no longer valid.",
                                 ci_fix_round=None,
+                                retry_safety="uncertain",
+                                retry_condition=None,
                             )
                         else:
                             await factory_run.defer(
@@ -1822,6 +1824,16 @@ async def _process_event(
                                 cause="approval_create_failed",
                                 detail=pause.failure_detail,
                                 ci_fix_round=None,
+                                retry_safety=failures.retry_safety(
+                                    outcome,
+                                    marker_flagged=await self._markers.saw_side_effect(event_id),
+                                    own_execute_turn=(
+                                        parsed_work_item is not None
+                                        and parsed_work_item.kind == "execute"
+                                        and run.event_id == event_id
+                                    ),
+                                ),
+                                retry_condition=outcome.retry_condition,
                             )
                         except WorkItemConflict as exc:
                             # work_item_cancelled means what it does in
@@ -1974,6 +1986,17 @@ async def _process_event(
                     # session. The started tracker_result run settles failed
                     # with its classification cause instead.
                     retryable = False
+            if (
+                retryable
+                and not dependency_retry
+                and outcome.classification != "sandbox-capacity"
+                and self._started_execute_run(owned_work_item_id, event_id) is not None
+            ):
+                # ADR 0269: a started factory execute turn is one attempt. The
+                # SQL lifecycle owns its retry as a fresh request, so this loop
+                # settles it failed. A sandbox-capacity refusal opened no
+                # runner turn and keeps this loop's bound on the same request.
+                retryable = False
             if not retryable or (attempt >= self._config.max_attempts and not dependency_retry):
                 if (
                     outcome.classification in {"runner-error", "sandbox-capacity"}
@@ -2152,6 +2175,8 @@ async def _settle_personal_refusal(
                 ),
                 detail=f"The personal execution was refused ({exc.code}).",
                 ci_fix_round=None,
+                retry_safety="uncertain",
+                retry_condition=None,
             )
         else:
             if exc.code not in constants._PERSONAL_REFUSALS_KEEPING_CLAIM:
@@ -2225,6 +2250,8 @@ async def _mint_tracker_result_capability(
                 cause="runner_escalated",
                 detail="The issue read capability for this investigation is unavailable.",
                 ci_fix_round=None,
+                retry_safety="uncertain",
+                retry_condition=None,
             )
         else:
             await run.defer("issue_read_unavailable", capacity=False, start_failure_detail=None)

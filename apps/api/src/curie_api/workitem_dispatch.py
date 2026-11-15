@@ -21,6 +21,7 @@ from curie_api.crud import channels as crud_channels
 from curie_api.workitems import lifecycle
 from curie_api.workitems.lifecycle import (
     ExecutionRequestSnapshot,
+    RetryConditionFact,
     WorkItemConflict,
     WorkItemOutcome,
     WorkItemSnapshot,
@@ -39,6 +40,7 @@ from curie_api.workitems.lifecycle import (
 from .config import Settings, get_settings
 from .factory_notices import start_failed_sentence
 from .factory_reply_target import reply_columns
+from .factory_retry_policy import RetrySafety
 from .factory_tracker_result_runtime import (
     CONTRACT_TRACKER_RESULT,
     IMPLEMENTATION,
@@ -735,6 +737,8 @@ async def claim_due(
             ExecutionRequest.status == "waiting",
             ExecutionRequest.wait_deadline > func.clock_timestamp(),
             ExecutionRequest.dispatch_not_before <= func.clock_timestamp(),
+            # A successor blocked on a typed condition is never dispatched (ADR 0269).
+            ExecutionRequest.blocked_on.is_(None),
             ExecutionRequest.objective.is_not(None),
             ~exists().where(
                 WorkItem.id == ExecutionRequest.work_item_id,
@@ -1921,6 +1925,8 @@ async def finish(
     cause: str,
     detail: str | None,
     ci_fix_round: int | None,
+    retry_safety: RetrySafety,
+    retry_condition: RetryConditionFact | None,
 ) -> WorkItemOutcome | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -1957,6 +1963,8 @@ async def finish(
         detail=detail,
         ci_fix_round=ci_fix_round,
         extra_where=(ExecutionRequest.runtime_epoch == runtime_epoch,),
+        retry_safety=retry_safety,
+        retry_condition=retry_condition,
     )
     if isinstance(result, WorkItemConflict):
         # The conflict path commits and expires this row.

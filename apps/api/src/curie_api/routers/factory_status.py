@@ -45,11 +45,7 @@ from ..models import (
     ThreadPublicationLineage,
     WorkItem,
 )
-from ..workitems.lifecycle import (
-    OWNER_LOST_RETRY_LIMIT,
-    owner_lost_streak,
-    owner_lost_successor_admitted,
-)
+from ..workitems.lifecycle import automatic_successor_of
 
 router = APIRouter(tags=["factory-status"])
 
@@ -191,10 +187,7 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
     retrying = (
         request.status == "failed"
         and terminal == "owner_lost"
-        and 1
-        <= await owner_lost_streak(session, work_item.id, through_sequence=request.sequence)
-        < OWNER_LOST_RETRY_LIMIT
-        and await owner_lost_successor_admitted(session, request)
+        and await automatic_successor_of(session, request) is not None
     )
     body = render_card(
         CardInput(

@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 import httpx
+from aci_protocol import RetryCondition
 from channel_protocol.work_item_events import (
     parse_work_item_event_id as _parse_shared_event_id,
 )
@@ -51,6 +52,10 @@ class WorkItemTransportError(Exception):
 CompletionContract = Literal["implementation", "tracker_result"]
 CONTRACT_IMPLEMENTATION: CompletionContract = "implementation"
 CONTRACT_TRACKER_RESULT: CompletionContract = "tracker_result"
+
+# What the worker observed about a finished turn's effects. The API admits an
+# automatic successor only for ``no_effects``.
+RetrySafety = Literal["no_effects", "flagged", "uncertain"]
 
 
 @dataclass(frozen=True)
@@ -484,6 +489,8 @@ class WorkItemDispatchClient:
         cause: str,
         detail: str | None,
         ci_fix_round: int | None,
+        retry_safety: RetrySafety,
+        retry_condition: RetryCondition | None,
         budget_s: float = DEFAULT_BUDGET_S,
     ) -> None:
         await self._post_settlement(
@@ -494,6 +501,12 @@ class WorkItemDispatchClient:
                 "cause": cause,
                 "detail": detail,
                 "ci_fix_round": ci_fix_round,
+                "retry_safety": retry_safety,
+                "retry_condition": (
+                    retry_condition.model_dump(mode="json")
+                    if retry_condition is not None
+                    else None
+                ),
             },
             budget_s=budget_s,
         )
@@ -858,7 +871,14 @@ class WorkItemRun:
         )
 
     async def finish(
-        self, *, outcome: str, cause: str, detail: str | None, ci_fix_round: int | None
+        self,
+        *,
+        outcome: str,
+        cause: str,
+        detail: str | None,
+        ci_fix_round: int | None,
+        retry_safety: RetrySafety,
+        retry_condition: RetryCondition | None,
     ) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
@@ -869,6 +889,8 @@ class WorkItemRun:
             cause=cause,
             detail=detail,
             ci_fix_round=ci_fix_round,
+            retry_safety=retry_safety,
+            retry_condition=retry_condition,
             budget_s=self._write_budget_s(),
         )
         self.finished = True

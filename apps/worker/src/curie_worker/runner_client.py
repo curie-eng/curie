@@ -33,6 +33,7 @@ from aci_protocol import Event, Final, Interrupt, OutboundEvent, parse_ndjson_li
 from aiohttp.helpers import sentinel
 from curie_telemetry import inject_trace_context, operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
+from pydantic import ValidationError
 
 # The interrupt RPC is a control-plane POST, not a streaming turn (#742, a
 # follow-up to #739): it exists only to hard-stop the live turn, never to carry
@@ -139,6 +140,16 @@ def _valid_turn_epoch(value: str | None) -> bool:
 
 class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
+
+
+class RunnerFrameInvalid(ValueError):
+    """A runner frame of this protocol version did not decode as any event.
+
+    The message names the rule only. The frame may carry provider text, so
+    its content is never copied into the message. It is deliberately not a
+    ``RunnerError``, so existing runner-error handlers keep treating an
+    undecodable frame as they did before.
+    """
 
 
 class FinalAnswerProtocolError(RunnerError):
@@ -337,7 +348,12 @@ class TurnStream:
                 line = raw.decode("utf-8").strip()
                 if not line:
                     continue
-                frame = parse_ndjson_line(line)
+                try:
+                    frame = parse_ndjson_line(line)
+                except ValidationError as exc:
+                    # Version refusals and unparseable JSON are other error
+                    # types and pass through untouched.
+                    raise RunnerFrameInvalid("runner frame failed ACI event validation") from exc
                 if isinstance(frame, Final):
                     self._saw_final = True
                 yield frame

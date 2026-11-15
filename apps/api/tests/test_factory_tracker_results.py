@@ -1770,6 +1770,8 @@ def _finish(triage: _Triage, outcome: str, cause: str) -> Any:
                 cause=cause,
                 detail=None,
                 ci_fix_round=None,
+                retry_safety="uncertain",
+                retry_condition=None,
             )
 
     return triage.client.portal.call(go)

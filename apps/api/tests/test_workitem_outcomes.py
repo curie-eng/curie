@@ -335,6 +335,8 @@ def _finish(request_id: uuid.UUID, epoch: int, outcome: str, cause: str) -> None
             cause=cause,
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert getattr(result, "code", None) is None, result
 
@@ -1085,6 +1087,8 @@ def test_completion_without_a_pull_request_stays_running(
             cause="completed",
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert getattr(result, "code", None) is not None, result
 
@@ -1279,6 +1283,8 @@ def test_pr_opened_after_execution_deadline_binds_and_completes(
             request_id=seeded.request_id,
             expected_work_item_version=work_item_version,
             expected_request_version=request_version,
+            retry_safety=None,
+            retry_condition=None,
         )
         assert isinstance(result, workitems.WorkItemOutcome), result
 

@@ -1718,7 +1718,7 @@ def test_a_continuation_the_runner_refuses_keeps_the_runner_failure(make_harness
             finish = items.finishes[0]
             assert finish["outcome"] == "failed"
             assert finish["cause"] not in {"early_stop", "no_pull_request"}
-            assert finish["cause"] in {"runner_failed", "runner_escalated"}
+            assert finish["cause"] in {"runner_failed", "runner_error"}
 
     asyncio.run(exercise())
 
@@ -1910,7 +1910,7 @@ def test_a_running_or_unreadable_request_continues_as_before(
             ]
             assert any("runner-error" in text for text in escalations), escalations
             assert len(items.finishes) == 1
-            assert items.finishes[0]["cause"] in {"runner_failed", "runner_escalated"}
+            assert items.finishes[0]["cause"] in {"runner_failed", "runner_error"}
         else:
             assert len(opened) == 2
             assert opened[0] == ISSUE_PROMPT

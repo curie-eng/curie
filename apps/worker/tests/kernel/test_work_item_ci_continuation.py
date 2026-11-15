@@ -829,6 +829,8 @@ def test_refused_continuation_finishes_its_epoch_and_valid_neighbor_runs(
                     "cause": "runner_escalated",
                     "detail": "Factory execution authority is no longer valid.",
                     "ci_fix_round": None,
+                    "retry_safety": "uncertain",
+                    "retry_condition": None,
                     "budget_s": 120.0,
                 },
             )]

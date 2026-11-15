@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from aci_protocol import (
     QueuedTurn,
+    RetryCondition,
 )
 
 from ..binding import FactoryWake
@@ -18,6 +19,7 @@ from ..killswitch import KillSwitch
 from ..sandbox.types import SandboxHandle, WorkItemRouteOwner
 from ..threadlock import LockLeaseLost
 from ..workitem_dispatch import (
+    RetrySafety,
     TerminationClaim,
     TerminationObservation,
     WorkItemConflict,
@@ -46,6 +48,8 @@ class _SettlingWorkItem:
     cause: str
     detail: str | None
     ci_fix_round: int | None
+    retry_safety: RetrySafety
+    retry_condition: RetryCondition | None
     task: asyncio.Task[None] | None = None
     cleaned: bool = False
 
@@ -77,13 +81,21 @@ def _begin_settling(
     cause: str,
     detail: str | None,
     ci_fix_round: int | None,
+    retry_safety: RetrySafety,
+    retry_condition: RetryCondition | None,
 ) -> None:
     """Hand off only the report, synchronously retaining ownership (#4174)."""
 
     if run.request_id in self._settling_work_items:
         return
     pending = _SettlingWorkItem(
-        run=run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+        run=run,
+        outcome=outcome,
+        cause=cause,
+        detail=detail,
+        ci_fix_round=ci_fix_round,
+        retry_safety=retry_safety,
+        retry_condition=retry_condition,
     )
     self._settling_work_items[run.request_id] = pending
     if self._work_item_runs.get(run.request_id) is run:
@@ -101,9 +113,18 @@ async def _finish_or_settle(
     cause: str,
     detail: str | None,
     ci_fix_round: int | None,
+    retry_safety: RetrySafety,
+    retry_condition: RetryCondition | None,
 ) -> None:
     try:
-        await run.finish(outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round)
+        await run.finish(
+            outcome=outcome,
+            cause=cause,
+            detail=detail,
+            ci_fix_round=ci_fix_round,
+            retry_safety=retry_safety,
+            retry_condition=retry_condition,
+        )
     except WorkItemConflict as exc:
         if exc.code != "not_running":
             raise
@@ -115,7 +136,13 @@ async def _finish_or_settle(
         _mark_recovery_eligible(run, outcome)
     except WorkItemTransportError:
         self._begin_settling(
-            run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+            run,
+            outcome=outcome,
+            cause=cause,
+            detail=detail,
+            ci_fix_round=ci_fix_round,
+            retry_safety=retry_safety,
+            retry_condition=retry_condition,
         )
     else:
         _mark_recovery_eligible(run, outcome)
@@ -143,6 +170,8 @@ async def _settle_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
                     cause=pending.cause,
                     detail=pending.detail,
                     ci_fix_round=pending.ci_fix_round,
+                    retry_safety=pending.retry_safety,
+                    retry_condition=pending.retry_condition,
                 )
             except WorkItemConflict as exc:
                 if exc.code in {"not_running", "publication_pending"}:
@@ -275,6 +304,27 @@ def _run_for_event(self: Kernel, event_id: str) -> WorkItemRun | None:
     return None
 
 
+def _started_execute_run(
+    self: Kernel, owned_work_item_id: uuid.UUID | None, event_id: str
+) -> WorkItemRun | None:
+    """This delivery's own started run when the turn is its execute wake.
+
+    The SQL lifecycle owns the retry of such a turn, so the in-delivery retry
+    refusal and the undecodable frame conversion ask this one question and
+    cannot drift apart. CI fix and approval resume turns are other event ids.
+    """
+
+    if owned_work_item_id is None:
+        return None
+    run = self._work_item_runs.get(owned_work_item_id)
+    if run is None or run.event_id != event_id or not run.started or run.finished:
+        return None
+    parsed = parse_work_item_event_id(event_id)
+    if parsed is None or parsed.kind != "execute":
+        return None
+    return run
+
+
 def _is_factory_work_item_turn(self: Kernel, event_id: str) -> bool:
     """Whether this turn's requesting chat belongs to a factory execution.
 
@@ -405,6 +455,8 @@ async def _adopt_resumed_work_item(
                 cause="runner_escalated",
                 detail="Factory execution authority is no longer valid.",
                 ci_fix_round=None,
+                retry_safety="uncertain",
+                retry_condition=None,
             )
         except WorkItemConflict as exc:
             logger.info("refused factory continuation finish for %s: %s", event_id, exc.code)

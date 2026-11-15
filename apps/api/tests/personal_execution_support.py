@@ -553,6 +553,8 @@ def finish_failed(request_id: UUID, runtime_epoch: int, *, cause: str = "deadlin
             cause=cause,
             detail=None,
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert isinstance(finished, WorkItemOutcome), finished
         assert finished.request is not None and finished.request.status == "failed"
