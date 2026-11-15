@@ -5606,6 +5606,235 @@ class WorkspaceRecoveryReader(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class PublicationCandidateInstallation(Base):
+    __tablename__ = "publication_candidate_installation"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="publication_candidate_installation_singleton_ck"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, server_default="1")
+
+
+class PublicationCandidateOutcome(Base):
+    __tablename__ = "publication_candidate_outcomes"
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(code) BETWEEN 1 AND 128", name="publication_candidate_outcome_code_ck"
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"), primary_key=True
+    )
+    code: Mapped[str] = mapped_column(String(128))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class PublicationCandidateGroup(Base):
+    __tablename__ = "publication_candidate_groups"
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(repository_provider) BETWEEN 1 AND 256 AND "
+            "char_length(repository_host) BETWEEN 1 AND 256 AND "
+            "char_length(repository_project_id) BETWEEN 1 AND 256 AND "
+            "char_length(repository_path) BETWEEN 1 AND 2048 AND "
+            "char_length(target_branch) BETWEEN 1 AND 1024",
+            name="publication_candidate_group_identity_ck",
+        ),
+        CheckConstraint(
+            "base_commit ~ '^([0-9a-f]{40}|[0-9a-f]{64})$' AND base_sha256 ~ '^[0-9a-f]{64}$'",
+            name="publication_candidate_group_base_ck",
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="RESTRICT"), primary_key=True
+    )
+    repository_provider: Mapped[str] = mapped_column(Text)
+    repository_host: Mapped[str] = mapped_column(Text)
+    repository_project_id: Mapped[str] = mapped_column(Text)
+    repository_path: Mapped[str] = mapped_column(Text)
+    base_commit: Mapped[str] = mapped_column(String(64))
+    target_branch: Mapped[str] = mapped_column(Text)
+    base_sha256: Mapped[str] = mapped_column(String(64))
+
+
+class PublicationCandidate(Base):
+    __tablename__ = "publication_candidates"
+    __table_args__ = (
+        UniqueConstraint("work_item_id", "id", name="publication_candidate_group_id_key"),
+        # A withdrawn capture frees its dedupe key, so a redelivery retains afresh.
+        Index(
+            "publication_candidate_idempotency_key",
+            "origin_request_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("status <> 'tombstoned'"),
+        ),
+        CheckConstraint(
+            "status IN ('staging', 'complete', 'tombstoned')",
+            name="publication_candidate_status_ck",
+        ),
+        CheckConstraint(
+            "runtime_epoch >= 1 AND dispatch_generation >= 1 AND version >= 1",
+            name="publication_candidate_authority_ck",
+        ),
+        CheckConstraint(
+            "char_length(idempotency_key) BETWEEN 1 AND 256",
+            name="publication_candidate_idempotency_length_ck",
+        ),
+        CheckConstraint(
+            "content_sha256 ~ '^[0-9a-f]{64}$'", name="publication_candidate_digest_ck"
+        ),
+        CheckConstraint(
+            "char_length(title) <= 256 AND char_length(body) <= 65536 AND "
+            "CASE WHEN jsonb_typeof(changed_paths) = 'array' "
+            "THEN jsonb_array_length(changed_paths) <= 4096 ELSE false END AND "
+            "octet_length(changed_paths::text) <= 1048576",
+            name="publication_candidate_metadata_ck",
+        ),
+        CheckConstraint(
+            "(status <> 'complete' OR completed_at IS NOT NULL) AND "
+            "(expires_at IS NULL OR completed_at IS NOT NULL)",
+            name="publication_candidate_completion_ck",
+        ),
+        CheckConstraint(
+            "(previous_owner_request_id IS NULL) = (owner_transferred_at IS NULL)",
+            name="publication_candidate_transfer_ck",
+        ),
+        Index(
+            "publication_candidate_one_staging",
+            "work_item_id",
+            unique=True,
+            postgresql_where=text("status = 'staging'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publication_candidate_groups.work_item_id", ondelete="RESTRICT")
+    )
+    origin_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="RESTRICT")
+    )
+    owner_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="RESTRICT")
+    )
+    previous_owner_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="RESTRICT")
+    )
+    owner_transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    runtime_epoch: Mapped[int] = mapped_column(BigInteger)
+    dispatch_generation: Mapped[int] = mapped_column(BigInteger)
+    idempotency_key: Mapped[str] = mapped_column(String(256))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    changed_paths: Mapped[list[str]] = mapped_column(JSONB)
+    contains_workflow_files: Mapped[bool] = mapped_column()
+    title: Mapped[str] = mapped_column(String(256))
+    body: Mapped[str] = mapped_column(Text)
+    includes_base: Mapped[bool] = mapped_column(default=False, server_default="false")
+    version: Mapped[int] = mapped_column(BigInteger, default=1, server_default="1")
+    status: Mapped[str] = mapped_column(String(16), default="staging", server_default="staging")
+    capture_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    staging_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PublicationCandidateObject(Base):
+    __tablename__ = "publication_candidate_objects"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["work_item_id", "candidate_id"],
+            [
+                f"{SCHEMA}.publication_candidates.work_item_id",
+                f"{SCHEMA}.publication_candidates.id",
+            ],
+            name="publication_candidate_object_candidate_fkey",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "kind IN ('base', 'patch') AND ((kind = 'base') = (candidate_id IS NULL))",
+            name="publication_candidate_object_kind_ck",
+        ),
+        CheckConstraint(
+            "size_bytes >= 0 AND sha256 ~ '^[0-9a-f]{64}$'",
+            name="publication_candidate_object_descriptor_ck",
+        ),
+        CheckConstraint(
+            "key LIKE 'publication-candidates/%'", name="publication_candidate_object_key_ck"
+        ),
+        CheckConstraint(
+            "status IN ('staging', 'complete', 'tombstoned', 'claimed')",
+            name="publication_candidate_object_status_ck",
+        ),
+        CheckConstraint(
+            "version >= 0 AND ((status = 'claimed' AND claim_id IS NOT NULL "
+            "AND collector_id IS NOT NULL AND claimed_until IS NOT NULL) OR "
+            "(status <> 'claimed' AND claim_id IS NULL AND collector_id IS NULL "
+            "AND claimed_until IS NULL))",
+            name="publication_candidate_object_claim_ck",
+        ),
+        UniqueConstraint(
+            "candidate_id", "kind", name="publication_candidate_object_candidate_kind_key"
+        ),
+        Index(
+            "publication_candidate_object_one_base",
+            "work_item_id",
+            unique=True,
+            # One live base; a withdrawn base awaits collection beside its successor.
+            postgresql_where=text("kind = 'base' AND status IN ('staging', 'complete')"),
+        ),
+        Index("publication_candidate_object_group", "work_item_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publication_candidate_groups.work_item_id", ondelete="RESTRICT")
+    )
+    candidate_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    kind: Mapped[str] = mapped_column(String(16))
+    key: Mapped[str] = mapped_column(String(512), unique=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="staging", server_default="staging")
+    staging_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    collector_id: Mapped[str | None] = mapped_column(String(256))
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
+
+class PublicationCandidateReader(Base):
+    __tablename__ = "publication_candidate_readers"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["work_item_id", "candidate_id"],
+            [
+                f"{SCHEMA}.publication_candidates.work_item_id",
+                f"{SCHEMA}.publication_candidates.id",
+            ],
+            name="publication_candidate_reader_candidate_fkey",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "work_item_id",
+            "candidate_id",
+            "holder_id",
+            name="publication_candidate_reader_holder_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publication_candidate_groups.work_item_id", ondelete="RESTRICT")
+    )
+    candidate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    holder_id: Mapped[str] = mapped_column(String(256))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class FactoryFactObservation(Base):
     __tablename__ = "factory_fact_observations"
     __table_args__ = (

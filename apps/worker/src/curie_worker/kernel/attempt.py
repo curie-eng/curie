@@ -60,6 +60,7 @@ from ..runner_client import (
     RunnerFrameInvalid,
     RunnerSnapshotReadError,
     RunnerStreamTimeout,
+    RunnerWorkspaceSnapshot,
     TurnStream,
 )
 from ..sandbox.quota import capacity_rejection_is_valid
@@ -80,6 +81,7 @@ from ..turn_progress import (
 from ..ui_evidence import capture_ui_evidence
 from ..workitem_dispatch import (
     WorkItemConflict,
+    WorkItemRun,
     parse_work_item_event_id,
 )
 from ..workspace import (
@@ -107,6 +109,11 @@ from . import (
     workspace,
 )
 from .log import logger
+
+# The publication candidate capture's ceiling (#5428), inside the snapshot budget.
+_CANDIDATE_CAPTURE_BUDGET_S = 60.0
+# Time kept back for validation, UI evidence and admission after a capture.
+_CANDIDATE_VALIDATION_RESERVE_S = 30.0
 
 # Tests replace these so the 10 s termination window does not wait on the wall clock.
 _pod_termination_clock = time.monotonic
@@ -988,21 +995,16 @@ async def _attempt_turn(
                 )
             else:
                 try:
-                    if self._workspace is None:
-                        raise WorkspacePreparationError(
-                            "publication-validation",
-                            "managed workspace coordinator is unavailable",
-                        )
-                    await asyncio.to_thread(
-                        validate_snapshot_against_base,
-                        self._workspace,
-                        thread_key=thread_key,
-                        snapshot=snapshot,
-                        max_patch_bytes=self._config.publication_patch_max_bytes,
-                        scratch_root=Path(self._config.workspace_scratch_root),
-                        git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
-                        protected_paths=self._config.publication_protected_paths,
-                        allow_dependency_additions=self._config.publication_allow_dependency_additions,
+                    await self._retain_and_validate_publication_snapshot(
+                        qevent,
+                        thread_key,
+                        snapshot,
+                        owned_run,
+                        (
+                            None
+                            if snapshot_budget_s is None
+                            else snapshot_budget_s - (clock.time.monotonic() - snapshot_started)
+                        ),
                     )
                     outcome.publication_snapshot = snapshot
                     outcome.ui_evidence = await capture_ui_evidence(
@@ -1030,6 +1032,99 @@ async def _attempt_turn(
         progress_plan = constants._TURN_PROGRESS.get()
         if progress_plan is not None and self._progress is not None:
             await deactivate_turn_progress(self._progress, progress_plan)
+
+
+async def _retain_and_validate_publication_snapshot(
+    self: Kernel,
+    qevent: QueuedTurn,
+    thread_key: str,
+    snapshot: RunnerWorkspaceSnapshot,
+    run: WorkItemRun | None,
+    remaining_s: float | None,
+) -> None:
+    """Retain the snapshot as a private candidate, then validate it (#5428).
+
+    The capture runs first, and only for the owned, started WorkItem run of
+    this exact event with a runtime epoch, so finished work survives a failed
+    validation or admission. What is left is the delivery budget bounded by the
+    run's execution deadline. The capture's budget is min(60 s, half of what is
+    left beyond a 30 s reserve for validation, UI evidence and admission and the
+    capture's own failure-report allowance), and it is skipped when that is
+    under 5 s. The budget clock starts before the claim read, so the claim read
+    and the capture share it. It never raises except on cancellation and never
+    changes the outcome: validation then runs exactly as it would without it,
+    and its errors propagate unchanged.
+    """
+
+    capture = self._publication_candidates
+    if (
+        capture is not None
+        and self._workspace is not None
+        and run is not None
+        and run.event_id == qevent.event_id
+        and run.started
+        and not run.finished
+        and run.runtime_epoch is not None
+    ):
+        # Validation, UI evidence and admission keep the larger share of what is
+        # left before the delivery budget or the execution deadline, whichever
+        # comes first: the capture takes at most half of the time beyond a
+        # reserve for them and its own failure report, and is skipped rather
+        # than squeezed below a useful minimum.
+        started = clock.time.monotonic()
+        left_s = run.bound_remaining_s(remaining_s)
+        budget_s = (
+            _CANDIDATE_CAPTURE_BUDGET_S
+            if left_s is None
+            else min(
+                _CANDIDATE_CAPTURE_BUDGET_S,
+                (left_s - _CANDIDATE_VALIDATION_RESERVE_S - capture.outcome_allowance_seconds) / 2,
+            )
+        )
+        if budget_s < constants._MIN_ATTEMPT_BUDGET_S:
+            logger.warning(
+                "publication candidate capture skipped for %s: %s s left is too little",
+                qevent.event_id,
+                "unbounded" if left_s is None else f"{left_s:.1f}",
+            )
+        else:
+            stage = "claim read"
+            try:
+                prepared = await asyncio.wait_for(
+                    asyncio.to_thread(self._workspace.current, thread_key), budget_s
+                )
+                if prepared is not None:
+                    stage = "capture"
+                    await capture.capture(
+                        run,
+                        snapshot,
+                        prepared,
+                        dedupe_key=qevent.event_id,
+                        budget_seconds=budget_s - (clock.time.monotonic() - started),
+                    )
+            except Exception:  # noqa: BLE001 - a capture fault never changes the outcome
+                logger.warning(
+                    "publication candidate capture skipped for %s: %s failed",
+                    qevent.event_id,
+                    stage,
+                    exc_info=True,
+                )
+    if self._workspace is None:
+        raise WorkspacePreparationError(
+            "publication-validation",
+            "managed workspace coordinator is unavailable",
+        )
+    await asyncio.to_thread(
+        validate_snapshot_against_base,
+        self._workspace,
+        thread_key=thread_key,
+        snapshot=snapshot,
+        max_patch_bytes=self._config.publication_patch_max_bytes,
+        scratch_root=Path(self._config.workspace_scratch_root),
+        git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
+        protected_paths=self._config.publication_protected_paths,
+        allow_dependency_additions=self._config.publication_allow_dependency_additions,
+    )
 
 
 async def _require_tool_access(

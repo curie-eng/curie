@@ -1501,6 +1501,15 @@
           "/v1/internal/workspace-recovery/release-reader",
           "/v1/internal/workspace-recovery/claim-collection",
           "/v1/internal/workspace-recovery/finalize-collection",
+          "/v1/internal/publication-candidates/context",
+          "/v1/internal/publication-candidates/outcome",
+          "/v1/internal/publication-candidates/reserve",
+          "/v1/internal/publication-candidates/complete",
+          "/v1/internal/publication-candidates/fail",
+          "/v1/internal/publication-candidates/acquire-reader",
+          "/v1/internal/publication-candidates/release-reader",
+          "/v1/internal/publication-candidates/claim-collection",
+          "/v1/internal/publication-candidates/finalize-collection",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -1546,6 +1555,7 @@
           "/work-items/tracker-result",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
+          "/work-items/{work_item_id}/publication-candidates",
           "/work-items/{work_item_id}/recovery",
           "/work-items/{work_item_id}/recovery/{checkpoint_id}",
           "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",
@@ -1572,7 +1582,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9280
+      "cardinality_bound": 9680
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1767,6 +1777,15 @@
           "/v1/internal/workspace-recovery/release-reader",
           "/v1/internal/workspace-recovery/claim-collection",
           "/v1/internal/workspace-recovery/finalize-collection",
+          "/v1/internal/publication-candidates/context",
+          "/v1/internal/publication-candidates/outcome",
+          "/v1/internal/publication-candidates/reserve",
+          "/v1/internal/publication-candidates/complete",
+          "/v1/internal/publication-candidates/fail",
+          "/v1/internal/publication-candidates/acquire-reader",
+          "/v1/internal/publication-candidates/release-reader",
+          "/v1/internal/publication-candidates/claim-collection",
+          "/v1/internal/publication-candidates/finalize-collection",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -1812,6 +1831,7 @@
           "/work-items/tracker-result",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
+          "/work-items/{work_item_id}/publication-candidates",
           "/work-items/{work_item_id}/recovery",
           "/work-items/{work_item_id}/recovery/{checkpoint_id}",
           "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",
@@ -1838,7 +1858,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9280
+      "cardinality_bound": 9680
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -2033,6 +2053,15 @@
           "/v1/internal/workspace-recovery/release-reader",
           "/v1/internal/workspace-recovery/claim-collection",
           "/v1/internal/workspace-recovery/finalize-collection",
+          "/v1/internal/publication-candidates/context",
+          "/v1/internal/publication-candidates/outcome",
+          "/v1/internal/publication-candidates/reserve",
+          "/v1/internal/publication-candidates/complete",
+          "/v1/internal/publication-candidates/fail",
+          "/v1/internal/publication-candidates/acquire-reader",
+          "/v1/internal/publication-candidates/release-reader",
+          "/v1/internal/publication-candidates/claim-collection",
+          "/v1/internal/publication-candidates/finalize-collection",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -2078,6 +2107,7 @@
           "/work-items/tracker-result",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
+          "/work-items/{work_item_id}/publication-candidates",
           "/work-items/{work_item_id}/recovery",
           "/work-items/{work_item_id}/recovery/{checkpoint_id}",
           "/work-items/{work_item_id}/recovery/{checkpoint_id}/objects/{kind}",
@@ -2097,7 +2127,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1856
+      "cardinality_bound": 1936
     },
     "curie.background.loop": {
       "type": "counter",

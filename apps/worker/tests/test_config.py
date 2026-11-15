@@ -1916,3 +1916,83 @@ def test_disabled_recovery_keeps_every_existing_configuration_valid(
     monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", token)
     monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", workspace)
     assert WorkerConfig().workspace_recovery_enabled is False
+
+
+# --- publication candidate capture prerequisites (#5428) -------------------------
+
+
+def test_candidate_capture_refuses_to_start_without_the_internal_worker_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The capture's ledger calls authenticate with the worker token, so none is a refusal."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_CANDIDATES_ENABLED", "true")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", "")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert "CURIE_PUBLICATION_CANDIDATES_ENABLED requires CURIE_INTERNAL_WORKER_TOKEN" in str(
+        exc_info.value
+    )
+
+
+def test_candidate_capture_refuses_to_start_without_managed_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate retains the claim's trusted base, which only managed workspaces have."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_CANDIDATES_ENABLED", "true")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", "candidate-worker-token")
+    monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", "false")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert "CURIE_PUBLICATION_CANDIDATES_ENABLED requires CURIE_WORKSPACE_ENABLED" in str(
+        exc_info.value
+    )
+
+
+def test_candidate_capture_starts_with_its_token_and_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Liveness for the two refusals above: the complete configuration is accepted."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_CANDIDATES_ENABLED", "true")
+    monkeypatch.setenv("CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S", "12.5")
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", "candidate-worker-token")
+    monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", "true")
+    config = WorkerConfig()
+    assert config.publication_candidates_enabled is True
+    assert config.publication_candidates_collect_interval_s == 12.5
+    assert config.workspace_recovery_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("token", "workspace"),
+    [("", "false"), ("", "true"), ("candidate-worker-token", "false")],
+    ids=["neither", "no-token", "no-workspace"],
+)
+def test_disabled_candidates_keep_every_existing_configuration_valid(
+    monkeypatch: pytest.MonkeyPatch, token: str, workspace: str
+) -> None:
+    """The refusals bind only when candidates are on; off (the default), nothing is required."""
+
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", token)
+    monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", workspace)
+    config = WorkerConfig()
+    assert config.publication_candidates_enabled is False
+    assert config.publication_candidates_collect_interval_s == 30.0
+
+
+def test_candidate_collect_interval_must_be_positive(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S", "0")
+    with pytest.raises(ValidationError) as exc_info:
+        WorkerConfig()
+    assert any(
+        error["loc"] == ("CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S",)
+        and error["type"] == "greater_than"
+        for error in exc_info.value.errors()
+    )

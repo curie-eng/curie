@@ -187,6 +187,14 @@ class Settings(BaseSettings):
     workspace_max_archive_bytes: int = Field(
         default=268435456, gt=0, validation_alias="CURIE_WORKSPACE_MAX_ARCHIVE_BYTES"
     )
+    # Private publication candidates (#5428): off by default. A disabled ledger
+    # refuses new captures and readers but still drains through collection.
+    publication_candidates_enabled: bool = Field(
+        default=False, validation_alias="CURIE_PUBLICATION_CANDIDATES_ENABLED"
+    )
+    publication_candidate_max_bytes: int = Field(
+        default=1073741824, gt=0, validation_alias="CURIE_PUBLICATION_CANDIDATE_MAX_BYTES"
+    )
 
     @model_validator(mode="after")
     def _validate_workspace_recovery(self) -> "Settings":

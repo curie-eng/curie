@@ -3670,6 +3670,159 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/publication-candidates/acquire-reader": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acquire Reader */
+        post: operations["acquire_reader_v1_internal_publication_candidates_acquire_reader_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/claim-collection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Claim Collection */
+        post: operations["claim_collection_v1_internal_publication_candidates_claim_collection_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Complete */
+        post: operations["complete_v1_internal_publication_candidates_complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Context */
+        post: operations["context_v1_internal_publication_candidates_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/fail": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fail */
+        post: operations["fail_v1_internal_publication_candidates_fail_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/finalize-collection": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Finalize Collection */
+        post: operations["finalize_collection_v1_internal_publication_candidates_finalize_collection_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Outcome */
+        post: operations["outcome_v1_internal_publication_candidates_outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/release-reader": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Release Reader */
+        post: operations["release_reader_v1_internal_publication_candidates_release_reader_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publication-candidates/reserve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reserve */
+        post: operations["reserve_v1_internal_publication_candidates_reserve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/publications": {
         parameters: {
             query?: never;
@@ -4728,6 +4881,23 @@ export interface paths {
         };
         /** Get Work Item */
         get: operations["get_work_item_work_items__work_item_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/work-items/{work_item_id}/publication-candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Candidates */
+        get: operations["list_candidates_work_items__work_item_id__publication_candidates_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -6629,6 +6799,437 @@ export interface components {
         CancelBody: {
             /** Expected Version */
             expected_version: number;
+        };
+        /** CandidateAcknowledged */
+        CandidateAcknowledged: {
+            /**
+             * Released
+             * @default true
+             */
+            released?: boolean;
+        };
+        /** CandidateAcquireReader */
+        CandidateAcquireReader: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Holder Id */
+            holder_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateCaptureAuthority */
+        CandidateCaptureAuthority: {
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateCaptureContext */
+        CandidateCaptureContext: {
+            /** Base Commit */
+            base_commit: string;
+            repository: components["schemas"]["CandidateRepository"];
+            /** Target Branch */
+            target_branch: string;
+        };
+        /** CandidateCaptureFailure */
+        CandidateCaptureFailure: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /**
+             * Status
+             * @default tombstoned
+             * @constant
+             */
+            status?: "tombstoned";
+        };
+        /** CandidateClaimCollection */
+        CandidateClaimCollection: {
+            /** Collector Id */
+            collector_id: string;
+            /**
+             * Limit
+             * @default 100
+             */
+            limit?: number;
+        };
+        /** CandidateCollectionClaim */
+        CandidateCollectionClaim: {
+            /**
+             * Claim Id
+             * Format: uuid
+             */
+            claim_id: string;
+            /**
+             * Claimed Until
+             * Format: date-time
+             */
+            claimed_until: string;
+            /** Key */
+            key: string;
+            /**
+             * Object Id
+             * Format: uuid
+             */
+            object_id: string;
+            /** Version */
+            version: number;
+        };
+        /** CandidateCollectionClaims */
+        CandidateCollectionClaims: {
+            /** Claims */
+            claims: components["schemas"]["CandidateCollectionClaim"][];
+        };
+        /** CandidateComplete */
+        CandidateComplete: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /** Receipts */
+            receipts: components["schemas"]["CandidateObjectReceipt"][];
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateCompletion */
+        CandidateCompletion: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /**
+             * Completed At
+             * Format: date-time
+             */
+            completed_at: string;
+            /**
+             * Status
+             * @default complete
+             * @constant
+             */
+            status?: "complete";
+        };
+        /** CandidateFail */
+        CandidateFail: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "upload_failed" | "capture_failed" | "capture_timeout";
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateFinalizeCollection */
+        CandidateFinalizeCollection: {
+            /**
+             * Claim Id
+             * Format: uuid
+             */
+            claim_id: string;
+            /** Collector Id */
+            collector_id: string;
+            /**
+             * Object Id
+             * Format: uuid
+             */
+            object_id: string;
+            /** Version */
+            version: number;
+        };
+        /** CandidateFinalized */
+        CandidateFinalized: {
+            /**
+             * Finalized
+             * @default true
+             */
+            finalized?: boolean;
+        };
+        /** CandidateObjectDeclaration */
+        CandidateObjectDeclaration: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "base" | "patch";
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** CandidateObjectReceipt */
+        CandidateObjectReceipt: {
+            /** Key */
+            key: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "base" | "patch";
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** CandidateOutcome */
+        CandidateOutcome: {
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "capture_timeout" | "capture_failed" | "base_unavailable" | "base_digest_mismatch" | "base_mismatch" | "ledger_unavailable" | "upload_failed" | "patch_too_large";
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidateOutcomeRecorded */
+        CandidateOutcomeRecorded: {
+            /** Recorded */
+            recorded: boolean;
+        };
+        /** CandidatePublic */
+        CandidatePublic: {
+            /** Available */
+            available: boolean;
+            base: components["schemas"]["CandidatePublicBase"] | null;
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /** Changed Path Count */
+            changed_path_count: number;
+            /** Completed At */
+            completed_at: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Expires At */
+            expires_at: string | null;
+            /** Final Disposition At */
+            final_disposition_at: string | null;
+            /**
+             * Origin Request Id
+             * Format: uuid
+             */
+            origin_request_id: string;
+            /**
+             * Owner Request Id
+             * Format: uuid
+             */
+            owner_request_id: string;
+            /** Owner Transferred At */
+            owner_transferred_at: string | null;
+            patch: components["schemas"]["CandidatePublicPatch"] | null;
+            /** Previous Owner Request Id */
+            previous_owner_request_id: string | null;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "staging" | "complete" | "tombstoned";
+        };
+        /** CandidatePublicBase */
+        CandidatePublicBase: {
+            /** Base Commit */
+            base_commit: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** CandidatePublicList */
+        CandidatePublicList: {
+            /** Candidates */
+            candidates: components["schemas"]["CandidatePublic"][];
+            /** Capture Outcome */
+            capture_outcome: string | null;
+            /** Capture Outcome At */
+            capture_outcome_at: string | null;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+        };
+        /** CandidatePublicPatch */
+        CandidatePublicPatch: {
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+        };
+        /** CandidateReader */
+        CandidateReader: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Holder Id */
+            holder_id: string;
+            /**
+             * Lease Id
+             * Format: uuid
+             */
+            lease_id: string;
+            /** Objects */
+            objects: components["schemas"]["CandidateObjectReceipt"][];
+        };
+        /** CandidateReleaseReader */
+        CandidateReleaseReader: {
+            /** Holder Id */
+            holder_id: string;
+            /**
+             * Lease Id
+             * Format: uuid
+             */
+            lease_id: string;
+        };
+        /** CandidateRepository */
+        CandidateRepository: {
+            /** Host */
+            host: string;
+            /** Path */
+            path: string;
+            /** Project Id */
+            project_id: string;
+            /** Provider */
+            provider: string;
+        };
+        /** CandidateReservation */
+        CandidateReservation: {
+            /**
+             * Candidate Id
+             * Format: uuid
+             */
+            candidate_id: string;
+            /**
+             * Capture Deadline
+             * Format: date-time
+             */
+            capture_deadline: string;
+            /** Objects */
+            objects: components["schemas"]["CandidateObjectReceipt"][];
+            /** Replayed */
+            replayed: boolean;
+            /**
+             * Staging Expires At
+             * Format: date-time
+             */
+            staging_expires_at: string;
+        };
+        /** CandidateReserve */
+        CandidateReserve: {
+            /** Base Archive Limit Bytes */
+            base_archive_limit_bytes: number;
+            /** Base Commit */
+            base_commit: string;
+            /** Body */
+            body: string;
+            /**
+             * Capture Budget Seconds
+             * @default 60
+             */
+            capture_budget_seconds?: number;
+            /** Changed Paths */
+            changed_paths: string[];
+            /** Contains Workflow Files */
+            contains_workflow_files: boolean;
+            /** Dedupe Key */
+            dedupe_key: string;
+            /** Dispatch Generation */
+            dispatch_generation: number;
+            /** Objects */
+            objects: components["schemas"]["CandidateObjectDeclaration"][];
+            /** Patch Limit Bytes */
+            patch_limit_bytes: number;
+            repository: components["schemas"]["CandidateRepository"];
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+            /** Target Branch */
+            target_branch: string;
+            /** Title */
+            title: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
         };
         /**
          * CanvasCell
@@ -21087,6 +21688,321 @@ export interface operations {
             };
         };
     };
+    acquire_reader_v1_internal_publication_candidates_acquire_reader_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateAcquireReader"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateReader"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    claim_collection_v1_internal_publication_candidates_claim_collection_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateClaimCollection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateCollectionClaims"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    complete_v1_internal_publication_candidates_complete_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateComplete"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateCompletion"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    context_v1_internal_publication_candidates_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateCaptureAuthority"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateCaptureContext"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    fail_v1_internal_publication_candidates_fail_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateFail"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateCaptureFailure"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    finalize_collection_v1_internal_publication_candidates_finalize_collection_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateFinalizeCollection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateFinalized"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    outcome_v1_internal_publication_candidates_outcome_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateOutcome"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateOutcomeRecorded"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    release_reader_v1_internal_publication_candidates_release_reader_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateReleaseReader"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateAcknowledged"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reserve_v1_internal_publication_candidates_reserve_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CandidateReserve"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidateReservation"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     create_publication_v1_internal_publications_post: {
         parameters: {
             query?: never;
@@ -23196,6 +24112,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkItemOutcomeOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_candidates_work_items__work_item_id__publication_candidates_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CandidatePublicList"];
                 };
             };
             /** @description Validation Error */

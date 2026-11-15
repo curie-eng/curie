@@ -2679,6 +2679,27 @@ true
 {{- $cap | int64 -}}
 {{- end -}}
 
+{{/* Publication candidates (#5428): the API and worker share these checks. */}}
+{{- define "curie.publicationCandidatesEnabled" -}}
+{{- $candidates := dig "workspace" "publicationCandidates" dict (.Values.worker | default dict) -}}
+{{- if get $candidates "enabled" -}}
+{{- if not (dig "runner" "workspace" "enabled" false (.Values.agentSandbox | default dict)) -}}
+{{- fail "worker.workspace.publicationCandidates.enabled needs agentSandbox.runner.workspace.enabled (#5428)" -}}
+{{- end -}}
+{{- $_ := include "curie.publicationCandidateMaxBytes" . -}}
+true
+{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{- define "curie.publicationCandidateMaxBytes" -}}
+{{- $candidates := dig "workspace" "publicationCandidates" dict (.Values.worker | default dict) -}}
+{{- $cap := get $candidates "maxBytes" -}}
+{{- $bad := "worker.workspace.publicationCandidates.maxBytes must be a positive integer (#5428)" -}}
+{{- if not (or (kindIs "float64" $cap) (kindIs "int64" $cap) (kindIs "int" $cap)) -}}{{- fail $bad -}}{{- end -}}
+{{- if or (le (float64 $cap) 0.0) (ne (float64 $cap) (floor (float64 $cap))) -}}{{- fail $bad -}}{{- end -}}
+{{- $cap | int64 -}}
+{{- end -}}
+
 {{/* Code host trust (ADR 0197): renders nothing when no ConfigMap is named. */}}
 {{- define "curie.codeHostTrust.name" -}}
 {{- dig "caBundle" "configMapRef" "name" "" (.Values.codeHostTrust | default dict) -}}
