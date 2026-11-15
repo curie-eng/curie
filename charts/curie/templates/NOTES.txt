@@ -135,6 +135,22 @@ Sandbox resource envelopes (request/limit; volume sizeLimits; agentSandbox.resou
 {{- range $differingEnvs }}
   - agent {{ .agent }} (profile {{ .env.profile }}): {{ include "curie.sandboxEnvelope.summary" (dict "root" $ "env" .env) }}
 {{- end }}
+{{- if .Values.resourceQuota.enabled }}
+{{- $quotaProfiles := .Values.agentSandbox.resourceProfiles | default dict }}
+{{- $standardRequestMemory := dig "standard" "resources" "requests" "memory" "" $quotaProfiles }}
+{{- $factoryRequestMemory := dig "factory" "resources" "requests" "memory" "" $quotaProfiles }}
+{{- $quotaRequestMemory := .Values.resourceQuota.hard.requestsMemory }}
+{{- $quotaBytes := include "curie.capacity.memBytes" $quotaRequestMemory | int64 }}
+{{- $factoryBytes := include "curie.capacity.memBytes" $factoryRequestMemory | int64 }}
+{{- $standardBytes := include "curie.capacity.memBytes" $standardRequestMemory | int64 }}
+{{- $factorySandboxCount := 0 }}
+{{- $standardRemainderCount := 0 }}
+{{- if and (gt $factoryBytes 0) (gt $standardBytes 0) }}
+{{- $factorySandboxCount = div $quotaBytes $factoryBytes }}
+{{- $standardRemainderCount = div (sub $quotaBytes (mul $factorySandboxCount $factoryBytes)) $standardBytes }}
+{{- end }}
+Sandbox request memory headroom: resourceQuota.hard.requestsMemory is {{ $quotaRequestMemory }}. The factory profile requests {{ $factoryRequestMemory }} and the standard profile requests {{ $standardRequestMemory }}. Integer division: factory sandboxes {{ $factorySandboxCount }}, standard sandboxes in the remainder {{ $standardRemainderCount }}.
+{{- end }}
 {{- if and .Values.resourceQuota.enabled (ne (toString .Values.resourceQuota.capacityReport) "false") }}
 {{- /* capacity-report-guard: every Node/Pod lookup stays inside this block.
      Empty under helm template / --dry-run: print nothing (#2949). */}}

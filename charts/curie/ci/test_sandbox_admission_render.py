@@ -10,6 +10,9 @@ from typing import Any
 import pytest
 import yaml
 from curie_worker.run import _substrate_config
+from curie_worker.sandbox.quota import admission_quota_headroom
+from curie_worker.sandbox.resources import pod_resources
+from curie_worker.sandbox.types import AdmissionConfig, QuotaStatus
 
 CHART = Path(__file__).resolve().parents[1]
 ENV = "CURIE_SANDBOX_ADMISSION"
@@ -435,3 +438,90 @@ def test_worker_reads_only_the_selected_runtime_class(tmp_path: Path) -> None:
         },
     )
     assert_worker_cluster_reads(docs, runtime_class="acme-runtime")
+
+
+def _default_templates(tmp_path: Path) -> list[dict[str, Any]]:
+    """Chart defaults, plus one agent opted into the factory profile.
+
+    The opt-in does not change resourceQuota.hard. It only renders a second
+    SandboxTemplate so the test can read both envelopes.
+    """
+
+    completed = subprocess.run(
+        [
+            "helm",
+            "template",
+            "curie",
+            str(CHART),
+            "--namespace",
+            "curie",
+            "--kube-version",
+            "1.31.0",
+            "--output-dir",
+            str(tmp_path),
+            "--set",
+            "agentSandbox.agentResourceProfiles.acme-factory=factory",
+            "--set",
+            "resourceQuota.capacityReport=false",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return [
+        doc
+        for path in sorted(tmp_path.rglob("*.yaml"))
+        for doc in yaml.safe_load_all(path.read_text())
+        if isinstance(doc, dict)
+    ]
+
+
+def _sandbox_pod(docs: list[dict[str, Any]], agent: str | None) -> dict[str, Any]:
+    matched: list[dict[str, Any]] = []
+    for doc in docs:
+        if doc.get("kind") != "SandboxTemplate":
+            continue
+        labels = doc["spec"]["podTemplate"]["metadata"].get("labels") or {}
+        found = labels.get("curietech.ai/agent")
+        if (agent is None and found is None) or found == agent:
+            matched.append(doc["spec"]["podTemplate"]["spec"])
+    assert len(matched) == 1, f"expected one sandbox pod for agent {agent!r}"
+    return matched[0]
+
+
+def test_default_quota_admits_one_factory_sandbox_beside_a_standard_sandbox(
+    tmp_path: Path,
+) -> None:
+    docs = _default_templates(tmp_path)
+    entries = [entry for entry in worker_env(docs) if entry["name"] == ENV]
+    assert len(entries) == 1
+    quota = next(doc for doc in docs if doc.get("kind") == "ResourceQuota")
+    contract = json.loads(entries[0]["value"])
+    assert contract["hard"] == quota["spec"]["hard"]
+    assert contract["hard"]["requests.memory"] == "10Gi"
+    assert contract["hard"]["limits.memory"] == "16Gi"
+    assert contract["hard"]["limits.cpu"] == "8"
+    standard = pod_resources(_sandbox_pod(docs, None))
+    factory = pod_resources(_sandbox_pod(docs, "acme-factory"))
+    assert set(standard) == set(factory) == set(contract["hard"])
+    config = AdmissionConfig(
+        quota_name=contract["quota_name"],
+        priority_class=contract["priority_class"],
+        ceiling=contract["ceiling"],
+        hard=contract["hard"],
+    )
+    namespace = quota["metadata"].get("namespace", "curie")
+
+    def counted(used: dict[str, str]) -> QuotaStatus:
+        return QuotaStatus(
+            name=contract["quota_name"],
+            namespace=namespace,
+            spec_hard=contract["hard"],
+            status_hard=contract["hard"],
+            status_used=used,
+        )
+
+    assert admission_quota_headroom(config, namespace, factory, counted(standard))
+    assert not admission_quota_headroom(config, namespace, factory, counted(factory))

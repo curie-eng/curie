@@ -522,8 +522,9 @@ ephemeral-storage limit also caps their combined use, so a pod is evicted if any
 one volume passes its ceiling or the total passes 20Gi. The home volume holds
 the default uv, Cargo and pnpm caches; a run can instead put them under
 `/workspace`. Each factory sandbox requests 8Gi of memory, so the default
-`resourceQuota.hard.requestsMemory` of `8Gi` admits one at a time; raise
-`resourceQuota.hard.*` for concurrency. Sandboxes created before an upgrade keep
+`resourceQuota.hard.requestsMemory` of `10Gi` admits one at a time and leaves
+room for standard sandboxes beside it. A second factory sandbox does not fit.
+Raise `resourceQuota.hard.requestsMemory` for factory concurrency. Sandboxes created before an upgrade keep
 the limits they started with.
 
 To change one field, override it on the profile in your Helm values. For
