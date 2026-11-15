@@ -13,8 +13,9 @@ such a block only on a fresh Valkey observation of the current scope (see
    scope's probe lease, reads OpenRouter GET /api/v1/key once and records the
    reading.
 
-The credential, the response body and the amounts are never logged, stored or
-returned. Only the provider name and the reading's outcome are logged.
+The credential and the response body are never logged or stored. The ledger
+keeps only the reading's outcome, ``limit`` and ``limit_remaining``, and only
+the provider name and the outcome are logged.
 """
 
 from __future__ import annotations
