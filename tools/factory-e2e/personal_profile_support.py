@@ -25,6 +25,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -344,21 +345,32 @@ class ChannelScan:
 
 
 class TokenScan:
-    """Counts per channel; records booleans and counts only."""
+    """Counts per channel; records booleans and counts only.
+
+    Scans run on several threads at once (one per followed container log), so
+    every update holds ``_lock``, and a hit only ever sets
+    ``token_bytes_found``: a concurrent miss never writes it back to False.
+    """
 
     def __init__(self, scrubber: Scrubber, channels: Sequence[str] = ()) -> None:
         self.scrubber = scrubber
         self.channels: dict[str, ChannelScan] = {name: ChannelScan() for name in channels}
         self._tails: dict[tuple[str, str], bytes] = {}
+        self._lock = threading.Lock()
 
     def __repr__(self) -> str:
         return "<token scan>"
 
+    def _count(self, channel: str, size: int, hit: bool) -> None:
+        with self._lock:
+            entry = self.channels.setdefault(channel, ChannelScan())
+            entry.scanned_bytes += size
+            if hit:
+                entry.token_bytes_found = True
+
     def scan(self, channel: str, data: bytes) -> bool:
-        entry = self.channels.setdefault(channel, ChannelScan())
-        entry.scanned_bytes += len(data)
         hit = self.scrubber.found(data)
-        entry.token_bytes_found |= hit
+        self._count(channel, len(data), hit)
         return hit
 
     def scan_stream(self, channel: str, key: str, data: bytes) -> bool:
@@ -368,13 +380,13 @@ class TokenScan:
         is scanned again with this chunk; only new bytes are counted.
         """
 
-        entry = self.channels.setdefault(channel, ChannelScan())
-        entry.scanned_bytes += len(data)
-        joined = self._tails.get((channel, key), b"") + data
+        with self._lock:
+            joined = self._tails.get((channel, key), b"") + data
         hit = self.scrubber.found(joined)
-        entry.token_bytes_found |= hit
         keep = max(0, self.scrubber.longest() - 1)
-        self._tails[(channel, key)] = joined[-keep:] if keep else b""
+        with self._lock:
+            self._tails[(channel, key)] = joined[-keep:] if keep else b""
+        self._count(channel, len(data), hit)
         return hit
 
     def as_json(self) -> dict[str, Any]:

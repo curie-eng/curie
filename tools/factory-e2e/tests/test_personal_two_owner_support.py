@@ -4361,3 +4361,66 @@ def test_a_zero_cost_ledger_runs_the_real_checks_and_never_passes(tmp_path: Path
     assert pto.judge(plain, "owners")["checks"] == {"live_ledger": False}
     every = pto.judge(ledger, "all")
     assert every["verdict"] == "fail" and every["checks"]["budget.live_ledger"] is False
+
+
+# -- the token-leak scan under concurrent log followers ----------------------------
+
+
+def test_a_concurrent_miss_never_clears_another_streams_token_hit() -> None:
+    """One scan thread per followed container: a miss writing last must not drop a hit.
+
+    The miss reads ``token_bytes_found`` (False), the hit on another
+    container's stream sets it, then the miss would write its stale read back.
+    """
+
+    reading, hit_done = threading.Event(), threading.Event()
+
+    class Entry:
+        def __init__(self) -> None:
+            self.scanned_bytes = 0
+            self.found = False
+
+        @property
+        def token_bytes_found(self) -> bool:
+            value = self.found
+            if threading.current_thread().name == "miss":
+                reading.set()
+                hit_done.wait(timeout=5)
+            return value
+
+        @token_bytes_found.setter
+        def token_bytes_found(self, value: bool) -> None:
+            self.found = value
+
+    class Scrubber:
+        def found(self, data: bytes) -> bool:
+            return b"MARK" in data
+
+        def longest(self) -> int:
+            return 4
+
+    scan = pps.TokenScan(Scrubber())  # type: ignore[arg-type]
+    entry = Entry()
+    scan.channels[pto.POD_LOGS_CHANNEL] = entry  # type: ignore[assignment]
+
+    def miss() -> None:
+        try:
+            scan.scan_stream(pto.POD_LOGS_CHANNEL, "pod:init:1", b"plain line\n")
+        finally:
+            reading.set()
+
+    def hit() -> None:
+        try:
+            scan.scan_stream(pto.POD_LOGS_CHANNEL, "pod:runner:2", b"leaked MARK\n")
+        finally:
+            hit_done.set()
+
+    first = threading.Thread(target=miss, name="miss")
+    first.start()
+    assert reading.wait(timeout=5)
+    second = threading.Thread(target=hit, name="hit")
+    second.start()
+    second.join(timeout=10)
+    first.join(timeout=10)
+    assert entry.found is True
+    assert entry.scanned_bytes == len(b"plain line\n") + len(b"leaked MARK\n")
