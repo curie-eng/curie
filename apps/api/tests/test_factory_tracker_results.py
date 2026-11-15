@@ -83,6 +83,7 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
 )
 from pydantic import ValidationError
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "tracker-result-proposal.json"
@@ -1924,6 +1925,79 @@ def test_the_contract_route_reserves_exactly_one_session(
     assert _code_of(second) == "session_already_started"
     assert _request(triage)["model_session_reserved_at"] == reserved_at
     assert _tracker_result_rows(triage)[0] == 1
+
+
+def test_a_reservation_racing_the_start_transition_does_not_deadlock(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#5687, on real Postgres with two connections. The worker's start
+    transition takes the WorkItem row lock and then the request's, as every
+    `workitems/lifecycle.py` transition does. ``starter`` holds the WorkItem
+    lock while `reserve_session` runs in ``reserver``; once the reservation
+    waits on a lock, ``starter`` locks the request. A reservation that took
+    the request first and the WorkItem second (its grant's foreign key) closes
+    the cycle, and Postgres aborts one side with ``deadlock detected``. Both
+    must finish, and the reservation must commit its grant."""
+
+    from curie_api import factory_tracker_result_runtime as runtime
+    from curie_api.workitems.lifecycle import lock_request, lock_work_item
+
+    triage = _triage(admitted, monkeypatch, 9570)
+    digest = source_content_sha256(SourceContent(SOURCE_TITLE, SOURCE_BODY))
+    lock_timeout = "SET LOCAL lock_timeout = '20s'"
+
+    async def work(maker: async_sessionmaker[AsyncSession]) -> tuple[list[str], Any]:
+        errors: list[str] = []
+        view: Any = None
+        async with maker() as starter, maker() as reserver, maker() as observer:
+            await starter.execute(text(lock_timeout))
+            assert await lock_work_item(starter, triage.work_item_id) is not None
+            # The reservation's transaction, whose backend the observer watches.
+            await reserver.execute(text(lock_timeout))
+            reserver_pid = await reserver.scalar(text("SELECT pg_backend_pid()"))
+            reserving = asyncio.create_task(
+                runtime.reserve_session(
+                    reserver,
+                    request_id=triage.request_id,
+                    content_sha256=digest,
+                    settings=get_settings(),
+                )
+            )
+            loop = asyncio.get_running_loop()
+            give_up = loop.time() + 15
+            waiting = False
+            while not waiting and not reserving.done() and loop.time() < give_up:
+                waiting = (
+                    await observer.scalar(
+                        text("SELECT wait_event_type FROM pg_stat_activity WHERE pid = :pid"),
+                        {"pid": reserver_pid},
+                    )
+                    == "Lock"
+                )
+                # A fresh transaction per poll reads a fresh activity snapshot;
+                # each round trip yields to the reservation task.
+                await observer.rollback()
+            assert waiting, "the reservation never waited on the held WorkItem lock"
+            try:
+                locked = await lock_request(
+                    starter, work_item_id=triage.work_item_id, request_id=triage.request_id
+                )
+                assert locked is not None
+            except DBAPIError as error:
+                errors.append(f"start: {error.orig}")
+            finally:
+                await starter.rollback()
+            try:
+                view = await asyncio.wait_for(reserving, timeout=30)
+            except DBAPIError as error:
+                errors.append(f"reservation: {error.orig}")
+        return errors, view
+
+    errors, view = _run(work)
+    assert errors == [], errors
+    assert view is not None and view.completion_contract == "tracker_result"
+    assert _request(triage)["model_session_reserved_at"] is not None
+    assert _tracker_result_rows(triage) == (1, 0, 0)
 
 
 def test_an_implementation_capability_gets_its_contract_and_cannot_submit(
