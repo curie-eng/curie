@@ -2056,10 +2056,12 @@ owns the result and `budget_exceeded` all suppress an ordinary retry.
 
 A retry is either scheduled or blocked. A scheduled retry is dispatched after a
 backoff of about 30 seconds for the first retry and about 120 seconds for the
-second, each with a fixed 20 percent jitter keyed by the WorkItem, or at a
-later provider retry time when the worker reported one. A blocked retry waits
-for a named condition, such as `provider_usage_reset` or
-`runner_fault_diagnosis`, and is never dispatched while it is blocked.
+second, each with a fixed 20 percent jitter keyed by the WorkItem, or later
+when the worker reported a provider time. A provider rate limit or usage reset
+time is used plus 60 seconds. A blocked retry waits for a named condition, such
+as `provider_usage_reset` or `runner_fault_diagnosis`, and is never dispatched
+while it is blocked. A provider rate limit that names no reset time is blocked
+on `provider_rate_limit`, which nothing releases before its deadline.
 
 Three provider waits can be released before their deadline. A retry blocked
 on `provider_credential` is released once the worker runs with a different

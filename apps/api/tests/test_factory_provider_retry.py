@@ -397,12 +397,12 @@ def test_rate_limit_with_a_time_is_a_backoff_not_a_blocked_gate(
     successor = _successor(ref.request_id)
     assert successor is not None
     assert successor["blocked_on"] is None
-    assert successor["dispatch_not_before"] == at
+    assert successor["dispatch_not_before"] == at + timedelta(seconds=60)
     _raise_limit(_now())
     _reconcile()
     after = _request(successor["id"])
     assert after["version"] == successor["version"]
-    assert after["dispatch_not_before"] == at
+    assert after["dispatch_not_before"] == at + timedelta(seconds=60)
     assert _no_wake(successor["id"])
 
 

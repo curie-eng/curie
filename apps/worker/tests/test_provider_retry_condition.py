@@ -679,7 +679,7 @@ def _errored_turn(error: str, provider_text: str) -> Callable[[], list[Any]]:
     return script
 
 
-def _rate_limited_turn(resets_at: int) -> Callable[[], list[Any]]:
+def _rate_limited_turn(resets_at: int | None) -> Callable[[], list[Any]]:
     """A model turn the SDK ends with a rejected rate limit event.
 
     Provenance: the typed SDK field ``claude_agent_sdk.types.RateLimitInfo.resets_at``.
@@ -879,10 +879,9 @@ def test_ordinary_throttle_backs_off_until_the_typed_reset(
             predecessor["retry_condition_retry_at"],
             predecessor["retry_condition_scope_key"],
         ) == ("rate_limited", retry_at, scope.scope_key)
-        # A backoff, not a block, due no earlier than the provider's reset.
+        # A backoff, not a block, due at the provider's reset plus the grace.
         assert successor["blocked_on"] is None
-        assert successor["dispatch_not_before"] >= retry_at
-        assert successor["dispatch_not_before"] == retry_at
+        assert successor["dispatch_not_before"] == retry_at + _RESET_GRACE
 
         await e2e.reconcile(passes=2)
         await e2e.assert_asleep(successor["id"])
@@ -893,6 +892,34 @@ def test_ordinary_throttle_backs_off_until_the_typed_reset(
         await e2e.reconcile()
         await e2e.assert_ran_once(successor["id"])
         assert [runner.turns for runner in later] == [1, 0]
+
+    _end_to_end(case, body)
+
+
+def test_ordinary_throttle_without_a_reset_time_stays_blocked_until_it_expires(
+    factory_retry: FactoryRetryCase,
+) -> None:
+    case = factory_retry
+
+    async def body(e2e: EndToEnd) -> None:
+        scope = _own_scope()
+        # The SDK leaves resets_at unset when the provider names no reset.
+        failing = await case.real_runners(1, script=_rate_limited_turn(None), provider_scope=scope)
+        later = await case.real_runners(2)
+
+        finish, predecessor, successor = await e2e.fail(case.item)
+        assert finish.body["cause"] == "model_rate_limited"
+        assert (
+            predecessor["retry_condition_reason"],
+            predecessor["retry_condition_retry_at"],
+        ) == ("rate_limited", None)
+        # No guessed timer: blocked until the waiting deadline.
+        assert successor["blocked_on"] == "provider_rate_limit"
+        assert successor["dispatch_not_before"] == successor["wait_deadline"]
+
+        await e2e.reconcile(passes=2)
+        await e2e.assert_asleep(successor["id"])
+        assert _turns(failing) == 1 and _turns(later) == 0
 
     _end_to_end(case, body)
 
