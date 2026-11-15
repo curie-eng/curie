@@ -69,7 +69,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 84 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 `CodingInstructionsOutput` in `cli/src/commands/coding_instructions.rs` reports the owner
-profile and its unavailable application status, or a dry-run plan.
+profile and whether this deployment applies it to factory runs, or a dry-run plan.
 
 `MigrationOutput` in `cli/src/process_migrate.rs` reports the completed offline
 protected-process migration as one JSON object or a human confirmation.

@@ -6,6 +6,7 @@ from typing import Any
 import personal_enrollment_support as enrollment
 import personal_execution_support as pe
 import pytest
+from curie_api.config import get_settings
 from fastapi.testclient import TestClient
 from oidc_test_idp import TestIdP
 from personal_enrollment_support import FakeCustodyStore, Owner
@@ -62,7 +63,8 @@ def body(response: Any) -> dict[str, Any]:
     assert response.status_code == 200, response.text
     assert response.headers["Cache-Control"] == "no-store"
     found: dict[str, Any] = response.json()
-    assert found["application"] == "unavailable"
+    expected = "available" if get_settings().requester_coding_instructions_apply else "unavailable"
+    assert found["application"] == expected
     assert set(found) == {
         "revision",
         "sha256",

@@ -105,8 +105,11 @@ curie cluster status --context <your-production-context>
    sandbox**, with a **1 CPU / 768Mi limit** on each runner (the `standard`
    resource profile). A factory agent uses the `factory` profile instead:
    **8Gi memory request and limit**, so it needs a node with 8Gi of unrequested
-   allocatable memory, and the default quota admits one factory sandbox at a
-   time. With `factory.enabled`, the API container's memory limit is **2Gi**
+   allocatable memory. The default `resourceQuota.hard.requestsMemory` of 10Gi
+   admits one factory sandbox at a time. Beside it, six standard sandboxes fit
+   and a seventh is refused, because limits.cpu binds before requests.memory
+   (factory CPU limit 2, standard CPU limit 1, limits.cpu 8). requests.memory
+   would allow ten standard sandboxes at 192Mi in the 2Gi remainder. With `factory.enabled`, the API container's memory limit is **2Gi**
    instead of 512Mi (its request stays 256Mi); set
    `api.resources.limits.memory` to choose another value. See the chart README's
    [resource profiles](../charts/curie/README.md#resource-profiles). Each distinct

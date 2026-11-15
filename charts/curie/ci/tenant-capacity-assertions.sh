@@ -192,7 +192,7 @@ default_quota="$(render_file default tenant-resourcequota.yaml)"
 check quota-scope "$default_quota" curie-sandbox
 echo "  ok: scopeSelector keys on PriorityClass=curie-sandbox"
 check quota-hard "$default_quota" \
-  requests.cpu=4 requests.memory=8Gi \
+  requests.cpu=4 requests.memory=10Gi \
   limits.cpu=8 limits.memory=16Gi pods=50
 echo "  ok: published hard ceiling values render as documented"
 
