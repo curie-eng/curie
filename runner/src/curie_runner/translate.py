@@ -434,7 +434,7 @@ def translate_message(
                     message="model rate limit reached",
                     classification="rate-limit",
                     retry_condition=rate_limited_condition(
-                        message.rate_limit_info, state.provider_scope
+                        message.rate_limit_info.resets_at, state.provider_scope
                     ),
                 )
             ]

@@ -36,6 +36,7 @@ from claude_agent_sdk.types import AssistantMessageError, RateLimitInfo
 from curie_internal.provider_scope import ProviderScope, provider_scope
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
+from curie_runner.provider_retry import rate_limited_condition
 from curie_runner.session import SessionRunner
 from curie_runner.translate import TurnState, translate_message
 
@@ -166,14 +167,15 @@ def _errors(events: Sequence[object]) -> list[ErrorEvent]:
 # --- Documented daily reset ---------------------------------------------------
 
 
-def test_workspace_daily_budget_carries_its_utc_reset_and_scope() -> None:
+def test_workspace_daily_budget_carries_its_utc_reset_and_no_key_scope() -> None:
+    # The budget is workspace scoped: only its typed reset can release it.
     errors = _translate(
         _errored("authentication_failed", _OPENROUTER_WORKSPACE_BUDGET_403), _state()
     )
 
     assert [e.classification for e in errors] == ["model-credit-exhausted"]
     assert errors[0].retry_condition == RetryCondition(
-        reason=RetryReason.USAGE_RESET, retry_at=_RESET, scope_key=_SCOPE_KEY
+        reason=RetryReason.USAGE_RESET, retry_at=_RESET, scope_key=None
     )
     assert '"retry_at":"2026-10-30T00:00:00Z"' in to_ndjson_line(errors[0])
 
@@ -195,7 +197,7 @@ def test_workspace_daily_budget_without_a_utc_reset_has_no_time(reset: str) -> N
 
     assert [e.classification for e in errors] == ["model-credit-exhausted"]
     assert errors[0].retry_condition == RetryCondition(
-        reason=RetryReason.USAGE_RESET, retry_at=None, scope_key=_SCOPE_KEY
+        reason=RetryReason.USAGE_RESET, retry_at=None, scope_key=None
     )
 
 
@@ -212,7 +214,7 @@ def test_workspace_daily_budget_through_the_session_ends_on_the_reset_condition(
     errors = _errors(events)
     assert errors[-1].classification == "model-credit-exhausted"
     assert errors[-1].retry_condition == RetryCondition(
-        reason=RetryReason.USAGE_RESET, retry_at=_RESET, scope_key=_SCOPE_KEY
+        reason=RetryReason.USAGE_RESET, retry_at=_RESET, scope_key=None
     )
     assert runner.status == SessionStatus.CLASSIFIED_FAILURE
 
@@ -239,27 +241,81 @@ def test_a_subagent_workspace_daily_budget_result_carries_the_reset() -> None:
 
     assert [e.classification for e in errors] == ["model-credit-exhausted"]
     assert errors[-1].retry_condition == RetryCondition(
-        reason=RetryReason.USAGE_RESET, retry_at=_RESET, scope_key=_SCOPE_KEY
+        reason=RetryReason.USAGE_RESET, retry_at=_RESET, scope_key=None
     )
 
 
 # --- Depleted credit -----------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("error", "text"),
-    [
-        pytest.param("unknown", _OPENROUTER_402, id="openrouter-402"),
-        pytest.param("authentication_failed", _OPENROUTER_KEY_LIMIT_403, id="key-limit-403"),
-        pytest.param("billing_error", "", id="sdk-billing-error"),
-    ],
-)
-def test_other_credit_refusals_are_credit_exhausted_without_a_time(error: str, text: str) -> None:
-    errors = _translate(_errored(error, text), _state())
+def test_key_limit_403_is_credit_exhausted_on_the_key_scope() -> None:
+    errors = _translate(_errored("authentication_failed", _OPENROUTER_KEY_LIMIT_403), _state())
 
     assert [e.classification for e in errors] == ["model-credit-exhausted"]
     assert errors[0].retry_condition == RetryCondition(
         reason=RetryReason.CREDIT_EXHAUSTED, retry_at=None, scope_key=_SCOPE_KEY
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        pytest.param("unknown", _OPENROUTER_402, id="openrouter-402"),
+        pytest.param("billing_error", "", id="sdk-billing-error"),
+        pytest.param(
+            "billing_error",
+            'API Error: 400 {"type":"error","error":{"type":"billing_error"}}',
+            id="sdk-billing-error-with-text",
+        ),
+    ],
+)
+def test_account_credit_refusals_are_credit_exhausted_without_a_scope(
+    error: str, text: str
+) -> None:
+    # The refused scope is the account, so no key probe can verify it.
+    errors = _translate(_errored(error, text), _state())
+
+    assert [e.classification for e in errors] == ["model-credit-exhausted"]
+    assert errors[0].retry_condition == RetryCondition(
+        reason=RetryReason.CREDIT_EXHAUSTED, retry_at=None, scope_key=None
+    )
+
+
+def _subagent_error(text: str) -> tuple[AssistantMessage, UserMessage]:
+    call = AssistantMessage(
+        content=[ToolUseBlock(id="toolu_rev1", name="Agent", input={"description": "review"})],
+        model="m",
+    )
+    result = UserMessage(
+        content=[
+            ToolResultBlock(
+                tool_use_id="toolu_rev1",
+                content="Agent terminated early due to an API error: " + text,
+                is_error=True,
+            )
+        ]
+    )
+    return call, result
+
+
+@pytest.mark.parametrize(
+    ("text", "scope_key"),
+    [
+        pytest.param(_OPENROUTER_KEY_LIMIT_403, _SCOPE_KEY, id="key-limit-403"),
+        pytest.param(_OPENROUTER_402, None, id="openrouter-402"),
+    ],
+)
+def test_a_subagent_credit_result_follows_the_same_scope_rules(
+    text: str, scope_key: str | None
+) -> None:
+    state = _state()
+    call, result = _subagent_error(text)
+    errors = _translate(call, state) + _translate(result, state)
+    errors += _translate(_result(is_error=False, result="recovered"), state)
+
+    assert [e.classification for e in errors] == ["model-credit-exhausted"]
+    assert errors[-1].retry_condition == RetryCondition(
+        reason=RetryReason.CREDIT_EXHAUSTED, retry_at=None, scope_key=scope_key
     )
 
 
@@ -342,6 +398,26 @@ def test_a_rejected_rate_limit_without_an_int_reset_has_no_time(resets_at: objec
     )
 
 
+@pytest.mark.parametrize(
+    ("resets_at", "retry_at"),
+    [
+        pytest.param(int(_RESET.timestamp()), _RESET, id="int"),
+        pytest.param(None, None, id="none"),
+        pytest.param(True, None, id="bool"),
+        pytest.param(float(_RESET.timestamp()), None, id="float"),
+        pytest.param(str(int(_RESET.timestamp())), None, id="string"),
+        pytest.param(10**20, None, id="out-of-range"),
+    ],
+)
+def test_rate_limited_condition_reads_only_a_plain_int(
+    resets_at: object, retry_at: datetime | None
+) -> None:
+    assert rate_limited_condition(resets_at, _SCOPE) == RetryCondition(
+        reason=RetryReason.RATE_LIMITED, retry_at=retry_at, scope_key=_SCOPE_KEY
+    )
+    assert rate_limited_condition(resets_at, None).scope_key is None
+
+
 def test_an_allowed_warning_rate_limit_emits_no_event() -> None:
     info = RateLimitInfo(status="allowed_warning", resets_at=int(_RESET.timestamp()))
     assert _translate(_rate_limit(info), _state()) == []
@@ -403,11 +479,9 @@ def test_a_personal_mode_halt_carries_no_condition(monkeypatch: pytest.MonkeyPat
 
 
 def test_no_scope_gives_a_condition_with_no_scope_key() -> None:
-    errors = _translate(
-        _errored("authentication_failed", _OPENROUTER_WORKSPACE_BUDGET_403), _state(None)
-    )
+    errors = _translate(_errored("authentication_failed", _OPENROUTER_KEY_LIMIT_403), _state(None))
     assert errors[0].retry_condition == RetryCondition(
-        reason=RetryReason.USAGE_RESET, retry_at=_RESET, scope_key=None
+        reason=RetryReason.CREDIT_EXHAUSTED, retry_at=None, scope_key=None
     )
 
     runner = _runner([_errored("authentication_failed", _OPENROUTER_401)], None)
@@ -433,7 +507,7 @@ def test_a_later_recoverable_error_does_not_erase_the_latched_condition() -> Non
     assert errors[1].retry_condition is None
     assert errors[-1].message == "model credit exhausted earlier in the turn"
     assert errors[-1].retry_condition == RetryCondition(
-        reason=RetryReason.CREDIT_EXHAUSTED, scope_key=_SCOPE_KEY
+        reason=RetryReason.CREDIT_EXHAUSTED, scope_key=None
     )
 
 
@@ -450,7 +524,7 @@ def test_a_latched_usage_condition_outranks_a_later_credit_condition() -> None:
     ]
     # The credit frame carries its own signal; the last frame re-emits the latch.
     assert errors[1].retry_condition == RetryCondition(
-        reason=RetryReason.CREDIT_EXHAUSTED, scope_key=_SCOPE_KEY
+        reason=RetryReason.CREDIT_EXHAUSTED, scope_key=None
     )
     assert errors[-1].message == "model usage limit reached earlier in the turn"
     assert errors[-1].retry_condition == RetryCondition(

@@ -60,6 +60,10 @@ class AllowanceReading:
 
     outcome: Literal["authenticated", "rejected", "unreadable"]
     limit_remaining: Decimal | None
+    # The key's credit limit. None when the key has no limit (a JSON null) or
+    # the value is not a finite number: an unlimited key shows no allowance that
+    # a probe could verify.
+    limit: Decimal | None
 
 
 def scope_key(provider: str, host: str, credential: str) -> str:
@@ -140,22 +144,30 @@ def parse_openrouter_key(status: int | None, body: object) -> AllowanceReading:
 
     Contract:
     https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key
-    A 200 carries a ``data`` object with ``limit_remaining``. ``data.limit_reset``
-    is a reset period string (for example "monthly"), never an absolute time, so
-    it is not read. 401 means the key was rejected; anything else, including a
-    malformed 200 and a failed transport (``status`` None), is unreadable. The
-    body is never kept.
+    A 200 carries a ``data`` object with ``limit`` and ``limit_remaining``; a
+    null ``limit`` is an unlimited key. ``data.limit_reset`` is a reset period
+    string (for example "monthly"), never an absolute time, so it is not read.
+    401 means the key was rejected; anything else, including a malformed 200 and
+    a failed transport (``status`` None), is unreadable. The body is never kept.
     """
 
     if status == 401:
-        return AllowanceReading(outcome="rejected", limit_remaining=None)
+        return AllowanceReading(outcome="rejected", limit_remaining=None, limit=None)
     if status != 200 or not isinstance(body, dict):
-        return AllowanceReading(outcome="unreadable", limit_remaining=None)
+        return AllowanceReading(outcome="unreadable", limit_remaining=None, limit=None)
     data = body.get("data")
     if not isinstance(data, dict):
-        return AllowanceReading(outcome="unreadable", limit_remaining=None)
-    value = data.get("limit_remaining")
-    remaining: Decimal | None = None
+        return AllowanceReading(outcome="unreadable", limit_remaining=None, limit=None)
+    return AllowanceReading(
+        outcome="authenticated",
+        limit_remaining=_finite_number(data.get("limit_remaining")),
+        limit=_finite_number(data.get("limit")),
+    )
+
+
+def _finite_number(value: object) -> Decimal | None:
+    """A JSON int or float (never a bool) that is finite, as a Decimal, else None."""
+
     if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-        remaining = Decimal(str(value))
-    return AllowanceReading(outcome="authenticated", limit_remaining=remaining)
+        return Decimal(str(value))
+    return None

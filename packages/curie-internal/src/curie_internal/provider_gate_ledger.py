@@ -4,12 +4,12 @@ All keys live under the caller's worker key prefix. Per scope, one hash tag
 ``{<provider>:<scope_key>}`` keeps two keys in one cluster slot:
 
 ``provider-scope``        a hash: ``provider``, ``current_at_ms``,
-                          ``probed_at_ms``, ``outcome``, ``limit_remaining``
-                          (decimal string, empty when unknown) and
-                          ``allowance_increased_at_ms``. Lives ``SCOPE_TTL_S``,
-                          refreshed on every write.
-``provider-probe-lease``  the owner token of the one worker allowed to probe
-                          the scope, alive ``PROBE_LEASE_MS``.
+                          ``probed_at_ms``, ``outcome``, ``limit`` and
+                          ``limit_remaining`` (decimal strings, empty when
+                          unknown) and ``allowance_increased_at_ms``. Lives
+                          ``SCOPE_TTL_S``, refreshed on every write.
+``provider-probe-lease``  the per-claim token of the one probe allowed to
+                          record for the scope, alive ``PROBE_LEASE_MS``.
 
 Per provider, ``provider-current`` holds the scope key a worker currently
 runs with, alive ``CURRENT_TTL_S``. A lost key only delays a release, so every
@@ -18,6 +18,7 @@ reader fails closed. Nothing here logs.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Final
@@ -49,26 +50,28 @@ def current_key(prefix: str, provider: str) -> str:
     return f"{prefix}:provider-current:{provider}"
 
 
-# KEYS: lease, scope hash. ARGV: owner, provider, now ms, outcome,
-# limit_remaining (decimal string, empty for unknown), scope ttl s. Refuses (0)
-# unless the caller holds the lease. Only an authenticated reading touches the
-# allowance fields; a strictly greater numeric value over a numeric baseline
-# marks an increase at now.
+# KEYS: lease, scope hash. ARGV: claim token, provider, now ms, outcome, limit,
+# limit_remaining (decimal strings, empty for unknown), scope ttl s. Refuses
+# (0) unless the lease still holds this claim's token. Only an authenticated
+# reading touches the allowance fields. Only a strictly greater numeric
+# ``limit`` over a stored numeric ``limit`` marks an increase at now: a rising
+# ``limit_remaining`` under the same limit can be a usage fall, a refund or a
+# period rollover, none of which is added allowance.
 RECORD_LUA: Final[str] = """
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
     return 0
 end
 redis.call('HSET', KEYS[2], 'provider', ARGV[2], 'probed_at_ms', ARGV[3], 'outcome', ARGV[4])
 if ARGV[4] == 'authenticated' then
-    local stored = tonumber(redis.call('HGET', KEYS[2], 'limit_remaining') or '')
+    local stored = tonumber(redis.call('HGET', KEYS[2], 'limit') or '')
     local fresh = tonumber(ARGV[5])
     if stored and fresh and fresh > stored then
         redis.call('HSET', KEYS[2], 'allowance_increased_at_ms', ARGV[3])
     end
-    redis.call('HSET', KEYS[2], 'limit_remaining', ARGV[5])
+    redis.call('HSET', KEYS[2], 'limit', ARGV[5], 'limit_remaining', ARGV[6])
 end
 redis.call('DEL', KEYS[1])
-redis.call('EXPIRE', KEYS[2], ARGV[6])
+redis.call('EXPIRE', KEYS[2], ARGV[7])
 return 1
 """
 
@@ -81,6 +84,7 @@ class ScopeObservation:
     current_at_ms: int | None
     probed_at_ms: int | None
     outcome: str | None
+    limit: Decimal | None
     limit_remaining: Decimal | None
     allowance_increased_at_ms: int | None
 
@@ -125,13 +129,26 @@ async def register_current(redis: Redis, prefix: str, scope: ProviderScope, now_
         await pipe.execute()
 
 
-async def claim_probe(redis: Redis, prefix: str, provider: str, scope_key: str, owner: str) -> bool:
-    """Take the scope's probe lease for ``owner``; False when another holds it."""
+async def claim_probe(
+    redis: Redis, prefix: str, provider: str, scope_key: str, owner: str
+) -> str | None:
+    """Take the scope's probe lease; the claim's token, or None when the lease is held.
 
+    Every call mints a fresh token, so a restarted worker that reuses ``owner``
+    can never commit a read taken under an earlier, lapsed claim.
+    """
+
+    token = f"{owner}:{uuid.uuid4().hex}"
     claimed = await redis.set(
-        lease_key(prefix, provider, scope_key), owner, nx=True, px=PROBE_LEASE_MS
+        lease_key(prefix, provider, scope_key), token, nx=True, px=PROBE_LEASE_MS
     )
-    return bool(claimed)
+    return token if claimed else None
+
+
+def _decimal_text(value: Decimal | None) -> str:
+    """A decimal as a plain string without exponent, empty for None."""
+
+    return "" if value is None else format(value, "f")
 
 
 async def record_probe(
@@ -139,23 +156,23 @@ async def record_probe(
     prefix: str,
     provider: str,
     scope_key: str,
-    owner: str,
+    token: str,
     now_ms: int,
     reading: AllowanceReading,
 ) -> bool:
-    """Store a probe reading and release the lease; False when ``owner`` lost it."""
+    """Store a probe reading and release the lease; False when ``token``'s claim lapsed."""
 
-    remaining = "" if reading.limit_remaining is None else format(reading.limit_remaining, "f")
     recorded = await redis.eval(
         RECORD_LUA,
         2,
         lease_key(prefix, provider, scope_key),
         scope_hash_key(prefix, provider, scope_key),
-        owner,
+        token,
         provider,
         str(now_ms),
         reading.outcome,
-        remaining,
+        _decimal_text(reading.limit),
+        _decimal_text(reading.limit_remaining),
         str(SCOPE_TTL_S),
     )
     return int(recorded) == 1
@@ -175,6 +192,7 @@ async def read_scope(
         current_at_ms=_int(fields.get("current_at_ms")),
         probed_at_ms=_int(fields.get("probed_at_ms")),
         outcome=_text(fields.get("outcome")) or None,
+        limit=_decimal(fields.get("limit")),
         limit_remaining=_decimal(fields.get("limit_remaining")),
         allowance_increased_at_ms=_int(fields.get("allowance_increased_at_ms")),
     )

@@ -5,7 +5,9 @@ classification into the ``RetryCondition`` that rides the same ``ErrorEvent``.
 A condition is never built from ``ErrorEvent.classification`` alone: every
 caller hands over the provider text or the typed SDK field it classified, at
 the point it classified it. ``scope_key`` comes from the turn's
-``ProviderScope`` and is None when the runner could not name the scope.
+``ProviderScope`` and is None when the runner could not name the scope, or
+when the refused scope is wider than the turn's credential (an account or a
+workspace), so no probe of the key could verify it.
 
 Nothing here logs, and nothing here keeps the provider text.
 """
@@ -16,7 +18,6 @@ import re
 from datetime import UTC, datetime
 
 from aci_protocol import RetryCondition, RetryReason
-from claude_agent_sdk.types import RateLimitInfo
 from curie_internal.provider_scope import ProviderScope
 
 # Observed 2026-10-29 (#5163, fixture ``_OPENROUTER_WORKSPACE_BUDGET_403`` in
@@ -44,6 +45,12 @@ _RFC3339_UTC = re.compile(
 # OpenRouter documents 401 for invalid credentials:
 # https://openrouter.ai/docs/api/reference/errors-and-debugging
 _CLI_HTTP_401 = re.compile(r"API Error: 401(?!\d)")
+# Observed 2026-10-05 on a staging install (#4104, fixture
+# ``_OPENROUTER_KEY_LIMIT_403`` in runner/tests/test_translate.py): an OpenRouter
+# key at its own spend limit answers 'API Error: 403 {"error":{"message":"Key
+# limit exceeded (total limit). ..."}}'. The refused scope is the key the turn
+# authenticated with.
+_KEY_LIMIT_EXCEEDED = re.compile(r"\bkey limit exceeded\b", re.IGNORECASE)
 # Anthropic's documented error body for an invalid credential (HTTP 401):
 # https://docs.anthropic.com/en/api/errors
 _ANTHROPIC_AUTHENTICATION_ERROR = re.compile(r'"type"\s*:\s*"authentication_error"')
@@ -96,15 +103,21 @@ def credit_exhausted_condition(provider_text: str, scope: ProviderScope | None) 
 
     The workspace daily budget refusal is a usage reset, timed when it names a
     UTC reset. Every other credit refusal (an HTTP 402, the SDK's
-    ``billing_error``, an OpenRouter key at its limit) is depleted credit.
+    ``billing_error``, an OpenRouter key at its limit) is depleted credit. Only
+    the key limit refusal names the turn's key scope.
     """
 
     is_daily_budget, reset_at = daily_budget_reset_at(provider_text)
     if is_daily_budget:
-        return RetryCondition(
-            reason=RetryReason.USAGE_RESET, retry_at=reset_at, scope_key=_scope_key(scope)
-        )
-    return RetryCondition(reason=RetryReason.CREDIT_EXHAUSTED, scope_key=_scope_key(scope))
+        # The budget is workspace scoped, not the key's, so a key probe cannot
+        # verify it. Only its typed reset time can release the wait.
+        return RetryCondition(reason=RetryReason.USAGE_RESET, retry_at=reset_at, scope_key=None)
+    if _KEY_LIMIT_EXCEEDED.search(provider_text):
+        return RetryCondition(reason=RetryReason.CREDIT_EXHAUSTED, scope_key=_scope_key(scope))
+    # An account-level refusal (an OpenRouter 402 or the SDK's billing_error,
+    # or any other credit text): the refused scope is the account, so no key
+    # probe can verify it, and the wait expires visibly.
+    return RetryCondition(reason=RetryReason.CREDIT_EXHAUSTED, scope_key=None)
 
 
 def usage_limited_condition(scope: ProviderScope | None) -> RetryCondition:
@@ -117,15 +130,15 @@ def usage_limited_condition(scope: ProviderScope | None) -> RetryCondition:
     return RetryCondition(reason=RetryReason.USAGE_RESET, scope_key=_scope_key(scope))
 
 
-def rate_limited_condition(info: RateLimitInfo, scope: ProviderScope | None) -> RetryCondition:
-    """The condition for a rejected ``RateLimitEvent``.
+def rate_limited_condition(resets_at: object, scope: ProviderScope | None) -> RetryCondition:
+    """The condition for a rejected ``RateLimitEvent``, given its ``resets_at``.
 
     Provenance: the typed SDK field ``claude_agent_sdk.types.RateLimitInfo.resets_at``
     ('Unix timestamp when the rate limit window resets', typed ``int | None``).
+    The caller hands over the plain value so this module stays free of the SDK.
     Read only when it is a real int, as Unix seconds in UTC.
     """
 
-    resets_at = info.resets_at
     retry_at: datetime | None = None
     if isinstance(resets_at, int) and not isinstance(resets_at, bool):
         try:

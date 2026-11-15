@@ -254,21 +254,46 @@ def _with_remaining(value: object) -> dict[str, Any]:
     return {"data": {**_DOCUMENTED_BODY["data"], "limit_remaining": value}}
 
 
+def _with_limit(value: object) -> dict[str, Any]:
+    return {"data": {**_DOCUMENTED_BODY["data"], "limit": value}}
+
+
 def test_parse_documented_body() -> None:
+    # The documented body carries a numeric limit.
     assert parse_openrouter_key(200, _DOCUMENTED_BODY) == AllowanceReading(
-        "authenticated", Decimal("12.5")
+        "authenticated", Decimal("12.5"), Decimal("25")
     )
 
 
 def test_parse_integer_remaining() -> None:
     assert parse_openrouter_key(200, _with_remaining(3)) == AllowanceReading(
-        "authenticated", Decimal("3")
+        "authenticated", Decimal("3"), Decimal("25")
+    )
+
+
+def test_parse_float_limit() -> None:
+    assert parse_openrouter_key(200, _with_limit(30.5)) == AllowanceReading(
+        "authenticated", Decimal("12.5"), Decimal("30.5")
     )
 
 
 def test_parse_null_limit() -> None:
+    # A JSON null limit is an unlimited key.
     body = {"data": {**_DOCUMENTED_BODY["data"], "limit": None, "limit_remaining": None}}
-    assert parse_openrouter_key(200, body) == AllowanceReading("authenticated", None)
+    assert parse_openrouter_key(200, body) == AllowanceReading("authenticated", None, None)
+
+
+def test_parse_null_limit_keeps_a_numeric_remaining() -> None:
+    assert parse_openrouter_key(200, _with_limit(None)) == AllowanceReading(
+        "authenticated", Decimal("12.5"), None
+    )
+
+
+def test_parse_missing_limit_reads_none() -> None:
+    data = {key: value for key, value in _DOCUMENTED_BODY["data"].items() if key != "limit"}
+    assert parse_openrouter_key(200, {"data": data}) == AllowanceReading(
+        "authenticated", Decimal("12.5"), None
+    )
 
 
 @pytest.mark.parametrize(
@@ -282,12 +307,29 @@ def test_parse_null_limit() -> None:
 )
 def test_parse_non_numeric_remaining_reads_none(value: object) -> None:
     assert parse_openrouter_key(200, _with_remaining(value)) == AllowanceReading(
-        "authenticated", None
+        "authenticated", None, Decimal("25")
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(True, id="bool"),
+        pytest.param("25", id="string"),
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(float("nan"), id="nan"),
+    ],
+)
+def test_parse_non_numeric_limit_reads_none(value: object) -> None:
+    assert parse_openrouter_key(200, _with_limit(value)) == AllowanceReading(
+        "authenticated", Decimal("12.5"), None
     )
 
 
 def test_parse_401_rejected() -> None:
-    assert parse_openrouter_key(401, {"error": {"code": 401}}) == AllowanceReading("rejected", None)
+    assert parse_openrouter_key(401, {"error": {"code": 401}}) == AllowanceReading(
+        "rejected", None, None
+    )
 
 
 @pytest.mark.parametrize(
@@ -302,4 +344,4 @@ def test_parse_401_rejected() -> None:
     ],
 )
 def test_parse_unreadable(status: int | None, body: object) -> None:
-    assert parse_openrouter_key(status, body) == AllowanceReading("unreadable", None)
+    assert parse_openrouter_key(status, body) == AllowanceReading("unreadable", None, None)
