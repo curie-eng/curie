@@ -1045,11 +1045,14 @@ async def _retain_and_validate_publication_snapshot(
 
     The capture runs first, and only for the owned, started WorkItem run of
     this exact event with a runtime epoch, so finished work survives a failed
-    validation or admission. It is bounded by min(60 s, half of what is left
-    beyond a 30 s reserve for validation, UI evidence and admission) and skipped
-    when that is under 5 s. It never raises and never changes the
-    outcome: validation then runs exactly as it would without it, and its
-    errors propagate unchanged.
+    validation or admission. What is left is the delivery budget bounded by the
+    run's execution deadline. The capture's budget is min(60 s, half of what is
+    left beyond a 30 s reserve for validation, UI evidence and admission and the
+    capture's own failure-report allowance), and it is skipped when that is
+    under 5 s. The budget clock starts before the claim read, so the claim read
+    and the capture share it. It never raises except on cancellation and never
+    changes the outcome: validation then runs exactly as it would without it,
+    and its errors propagate unchanged.
     """
 
     capture = self._publication_candidates
@@ -1063,37 +1066,46 @@ async def _retain_and_validate_publication_snapshot(
         and run.runtime_epoch is not None
     ):
         # Validation, UI evidence and admission keep the larger share of what is
-        # left: the capture takes at most half of the time beyond a reserve for
-        # them, and is skipped rather than squeezed below a useful minimum.
+        # left before the delivery budget or the execution deadline, whichever
+        # comes first: the capture takes at most half of the time beyond a
+        # reserve for them and its own failure report, and is skipped rather
+        # than squeezed below a useful minimum.
+        started = clock.time.monotonic()
+        left_s = run.bound_remaining_s(remaining_s)
         budget_s = (
             _CANDIDATE_CAPTURE_BUDGET_S
-            if remaining_s is None
+            if left_s is None
             else min(
                 _CANDIDATE_CAPTURE_BUDGET_S,
-                (remaining_s - _CANDIDATE_VALIDATION_RESERVE_S) / 2,
+                (left_s - _CANDIDATE_VALIDATION_RESERVE_S - capture.outcome_allowance_seconds) / 2,
             )
         )
         if budget_s < constants._MIN_ATTEMPT_BUDGET_S:
             logger.warning(
-                "publication candidate capture skipped for %s: %.1f s left is too little",
+                "publication candidate capture skipped for %s: %s s left is too little",
                 qevent.event_id,
-                remaining_s,
+                "unbounded" if left_s is None else f"{left_s:.1f}",
             )
         else:
+            stage = "claim read"
             try:
-                prepared = await asyncio.to_thread(self._workspace.current, thread_key)
+                prepared = await asyncio.wait_for(
+                    asyncio.to_thread(self._workspace.current, thread_key), budget_s
+                )
                 if prepared is not None:
+                    stage = "capture"
                     await capture.capture(
                         run,
                         snapshot,
                         prepared,
                         dedupe_key=qevent.event_id,
-                        budget_seconds=budget_s,
+                        budget_seconds=budget_s - (clock.time.monotonic() - started),
                     )
             except Exception:  # noqa: BLE001 - a capture fault never changes the outcome
                 logger.warning(
-                    "publication candidate capture skipped for %s: claim read failed",
+                    "publication candidate capture skipped for %s: %s failed",
                     qevent.event_id,
+                    stage,
                     exc_info=True,
                 )
     if self._workspace is None:

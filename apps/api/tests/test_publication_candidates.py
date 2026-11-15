@@ -593,6 +593,34 @@ def test_replay_without_the_base_declaration_answers_the_same_candidate(
     assert _snapshot() == before
 
 
+def test_staging_replay_without_its_declared_base_requires_the_base(
+    candidates: None, client: Any
+) -> None:
+    source = _seed()
+    without_base = _reserve_body(source, key="base-cut", base=False)
+    _refused(_post(client, "reserve", without_base), 409, "base_required")
+    with_base = _reserve_body(source, key="base-cut")
+    first = _ok(_post(client, "reserve", with_base))
+    assert first["replayed"] is False
+    assert sorted(obj["kind"] for obj in first["objects"]) == ["base", "patch"]
+    assert _candidate(first)["status"] == "staging"
+    # The base upload may never have happened: a replay that does not declare
+    # the base gets the answer a fresh reserve gets and writes nothing, so the
+    # writer spools the base and declares it.
+    before = _snapshot()
+    _refused(_post(client, "reserve", without_base), 409, "base_required")
+    assert _snapshot() == before
+    assert _candidate(first)["status"] == "staging"
+    # Declared again, the replay names both receipts for the writer to upload.
+    replay = _ok(_post(client, "reserve", with_base))
+    assert replay == {**first, "replayed": True}
+    assert sorted(obj["kind"] for obj in replay["objects"]) == ["base", "patch"]
+    assert _count("publication_candidates") == 1
+    # Liveness: completed, the same replay without the base is answered.
+    _ok(_post(client, "complete", _completion(source, replay)))
+    assert _ok(_post(client, "reserve", without_base)) == {**first, "replayed": True}
+
+
 def test_outcome_needs_only_the_capture_identity(candidates: None, client: Any) -> None:
     source = _seed()
     _sql(

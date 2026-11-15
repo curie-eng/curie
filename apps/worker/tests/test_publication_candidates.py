@@ -32,8 +32,10 @@ asserted.
 Injected faults are named where they are used and sit outside the changed code:
 an httpx transport that loses one ``/complete`` response after the API committed
 it, SQL that moves a terminal timestamp or a claim deadline instead of waiting it
-out, a stored object overwritten in the bucket, and a collector subprocess killed
-between deletion and finalize.
+out, a stored object overwritten in the bucket, a collector subprocess killed
+between deletion and finalize, a store that cuts one base upload before any byte
+lands together with a transport that loses the writer's ``/fail`` call, and a run
+whose ``execution_deadline`` is moved close instead of waiting it out.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -386,6 +389,37 @@ class _DropCompleteResponse(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
+class _LoseFail(httpx.AsyncBaseTransport):
+    """Real HTTP, except every ``/fail`` call is lost before it reaches the API."""
+
+    def __init__(self) -> None:
+        self._inner = httpx.AsyncHTTPTransport()
+        self.lost = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/fail"):
+            self.lost += 1
+            raise httpx.ConnectError("injected loss of the withdrawal", request=request)
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+class _CutBaseUpload(CandidateObjectStore):
+    """The real store; the first base object upload is cut before any byte lands."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.cut = 0
+
+    def upload_verified(self, key: str, *args: Any, **kwargs: Any) -> None:
+        if key.endswith("/base") and self.cut == 0:
+            self.cut += 1
+            raise ConnectionResetError("injected cut of the base upload")
+        super().upload_verified(key, *args, **kwargs)
+
+
 async def _drain(collector: RecoveryCollector, *, passes: int = 10) -> list[RecoveryCollectionPass]:
     results: list[RecoveryCollectionPass] = []
     for _ in range(passes):
@@ -595,13 +629,17 @@ class _Stage:
         return CandidateObjectStore(client=self.services.s3, bucket=self.services.bucket)
 
     def capture(
-        self, ledger: PublicationCandidateClient, *, budget_seconds: float = 60.0
+        self,
+        ledger: PublicationCandidateClient,
+        *,
+        budget_seconds: float = 60.0,
+        store: CandidateObjectStore | None = None,
     ) -> PublicationCandidateCapture:
         return PublicationCandidateCapture(
             ledger=ledger,
             writer=CandidateWriter(
                 ledger=ledger,
-                store=self.store(),
+                store=store or self.store(),
                 scratch_root=self.root / "candidate-scratch",
                 base_archive_limit_bytes=ARCHIVE_LIMIT,
             ),
@@ -617,11 +655,12 @@ class _Stage:
         ledger: PublicationCandidateClient | None = None,
         budget_seconds: float = 60.0,
         run: WorkItemRun | None = None,
+        store: CandidateObjectStore | None = None,
     ) -> CandidateCaptureResult:
         run = run or self.run
         assert run is not None
         ledger = ledger or await self.ledger()
-        return await self.capture(ledger).capture(
+        return await self.capture(ledger, store=store).capture(
             run,
             snapshot,
             self.prepared,
@@ -1214,6 +1253,61 @@ def test_exhausted_budget_records_capture_timeout(
     _assert_valkey_clean(sync_redis, names)
 
 
+def test_recapture_after_a_cut_base_upload_uploads_the_base(
+    services: _Services,
+    names: dict[str, str],
+    sync_redis: redis.Redis,
+    tmp_path: Path,
+) -> None:
+    async def go() -> None:
+        async with _stage(services, names, sync_redis, tmp_path) as stage:
+            await stage.start_run()
+            stage.direct_edits()
+            snapshot = await stage.snapshot()
+            key = f"capture-{uuid.uuid4().hex}"
+
+            # The with-base reserve commits, then the base upload is cut and the
+            # writer's withdrawal is lost: the candidate stays staging with no
+            # base bytes in the store.
+            cut = _CutBaseUpload(client=services.s3, bucket=services.bucket)
+            loser = _LoseFail()
+            first = await stage.capture_once(
+                snapshot,
+                dedupe_key=key,
+                ledger=await stage.ledger(transport=loser),
+                store=cut,
+            )
+            assert first.status == "failed" and first.code == "upload_failed", first
+            assert cut.cut == 1 and loser.lost == 1
+            assert [row["status"] for row in await stage.candidates()] == ["staging"]
+            base = next(row for row in await stage.objects() if row["kind"] == "base")
+            assert not stage.exists(f"private/{base['key']}")
+
+            # The same capture again is told to declare the base, then replays
+            # with both receipts and uploads both.
+            ledger = await stage.ledger()
+            second = await stage.capture_once(snapshot, dedupe_key=key, ledger=ledger)
+            assert second.status == "complete", second
+            assert second.candidate_id == first.candidate_id
+            assert [r["replayed"] for r in ledger.reservations] == [True]
+            assert sorted(obj["kind"] for obj in ledger.reservations[0]["objects"]) == [
+                "base",
+                "patch",
+            ]
+            assert [row["status"] for row in await stage.candidates()] == ["complete"]
+            receipts = {row["kind"]: row for row in await stage.objects()}
+            assert receipts["base"]["sha256"] == stage.prepared.sha256
+            stored = services.s3.get_object(
+                Bucket=services.bucket, Key=f"private/{receipts['base']['key']}"
+            )["Body"].read()
+            assert _sha(stored) == receipts["base"]["sha256"]
+            assert second.candidate_id is not None
+            await _read_candidate(stage, second.candidate_id, stage.root / "recaptured")
+
+    asyncio.run(go())
+    _assert_valkey_clean(sync_redis, names)
+
+
 # --- liveness of each capture refusal branch ------------------------------------------------
 
 
@@ -1348,6 +1442,47 @@ def test_helper_captures_only_for_this_events_started_run_with_budget(
             await stage.h.kernel._retain_and_validate_publication_snapshot(
                 _qevent(run.event_id), stage.thread_key, snapshot, run, 120.0
             )
+            rows = await stage.candidates()
+            assert [(row["status"], row["idempotency_key"]) for row in rows] == [
+                ("complete", run.event_id)
+            ]
+
+    asyncio.run(go())
+    _assert_valkey_clean(sync_redis, names)
+
+
+def test_helper_capture_is_bounded_by_the_execution_deadline(
+    services: _Services,
+    names: dict[str, str],
+    sync_redis: redis.Redis,
+    tmp_path: Path,
+) -> None:
+    async def go() -> None:
+        async with _stage(services, names, sync_redis, tmp_path) as stage:
+            run = await stage.start_run()
+            assert run.execution_deadline is not None
+            stage.direct_edits()
+            snapshot = await stage.snapshot()
+            stage.h.kernel._publication_candidates = stage.capture(await stage.ledger())
+            qevent = _qevent(run.event_id)
+            granted = run.execution_deadline
+            try:
+                # A large delivery budget, but 40 s to the execution deadline cannot
+                # keep 30 s for validation and 5 s for a failure report and still
+                # give the capture 5 s: nothing is captured, validation passes.
+                run.execution_deadline = datetime.now(UTC) + timedelta(seconds=40)
+                await stage.h.kernel._retain_and_validate_publication_snapshot(
+                    qevent, stage.thread_key, snapshot, run, 600.0
+                )
+                assert await stage.candidates() == []
+                assert await stage.outcome() is None
+                # Liveness: the same with a far execution deadline captures.
+                run.execution_deadline = datetime.now(UTC) + timedelta(hours=1)
+                await stage.h.kernel._retain_and_validate_publication_snapshot(
+                    qevent, stage.thread_key, snapshot, run, 600.0
+                )
+            finally:
+                run.execution_deadline = granted
             rows = await stage.candidates()
             assert [(row["status"], row["idempotency_key"]) for row in rows] == [
                 ("complete", run.event_id)

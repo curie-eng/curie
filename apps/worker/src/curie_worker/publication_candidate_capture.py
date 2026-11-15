@@ -113,6 +113,12 @@ class PublicationCandidateCapture:
         self._cleanup_budget = cleanup_budget_seconds
         self._clock = clock
 
+    @property
+    def outcome_allowance_seconds(self) -> float:
+        """The allowance a failed capture may spend past its budget to report why."""
+
+        return self._cleanup_budget
+
     async def capture(
         self,
         run: WorkItemRun,

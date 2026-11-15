@@ -369,6 +369,15 @@ async def reserve(
             raise CandidateRefusal("idempotency_conflict")
         if replay.status == "tombstoned":
             raise CandidateRefusal("candidate_state")
+        if (
+            replay.status == "staging"
+            and replay.includes_base
+            and not any(obj.kind == "base" for obj in body.objects)
+        ):
+            # A staging candidate whose base may never have been uploaded: the
+            # writer must spool and declare the base again, as on a first reserve,
+            # so the replay names both objects and it uploads both.
+            raise CandidateRefusal("base_required")
         return await _reservation(session, replay, replayed=True)
     patch = next(obj for obj in body.objects if obj.kind == "patch")
     base = next((obj for obj in body.objects if obj.kind == "base"), None)
