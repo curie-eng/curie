@@ -20,11 +20,11 @@ changed component with nothing inside it faked:
    checkout extracted from the claim's real base archive, reached through the real
    ``RunnerClient``. Only the model behind it is scripted (``FakeModelSession``).
 
-Real services are supplied by the caller and nothing here calls docker: Postgres
-from ``TEST_DATABASE_URL`` (an owned database is created and migrated), Valkey
-from ``TEST_VALKEY_HOST``/``TEST_VALKEY_PORT``, and an S3 endpoint from
-``TEST_S3_ENDPOINT_URL`` with ``S3_ACCESS_KEY``/``S3_SECRET_KEY``, in which this
-module creates its own uniquely named bucket. A missing prerequisite skips
+Real services: Postgres from ``TEST_DATABASE_URL`` (an owned database is
+created and migrated), Valkey from ``TEST_VALKEY_HOST``/``TEST_VALKEY_PORT``, and
+an S3 endpoint from ``TEST_S3_ENDPOINT_URL`` (the dev stack's RustFS by default,
+as the other S3 backed worker suites use) with ``S3_ACCESS_KEY``/``S3_SECRET_KEY``,
+in which this module creates its own uniquely named bucket. A missing prerequisite skips
 locally and fails under CI. Every owned resource (database, bucket, temp
 directories, Valkey keys under the test prefix) is removed and its absence
 asserted.
@@ -168,13 +168,6 @@ def _require_valkey() -> None:
         client.close()
 
 
-def _s3_endpoint() -> str:
-    endpoint = os.environ.get("TEST_S3_ENDPOINT_URL", "")
-    if not endpoint:
-        _unavailable("TEST_S3_ENDPOINT_URL names no S3 endpoint")
-    return endpoint
-
-
 def _s3_client(endpoint: str) -> Any:
     return build_recovery_s3_client(
         endpoint_url=endpoint,
@@ -252,7 +245,7 @@ class _Services:
 def services(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Services]:
     _require_postgres()
     _require_valkey()
-    endpoint = _s3_endpoint()
+    endpoint = os.environ.get("TEST_S3_ENDPOINT_URL", "http://127.0.0.1:29000")
     root = tmp_path_factory.mktemp("publication-candidate-services")
     with ExitStack() as stack:
 
