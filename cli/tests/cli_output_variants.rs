@@ -764,7 +764,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 text: Some("text".to_string()),
                 updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                 tenant_enabled: true,
-                application: CodingInstructionsApplication::Unavailable,
+                application: CodingInstructionsApplication::Available,
             }),
             "Document" => CodingInstructionsOutput::Document(CodingInstructionsStatus {
                 revision: 0,
@@ -1175,7 +1175,7 @@ fn every_cli_output_enum_has_samples() {
 }
 
 #[test]
-fn coding_instructions_schema_requires_unavailable_application_for_every_variant() {
+fn coding_instructions_schema_reports_both_application_states() {
     let schema: serde_json::Value =
         serde_json::from_str(include_str!("../schema/coding-instructions.schema.json"))
             .expect("coding instructions schema parses");
@@ -1186,13 +1186,23 @@ fn coding_instructions_schema_requires_unavailable_application_for_every_variant
         .expect("coding instructions samples");
     for (variant, value) in samples {
         assert!(validator.is_valid(value), "{variant}: {value}");
+        if value.get("dry_run").is_some() {
+            assert!(value.get("application").is_none(), "{value}");
+            continue;
+        }
         let mut missing = value.clone();
         missing.as_object_mut().unwrap().remove("application");
         assert!(!validator.is_valid(&missing), "{variant}: {missing}");
-        let mut available = value.clone();
-        available["application"] = serde_json::json!("available");
-        assert!(!validator.is_valid(&available), "{variant}: {available}");
+        let mut other = value.clone();
+        other["application"] = serde_json::json!("not-a-state");
+        assert!(!validator.is_valid(&other), "{variant}: {other}");
     }
+    let states: Vec<_> = samples
+        .iter()
+        .filter_map(|(_, value)| value.get("application").and_then(|item| item.as_str()))
+        .collect();
+    assert!(states.contains(&"available"), "{states:?}");
+    assert!(states.contains(&"unavailable"), "{states:?}");
 }
 
 #[test]

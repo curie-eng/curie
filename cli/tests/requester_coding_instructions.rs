@@ -106,6 +106,10 @@ fn object(output: &Output) -> Value {
 }
 
 fn status(revision: i64, text: Option<&str>) -> Value {
+    applied(revision, text, "unavailable")
+}
+
+fn applied(revision: i64, text: Option<&str>, application: &str) -> Value {
     json!({
         "revision": revision,
         "sha256": text.map(|_| "a".repeat(64)),
@@ -114,7 +118,7 @@ fn status(revision: i64, text: Option<&str>) -> Value {
         "text": text,
         "updated_at": (revision > 0).then_some("2026-11-13T00:00:00Z"),
         "tenant_enabled": true,
-        "application": "unavailable",
+        "application": application,
     })
 }
 
@@ -447,8 +451,9 @@ fn dry_run_validates_files_and_plans_the_selected_release_without_io() {
         assert_eq!(output.status.code(), Some(0), "{}", text(&output));
         let value = object(&output);
         assert_eq!(value["dry_run"], true);
-        assert_eq!(value["application"], "unavailable");
+        assert!(value.get("application").is_none(), "{value}");
         let plan = value["plan"].to_string();
+        assert!(!plan.contains("application to factory runs"), "{plan}");
         assert!(plan.contains("acme-ns"));
         assert!(plan.contains("release acme"));
         assert!(plan.contains("/coding-instructions"));
@@ -459,29 +464,55 @@ fn dry_run_validates_files_and_plans_the_selected_release_without_io() {
 }
 
 #[test]
-fn human_get_and_set_state_that_factory_application_is_unavailable() {
+fn human_get_and_set_print_the_deployment_application_state() {
     let fixture = Fixture::new();
     let session = fixture.session();
     let file = fixture.file("instructions", b"use precise names\n", 0o644);
-    let server = serve(|_| json_response(&status(1, Some("use precise names\n"))));
-    for verb in ["get", "set"] {
-        let mut argv = args(verb, &session, &server.base_url);
-        argv.remove(0);
-        if verb == "set" {
-            argv.extend([
-                "--file",
-                file.to_str().expect("UTF-8 fixture path"),
-                "--expected-revision",
-                "0",
-            ]);
+    for application in ["available", "unavailable"] {
+        let document = applied(1, Some("use precise names\n"), application);
+        let server = serve(move |_| json_response(&document));
+        for verb in ["get", "set"] {
+            let mut argv = args(verb, &session, &server.base_url);
+            argv.remove(0);
+            if verb == "set" {
+                argv.extend([
+                    "--file",
+                    file.to_str().expect("UTF-8 fixture path"),
+                    "--expected-revision",
+                    "0",
+                ]);
+            }
+            let output = fixture.run(&argv);
+            assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+            let rendered = text(&output);
+            assert!(
+                rendered.contains(&format!("application to factory runs: {application}")),
+                "{application} {verb}: {rendered}"
+            );
+            let other = if application == "available" {
+                "unavailable"
+            } else {
+                "available"
+            };
+            assert!(
+                !rendered.contains(&format!("application to factory runs: {other}")),
+                "{application} {verb}: {rendered}"
+            );
+            assert!(rendered.contains("use precise names"));
+            assert_no_credentials(&output);
+            let mut json_argv = args(verb, &session, &server.base_url);
+            if verb == "set" {
+                json_argv.extend([
+                    "--file",
+                    file.to_str().expect("UTF-8 fixture path"),
+                    "--expected-revision",
+                    "0",
+                ]);
+            }
+            let json = fixture.run(&json_argv);
+            assert_eq!(json.status.code(), Some(0), "{}", text(&json));
+            assert_eq!(object(&json)["application"], application);
         }
-        let output = fixture.run(&argv);
-        assert_eq!(output.status.code(), Some(0), "{}", text(&output));
-        let rendered = text(&output);
-        assert!(rendered.contains("application"));
-        assert!(rendered.contains("unavailable"));
-        assert!(rendered.contains("use precise names"));
-        assert_no_credentials(&output);
     }
 }
 
@@ -525,6 +556,8 @@ fn help_explains_provider_delivery_and_credential_exclusion() {
         let rendered = text(&output);
         assert!(rendered.contains("model provider"));
         assert!(rendered.contains("credentials"));
+        assert!(rendered.contains("whether this deployment applies them"));
+        assert!(!rendered.contains("unavailable"));
         assert!(!rendered.contains("--api-key"));
     }
 }

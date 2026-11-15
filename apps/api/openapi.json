@@ -6021,7 +6021,10 @@
       "CodingInstructionsOut": {
         "properties": {
           "application": {
-            "const": "unavailable",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
             "title": "Application",
             "type": "string"
           },

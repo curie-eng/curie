@@ -9,16 +9,16 @@ pub(crate) struct CodingInstructionsExpectedRevision {
 
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum ClusterCodingInstructionsAction {
-    /// Read your coding instructions and current revision. Application to
-    /// factory runs is unavailable.
+    /// Read your coding instructions and current revision. The response
+    /// reports whether this deployment applies them to factory runs.
     Get {
         #[command(flatten)]
         session: SubscriptionSession,
     },
     /// Replace your coding instructions from a UTF-8 file, preserving its
     /// whitespace. An empty file clears the document. The content reaches the
-    /// model provider and must not contain credentials. Application to factory
-    /// runs is unavailable.
+    /// model provider and must not contain credentials. The response reports
+    /// whether this deployment applies them to factory runs.
     Set {
         #[command(flatten)]
         session: SubscriptionSession,

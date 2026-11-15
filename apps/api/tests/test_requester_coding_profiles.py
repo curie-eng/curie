@@ -72,7 +72,28 @@ def test_body_at_cap_preserves_the_document_and_requires_a_session(
     assert saved["byte_length"] == MAX_BYTES
 
 
+def test_get_and_set_report_application_from_the_deployment_setting(
+    api: TestClient, owner: Owner
+) -> None:
+    """The owner routes report the deployment switch, including after a write."""
+
+    with enrollment.environment({"CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY": "true"}):
+        assert support.body(support.get(api, owner))["application"] == "available"
+        created = support.body(support.put(api, owner, "one\n", 0))
+        assert created["application"] == "available"
+    with enrollment.environment({"CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY": "false"}):
+        assert support.body(support.get(api, owner))["application"] == "unavailable"
+        replaced = support.body(support.put(api, owner, "two\n", created["revision"]))
+        assert replaced["application"] == "unavailable"
+        cleared = support.body(support.clear(api, owner, replaced["revision"]))
+        assert cleared["application"] == "unavailable"
+        assert cleared["text"] is None
+
+
 def test_create_replace_clear_retains_revision(api: TestClient, owner: Owner) -> None:
+    application = (
+        "available" if get_settings().requester_coding_instructions_apply else "unavailable"
+    )
     assert support.body(support.get(api, owner)) == {
         "revision": 0,
         "sha256": None,
@@ -81,7 +102,7 @@ def test_create_replace_clear_retains_revision(api: TestClient, owner: Owner) ->
         "text": None,
         "updated_at": None,
         "tenant_enabled": True,
-        "application": "unavailable",
+        "application": application,
     }
     first = support.body(support.put(api, owner, "first\r\nsecond\r  \t\n"))
     assert first["text"] == "first\nsecond\n  \t\n"
