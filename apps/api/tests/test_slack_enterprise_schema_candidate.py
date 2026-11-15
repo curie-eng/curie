@@ -13,7 +13,7 @@ from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[3]
 MIGRATION = ROOT / "apps/api/alembic/versions/0139_slack_enterprise_namespaces.py"
-CANDIDATE = {"schema_min": "0173", "schema_head": "0173"}
+CANDIDATE = {"schema_min": "0172", "schema_head": "0172"}
 
 
 def load(relative: str) -> Any:
@@ -31,7 +31,7 @@ def script() -> ScriptDirectory:
 def test_migration_0139_keeps_parent_0138_below_factory_base_head() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: additive revision after approval provenance."""
     graph = script()
-    assert graph.get_heads() == ["0173"]
+    assert graph.get_heads() == ["0172"]
     revision = graph.get_revision("0139")
     assert revision is not None and revision.down_revision == "0138"
     assert Path(revision.path).resolve() == MIGRATION.resolve()
@@ -93,7 +93,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
         "0169",
         "0170",
         "0171",
-        "0173",
+        "0172",
     ]
     kinds = load("apps/api/src/curie_api/revision_kinds.json")
     assert kinds["0139"] == "expand"
@@ -123,7 +123,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
     assert kinds["0169"] == "expand"
     assert kinds["0170"] == "expand"
     assert kinds["0171"] == "expand"
-    assert kinds["0173"] == "expand"
+    assert kinds["0172"] == "expand"
     serving = load("packages/protected-hooks/src/curie_protected_hooks/schema_serving.json")
     assert serving["revision_parents"]["0139"] == ["0138"]
     assert serving["revision_parents"]["0143"] == ["0141"]
@@ -152,7 +152,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
     assert serving["revision_parents"]["0169"] == ["0168"]
     assert serving["revision_parents"]["0170"] == ["0169"]
     assert serving["revision_parents"]["0171"] == ["0170"]
-    assert serving["revision_parents"]["0173"] == ["0171"]
+    assert serving["revision_parents"]["0172"] == ["0171"]
     chart_rows = load("charts/curie/files/schema-compat.json")["revisions"]
     chart = {row["revision"]: row for row in chart_rows}
     assert chart["0139"] == {

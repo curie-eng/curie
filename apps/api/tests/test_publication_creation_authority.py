@@ -436,7 +436,12 @@ def test_expired_new_proposal(stack: TestClient) -> None:
     assert heartbeat.status_code == 409, heartbeat.text
     finish = client.post(
         f"{prefix}/finish",
-        json={"runtime_epoch": 1, "outcome": "failed", "cause": "fixture_failed"},
+        json={
+            "runtime_epoch": 1,
+            "outcome": "failed",
+            "cause": "fixture_failed",
+            "retry_safety": "uncertain",
+        },
         headers=WORKER_HEADERS,
     )
     assert finish.status_code == 409, finish.text

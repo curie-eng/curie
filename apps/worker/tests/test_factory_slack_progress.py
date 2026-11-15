@@ -252,6 +252,43 @@ def test_a_kickoff_thread_owes_no_root_and_posts_progress_pr_and_terminal_into_i
     assert f"#{number}" not in " ".join(texts)
 
 
+def test_a_failed_run_with_an_automatic_retry_queued_does_not_ask_for_a_person(
+    stack: Stack,
+) -> None:
+    """A failure settled together with its automatic retry says the retry is queued.
+
+    The run fails flag clean with a cause the factory retries, so the API
+    admits the successor in the same settlement. Nobody is needed yet, and the
+    thread must not say so. A failure that admits nothing keeps the needs a
+    person line (the tests around this one).
+    """
+
+    _number, request_id, work_item_id, epoch, root_ts = _kickoff_run(stack)
+    response = stack.client.post(
+        f"/v1/internal/work-items/requests/{request_id}/finish",
+        headers=stack.internal,
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "model_unreachable",
+            "retry_safety": "no_effects",
+        },
+    )
+    assert response.status_code == 200, response.text
+    successors = _rows(
+        "SELECT status FROM curie.execution_requests WHERE retry_of_request_id = :id",
+        {"id": request_id},
+    )
+    assert successors == [{"status": "waiting"}], successors
+    stack.drain(fresh=True)
+
+    texts = _thread_texts(stack, root_ts)
+    assert len(texts) == 1, texts
+    assert texts[0].startswith(f"Automatic retry queued: {cause_text('model_unreachable')}")
+    assert "Needs a person" not in texts[0]
+    assert [post["kind"] for post in _posts(work_item_id)] == ["terminal"]
+
+
 def test_origin_delivery_when_the_configured_progress_channel_differs(stack: Stack) -> None:
     """A kickoff run posts in its own root while the destination names another channel.
 

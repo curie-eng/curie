@@ -53,6 +53,7 @@ from curie_api.schemas.workitems import (
 from .config import Settings
 from .factory_notices import start_failed_sentence
 from .factory_progress import phase_view
+from .factory_retry_policy import RetrySafety, condition_text
 from .models import (
     Approval,
     ExecutionRequest,
@@ -65,6 +66,7 @@ from .models import (
 )
 from .personal_execution import mode_of
 from .requester_instruction_admission import evidence, metadata
+from .workitems.lifecycle import AUTOMATIC_RETRY_LIMIT
 
 OBJECTIVE_LIMIT = 512
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
@@ -138,6 +140,22 @@ def _cause(
         deadline = req.wait_deadline
         if deadline is None:
             raise ValueError("a waiting request has no capacity deadline")
+        if req.blocked_on is not None:
+            text = (
+                f"automatic retry blocked on {req.blocked_on}: it waits for "
+                f"{condition_text(req.blocked_on)}"
+            )
+            if now >= deadline:
+                return (
+                    f"{text}; the waiting deadline elapsed at {_iso(deadline)} "
+                    "and expiry is pending the reconciler"
+                )
+            return f"{text}; waiting deadline {_iso(deadline)}"
+        if req.retry_of_request_id is not None and now < req.dispatch_not_before:
+            return (
+                f"automatic retry scheduled for {_iso(req.dispatch_not_before)}; "
+                f"waiting deadline {_iso(deadline)}"
+            )
         text = "waiting for sandbox capacity"
         if req.last_deferral_reason == "admission_unavailable":
             text = "waiting for sandbox admission observations"
@@ -169,6 +187,13 @@ def _cause(
             text += f"; pull request #{lineage.pr_number} is retained"
         return text
     if state == "expired":
+        # The state shape check keeps blocked_on on every retry_condition_expired row.
+        if cause == "retry_condition_expired" and req.blocked_on is not None:
+            return (
+                f"expired: retry_condition_expired, the automatic retry was still blocked on "
+                f"{req.blocked_on} ({condition_text(req.blocked_on)}) when its waiting "
+                f"deadline {_iso(req.wait_deadline)} elapsed"
+            )
         if cause == "capacity_wait_expired":
             return (
                 "expired: capacity_wait_expired, sandbox admission did not complete before the "
@@ -412,6 +437,8 @@ def derive_outcome(
         enrollment_generation=item.enrollment_generation,
         requester_principal_id=item.requester_principal_id,
         coding_instructions=metadata(item),
+        automatic_retries_used=item.automatic_retries_used,
+        automatic_retry_limit=AUTOMATIC_RETRY_LIMIT,
     )
 
 
@@ -458,6 +485,17 @@ def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
         enrollment_generation=req.enrollment_generation,
         coding_instructions_selection_id=req.coding_instructions_selection_id,
         coding_instructions_evidence=evidence(req.coding_instructions_evidence),
+        retry_of_request_id=req.retry_of_request_id,
+        retry_kind=(
+            "owner_loss"
+            if req.owner_lost_retry
+            else "failure"
+            if req.retry_of_request_id is not None
+            else None
+        ),
+        dispatch_not_before=req.dispatch_not_before,
+        blocked_on=req.blocked_on,
+        retry_safety=cast(RetrySafety | None, req.retry_safety),
     )
 
 

@@ -88,6 +88,7 @@ class CardInput:
     note: str | None
     phase_view: PhaseView
     cause_text: str | None
+    # This failed request's settlement admitted an automatic successor (ADR 0269).
     retrying: bool = False
 
 

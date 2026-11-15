@@ -2636,7 +2636,14 @@ class Launcher:
         return await asyncio.to_thread(self.substrate.lookup, self.proof.thread_key)
 
     async def finish(self, launched: Launched, cause: str) -> None:
-        await launched.run.finish(outcome="failed", cause=cause, detail=None, ci_fix_round=None)
+        await launched.run.finish(
+            outcome="failed",
+            cause=cause,
+            detail=None,
+            ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
+        )
 
     async def revalidate(self) -> tuple[int, dict[str, Any]]:
         """Read the token-free personal context, then compare-and-set its versions."""

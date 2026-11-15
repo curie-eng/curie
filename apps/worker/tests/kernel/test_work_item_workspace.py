@@ -55,6 +55,7 @@ from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
 from curie_worker.runner_client import RunnerWorkspaceSnapshot
 from curie_worker.sandbox import SandboxError, SuspendedThreadError
+from curie_worker.sandbox.types import OwnerBusy
 from curie_worker.workitem_dispatch import (
     TerminationClaim,
     WorkItemAcquireGrant,
@@ -706,9 +707,11 @@ def test_existing_pr_refusal_finishes_execute_once_without_starting_the_runner(
 @pytest.mark.parametrize(
     ("status", "code"), [(409, "invalid_context"), (503, "precheck_unavailable")]
 )
-def test_other_precheck_backend_errors_exhaust_the_existing_execute_retry_budget(
+def test_other_precheck_backend_errors_end_the_execute_turn_without_a_retry(
     make_harness, status: int, code: str
 ) -> None:
+    """ADR 0269: a started execute turn is one attempt inside a delivery."""
+
     async def exercise() -> None:
         publications = _HttpPrecheckApi([(status, {"detail": {"code": code}})])
         try:
@@ -724,20 +727,23 @@ def test_other_precheck_backend_errors_exhaust_the_existing_execute_retry_budget
                     _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
                 )
 
-                assert len(publications.mints) == h.config.max_attempts
+                assert h.config.max_attempts == 3
+                assert len(publications.mints) == 1
                 assert h.runner.opened == []
                 assert items.calls.count("finish") == 1
                 assert items.finishes[0]["outcome"] == "failed"
-                assert items.finishes[0]["cause"] == "runner_escalated"
+                assert items.finishes[0]["cause"] == "runner_error"
         finally:
             await publications.aclose()
 
     asyncio.run(exercise())
 
 
-def test_a_transient_generic_precheck_refusal_still_allows_a_factory_turn(
+def test_a_transient_generic_precheck_refusal_ends_a_started_factory_turn(
     make_harness,
 ) -> None:
+    """ADR 0269: the delivery does not ask again, so the second answer is unread."""
+
     async def exercise() -> None:
         publications = _HttpPrecheckApi(
             [(409, {"detail": {"code": "invalid_context"}}), (204, None)]
@@ -765,10 +771,14 @@ def test_a_transient_generic_precheck_refusal_still_allows_a_factory_turn(
                     _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
                 )
 
-                assert len(publications.mints) == 2
-                assert len(h.runner.opened) == 1
-                assert items.finishes == []
-                assert items.calls.count("hold_for_approval") == 1
+                assert len(publications.mints) == 1
+                assert h.runner.opened == []
+                assert items.calls.count("hold_for_approval") == 0
+                [finish] = items.finishes
+                assert finish["outcome"] == "failed"
+                assert finish["cause"] == "runner_error"
+                # No turn end was observed, so the SQL lifecycle admits nothing.
+                assert finish["retry_safety"] == "uncertain"
         finally:
             await publications.aclose()
 
@@ -1036,10 +1046,10 @@ def test_credit_exhausted_escalation_finishes_with_its_cause_and_message(
     asyncio.run(exercise())
 
 
-def test_model_unreachable_on_every_attempt_finishes_with_its_cause_and_message(
+def test_model_unreachable_finishes_after_one_attempt_with_its_cause_and_message(
     make_harness,
 ) -> None:
-    """#4333: an outage longer than the retries names the cause, not ``unclassified``."""
+    """#4333: a model outage names the cause, not ``unclassified``."""
 
     async def exercise() -> None:
         async with make_harness(
@@ -1060,12 +1070,14 @@ def test_model_unreachable_on_every_attempt_finishes_with_its_cause_and_message(
 
             await h.kernel.process_event(_turn(f"work-item-{request_id}-execute-1", prompt))
 
-            # Retryable with no side effect: every attempt is spent first.
-            assert h.runner.opened == [prompt, prompt, prompt]
+            # ADR 0269: one attempt per delivery. The finish carries the fact
+            # the SQL lifecycle needs to admit a fresh request.
+            assert h.runner.opened == [prompt]
             assert work_items.calls.count("finish") == 1
             finish = work_items.finishes[0]
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "model_unreachable"
+            assert finish["retry_safety"] == "no_effects"
             assert isinstance(finish["detail"], str)
             assert "API Error: Connection refused (ECONNREFUSED)" in finish["detail"]
 
@@ -1073,7 +1085,7 @@ def test_model_unreachable_on_every_attempt_finishes_with_its_cause_and_message(
 
 
 def test_workspace_retry_fault_finishes_with_redacted_bounded_stage_and_reason(
-    make_harness,
+    make_harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#4367: work-item finish consumes safe detail before reply formatting."""
 
@@ -1101,17 +1113,28 @@ def test_workspace_retry_fault_finishes_with_redacted_bounded_stage_and_reason(
             h.kernel._work_items = work_items
             # Start the real execution before the workspace retry fails. A
             # fault before start defers the request and has no finish reader.
-            h.runner.default_script = [
-                ErrorEvent(message="retry this clean attempt", classification="runner-error"),
-                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
-            ]
+            # An owner slot refusal after start is the one failure a started
+            # execute turn still retries inside the delivery (ADR 0269).
+            cap_token = h.kernel._cap_caller_token_to_deadline
+            refusals: list[str] = []
+
+            async def refuse_the_owner_slot_once(*args: object, **kwargs: object) -> object:
+                if not refusals:
+                    refusals.append("owner_busy")
+                    raise OwnerBusy
+                return await cap_token(*args, **kwargs)
+
+            monkeypatch.setattr(
+                h.kernel, "_cap_caller_token_to_deadline", refuse_the_owner_slot_once
+            )
             request_id = uuid.uuid4()
             prompt = f"Resolve {ISSUE_URL}"
 
             await h.kernel.process_event(_turn(f"work-item-{request_id}-execute-1", prompt))
 
-            assert h.runner.opened == [prompt]
-            assert h.kernel._workspace.selections == [WORK_ITEM_REPO] * 3
+            assert refusals == ["owner_busy"]
+            assert h.runner.opened == []
+            assert h.kernel._workspace.selections == [WORK_ITEM_REPO] * 2
             assert work_items.calls.count("start") == 1
             assert work_items.calls.count("finish") == 1
             finish = work_items.finishes[0]

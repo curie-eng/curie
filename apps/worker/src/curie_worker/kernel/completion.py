@@ -133,6 +133,17 @@ async def _complete(
     if run is not None and run.request_id in self._settling_work_items:
         run = None
     if run is not None and run.started and not run.finished:
+        # The two retry facts every finishing branch below reports. Approval
+        # is not a finish, so it reads no marker.
+        finishing = outcome != "awaiting-approval"
+        retry_safety = failures.retry_safety(
+            turn,
+            marker_flagged=finishing and await self._markers.saw_side_effect(qevent.event_id),
+            own_execute_turn=(
+                parsed is not None and parsed.kind == "execute" and run.event_id == qevent.event_id
+            ),
+        )
+        retry_condition = turn.retry_condition if turn is not None else None
         try:
             if outcome == "awaiting-approval":
                 # Approval is not a terminus. Stop the short lease refresh
@@ -167,6 +178,8 @@ async def _complete(
                     cause="runner_escalated" if turn.start_failed else "tracker_result",
                     detail=None,
                     ci_fix_round=None,
+                    retry_safety=retry_safety,
+                    retry_condition=retry_condition,
                 )
             elif outcome == "delivered":
                 ci_fix = parsed is not None and parsed.is_ci_fix
@@ -199,6 +212,8 @@ async def _complete(
                             else failures._finish_detail(turn.assistant_text)
                         ),
                         ci_fix_round=ci_fix_round,
+                        retry_safety=retry_safety,
+                        retry_condition=retry_condition,
                     )
                 except WorkItemConflict as exc:
                     if exc.code != "publication_pending":
@@ -214,6 +229,8 @@ async def _complete(
                     cause=failures._escalation_cause(turn),
                     detail=turn.error_message if turn is not None else None,
                     ci_fix_round=None,
+                    retry_safety=retry_safety,
+                    retry_condition=retry_condition,
                 )
             else:
                 await self._finish_or_settle(
@@ -222,6 +239,8 @@ async def _complete(
                     cause="runner_failed",
                     detail=None,
                     ci_fix_round=None,
+                    retry_safety=retry_safety,
+                    retry_condition=retry_condition,
                 )
         except WorkItemConflict as exc:
             logger.warning(

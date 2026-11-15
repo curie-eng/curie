@@ -268,6 +268,7 @@ def _finish(client: Any, row: dict[str, Any], *, round_: int | None = None) -> A
             "runtime_epoch": row["epoch"],
             "outcome": "failed",
             "cause": "no_pull_request" if round_ is None else "ci_fix_unpublished",
+            "retry_safety": "uncertain",
             "detail": "No changes needed: repository verification passed on the new base.",
             "ci_fix_round": round_,
         },

@@ -700,6 +700,8 @@ def test_observed_selection_in_applied_outcome_gap_preserves_transition_request(
             cause="no_pull_request",
             detail="No changes needed: repository verification passed on the new base.",
             ci_fix_round=None,
+            retry_safety="uncertain",
+            retry_condition=None,
         )
         assert isinstance(result, DispatchConflict), result
         assert result.code == "publication_pending"

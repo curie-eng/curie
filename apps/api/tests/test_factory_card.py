@@ -316,7 +316,12 @@ def test_terminal_cause_selects_the_card_pill_at_the_route(
     finished = client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=WORKER,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": cause},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": cause,
+            "retry_safety": "uncertain",
+        },
     )
     assert finished.status_code == 200, finished.text
 

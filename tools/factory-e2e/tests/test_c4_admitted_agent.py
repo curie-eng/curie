@@ -1575,7 +1575,7 @@ def test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecesso
     for action in ("heartbeat", "hold-approval", "finish"):
         body: dict[str, Any] = {"runtime_epoch": predecessor["runtime_epoch"]}
         if action == "finish":
-            body.update(outcome="failed", cause="runner_escalated")
+            body.update(outcome="failed", cause="runner_escalated", retry_safety="no_effects")
         status, result = run.api_result(
             "POST", f"/v1/internal/work-items/requests/{predecessor['id']}/{action}",
             body, internal=True,

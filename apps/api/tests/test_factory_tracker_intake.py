@@ -1751,6 +1751,7 @@ def _completed_open_polled_authority(
                 "runtime_epoch": epoch,
                 "outcome": "failed",
                 "cause": "no_pull_request",
+                "retry_safety": "uncertain",
                 "detail": "No changes needed: verification passed on the moved head.",
             },
         )
@@ -1797,6 +1798,7 @@ def _complete_polled_unchanged_follow_up(
             "runtime_epoch": epoch,
             "outcome": "failed",
             "cause": "no_pull_request",
+            "retry_safety": "uncertain",
             "detail": "No changes needed: the existing pull request satisfies this follow-up.",
         },
     )

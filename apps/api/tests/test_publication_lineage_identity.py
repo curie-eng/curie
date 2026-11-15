@@ -1288,6 +1288,7 @@ def test_label_readmission_of_headless_all_null_base_uses_moved_repository_defau
                 "runtime_epoch": started["runtime_epoch"],
                 "outcome": "failed",
                 "cause": "provider_error",
+                "retry_safety": "uncertain",
             },
             headers=WORKER_HEADERS,
         )

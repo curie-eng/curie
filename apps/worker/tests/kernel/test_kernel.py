@@ -3493,7 +3493,11 @@ def test_deleted_pod_after_side_effect_escalates_as_sandbox_terminated(make_harn
     asyncio.run(go())
 
 
-def test_deleted_pod_without_side_effect_retries(make_harness) -> None:
+def test_deleted_pod_without_side_effect_ends_the_factory_turn_after_one_attempt(
+    make_harness,
+) -> None:
+    """ADR 0269: the SQL lifecycle owns the retry, so the delivery opens one turn."""
+
     async def go() -> None:
         async with make_harness(
             binding=_Binding(),
@@ -3510,8 +3514,14 @@ def test_deleted_pod_without_side_effect_retries(make_harness) -> None:
 
             await h.kernel.process_event(event)
 
-            assert h.runner.opened == [ISSUE_PROMPT, ISSUE_PROMPT]
-            assert len(h.fake_k8s.termination_queries) == 2
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(h.fake_k8s.termination_queries) == 1
+            [finish] = items.finishes
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            # Flag clean with the termination observed: the fact a successor needs.
+            assert finish["retry_safety"] == "no_effects"
+            assert finish["retry_condition"] is None
 
     asyncio.run(go())
 
@@ -3614,7 +3624,7 @@ def test_stream_drop_without_termination_ends_runner_error_at_the_10_s_bound(
 
             assert "runner-error" in caplog.text
             assert len(items.finishes) == 1
-            assert items.finishes[0]["cause"] == "runner_escalated"
+            assert items.finishes[0]["cause"] == "runner_error"
             assert read_at == [i * 0.5 for i in range(20)]
             assert clock.sleeps
             assert all(delay == 0.5 for delay in clock.sleeps)
@@ -3683,9 +3693,59 @@ def test_sandbox_release_waits_for_termination_classification(
     asyncio.run(go())
 
 
-def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factory(
+def _eviction_then_no_diagnosis(h: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    diagnoses = iter(
+        [
+            SandboxTermination(
+                reason="Evicted",
+                detail=(
+                    'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi". '
+                    "token=exampleSecretValue123456 " + "x" * 400
+                ),
+            ),
+            None,
+        ]
+    )
+
+    def diagnose(
+        name: str, *, request_timeout_seconds: float, since: datetime
+    ) -> SandboxTermination | None:
+        h.fake_k8s.termination_queries.append(name)
+        return next(diagnoses)
+
+    monkeypatch.setattr(h.fake_k8s, "pod_termination", diagnose)
+    h.runner.default_script = [TextDelta(text="partial")]
+    h.runner.abort_after_frames = True
+
+
+def test_first_eviction_survives_generic_failure_on_retry_in_terminal(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interactive turn still retries, and its final reply names the eviction."""
+
+    async def go() -> None:
+        async with make_harness(max_attempts=2) as h:
+            _eviction_then_no_diagnosis(h, monkeypatch)
+
+            await h.kernel.process_event(qevent("go"))
+
+            assert h.runner.opened == ["go", "go"]
+            assert len(h.fake_k8s.termination_queries) == 2
+            reply = h.sink.last_text
+            assert reply is not None
+            assert "runner-error" in reply
+            assert "Earlier attempt" in reply
+            assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in reply
+            assert "exampleSecretValue123456" not in reply
+
+    asyncio.run(go())
+
+
+def test_first_eviction_ends_a_factory_execute_turn_with_its_own_cause(
     make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """ADR 0269: no second attempt runs, so the eviction is the finish cause."""
+
     async def go() -> None:
         async with make_harness(
             binding=_Binding(),
@@ -3695,45 +3755,22 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
-            diagnoses = iter(
-                [
-                    SandboxTermination(
-                        reason="Evicted",
-                        detail=(
-                            'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi". '
-                            "token=exampleSecretValue123456 " + "x" * 400
-                        ),
-                    ),
-                    None,
-                ]
-            )
-
-            def diagnose(
-                name: str, *, request_timeout_seconds: float, since: datetime
-            ) -> SandboxTermination | None:
-                h.fake_k8s.termination_queries.append(name)
-                return next(diagnoses)
-
-            monkeypatch.setattr(h.fake_k8s, "pod_termination", diagnose)
-            h.runner.default_script = [TextDelta(text="partial")]
-            h.runner.abort_after_frames = True
+            _eviction_then_no_diagnosis(h, monkeypatch)
             event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
 
             await h.kernel.process_event(event)
 
-            assert h.runner.opened == [ISSUE_PROMPT, ISSUE_PROMPT]
-            assert len(h.fake_k8s.termination_queries) == 2
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(h.fake_k8s.termination_queries) == 1
             # Factory work items intentionally suppress a direct reply. The
             # terminal issue comment is built from the recorded finish below.
-            assert "runner-error" in caplog.text
-            assert "Earlier attempt" in caplog.text
+            assert "sandbox-terminated" in caplog.text
             assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in caplog.text
             assert "exampleSecretValue123456" not in caplog.text
             assert len(items.finishes) == 1
             finish = items.finishes[0]
-            assert finish["cause"] == "runner_escalated"
+            assert finish["cause"] == "sandbox_terminated"
             assert isinstance(finish["detail"], str)
-            assert "Earlier attempt" in finish["detail"]
             assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in finish["detail"]
             assert "exampleSecretValue123456" not in finish["detail"]
             assert len(finish["detail"]) <= 300
@@ -3785,7 +3822,7 @@ def test_publication_unrecorded_escalation_has_its_own_cause(make_harness) -> No
     [
         ("false-completion", "runner_escalated", 3),
         ("approval-not-acted", "runner_escalated", 3),
-        ("runner-error", "runner_escalated", 1),
+        ("runner-error", "runner_error", 1),
         ("model-credit-exhausted", "model_credit_exhausted", 3),
         ("model-usage-limited", "model_usage_limited", 3),
         ("model-credential-rejected", "model_credential_rejected", 3),
