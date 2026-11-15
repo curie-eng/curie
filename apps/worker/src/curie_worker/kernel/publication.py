@@ -185,7 +185,7 @@ async def _continue_unpublished(
     channel_read_grant: channel_read.TurnChannelReadGrant | None = None,
     attachment_turn: attachment_access.AttachmentAccessTurn | None = None,
 ) -> failures.TurnOutcome:
-    """Re-prompt a factory execute turn that ended without publishing, ONCE.
+    """Re-prompt an unpublished factory turn once, preserving explicit PR no-change replies.
 
     The returned outcome merges both turns: the tools either called, and the
     first turn's reply when the continuation said nothing. A continuation
@@ -208,6 +208,12 @@ async def _continue_unpublished(
         or outcome.continued
         or outcome.status not in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT)
         or PLATFORM_PUBLISH_TOOL_NAME in outcome.tools_called
+    ):
+        return outcome
+    if (
+        run.recorded_pr_url is not None
+        and run.recorded_pr_url.strip()
+        and outcome.assistant_text.strip().startswith("No changes needed:")
     ):
         return outcome
     left = run.bound_remaining_s(remaining_s)

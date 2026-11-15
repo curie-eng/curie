@@ -14,6 +14,7 @@ double is the boundary outside the box.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import subprocess
 import time
@@ -609,6 +610,99 @@ def test_issue_4752_unpublished_revision_uses_the_recorded_pull_request(
         assert items.finishes[0]["cause"] == ("early_stop" if context_only else worked_cause)
         assert items.finishes[0]["detail"] == detail
         assert publications.creates == []
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("case_id", ["answers-recorded-decision", "admits-unrecorded-decision"])
+@pytest.mark.parametrize("tool", ["Read", PROGRESS_TOOL])
+@pytest.mark.parametrize("status", [SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT])
+def test_decision_followup_preserves_the_graded_terminal_answer(
+    make_harness, case_id: str, tool: str, status: SessionStatus
+) -> None:
+    from curie_api.factory_comment_text import marker_for
+    from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
+    from curie_worker.eval.models import EvalSuite
+
+    root = Path(__file__).resolve().parents[4]
+    suite = EvalSuite.model_validate_json(
+        (root / "examples/dark-factory/evals/cases.json").read_text()
+    )
+    case = next(case for case in suite.cases if case.id == case_id)
+    fixtures = json.loads((root / "cli/tests/data/eval_falsifiability_fixtures.json").read_text())
+    answer = fixtures["exemplars"][f"dark-factory/{case_id}"]
+    summary = (
+        "No changes needed: the pull request is already complete; I answered "
+        "by citing Decisions entry 1. Nothing in the question asked for a code change."
+    )
+
+    async def exercise() -> None:
+        publications = _PublicationApi(_revision_lineage(PR_URL, "1700000000.000001"))
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, publication_creator=publications
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.runner.turn_scripts = [
+                [_tool(tool), TextDelta(text=answer), Final(text=answer, status=status)],
+                [_done(summary)],
+            ]
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", case.input)
+            await h.kernel.process_event(event)
+
+            assert len(items.finishes) == 1
+            detail = items.finishes[0]["detail"]
+            assert isinstance(detail, str)
+            assert case.grader.grade(detail), detail
+            assert not case.grader.grade(summary)
+            assert detail == answer
+            request_id = next(iter(items.starts))
+            body = status_body(
+                request_id=request_id,
+                card_url=None,
+                pill_label="SUCCEEDED",
+                phase_view=None,
+                result=result_section(
+                    "completed",
+                    pr_url=PR_URL,
+                    feedback_url=case.input.splitlines()[0],
+                    detail=detail,
+                    unchanged=True,
+                ),
+            )
+            assert f"> {answer}" in body
+            assert body.count(FINAL_MARKER) == 1
+            assert body.count(marker_for(request_id)) == 1
+            assert h.runner.opened == [case.input]
+            assert publications.creates == []
+            assert await h.kernel._markers.is_terminal(event.event_id)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("pr_url", "reply"),
+    [
+        (None, "No changes needed: the reason was not recorded."),
+        (" \t ", "No changes needed: the reason was not recorded."),
+        (PR_URL, "I will make the requested change next."),
+        (PR_URL, "The response should start with No changes needed: when appropriate."),
+    ],
+)
+def test_a_missing_lineage_or_no_change_outcome_still_gets_a_continuation(
+    make_harness, pr_url: str | None, reply: str
+) -> None:
+    async def exercise() -> None:
+        publications = _PublicationApi(_revision_lineage(pr_url, "1700000000.000001"))
+        opened, items, terminal = await _run_execute(
+            make_harness,
+            [[_tool("Read"), _done(reply)], [_done("Continue the requested work.")]],
+            publication_creator=publications,
+        )
+        assert len(opened) == 2
+        assert "publish_changes" in opened[1]
+        assert items.finishes[0]["detail"] == "Continue the requested work."
+        assert terminal
 
     asyncio.run(exercise())
 
