@@ -7,6 +7,10 @@ documented GET /api/v1/key shapes:
 https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key
 The amounts in the replayed body are sentinels, and the key is a low-entropy
 placeholder.
+
+The end to end tests at the bottom (AC1) also run the real runner app over a
+scripted model session, the real worker consumer and finish, the real API and
+real reconciler passes, through ``FactoryRetryCase``.
 """
 
 from __future__ import annotations
@@ -22,12 +26,16 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 import redis
 import redis.asyncio as aredis
+from claude_agent_sdk import AssistantMessage, RateLimitEvent, ResultMessage, TextBlock
+from claude_agent_sdk.types import AssistantMessageError, RateLimitInfo
+from curie_api.config import get_settings
+from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_internal.provider_gate_ledger import (
     claim_probe,
     lease_key,
@@ -46,8 +54,19 @@ from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.config import WorkerConfig
 from curie_worker.provider_probe import ProviderProbeLoop, read_openrouter_allowance
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
+
+from apps.worker.tests.factory_retry_fixtures import (
+    Call,
+    FactoryRetryCase,
+    Item,
+    RealRunner,
+    factory_retry,
+    factory_retry_database,
+)
+
+__all__ = ["factory_retry", "factory_retry_database"]
 
 # Low-entropy placeholders only.
 # Every test runs under its own credentials (see ``_per_test_credentials``), so the
@@ -582,3 +601,530 @@ def test_the_key_never_reaches_logs_or_valkey(
     assert KEY not in blob
     assert KEY.removeprefix("sk-or-v1-") not in blob
     assert "12.5" not in caplog.text
+
+
+# -- AC1 end to end: runner, NDJSON, worker finish, API settlement, reconciler -------
+#
+# Each test below serves the real runner app (the production SessionRunner over a
+# FakeModelSession replaying the scripted SDK messages) for every sandbox the case
+# claims, so the condition is built by the real translator and session, crosses the
+# real NDJSON wire to the real worker consumer and finish, and is settled by the real
+# API into SQL. Every release pass runs a WorkItemReconciler constructed for that pass,
+# standing for an API restart, on the worker's key prefix. The probe is the real
+# ProviderProbeLoop; only OpenRouter GET /api/v1/key is faked, at the HTTP edge.
+
+# Observed 2026-10-29 (#5163, fixture ``_OPENROUTER_WORKSPACE_BUDGET_403`` in
+# runner/tests/test_translate.py and runner/tests/test_provider_retry_condition.py):
+# an OpenRouter workspace daily budget refusal is HTTP 403, reported by the SDK as
+# error="authentication_failed". ``{reset}`` replaces the observed reset clause.
+_WORKSPACE_BUDGET_403 = (
+    'API Error: 403 {{"error":{{"message":"Workspace daily budget of $20.00 exceeded. '
+    'Contact your org admin. $20.08 of $20.00 used{reset}",'
+    '"code":403}}}}'
+)
+# Observed 2026-10-05 on a staging install (#4104, fixture ``_OPENROUTER_KEY_LIMIT_403``
+# in runner/tests/test_translate.py): an OpenRouter key at its own spend limit,
+# reported as error="authentication_failed".
+_KEY_LIMIT_403 = (
+    'API Error: 403 {"error":{"message":"Key limit exceeded (total limit). Manage it '
+    'using https://openrouter.ai/workspaces/example/keys/example","code":403}}'
+)
+# OpenRouter documents HTTP 401 for invalid credentials, with an
+# {"error":{"code","message"}} body:
+# https://openrouter.ai/docs/api/reference/errors-and-debugging
+# The 'API Error: <status>' prefix is the CLI format observed for the 402 and 403
+# fixtures (runner/tests/test_translate.py).
+_OPENROUTER_401 = 'API Error: 401 {"error":{"message":"User not found.","code":401}}'
+# A 403 with no credit, budget or documented 401 text (runner/tests/test_translate.py
+# pins it as not credit exhausted).
+_GENERIC_403 = 'API Error: 403 {"error":{"message":"invalid api key","code":403}}'
+_RESET_GRACE = timedelta(seconds=60)
+_CLEAN_TURN_FINISH = {"cause": "model_unreachable", "retry_safety": "no_effects"}
+
+
+def _budget_403(reset_clause: str) -> str:
+    return _WORKSPACE_BUDGET_403.format(reset=reset_clause)
+
+
+def _rfc3339(moment: datetime, designator: str = "Z") -> str:
+    return f"{moment:%Y-%m-%dT%H:%M:%S}.000{designator}"
+
+
+def _failed_result(text_: str) -> ResultMessage:
+    return ResultMessage(
+        subtype="error_during_execution",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="fake-session",
+        result=text_,
+        usage=None,
+    )
+
+
+def _errored_turn(error: str, provider_text: str) -> Callable[[], list[Any]]:
+    """A model turn whose assistant message carries the SDK error and provider text."""
+
+    def script() -> list[Any]:
+        return [
+            AssistantMessage(
+                content=[TextBlock(text=provider_text)],
+                model="fake-model",
+                error=cast("AssistantMessageError", error),
+            ),
+            _failed_result(provider_text),
+        ]
+
+    return script
+
+
+def _rate_limited_turn(resets_at: int) -> Callable[[], list[Any]]:
+    """A model turn the SDK ends with a rejected rate limit event.
+
+    Provenance: the typed SDK field ``claude_agent_sdk.types.RateLimitInfo.resets_at``.
+    """
+
+    def script() -> list[Any]:
+        return [
+            RateLimitEvent(
+                rate_limit_info=RateLimitInfo(status="rejected", resets_at=resets_at),
+                uuid="fake-rate-limit",
+                session_id="fake-session",
+            ),
+            _failed_result("model rate limit reached"),
+        ]
+
+    return script
+
+
+def _key_body(limit: float, remaining: float) -> httpx.Response:
+    """The documented GET /api/v1/key 200 shape with sentinel amounts."""
+
+    return httpx.Response(
+        200, json={"data": {**_KEY_BODY["data"], "limit": limit, "limit_remaining": remaining}}
+    )
+
+
+def _turns(runners: list[RealRunner]) -> int:
+    return sum(runner.turns for runner in runners)
+
+
+@dataclass
+class EndToEnd:
+    """One FactoryRetryCase, the fake OpenRouter edge and the passes the tests run."""
+
+    case: FactoryRetryCase
+    client: httpx.AsyncClient
+    script: Script
+
+    @property
+    def prefix(self) -> str:
+        return self.case.names["prefix"]
+
+    @property
+    def valkey(self) -> aredis.Redis:
+        valkey = self.case.reconciler_valkey
+        assert valkey is not None
+        return valkey
+
+    async def db_now(self) -> datetime:
+        (row,) = await self.case.rows("SELECT clock_timestamp() AS now")
+        now: datetime = row["now"]
+        return now
+
+    async def reconcile(self, passes: int = 1) -> None:
+        """Real reconciler passes, each by a reconciler constructed for it (a restart)."""
+
+        for _ in range(passes):
+            reconciler = WorkItemReconciler(
+                async_sessionmaker(self.case.engine, expire_on_commit=False),
+                self.valkey,
+                get_settings().model_copy(update={"worker_key_prefix": self.prefix}),
+            )
+            await reconciler.run_once()
+            await self.case.settle()
+
+    async def probe(self, credential: str, *, offset: timedelta) -> None:
+        """One real probe loop tick, its clock ``offset`` after database time.
+
+        Moving the injected clock stands for the probe interval passing between
+        ticks; the ledger is stamped from this clock.
+        """
+
+        clock = Clock(await self.db_now() + offset)
+        loop = ProviderProbeLoop(
+            self.case.engine,
+            WorkerConfig(db_schema="curie", key_prefix=self.prefix, credentials=credential),
+            self.valkey,
+            client=self.client,
+            clock=clock,
+            environ={"CURIE_OPENROUTER_API_URL": API},
+        )
+        await loop.tick()
+
+    async def fail(self, item: Item) -> tuple[Call, dict[str, Any], dict[str, Any]]:
+        """Dispatch ``item``'s request; its finish, its stored row and its successor."""
+
+        case = self.case
+        await case.publish_wake(item.request_id)
+        finish = await case.finished(item.request_id)
+        await case.settle()
+        predecessor = await case.row(item.request_id)
+        assert predecessor["status"] == "failed", predecessor
+        successor = await case.successor(item.request_id)
+        assert successor is not None and successor["status"] == "waiting", successor
+        return finish, predecessor, successor
+
+    async def assert_asleep(self, request_id: uuid.UUID) -> None:
+        """The request is waiting, was never woken and was never acquired."""
+
+        row = await self.case.row(request_id)
+        assert (row["status"], row["published_generation"], row["started_at"]) == (
+            "waiting",
+            None,
+            None,
+        ), row
+        assert self.case.wakes_for(request_id) == []
+        assert self.case.calls_to("acquire", request_id) == []
+
+    async def assert_ran_once(self, request_id: uuid.UUID) -> None:
+        """The released request started exactly one runner turn and finished it."""
+
+        finish = await self.case.finished(request_id)
+        assert {key: finish.body[key] for key in _CLEAN_TURN_FINISH} == _CLEAN_TURN_FINISH
+        await self.case.settle()
+        assert [call.status for call in self.case.calls_to("start", request_id)] == [200]
+        assert (await self.case.row(request_id))["execution_attempts"] == 1
+
+
+def _end_to_end(case: FactoryRetryCase, body: Callable[[EndToEnd], Any]) -> None:
+    async def go() -> None:
+        script = Script()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(script)) as client:
+            await body(EndToEnd(case, client, script))
+
+    case.run(go())
+
+
+def _assert_bearer_of(request: httpx.Request, credential: str) -> None:
+    assert request.method == "GET"
+    assert str(request.url) == f"{API}/key"
+    assert request.headers["authorization"] == f"Bearer {credential}"
+
+
+def test_documented_daily_reset_waits_until_the_reset_plus_sixty_seconds(
+    factory_retry: FactoryRetryCase,
+) -> None:
+    case = factory_retry
+
+    async def body(e2e: EndToEnd) -> None:
+        reset = (await e2e.db_now() + timedelta(minutes=5)).replace(microsecond=0)
+        refusal = _budget_403(f"; resets {_rfc3339(reset)}.")
+        failing = await case.real_runners(
+            1,
+            script=_errored_turn("authentication_failed", refusal),
+            provider_scope=_own_scope(),
+        )
+        later = await case.real_runners(2)
+
+        finish, predecessor, successor = await e2e.fail(case.item)
+        assert finish.body["cause"] == "model_credit_exhausted"
+        assert finish.body["retry_safety"] == "no_effects"
+        assert finish.body["retry_condition"]["reason"] == "usage_reset"
+        # The budget is workspace scoped, so the condition names no key scope.
+        assert (
+            predecessor["retry_condition_reason"],
+            predecessor["retry_condition_retry_at"],
+            predecessor["retry_condition_scope_key"],
+        ) == ("usage_reset", reset, None)
+        assert successor["blocked_on"] is None
+        assert successor["dispatch_not_before"] == reset + _RESET_GRACE
+        assert await case.used(case.item.work_item_id) == 1
+
+        await e2e.reconcile(passes=2)
+        await e2e.assert_asleep(successor["id"])
+        assert _turns(failing) == 1 and _turns(later) == 0
+
+        # Stand for the reset plus its grace passing: only the waiting successor's
+        # dispatch_not_before is rewritten into the past.
+        await case.make_due(successor["id"])
+        await e2e.reconcile()
+        await e2e.assert_ran_once(successor["id"])
+        assert [runner.turns for runner in later] == [1, 0]
+        assert _turns(failing) == 1
+
+    _end_to_end(case, body)
+
+
+def test_ordinary_throttle_backs_off_until_the_typed_reset(
+    factory_retry: FactoryRetryCase,
+) -> None:
+    case = factory_retry
+
+    async def body(e2e: EndToEnd) -> None:
+        scope = _own_scope()
+        resets_at = int((await e2e.db_now() + timedelta(minutes=5)).timestamp())
+        failing = await case.real_runners(
+            1, script=_rate_limited_turn(resets_at), provider_scope=scope
+        )
+        later = await case.real_runners(2)
+
+        finish, predecessor, successor = await e2e.fail(case.item)
+        assert finish.body["cause"] == "model_rate_limited"
+        assert finish.body["retry_safety"] == "no_effects"
+        retry_at = datetime.fromtimestamp(resets_at, tz=UTC)
+        assert (
+            predecessor["retry_condition_reason"],
+            predecessor["retry_condition_retry_at"],
+            predecessor["retry_condition_scope_key"],
+        ) == ("rate_limited", retry_at, scope.scope_key)
+        # A backoff, not a block, due no earlier than the provider's reset.
+        assert successor["blocked_on"] is None
+        assert successor["dispatch_not_before"] >= retry_at
+        assert successor["dispatch_not_before"] == retry_at
+
+        await e2e.reconcile(passes=2)
+        await e2e.assert_asleep(successor["id"])
+        assert _turns(failing) == 1 and _turns(later) == 0
+
+        # Stand for the reset passing: only the successor's dispatch_not_before moves.
+        await case.make_due(successor["id"])
+        await e2e.reconcile()
+        await e2e.assert_ran_once(successor["id"])
+        assert [runner.turns for runner in later] == [1, 0]
+
+    _end_to_end(case, body)
+
+
+def test_invalid_credential_blocks_until_a_replaced_credential_authenticates(
+    factory_retry: FactoryRetryCase,
+) -> None:
+    case = factory_retry
+
+    async def body(e2e: EndToEnd) -> None:
+        failed_scope = _own_scope()
+        failing = await case.real_runners(
+            1,
+            script=_errored_turn("authentication_failed", _OPENROUTER_401),
+            provider_scope=failed_scope,
+        )
+        later = await case.real_runners(2)
+        item = case.item
+
+        finish, predecessor, successor = await e2e.fail(item)
+        # The worker reports the runner's model-credential-rejected classification.
+        assert finish.body["cause"] == "model_credential_rejected"
+        assert finish.body["retry_safety"] == "no_effects"
+        assert (
+            predecessor["retry_condition_reason"],
+            predecessor["retry_condition_retry_at"],
+            predecessor["retry_condition_scope_key"],
+        ) == ("credential_rejected", None, failed_scope.scope_key)
+        assert successor["blocked_on"] == "provider_credential"
+        assert await case.used(item.work_item_id) == 1
+
+        await e2e.reconcile(passes=3)
+        # The worker still runs with the rejected credential: nothing is read.
+        await e2e.probe(KEY, offset=timedelta(seconds=1))
+        assert e2e.script.requests == []
+        await e2e.reconcile(passes=2)
+        await e2e.assert_asleep(successor["id"])
+        assert _turns(failing) == 1 and _turns(later) == 0
+
+        # The credential is replaced: the probe reads the new key once and it
+        # authenticates. The successor is released by a fresh reconciler.
+        e2e.script.steps.append(_ok())
+        await e2e.probe(OTHER_KEY, offset=timedelta(seconds=31))
+        assert len(e2e.script.requests) == 1
+        _assert_bearer_of(e2e.script.requests[0], OTHER_KEY)
+        await e2e.reconcile()
+        await e2e.assert_ran_once(successor["id"])
+        assert [runner.turns for runner in later] == [1, 0]
+        assert _turns(failing) == 1
+        # The release spent no allowance: the released turn's own transient failure
+        # took the second and last automatic slot, which is only possible when the
+        # count still stood at one after the release.
+        assert await case.used(item.work_item_id) == 2
+        third = await case.successor(successor["id"])
+        assert third is not None and third["status"] == "waiting", third
+
+    _end_to_end(case, body)
+
+
+def test_depleted_credit_releases_only_on_a_raised_limit(
+    factory_retry: FactoryRetryCase,
+) -> None:
+    case = factory_retry
+
+    async def body(e2e: EndToEnd) -> None:
+        scope = _own_scope()
+        failing = await case.real_runners(
+            1,
+            script=_errored_turn("authentication_failed", _KEY_LIMIT_403),
+            provider_scope=scope,
+        )
+        later = await case.real_runners(2)
+
+        finish, predecessor, successor = await e2e.fail(case.item)
+        assert finish.body["cause"] == "model_credit_exhausted"
+        assert (
+            predecessor["retry_condition_reason"],
+            predecessor["retry_condition_retry_at"],
+            predecessor["retry_condition_scope_key"],
+        ) == ("credit_exhausted", None, scope.scope_key)
+        assert successor["blocked_on"] == "provider_credit"
+
+        # The same limit with a rising remainder (a usage fall or a period
+        # rollover) is not added allowance. Each tick's clock is 30 s past the
+        # last, the probe interval.
+        e2e.script.steps.extend([_key_body(25, 0.5), _key_body(25, 12.5)])
+        await e2e.probe(KEY, offset=timedelta(seconds=1))
+        await e2e.reconcile(passes=2)
+        await e2e.probe(KEY, offset=timedelta(seconds=32))
+        await e2e.reconcile(passes=2)
+        assert len(e2e.script.requests) == 2
+        await e2e.assert_asleep(successor["id"])
+        assert _turns(failing) == 1 and _turns(later) == 0
+
+        # A strictly greater limit with something left under it releases.
+        e2e.script.steps.append(_key_body(50, 25))
+        await e2e.probe(KEY, offset=timedelta(seconds=63))
+        assert len(e2e.script.requests) == 3
+        for request in e2e.script.requests:
+            _assert_bearer_of(request, KEY)
+        await e2e.reconcile()
+        await e2e.assert_ran_once(successor["id"])
+        assert [runner.turns for runner in later] == [1, 0]
+
+    _end_to_end(case, body)
+
+
+def test_generic_403_and_unscoped_rejections_stay_blocked_while_a_valid_control_releases(
+    factory_retry: FactoryRetryCase,
+) -> None:
+    case = factory_retry
+
+    async def body(e2e: EndToEnd) -> None:
+        scope = _own_scope()
+        generic = await case.real_runners(
+            1, script=_errored_turn("authentication_failed", _GENERIC_403), provider_scope=scope
+        )
+        # A runner that could not name its scope (scope None).
+        unscoped = await case.real_runners(
+            1, script=_errored_turn("authentication_failed", _OPENROUTER_401)
+        )
+        control = await case.real_runners(
+            1, script=_errored_turn("authentication_failed", _OPENROUTER_401), provider_scope=scope
+        )
+        later = await case.real_runners(2)
+
+        # Each WorkItem is admitted only once the one before it settled, so the
+        # pooled runners are claimed in this order.
+        finish, predecessor, generic_successor = await e2e.fail(case.item)
+        # Classification unchanged and no condition on the wire.
+        assert finish.body["cause"] == "model_credential_rejected"
+        assert finish.body["retry_condition"] is None
+        assert predecessor["retry_condition_reason"] is None
+        assert predecessor["retry_condition_scope_key"] is None
+        assert generic_successor["blocked_on"] == "provider_credential"
+
+        finish, predecessor, unscoped_successor = await e2e.fail(await case.admit())
+        assert finish.body["cause"] == "model_credential_rejected"
+        assert (
+            predecessor["retry_condition_reason"],
+            predecessor["retry_condition_scope_key"],
+        ) == ("credential_rejected", None)
+        assert unscoped_successor["blocked_on"] == "provider_credential"
+
+        finish, predecessor, control_successor = await e2e.fail(await case.admit())
+        assert (
+            predecessor["retry_condition_reason"],
+            predecessor["retry_condition_scope_key"],
+        ) == ("credential_rejected", scope.scope_key)
+        assert control_successor["blocked_on"] == "provider_credential"
+
+        # The worker registers the failed scope, then runs with a replaced
+        # credential that authenticates.
+        await e2e.probe(KEY, offset=timedelta(seconds=1))
+        e2e.script.steps.append(_ok())
+        await e2e.probe(OTHER_KEY, offset=timedelta(seconds=31))
+        assert len(e2e.script.requests) == 1
+        _assert_bearer_of(e2e.script.requests[0], OTHER_KEY)
+        await e2e.reconcile(passes=3)
+
+        await e2e.assert_ran_once(control_successor["id"])
+        for blocked in (generic_successor, unscoped_successor):
+            await e2e.assert_asleep(blocked["id"])
+            assert (await case.row(blocked["id"]))["blocked_on"] == "provider_credential"
+        assert [_turns(generic), _turns(unscoped), _turns(control)] == [1, 1, 1]
+        assert [runner.turns for runner in later] == [1, 0]
+
+    _end_to_end(case, body)
+
+
+def test_daily_budget_without_a_utc_reset_stays_blocked_while_a_valid_control_releases(
+    factory_retry: FactoryRetryCase,
+) -> None:
+    case = factory_retry
+
+    async def body(e2e: EndToEnd) -> None:
+        scope = _own_scope()
+        reset = (await e2e.db_now() + timedelta(minutes=5)).replace(microsecond=0)
+        offset = await case.real_runners(
+            1,
+            script=_errored_turn(
+                "authentication_failed", _budget_403(f"; resets {_rfc3339(reset, '+00:00')}.")
+            ),
+            provider_scope=scope,
+        )
+        missing = await case.real_runners(
+            1,
+            script=_errored_turn("authentication_failed", _budget_403(".")),
+            provider_scope=scope,
+        )
+        control = await case.real_runners(
+            1, script=_errored_turn("authentication_failed", _KEY_LIMIT_403), provider_scope=scope
+        )
+        later = await case.real_runners(2)
+
+        # Each WorkItem is admitted only once the one before it settled, so the
+        # pooled runners are claimed in this order.
+        waiting: list[dict[str, Any]] = []
+        for first in (True, False):
+            finish, predecessor, successor = await e2e.fail(
+                case.item if first else await case.admit()
+            )
+            assert finish.body["cause"] == "model_credit_exhausted"
+            assert (
+                predecessor["retry_condition_reason"],
+                predecessor["retry_condition_retry_at"],
+                predecessor["retry_condition_scope_key"],
+            ) == ("usage_reset", None, None)
+            assert successor["blocked_on"] == "provider_credit"
+            waiting.append(successor)
+        _finish, predecessor, control_successor = await e2e.fail(await case.admit())
+        assert (
+            predecessor["retry_condition_reason"],
+            predecessor["retry_condition_scope_key"],
+        ) == ("credit_exhausted", scope.scope_key)
+        assert control_successor["blocked_on"] == "provider_credit"
+
+        # A baseline read, then a strictly greater limit with something left.
+        e2e.script.steps.extend([_key_body(25, 0.5), _key_body(50, 25)])
+        await e2e.probe(KEY, offset=timedelta(seconds=1))
+        await e2e.reconcile(passes=2)
+        for successor in (*waiting, control_successor):
+            await e2e.assert_asleep(successor["id"])
+        await e2e.probe(KEY, offset=timedelta(seconds=32))
+        assert len(e2e.script.requests) == 2
+        await e2e.reconcile(passes=3)
+
+        await e2e.assert_ran_once(control_successor["id"])
+        for successor in waiting:
+            await e2e.assert_asleep(successor["id"])
+            assert (await case.row(successor["id"]))["blocked_on"] == "provider_credit"
+        assert [_turns(offset), _turns(missing), _turns(control)] == [1, 1, 1]
+        assert [runner.turns for runner in later] == [1, 0]
+
+    _end_to_end(case, body)
