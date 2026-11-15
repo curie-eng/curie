@@ -9,9 +9,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sqlite3
 import ssl
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -581,9 +583,7 @@ def _create_issue(github: httpx.Client, title: str) -> httpx.Response:
     )
 
 
-def test_refused_issue_creates_write_nothing_then_recover(
-    stub: Any, github: httpx.Client
-) -> None:
+def test_refused_issue_creates_write_nothing_then_recover(stub: Any, github: httpx.Client) -> None:
     stub.inject_fault("issue_create", "refuse", count=2, status=503)
     assert _create_issue(github, "First").status_code == 503
     assert _create_issue(github, "Second").status_code == 503
@@ -687,3 +687,234 @@ def test_branch_and_main_revision_reads(stub: Any) -> None:
 
 def stub_human() -> dict[str, Any]:
     return {"id": 6601, "login": "octocat", "type": "User"}
+
+
+def _tls_client(stub: Any) -> httpx.Client:
+    return httpx.Client(
+        base_url=stub.base_url,
+        verify=ssl.create_default_context(cafile=str(stub.ca_file)),
+        trust_env=False,
+        timeout=20,
+    )
+
+
+def _seed_objects(stub: Any, kind: str, rows: list[dict[str, Any]]) -> None:
+    """Insert stored objects directly so the next id read has a full table to scan."""
+
+    with sqlite3.connect(stub._database) as connection:
+        connection.executemany(
+            "INSERT INTO objects(kind, id, body) VALUES(?,?,?)",
+            [(kind, int(row["id"]), json.dumps(row)) for row in rows],
+        )
+
+
+def _concurrent_posts(stub: Any, calls: list[tuple[str, dict[str, Any]]]) -> list[httpx.Response]:
+    """POST every call at once. A barrier releases the requests together."""
+
+    barrier = threading.Barrier(len(calls))
+    responses: list[httpx.Response | None] = [None] * len(calls)
+    errors: list[BaseException] = []
+
+    def post(index: int, path: str, payload: dict[str, Any]) -> None:
+        try:
+            with _tls_client(stub) as client:
+                # Open TLS before the barrier so the posts enter the stub together.
+                client.get(f"/repos/{REPO}")
+                barrier.wait(timeout=10)
+                responses[index] = client.post(path, json=payload)
+        except (httpx.HTTPError, OSError, threading.BrokenBarrierError) as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=post, args=(index, path, payload))
+        for index, (path, payload) in enumerate(calls)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert not errors, errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert all(response is not None for response in responses)
+    return [response for response in responses if response is not None]
+
+
+def test_concurrent_comment_creates_remain_readable(stub: Any) -> None:
+    """Concurrent comment creates keep distinct ids, and every 201 body reads back.
+
+    Twenty batches of three posts, released together by a barrier. The stored
+    comments make the non-atomic id read long enough for those posts to share
+    an id. The later insert then replaces the earlier row, so a read of that
+    id loses one acknowledged body.
+    """
+
+    batches = 20
+    width = 3
+    _seed_objects(
+        stub,
+        "comment",
+        [{"id": index, "body": "stored", "issue_number": 3815} for index in range(1, 2001)],
+    )
+    with _tls_client(stub) as setup:
+        issues = [
+            _ok(
+                setup.post(
+                    f"/repos/{REPO}/issues",
+                    json={"title": f"Comment race {offset}", "body": "Body."},
+                ),
+                201,
+            )["number"]
+            for offset in range(width)
+        ]
+    acknowledged = 0
+    with _tls_client(stub) as reader:
+        for batch in range(batches):
+            bodies = [f"admitted-{batch}-{offset}" for offset in range(width)]
+            responses = _concurrent_posts(
+                stub,
+                [
+                    (f"/repos/{REPO}/issues/{number}/comments", {"body": body})
+                    for number, body in zip(issues, bodies, strict=True)
+                ],
+            )
+            rows = [_ok(response, 201) for response in responses]
+            ids = [row["id"] for row in rows]
+            missing = []
+            for row in rows:
+                fetched = reader.get(f"/repos/{REPO}/issues/comments/{row['id']}")
+                if fetched.status_code != 200 or fetched.json().get("body") != row["body"]:
+                    missing.append(row["body"])
+            assert len(set(ids)) == width and not missing, {
+                "batch": batch,
+                "returned_comment_ids": ids,
+                "acknowledged_posts": width,
+                "persisted_matching_bodies": width - len(missing),
+                "missing_bodies": missing,
+            }
+            acknowledged += width
+    assert acknowledged == batches * width
+
+
+def test_concurrent_issue_pull_and_label_creates_keep_distinct_ids(stub: Any) -> None:
+    """Issue, pull, and label-event ids stay unique when creates run together.
+
+    Review and review-comment routes only list objects. They hand out no ids.
+    Issue and label-event allocation scans the stored rows, so those tables
+    start full. Pull creation resolves git refs between the id read and the
+    insert, which is enough for concurrent creates to share an id.
+    """
+
+    batches = 8
+    width = 3
+    _seed_objects(
+        stub,
+        "issue",
+        [
+            {
+                "id": index,
+                "number": index,
+                "title": "stored",
+                "body": "stored",
+                "state": "open",
+                "labels": [],
+                "user": {"login": "octocat"},
+            }
+            for index in range(1, 2001)
+        ],
+    )
+    _seed_objects(
+        stub,
+        "event",
+        [
+            {
+                "id": index,
+                "issue_number": 3815,
+                "event": "labeled",
+                "label": {"name": "stored"},
+                "actor": {"login": "octocat"},
+            }
+            for index in range(2, 2001)
+        ],
+    )
+    with _tls_client(stub) as reader:
+        for batch in range(batches):
+            issue_rows = [
+                _ok(response, 201)
+                for response in _concurrent_posts(
+                    stub,
+                    [
+                        (
+                            f"/repos/{REPO}/issues",
+                            {
+                                "title": f"Issue {batch}-{offset}",
+                                "body": "Body.",
+                                "labels": [f"lane-{batch}-{offset}"],
+                            },
+                        )
+                        for offset in range(width)
+                    ],
+                )
+            ]
+            numbers = [row["number"] for row in issue_rows]
+            assert len(set(numbers)) == width, {"batch": batch, "issue_numbers": numbers}
+            event_ids: list[int] = []
+            for row in issue_rows:
+                fetched = _ok(reader.get(f"/repos/{REPO}/issues/{row['number']}"))
+                assert fetched["title"] == row["title"]
+                events = _ok(reader.get(f"/repos/{REPO}/issues/{row['number']}/events"))
+                labeled = [event for event in events if event["event"] == "labeled"]
+                assert [event["label"]["name"] for event in labeled] == [row["labels"][0]["name"]]
+                event_ids.extend(event["id"] for event in labeled)
+            assert len(set(event_ids)) == width, {"batch": batch, "event_ids": event_ids}
+
+            pull_rows = [
+                _ok(response, 201)
+                for response in _concurrent_posts(
+                    stub,
+                    [
+                        (
+                            f"/repos/{REPO}/pulls",
+                            {
+                                "title": f"Pull {batch}-{offset}",
+                                "head": "main",
+                                "base": "main",
+                            },
+                        )
+                        for offset in range(width)
+                    ],
+                )
+            ]
+            pull_numbers = [row["number"] for row in pull_rows]
+            assert len(set(pull_numbers)) == width, {
+                "batch": batch,
+                "pull_numbers": pull_numbers,
+            }
+            for row in pull_rows:
+                fetched = _ok(reader.get(f"/repos/{REPO}/pulls/{row['number']}"))
+                assert fetched["title"] == row["title"]
+                assert reader.get(f"/repos/{REPO}/pulls/{row['number']}/reviews").json() == []
+                assert reader.get(f"/repos/{REPO}/pulls/{row['number']}/comments").json() == []
+
+            label_rows = _concurrent_posts(
+                stub,
+                [
+                    (
+                        f"/repos/{REPO}/issues/{number}/labels",
+                        {"labels": [f"extra-{batch}-{offset}"]},
+                    )
+                    for offset, number in enumerate(numbers)
+                ],
+            )
+            assert [response.status_code for response in label_rows] == [200] * width
+            extra_ids: list[int] = []
+            for offset, number in enumerate(numbers):
+                events = _ok(reader.get(f"/repos/{REPO}/issues/{number}/events"))
+                matched = [
+                    event
+                    for event in events
+                    if event["event"] == "labeled"
+                    and event["label"]["name"] == f"extra-{batch}-{offset}"
+                ]
+                assert len(matched) == 1
+                extra_ids.append(matched[0]["id"])
+            assert len(set(extra_ids)) == width, {"batch": batch, "label_event_ids": extra_ids}
