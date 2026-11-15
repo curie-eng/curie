@@ -71,6 +71,7 @@ from curie_worker.workspace import WorkspacePreparationError, WorkspaceRepositor
 from redis.exceptions import ResponseError
 
 from apps.worker.tests.queue_fixtures import factory_context, factory_conversation, wait_until
+from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -207,7 +208,7 @@ class _TerminationLease:
         return TerminationClaim(runtime_epoch=self.runtime_epoch, request_version=self.version)
 
 
-class _WorkItems:
+class _WorkItems(AbsentRequesterContext):
     """Dispatch double: the acquire grant carries the WorkItem repository."""
 
     def __init__(self) -> None:

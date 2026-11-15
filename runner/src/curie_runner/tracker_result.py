@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import re
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -40,6 +41,7 @@ import aiohttp
 import anyio
 
 from .issue_read import CAPABILITY_HEADER
+from .requester_context import ExecutionBinding
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +131,9 @@ class CompletionContract:
     kind: ContractKind
     result_kinds: tuple[str, ...] = ()
     session_usd_allowance: float | None = None
+    # ADR 0278 (#5592): the execution this process is bound to. Present, it
+    # makes the start wait for the worker's requester context envelope.
+    execution: ExecutionBinding | None = None
 
     @property
     def tracker_result(self) -> bool:
@@ -281,8 +286,13 @@ def parse_contract(payload: Any) -> CompletionContract:
     if not isinstance(payload, dict):
         raise ContractUnavailable(REASON_BODY_INVALID)
     kind = payload.get("completion_contract")
+    execution = _parse_execution(payload.get("execution"))
     if kind == CONTRACT_IMPLEMENTATION:
-        return IMPLEMENTATION
+        return (
+            IMPLEMENTATION
+            if execution is None
+            else CompletionContract(CONTRACT_IMPLEMENTATION, execution=execution)
+        )
     if kind != CONTRACT_TRACKER_RESULT:
         raise ContractUnavailable(REASON_CONTRACT_UNKNOWN)
     kinds = payload.get("result_kinds")
@@ -305,7 +315,39 @@ def parse_contract(payload: Any) -> CompletionContract:
         CONTRACT_TRACKER_RESULT,
         result_kinds=tuple(sorted(kinds)),
         session_usd_allowance=float(allowance),
+        execution=execution,
     )
+
+
+def _parse_execution(value: Any) -> ExecutionBinding | None:
+    """The contract's execution binding; a malformed one is a contract failure."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ContractUnavailable(REASON_BODY_INVALID)
+    ids = [value.get(key) for key in ("tenant_id", "work_item_id", "execution_request_id")]
+    fence = value.get("execution_fence")
+    if (
+        not all(isinstance(item, str) and _is_uuid(item) for item in ids)
+        or type(fence) is not int
+        or fence < 1
+    ):
+        raise ContractUnavailable(REASON_BODY_INVALID)
+    tenant, work_item, request = (str(item) for item in ids)
+    return ExecutionBinding(
+        tenant_id=tenant,
+        work_item_id=work_item,
+        execution_request_id=request,
+        execution_fence=fence,
+    )
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
 
 
 async def _fetch(url: str, token: str, delay: Delay) -> CompletionContract:

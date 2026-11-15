@@ -2610,6 +2610,73 @@ The plugin bundle you just deployed is the agent's backend. There are two
 frontends that can talk to it: your terminal (no Slack involved) or a real
 Slack workspace.
 
+### Requester coding instructions
+
+A requester can store one private coding instructions document. When that
+requester starts a factory WorkItem, admission pins the document's text and
+digest to the WorkItem, and the implementer session reads it as a preferences
+section after the bundle's own instructions ([ADR 0278](adr/0278-requester-coding-instructions.md)).
+Reviewer sessions never receive it.
+
+The chart value `factory.requesterCodingInstructions.apply` (default `true`)
+renders `CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY` into the API. Set it to
+`false` and admission records the absence reason `application_unavailable`
+for every new WorkItem. A WorkItem keeps the selection or absence it was
+admitted with when the value changes later, so turning it on never adds a
+document to work already admitted.
+
+Delivery happens once per execution, after the request starts and before its
+first model turn:
+
+1. The worker reads the version 1 context envelope for the request's current
+   execution fence from `POST /v1/internal/work-items/requests/{request_id}/requester-context`.
+   An absent selection is delivered too.
+2. The worker posts the envelope to the runner's `POST /v1/requester-context`,
+   behind the same per-claim bearer as every other runner route. The runner
+   checks it against the execution its completion contract names: the version,
+   the WorkItem, the request, the fence, the 16,384 byte bound, the format and
+   the digest of the text.
+3. The worker relays the runner's acknowledgment to
+   `POST /v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment`.
+   The API accepts it only for the current request and fence. Model work
+   starts only after the API accepted it.
+
+The request's `coding_instructions_evidence` records the outcome: `none` (no
+document selected), `pending` (selected, not yet acknowledged), `applied` or
+`failed`. Any failure fails the request before model work, with
+`terminal_cause` `runner_escalated` and the reason in its detail. The reasons
+are `missing_envelope`, `unsupported_version`, `wrong_execution`,
+`wrong_fence`, `too_large`, `unsupported_format`, `digest_mismatch` and
+`malformed_envelope` from the runner; `runner_unacknowledged` for a runner
+that never answered, including an older runner without the route;
+`tenant_disabled` when the tenant turned the capability off after the
+document was pinned (the pinned snapshot is kept); and
+`coding_instructions_unavailable` when the stored snapshot no longer matches
+its digest.
+
+A pull request published for a request whose evidence is `applied` ends with
+exactly one line, `Requester preferences: applied; sha256:<digest>`. It names
+no requester, principal or text. Any other evidence adds no line, and a
+publication body that already carries a line starting with
+`Requester preferences:` is refused with
+`publication.requester_annotation_reserved`.
+
+Limits:
+
+1. The runner refuses an `Agent` or `Task` tool call that carries a section
+   delimiter line or the exact pinned text in any field. It does not detect a
+   paraphrase of the text.
+2. The text never appears in API, worker or runner logs, traces or errors. The
+   runner registers the text, each of its lines and the section with its held
+   secret redaction as soon as it accepts the envelope.
+3. A runner process serves the one execution its completion contract names. An
+   envelope for any other execution is refused, so a request never runs under
+   another requester's preferences.
+4. The document cannot add tools, skills, credentials, egress, grants or
+   budget, change the task's acceptance criteria, or remove review and
+   publication gates. Those come from the platform, the bundle and the
+   repository, which take precedence in that order.
+
 ### Driving the deployed agent
 
 ```bash

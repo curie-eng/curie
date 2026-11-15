@@ -33,8 +33,8 @@ redefine them.
 ## Current contract
 
 A second implementation is an **ACI server**, an HTTP process serving eight required authenticated
-control routes (seven POSTs and `GET /v1/status`) plus four optional runner-private routes. The 11 POST endpoints (`runner/src/curie_runner/server.py`, seven every
-server serves plus four optional runner-private routes: the executor route, the checkpoint route and the two UI evidence routes): `POST /v1/event` opens a
+control routes (seven POSTs and `GET /v1/status`) plus five optional runner-private routes. The 12 POST endpoints (`runner/src/curie_runner/server.py`, seven every
+server serves plus five optional runner-private routes: the executor route, the checkpoint route, the two UI evidence routes and the requester context route): `POST /v1/event` opens a
 turn, `POST /v1/steer` injects into the live turn (409 if none running),
 `POST /v1/interrupt` hard-stops it, `POST /v1/reset` discards the conversation so the
 next turn starts fresh (409 while a turn is active), `POST /v1/snapshot` captures a
@@ -45,6 +45,10 @@ connector action for the worker's executor, the optional `POST /v1/checkpoint` c
 managed workspace against a worker-supplied trusted base commit, and the optional
 `POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image` return the validated index
 and the raw bytes of one indexed PNG from the gitignored `.curie/ui-evidence/` directory.
+The optional, bearer-authenticated `POST /v1/requester-context` takes the worker's version 1
+requester context envelope before a factory execution's first turn and answers its
+acknowledgment (ADR 0278); a server without it answers `404`, which the worker treats as
+no acknowledgment and fails the request before model work.
 The two evidence routes are bearer-authenticated, carry no ACI frame, answer `409` without a
 managed workspace and in executor mode, and a server without them answers `404`, which the
 worker records as unavailable evidence without changing publication. Two GETs sit alongside them and stay

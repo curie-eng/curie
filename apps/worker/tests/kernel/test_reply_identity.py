@@ -35,6 +35,7 @@ from curie_worker.reply_sink import build_reply_sink as production_reply_sink
 from curie_worker.workitem_dispatch import WorkItemRunning
 
 from apps.worker.tests.queue_fixtures import factory_context
+from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
 
 _gateways = []
 
@@ -296,7 +297,7 @@ def test_a_turn_on_an_identity_this_worker_cannot_speak_as_is_dropped_before_it_
     asyncio.run(go())
 
 
-class _CiWorkItems:
+class _CiWorkItems(AbsentRequesterContext):
     """Names one already-running request, like a CI continuation's dispatch."""
 
     def __init__(self, running: uuid.UUID, *, agent_id: uuid.UUID) -> None:

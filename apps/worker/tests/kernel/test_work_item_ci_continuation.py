@@ -50,6 +50,7 @@ from curie_worker.workitem_dispatch import (
 
 from apps.worker.tests.kernel.test_work_item_early_stop import _revision_lineage
 from apps.worker.tests.queue_fixtures import factory_context
+from apps.worker.tests.requester_context_doubles import AbsentRequesterContext
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -182,7 +183,7 @@ class _Workspace:
         return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha=HEAD)
 
 
-class _WorkItems:
+class _WorkItems(AbsentRequesterContext):
     """Dispatch double. ``running_for_conversation`` names the running request."""
 
     def __init__(self, running: uuid.UUID | None, *, ended: bool = False) -> None:

@@ -12,7 +12,7 @@
     },
     "ci_observation": null,
     "coding_instructions": {
-      "absence_reason": "application_unavailable",
+      "absence_reason": "no_profile",
       "format_version": null,
       "revision": null,
       "sha256": null,
@@ -111,7 +111,7 @@
     },
     "ci_observation": null,
     "coding_instructions": {
-      "absence_reason": "application_unavailable",
+      "absence_reason": "no_verified_requester",
       "format_version": null,
       "revision": null,
       "sha256": null,
@@ -187,7 +187,7 @@
         "ci": null,
         "ci_observation": null,
         "coding_instructions": {
-          "absence_reason": "application_unavailable",
+          "absence_reason": "no_profile",
           "format_version": null,
           "revision": null,
           "sha256": null,
@@ -281,7 +281,7 @@
         "ci": null,
         "ci_observation": null,
         "coding_instructions": {
-          "absence_reason": "application_unavailable",
+          "absence_reason": "no_verified_requester",
           "format_version": null,
           "revision": null,
           "sha256": null,

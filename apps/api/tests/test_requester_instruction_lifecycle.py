@@ -162,7 +162,8 @@ def test_activation_after_admission_never_reselects_the_existing_work_item(api, 
     from curie_api import workitem_dispatch
     from curie_api.workitems.lifecycle import WorkItemOutcome
 
-    monkeypatch.delenv("CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY", raising=False)
+    # Admitted while the capability was off; the default is now on (#5592).
+    monkeypatch.setenv("CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY", "false")
     get_settings.cache_clear()
     _write(world, value=TEXT, expected_revision=0)
     agent = support.insert_agent(world.tenant_id)

@@ -4175,6 +4175,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/work-items/requests/{request_id}/requester-context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Requester Context
+         * @description The running request's version 1 context envelope, for the current fence.
+         */
+        post: operations["read_requester_context_v1_internal_work_items_requests__request_id__requester_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge Requester Context
+         * @description Accept the relayed acknowledgment only for the current request and fence.
+         */
+        post: operations["acknowledge_requester_context_v1_internal_work_items_requests__request_id__requester_context_acknowledgment_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/work-items/requests/{request_id}/start": {
         parameters: {
             query?: never;
@@ -4771,6 +4811,20 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AcknowledgmentBody
+         * @description What the worker relays: the runner's acknowledgment, or its own failure.
+         */
+        AcknowledgmentBody: {
+            /** Acknowledgment */
+            acknowledgment?: {
+                [key: string]: unknown;
+            } | null;
+            /** Reason */
+            reason?: string | null;
+            /** Runtime Epoch */
+            runtime_epoch: number;
+        };
         /** AcquireBody */
         AcquireBody: {
             context: components["schemas"]["FactoryContext"] | null;
@@ -7194,6 +7248,7 @@ export interface components {
              * @enum {string}
              */
             completion_contract: "implementation" | "tracker_result";
+            execution?: components["schemas"]["ExecutionBindingOut"] | null;
             /** Result Kinds */
             result_kinds: string[];
             /** Session Usd Allowance */
@@ -7314,6 +7369,11 @@ export interface components {
              * @default 3600
              */
             ttl_s?: number;
+        };
+        /** ContextBody */
+        ContextBody: {
+            /** Runtime Epoch */
+            runtime_epoch: number;
         };
         /**
          * CostReport
@@ -8046,6 +8106,32 @@ export interface components {
             };
             /** Tool */
             tool: string;
+        };
+        /**
+         * ExecutionBindingOut
+         * @description The execution a runner process is bound to (ADR 0278, #5592).
+         *
+         *     The runner checks the worker's requester context envelope against it, and
+         *     its presence tells the runner to wait for one before any model work.
+         */
+        ExecutionBindingOut: {
+            /** Execution Fence */
+            execution_fence: number;
+            /**
+             * Execution Request Id
+             * Format: uuid
+             */
+            execution_request_id: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
         };
         /**
          * ExecutionClaim
@@ -21932,6 +22018,84 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["OwnerLostBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_requester_context_v1_internal_work_items_requests__request_id__requester_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContextBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    acknowledge_requester_context_v1_internal_work_items_requests__request_id__requester_context_acknowledgment_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcknowledgmentBody"];
             };
         };
         responses: {

@@ -1,6 +1,47 @@
 {
   "components": {
     "schemas": {
+      "AcknowledgmentBody": {
+        "additionalProperties": false,
+        "description": "What the worker relays: the runner's acknowledgment, or its own failure.",
+        "properties": {
+          "acknowledgment": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acknowledgment"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "pattern": "^[a-z_]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch"
+        ],
+        "title": "AcknowledgmentBody",
+        "type": "object"
+      },
       "AcquireBody": {
         "properties": {
           "context": {
@@ -6167,6 +6208,16 @@
             "title": "Completion Contract",
             "type": "string"
           },
+          "execution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionBindingOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "result_kinds": {
             "items": {
               "type": "string"
@@ -6391,6 +6442,21 @@
           "route_generation"
         ],
         "title": "Context",
+        "type": "object"
+      },
+      "ContextBody": {
+        "additionalProperties": false,
+        "properties": {
+          "runtime_epoch": {
+            "minimum": 1.0,
+            "title": "Runtime Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runtime_epoch"
+        ],
+        "title": "ContextBody",
         "type": "object"
       },
       "CostReport": {
@@ -8091,6 +8157,38 @@
           "arguments"
         ],
         "title": "ExecutionArguments",
+        "type": "object"
+      },
+      "ExecutionBindingOut": {
+        "description": "The execution a runner process is bound to (ADR 0278, #5592).\n\nThe runner checks the worker's requester context envelope against it, and\nits presence tells the runner to wait for one before any model work.",
+        "properties": {
+          "execution_fence": {
+            "title": "Execution Fence",
+            "type": "integer"
+          },
+          "execution_request_id": {
+            "format": "uuid",
+            "title": "Execution Request Id",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "work_item_id",
+          "execution_request_id",
+          "execution_fence"
+        ],
+        "title": "ExecutionBindingOut",
         "type": "object"
       },
       "ExecutionClaim": {
@@ -36695,6 +36793,150 @@
           }
         },
         "summary": "Declare Work Item Owner Lost",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/requester-context": {
+      "post": {
+        "description": "The running request's version 1 context envelope, for the current fence.",
+        "operationId": "read_requester_context_v1_internal_work_items_requests__request_id__requester_context_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContextBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Requester Context V1 Internal Work Items Requests  Request Id  Requester Context Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Requester Context",
+        "tags": [
+          "internal-work-items"
+        ]
+      }
+    },
+    "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment": {
+      "post": {
+        "description": "Accept the relayed acknowledgment only for the current request and fence.",
+        "operationId": "acknowledge_requester_context_v1_internal_work_items_requests__request_id__requester_context_acknowledgment_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcknowledgmentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Acknowledge Requester Context V1 Internal Work Items Requests  Request Id  Requester Context Acknowledgment Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Acknowledge Requester Context",
         "tags": [
           "internal-work-items"
         ]

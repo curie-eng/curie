@@ -1836,13 +1836,22 @@ def test_a_submission_is_delivered_once_and_completes_the_request_without_a_pull
     contract = _contract(triage)
     assert contract.status_code == 200, contract.text
     assert contract.headers["cache-control"] == "no-store"
-    assert contract.json() == {
+    body = contract.json()
+    # Asked before the start grant: bound to the fence that start assigns (ADR 0278).
+    execution = body.pop("execution")
+    assert body == {
         "completion_contract": "tracker_result",
         "result_kinds": ["findings", "ticket"],
         "session_usd_allowance": 5.0,
     }
+    assert execution["execution_request_id"] == str(triage.request_id)
     assert _request(triage)["model_session_reserved_at"] is not None
     _begin(triage)
+    (started,) = _rows(
+        "SELECT runtime_epoch FROM curie.execution_requests WHERE id = :id",
+        {"id": triage.request_id},
+    )
+    assert execution["execution_fence"] == started["runtime_epoch"]
     deadline = _request(triage)["execution_deadline"]
     (grant,) = _rows(
         "SELECT expires_at, source_content_sha256, output_identity, allowed_result_kinds "
@@ -1921,7 +1930,9 @@ def test_an_implementation_capability_gets_its_contract_and_cannot_submit(
     triage = _triage(admitted, monkeypatch, 9504, tracker_result=False)
     contract = _contract(triage)
     assert contract.status_code == 200, contract.text
-    assert contract.json() == {
+    body = contract.json()
+    assert body.pop("execution")["execution_request_id"] == str(triage.request_id)
+    assert body == {
         "completion_contract": "implementation",
         "result_kinds": [],
         "session_usd_allowance": None,

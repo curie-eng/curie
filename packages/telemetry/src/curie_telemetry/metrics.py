@@ -537,6 +537,9 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination/claim",
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/internal/work-items/issue-read/context",
+    # Requester coding instructions delivery and acknowledgment (#5592).
+    "/v1/internal/work-items/requests/{request_id}/requester-context",
+    "/v1/internal/work-items/requests/{request_id}/requester-context/acknowledgment",
     # Factory Slack run steering (#5414) and kickoff (#5380).
     "/v1/internal/factory-slack/steer",
     "/v1/internal/factory-slack/kickoff",
