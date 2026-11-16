@@ -119,6 +119,7 @@ def served(tmp_path: Path) -> Iterator[tuple[Path, int, ssl.SSLContext]]:
     )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certificate, key)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (upstream, server)]
