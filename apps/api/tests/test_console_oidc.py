@@ -487,11 +487,12 @@ def test_oidc_session_row_binds_the_principal_and_no_subject(
     # Only a hash is stored.
     assert row["session_token_hash"] and row["session_token_hash"] != token
 
-    # A subject-less session is not a login-code/approval session.
-    assert (
-        oidc_client.get("/console/session", headers=_cookie(SESSION_COOKIE, token)).status_code
-        == 401
-    )
+    # The row has no login-code subject. The console still names the principal.
+    current = oidc_client.get("/console/session", headers=_cookie(SESSION_COOKIE, token))
+    assert current.status_code == 200, current.text
+    assert current.json()["kind"] == "principal"
+    assert current.json()["subject"] == f"principal:{principal['id']}"
+    assert token not in current.text
 
 
 @pytest.mark.parametrize("methods", [["client_secret_post"], ["client_secret_basic"]])
@@ -2090,6 +2091,288 @@ def test_oidc_route_rate_limit_fails_closed_when_valkey_is_unavailable(
             assert refused.headers["Cache-Control"] == "no-store"
             assert not statements, statements
             assert _attempt_rows() == []
+
+
+# --- principal session on GET /console/session (#5682) -------------------------
+
+RETURN_COOKIE = "__Host-curie_oidc_return"
+
+
+def _get_session(client: TestClient, token: str) -> httpx.Response:
+    response = client.get("/console/session", headers=_cookie(SESSION_COOKIE, token))
+    client.cookies.clear()
+    return response
+
+
+def _assert_no_token(response: httpx.Response, token: str) -> None:
+    assert token not in response.text
+    assert "set-cookie" not in response.headers
+
+
+def test_principal_session_get_names_the_person(oidc_client: TestClient, idp: TestIdP) -> None:
+    token = _session_token(_login(oidc_client))
+    (principal,) = _principal_rows()
+
+    response = _get_session(oidc_client, token)
+
+    assert response.status_code == 200, response.text
+    assert response.headers.get("cache-control") == "no-store"
+    _assert_no_token(response, token)
+    body = response.json()
+    assert set(body) == {"subject", "expires_at", "kind", "principal"}
+    assert body["subject"] == f"principal:{principal['id']}"
+    assert body["kind"] == "principal"
+    assert body["expires_at"]
+    assert body["principal"] == {
+        "id": str(principal["id"]),
+        "display_name": "Alice Example",
+        "email": "alice@example.com",
+    }
+    assert idp.issuer not in response.text
+
+
+def test_principal_session_disabled_principal_is_401(oidc_client: TestClient) -> None:
+    token = _session_token(_login(oidc_client))
+    live = _get_session(oidc_client, token)
+    assert live.status_code == 200, live.text
+    _sql("UPDATE curie.principals SET status = 'disabled'")
+
+    response = _get_session(oidc_client, token)
+
+    assert response.status_code == 401, response.text
+    assert response.headers.get("cache-control") == "no-store"
+    _assert_no_token(response, token)
+
+
+def test_principal_session_suspended_tenant_is_401(oidc_client: TestClient) -> None:
+    token = _session_token(_login(oidc_client))
+    live = _get_session(oidc_client, token)
+    assert live.status_code == 200, live.text
+    try:
+        _sql(
+            "UPDATE curie.tenants SET status = 'suspended' WHERE id = :id",
+            {"id": uuid.UUID(DEFAULT_TENANT_ID)},
+        )
+        response = _get_session(oidc_client, token)
+        assert response.status_code == 401, response.text
+        _assert_no_token(response, token)
+    finally:
+        _sql(
+            "UPDATE curie.tenants SET status = 'active' WHERE id = :id",
+            {"id": uuid.UUID(DEFAULT_TENANT_ID)},
+        )
+
+
+def test_principal_session_revoked_session_is_401(oidc_client: TestClient) -> None:
+    token = _session_token(_login(oidc_client))
+    live = _get_session(oidc_client, token)
+    assert live.status_code == 200, live.text
+    _sql("UPDATE curie.console_sessions SET revoked_at = now()")
+
+    response = _get_session(oidc_client, token)
+
+    assert response.status_code == 401, response.text
+    _assert_no_token(response, token)
+
+
+def test_principal_session_issuer_switch_is_401(oidc_client: TestClient, idp: TestIdP) -> None:
+    token = _session_token(_login(oidc_client))
+    live = _get_session(oidc_client, token)
+    assert live.status_code == 200, live.text
+    other_issuer = f"{idp.issuer}/some-other-tenant"
+    with _rebooted({**enabled_env(idp), "CURIE_OIDC_ISSUER": other_issuer}) as switched:
+        response = _get_session(switched, token)
+        assert response.status_code == 401, response.text
+        _assert_no_token(response, token)
+
+
+def test_principal_session_operator_body_adds_kind_and_null_principal(
+    oidc_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    minted = oidc_client.post(
+        "/console/login-codes", json={"subject": "U0EXAMPLE1"}, headers=auth_headers
+    )
+    assert minted.status_code == 201, minted.text
+    exchanged = oidc_client.post("/console/session", json={"code": minted.json()["code"]})
+    assert exchanged.status_code == 200, exchanged.text
+    token = str(_set_cookies(exchanged)[SESSION_COOKIE].value)
+    oidc_client.cookies.clear()
+
+    body = exchanged.json()
+    assert body["subject"] == "U0EXAMPLE1"
+    assert body["kind"] == "operator"
+    assert body["principal"] is None
+    assert token not in exchanged.text
+
+    current = _get_session(oidc_client, token)
+    assert current.status_code == 200, current.text
+    assert current.json()["subject"] == "U0EXAMPLE1"
+    assert current.json()["kind"] == "operator"
+    assert current.json()["principal"] is None
+    assert current.headers.get("cache-control") == "no-store"
+    _assert_no_token(current, token)
+
+
+def test_principal_session_sign_in_methods_reports_oidc_enabled(oidc_client: TestClient) -> None:
+    response = oidc_client.get("/console/sign-in-methods")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"oidc": True}
+    assert response.headers.get("cache-control") == "no-store"
+
+
+def test_principal_session_sign_in_methods_reports_oidc_disabled(
+    oidc_client: TestClient, idp: TestIdP
+) -> None:
+    del idp
+    with _rebooted({}) as disabled:
+        response = disabled.get("/console/sign-in-methods")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"oidc": False}
+        assert response.headers.get("cache-control") == "no-store"
+
+
+def test_principal_session_sign_in_methods_shares_the_session_get_budget(
+    oidc_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api.routers import console as console_router
+
+    seen: list[tuple[str, int, int]] = []
+    real = console_router.require_rate_limit
+
+    async def spy(request: Any, *, route: str, limit: int, window_seconds: int) -> None:
+        seen.append((route, limit, window_seconds))
+        await real(request, route=route, limit=limit, window_seconds=window_seconds)
+
+    monkeypatch.setattr(console_router, "require_rate_limit", spy)
+
+    assert oidc_client.get("/console/session").status_code == 401
+    methods = oidc_client.get("/console/sign-in-methods")
+    assert methods.status_code == 200, methods.text
+    assert seen[:2] == [
+        ("console_session_get", 120, 60),
+        ("console_session_get", 120, 60),
+    ]
+
+
+def _begin_with_return(client: TestClient, return_to: str | None) -> Callback:
+    query = "" if return_to is None else "?" + urllib.parse.urlencode({"return_to": return_to})
+    login = client.get(f"/console/oidc/login{query}", follow_redirects=False)
+    assert login.status_code == 302, login.text
+    state_morsel = _set_cookies(login).get(STATE_COOKIE)
+    assert state_morsel is not None, login.headers
+    client.cookies.clear()
+    with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:
+        at_idp = browser.get(login.headers["location"])
+    assert at_idp.status_code == 302, at_idp.text
+    back = urllib.parse.urlsplit(at_idp.headers["location"])
+    assert f"{back.scheme}://{back.netloc}{back.path}" == REDIRECT_URI
+    return Callback(
+        path=back.path,
+        params=dict(urllib.parse.parse_qsl(back.query)),
+        state_cookie=state_morsel.value,
+        login=login,
+    )
+
+
+def _finish_with_return(
+    client: TestClient, callback: Callback, return_value: str | None
+) -> httpx.Response:
+    parts = [f"{STATE_COOKIE}={callback.state_cookie}"]
+    if return_value is not None:
+        parts.append(f"{RETURN_COOKIE}={return_value}")
+    response = client.get(
+        f"{callback.path}?{urllib.parse.urlencode(callback.params)}",
+        headers={"Cookie": "; ".join(parts)},
+        follow_redirects=False,
+    )
+    client.cookies.clear()
+    return response
+
+
+def test_principal_session_return_to_settings_claude_plan(
+    oidc_client: TestClient, idp: TestIdP
+) -> None:
+    del idp
+    callback = _begin_with_return(oidc_client, "/settings/claude-plan")
+    morsel = _set_cookies(callback.login)[RETURN_COOKIE]
+    assert morsel.value == "/settings/claude-plan"
+    assert morsel["httponly"]
+    assert morsel["secure"]
+    assert morsel["samesite"].lower() == "lax"
+    assert morsel["path"] == "/"
+    assert morsel["domain"] == ""
+
+    response = _finish_with_return(oidc_client, callback, morsel.value)
+
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == "/settings/claude-plan"
+    assert _clears_cookie(response, RETURN_COOKIE)
+    assert _clears_cookie(response, STATE_COOKIE)
+
+
+@pytest.mark.parametrize("return_to", ["https://example.com/", "//example.com", "/agents"])
+def test_principal_session_return_to_ignored_values_end_at_root(
+    oidc_client: TestClient, idp: TestIdP, return_to: str
+) -> None:
+    del idp
+    callback = _begin_with_return(oidc_client, return_to)
+    assert _clears_cookie(callback.login, RETURN_COOKIE)
+
+    response = _finish_with_return(oidc_client, callback, None)
+
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == "/"
+
+
+def test_principal_session_return_to_missing_ends_at_root(
+    oidc_client: TestClient, idp: TestIdP
+) -> None:
+    del idp
+    callback = _begin_with_return(oidc_client, None)
+    assert _clears_cookie(callback.login, RETURN_COOKIE)
+
+    response = _finish(oidc_client, callback)
+
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == "/"
+
+
+def test_principal_session_return_to_refused_callback_clears_the_cookie(
+    oidc_client: TestClient, idp: TestIdP
+) -> None:
+    del idp
+    callback = _begin_with_return(oidc_client, "/")
+    morsel = _set_cookies(callback.login)[RETURN_COOKIE]
+    params = {**callback.params, "error": "access_denied"}
+    response = oidc_client.get(
+        f"{callback.path}?{urllib.parse.urlencode(params)}",
+        headers={
+            "Cookie": (
+                f"{STATE_COOKIE}={callback.state_cookie}; {RETURN_COOKIE}={morsel.value}"
+            )
+        },
+        follow_redirects=False,
+    )
+    oidc_client.cookies.clear()
+
+    assert response.status_code == 401, response.text
+    assert _clears_cookie(response, RETURN_COOKIE)
+    assert _clears_cookie(response, STATE_COOKIE)
+    assert SESSION_COOKIE not in _set_cookies(response)
+
+
+def test_principal_session_return_to_forged_absolute_url_is_ignored(
+    oidc_client: TestClient, idp: TestIdP
+) -> None:
+    del idp
+    callback = _begin_with_return(oidc_client, None)
+
+    response = _finish_with_return(oidc_client, callback, "https://example.com/")
+
+    assert response.status_code == 303, response.text
+    assert response.headers["location"] == "/"
+    assert _clears_cookie(response, RETURN_COOKIE)
 
 
 def test_oidc_disabled_routes_stay_404_without_charging_the_limiter(

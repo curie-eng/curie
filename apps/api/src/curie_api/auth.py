@@ -9,7 +9,7 @@ dependency: it accepts only a session bound to a principal (a person), never a
 bare login-code session, and no route guarded by it widens through the
 ``require_api_key`` fallback above. But a principal-bound cookie IS one of the
 live sessions ``require_api_key`` accepts, so both dependencies run the same
-``_authorized_principal`` check on it: disabling the principal, suspending its
+``authorized_console_principal`` check on it: disabling the principal, suspending its
 tenant, or repointing the configured issuer closes every route that cookie
 reaches, not only the principal-only ones.
 """
@@ -42,14 +42,14 @@ def verify_platform_key(x_api_key: str | None) -> bool:
     return hmac.compare_digest(x_api_key, get_settings().api_key)
 
 
-async def _authorized_principal(session: AsyncSession, token: str) -> Principal | None:
+async def authorized_console_principal(session: AsyncSession, token: str) -> Principal | None:
     """The principal ``token`` authenticates, if every check still holds.
 
-    Shared by ``require_principal_session`` and ``require_api_key``'s
-    principal-bound sessions, so a principal-bound cookie closes the same way
-    everywhere: disabling the principal, suspending its tenant, or changing
-    the configured issuer takes effect immediately on every route it reaches,
-    not only ``/console/principal``.
+    Shared by ``require_principal_session``, ``require_api_key``'s
+    principal-bound sessions, and ``GET /console/session``, so a principal-bound
+    cookie closes the same way everywhere: disabling the principal, suspending
+    its tenant, or changing the configured issuer takes effect immediately on
+    every route it reaches, not only ``/console/principal``.
     """
     from .crud import console as crud_console
 
@@ -85,7 +85,7 @@ async def authenticate_administrator(
 
     The platform key first, with no database read; then a live console
     session, after the cookie origin check, with a principal-bound session
-    also passing ``_authorized_principal``. Every refusal is the same 401.
+    also passing ``authorized_console_principal``. Every refusal is the same 401.
     """
 
     if verify_platform_key(x_api_key):
@@ -107,7 +107,7 @@ async def authenticate_administrator(
             # A principal-bound session is only as live as its principal: the
             # bare session row doesn't know the principal was disabled, its
             # tenant suspended, or the issuer changed out from under it.
-            if await _authorized_principal(session, token) is None:
+            if await authorized_console_principal(session, token) is None:
                 row = None
     if row is not None:
         subject = (
@@ -216,7 +216,7 @@ async def require_principal_session(
     Every refusal is the same 401, so the response does not tell a caller
     whether the cookie was unknown, expired, or valid for someone disabled.
     """
-    principal = await _authorized_principal(session, console_session or "")
+    principal = await authorized_console_principal(session, console_session or "")
     if principal is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

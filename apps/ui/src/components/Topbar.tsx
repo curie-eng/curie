@@ -1,7 +1,14 @@
 import { C } from "../tokens";
 import { useStore } from "../state/store";
+import { useConsoleSignOut, useOptionalConsoleSession } from "../state/session";
 import { useWired } from "../state/wired";
 import type { Nav } from "../state/types";
+import type { ConsoleSession } from "../api/client";
+
+function principalLabel(session: ConsoleSession): string | null {
+  if (session.kind !== "principal") return null;
+  return session.principal?.display_name?.trim() || session.principal?.email?.trim() || "your account";
+}
 
 const CRUMB: Record<Nav, string> = {
   overview: "Overview",
@@ -20,6 +27,9 @@ export function Topbar() {
   const wired = useWired();
   const orgName = wired.orgName;
   const isProd = state.env === "prod" && !envDev;
+  const session = useOptionalConsoleSession();
+  const signOut = useConsoleSignOut();
+  const who = session ? principalLabel(session) : null;
 
   const pill = (label: string, active: boolean, activeBg: string, activeColor: string, onClick: () => void) => (
     <button
@@ -61,6 +71,29 @@ export function Topbar() {
         <span style={{ color: C.text }}>{CRUMB[state.nav]}</span>
       </div>
       <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
+        {who ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span data-testid="console-principal" style={{ fontSize: 13, color: C.text }}>
+              {who}
+            </span>
+            <button
+              type="button"
+              data-testid="console-sign-out"
+              onClick={() => void signOut?.()}
+              style={{
+                fontSize: 12,
+                fontFamily: C.sans,
+                color: C.link,
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                padding: 0,
+              }}
+            >
+              Sign out
+            </button>
+          </div>
+        ) : null}
         <div
           style={{
             display: "flex",

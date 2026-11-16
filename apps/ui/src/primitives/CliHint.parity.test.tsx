@@ -310,6 +310,14 @@ describe("console/CLI parity registry (#280)", () => {
     }
   });
 
+  it("records organization sign-in as a console gap tracked by issue 5559", () => {
+    const action = WIRED_ACTIONS.find((candidate) => candidate.id === "console-oidc-sign-in");
+    expect(action?.label).toBe("Sign in with your organization");
+    expect(action && "noCliEquivalent" in action.mapping ? action.mapping.noCliEquivalent : undefined).toBe(
+      "https://github.com/curie-eng/curie/issues/5559",
+    );
+  });
+
   it("removes the issue scoped unrendered registry entries", () => {
     const staleIds = ["message-cluster", "message-local", "eval"];
     expect(WIRED_ACTIONS.filter((action) => staleIds.includes(action.id))).toEqual([]);

@@ -729,6 +729,7 @@ export async function getApprovalAudit(approvalId: string): Promise<ApprovalAudi
 export type ApprovalResolveInput = Schemas["ApprovalResolve"];
 
 export type ConsoleSession = Schemas["ConsoleSessionOut"];
+export type ConsoleSignInMethods = Schemas["ConsoleSignInMethodsOut"];
 
 // Inspect the HttpOnly same-origin console session. No platform key is sent:
 // the ambient cookie is the only credential on this identity boundary.
@@ -753,6 +754,24 @@ export async function exchangeConsoleLoginCode(code: string): Promise<ConsoleSes
     body: JSON.stringify({ code }),
   });
   return jsonOrThrow<ConsoleSession>(resp);
+}
+
+// Which sign-in paths this install offers. Unauthenticated, and a failure means
+// the login screen hides the organization link rather than guessing it is on.
+// Bypasses request() so a 401 does not look like an expired console session.
+export async function getConsoleSignInMethods(): Promise<ConsoleSignInMethods> {
+  const resp = await fetch(url("/console/sign-in-methods"), { credentials: "same-origin" });
+  return jsonOrThrow<ConsoleSignInMethods>(resp);
+}
+
+// End the cookie session. Direct fetch, same as the probe: a 401 here is the
+// answer, not a signal to re-probe. True only when the API clears the cookie.
+export async function logoutConsoleSession(): Promise<boolean> {
+  const resp = await fetch(url("/console/logout"), {
+    method: "POST",
+    credentials: "same-origin",
+  });
+  return resp.status === 204;
 }
 
 // Resolve an approval (resolve-once compare-and-set) as the immutable subject

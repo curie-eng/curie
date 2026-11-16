@@ -132,8 +132,11 @@ test("T12: an unauthenticated visit shows the login screen and loads nothing beh
   await expect(page.getByRole("navigation")).toHaveCount(0);
   // The gate probed, and nothing behind it ran.
   expect(h.sessionGets().length).toBeGreaterThan(0);
+  await expect.poll(() => h.hits("GET", "/api/console/sign-in-methods").length).toBeGreaterThan(0);
   expect(h.hits("GET", "/api/agents")).toHaveLength(0);
-  expect(h.log.filter((r) => r.path !== "/api/console/session")).toEqual([]);
+  expect(
+    h.log.filter((r) => r.path !== "/api/console/session" && r.path !== "/api/console/sign-in-methods"),
+  ).toEqual([]);
 });
 
 test("T13: a bad code shows the server's refusal and stays on the login screen", async ({ page }) => {

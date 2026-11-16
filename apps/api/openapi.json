@@ -7450,12 +7450,30 @@
         "type": "object"
       },
       "ConsoleSessionOut": {
-        "description": "The result of an exchange. Deliberately carries NO token.\n\nThe session token travels only as an `HttpOnly` cookie, so page script cannot\nread it -- putting it in the body would hand the credential straight back to\nthe JavaScript this design exists to keep it away from.",
+        "description": "The result of an exchange or a session probe. Deliberately carries NO token.\n\nThe session token travels only as an `HttpOnly` cookie, so page script cannot\nread it -- putting it in the body would hand the credential straight back to\nthe JavaScript this design exists to keep it away from.\n\n``kind`` is ``operator`` for a login-code session and ``principal`` for an\nOIDC session. ``principal`` is populated only for the latter. A principal\nsession's ``subject`` is ``principal:<id>``, the same subject\n``authenticate_administrator`` already records.",
         "properties": {
           "expires_at": {
             "format": "date-time",
             "title": "Expires At",
             "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "operator",
+              "principal"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "principal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConsoleSessionPrincipal"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "subject": {
             "anyOf": [
@@ -7471,9 +7489,64 @@
         },
         "required": [
           "subject",
-          "expires_at"
+          "expires_at",
+          "kind",
+          "principal"
         ],
         "title": "ConsoleSessionOut",
+        "type": "object"
+      },
+      "ConsoleSessionPrincipal": {
+        "description": "The person a principal console session names. No token, no issuer.",
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "display_name",
+          "email"
+        ],
+        "title": "ConsoleSessionPrincipal",
+        "type": "object"
+      },
+      "ConsoleSignInMethodsOut": {
+        "description": "Which unauthenticated sign-in paths this install offers.",
+        "properties": {
+          "oidc": {
+            "title": "Oidc",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "oidc"
+        ],
+        "title": "ConsoleSignInMethodsOut",
         "type": "object"
       },
       "Context": {
@@ -30053,9 +30126,37 @@
       "get": {
         "description": "Start an OIDC login: persist an attempt and redirect to the IdP.\n\nDiscovery runs first so a misconfigured or mixed-up IdP fails here, before\nan attempt row exists and before the browser is sent anywhere.",
         "operationId": "oidc_login_console_oidc_login_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "return_to",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Return To"
+            }
+          }
+        ],
         "responses": {
           "302": {
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Oidc Login",
@@ -30199,6 +30300,28 @@
           }
         },
         "summary": "Exchange Login Code",
+        "tags": [
+          "console"
+        ]
+      }
+    },
+    "/console/sign-in-methods": {
+      "get": {
+        "description": "Report whether Console OIDC sign-in is enabled. No credential required.",
+        "operationId": "sign_in_methods_console_sign_in_methods_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsoleSignInMethodsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Sign In Methods",
         "tags": [
           "console"
         ]
