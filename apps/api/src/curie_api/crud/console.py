@@ -431,18 +431,28 @@ async def create_principal_console_session(
     return token, row
 
 
-async def live_principal_session(session: AsyncSession, token: str) -> Principal | None:
-    """The active principal a live OIDC session token authenticates, else ``None``.
+async def principal_for_live_row(session: AsyncSession, row: ConsoleSession) -> Principal | None:
+    """The active principal bound to an already loaded live session, else ``None``.
 
-    Layered on :func:`live_console_session`, so revocation and expiry are the
-    ADR-0083 ones. A login-code session (no ``principal_id``) is not a
-    principal session, and neither is one whose principal or tenant is no
-    longer active.
+    Does not look the session up again. A login-code row (no ``principal_id``)
+    is not a principal session, and neither is one whose principal or tenant is
+    no longer active.
     """
-    row = await live_console_session(session, token)
-    if row is None or row.principal_id is None:
+    if row.principal_id is None:
         return None
     principal = await session.get(Principal, row.principal_id, populate_existing=True)
     if principal is None or not await principal_is_active(session, principal):
         return None
     return principal
+
+
+async def live_principal_session(session: AsyncSession, token: str) -> Principal | None:
+    """The active principal a live OIDC session token authenticates, else ``None``.
+
+    Layered on :func:`live_console_session`, so revocation and expiry are the
+    ADR-0083 ones.
+    """
+    row = await live_console_session(session, token)
+    if row is None:
+        return None
+    return await principal_for_live_row(session, row)

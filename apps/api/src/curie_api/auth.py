@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .deps import SessionDep
-from .models import Principal
+from .models import ConsoleSession, Principal
 
 API_KEY_HEADER = "X-API-Key"
 #: The console session cookie (ADR-0083). Defined here rather than beside its
@@ -42,7 +42,12 @@ def verify_platform_key(x_api_key: str | None) -> bool:
     return hmac.compare_digest(x_api_key, get_settings().api_key)
 
 
-async def authorized_console_principal(session: AsyncSession, token: str) -> Principal | None:
+async def authorized_console_principal(
+    session: AsyncSession,
+    token: str,
+    *,
+    live_row: ConsoleSession | None = None,
+) -> Principal | None:
     """The principal ``token`` authenticates, if every check still holds.
 
     Shared by ``require_principal_session``, ``require_api_key``'s
@@ -50,10 +55,16 @@ async def authorized_console_principal(session: AsyncSession, token: str) -> Pri
     cookie closes the same way everywhere: disabling the principal, suspending
     its tenant, or changing the configured issuer takes effect immediately on
     every route it reaches, not only ``/console/principal``.
+
+    Pass ``live_row`` when the caller already loaded that session. The principal
+    is read from the row, and the token is not looked up again.
     """
     from .crud import console as crud_console
 
-    principal = await crud_console.live_principal_session(session, token)
+    if live_row is None:
+        principal = await crud_console.live_principal_session(session, token)
+    else:
+        principal = await crud_console.principal_for_live_row(session, live_row)
     settings = get_settings()
     if (
         principal is None

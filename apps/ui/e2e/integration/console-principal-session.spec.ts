@@ -1,13 +1,13 @@
 import { expect, test, type Page } from "@playwright/test";
 
-// Live organization sign-in (#5682) against a throwaway install whose Dex
-// issuer is not the browser's host. The driver publishes:
-//   CURIE_OIDC_ISSUER_HOST   hostname in the API's authorize redirect
+// Live organization sign-in (#5682). No driver in this repo sets these.
+// The caller does, as documented in apps/ui/README.md under Integration E2E:
+//   CURIE_OIDC_ISSUER_HOST   hostname in the authorize redirect
 //   CURIE_OIDC_ISSUER_MAP    Chromium host-resolver target, "ip" or "ip:port"
-//   CURIE_OIDC_TEST_EMAIL    Dex password user (default owner-a@example.com)
-//   CURIE_OIDC_TEST_PASSWORD Dex password (default the public fixture password)
-// PW_BASE_URL is the port-forwarded console. The redirect URI for that run is
-// the console origin plus /api/console/oidc/callback, so the session cookie is
+//   CURIE_OIDC_TEST_EMAIL    password user (default owner-a@example.com)
+//   CURIE_OIDC_TEST_PASSWORD that user's password (default the public fixture password)
+// PW_BASE_URL is the console origin. The redirect URI for that run is the
+// console origin plus /api/console/oidc/callback, so the session cookie is
 // set on the page the browser is looking at.
 
 const issuerHost = process.env.CURIE_OIDC_ISSUER_HOST ?? "";

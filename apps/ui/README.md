@@ -211,6 +211,16 @@ apps/api on 8000:
 PW_INTEGRATION=1 CURIE_API_TARGET=http://localhost:8000 pnpm exec playwright test --project=integration
 ```
 
+Organization sign-in (`e2e/integration/console-principal-session.spec.ts`) is
+not started by a driver in this repo. The caller sets `PW_BASE_URL` to the
+console origin and four variables. `CURIE_OIDC_ISSUER_HOST` is the identity
+provider hostname in the authorize redirect. `CURIE_OIDC_ISSUER_MAP` is the
+Chromium host-resolver target, an address or an address and port.
+`CURIE_OIDC_TEST_EMAIL` is the password user, default `owner-a@example.com`.
+`CURIE_OIDC_TEST_PASSWORD` is that user's password, default the public fixture
+password. The redirect URI for the run is the console origin plus
+`/api/console/oidc/callback`.
+
 The integration spec (`e2e/integration/`) seeds a real OTLP (OpenTelemetry
 Protocol) trace (`seed_trace.py`, run via `uv run`), drives create -> Deploy -> verifies the
 version + stored bundle via the API, checks the malformed-skill.md validator

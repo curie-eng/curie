@@ -2109,13 +2109,27 @@ def _assert_no_token(response: httpx.Response, token: str) -> None:
     assert "set-cookie" not in response.headers
 
 
-def test_principal_session_get_names_the_person(oidc_client: TestClient, idp: TestIdP) -> None:
+def test_principal_session_get_names_the_person(
+    oidc_client: TestClient, idp: TestIdP, monkeypatch: pytest.MonkeyPatch
+) -> None:
     idp.name = "  Alice Example  "
     token = _session_token(_login(oidc_client))
     (principal,) = _principal_rows()
+    from curie_api.crud import console as crud_console
+
+    lookups = 0
+    original = crud_console.live_console_session
+
+    async def counting_lookup(db: Any, presented: str, *, now: datetime | None = None) -> Any:
+        nonlocal lookups
+        lookups += 1
+        return await original(db, presented, now=now)
+
+    monkeypatch.setattr(crud_console, "live_console_session", counting_lookup)
 
     response = _get_session(oidc_client, token)
 
+    assert lookups == 1
     assert response.status_code == 200, response.text
     assert response.headers.get("cache-control") == "no-store"
     _assert_no_token(response, token)

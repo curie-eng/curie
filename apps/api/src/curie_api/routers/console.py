@@ -190,7 +190,9 @@ async def current_session(
             headers={"Cache-Control": "no-store"},
         )
     if row.principal_id is not None:
-        principal = await authorized_console_principal(session, console_session or "")
+        principal = await authorized_console_principal(
+            session, console_session or "", live_row=row
+        )
         if principal is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

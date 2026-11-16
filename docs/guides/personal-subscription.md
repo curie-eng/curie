@@ -48,6 +48,10 @@ Do not put a real token in a ticket, a document, or a shell history you share.
 The CLI uses your Console session cookie. It has no `--api-key`, and these
 commands do not read a platform key.
 
+When organization sign-in is enabled, the login screen shows "Sign in with
+your organization". That sign-in lands you in the Console, already signed
+in. If the return path was `/settings/claude-plan`, you land on that page.
+
 Sign in to the Console in a browser. Copy only the value of the
 `__Host-curie_console_session` cookie into a regular file named `session.txt`,
 mode 0600 or 0400. Copying that cookie by hand is a known limit. See
