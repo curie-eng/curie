@@ -2023,6 +2023,109 @@ def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
     assert sink.ci_observations == []
 
 
+def _assert_lead_in_unchanged_completion(
+    client: Any,
+    github: GitHubAPI,
+    sink: _CommentServer,
+    detail: str,
+    cause: str,
+) -> None:
+    """Row, comment, and label outcome shared with the first-line no-change test."""
+
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    sink.requests.clear()
+    sink.ci_observations.clear()
+    objective = _follow_up_objective(number, 88120)
+    revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
+    _start_running(client, revision)
+
+    finished = _finish_unpublished(client, revision, cause=cause, detail=detail)
+
+    assert finished.status_code == 200, finished.text
+    terminal = {row["id"]: row for row in _requests(number)}[revision]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("completed", "completed")
+    notices = _notices(revision)
+    assert len(notices) == 1
+    assert notices[0]["terminal_cause"] == "completed"
+    assert notices[0]["detail"].strip() == detail.strip()
+    assert (
+        _rows(
+            "SELECT count(*) AS count FROM curie.publications WHERE execution_request_id = :id",
+            {"id": revision},
+        )[0]["count"]
+        == 0
+    )
+
+    _reconcile()
+    posts = _posts(sink)
+    path = f"/repos/{REPO}/issues/{number}/comments"
+    assert [posted_path for posted_path, _body in posts] == [path]
+    body = _assert_one_final_comment([comment["body"] for comment in sink.lists[path]], revision)
+    assert "Status: SUCCEEDED" in body
+    assert (
+        "No changes needed: the open pull request already covers this request: "
+        f"https://github.com/{REPO}/pull/{pr}"
+    ) in body
+    assert "Agent's last message:" in body
+    for line in detail.strip().splitlines():
+        if line:
+            assert line in body
+    assert "Could not complete:" not in body
+    assert "NEEDS HUMAN" not in body
+    assert "Cause:" not in body
+    assert "curie-factory:pr-open" in sink.issue_labels[number]
+    assert "curie-factory:needs-human" not in sink.issue_labels[number]
+    assert _notices(revision)[0]["posted_at"] is not None
+    assert sink.ci_observations == []
+    _reconcile()
+    assert len(_posts(sink)) == 1
+    assert len(_notices(revision)) == 1
+    assert sink.ci_observations == []
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
+def test_a_lead_in_before_the_no_change_marker_completes(admitted: Any, cause: str) -> None:
+    """#5727 AC1: a later line that starts with the marker completes as unchanged."""
+
+    client, github, sink = admitted
+    detail = (
+        "The recorded decision already covers this request.\n"
+        "\n"
+        "No changes needed: the existing tests already cover this request."
+    )
+    _assert_lead_in_unchanged_completion(client, github, sink, detail, cause)
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
+def test_a_blockquote_no_change_marker_completes(admitted: Any, cause: str) -> None:
+    """#5727 AC3: a blockquote line that starts with the marker completes as unchanged."""
+
+    client, github, sink = admitted
+    detail = (
+        "The recorded decision already covers this request.\n"
+        "\n"
+        "> No changes needed: the existing tests already cover this request."
+    )
+    _assert_lead_in_unchanged_completion(client, github, sink, detail, cause)
+
+
+@pytest.mark.parametrize(
+    "marker_line",
+    [
+        "**No changes needed:** the existing tests already cover this request.",
+        "_No changes needed: the existing tests already cover this request.",
+    ],
+)
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
+def test_a_emphasis_no_change_marker_completes(admitted: Any, cause: str, marker_line: str) -> None:
+    """#5727 AC4: an emphasis line that starts with the marker completes as unchanged."""
+
+    client, github, sink = admitted
+    detail = f"The recorded decision already covers this request.\n\n{marker_line}"
+    _assert_lead_in_unchanged_completion(client, github, sink, detail, cause)
+
+
 @pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
 def test_a_review_revision_with_no_changes_completes_in_its_thread(
     admitted: Any, cause: str
