@@ -137,6 +137,7 @@ _REFUSAL_REASONS: Final[tuple[str, ...]] = (
     "actor_no_permission",
     "actor_unverifiable",
     "personal_owner_required",
+    "enrollment_inactive",
     "publication_completed",
     "installation_changed",
 )
@@ -144,7 +145,8 @@ _REFUSAL_REASONS: Final[tuple[str, ...]] = (
 # keeps it the same list as _REFUSAL_REASONS.
 _REFUSAL_REASON_SQL = (
     "'actor_bot', 'actor_own_app', 'actor_no_permission', 'actor_unverifiable', "
-    "'personal_owner_required', 'publication_completed', 'installation_changed'"
+    "'personal_owner_required', 'enrollment_inactive', 'publication_completed', "
+    "'installation_changed'"
 )
 assert _REFUSAL_REASON_SQL == ", ".join(repr(reason) for reason in _REFUSAL_REASONS)
 # Taken fields for an unposted root. Aliases are w, q and n.
@@ -217,6 +219,12 @@ def _refusal_sentence(reason: str, login: object) -> str:
         return (
             f"{who} is not linked to a personal model account. The operator links them, "
             "or a linked person applies the label."
+        )
+    if reason == "enrollment_inactive":
+        who = str(login) if login else "the account"
+        return (
+            f"{who} has no connected personal Claude plan. They connect it, "
+            "then apply the label again."
         )
     sentence = _REFUSAL_SENTENCES.get(reason)
     if sentence is None:

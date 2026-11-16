@@ -685,7 +685,9 @@ async def admit_notice(
             and (existing is None or existing.model_auth_mode != "personal")
             and owner is None
         ):
-            reason = "personal_owner_required"
+            # A resolved principal with no active enrollment can connect a plan.
+            # An unresolved actor still needs a link.
+            reason = "enrollment_inactive" if principal is not None else "personal_owner_required"
         if reason is None and len(matches) > 1:
             reason = "binding_ambiguous"
         if reason is not None:

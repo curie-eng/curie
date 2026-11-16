@@ -42,6 +42,7 @@ from curie_internal.factory_cause import cause_text
 from curie_worker.factory_slack_progress import (
     FactorySlackProgressLoop,
     PostgresFactorySlackStore,
+    render_refusal,
 )
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -517,3 +518,36 @@ def test_tracker_started_runs_keep_configured_channel_behavior(stack: Stack) -> 
     assert _chat_calls_since(stack, since) == []
     for call in stack.slack.calls:
         assert "Implemented after clearing" not in call.haystack
+
+
+def test_label_enrollment_inactive_renders_the_disconnected_plan_sentence() -> None:
+    """A linked labeller with no connected plan is told to connect it, then relabel."""
+
+    sentence = (
+        "pat&lt;lab&gt; has no connected personal Claude plan. They connect it, "
+        "then apply the label again."
+    )
+    text = render_refusal(
+        {
+            "reason": "enrollment_inactive",
+            "actor_login": "pat<lab>",
+            "repository_path": "acme/widgets",
+            "issue_id": "17",
+            "issue_url": "https://github.com/acme/widgets/issues/17",
+        }
+    )
+    assert text == (
+        f"Refused: acme/widgets #17 · {sentence}\n"
+        "https://github.com/acme/widgets/issues/17"
+    )
+    missing = render_refusal(
+        {
+            "reason": "enrollment_inactive",
+            "repository_path": "acme/widgets",
+            "issue_id": "18",
+        }
+    )
+    assert missing == (
+        "Refused: acme/widgets #18 · the account has no connected personal Claude plan. "
+        "They connect it, then apply the label again."
+    )
