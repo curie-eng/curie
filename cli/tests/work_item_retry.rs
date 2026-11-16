@@ -288,11 +288,18 @@ fn not_found_is_exit_one() {
 
 #[test]
 fn validation_422_is_usage_exit_two() {
-    let server = fixed(422, json!({"detail": [{"msg": "bad"}]}));
+    let server = fixed(422, json!({"detail": [{"msg": "reason-422-sentinel"}]}));
 
     let output = rerun(&server.base_url, &["--yes"]);
 
     assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    let error = error_payload(&output)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(error.contains("work item retry rejected"), "{error}");
+    assert!(error.contains("reason-422-sentinel"), "{error}");
+    assert_eq!(retry_posts(&server).len(), 1);
 }
 
 #[test]
@@ -350,6 +357,12 @@ fn agent_with_rerun_is_usage() {
     );
 
     assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    let text = describe(&output);
+    assert!(
+        text.contains("'--rerun' cannot be used with '--agent"),
+        "{text}"
+    );
+    assert!(!text.contains("unexpected argument"), "{text}");
     assert!(server.recorded().is_empty());
 }
 
@@ -372,11 +385,17 @@ fn non_uuid_request_id_is_usage() {
         &server.base_url,
         "--api-key",
         TEST_API_KEY,
+        "--json",
     ];
 
     let output = run(&args);
 
     assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    let error = error_payload(&output)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(error.contains("--request-id must be a UUID"), "{error}");
     assert!(server.recorded().is_empty());
 }
 
@@ -427,11 +446,20 @@ fn reason_over_500_chars_is_usage() {
         &server.base_url,
         "--api-key",
         TEST_API_KEY,
+        "--json",
     ];
 
     let output = run(&args);
 
     assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    let error = error_payload(&output)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("--reason must be 1 to 500 characters"),
+        "{error}"
+    );
     assert!(server.recorded().is_empty());
 }
 
@@ -455,6 +483,12 @@ fn rerun_only_flags_without_rerun_are_usage() {
             "{flag:?}: {}",
             describe(&output)
         );
+        let text = describe(&output);
+        assert!(
+            text.contains("required arguments were not provided") && text.contains("--rerun"),
+            "{flag:?}: {text}"
+        );
+        assert!(!text.contains("unexpected argument"), "{flag:?}: {text}");
     }
 }
 
