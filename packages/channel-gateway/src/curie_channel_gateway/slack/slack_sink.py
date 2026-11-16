@@ -61,6 +61,7 @@ from ..reply_route import ReplyRoute
 from ..reply_transport import redacted_endpoint
 from .approval_actions import parse_decision_time
 from .blocks import (
+    _reply_from_message,
     approval_card,
     expired_approval_card,
     parse_reply,
@@ -207,10 +208,6 @@ def _thread_ts(conversation_id: str | None) -> str | None:
     if conversation_id is None or not _SLACK_TS.match(conversation_id):
         return None
     return conversation_id
-
-
-
-
 
 
 def _missing_token(identity: str) -> str:
@@ -419,10 +416,11 @@ class SlackReplyAdapter:
         signal would be a second, contentless message in the thread. The event
         exists for channels (email) whose reply is only sent at the end.
 
-        A body carrying ``progress`` (reply wire 1.1) is ADR-0130's Slack
-        adapter path, checked first on both events so it never reaches the
-        answer or the approval card; the worker README's "How the Slack adapter
-        renders progress" is its contract. A create carrying a ``delivery_id``
+        A reply wire 1.3 replace edit and a 1.3 audience post are checked
+        before progress. A body carrying ``progress`` (reply wire 1.1) is
+        ADR-0130's Slack adapter path, checked before the answer and the
+        approval card; the worker README's "How the Slack adapter renders
+        progress" is its contract. A create carrying a ``delivery_id``
         passes it as ``client_msg_id``.
         """
         endpoint = route.endpoint
@@ -438,6 +436,25 @@ class SlackReplyAdapter:
             )
             return ReplyAck(ref=None)
         if isinstance(event, ReplyUpdate):
+            if event.message_mode == "replace":
+                # A 1.3 replace edit. Checked before progress and before the
+                # approval settle path: it rewrites target.reply_ref with the
+                # generic message blocks and never an approval card.
+                reply_ref = target.reply_ref
+                message = event.message
+                if reply_ref is None or message is None:
+                    raise ValueError(
+                        "reply wire 1.3 replace edit needs the posted message's reply_ref"
+                    )
+                await self._replace_message(
+                    channel=target.address,
+                    ts=reply_ref,
+                    message=message,
+                    endpoint=endpoint,
+                    best_effort_unreachable=best_effort_unreachable,
+                    identity=identity,
+                )
+                return ReplyAck(ref=reply_ref)
             if event.progress is not None:
                 # A card edit (ADR-0130). Checked before everything else: it
                 # carries no text or message, so the answer path would blank the
@@ -485,6 +502,19 @@ class SlackReplyAdapter:
             )
             return ReplyAck(ref=ref)
         if isinstance(event, ReplyPost):
+            if event.audience_user is not None:
+                # A 1.3 private post. Checked before progress and before the
+                # approval card post. Only audience_user sees it.
+                ref = await self._post_audience(
+                    channel=target.address,
+                    user=event.audience_user,
+                    thread_ts=target.conversation_id,
+                    message=event.message,
+                    endpoint=endpoint,
+                    best_effort_unreachable=best_effort_unreachable,
+                    identity=identity,
+                )
+                return ReplyAck(ref=ref)
             if event.progress is not None:
                 # A card's first revision or a milestone (ADR-0130): its own
                 # Block Kit, never the approval card, keyed by its delivery_id.
@@ -1100,6 +1130,88 @@ class SlackReplyAdapter:
             identity=identity,
         )
 
+    async def _replace_message(
+        self,
+        *,
+        channel: str,
+        ts: str,
+        message: OutboundMessage,
+        endpoint: str | None = None,
+        best_effort_unreachable: bool = False,
+        identity: str = DEFAULT_IDENTITY,
+    ) -> None:
+        """Replace one posted message with generic blocks.
+
+        Provider contract: https://docs.slack.dev/reference/methods/chat.update/
+        ``text`` is the plain ``message.text`` fallback, not mrkdwn. A Block Kit
+        rejection retries once without blocks. A rate limit still raises.
+        """
+        text = message.text
+        blocks = to_blocks(_reply_from_message(message))
+
+        async def op(client: AsyncWebClient) -> None:
+            try:
+                await client.chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
+            except SlackApiError as exc:
+                if _slack_retry_class(exc) == "rate-limit":
+                    raise
+                logger.warning("chat_update with blocks rejected for %s; retrying text-only", ts)
+                await client.chat_update(channel=channel, ts=ts, text=text)
+
+        await self._with_transport_fallback(
+            endpoint,
+            op,
+            describe="chat_update",
+            operation="update",
+            best_effort_unreachable=best_effort_unreachable,
+            identity=identity,
+        )
+
+    async def _post_audience(
+        self,
+        *,
+        channel: str,
+        user: str,
+        thread_ts: str | None,
+        message: OutboundMessage,
+        endpoint: str | None = None,
+        best_effort_unreachable: bool = False,
+        identity: str = DEFAULT_IDENTITY,
+    ) -> str | None:
+        """Post one message only ``user`` can see, and return Slack's ``message_ts``.
+
+        Provider contract: https://docs.slack.dev/reference/methods/chat.postEphemeral/
+        ``thread_ts`` is the target ``conversation_id`` when that is set. The ack
+        is ``message_ts``, not ``ts``.
+        """
+        text = message.text
+        blocks = to_blocks(_reply_from_message(message))
+
+        async def op(client: AsyncWebClient) -> AsyncSlackResponse:
+            kwargs: dict[str, Any] = {"channel": channel, "user": user, "text": text}
+            if thread_ts is not None:
+                kwargs["thread_ts"] = thread_ts
+            try:
+                return await client.chat_postEphemeral(**kwargs, blocks=blocks)
+            except SlackApiError as exc:
+                if _slack_retry_class(exc) == "rate-limit":
+                    raise
+                logger.warning("chat_postEphemeral with blocks rejected; retrying text-only")
+                return await client.chat_postEphemeral(**kwargs)
+
+        response = await self._with_transport_fallback(
+            endpoint,
+            op,
+            describe="chat_postEphemeral",
+            operation="post",
+            best_effort_unreachable=best_effort_unreachable,
+            identity=identity,
+        )
+        if response is None:
+            return None
+        message_ts = response.get("message_ts")
+        return str(message_ts) if message_ts else None
+
     async def _update_message(
         self,
         *,
@@ -1132,7 +1244,8 @@ class SlackReplyAdapter:
                 resolved_at=next(
                     (
                         parse_decision_time(item.value)
-                        for item in message.fields if item.label == "Decided"
+                        for item in message.fields
+                        if item.label == "Decided"
                     ),
                     None,
                 ),

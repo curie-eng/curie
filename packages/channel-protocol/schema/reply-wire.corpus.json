@@ -508,6 +508,60 @@
       }
     }
   ],
+  "v1_3": [
+    {
+      "name": "reply-update-replace",
+      "body": {
+        "version": "1.3",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "event": "reply.update",
+        "text": null,
+        "message": {
+          "version": "1.0",
+          "text": "replacement body",
+          "status": null,
+          "header": "Replacement heading",
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "settled": null,
+        "nav": null,
+        "message_mode": "replace"
+      }
+    },
+    {
+      "name": "reply-post-audience",
+      "body": {
+        "version": "1.3",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": null
+        },
+        "event": "reply.post",
+        "message": {
+          "version": "1.0",
+          "text": "only you can see this",
+          "status": null,
+          "header": "Private heading",
+          "fields": [],
+          "links": [],
+          "footer": null,
+          "interaction": null
+        },
+        "requested_by": "U0EXAMPLE1",
+        "audience_user": "U0EXAMPLE1"
+      }
+    }
+  ],
   "refused": [
     {
       "name": "v1-0-update-with-delivery-id",
@@ -696,7 +750,7 @@
     {
       "name": "unknown-wire-version",
       "body": {
-        "version": "1.3",
+        "version": "1.4",
         "target": {
           "kind": "email",
           "address": "agent@example.com",
@@ -1292,6 +1346,366 @@
       "error": {
         "type": "string_too_short",
         "at": "summary"
+      }
+    },
+    {
+      "name": "message-mode-on-1-0",
+      "body": {
+        "version": "1.0",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "message": {
+          "version": "1.0",
+          "text": "replacement body"
+        },
+        "message_mode": "replace"
+      },
+      "error": {
+        "type": "reply_wire_version",
+        "contains": "need reply wire 1.3"
+      }
+    },
+    {
+      "name": "message-mode-on-1-1",
+      "body": {
+        "version": "1.1",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "message": {
+          "version": "1.0",
+          "text": "replacement body"
+        },
+        "message_mode": "replace",
+        "delivery_id": "00000000-0000-4000-8000-000000000021"
+      },
+      "error": {
+        "type": "reply_wire_version",
+        "contains": "need reply wire 1.3"
+      }
+    },
+    {
+      "name": "message-mode-on-1-2",
+      "body": {
+        "version": "1.2",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "text": "exact",
+        "text_mode": "verbatim",
+        "delivery_id": "00000000-0000-4000-8000-000000000022",
+        "message_mode": "replace"
+      },
+      "error": {
+        "type": "reply_wire_version",
+        "contains": "need reply wire 1.3"
+      }
+    },
+    {
+      "name": "audience-user-on-1-0",
+      "body": {
+        "version": "1.0",
+        "event": "reply.post",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": null
+        },
+        "message": {
+          "version": "1.0",
+          "text": "only you can see this"
+        },
+        "requested_by": "U0EXAMPLE1",
+        "audience_user": "U0EXAMPLE1"
+      },
+      "error": {
+        "type": "reply_wire_version",
+        "contains": "need reply wire 1.3"
+      }
+    },
+    {
+      "name": "audience-user-on-1-1",
+      "body": {
+        "version": "1.1",
+        "event": "reply.post",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": null
+        },
+        "message": {
+          "version": "1.0",
+          "text": "only you can see this"
+        },
+        "requested_by": "U0EXAMPLE1",
+        "audience_user": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-000000000023"
+      },
+      "error": {
+        "type": "reply_wire_version",
+        "contains": "need reply wire 1.3"
+      }
+    },
+    {
+      "name": "replace-with-text",
+      "body": {
+        "version": "1.3",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "message": {
+          "version": "1.0",
+          "text": "replacement body"
+        },
+        "message_mode": "replace",
+        "text": "nope"
+      },
+      "error": {
+        "type": "replace_shape"
+      }
+    },
+    {
+      "name": "replace-with-settled",
+      "body": {
+        "version": "1.3",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "message": {
+          "version": "1.0",
+          "text": "replacement body"
+        },
+        "message_mode": "replace",
+        "settled": {
+          "requested_by": "U0EXAMPLE1"
+        }
+      },
+      "error": {
+        "type": "replace_shape"
+      }
+    },
+    {
+      "name": "replace-with-nav",
+      "body": {
+        "version": "1.3",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "message": {
+          "version": "1.0",
+          "text": "replacement body"
+        },
+        "message_mode": "replace",
+        "nav": {
+          "label": "Home",
+          "command": "hub"
+        }
+      },
+      "error": {
+        "type": "replace_shape"
+      }
+    },
+    {
+      "name": "replace-with-progress",
+      "body": {
+        "version": "1.3",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "message": {
+          "version": "1.0",
+          "text": "replacement body"
+        },
+        "message_mode": "replace",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running the integration suite",
+          "revision": 3,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "replace_shape"
+      }
+    },
+    {
+      "name": "replace-with-text-mode",
+      "body": {
+        "version": "1.3",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "message": {
+          "version": "1.0",
+          "text": "replacement body"
+        },
+        "message_mode": "replace",
+        "text_mode": "verbatim"
+      },
+      "error": {
+        "type": "replace_shape"
+      }
+    },
+    {
+      "name": "replace-with-no-message",
+      "body": {
+        "version": "1.3",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "message_mode": "replace"
+      },
+      "error": {
+        "type": "replace_shape"
+      }
+    },
+    {
+      "name": "replace-with-reply-ref-null",
+      "body": {
+        "version": "1.3",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": null
+        },
+        "message": {
+          "version": "1.0",
+          "text": "replacement body"
+        },
+        "message_mode": "replace"
+      },
+      "error": {
+        "type": "replace_shape"
+      }
+    },
+    {
+      "name": "audience-with-progress",
+      "body": {
+        "version": "1.3",
+        "event": "reply.post",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": null
+        },
+        "message": {
+          "version": "1.0",
+          "text": "only you can see this"
+        },
+        "requested_by": "U0EXAMPLE1",
+        "audience_user": "U0EXAMPLE1",
+        "progress": {
+          "kind": "card",
+          "state": "testing",
+          "summary": "Running the integration suite",
+          "revision": 3,
+          "terminal": false
+        }
+      },
+      "error": {
+        "type": "audience_shape"
+      }
+    },
+    {
+      "name": "audience-with-interaction",
+      "body": {
+        "version": "1.3",
+        "event": "reply.post",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": null
+        },
+        "message": {
+          "version": "1.0",
+          "text": "only you can see this",
+          "interaction": {
+            "kind": "confirm",
+            "id": "00000000-0000-4000-8000-00000000a001",
+            "prompt": "Deploy acme-bot to production?",
+            "confirm": {
+              "label": "Approve",
+              "value": "approve"
+            },
+            "cancel": {
+              "label": "Reject",
+              "value": "reject"
+            },
+            "allow_free_text": false
+          }
+        },
+        "requested_by": "U0EXAMPLE1",
+        "audience_user": "U0EXAMPLE1"
+      },
+      "error": {
+        "type": "audience_shape"
+      }
+    },
+    {
+      "name": "malformed-audience-user-id",
+      "body": {
+        "version": "1.3",
+        "event": "reply.post",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": null
+        },
+        "message": {
+          "version": "1.0",
+          "text": "only you can see this"
+        },
+        "requested_by": "U0EXAMPLE1",
+        "audience_user": "u0example"
+      },
+      "error": {
+        "type": "string_pattern_mismatch",
+        "at": "audience_user"
       }
     }
   ]

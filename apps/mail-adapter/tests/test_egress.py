@@ -139,6 +139,35 @@ def test_reply_text_is_the_latest_update_and_carries_the_event_marker(
     assert f"{EVENT_MARKER} ev-42" in text
 
 
+def test_wire_13_replace_and_audience_are_refused_before_recording_or_provider_send(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+    assert adapter.record_text_at("thr-1", "msg-1", "existing answer")[0] == 200
+    before = adapter.state.reply_text("thr-1", "msg-1")
+    replace = update("replacement body")
+    replace.update(
+        version="1.3",
+        text=None,
+        message={"version": "1.0", "text": "replacement body", "header": "Replacement heading"},
+        message_mode="replace",
+    )
+    audience = reply_post("only you can see this")
+    audience.update(version="1.3", audience_user="U0EXAMPLE1")
+
+    replace_status, replace_body = post_event(egress_url, replace)
+    audience_status, audience_body = post_event(egress_url, audience)
+
+    assert replace_status == 422
+    assert replace_body == {"detail": "reply wire 1.3 replace edit is not supported"}
+    assert audience_status == 422
+    assert audience_body == {"detail": "reply wire 1.3 audience post is not supported"}
+    assert adapter.state.reply_text("thr-1", "msg-1") == before
+    assert mail.replies == []
+    assert mail.thread_calls == 0
+    assert mail.list_calls == 0
+
+
 def test_verbatim_reply_update_is_refused_before_recording_or_provider_send(
     mail: MailState, adapter: MailAdapter, egress_url: str
 ) -> None:

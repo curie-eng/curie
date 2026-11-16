@@ -3,6 +3,7 @@
 from typing import Protocol
 
 from channel_protocol import (
+    SCOPED_REPLY_WIRE_VERSION,
     ReplyAck,
     ReplyEvent,
     ReplyPost,
@@ -44,6 +45,18 @@ class DiscordReplyService:
     async def deliver(self, event: ReplyEvent) -> ReplyAck:
         if isinstance(event, ReplyUpdate) and event.text_mode == "verbatim":
             raise ValueError("reply wire 1.2 verbatim is not supported")
+        if (
+            isinstance(event, ReplyUpdate)
+            and event.version == SCOPED_REPLY_WIRE_VERSION
+            and event.message_mode == "replace"
+        ):
+            raise ValueError("reply wire 1.3 replace edit is not supported")
+        if (
+            isinstance(event, ReplyPost)
+            and event.version == SCOPED_REPLY_WIRE_VERSION
+            and event.audience_user is not None
+        ):
+            raise ValueError("reply wire 1.3 audience post is not supported")
         if event.target.kind != "discord":
             raise ValueError(f"Discord adapter cannot render kind {event.target.kind!r}")
         if isinstance(event, TurnStatus):
@@ -60,9 +73,7 @@ class DiscordReplyService:
                 if known is not None:
                     return ReplyAck(ref=known)
             text = (
-                progress_text(event.progress)
-                if event.progress is not None
-                else event.message.text
+                progress_text(event.progress) if event.progress is not None else event.message.text
             )
             ref = await self._discord.post_message(channel_id, text)
             if event.delivery_id is not None:
@@ -82,9 +93,7 @@ class DiscordReplyService:
             )
             return ReplyAck(ref=event.target.reply_ref)
         text = (
-            event.text
-            if event.text is not None
-            else (event.message.text if event.message else "")
+            event.text if event.text is not None else (event.message.text if event.message else "")
         )
         if event.settled is not None:
             if event.settled.decision is None:

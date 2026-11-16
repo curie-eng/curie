@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -46,6 +47,7 @@ from channel_protocol import (
     ProgressState,
     ReplyPost,
     ReplyTarget,
+    ReplyUpdate,
 )
 from curie_channel_gateway.slack.blocks import (
     PROGRESS_CARD_BLOCK_ID_PREFIX,
@@ -142,7 +144,9 @@ def _one_page_pdf(code: str) -> bytes:
             b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
         ),
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        b"<< /Length " + str(len(content)).encode("ascii") + b" >>\nstream\n"
+        b"<< /Length "
+        + str(len(content)).encode("ascii")
+        + b" >>\nstream\n"
         + content
         + b"endstream",
     )
@@ -221,12 +225,8 @@ def _remaining(deadline: float) -> float:
     return min(15.0, remaining)
 
 
-def _preflight(
-    web: httpx.Client, redis_client: Redis, config: _LiveConfig, deadline: float
-) -> str:
-    identity = _slack_call(
-        web, config.slack_token, "auth.test", timeout=_remaining(deadline)
-    )
+def _preflight(web: httpx.Client, redis_client: Redis, config: _LiveConfig, deadline: float) -> str:
+    identity = _slack_call(web, config.slack_token, "auth.test", timeout=_remaining(deadline))
     user_id = identity.get("user_id")
     if not isinstance(user_id, str) or not user_id:
         raise _ProofError("Slack identity prerequisite returned no bot identity")
@@ -261,12 +261,9 @@ def _preflight(
     agent_id = agent.get("id")
     if not isinstance(agent_id, str) or not agent_id:
         raise _ProofError("Curie agent prerequisite returned no agent identity")
-    deployments = _api_get(
-        web, config, f"/deployments?agent_id={agent_id}", _remaining(deadline)
-    )
+    deployments = _api_get(web, config, f"/deployments?agent_id={agent_id}", _remaining(deadline))
     if not any(
-        row.get("agent_id") == agent_id and row.get("status") == "active"
-        for row in deployments
+        row.get("agent_id") == agent_id and row.get("status") == "active" for row in deployments
     ):
         raise _ProofError("Curie agent prerequisite found no active deployment")
     try:
@@ -629,9 +626,7 @@ def _slack_answer(data: object) -> dict[str, Any]:
         }
     message = data.get("message")
     if isinstance(message, dict):
-        kept["message"] = {
-            key: message[key] for key in ("ts", "client_msg_id") if key in message
-        }
+        kept["message"] = {key: message[key] for key in ("ts", "client_msg_id") if key in message}
     kept["keys"] = sorted(data)
     return kept
 
@@ -830,4 +825,128 @@ def test_live_slack_client_msg_id_dedupes_an_ambiguous_retry() -> None:
     except _ProofError as exc:
         pytest.fail(str(exc), pytrace=False)
     finally:
+        web.close()
+
+
+def test_live_wire_13_replace_edit_and_audience_post() -> None:
+    """Replace one visible Slack message, then post an ephemeral only that user sees.
+
+    Drives the production ``SlackReplyAdapter``. ``chat.update`` rewrites the
+    posted message in place. ``chat.postEphemeral`` returns ``message_ts`` when
+    Slack answers ok, and the SDK raises when it does not. That raise is the
+    ok proof.
+
+    Provider contract: https://docs.slack.dev/reference/methods/chat.postEphemeral/
+    and https://docs.slack.dev/reference/methods/chat.update/
+    """
+
+    if not os.environ.get("SLACK_BOT_TOKEN") or not os.environ.get("SLACK_TEST_CHANNEL"):
+        pytest.fail("SLACK_BOT_TOKEN and SLACK_TEST_CHANNEL are required", pytrace=False)
+    token = os.environ["SLACK_BOT_TOKEN"]
+    channel = os.environ["SLACK_TEST_CHANNEL"]
+    web = httpx.Client(follow_redirects=False)
+    posted_ts: str | None = None
+    try:
+        user_id = _slack_call(web, token, "auth.test", timeout=15.0).get("user_id")
+        if not isinstance(user_id, str) or re.fullmatch(r"^[A-Z0-9]+$", user_id) is None:
+            pytest.fail("Slack auth.test user id is not an audience id", pytrace=False)
+        sink = SlackReplyAdapter(token)
+        posted = asyncio.run(
+            sink.emit(
+                ReplyPost(
+                    version="1.0",
+                    event="reply.post",
+                    target=ReplyTarget(
+                        kind="slack", address=channel, conversation_id=None, reply_ref=None
+                    ),
+                    message=OutboundMessage(
+                        version=MESSAGE_VERSION,
+                        text="original body",
+                        header="Original heading",
+                    ),
+                    requested_by=user_id,
+                ),
+                route=TargetRoute(),
+            )
+        )
+        if not isinstance(posted.ref, str) or not posted.ref:
+            pytest.fail("Slack reply.post returned no timestamp", pytrace=False)
+        posted_ts = posted.ref
+        asyncio.run(
+            sink.emit(
+                ReplyUpdate(
+                    version="1.3",
+                    event="reply.update",
+                    target=ReplyTarget(
+                        kind="slack",
+                        address=channel,
+                        conversation_id=posted_ts,
+                        reply_ref=posted_ts,
+                    ),
+                    message=OutboundMessage(
+                        version=MESSAGE_VERSION,
+                        text="replacement body",
+                        header="Replacement heading",
+                    ),
+                    message_mode="replace",
+                ),
+                route=TargetRoute(),
+            )
+        )
+        messages = _slack_call(
+            web,
+            token,
+            "conversations.replies",
+            timeout=15.0,
+            data={"channel": channel, "ts": posted_ts, "limit": "20"},
+        ).get("messages")
+        if (
+            not isinstance(messages, list)
+            or len(messages) != 1
+            or not isinstance(messages[0], dict)
+        ):
+            pytest.fail(
+                "Slack conversations.replies did not return exactly one message",
+                pytrace=False,
+            )
+        visible = json.dumps({"text": messages[0].get("text"), "blocks": messages[0].get("blocks")})
+        assert "Replacement heading" in visible
+        assert "replacement body" in visible
+        assert "Original heading" not in visible
+        audience = asyncio.run(
+            sink.emit(
+                ReplyPost(
+                    version="1.3",
+                    event="reply.post",
+                    target=ReplyTarget(
+                        kind="slack",
+                        address=channel,
+                        conversation_id=posted_ts,
+                        reply_ref=None,
+                    ),
+                    message=OutboundMessage(
+                        version=MESSAGE_VERSION,
+                        text="audience body",
+                        header="Audience heading",
+                    ),
+                    requested_by=user_id,
+                    audience_user=user_id,
+                ),
+                route=TargetRoute(),
+            )
+        )
+        if not isinstance(audience.ref, str) or not audience.ref:
+            pytest.fail("Slack audience post returned no message_ts", pytrace=False)
+    finally:
+        if posted_ts is not None:
+            try:
+                _slack_call(
+                    web,
+                    token,
+                    "chat.delete",
+                    timeout=15.0,
+                    data={"channel": channel, "ts": posted_ts},
+                )
+            except Exception:  # noqa: BLE001 - delete failure must not fail the proof
+                pass
         web.close()

@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 
 from channel_protocol import (
+    SCOPED_REPLY_WIRE_VERSION,
     ConfirmIntent,
     ReplyAck,
     ReplyEvent,
@@ -188,9 +189,7 @@ class EgressHandler(BaseHTTPRequestHandler):
             self._respond(413, {"detail": "request body is too large"})
             self._drain_rejected_body(length)
             return
-        content_type = (
-            (self.headers.get("Content-Type") or "").partition(";")[0].strip().lower()
-        )
+        content_type = (self.headers.get("Content-Type") or "").partition(";")[0].strip().lower()
         if content_type != "application/json":
             return self._respond(415, {"detail": "Content-Type must be application/json"})
         try:
@@ -204,10 +203,7 @@ class EgressHandler(BaseHTTPRequestHandler):
         except (OSError, UnicodeDecodeError, ValueError, ValidationError):
             logger.warning("invalid reply event")
             return self._respond(400, {"detail": "invalid reply event"})
-        if (
-            event.target.kind != CHANNEL_KIND
-            or event.target.address != self.adapter.inbox_address
-        ):
+        if event.target.kind != CHANNEL_KIND or event.target.address != self.adapter.inbox_address:
             return self._respond(
                 422,
                 {"detail": "event target does not belong to this adapter"},
@@ -216,6 +212,24 @@ class EgressHandler(BaseHTTPRequestHandler):
             return self._respond(
                 422,
                 {"detail": "reply wire 1.2 verbatim is not supported"},
+            )
+        if (
+            isinstance(event, ReplyUpdate)
+            and event.version == SCOPED_REPLY_WIRE_VERSION
+            and event.message_mode == "replace"
+        ):
+            return self._respond(
+                422,
+                {"detail": "reply wire 1.3 replace edit is not supported"},
+            )
+        if (
+            isinstance(event, ReplyPost)
+            and event.version == SCOPED_REPLY_WIRE_VERSION
+            and event.audience_user is not None
+        ):
+            return self._respond(
+                422,
+                {"detail": "reply wire 1.3 audience post is not supported"},
             )
         if isinstance(event, TurnCompleted) and not event.event_id:
             return self._respond(422, {"detail": "event_id must not be empty"})
