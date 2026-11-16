@@ -323,7 +323,19 @@ def _paginate(
             ) from None
         if not isinstance(body, list):
             raise ToolError(f"GitHub returned an unexpected shape for {repo} {endpoint}.")
-        page_rows = [row for row in body if isinstance(row, dict)]
+        # Each collection endpoint documents an array of objects (see the REST
+        # reference for list-repository-issues, list-issue-events-for-a-repository
+        # and list-milestones). A member that is not an object means the page is
+        # not the documented shape, and dropping it would read as a complete
+        # result. Refuse before the page is accumulated or `stop` can end the
+        # read early on a page that was only partly understood. The message
+        # carries no response text.
+        if not all(isinstance(row, dict) for row in body):
+            raise ToolError(
+                f"GitHub returned a page with an unexpected item shape for {repo} "
+                f"{endpoint}: every item must be a JSON object."
+            )
+        page_rows: list[dict[str, Any]] = body
         rows.extend(page_rows)
         if stop is not None and stop(page_rows):
             return rows, False

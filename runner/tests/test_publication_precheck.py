@@ -9,7 +9,6 @@ import subprocess
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from shutil import which
 from typing import Any
 
 import anyio
@@ -36,6 +35,7 @@ from curie_runner.harness.claude.approval import (
 )
 from curie_runner.session import SessionRunner
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
+from sdk_cli_support import sdk_cli_available
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
@@ -741,12 +741,18 @@ def test_fake_permission_callback_receives_the_stream_tool_use_id() -> None:
     anyio.run(go)
 
 
-@pytest.mark.skipif(which("claude") is None, reason="local Claude CLI is unavailable")
+@pytest.mark.skipif(not sdk_cli_available(), reason="the SDK has no executable Claude CLI")
 def test_real_sdk_publication_call_shares_stream_hook_and_permission_identity(
     tmp_path: Path,
     workspace: tuple[Path, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The scripted provider offers the publication call only once the tools array
+    # the CLI posts names the platform tool. The packaged CLI otherwise defers
+    # that tool behind ToolSearch, so the array omits it. ENABLE_TOOL_SEARCH=false
+    # lists it upfront for this observation only; production does not set it.
+    monkeypatch.setenv("ENABLE_TOOL_SEARCH", "false")
+
     class PublicationProvider(_ProviderCapture):
         def __init__(self) -> None:
             super().__init__()

@@ -60,6 +60,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from . import capacity_wait as capacity_wait_module
+from .boot_grace import BootGrace
 from .capacity_wait import (
     REQUESTER_HANDOFF_REASON,
     WAIT_GENERATION_FIELD,
@@ -207,6 +208,7 @@ class Consumer(StreamConsumer):
         reminders: Callable[[ApprovalReminderV1], Awaitable[None]],
         max_concurrency: int | None = None,
         drain: UpgradeDrainGate | None = None,
+        boot_grace: BootGrace | None = None,
     ) -> None:
         # Capacity parking requires a real delivery fence, so every runs
         # consumer supplies the same lease store the production entry point uses.
@@ -229,6 +231,11 @@ class Consumer(StreamConsumer):
         self._kernel = kernel
         self._reminders = reminders
         self._config = config
+        # The #3079 startup window for maintenance step failures. The Consumer
+        # is built once at worker boot (run.py build()), and a supervisor
+        # restart re-enters run() on this same instance, so the window is
+        # anchored at boot and never reopened.
+        self._boot_grace = boot_grace if boot_grace is not None else BootGrace.starting_now()
         self._waits = CapacityWaitStore(redis, config)
         # None, which the production entry point passes, sizes the lane from
         # CURIE_WORKER_MAX_CONCURRENCY; an explicit value is for tests.
@@ -1204,25 +1211,31 @@ class Consumer(StreamConsumer):
 
     async def _maintenance_loop(self) -> None:
         while not self._should_stop():
-            try:
-                # A reclaim is a NEW claim: it moves a peer's pending entry into
-                # this consumer and dispatches it. During an upgrade drain
-                # (#2010) that is exactly the theft the gate exists to stop --
-                # a replacement pod coming up mid-roll would otherwise take the
-                # delivery a still-draining replica is settling, see the
-                # side-effect marker, and escalate work that was about to
-                # complete. The rest of the tick is unaffected: reaping orphans
-                # and sweeping owed completions create no claims and stay
-                # useful while a drain is in progress.
-                if not await self._claims_paused():
-                    await self._reclaim_once()
-                await self._kernel.reap_orphans()
-                await self._kernel.sweep_pending_completions()
-                await self._sweep_pending_progress()
-                await self._drain_pending_progress_inboxes()
-                await self._drain_thread_reset_requests()
-            except Exception:
-                logger.exception("maintenance tick failed")
+            # Each step runs in its own try (#5630): the steps are independent,
+            # so a Kubernetes outage that fails the orphan reap must not stall
+            # owed completion recovery or the thread-reset drain behind it.
+            #
+            # A reclaim is a NEW claim: it moves a peer's pending entry into
+            # this consumer and dispatches it. During an upgrade drain
+            # (#2010) that is exactly the theft the gate exists to stop --
+            # a replacement pod coming up mid-roll would otherwise take the
+            # delivery a still-draining replica is settling, see the
+            # side-effect marker, and escalate work that was about to
+            # complete. The rest of the tick is unaffected: reaping orphans
+            # and sweeping owed completions create no claims and stay
+            # useful while a drain is in progress.
+            await self._maintenance_step("reclaim", self._reclaim_unless_paused)
+            await self._maintenance_step("reap_orphans", self._kernel.reap_orphans)
+            await self._maintenance_step(
+                "sweep_pending_completions", self._kernel.sweep_pending_completions
+            )
+            await self._maintenance_step("progress_sweep", self._sweep_pending_progress)
+            await self._maintenance_step(
+                "progress_inbox_drain", self._drain_pending_progress_inboxes
+            )
+            await self._maintenance_step(
+                "thread_reset_drain", self._drain_thread_reset_requests
+            )
             # Queue inventory is operational sampling, not message settlement.
             # Keep its three Valkey reads on the bounded maintenance cadence so
             # a slow telemetry read cannot retain a per-message concurrency slot
@@ -1233,6 +1246,34 @@ class Consumer(StreamConsumer):
             await self._observe_completion_outbox()
             await self._observe_capacity_waits()
             await self._sleep_or_stop(self._config.reclaim_interval_s)
+
+    async def _reclaim_unless_paused(self) -> None:
+        if not await self._claims_paused():
+            await self._reclaim_once()
+
+    async def _maintenance_step(self, name: str, step: Callable[[], Awaitable[object]]) -> None:
+        """Run one maintenance step, logging its failure without skipping the rest.
+
+        Inside the boot window a failure caused by a dependency that is not
+        ready yet, such as the object-store bucket a post-install Job creates
+        after the worker starts, is expected (#3079) and logs a one-line
+        warning; any other failure, or any failure after the window, logs the
+        traceback.
+        """
+        try:
+            await step()
+        except Exception as exc:
+            if self._boot_grace.excuses(exc):
+                logger.warning(
+                    "maintenance step %s deferred: a dependency is not ready yet "
+                    "(expected during startup) cause=%s: %s",
+                    name,
+                    type(exc).__name__,
+                    " ".join(str(exc).split()),
+                    extra={"maintenance_step": name},
+                )
+            else:
+                logger.exception("maintenance tick failed", extra={"maintenance_step": name})
 
     async def _sweep_pending_progress(self) -> None:
         """Sweep the progress outbox (ADR 0130) with no deliverer.

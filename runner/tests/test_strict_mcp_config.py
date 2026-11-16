@@ -14,22 +14,20 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 import anyio
-import claude_agent_sdk
 import pytest
 from claude_agent_sdk import ClaudeSDKClient
 from curie_runner.adapter import build_options
 from curie_runner.check import run_check
 from curie_runner.plugin import bundle_mcp_servers, load_plugins
 from plugin_format.approval_policy import effective_tool_prefix
+from sdk_cli_support import sdk_cli_available
 
-_BUNDLED_CLI = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
-_CLI_AVAILABLE = _BUNDLED_CLI.is_file() or shutil.which("claude") is not None
+_CLI_AVAILABLE = sdk_cli_available()
 
 # A one-tool stdio server on the interpreter running the tests, so the real CLI
 # can connect it without relying on the host's `python3` having `mcp` installed.

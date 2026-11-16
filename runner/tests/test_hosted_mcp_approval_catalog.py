@@ -14,8 +14,8 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
-from shutil import which
 from typing import Any
 from uuid import uuid4
 
@@ -42,6 +42,7 @@ from curie_runner.mcp_tool_capability import probe_mcp_tool_capability
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from runner_boot_session import initialized_session_sync
+from sdk_cli_support import sdk_cli_available
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
@@ -54,7 +55,7 @@ WRITE_APPROVAL = "mcp__operations__write_approval"
 WRITE_DENIED = "mcp__operations__write_denied"
 WRITE_UNMATCHED = "mcp__operations__write_unmatched"
 
-_HAS_CLAUDE_CLI = which("claude") is not None
+_HAS_CLAUDE_CLI = sdk_cli_available()
 
 
 class _TranscriptStore:
@@ -494,8 +495,29 @@ def _first_provider_catalog(capture: _ProviderCapture) -> set[str]:
     return set()
 
 
-async def _drive(runner: Any, text: str, ts: str) -> Final:
+async def _await_mcp_connected(runner: Any, server: str) -> None:
+    """Block until the CLI's own MCP status reports ``server`` connected.
+
+    The CLI connects MCP servers in the background, so a query sent at once can
+    be answered from a catalogue built before they finish. Each status read is a
+    control round trip to the CLI, so a server still connecting is read again
+    rather than slept on. Not connected by the deadline fails the test; it is
+    never a skip.
+    """
+
+    client = runner._session._client
+    with anyio.fail_after(30):
+        while True:
+            status = await client.get_mcp_status()
+            found = {item.get("name"): item.get("status") for item in status["mcpServers"]}
+            if found.get(server) == "connected":
+                return
+
+
+async def _drive(runner: Any, text: str, ts: str, *, connected_server: str | None = None) -> Final:
     await runner.start()
+    if connected_server is not None:
+        await _await_mcp_connected(runner, connected_server)
     final: Final | None = None
     try:
         with anyio.fail_after(45):
@@ -518,6 +540,11 @@ async def _drive(runner: Any, text: str, ts: str) -> Final:
 def test_loopback_sdk_hosted_catalog_keeps_approval_tools_across_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # This test reads the tools array the CLI posts to the provider. The packaged
+    # CLI otherwise defers MCP tools behind ToolSearch, so that array names none
+    # of them (see test_channel_hidden_tools). ENABLE_TOOL_SEARCH=false lists them
+    # upfront for this observation only; production does not set it.
+    monkeypatch.setenv("ENABLE_TOOL_SEARCH", "false")
     calls: list[str] = []
     capture = _ProviderCapture()
     catalogs = _observe_catalogs(monkeypatch)
@@ -532,7 +559,9 @@ def test_loopback_sdk_hosted_catalog_keeps_approval_tools_across_resume(
             sdk_env=_sdk_env(provider_url, tmp_path / "claude-a"),
             history_store=store,
         )
-        first_final = anyio.run(_drive, first, "Reply with only ok.", "1")
+        first_final = anyio.run(
+            partial(_drive, first, "Reply with only ok.", "1", connected_server="operations")
+        )
         assert catalogs, "first boot emitted no SDK init catalog"
         _assert_catalog(set(catalogs[0]))
         provider_catalog = _first_provider_catalog(capture)
@@ -545,7 +574,9 @@ def test_loopback_sdk_hosted_catalog_keeps_approval_tools_across_resume(
             sdk_env=_sdk_env(provider_url, tmp_path / "claude-b"),
             conversation_replay=replay,
         )
-        resumed_final = anyio.run(_drive, resumed, "Reply with only ok.", "2")
+        resumed_final = anyio.run(
+            partial(_drive, resumed, "Reply with only ok.", "2", connected_server="operations")
+        )
 
     assert first_final.status in {SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT}
     assert resumed_final.status in {SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT}

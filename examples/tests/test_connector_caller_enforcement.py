@@ -18,9 +18,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "check-connector-caller-enforcement.sh"
 SERVICE = "curie-weather-mcp-netpol-probe"
 POD_IP = "192.0.2.20"
+# A stand-in for the store password the fake Secret holds; the gate must
+# never print it or put it on an argv.
+LEAK_SENTINEL = "leak-sentinel-for-the-grant-store-5550"
+STORE_POD = "curie-valkey-0"
 
 _FAKE = """#!/usr/bin/env python3
-import json, os, sys
+import base64, json, os, sys
 
 args = sys.argv[1:]
 with open(os.environ["FAKE_KUBECTL_LOG"], "a", encoding="utf-8") as stream:
@@ -42,6 +46,72 @@ if "get" in args and "svc" in args:
     jsonpath = args[-1]
     print(env("FAKE_TARGET_PORT", "caller") if "targetPort" in jsonpath else "8000", end="")
     raise SystemExit(0)
+if "get" in args and "secret" in args:
+    password = env("FAKE_VALKEY_PASSWORD", "")
+    encoded = base64.b64encode(password.encode()).decode()
+    print(json.dumps({"kind": "Secret", "data": {"valkeyPassword": encoded}}))
+    raise SystemExit(0)
+if "get" in args and "deployments,pods,replicasets" in args:
+    password = env("FAKE_VALKEY_PASSWORD", "")
+    literal = env("FAKE_LITERAL_IN", "")
+    svc = env("FAKE_CONNECTORS", "").split()[0]
+    ref = {"name": "curie-secrets", "key": "valkeyPassword"}
+    if env("FAKE_PROXY_REF") == "wrong-secret":
+        ref = {"name": "other-secret", "key": "valkeyPassword"}
+    proxy_env = [
+        {"name": "CURIE_CALLER_PROXY_GRANT_STORE", "value": "redis://curie-valkey:6379/0"},
+        {"name": "CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD", "valueFrom": {"secretKeyRef": ref}},
+    ]
+    if env("FAKE_PROXY_REF") == "missing":
+        proxy_env = proxy_env[:1]
+    def leak(kind):
+        return [{"name": "LEAKED", "value": password}] if literal == kind else []
+    def pod_spec(env_list, name="server"):
+        return {"containers": [{"name": name, "env": env_list}]}
+    containers = [
+        {"name": "caller-proxy", "env": proxy_env},
+        {"name": "server", "env": leak("deployment")},
+    ]
+    items = [
+        {
+            "kind": "Deployment",
+            "metadata": {"name": svc},
+            "spec": {"replicas": 1, "template": {"spec": {"containers": containers}}},
+        },
+        {
+            "kind": "Pod",
+            "metadata": {"name": svc + "-abc12"},
+            "spec": {"containers": [{"name": "caller-proxy", "env": proxy_env + leak("pod")}]},
+        },
+        {
+            "kind": "ReplicaSet",
+            "metadata": {"name": svc + "-live"},
+            "spec": {"replicas": 1, "template": {"spec": pod_spec(leak("replicaset"))}},
+        },
+    ]
+    if literal == "stale-replicaset":
+        items.append(
+            {
+                "kind": "ReplicaSet",
+                "metadata": {"name": svc + "-old"},
+                "spec": {
+                    "replicas": 0,
+                    "template": {"spec": pod_spec([{"name": "OLD", "value": password}])},
+                },
+            }
+        )
+    print(json.dumps({"kind": "List", "items": items}))
+    raise SystemExit(0)
+selector = args[args.index("-l") + 1] if "-l" in args else ""
+if "get" in args and "pod" in args and "component=valkey" in selector:
+    print("curie-valkey-0", end="")
+    raise SystemExit(0)
+if "get" in args and "deployment" in args and "component=api" in selector:
+    print("curie-api", end="")
+    raise SystemExit(0)
+if "get" in args and "deployment" in args and "VALKEY_PASSWORD" in args[-1]:
+    print("curie-secrets valkeyPassword", end="")
+    raise SystemExit(0)
 if "get" in args and "pod" in args:
     print("192.0.2.20", end="")
     raise SystemExit(0)
@@ -56,6 +126,31 @@ if "exec" in args:
     pod = args[args.index("exec") + 1]
     if "other-agent" in pod:
         raise SystemExit(0 if env("FAKE_OTHER_AGENT_REACHES", "0") == "1" else 1)
+    if command[0] == "sh" and "valkey" in args:
+        state = env("FAKE_STATE_FILE")
+        spent = json.load(open(state)) if os.path.exists(state) else []
+        found = command[-1] in spent and env("FAKE_KEY_MISSING") != "1"
+        print("1" if found else "0", end="")
+        raise SystemExit(0)
+    if command[0] == "python" and len(command) > 3:
+        state = env("FAKE_STATE_FILE")
+        spent = json.load(open(state)) if os.path.exists(state) else []
+        grant, count, wrong = command[3], int(command[4]), len(command) > 5
+        mode = env("FAKE_SPEND", "")
+        for _ in range(count):
+            if wrong:
+                result = mode == "wrong-spends"
+            elif mode == "none":
+                result = False
+            elif mode == "twice":
+                result = True
+            else:
+                result = grant not in spent
+            if result:
+                spent.append(grant)
+            print(result)
+        json.dump(spent, open(state, "w"))
+        raise SystemExit(0)
     if command[0] == "python":
         raise SystemExit(0 if env("FAKE_SERVER_LISTENS", "1") == "1" else 1)
     url = command[-1]
@@ -112,6 +207,8 @@ def _run(
         "FAKE_KUBECTL_LOG": str(log),
         "FAKE_DOCKER_LOG": str(tmp_path / "docker.jsonl"),
         "FAKE_CONNECTORS": SERVICE,
+        "FAKE_VALKEY_PASSWORD": LEAK_SENTINEL,
+        "FAKE_STATE_FILE": str(tmp_path / "spent.json"),
         **fake,
     }
     env.pop("CURIE_CALLER_SIGNING_KEY", None)
@@ -240,3 +337,87 @@ def test_a_connector_admitting_nobody_is_not_an_admitted_leg(tmp_path: Path) -> 
     assert result.returncode != 0
     assert "no connector admits an agent" in result.stderr
     assert _token_dials(calls) == []
+
+
+# @spec #5550
+def test_the_healthy_install_passes_legs_6_to_8(tmp_path: Path) -> None:
+    result, calls = _run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    for leg in ("leg 6", "leg 7", "leg 8"):
+        assert f"ok  {leg}" in result.stdout
+    assert any(STORE_POD in c for c in calls)
+
+
+# @spec #5550
+@pytest.mark.parametrize(
+    ("where", "named"),
+    [
+        ("deployment", f"Deployment/{SERVICE}"),
+        ("pod", f"Pod/{SERVICE}-abc12"),
+        ("replicaset", f"ReplicaSet/{SERVICE}-live"),
+    ],
+)
+def test_the_password_literal_in_a_live_workload_fails_leg_6(
+    tmp_path: Path, where: str, named: str
+) -> None:
+    result, _ = _run(tmp_path, FAKE_LITERAL_IN=where)
+    assert result.returncode != 0
+    assert "leg 6:" in result.stderr
+    assert named in result.stderr
+
+
+# @spec #5550
+def test_a_superseded_replicaset_holding_the_literal_is_reported_not_failed(tmp_path: Path) -> None:
+    result, _ = _run(tmp_path, FAKE_LITERAL_IN="stale-replicaset")
+    assert result.returncode == 0, result.stderr
+    assert "--  leg 6: superseded ReplicaSet" in result.stdout
+    assert f"{SERVICE}-old" in result.stdout
+
+
+# @spec #5550
+@pytest.mark.parametrize("mode", ["missing", "wrong-secret"])
+def test_a_proxy_not_reading_the_password_by_reference_fails_leg_6(
+    tmp_path: Path, mode: str
+) -> None:
+    result, _ = _run(tmp_path, FAKE_PROXY_REF=mode)
+    assert result.returncode != 0
+    assert "leg 6:" in result.stderr
+
+
+# @spec #5550
+def test_an_empty_secret_key_fails_leg_6(tmp_path: Path) -> None:
+    result, _ = _run(tmp_path, FAKE_VALKEY_PASSWORD="")
+    assert result.returncode != 0
+    assert "leg 6:" in result.stderr
+    assert "is empty" in result.stderr
+
+
+# @spec #5550
+@pytest.mark.parametrize(
+    "fake",
+    [{"FAKE_SPEND": "twice"}, {"FAKE_SPEND": "none"}, {"FAKE_KEY_MISSING": "1"}],
+    ids=["double_spend", "no_spend", "key_missing"],
+)
+def test_a_grant_spend_that_misbehaves_fails_leg_7(tmp_path: Path, fake: dict[str, str]) -> None:
+    result, _ = _run(tmp_path, **fake)
+    assert result.returncode != 0
+    assert "leg 7:" in result.stderr
+
+
+# @spec #5550
+def test_a_wrong_password_that_spends_fails_leg_8(tmp_path: Path) -> None:
+    result, _ = _run(tmp_path, FAKE_SPEND="wrong-spends")
+    assert result.returncode != 0
+    assert "leg 8:" in result.stderr
+
+
+# @spec #5550
+@pytest.mark.parametrize("fake", [{}, {"FAKE_LITERAL_IN": "pod"}], ids=["healthy", "leg_6_failure"])
+def test_the_password_never_reaches_an_argv_or_the_output(
+    tmp_path: Path, fake: dict[str, str]
+) -> None:
+    result, calls = _run(tmp_path, **fake)
+    assert (result.returncode == 0) == (not fake)
+    assert LEAK_SENTINEL not in json.dumps(calls)
+    assert LEAK_SENTINEL not in result.stdout
+    assert LEAK_SENTINEL not in result.stderr

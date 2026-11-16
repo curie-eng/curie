@@ -492,6 +492,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CALLER_PROXY_GATED_TOOLS",
         "CURIE_CALLER_PROXY_CONNECTOR",
         "CURIE_CALLER_PROXY_GRANT_STORE",
+        "CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.

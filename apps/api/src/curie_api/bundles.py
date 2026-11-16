@@ -549,7 +549,7 @@ def render_connector_manifests(
     app_name: str,
     secret_name: str,
     proxy: connector_render.ConnectorProxy | None = None,
-    grant_store_url: str = "",
+    grant_store: connector_render.GrantStore | None = None,
     gated_tools: Mapping[str, tuple[str, ...]] | None = None,
     e2e: E2EInstall | None = None,
 ) -> list[dict[str, Any]]:
@@ -579,7 +579,7 @@ def render_connector_manifests(
                 secret_name=secret_name,
                 proxy=proxy,
                 gated_tools=tools,
-                grant_store_url=grant_store_url if proxy is not None else "",
+                grant_store=grant_store if proxy is not None else None,
             )
         )
     if install.enabled and CONNECTOR_NAME in connectors.connectors:

@@ -41,7 +41,13 @@ stop -- that is scope creep on the sacred module.
    a required safety fact and the provider retry condition the runner sent, and
    the SQL lifecycle owns the retry as a fresh request. Interactive, cron, CI
    fix and approval resume turns keep the classification list.
-   `workspace-error` (#2004) is a workspace
+   A connect-phase turn-start failure (classified
+   `runner-error`) opens one window per delivery, the sandbox claim timeout
+   long (90 s by default) and never reset, in which attempts do not consume
+   `max_attempts` but are counted in the escalation text; each sleep is capped
+   at 5 s and the wait runs between attempts, outside the thread lock (#4733).
+   Cron deliveries and deliveries with a persisted side-effect flag get no
+   window. `workspace-error` (#2004) is a workspace
    preparation FAULT before the turn was accepted; it must log a WARNING naming
    the agent, deployment, repository and stage, because a silent one acks the
    turn and creates no sandbox with nothing in the log to find it by. A

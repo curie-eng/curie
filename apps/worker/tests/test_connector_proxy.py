@@ -1506,3 +1506,126 @@ def test_the_decision_log_says_present_and_never_carries_the_header_or_the_reque
         assert expected[-24:] not in text
         for value in case["principal"].values():
             assert value not in text
+
+
+# #5550: the rendered address is credential-free and the password arrives in
+# its own variable from a Secret. The proxy assembles the URL in memory.
+def _grant_store_env(sync_redis: Any, password: str | None = None) -> dict[str, str]:
+    connection = sync_redis.connection_pool.connection_kwargs
+    username = connection.get("username") or ""
+    user = f"{username}@" if username else ""
+    address = f"redis://{user}{connection['host']}:{connection['port']}/0"
+    secret = (connection.get("password") or "") if password is None else password
+    return _env(**{server.GRANT_STORE_ENV: address, server.GRANT_STORE_PASSWORD_ENV: secret})
+
+
+def test_the_proxy_spends_a_grant_once_with_the_secret_delivered_password(
+    sync_redis: Any,
+) -> None:
+    config = server.ProxyConfig.from_env(_grant_store_env(sync_redis))
+    assert config.grant_store is not None
+    jti = str(uuid.uuid4())
+    key = f"connector-grant:{jti}"
+    try:
+        assert config.grant_store.spend(jti, 300) is True
+        assert config.grant_store.spend(jti, 300) is False
+        assert sync_redis.exists(key) == 1
+    finally:
+        sync_redis.delete(key)
+
+
+def test_a_wrong_grant_store_password_spends_nothing(sync_redis: Any) -> None:
+    wrong = f"wrong-{uuid.uuid4().hex}"
+    config = server.ProxyConfig.from_env(_grant_store_env(sync_redis, password=wrong))
+    assert config.grant_store is not None
+    jti = str(uuid.uuid4())
+    key = f"connector-grant:{jti}"
+    try:
+        assert config.grant_store.spend(jti, 300) is False
+        assert sync_redis.exists(key) == 0
+    finally:
+        sync_redis.delete(key)
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "redis://valkey:6379/0",
+        "redis://grant-user@valkey:6380/2",
+        "rediss://[fd00::1]:6379/0",
+        "redis://valkey",
+    ],
+)
+def test_a_grant_store_password_with_reserved_characters_survives_assembly(
+    address: str,
+) -> None:
+    from urllib.parse import unquote, urlsplit
+
+    password = "p@ss/w#rd%2F+x:y?z "
+    config = server.ProxyConfig.from_env(
+        _env(**{server.GRANT_STORE_ENV: address, server.GRANT_STORE_PASSWORD_ENV: password})
+    )
+    assert isinstance(config.grant_store, server._ValkeyGrantStore)
+    built = urlsplit(config.grant_store._url)
+    rendered = urlsplit(address)
+    assert (built.scheme, built.hostname, built.port, built.path) == (
+        rendered.scheme,
+        rendered.hostname,
+        rendered.port,
+        rendered.path,
+    )
+    assert built.username == (rendered.username or "")
+    assert built.password is not None
+    assert unquote(built.password) == password
+    assert (built.query, built.fragment) == ("", "")
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "redis://:hunter2-5550@valkey:6379/0",
+        "redis://grant-user:hunter2-5550@valkey:6379/0",
+        "redis://:@valkey:6379/0",
+    ],
+)
+def test_a_grant_store_address_carrying_a_password_is_refused(address: str) -> None:
+    with pytest.raises(ValueError, match=server.GRANT_STORE_ENV) as caught:
+        server.ProxyConfig.from_env(
+            _env(**{server.GRANT_STORE_ENV: address, server.GRANT_STORE_PASSWORD_ENV: "x"})
+        )
+    assert "hunter2-5550" not in str(caught.value)
+    assert address not in str(caught.value)
+
+
+def test_the_entrypoint_refuses_a_grant_store_address_carrying_a_password(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for name, value in _env(
+        **{server.GRANT_STORE_ENV: "redis://:hunter2-5550@valkey:6379/0"}
+    ).items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv(server.GRANT_STORE_PASSWORD_ENV, raising=False)
+    assert proxy_main.main() == 2
+    err = capsys.readouterr().err
+    assert server.GRANT_STORE_ENV in err
+    assert "hunter2-5550" not in err
+
+
+def test_a_credential_free_address_without_a_password_configures_a_store_with_no_auth() -> None:
+    from urllib.parse import urlsplit
+
+    address = "redis://valkey:6379/0"
+    config = server.ProxyConfig.from_env(_env(**{server.GRANT_STORE_ENV: address}))
+    assert isinstance(config.grant_store, server._ValkeyGrantStore)
+    assert config.grant_store._url == address
+    assert urlsplit(config.grant_store._url).password is None
+    empty = server.ProxyConfig.from_env(
+        _env(**{server.GRANT_STORE_ENV: address, server.GRANT_STORE_PASSWORD_ENV: ""})
+    )
+    assert isinstance(empty.grant_store, server._ValkeyGrantStore)
+    assert empty.grant_store._url == address
+
+
+def test_no_grant_store_address_configures_no_store_even_with_a_password() -> None:
+    config = server.ProxyConfig.from_env(_env(**{server.GRANT_STORE_PASSWORD_ENV: "secret"}))
+    assert config.grant_store is None

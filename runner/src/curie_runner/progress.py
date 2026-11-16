@@ -216,8 +216,8 @@ def build_progress_tool(
     ids = [phase["id"] for phase in declaration["phases"]]
     caps: dict[str, int] = {}
     for loop in declaration.get("loops", []):
-        caps[loop["start"]] = loop["cap"]
-        caps[loop["review"]] = loop["cap"]
+        for phase in (loop["start"], loop["review"]):
+            caps[phase] = max(caps.get(phase, 0), loop["cap"])
     schema = {
         "type": "object",
         "properties": {

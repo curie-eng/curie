@@ -166,8 +166,16 @@ The proxy runs from the worker image as `python -m curie_connector_proxy`, pulle
 with the worker's pull policy and pull secrets, and holds the public keys, the
 connector's `admits` list, resolved at render
 (`packages/plugin-format/src/plugin_format/connector_render.py::resolved_admits`),
-the connector's gated tool patterns, its name and the grant store URL
-(`apps/worker/src/curie_connector_proxy/server.py::ProxyConfig`).
+the connector's gated tool patterns, its name and the grant store
+(`apps/worker/src/curie_connector_proxy/server.py::ProxyConfig`). The grant
+store reaches the proxy as two parts
+(`packages/plugin-format/src/plugin_format/connector_render.py::GrantStore`):
+`CURIE_CALLER_PROXY_GRANT_STORE` is a literal, credential-free Valkey address,
+and `CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD` is a `secretKeyRef` to the
+Secret that holds the Valkey password (the API learns its name from
+`CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME`, key `valkeyPassword`). No rendered
+object carries the password. The proxy refuses to start when the address
+carries a password of its own, and otherwise builds the store URL in memory.
 The Service keeps the connector's port, so the URL and the allowed hosts do not
 move, and lands it on the proxy's port. Both rendered NetworkPolicies open only
 that port, so nothing Curie renders opens the server's own port.

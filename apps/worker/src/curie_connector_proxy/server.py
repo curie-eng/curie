@@ -32,7 +32,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Protocol
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, TCPConnector, web
 from aiohttp.typedefs import Handler
@@ -51,6 +51,9 @@ ADMITS_ENV = "CURIE_CALLER_PROXY_ADMITS"
 GATED_TOOLS_ENV = "CURIE_CALLER_PROXY_GATED_TOOLS"
 CONNECTOR_ENV = "CURIE_CALLER_PROXY_CONNECTOR"
 GRANT_STORE_ENV = "CURIE_CALLER_PROXY_GRANT_STORE"
+# The grant store password, delivered by secretKeyRef (#5550). The address in
+# GRANT_STORE_ENV carries no credential; the URL is assembled in memory.
+GRANT_STORE_PASSWORD_ENV = "CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD"
 ROUTES_ENV = "CURIE_CALLER_PROXY_ROUTES"
 
 GRANT_HEADER = "X-Curie-Connector-Grant"
@@ -352,7 +355,7 @@ class ProxyConfig:
             isinstance(name, str) and name for name in admits
         ):
             raise ValueError(f"{ADMITS_ENV} must be a JSON list of agent names")
-        store_url = env.get(GRANT_STORE_ENV, "").strip()
+        store_url = _grant_store_dsn(env)
         upstream_host = env.get(UPSTREAM_HOST_ENV)
         if upstream_host is not None and not _is_loopback_host(upstream_host):
             raise ValueError(
@@ -370,6 +373,37 @@ class ProxyConfig:
             upstream_host=upstream_host,
             routes=_routes(env),
         )
+
+
+def _grant_store_dsn(env: Mapping[str, str]) -> str:
+    """The grant store URL: the rendered address plus the Secret-delivered password.
+
+    The address is refused when it carries a password of its own, since that
+    password would then sit in the workload spec. The password is
+    percent-encoded with nothing safe and set into the userinfo in front of
+    the host, leaving scheme, host, port and path as rendered. No password
+    leaves the address as it is, so no ``AUTH`` is sent. No message here
+    echoes the address or the password.
+    """
+
+    address = env.get(GRANT_STORE_ENV, "").strip()
+    if not address:
+        return ""
+    try:
+        parts = urlsplit(address)
+    except ValueError:
+        raise ValueError(f"{GRANT_STORE_ENV} is not a parsable URL") from None
+    if parts.password is not None:
+        raise ValueError(
+            f"{GRANT_STORE_ENV} carries a password; the password belongs in "
+            f"{GRANT_STORE_PASSWORD_ENV}, delivered from a Secret"
+        )
+    password = env.get(GRANT_STORE_PASSWORD_ENV, "")
+    if not password:
+        return address
+    username, at, hostport = parts.netloc.rpartition("@")
+    userinfo = f"{username if at else ''}:{quote(password, safe='')}@"
+    return parts._replace(netloc=f"{userinfo}{hostport}").geturl()
 
 
 def _is_loopback_host(text: str) -> bool:
