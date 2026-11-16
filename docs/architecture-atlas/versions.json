@@ -414,9 +414,9 @@
       "id": "v0.16.2",
       "label": "v0.16.2",
       "file": "snapshots/v0.16.2.json",
-      "date": "2026-11-14",
+      "date": "2026-11-16",
       "branch": "main",
-      "commit": "6e3fbd014afe8937c28fd0c2f3ecdc8a9c95a7b5"
+      "commit": "dfb754e26c61603818109af6717abc23be7348f5"
     }
   ]
 }
