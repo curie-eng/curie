@@ -9,6 +9,7 @@ outcome it exists to catch and passes on the shape a correct recovery leaves.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from typing import Any
 import candidate_install as ci
 import publication_recovery_live as prl
 import pytest
+import tls_code_host as tch
 
 ROOT = Path(__file__).resolve().parents[3]
 DRIVER = "tools/factory-e2e/tests/test_factory_publication_recovery_live.py"
@@ -120,28 +122,54 @@ def test_a_flag_other_than_one_is_an_error_not_a_run() -> None:
 # --------------------------------------------------------------------------
 
 
+STUB_IP, PROXY_IP = "10.42.0.7", "10.42.0.9"
+STUB = "https://github-stub.ns.svc.cluster.local:8443"
+PROXY = "https://forge-fault-proxy.ns.svc.cluster.local:8443"
+
+
 def _base() -> dict[str, Any]:
-    return {
-        "api": {"githubApiUrl": "https://github-stub.ns.svc.cluster.local:8443/api/v3"},
-        "agentSandbox": {"runner": {"fakeModel": True}},
-        "factory": {
-            "codeHosts": [{"apiUrl": "https://github-stub.ns.svc.cluster.local:8443/api/v3"}],
-            "trackers": [{"apiUrl": "https://github-stub.ns.svc.cluster.local:8443/api/v3"}],
-            "sandboxEgress": {"factory": True},
+    """Base values as the harness builds them: the stub's own TLS values."""
+
+    return tch.tls_values(
+        {
+            "agentSandbox": {"runner": {"fakeModel": True}},
+            "factory": {
+                "codeHosts": [{"name": "github"}],
+                "trackers": [{"name": "github"}],
+                "sandboxEgress": {"factory": True},
+            },
         },
-    }
-
-
-def test_recovery_values_turn_on_retention_and_route_only_the_api_through_the_proxy() -> None:
-    base = _base()
-    values = prl.recovery_values(base, namespace="ns")
-    assert base == _base(), "the base values were mutated"
-    assert values["api"]["githubApiUrl"] == (
-        "https://forge-fault-proxy.ns.svc.cluster.local:8443/api/v3"
+        namespace="ns",
+        ca_config_map=tch.CA_CONFIG_MAP,
+        stub_cluster_ip=STUB_IP,
+        port=ci.STUB_PORT,
+        model_cidrs=(),
     )
-    stub = "https://github-stub.ns.svc.cluster.local:8443/api/v3"
-    assert values["factory"]["codeHosts"][0]["apiUrl"] == stub
-    assert values["factory"]["trackers"][0]["apiUrl"] == stub
+
+
+def _egress_cidrs(values: dict[str, Any]) -> list[str]:
+    rules = [
+        *values["security"]["networkPolicy"]["allowedEgress"],
+        *(rule for host in values["factory"]["codeHosts"] for rule in host["egress"]),
+    ]
+    return [rule["cidr"] for rule in rules]
+
+
+def test_recovery_values_route_every_forge_address_through_the_proxy() -> None:
+    base = _base()
+    assert base["api"]["githubApiUrl"] == f"{STUB}/api/v3", "the base fixture is not the stub's"
+    assert set(_egress_cidrs(base)) == {f"{STUB_IP}/32"}
+    values = prl.recovery_values(base, namespace="ns", stub_ip=STUB_IP, proxy_ip=PROXY_IP)
+    assert base == _base(), "the base values were mutated"
+    assert values["api"]["githubApiUrl"] == f"{PROXY}/api/v3"
+    assert values["api"]["githubCloneBase"] == PROXY
+    assert values["factory"]["codeHosts"][0]["apiUrl"] == f"{PROXY}/api/v3"
+    assert values["factory"]["trackers"][0]["apiUrl"] == f"{PROXY}/api/v3"
+    assert set(_egress_cidrs(values)) == {f"{PROXY_IP}/32"}
+    assert STUB not in json.dumps(values) and STUB_IP not in json.dumps(values)
+    # Everything else the stub values set is kept.
+    assert values["codeHostTrust"] == base["codeHostTrust"]
+    assert values["api"]["githubRepoAllowlist"] == [tch.STUB_REPO]
     assert values["agentSandbox"]["runner"]["workspace"] == {"enabled": True}
     assert values["agentSandbox"]["runner"]["fakeModel"] is True
     assert values["worker"]["workspace"]["publicationCandidates"] == {"enabled": True}
@@ -149,6 +177,24 @@ def test_recovery_values_turn_on_retention_and_route_only_the_api_through_the_pr
     directive = values["agentSandbox"]["runnerEnv"][prl.AGENT]["FAKE_MODEL_DIRECTIVE"]
     assert directive.startswith(f"[fake:write-file {prl.CHANGED_FILE} ")
     assert values["factory"]["sandboxEgress"] == {"factory": True, prl.AGENT: True}
+
+
+def test_recovery_values_refuse_a_base_whose_api_base_is_not_the_stub() -> None:
+    base = _base()
+    base["api"]["githubApiUrl"] = "https://elsewhere.example/api/v3"
+    with pytest.raises(AssertionError, match="api.githubApiUrl"):
+        prl.recovery_values(base, namespace="ns", stub_ip=STUB_IP, proxy_ip=PROXY_IP)
+
+
+def test_recovery_values_swap_only_the_exact_stub_cidr() -> None:
+    base = _base()
+    base["security"]["networkPolicy"]["allowedEgress"].append(
+        {"cidr": f"1{STUB_IP}/32", "ports": [{"protocol": "TCP", "port": 443}]}
+    )
+    values = prl.recovery_values(base, namespace="ns", stub_ip=STUB_IP, proxy_ip=PROXY_IP)
+    assert sorted(_egress_cidrs(values)) == sorted(
+        [f"{PROXY_IP}/32", f"{PROXY_IP}/32", f"1{STUB_IP}/32"]
+    )
 
 
 def test_the_proxy_pod_forwards_to_the_stub_with_its_ca_and_holds_no_token() -> None:
@@ -160,8 +206,8 @@ def test_the_proxy_pod_forwards_to_the_stub_with_its_ca_and_holds_no_token() -> 
     assert spec["automountServiceAccountToken"] is False
     container = spec["containers"][0]
     args = container["args"]
-    upstream = args[args.index("--upstream") + 1]
-    assert upstream == "https://github-stub.ns.svc.cluster.local:8443/api/v3"
+    assert args[args.index("--upstream") + 1] == STUB
+    assert "--prefix" not in args
     assert args[args.index("--upstream-ca") + 1] == "/upstream/ca.crt"
     assert args[args.index("--host") + 1] == "forge-fault-proxy.ns.svc.cluster.local"
     assert container["imagePullPolicy"] == "Always"
@@ -170,20 +216,16 @@ def test_the_proxy_pod_forwards_to_the_stub_with_its_ca_and_holds_no_token() -> 
 
 
 def test_proxy_log_and_ref_parsing() -> None:
-    log = "\n".join(
-        [
-            '{"event": "startup", "base_url": "https://p:8443/api/v3", "ca_file": "/state/ca.pem"}',
-            '{"event": "request", "method": "GET", "path": "/repos/acme-corp/acme-bot/pulls",'
-            ' "status": 200, "fault": false}',
-            '{"event": "request", "method": "POST", "path": "/repos/acme-corp/acme-bot/pulls",'
-            ' "status": 502, "fault": true}',
-            "not json",
-            '{"event": "request", "method": "POST", "path": "/repos/acme-corp/acme-bot/pulls",'
-            ' "status": 201, "fault": false}',
-            '{"event": "request", "method": "POST", "path": "/repos/acme-corp/acme-bot/pulls/1",'
-            ' "status": 200, "fault": false}',
-        ]
-    )
+    pulls = "/api/v3/repos/acme-corp/acme-bot/pulls"
+    rows = [
+        {"event": "startup", "base_url": "https://p:8443", "ca_file": "/state/ca.pem"},
+        {"event": "request", "method": "GET", "path": pulls, "status": 200, "fault": False},
+        {"event": "request", "method": "POST", "path": pulls, "status": 502, "fault": True},
+        {"event": "request", "method": "POST", "path": pulls, "status": 201, "fault": False},
+        {"event": "request", "method": "POST", "path": pulls + "/1", "status": 200, "fault": False},
+    ]
+    lines = [json.dumps(row) for row in rows]
+    log = "\n".join([*lines[:3], "not json", *lines[3:]])
     assert prl.pull_creates(log) == [(502, True), (201, False)]
     refs = f"refs/heads/main {BASE_COMMIT}\nrefs/heads/{BRANCH} {PUSHED}\nrefs/tags/x {PUSHED}\n"
     assert prl.branch_heads(refs) == {"main": BASE_COMMIT, BRANCH: PUSHED}
@@ -356,6 +398,7 @@ def test_judge_recovery_accepts_one_identical_model_free_publication() -> None:
             {"candidate_after": {**_candidate(), "patch": {"sha256": "9" * 64, "size_bytes": 1}}},
             "objects changed",
         ),
+        ({"candidate_after": None}, "no longer listed"),
         (
             {
                 "publications": [

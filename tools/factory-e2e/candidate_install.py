@@ -796,6 +796,10 @@ class CandidateInstall:
         if self.forward is not None:
             fe._stop(self.forward)
         port = int(self.api_url.rsplit(":", 1)[1]) if self.api_url else fe._free_port()
+        if self.forward is None and not self.api_url:
+            self.teardown.push(
+                "stop the API port-forward", lambda: {"stopped": self.stop_forward()}
+            )
         process = subprocess.Popen(
             [
                 "kubectl",
@@ -812,10 +816,6 @@ class CandidateInstall:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        if self.forward is None:
-            self.teardown.push(
-                "stop the API port-forward", lambda: {"stopped": self.stop_forward()}
-            )
         self.forward = process
         self.api_url = f"http://127.0.0.1:{port}"
 

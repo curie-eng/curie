@@ -7,6 +7,7 @@ so the judgements are exercised by ordinary tests with recorded row shapes.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -50,7 +51,7 @@ PROXY_STATE = "/state"
 PROXY_SOURCE = Path(__file__).resolve().parent / "forge_fault_proxy.py"
 API_PREFIX = "/api/v3"
 
-PULL_CREATE_PATH = f"/repos/{re.escape(tch.STUB_REPO)}/pulls"
+PULL_CREATE_PATH = f"{API_PREFIX}/repos/{re.escape(tch.STUB_REPO)}/pulls"
 _OWNER_KEY, _OWNER_VALUE = "owner", "factory-tools"
 
 
@@ -58,14 +59,29 @@ def proxy_host(namespace: str) -> str:
     return f"{PROXY_NAME}.{namespace}.svc.cluster.local"
 
 
+def proxy_origin(namespace: str) -> str:
+    """The origin the whole install knows the forge by. Pure."""
+
+    return f"https://{proxy_host(namespace)}:{PROXY_PORT}"
+
+
 def proxy_base_url(namespace: str) -> str:
-    """The base the candidate API is pointed at instead of the forge's REST API. Pure."""
+    """The GitHub REST base the candidate API is pointed at. Pure."""
 
-    return f"https://{proxy_host(namespace)}:{PROXY_PORT}{API_PREFIX}"
+    return proxy_origin(namespace) + API_PREFIX
 
 
-def stub_api_base(namespace: str) -> str:
-    return f"https://{tch.stub_host(namespace)}:{tch.STUB_PORT_DEFAULT}{API_PREFIX}"
+def stub_origin(namespace: str) -> str:
+    """The stub's own origin, the one only the proxy talks to. Pure."""
+
+    return f"https://{tch.stub_host(namespace)}:{ci.STUB_PORT}"
+
+
+def host_cidr(address: str) -> str:
+    """One address as a single-host CIDR. Pure."""
+
+    ip = ipaddress.ip_address(address)
+    return f"{ip}/{ip.max_prefixlen}"
 
 
 def proxy_manifests(
@@ -121,10 +137,8 @@ def proxy_manifests(
                         "0.0.0.0",
                         "--port",
                         str(PROXY_PORT),
-                        "--prefix",
-                        API_PREFIX,
                         "--upstream",
-                        stub_api_base(namespace),
+                        stub_origin(namespace),
                         "--upstream-ca",
                         "/upstream/ca.crt",
                     ],
@@ -168,17 +182,53 @@ def proxy_manifests(
     return [source, pod, service]
 
 
-def recovery_values(base: Mapping[str, Any], *, namespace: str) -> dict[str, Any]:
+def _swap(node: Any, origins: tuple[str, str], cidrs: tuple[str, str]) -> Any:
+    """``node`` with one origin replaced inside strings and one CIDR replaced whole. Pure."""
+
+    if isinstance(node, dict):
+        return {key: _swap(value, origins, cidrs) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_swap(value, origins, cidrs) for value in node]
+    if isinstance(node, str):
+        return cidrs[1] if node == cidrs[0] else node.replace(*origins)
+    return node
+
+
+def _strings(node: Any) -> list[str]:
+    if isinstance(node, dict):
+        return [s for value in node.values() for s in _strings(value)]
+    if isinstance(node, list):
+        return [s for value in node for s in _strings(value)]
+    return [node] if isinstance(node, str) else []
+
+
+def recovery_values(
+    base: Mapping[str, Any], *, namespace: str, stub_ip: str, proxy_ip: str
+) -> dict[str, Any]:
     """The proof's install values over the candidate base values. Pure.
 
-    Workspaces and candidate retention are on (both off by default), the
-    publication reconcile ceiling is ``RECONCILE_MAX_ATTEMPTS``, the API's
-    GitHub REST base is the fault proxy, and the agent's fake model writes one
-    file into its checkout.
+    The fault proxy stands in for the forge everywhere the base values name
+    the stub: the GitHub API and clone bases, the factory's code host and
+    tracker entries, and the stub address in every egress rule (sandbox and
+    publication Job) becomes the proxy's. The API derives its GitHub identity
+    host from ``api.githubApiUrl`` and checks the forge's answers against it,
+    so every forge URL Curie sees must name one host. Workspaces and candidate
+    retention are on (both off by default), the publication reconcile ceiling
+    is ``RECONCILE_MAX_ATTEMPTS``, and the agent's fake model writes one file
+    into its checkout.
     """
 
-    values: dict[str, Any] = json.loads(json.dumps(base))
-    values["api"]["githubApiUrl"] = proxy_base_url(namespace)
+    stub, stub_cidr = stub_origin(namespace), host_cidr(stub_ip)
+    values: dict[str, Any] = _swap(
+        json.loads(json.dumps(base)),
+        (stub, proxy_origin(namespace)),
+        (stub_cidr, host_cidr(proxy_ip)),
+    )
+    left = [s for s in _strings(values) if stub in s or s == stub_cidr]
+    assert not left, f"the base values still route to the stub directly: {left}"
+    assert values["api"]["githubApiUrl"] == proxy_base_url(namespace), (
+        "the base values name the stub's API base somewhere other than api.githubApiUrl"
+    )
     sandbox = values["agentSandbox"]
     sandbox["runner"]["workspace"] = {"enabled": True}
     sandbox["runnerEnv"] = {
@@ -357,7 +407,9 @@ def judge_recovery(
 
     ``requests`` are every request of the WorkItem in order; ``candidate`` is
     the listing entry captured by the original; ``candidate_row`` its ledger
-    row; ``candidate_after`` the listing entry after recovery, when listed.
+    row; ``candidate_after`` the listing entry for the same candidate id after
+    recovery (the listing keeps every candidate of the WorkItem, so a missing
+    entry fails).
     """
 
     assert len(requests) == 2, (
@@ -404,10 +456,10 @@ def judge_recovery(
     assert str(candidate_row.get("owner_request_id")) == str(successor.get("id")), (
         "the candidate's ownership was not handed to the successor"
     )
-    if candidate_after is not None:
-        assert candidate_identity(candidate_after) == identity, (
-            "the candidate's objects changed during recovery"
-        )
+    assert candidate_after is not None, "the captured candidate is no longer listed"
+    assert candidate_identity(candidate_after) == identity, (
+        "the candidate's objects changed during recovery"
+    )
 
     own = [p for p in publications if p.get("execution_request_id") == successor.get("id")]
     assert len(own) == 1, f"the successor has {len(own)} publications, expected one"

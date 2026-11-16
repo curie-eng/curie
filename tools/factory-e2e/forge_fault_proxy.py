@@ -1,29 +1,34 @@
-"""A forge REST API proxy that can fail chosen calls on purpose (#5429).
+"""A forge proxy that can fail chosen calls on purpose (#5429).
 
 The publication recovery proof needs one controlled transport failure between
 Curie and its forge after the publication Job has pushed: the API's pull
 request create must fail, the same way it would against a forge outage, while
-every other call reaches the forge unchanged. This program sits between the
-candidate API (its ``api.githubApiUrl``) and the forge's REST API, so the
-injection is the same whether the upstream is the recorded GitHub stub or a
-real forge.
+every other call reaches the forge unchanged. This program stands in for the
+whole forge: the install's GitHub API base, clone base, tracker and code host
+entries all name it, and it forwards every request (REST calls and git smart
+HTTP alike) to the real forge origin.
+
+Curie checks the URLs a forge returns against the host it was configured
+with (a pull request's ``html_url`` must sit under the configured GitHub), so
+the proxy rewrites the upstream origin to its own in JSON and text response
+bodies and in ``Location`` headers. Git pack data is passed through
+untouched.
 
 ``serve`` generates a private test CA and a server certificate for ``--host``
 in ``--state`` (only the CA's public certificate is meant to leave), listens
-with TLS, and prints one JSON startup object with ``base_url`` and
-``ca_file``. A request whose path starts with ``--prefix`` is forwarded to
-``--upstream`` plus the rest of the path, with its query, method, body and
-headers (minus hop-by-hop ones and ``Host``), verified against
-``--upstream-ca`` or the system roots. Anything else is a 404.
+with TLS, and prints one JSON startup object with ``base_url`` (its own
+origin) and ``ca_file``. Every request is forwarded to ``--upstream`` (an
+origin) with the same path, query, method, body and headers (minus hop-by-hop
+ones and ``Host``), verified against ``--upstream-ca`` or the system roots.
 
 ``fault`` arms a rule: the next ``--count`` requests with ``--method`` whose
-forwarded path fully matches ``--path`` are answered ``--status`` with a
-GitHub-shaped error body, without reaching the upstream. ``faults`` prints the
-armed rules with what remains of each. Rules live in ``faults.json`` under the
-state directory, read and consumed under a file lock, so the proxy and a
-caller exec'ing into its Pod never race. Every request is logged as one JSON
-line: method, forwarded path, status and whether a fault answered it. No
-header, body or credential is ever logged.
+path fully matches ``--path`` are answered ``--status`` with a GitHub-shaped
+error body, without reaching the upstream. ``faults`` prints the armed rules
+with what remains of each. Rules live in ``faults.json`` under the state
+directory, read and consumed under a file lock, so the proxy and a caller
+exec'ing into its Pod never race. Every request is logged as one JSON line:
+method, path, status and whether a fault answered it. No header, body or
+credential is ever logged.
 
 Standard library only; it runs on the candidate worker image.
 """
@@ -67,7 +72,7 @@ _DROPPED = frozenset(
         "accept-encoding",
     }
 )
-_METHODS = ("GET", "POST", "PATCH", "PUT", "DELETE")
+_METHODS = ("GET", "HEAD", "POST", "PATCH", "PUT", "DELETE")
 UPSTREAM_TIMEOUT_S = 60.0
 
 
@@ -76,32 +81,46 @@ UPSTREAM_TIMEOUT_S = 60.0
 # --------------------------------------------------------------------------
 
 
-def forwarded_path(prefix: str, raw_path: str) -> str | None:
-    """The upstream-relative path and query for ``raw_path``, or None. Pure.
+def origin_of(url: str) -> str:
+    """``scheme://host[:port]`` of ``url``, refusing anything but HTTP(S). Pure."""
 
-    ``prefix`` is the path the proxy is reached under (``/api/v3`` for a
-    GitHub Enterprise shaped base URL); only a request under it is forwarded.
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"unsupported origin {url!r}")
+    if parts.path not in ("", "/") or parts.query or parts.fragment or parts.username:
+        raise ValueError(f"an origin carries no path, query or credentials: {url!r}")
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def upstream_url(upstream: str, raw_path: str) -> str:
+    """The upstream origin joined with a request's path and query. Pure."""
+
+    if not raw_path.startswith("/"):
+        raise ValueError(f"a forwarded request path is absolute: {raw_path!r}")
+    return upstream.rstrip("/") + raw_path
+
+
+def rewrites_body(content_type: str | None) -> bool:
+    """Whether a response body is text the origin rewrite applies to. Pure.
+
+    JSON and text answers carry the forge's URLs; git pack data and every
+    other binary type pass through byte for byte.
     """
 
-    parts = urllib.parse.urlsplit(raw_path)
-    path = parts.path
-    base = prefix.rstrip("/")
-    if base and path != base and not path.startswith(base + "/"):
-        return None
-    rest = path[len(base) :] or "/"
-    return rest + (f"?{parts.query}" if parts.query else "")
+    kind = (content_type or "").split(";", 1)[0].strip().lower()
+    return kind.startswith("text/") or kind == "application/json" or kind.endswith("+json")
 
 
-def upstream_url(upstream: str, rest: str) -> str:
-    """``upstream`` joined with a forwarded path and query. Pure."""
+def rewrite_origin(data: bytes, upstream: str, public: str) -> bytes:
+    """``data`` with every occurrence of the upstream origin replaced by ``public``. Pure."""
 
-    return upstream.rstrip("/") + rest
+    return data.replace(upstream.encode(), public.encode())
 
 
 def take_fault(rules: list[dict[str, Any]], method: str, path: str) -> int | None:
     """Consume one matching armed rule in place and return its status. Pure.
 
-    ``path`` is the forwarded path without its query. The first rule, in arming
+    ``path`` is the request path without its query. The first rule, in arming
     order, with remaining count, the same method and a full regex match wins.
     """
 
@@ -249,12 +268,29 @@ def _log(**fields: Any) -> None:
     print(json.dumps(fields, sort_keys=True), flush=True)
 
 
+def _read_chunked(stream: Any) -> bytes:
+    """A ``Transfer-Encoding: chunked`` request body (RFC 9112 7.1), trailers dropped."""
+
+    body = bytearray()
+    while True:
+        size_line = stream.readline(1024)
+        if not size_line:
+            raise ValueError("the chunked body ended early")
+        size = int(size_line.split(b";", 1)[0].strip(), 16)
+        if size == 0:
+            while stream.readline(1024) not in (b"\r\n", b"\n", b""):
+                pass
+            return bytes(body)
+        body += stream.read(size)
+        stream.readline(1024)
+
+
 def build_handler(
-    *, state: Path, prefix: str, upstream: str, upstream_context: ssl.SSLContext | None
+    *, state: Path, upstream: str, public: str, upstream_context: ssl.SSLContext | None
 ) -> type[BaseHTTPRequestHandler]:
-    target = urllib.parse.urlsplit(upstream)
-    if target.scheme not in ("http", "https") or not target.hostname:
-        raise ValueError(f"unsupported upstream {upstream!r}")
+    """The request handler forwarding to the ``upstream`` origin, seen as ``public``."""
+
+    upstream, public = origin_of(upstream), origin_of(public)
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -272,15 +308,15 @@ def build_handler(
             if self.command != "HEAD":
                 self.wfile.write(body)
 
-        def _handle(self) -> None:
+        def _body(self) -> bytes:
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                return _read_chunked(self.rfile)
             length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(length) if length else b""
-            rest = forwarded_path(prefix, self.path)
-            if rest is None:
-                _log(event="request", method=self.command, path=self.path, status=404, fault=False)
-                self._answer(404, {"Content-Type": "application/json"}, b'{"message":"Not Found"}')
-                return
-            path_only = rest.split("?", 1)[0]
+            return self.rfile.read(length) if length else b""
+
+        def _handle(self) -> None:
+            body = self._body()
+            path_only = urllib.parse.urlsplit(self.path).path
             with lock:
                 status = consume(state, self.command, path_only)
             if status is not None:
@@ -289,7 +325,7 @@ def build_handler(
                 )
                 self._answer(status, {"Content-Type": "application/json"}, fault_body(status))
                 return
-            url = urllib.parse.urlsplit(upstream_url(upstream, rest))
+            url = urllib.parse.urlsplit(upstream_url(upstream, self.path))
             port = url.port or (443 if url.scheme == "https" else 80)
             connection: http.client.HTTPConnection
             if url.scheme == "https":
@@ -314,7 +350,6 @@ def build_handler(
                 response = connection.getresponse()
                 answer = response.read()
                 headers = forward_headers(dict(response.getheaders()))
-                headers.pop("Content-Encoding", None)
                 status = response.status
             except (OSError, http.client.HTTPException) as exc:
                 _log(
@@ -325,10 +360,19 @@ def build_handler(
                 return
             finally:
                 connection.close()
+            encoded = any(name.lower() == "content-encoding" for name in headers)
+            content_type = next(
+                (value for name, value in headers.items() if name.lower() == "content-type"), None
+            )
+            if rewrites_body(content_type) and not encoded:
+                answer = rewrite_origin(answer, upstream, public)
+            for name in [name for name in headers if name.lower() == "location"]:
+                headers[name] = headers[name].replace(upstream, public)
             _log(event="request", method=self.command, path=path_only, status=status, fault=False)
             self._answer(status, headers, answer)
 
         do_GET = _handle
+        do_HEAD = _handle
         do_POST = _handle
         do_PATCH = _handle
         do_PUT = _handle
@@ -343,20 +387,16 @@ def serve(args: argparse.Namespace) -> int:
     upstream_context: ssl.SSLContext | None = None
     if urllib.parse.urlsplit(args.upstream).scheme == "https":
         upstream_context = ssl.create_default_context(cafile=args.upstream_ca or None)
-    handler = build_handler(
-        state=state, prefix=args.prefix, upstream=args.upstream, upstream_context=upstream_context
+    server = ThreadingHTTPServer((args.bind, args.port), BaseHTTPRequestHandler)
+    public = f"https://{args.host}:{server.server_address[1]}"
+    server.RequestHandlerClass = build_handler(
+        state=state, upstream=args.upstream, public=public, upstream_context=upstream_context
     )
-    server = ThreadingHTTPServer((args.bind, args.port), handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certificate, key)
     server.socket = context.wrap_socket(server.socket, server_side=True)
-    port = server.server_address[1]
-    _log(
-        event="startup",
-        base_url=f"https://{args.host}:{port}{args.prefix.rstrip('/')}",
-        ca_file=str(ca),
-    )
+    _log(event="startup", base_url=public, ca_file=str(ca))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -374,7 +414,6 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--host", required=True)
     run.add_argument("--bind", default="127.0.0.1")
     run.add_argument("--port", type=int, default=8443)
-    run.add_argument("--prefix", default="")
     run.add_argument("--upstream", required=True)
     run.add_argument("--upstream-ca", default="")
     rule = commands.add_parser("fault")

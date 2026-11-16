@@ -21,10 +21,16 @@ check and credentials) is a separate run.
 
 The failure injection
 ---------------------
-The candidate API's GitHub REST base (``api.githubApiUrl``) points at the
-forge fault proxy (``tools/factory-e2e/forge_fault_proxy.py``), one more Pod
-that forwards every call to the forge unchanged except the pull request
-creates it is armed to fail. The install runs with
+The forge fault proxy (``tools/factory-e2e/forge_fault_proxy.py``), one more
+Pod, stands in for the forge for the whole install: ``api.githubApiUrl``,
+``api.githubCloneBase``, the factory's code host and tracker entries and the
+stub address in every egress rule all name the proxy instead of the stub. It
+forwards every request, REST and git alike, to the stub unchanged except the
+pull request creates it is armed to fail, and rewrites the stub's origin to
+its own in JSON answers. Routing only the REST base through it would not
+work: the API derives its GitHub identity host from ``api.githubApiUrl`` and
+refuses a pull request whose ``html_url`` sits on another host, and refuses
+to start when a factory code host is on another host. The install runs with
 ``worker.publication.reconcileMaxAttempts=2`` and the proxy answers exactly the
 first two pull request creates for the fixture repository with HTTP 502.
 
@@ -37,8 +43,8 @@ Why that lands on ``publication_failed`` with a retained candidate:
 3. The API's pull request create then fails. The API answers the worker 503,
    and the worker's code host client charges a reconcile attempt for every
    non-success answer (PublicationReconcileError, not the uncharged identity
-   escape). Each charged attempt backs off 15 s, then 30 s, and at the
-   ceiling the store marks the publication failed.
+   escape). The first charged failure backs off 15 s; the second reaches the
+   ceiling and the store marks the publication failed.
 4. The API settles the running request ``publication_failed``, which the retry
    policy admits as a publication recovery for an exact retained candidate.
 
@@ -99,8 +105,9 @@ The install values this driver sets over the candidate base values:
 ``agentSandbox.runner.workspace.enabled=true``,
 ``worker.workspace.publicationCandidates.enabled=true`` (candidate retention
 is off by default and needs workspaces), ``worker.publication.
-reconcileMaxAttempts=2``, ``api.githubApiUrl`` the proxy, the fake model, and a
-per-agent ``FAKE_MODEL_DIRECTIVE`` through ``agentSandbox.runnerEnv``. The
+reconcileMaxAttempts=2``, every forge address the proxy (above), the fake
+model, and a per-agent ``FAKE_MODEL_DIRECTIVE`` through
+``agentSandbox.runnerEnv``. The
 agent's publication policy is ``auto``.
 
 Teardown is registered before each resource it removes is created and runs on
@@ -159,6 +166,7 @@ class Recovery(ci.CandidateInstall):
     agent_id: str = ""
     issue: int = 0
     work_item_id: str = ""
+    proxy_ip: str = ""
     proxy_logs: str = field(default="", repr=False)
 
     # --- the fault proxy ------------------------------------------------
@@ -195,14 +203,17 @@ class Recovery(ci.CandidateInstall):
             return None
 
         startup = fe._wait("the fault proxy startup line", 120, started, 2)
-        assert startup["base_url"] == prl.proxy_base_url(ns), (
+        assert startup["base_url"] == prl.proxy_origin(ns), (
             f"the proxy advertises {startup['base_url']}"
         )
         pod = json.loads(self.kubectl("-n", ns, "get", "pod", prl.PROXY_NAME, "-o", "json"))
         self.assert_digest(pod, prl.PROXY_NAME, "worker")
+        # The headless Service resolves to this Pod IP; egress rules name it.
+        self.proxy_ip = str((pod.get("status") or {}).get("podIP") or "")
+        assert self.proxy_ip, "the fault proxy Pod has no IP"
         ca = self.proxy_exec("cat", f"{prl.PROXY_STATE}/ca.pem")
         self.trust_code_host_ca(ca)
-        self.log("fault proxy serving in front of the stub's REST API; its CA is trusted")
+        self.log("fault proxy serving in front of the whole stub forge; its CA is trusted")
 
     def proxy_exec(self, *argv: str) -> str:
         return self.kubectl(
@@ -400,7 +411,14 @@ def _install(live: Recovery) -> None:
     live.create_namespace()
     live.start_stub(prl.SEED_FILES, prl.SEED_ISSUE)
     live.start_proxy()
-    live.install(prl.recovery_values(live.base_values(), namespace=live.inputs.namespace))
+    live.install(
+        prl.recovery_values(
+            live.base_values(),
+            namespace=live.inputs.namespace,
+            stub_ip=live.stub_ip,
+            proxy_ip=live.proxy_ip,
+        )
+    )
     live.port_forward()
     live.start_pod_watch()
     live.agent_id = live.create_agent(prl.AGENT, prl.TRIGGER_LABEL)
@@ -413,6 +431,7 @@ def _install(live: Recovery) -> None:
         images={name: sorted(digests) for name, digests in live.digests.items()},
         reconcile_max_attempts=prl.RECONCILE_MAX_ATTEMPTS,
         github_api_url=prl.proxy_base_url(live.inputs.namespace),
+        forge_origin=prl.proxy_origin(live.inputs.namespace),
     )
 
 
