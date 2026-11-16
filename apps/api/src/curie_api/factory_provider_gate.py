@@ -36,26 +36,19 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from .factory_retry_policy import PROVIDER_GATE_REASONS, PROVIDER_GATES
 from .models import ExecutionRequest, WorkItem
 
 PROVIDER_CREDENTIAL: Final = "provider_credential"
 PROVIDER_CREDIT: Final = "provider_credit"
 PROVIDER_USAGE_RESET: Final = "provider_usage_reset"
-# The blocked conditions a provider probe can release. Every other condition
-# (``provider_rate_limit``, ``provider_service``, the diagnosis and limit waits)
-# is never released here.
-PROVIDER_GATES: Final[frozenset[str]] = frozenset(
-    {PROVIDER_CREDENTIAL, PROVIDER_CREDIT, PROVIDER_USAGE_RESET}
-)
+# PROVIDER_GATES, the blocked conditions a provider probe can release, and the
+# predecessor reasons each accepts live with the retry policy, which admits a
+# blocked row only where this module could clear it. Every other condition
+# (``provider_rate_limit``, ``provider_service``, the limit waits) is never
+# released here.
 # How old a probe may be, either side of now, and still count.
 PROBE_FRESH_S: Final[int] = 120
-
-# The predecessor's condition reasons each gate accepts.
-_GATE_REASONS: Final[dict[str, frozenset[str]]] = {
-    PROVIDER_CREDENTIAL: frozenset({"credential_rejected"}),
-    PROVIDER_CREDIT: frozenset({"credit_exhausted", "usage_reset"}),
-    PROVIDER_USAGE_RESET: frozenset({"usage_reset"}),
-}
 
 
 @dataclass(frozen=True)
@@ -119,7 +112,7 @@ def clearance(facts: GateFacts, observed: GateObservation, now: datetime) -> boo
     blocked_on = facts.blocked_on
     if blocked_on is None or blocked_on not in PROVIDER_GATES:
         return False
-    if facts.reason not in _GATE_REASONS[blocked_on]:
+    if facts.reason not in PROVIDER_GATE_REASONS[blocked_on]:
         return False
     if facts.scope_key is None or facts.retry_at is not None or facts.terminal_at is None:
         return False

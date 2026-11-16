@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from curie_internal.requester_coding_instructions import EvidenceState
 from curie_telemetry.redact import redact_text
@@ -119,6 +119,9 @@ _NOTICE_DETAIL_MAX = 4000
 # Automatic fresh requests a WorkItem may receive over its lifetime, shared by
 # owner loss and ordinary failures (ADR 0269).
 AUTOMATIC_RETRY_LIMIT = 2
+# Every condition a blocked successor may wait on has a releaser: a provider
+# probe or a resource gate (#5424).
+_RELEASED_CONDITIONS: Final = factory_retry_policy.PROVIDER_GATES | resource_gate.GATE_CONDITIONS
 # Backoff before each slot's successor, and the deterministic jitter around it.
 AUTOMATIC_RETRY_DELAYS_S = (30, 120)
 AUTOMATIC_RETRY_JITTER = 0.2
@@ -1626,6 +1629,7 @@ async def release_retry_condition(
             ),
             condition_reason=predecessor.retry_condition_reason,
             condition_retry_at=predecessor.retry_condition_retry_at,
+            condition_scope_key=predecessor.retry_condition_scope_key,
         )
     )
     if not disposition.successor or disposition.condition != condition:
@@ -2166,6 +2170,9 @@ async def terminalize_execution(
                 safety=retry_safety,
                 condition_reason=None if retry_condition is None else retry_condition.reason,
                 condition_retry_at=None if retry_condition is None else retry_condition.retry_at,
+                condition_scope_key=(
+                    None if retry_condition is None else retry_condition.scope_key
+                ),
             )
         )
         # Before settlement, so the successor keeps the transcript (ADR 0269).
@@ -3327,6 +3334,12 @@ async def admit_automatic_successor(
     limit the predecessor's attempt actually had, and the reconciler offers
     it every probe interval until a start delivers strictly more. A
     predecessor without that delivered value admits no successor.
+
+    A successor is admitted blocked only when something can release it: a
+    resource gate, or a provider gate whose predecessor names a probed scope
+    and no reset time. A condition wait naming any other condition, and a
+    successor that would block with no releaser (such as a provider time at
+    or past the waiting deadline), admits nothing and spends no slot (#5424).
     """
 
     if (
@@ -3361,6 +3374,10 @@ async def admit_automatic_successor(
         or predecessor.retry_safety != "no_effects"
         or disposition is None
         or not disposition.successor
+        or (
+            disposition.kind == DispositionKind.CONDITION_WAIT
+            and disposition.condition not in _RELEASED_CONDITIONS
+        )
     ):
         return False
     if await _publication_owns_terminus(
@@ -3399,13 +3416,6 @@ async def admit_automatic_successor(
             blocked = provider_time is None or due >= wait_deadline
         else:
             return False
-        if blocked:
-            if not disposition.condition:
-                return False
-            blocked_on = disposition.condition
-            dispatch_not_before = wait_deadline
-        else:
-            dispatch_not_before = due
         if disposition.condition in resource_gate.GATE_CONDITIONS:
             gate = resource_gate.gate_for(
                 disposition.condition,
@@ -3420,6 +3430,20 @@ async def admit_automatic_successor(
             dispatch_not_before = now + timedelta(
                 seconds=get_settings().work_item_resource_gate_probe_seconds
             )
+        elif blocked:
+            # Only a provider probe releases any other block, and only for a
+            # probed scope with no reset time; otherwise nothing would wait.
+            if not factory_retry_policy.provider_gate_releasable(
+                disposition.condition,
+                predecessor.retry_condition_reason,
+                predecessor.retry_condition_retry_at,
+                predecessor.retry_condition_scope_key,
+            ):
+                return False
+            blocked_on = disposition.condition
+            dispatch_not_before = wait_deadline
+        else:
+            dispatch_not_before = due
     admitted = await _insert_waiting_request(
         session,
         work_item,

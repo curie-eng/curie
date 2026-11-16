@@ -475,7 +475,8 @@ def test_scheduled_and_blocked_successors_are_not_dispatched_before_release(
     factory_retry: FactoryRetryCase,
 ) -> None:
     case = factory_retry
-    blocking = CASES["runner_error_reported_with_final_is_blocked"]
+    # Only a probed provider scope can release a block (#5424).
+    blocking = CASES["model_credit_exhausted_on_a_probed_scope_is_blocked_on_credit"]
 
     async def exercise() -> None:
         retried = case.item
@@ -487,7 +488,7 @@ def test_scheduled_and_blocked_successors_are_not_dispatched_before_release(
         assert scheduled is not None and scheduled["blocked_on"] is None, scheduled
 
         faulted = await case.admit()
-        case.script(*clean_failure("runner-error"))
+        case.script(frame_line(blocking["worker"]["error_frame"]), _ended_failed())
         await case.publish_wake(faulted.request_id)
         finish = await case.finished(faulted.request_id)
         await case.settle()
@@ -867,12 +868,12 @@ def test_error_frame_then_accepted_timeout_reports_uncertain_and_admits_nothing(
 
 
 @pytest.mark.parametrize("factory_retry", [SHORT_STREAM], indirect=True)
-def test_accepted_timeout_and_observed_termination_without_an_error_frame_are_blocked_not_retried(
+def test_accepted_timeout_and_observed_termination_without_an_error_frame_settle_terminal(
     factory_retry: FactoryRetryCase,
 ) -> None:
     case = factory_retry
-    stopped = CASES["runner_timeout_accepted_stop_is_blocked"]
-    terminated = CASES["sandbox_terminated_observed_termination_is_blocked"]
+    stopped = CASES["runner_timeout_accepted_stop_is_terminal"]
+    terminated = CASES["sandbox_terminated_observed_termination_is_terminal"]
     unconfirmed = CASES["runner_timeout_unconfirmed_reports_uncertain"]
 
     async def ends(item: Item) -> dict[str, Any]:
@@ -885,18 +886,19 @@ def test_accepted_timeout_and_observed_termination_without_an_error_frame_are_bl
         await case.settle()
         return finish.facts
 
-    async def blocked_on(item: Item) -> object:
-        successor = await case.successor(item.request_id)
-        assert successor is not None and successor["status"] == "waiting", successor
-        assert await case.used(item.work_item_id) == 1
-        return successor["blocked_on"]
+    async def settled_terminal(item: Item) -> None:
+        # Nothing could release a wait on these, so none is admitted (#5424).
+        assert (await case.row(item.request_id))["status"] == "failed"
+        assert await case.successor(item.request_id) is None
+        assert await case.used(item.work_item_id) == 0
 
     async def exercise() -> None:
         # The runner accepted the timeout stop: the end was observed.
         timed_out = case.item
         case.script(end="stall")
         assert await ends(timed_out) == stopped["finish"]
-        assert await blocked_on(timed_out) == stopped["expected"]["blocked_on"]
+        assert stopped["expected"]["successor"] is False
+        await settled_terminal(timed_out)
 
         # The connection dropped and the control plane reported the pod terminated.
         deleted = await case.admit()
@@ -905,7 +907,8 @@ def test_accepted_timeout_and_observed_termination_without_an_error_frame_are_bl
         facts = await ends(deleted)
         case.h.fake_k8s.termination = None
         assert facts == terminated["finish"]
-        assert await blocked_on(deleted) == terminated["expected"]["blocked_on"]
+        assert terminated["expected"]["successor"] is False
+        await settled_terminal(deleted)
 
         # The runner refused the timeout stop: nothing shows that the turn ended.
         refused = await case.admit()

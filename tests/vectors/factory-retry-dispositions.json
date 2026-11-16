@@ -1,5 +1,5 @@
 {
-  "comment": "Shared factory retry disposition vectors (issue 5424, ADR 0269). The API reads them in apps/api/tests/test_factory_retry.py and the worker in apps/worker/tests/kernel/test_factory_retry.py. finish holds the facts a boundary reports: the cause, the safety fact and the decoded carrier in canonical spelling. worker is present only when a worker kernel classification produces the cause; its runner_ended follows the observed turn end and its finish must equal the case's finish. error_frame omits version. A case with retry_at_from_now_seconds uses retry_at as a placeholder that boundary tests replace with database time plus that many seconds; the pure policy test reads the placeholder as written. expected.disposition, condition, not_before and policy_successor are the pure policy result; successor, blocked_on and timing are the boundary result. finish_wire_retry_condition, when present, is the carrier as posted on the wire. setup holds the state a boundary test arranges first. A finish of cause sandbox_scratch_exhausted also names exhausted_volume, the scratch volume it filled; boundary tests post it. Timing gated (#5427) is a blocked successor that carries a resource gate: the reconciler offers it every resource gate probe interval, so its dispatch time is the predecessor's settlement plus that interval instead of its waiting deadline. Boundary tests start every request with a delivered limit for every dimension.",
+  "comment": "Shared factory retry disposition vectors (issue 5424, ADR 0269). The API reads them in apps/api/tests/test_factory_retry.py and the worker in apps/worker/tests/kernel/test_factory_retry.py. finish holds the facts a boundary reports: the cause, the safety fact and the decoded carrier in canonical spelling. worker is present only when a worker kernel classification produces the cause; its runner_ended follows the observed turn end and its finish must equal the case's finish. error_frame omits version. A case with retry_at_from_now_seconds uses retry_at as a placeholder that boundary tests replace with database time plus that many seconds; the pure policy test reads the placeholder as written. expected.disposition, condition, not_before and policy_successor are the pure policy result; successor, blocked_on and timing are the boundary result. finish_wire_retry_condition, when present, is the carrier as posted on the wire. setup holds the state a boundary test arranges first. A finish of cause sandbox_scratch_exhausted also names exhausted_volume, the scratch volume it filled; boundary tests post it. Timing gated (#5427) is a blocked successor that carries a resource gate: the reconciler offers it every resource gate probe interval, so its dispatch time is the predecessor's settlement plus that interval instead of its waiting deadline. Boundary tests start every request with a delivered limit for every dimension. A credential, credit or usage wait blocks only when its carrier names a probed scope_key and no retry_at; a cause with no releaser is terminal and its boundary admits nothing (#5424).",
   "allowance": {
     "limit": 2,
     "delays_seconds": [
@@ -561,7 +561,7 @@
       }
     },
     {
-      "id": "model_rate_limited_without_provider_time_waits_blocked",
+      "id": "model_rate_limited_without_provider_time_takes_plain_backoff",
       "row": "model_rate_limited",
       "path": "positive",
       "boundary": "finish",
@@ -592,13 +592,13 @@
         }
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "provider_rate_limit",
+        "disposition": "retry_backoff",
+        "condition": null,
         "not_before": null,
         "policy_successor": true,
         "successor": true,
-        "blocked_on": "provider_rate_limit",
-        "timing": "blocked"
+        "blocked_on": null,
+        "timing": "backoff"
       }
     },
     {
@@ -688,9 +688,51 @@
       }
     },
     {
-      "id": "model_rate_limited_contradicting_credential_reason_waits_on_credential",
+      "id": "model_rate_limited_contradicting_credential_reason_on_a_probed_scope_waits_on_credential",
       "row": "model_rate_limited",
       "path": "secondary",
+      "boundary": "finish",
+      "worker": {
+        "classification": "rate-limit",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "rate-limit",
+          "retry_condition": {
+            "reason": "credential_rejected",
+            "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_rate_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "credential_rejected",
+          "retry_at": null,
+          "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+        }
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_credential",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_credential",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "model_rate_limited_contradicting_credential_reason_without_a_probed_scope_is_terminal",
+      "row": "model_rate_limited",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "rate-limit",
@@ -719,13 +761,13 @@
         }
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "provider_credential",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "provider_credential",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -816,9 +858,9 @@
       }
     },
     {
-      "id": "workspace_error_without_diagnosis_is_blocked",
+      "id": "workspace_error_without_diagnosis_is_terminal",
       "row": "workspace_error",
-      "path": "secondary",
+      "path": "refusal",
       "boundary": "finish",
       "finish": {
         "cause": "workspace_error",
@@ -826,13 +868,13 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "workspace_preparation",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "workspace_preparation",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -866,9 +908,9 @@
       }
     },
     {
-      "id": "runner_error_reported_with_final_is_blocked",
+      "id": "runner_error_reported_with_final_is_terminal",
       "row": "runner_error",
-      "path": "positive",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "runner-error",
@@ -891,13 +933,13 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "runner_fault_diagnosis",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "runner_fault_diagnosis",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -944,9 +986,9 @@
       }
     },
     {
-      "id": "runner_error_contradicting_rate_limited_reason_is_ignored",
+      "id": "runner_error_contradicting_rate_limited_reason_is_terminal",
       "row": "runner_error",
-      "path": "secondary",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "runner-error",
@@ -975,13 +1017,13 @@
         }
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "runner_fault_diagnosis",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "runner_fault_diagnosis",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -1020,9 +1062,9 @@
       }
     },
     {
-      "id": "runner_failed_without_diagnosis_is_blocked",
+      "id": "runner_failed_without_diagnosis_is_terminal",
       "row": "runner_failed",
-      "path": "positive",
+      "path": "refusal",
       "boundary": "finish",
       "finish": {
         "cause": "runner_failed",
@@ -1030,13 +1072,13 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "runner_fault_diagnosis",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "runner_fault_diagnosis",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -1060,9 +1102,9 @@
       }
     },
     {
-      "id": "sandbox_terminated_observed_termination_is_blocked",
+      "id": "sandbox_terminated_observed_termination_is_terminal",
       "row": "sandbox_terminated",
-      "path": "positive",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "sandbox-terminated",
@@ -1080,13 +1122,13 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "sandbox_disruption_diagnosis",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "sandbox_disruption_diagnosis",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -1144,9 +1186,9 @@
       }
     },
     {
-      "id": "runner_timeout_accepted_stop_is_blocked",
+      "id": "runner_timeout_accepted_stop_is_terminal",
       "row": "runner_timeout",
-      "path": "positive",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "runner-timeout",
@@ -1164,13 +1206,13 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "runner_stop_confirmation",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "runner_stop_confirmation",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -1234,11 +1276,11 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "runner_stop_confirmation",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
+        "policy_successor": false,
+        "successor": false,
         "blocked_on": null,
         "timing": null
       }
@@ -1471,9 +1513,51 @@
       }
     },
     {
-      "id": "model_usage_limited_without_reset_is_blocked",
+      "id": "model_usage_limited_on_a_probed_scope_without_reset_is_blocked",
       "row": "model_usage_limited",
-      "path": "secondary",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-usage-limited",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-usage-limited",
+          "retry_condition": {
+            "reason": "usage_reset",
+            "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_usage_limited",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "usage_reset",
+          "retry_at": null,
+          "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+        }
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_usage_reset",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_usage_reset",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "model_usage_limited_without_reset_or_probed_scope_is_terminal",
+      "row": "model_usage_limited",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "model-usage-limited",
@@ -1496,19 +1580,19 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "provider_usage_reset",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "provider_usage_reset",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
-      "id": "model_usage_limited_reset_past_the_wait_deadline_is_blocked",
+      "id": "model_usage_limited_reset_past_the_wait_deadline_admits_nothing",
       "row": "model_usage_limited",
-      "path": "secondary",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "model-usage-limited",
@@ -1543,9 +1627,9 @@
         "condition": "provider_usage_reset",
         "not_before": "2030-01-01T00:01:00Z",
         "policy_successor": true,
-        "successor": true,
-        "blocked_on": "provider_usage_reset",
-        "timing": "blocked"
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -1584,9 +1668,51 @@
       }
     },
     {
-      "id": "model_credit_exhausted_is_blocked_on_credit",
+      "id": "model_credit_exhausted_on_a_probed_scope_is_blocked_on_credit",
       "row": "model_credit_exhausted",
       "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-credit-exhausted",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-credit-exhausted",
+          "retry_condition": {
+            "reason": "credit_exhausted",
+            "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_credit_exhausted",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "credit_exhausted",
+          "retry_at": null,
+          "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+        }
+      },
+      "expected": {
+        "disposition": "condition_wait",
+        "condition": "provider_credit",
+        "not_before": null,
+        "policy_successor": true,
+        "successor": true,
+        "blocked_on": "provider_credit",
+        "timing": "blocked"
+      }
+    },
+    {
+      "id": "model_credit_exhausted_without_a_probed_scope_is_terminal",
+      "row": "model_credit_exhausted",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "model-credit-exhausted",
@@ -1609,13 +1735,13 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "provider_credit",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "provider_credit",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -1662,9 +1788,9 @@
       }
     },
     {
-      "id": "model_credit_exhausted_time_without_reset_reason_is_ignored",
+      "id": "model_credit_exhausted_time_without_reset_reason_is_terminal",
       "row": "model_credit_exhausted",
-      "path": "secondary",
+      "path": "refusal",
       "boundary": "finish",
       "finish": {
         "cause": "model_credit_exhausted",
@@ -1677,19 +1803,61 @@
       },
       "retry_at_from_now_seconds": 600,
       "expected": {
+        "disposition": "terminal",
+        "condition": null,
+        "not_before": null,
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
+      }
+    },
+    {
+      "id": "model_credential_rejected_on_a_probed_scope_is_blocked_on_the_credential",
+      "row": "model_credential_rejected",
+      "path": "positive",
+      "boundary": "finish",
+      "worker": {
+        "classification": "model-credential-rejected",
+        "error_frame": {
+          "type": "error",
+          "message": "Example provider error.",
+          "classification": "model-credential-rejected",
+          "retry_condition": {
+            "reason": "credential_rejected",
+            "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+          }
+        },
+        "turn_end": "final",
+        "saw_side_effect": false,
+        "execution_uncertain": false,
+        "runner_ended": true,
+        "own_execute_turn": true,
+        "marker_flagged": false
+      },
+      "finish": {
+        "cause": "model_credential_rejected",
+        "retry_safety": "no_effects",
+        "retry_condition": {
+          "reason": "credential_rejected",
+          "retry_at": null,
+          "scope_key": "sha256:cefc1ab876b7698f6e62b340ad59741be655f061976d9337f3eaceec751ceaba"
+        }
+      },
+      "expected": {
         "disposition": "condition_wait",
-        "condition": "provider_credit",
+        "condition": "provider_credential",
         "not_before": null,
         "policy_successor": true,
         "successor": true,
-        "blocked_on": "provider_credit",
+        "blocked_on": "provider_credential",
         "timing": "blocked"
       }
     },
     {
-      "id": "model_credential_rejected_is_blocked_on_the_credential",
+      "id": "model_credential_rejected_without_a_probed_scope_is_terminal",
       "row": "model_credential_rejected",
-      "path": "positive",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "model-credential-rejected",
@@ -1712,19 +1880,19 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "provider_credential",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "provider_credential",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
-      "id": "model_credential_rejected_carrier_time_is_ignored",
+      "id": "model_credential_rejected_carrier_time_is_terminal",
       "row": "model_credential_rejected",
-      "path": "secondary",
+      "path": "refusal",
       "boundary": "finish",
       "worker": {
         "classification": "model-credential-rejected",
@@ -1755,13 +1923,13 @@
       },
       "retry_at_from_now_seconds": 600,
       "expected": {
-        "disposition": "condition_wait",
-        "condition": "provider_credential",
+        "disposition": "terminal",
+        "condition": null,
         "not_before": null,
-        "policy_successor": true,
-        "successor": true,
-        "blocked_on": "provider_credential",
-        "timing": "blocked"
+        "policy_successor": false,
+        "successor": false,
+        "blocked_on": null,
+        "timing": null
       }
     },
     {
@@ -2340,7 +2508,7 @@
       }
     },
     {
-      "id": "merge_conflict_waits_on_lineage_without_a_request",
+      "id": "merge_conflict_is_terminal_naming_the_lineage",
       "row": "merge_conflict",
       "path": "positive",
       "boundary": "api_settlement",
@@ -2350,7 +2518,7 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
+        "disposition": "terminal",
         "condition": "pull_request_lineage",
         "not_before": null,
         "policy_successor": false,
@@ -2374,7 +2542,7 @@
         }
       },
       "expected": {
-        "disposition": "condition_wait",
+        "disposition": "terminal",
         "condition": "pull_request_lineage",
         "not_before": null,
         "policy_successor": false,
@@ -2384,7 +2552,7 @@
       }
     },
     {
-      "id": "pull_request_not_adopted_waits_on_lineage_without_a_request",
+      "id": "pull_request_not_adopted_is_terminal_naming_the_lineage",
       "row": "pull_request_not_adopted",
       "path": "positive",
       "boundary": "finish",
@@ -2404,7 +2572,7 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
+        "disposition": "terminal",
         "condition": "pull_request_lineage",
         "not_before": null,
         "policy_successor": false,
@@ -2424,7 +2592,7 @@
         "retry_condition": null
       },
       "expected": {
-        "disposition": "condition_wait",
+        "disposition": "terminal",
         "condition": "pull_request_lineage",
         "not_before": null,
         "policy_successor": false,

@@ -14,6 +14,13 @@ by rewriting a string.
 A publication failure allows a publication recovery successor; the lifecycle
 admits it only when an exact retained candidate exists, and it reruns no model.
 
+A successor waits blocked only when something can release it: a provider
+probe (``factory_provider_gate``) for a gate whose predecessor names a probed
+scope and no reset time, or a resource gate (``workitems.resource_gate``). A
+cause with no releaser settles terminal at once and spends no retry, so the
+tracker hears needs-human now instead of after a 24 hour wait that nothing
+ends (#5424).
+
 Owner loss is terminal here on purpose. Its successor is admitted only by the
 observed teardown path (ADR 0206), so a worker that reports ``owner_lost`` by
 name through a finish earns nothing.
@@ -31,6 +38,16 @@ RetrySafety = Literal["no_effects", "flagged", "uncertain"]
 # The scheduler's own margin after a provider reset time; the producer reports
 # the provider's time without it.
 RESET_GRACE: Final = timedelta(seconds=60)
+
+# The blocked conditions a provider probe can release, each with the
+# predecessor condition reasons it accepts. ``factory_provider_gate`` reads
+# this table; a row it can never clear is not admitted.
+PROVIDER_GATE_REASONS: Final[dict[str, frozenset[str]]] = {
+    "provider_credential": frozenset({"credential_rejected"}),
+    "provider_credit": frozenset({"credit_exhausted", "usage_reset"}),
+    "provider_usage_reset": frozenset({"usage_reset"}),
+}
+PROVIDER_GATES: Final[frozenset[str]] = frozenset(PROVIDER_GATE_REASONS)
 
 
 class DispositionKind(StrEnum):
@@ -53,6 +70,9 @@ class RetryFacts:
     # A RetryReason value, already validated at the wire boundary.
     condition_reason: str | None
     condition_retry_at: datetime | None
+    # The carrier's provider scope; None when the runner could not name a
+    # probed scope, so no probe can release a wait on it.
+    condition_scope_key: str | None
 
 
 @dataclass(frozen=True)
@@ -90,15 +110,11 @@ _SAME_REQUEST_TOKENS: Final = frozenset({"sandbox-capacity"})
 
 # Row a: a provider throttle, transport failure or server error.
 _PROVIDER_TRANSIENT: Final = frozenset({"model_rate_limited", "model_unreachable", "model_error"})
-# Row b: a generic class retries only a diagnosed transient; otherwise it
-# waits on the named diagnosis.
-_DIAGNOSIS_CONDITIONS: Final[dict[str, str]] = {
-    "workspace_error": "workspace_preparation",
-    "runner_error": "runner_fault_diagnosis",
-    "runner_failed": "runner_fault_diagnosis",
-    "sandbox_terminated": "sandbox_disruption_diagnosis",
-    "runner_timeout": "runner_stop_confirmation",
-}
+# Row b: a generic class retries only a diagnosed transient. Nothing delivers
+# a diagnosis of the other faults yet, so they settle terminal (#5424).
+_DIAGNOSED_TRANSIENT_ONLY: Final = frozenset(
+    {"workspace_error", "runner_error", "runner_failed", "sandbox_terminated", "runner_timeout"}
+)
 # Row d: a limit that needs a raised allowance before a fresh run.
 _LIMIT_CONDITIONS: Final[dict[str, str]] = {
     "history_capacity": "history_capacity",
@@ -127,10 +143,6 @@ _CONDITION_TEXT: Final[dict[str, str]] = {
     "provider_usage_reset": "the model provider's usage allowance reset",
     "provider_credit": "a verified model provider credit or limit increase",
     "provider_credential": "a successful sign in after the model credential is replaced",
-    "workspace_preparation": "a repair of the workspace preparation fault",
-    "runner_fault_diagnosis": "a diagnosis of the runner fault",
-    "sandbox_disruption_diagnosis": "a diagnosis of the sandbox disruption",
-    "runner_stop_confirmation": "confirmation of why the runner stopped",
     "history_capacity": "a raised conversation history capacity",
     "turn_limit": "a raised turn limit",
     "execution_time_limit": "a raised execution time limit",
@@ -172,22 +184,16 @@ def decide(facts: RetryFacts) -> Disposition:
         if reason == "credit_exhausted":
             return _credit(facts)
         if reason == "credential_rejected":
-            return _credential()
+            return _provider_gate("provider_credential", facts)
         return _TERMINAL
-    if cause in _DIAGNOSIS_CONDITIONS:
-        if not clean:
+    if cause in _DIAGNOSED_TRANSIENT_ONLY:
+        if not clean or reason != "transient_service":
             return _TERMINAL
-        if reason == "transient_service":
-            at = facts.condition_retry_at
-            return Disposition(
-                DispositionKind.RETRY_BACKOFF,
-                condition="provider_service" if at is not None else None,
-                not_before=at,
-                successor=True,
-            )
+        at = facts.condition_retry_at
         return Disposition(
-            DispositionKind.CONDITION_WAIT,
-            condition=_DIAGNOSIS_CONDITIONS[cause],
+            DispositionKind.RETRY_BACKOFF,
+            condition="provider_service" if at is not None else None,
+            not_before=at,
             successor=True,
         )
     if cause == "model_usage_limited":
@@ -195,7 +201,7 @@ def decide(facts: RetryFacts) -> Disposition:
     if cause == "model_credit_exhausted":
         return _credit(facts) if clean else _TERMINAL
     if cause == "model_credential_rejected":
-        return _credential() if clean else _TERMINAL
+        return _provider_gate("provider_credential", facts) if clean else _TERMINAL
     if cause in _LIMIT_CONDITIONS:
         if not clean:
             return _TERMINAL
@@ -215,7 +221,9 @@ def decide(facts: RetryFacts) -> Disposition:
     if cause in _CI_OBSERVATION:
         return Disposition(DispositionKind.CI_OBSERVATION)
     if cause in _LINEAGE_WAIT:
-        return Disposition(DispositionKind.CONDITION_WAIT, condition="pull_request_lineage")
+        # The lineage condition admits no request, so it is terminal and only
+        # names what a person must change.
+        return Disposition(DispositionKind.TERMINAL, condition="pull_request_lineage")
     if cause == "workspace_timeout":
         return Disposition(DispositionKind.SAME_REQUEST_WAIT)
     if cause == "completed":
@@ -226,13 +234,11 @@ def decide(facts: RetryFacts) -> Disposition:
 
 def _rate_limited(facts: RetryFacts) -> Disposition:
     # A typed throttle reset is scheduled with the reset grace. Without one the
-    # retry waits blocked: no probe verifies a rate window, so a guessed timer
-    # would only spend the retry early.
+    # retry takes the plain backoff: no probe verifies a rate window, so a
+    # block would never be released.
     at = facts.condition_retry_at
     if at is None:
-        return Disposition(
-            DispositionKind.CONDITION_WAIT, condition="provider_rate_limit", successor=True
-        )
+        return Disposition(DispositionKind.RETRY_BACKOFF, successor=True)
     return Disposition(
         DispositionKind.RETRY_BACKOFF,
         condition="provider_rate_limit",
@@ -243,27 +249,46 @@ def _rate_limited(facts: RetryFacts) -> Disposition:
 
 def _usage_reset(facts: RetryFacts) -> Disposition:
     at = facts.condition_retry_at
-    trusted = facts.condition_reason == "usage_reset" and at is not None
-    return Disposition(
-        DispositionKind.CONDITION_WAIT,
-        condition="provider_usage_reset",
-        not_before=at + RESET_GRACE if trusted and at is not None else None,
-        successor=True,
-    )
+    if facts.condition_reason == "usage_reset" and at is not None:
+        return Disposition(
+            DispositionKind.CONDITION_WAIT,
+            condition="provider_usage_reset",
+            not_before=at + RESET_GRACE,
+            successor=True,
+        )
+    return _provider_gate("provider_usage_reset", facts)
 
 
 def _credit(facts: RetryFacts) -> Disposition:
     # A daily reset refusal carries a usage reset time; a credit balance does not.
     if facts.condition_reason == "usage_reset" and facts.condition_retry_at is not None:
         return _usage_reset(facts)
-    return Disposition(DispositionKind.CONDITION_WAIT, condition="provider_credit", successor=True)
+    return _provider_gate("provider_credit", facts)
 
 
-def _credential() -> Disposition:
-    # A rejected credential never resets on a clock, so a carrier time is ignored.
-    return Disposition(
-        DispositionKind.CONDITION_WAIT, condition="provider_credential", successor=True
+def provider_gate_releasable(
+    condition: str | None, reason: str | None, retry_at: datetime | None, scope_key: str | None
+) -> bool:
+    """Whether a provider probe could ever release a block on ``condition``.
+
+    Only a predecessor that names a probed scope, no reset time and a reason
+    the gate accepts can clear (``factory_provider_gate.clearance``).
+    """
+
+    accepted = PROVIDER_GATE_REASONS.get(condition or "")
+    return (
+        accepted is not None and reason in accepted and retry_at is None and scope_key is not None
     )
+
+
+def _provider_gate(condition: str, facts: RetryFacts) -> Disposition:
+    # A credential, credit or usage wait blocks only where a probe can verify
+    # its repair; a row nothing can release is terminal and spends no retry.
+    if provider_gate_releasable(
+        condition, facts.condition_reason, facts.condition_retry_at, facts.condition_scope_key
+    ):
+        return Disposition(DispositionKind.CONDITION_WAIT, condition=condition, successor=True)
+    return _TERMINAL
 
 
 def condition_text(name: str) -> str:
@@ -273,6 +298,8 @@ def condition_text(name: str) -> str:
 
 
 __all__ = [
+    "PROVIDER_GATES",
+    "PROVIDER_GATE_REASONS",
     "RESET_GRACE",
     "Disposition",
     "DispositionKind",
@@ -280,4 +307,5 @@ __all__ = [
     "RetrySafety",
     "condition_text",
     "decide",
+    "provider_gate_releasable",
 ]
