@@ -2144,6 +2144,14 @@ def test_principal_session_get_names_the_person(
         "email": "alice@example.com",
     }
     assert idp.issuer not in response.text
+    from curie_api.routers import console as console_router
+
+    # The cookie and the redirect must be the allowlist constant, not the
+    # supplied string. Reversing that check hands the supplied object back.
+    supplied = ["/settings/", "claude-plan"]
+    supplied_path = supplied[0] + supplied[1]
+    assert console_router._accepted_return_to(supplied_path) == "/settings/claude-plan"
+    assert console_router._accepted_return_to(supplied_path) is not supplied_path
 
 
 def test_principal_session_disabled_principal_is_401(oidc_client: TestClient) -> None:
@@ -2324,6 +2332,21 @@ def test_principal_session_return_to_settings_claude_plan(
     assert response.headers["location"] == "/settings/claude-plan"
     assert _clears_cookie(response, RETURN_COOKIE)
     assert _clears_cookie(response, STATE_COOKIE)
+
+
+@pytest.mark.parametrize(
+    "return_to",
+    [
+        "https://example.com/",
+        "//example.com",
+        "/settings\\claude-plan",
+        "\\\\settings",
+    ],
+)
+def test_accepted_return_to_rejects_remote_shapes(return_to: str) -> None:
+    from curie_api.routers import console as console_router
+
+    assert console_router._accepted_return_to(return_to) is None
 
 
 @pytest.mark.parametrize("return_to", ["https://example.com/", "//example.com", "/agents"])

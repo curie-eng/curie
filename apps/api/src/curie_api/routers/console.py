@@ -295,8 +295,11 @@ OIDC_STATE_COOKIE = "__Host-curie_oidc_state"
 #: Where a completed OIDC login returns. Same flags and scope as the state
 #: cookie, and only ever one of the two paths the console is allowed to open.
 OIDC_RETURN_COOKIE = "__Host-curie_oidc_return"
-_ALLOWED_RETURN_TO = frozenset({"/", "/settings/claude-plan"})
 _OIDC_COOKIE_PATH = "/"
+# Fixed console paths. The cookie and the redirect use these constants, never
+# the string the request supplied, even when that string compares equal.
+_RETURN_ROOT = "/"
+_RETURN_CLAUDE_PLAN = "/settings/claude-plan"
 _NO_STORE = {"Cache-Control": "no-store"}
 #: The one body every refused callback gets. Never the IdP's `error` or
 #: `error_description`: those are attacker-influenced strings, and echoing
@@ -312,10 +315,17 @@ def _require_oidc_enabled() -> None:
 
 
 def _accepted_return_to(value: str | None) -> str | None:
-    """The return path when it is exactly one of the two allowed paths."""
+    """The allowlisted console path, or none.
 
-    if value in _ALLOWED_RETURN_TO:
-        return value
+    The result is ``_RETURN_ROOT`` or ``_RETURN_CLAUDE_PLAN``, never
+    ``value``. An absolute URL, a protocol-relative path, and a path that
+    contains a backslash do not match either constant.
+    """
+
+    if value == _RETURN_CLAUDE_PLAN:
+        return _RETURN_CLAUDE_PLAN
+    if value == _RETURN_ROOT:
+        return _RETURN_ROOT
     return None
 
 
@@ -395,10 +405,16 @@ async def oidc_login(
         samesite="lax",
     )
     accepted = _accepted_return_to(return_to)
-    if accepted is not None:
+    if accepted == _RETURN_CLAUDE_PLAN:
+        return_cookie = _RETURN_CLAUDE_PLAN
+    elif accepted == _RETURN_ROOT:
+        return_cookie = _RETURN_ROOT
+    else:
+        return_cookie = None
+    if return_cookie is not None:
         response.set_cookie(
             OIDC_RETURN_COOKIE,
-            accepted,
+            return_cookie,
             max_age=int(crud_console.OIDC_LOGIN_TTL.total_seconds()),
             path=_OIDC_COOKIE_PATH,
             httponly=True,
@@ -536,7 +552,11 @@ async def oidc_callback(
         except PrincipalAuthorityRefusal:
             await session.rollback()
             return _refuse_callback("principal authority refused login")
-        destination = _accepted_return_to(request.cookies.get(OIDC_RETURN_COOKIE)) or "/"
+        returned = _accepted_return_to(request.cookies.get(OIDC_RETURN_COOKIE))
+        if returned == _RETURN_CLAUDE_PLAN:
+            destination = _RETURN_CLAUDE_PLAN
+        else:
+            destination = _RETURN_ROOT
         response = RedirectResponse(
             destination, status_code=status.HTTP_303_SEE_OTHER, headers=_NO_STORE
         )
