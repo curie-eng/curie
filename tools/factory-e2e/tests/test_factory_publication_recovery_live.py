@@ -65,16 +65,20 @@ What it asserts
    publication failed after exactly two charged attempts, both answered by the
    proxy's injected failures, and exactly one complete candidate is retained.
 2. Exactly one successor exists: execution kind ``publication_recovery``,
-   ``retry_of_request_id`` the original, its own runtime epoch and sandbox
-   claim, started after the original ended, completed, no model session
-   reserved, recovering the captured candidate id with the captured content
-   digest, which now owns the candidate.
+   ``retry_of_request_id`` the original, a runtime epoch of at least 1 (a
+   new request, not an increment of the original's), its own sandbox claim,
+   started after the original ended, completed, no model session reserved,
+   recovering the captured candidate id with the captured content digest,
+   which now owns the candidate.
 3. Identical bytes: the candidate's patch and base digests, sizes and base
    commit are unchanged; the recovery publication's base is the candidate's
    base commit and its title and body are the candidate's.
 4. No model call after capture: the WorkItem usage read on the first
    complete-candidate poll (half a second, not the 3 second request poll)
-   equals the usage after recovery, and the recovery request recorded no tokens.
+   equals the usage after recovery, and the recovery request recorded no
+   tokens. A zero reading is accepted. The fake publish gate ends the turn
+   before the scripted usage messages, and that interrupt result carries
+   no usage.
 5. Exactly one branch, publication and pull request: the forge's one branch
    still holds the commit the original attempt pushed (adopted, not
    rewritten), one publication succeeded, the forge holds one pull request on

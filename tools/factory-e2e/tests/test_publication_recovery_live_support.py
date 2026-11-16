@@ -392,7 +392,21 @@ def test_judge_recovery_accepts_one_identical_model_free_publication() -> None:
     facts = prl.judge_recovery(**_recovered())
     assert facts["execution_kind"] == "publication_recovery"
     assert facts["pushed_commit"] == PUSHED and facts["pull_requests"] == 1
+    assert facts["original_runtime_epoch"] == 1
+    assert facts["successor_runtime_epoch"] == 2
     assert facts["tokens_at_capture"] == facts["tokens_after"] == 28
+
+
+def test_judge_recovery_accepts_a_successor_on_its_own_first_epoch() -> None:
+    facts = prl.judge_recovery(**_recovered(successor={"runtime_epoch": 1}))
+    assert facts["original_runtime_epoch"] == 1
+    assert facts["successor_runtime_epoch"] == 1
+
+
+def test_judge_recovery_accepts_a_capture_snapshot_with_no_flushed_tokens() -> None:
+    empty = {"total_tokens": 0, "models": [], "requests": []}
+    facts = prl.judge_recovery(**_recovered(usage_at_capture=empty, usage_after=empty))
+    assert facts["tokens_at_capture"] == facts["tokens_after"] == 0
 
 
 @pytest.mark.parametrize(
@@ -400,7 +414,11 @@ def test_judge_recovery_accepts_one_identical_model_free_publication() -> None:
     [
         ({"successor": {"execution_kind": "implementation"}}, "implementation"),
         ({"successor": {"status": "failed"}}, "expected completed"),
-        ({"successor": {"runtime_epoch": 1}}, "above the original"),
+        ({"successor": {"runtime_epoch": 0}}, "successor runtime epoch 0 was never taken"),
+        (
+            {"original": {**_original(), "runtime_epoch": 0}},
+            "original runtime epoch 0 was never taken",
+        ),
         ({"successor": {"runtime_claim_name": "claim-a"}}, "reused the original"),
         ({"successor": {"started_at": "2026-11-16T08:04:00+00:00"}}, "before the original"),
         ({"successor": {"recovery_candidate_id": "x"}}, "different candidate"),
