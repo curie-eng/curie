@@ -473,6 +473,12 @@ def _start(client: TestClient, request_id: uuid.UUID) -> int:
                 claim_name="claim-jira",
                 sandbox_name="sbx-jira",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)

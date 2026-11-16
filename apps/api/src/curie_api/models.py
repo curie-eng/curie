@@ -1465,6 +1465,16 @@ class ExecutionRequest(Base):
             "OR (retry_condition_retry_at IS NULL AND retry_condition_scope_key IS NULL)",
             name="execution_requests_retry_condition_ck",
         ),
+        # Migration 0174 (#5427): a delivered limits record and a resource gate
+        # are JSON objects when present, never a JSON null or scalar.
+        CheckConstraint(
+            "delivered_limits IS NULL OR jsonb_typeof(delivered_limits) = 'object'",
+            name="execution_requests_delivered_limits_ck",
+        ),
+        CheckConstraint(
+            "resource_gate IS NULL OR jsonb_typeof(resource_gate) = 'object'",
+            name="execution_requests_resource_gate_ck",
+        ),
         UniqueConstraint(
             "work_item_id",
             "sequence",
@@ -1617,6 +1627,16 @@ class ExecutionRequest(Base):
         DateTime(timezone=True), default=None
     )
     retry_condition_scope_key: Mapped[str | None] = mapped_column(Text, default=None)
+    # The limits actually delivered to this request's attempt, recorded by its
+    # start, and the gate an automatic successor of a limit failure waits on
+    # (migration 0174, #5427). ``none_as_null`` keeps a Python None SQL NULL,
+    # which the object-shape checks require.
+    delivered_limits: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
+    resource_gate: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
     # Where the factory status reply lands (ADR 0197 decision fact 4): the
     # tracker issue, a pull request conversation, or one review thread. A
     # revision answers on its pull request; every other request on the issue.

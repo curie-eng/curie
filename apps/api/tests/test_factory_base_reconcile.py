@@ -690,6 +690,12 @@ def test_observed_selection_in_applied_outcome_gap_preserves_transition_request(
             claim_name="claim-base-observation",
             sandbox_name="sandbox-base-observation",
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         assert isinstance(started, StartResult), started
         result = await finish(
@@ -702,6 +708,7 @@ def test_observed_selection_in_applied_outcome_gap_preserves_transition_request(
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
         assert isinstance(result, DispatchConflict), result
         assert result.code == "publication_pending"

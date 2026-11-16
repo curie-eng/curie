@@ -82,6 +82,7 @@ from curie_runner.session import SessionRunner
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import RUNNER_TOKEN_ENV, FactoryWake
 from curie_worker.runner_client import RunnerClient
+from curie_worker.sandbox.types import DeliveredLimits
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
@@ -135,6 +136,11 @@ from apps.worker.tests.test_workspace_recovery_storage import (
     _served_api,
     _settings_env,
 )
+
+UNOBSERVED_LIMITS = DeliveredLimits(
+    memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+).to_wire()
+
 
 RUNNER_TOKEN = "recovery-runner-token-claim"
 SUCCESSOR_TOKEN = "successor-holds-this-thread"
@@ -654,6 +660,7 @@ class _Stage:
             claim_name=claim,
             sandbox_name=f"sbx-{claim}",
             context=grant.context,
+            delivered_limits=UNOBSERVED_LIMITS,
         )
         await self.dispatch.finish(
             request_id,
@@ -664,6 +671,7 @@ class _Stage:
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
         assert self.work_item_id is not None
         return _Source(self.work_item_id, request_id, started.runtime_epoch, grant.generation)
@@ -778,7 +786,11 @@ class _Stage:
             on_stop=self.h.kernel._stop_owned_work_item,
             on_stale=self.h.kernel._abandon_stale_work_item,
         )
-        await run.start(claim_name=self.handle.claim_name, sandbox_name=self.handle.sandbox_name)
+        await run.start(
+            claim_name=self.handle.claim_name,
+            sandbox_name=self.handle.sandbox_name,
+            delivered_limits=UNOBSERVED_LIMITS,
+        )
         assert run.runtime_epoch is not None
         assert run.recovery_eligible is False
         self.run = run
@@ -821,6 +833,7 @@ class _Stage:
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
         assert run.finished
         self.request_after_finish = await self.request_row(run.request_id)
@@ -1741,6 +1754,7 @@ async def _fault_cancelled_finish(stage: _Stage, _monkeypatch: pytest.MonkeyPatc
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
     assert refused.value.code == "work_item_cancelled"
     # kernel/completion.py's handling of this refusal (#3208).

@@ -447,6 +447,12 @@ def test_issue_read_reports_the_stored_execution_deadline_and_configured_duratio
             "claim_name": "fixture-claim",
             "sandbox_name": "fixture-sandbox",
             "context": acquire.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text

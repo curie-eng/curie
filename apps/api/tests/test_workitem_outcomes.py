@@ -319,6 +319,12 @@ def _start(client: TestClient, request_id: uuid.UUID, *, generation: int = 1) ->
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         return int(started.runtime_epoch)
 
@@ -337,6 +343,7 @@ def _finish(request_id: uuid.UUID, epoch: int, outcome: str, cause: str) -> None
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
         assert getattr(result, "code", None) is None, result
 
@@ -1089,6 +1096,7 @@ def test_completion_without_a_pull_request_stays_running(
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
         assert getattr(result, "code", None) is not None, result
 

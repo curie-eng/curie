@@ -1019,6 +1019,12 @@ def test_poll_uses_current_labels_at_claim_and_replaces_only_a_pinned_selection(
                 "claim_name": "claim-poll-intake",
                 "sandbox_name": "sandbox-poll-intake",
                 "context": acquired.json()["context"],
+                "delivered_limits": {
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             },
         )
         assert started.status_code == 200, started.text

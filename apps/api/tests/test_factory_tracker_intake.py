@@ -894,6 +894,12 @@ def test_base_poll_reads_active_selection_without_reopening_or_reading_finished_
             "claim_name": "claim-active-poll",
             "sandbox_name": "sandbox-active-poll",
             "context": grants[1]["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text
@@ -1586,6 +1592,12 @@ def _start_polled_request(intake: Intake, request_id: uuid.UUID) -> int:
             "claim_name": "claim-completed-poll",
             "sandbox_name": "sandbox-completed-poll",
             "context": grant["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text
@@ -2056,6 +2068,12 @@ def test_deleted_jira_issue_cancels_running_work_item(intake: Intake) -> None:
             "claim_name": "claim-deleted-issue",
             "sandbox_name": "sandbox-deleted-issue",
             "context": grant["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
     )
     assert started.status_code == 200, started.text

@@ -832,6 +832,7 @@ def test_refused_continuation_finishes_its_epoch_and_valid_neighbor_runs(
                     "ci_fix_round": None,
                     "retry_safety": "uncertain",
                     "retry_condition": None,
+                    "exhausted_volume": None,
                     "budget_s": 120.0,
                 },
             )]

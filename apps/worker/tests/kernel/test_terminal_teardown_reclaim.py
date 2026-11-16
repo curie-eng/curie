@@ -42,6 +42,7 @@ import pytest
 from aci_protocol import Final, SessionStatus
 from curie_worker.binding import FactoryWake
 from curie_worker.kernel import routing
+from curie_worker.sandbox.types import DeliveredLimits
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
@@ -64,6 +65,11 @@ from .test_work_item_workspace import (
     _turn,
     _Workspace,
 )
+
+UNOBSERVED_LIMITS = DeliveredLimits(
+    memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+).to_wire()
+
 
 OWNER = "test-consumer"  # the harness kernel's consumer name
 PEER = "worker-b"
@@ -361,6 +367,8 @@ async def _owned_run(h: Any, api: TeardownApi, http: httpx.AsyncClient, thread_k
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path="acme-corp/widgets",
             context=factory_context(AGENT_ID, wake),
+            resource_gate=None,
+            predecessor_claim_name=None,
         ),
         wake=wake,
         event_id=f"work-item-{api.request_id}-execute-1",
@@ -368,7 +376,11 @@ async def _owned_run(h: Any, api: TeardownApi, http: httpx.AsyncClient, thread_k
         on_stop=h.kernel._stop_owned_work_item,
         on_stale=h.kernel._abandon_stale_work_item,
     )
-    await run.start(claim_name=handle.claim_name, sandbox_name=handle.sandbox_name)
+    await run.start(
+        claim_name=handle.claim_name,
+        sandbox_name=handle.sandbox_name,
+        delivered_limits=UNOBSERVED_LIMITS,
+    )
     return run, handle
 
 

@@ -855,6 +855,7 @@ async def _process_event(
                                 ci_fix_round=None,
                                 retry_safety="uncertain",
                                 retry_condition=None,
+                                exhausted_volume=None,
                             )
                         else:
                             await factory_run.defer(
@@ -1847,6 +1848,7 @@ async def _process_event(
                                     ),
                                 ),
                                 retry_condition=outcome.retry_condition,
+                                exhausted_volume=None,
                             )
                         except WorkItemConflict as exc:
                             # work_item_cancelled means what it does in
@@ -2190,6 +2192,7 @@ async def _settle_personal_refusal(
                 ci_fix_round=None,
                 retry_safety="uncertain",
                 retry_condition=None,
+                exhausted_volume=None,
             )
         else:
             if exc.code not in constants._PERSONAL_REFUSALS_KEEPING_CLAIM:
@@ -2216,6 +2219,7 @@ async def _settle_requester_refusal(
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
     except WorkItemConflict as conflict:
         logger.info("requester refusal settlement for %s refused: %s", event_id, conflict.code)
@@ -2287,6 +2291,7 @@ async def _mint_tracker_result_capability(
                 ci_fix_round=None,
                 retry_safety="uncertain",
                 retry_condition=None,
+                exhausted_volume=None,
             )
         else:
             await run.defer("issue_read_unavailable", capacity=False, start_failure_detail=None)

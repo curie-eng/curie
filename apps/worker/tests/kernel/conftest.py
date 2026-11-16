@@ -63,7 +63,7 @@ from curie_worker.sandbox import (
     QuotaRejection,
     SandboxSubstrate,
 )
-from curie_worker.sandbox.types import ClaimView, SandboxClient, SandboxView
+from curie_worker.sandbox.types import ClaimView, DeliveredLimits, SandboxClient, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -491,6 +491,15 @@ class FakeK8s:
     unschedulable_message: str | None = None
     termination: Any | None = None
     termination_queries: list[str] = field(default_factory=list)
+    # ADR 0269 (#5427): what pod_limits and claim_limits answer. Unobserved
+    # by default, which never releases a resource gate.
+    delivered: DeliveredLimits | None = None
+    template_limits: DeliveredLimits = field(
+        default_factory=lambda: DeliveredLimits(
+            memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+        )
+    )
+    pod_limit_reads: list[str] = field(default_factory=list)
     template_reaps: list[tuple[set[str], datetime]] = field(default_factory=list)
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
@@ -720,6 +729,20 @@ class FakeK8s:
         assert since.tzinfo is not None
         self.termination_queries.append(name)
         return self.termination
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        assert request_timeout_seconds > 0
+        self.pod_limit_reads.append(name)
+        return self.delivered
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        return self.template_limits
 
     # No Docker repository pool is configured in this suite, so the substrate
     # never reaches the tool-daemon seam (ADR 0217); any call is a test bug.

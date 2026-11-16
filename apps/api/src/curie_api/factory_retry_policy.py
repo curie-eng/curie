@@ -101,7 +101,15 @@ _LIMIT_CONDITIONS: Final[dict[str, str]] = {
     "history_capacity": "history_capacity",
     "max_turns": "turn_limit",
     "execution_deadline": "execution_time_limit",
+    # A positively diagnosed resource exhaustion waits for a strictly larger
+    # delivered limit of the same dimension (#5427).
+    "sandbox_memory_exhausted": "memory_limit",
+    "sandbox_storage_exhausted": "ephemeral_storage_limit",
+    "sandbox_scratch_exhausted": "scratch_limit",
 }
+# A node disruption the substrate positively identified is external to the run,
+# so a clean one retries like a provider transient (#5427).
+_NODE_DISRUPTION: Final = frozenset({"sandbox_node_disrupted"})
 _PUBLICATION_RECOVERY: Final = frozenset(
     {"approval_create_failed", "publication_failed", "publication_unrecorded"}
 )
@@ -123,6 +131,9 @@ _CONDITION_TEXT: Final[dict[str, str]] = {
     "history_capacity": "a raised conversation history capacity",
     "turn_limit": "a raised turn limit",
     "execution_time_limit": "a raised execution time limit",
+    "memory_limit": "a raised runner memory limit",
+    "ephemeral_storage_limit": "a raised runner ephemeral storage limit",
+    "scratch_limit": "a raised sandbox scratch volume limit",
     "start_preparation": "a repair of the sandbox start fault",
     "pull_request_lineage": "a verified change to the pull request base, head or ownership",
 }
@@ -188,6 +199,10 @@ def decide(facts: RetryFacts) -> Disposition:
         return Disposition(
             DispositionKind.CONDITION_WAIT, condition=_LIMIT_CONDITIONS[cause], successor=True
         )
+    if cause in _NODE_DISRUPTION:
+        if not clean:
+            return _TERMINAL
+        return Disposition(DispositionKind.RETRY_BACKOFF, successor=True)
     if cause == "start_failed":
         return Disposition(DispositionKind.TERMINAL, condition="start_preparation")
     if cause in _PUBLICATION_RECOVERY:

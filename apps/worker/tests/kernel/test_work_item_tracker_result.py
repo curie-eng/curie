@@ -34,6 +34,7 @@ from aci_protocol import ErrorEvent, Final, SessionStatus, TextDelta
 from curie_worker import workitem_dispatch as dispatch_module
 from curie_worker.binding import FactoryContext, FactoryWake
 from curie_worker.kernel import lifecycle as lifecycle_module
+from curie_worker.sandbox.types import DeliveredLimits
 from curie_worker.workitem_dispatch import (
     CONTRACT_IMPLEMENTATION,
     CONTRACT_TRACKER_RESULT,
@@ -66,6 +67,11 @@ from apps.worker.tests.kernel.test_work_item_early_stop import (
     _WorkItems,
     _Workspace,
 )
+
+UNOBSERVED_LIMITS = DeliveredLimits(
+    memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+).to_wire()
+
 
 TRACKER_RESULT = CONTRACT_TRACKER_RESULT
 IMPLEMENTATION = CONTRACT_IMPLEMENTATION
@@ -507,6 +513,8 @@ _ACQUIRE_BODY: dict[str, object] = {
     "wait_deadline": "2099-01-01T00:00:00+00:00",
     "repository_path": WORK_ITEM_REPO,
     "context": _CONTEXT.model_dump(mode="json"),
+    "resource_gate": None,
+    "predecessor_claim_name": None,
 }
 _START_BODY: dict[str, object] = {
     "runtime_epoch": 3,
@@ -554,6 +562,7 @@ async def _call(body: dict[str, object], verb: str) -> object:
                 claim_name="claim-1",
                 sandbox_name="sandbox-1",
                 context=_CONTEXT,
+                delivered_limits=UNOBSERVED_LIMITS,
             )
         return await client.running_for_conversation("thread", wake=_WAKE)
 
@@ -653,7 +662,11 @@ def test_the_start_answer_only_ever_widens_the_contract_to_tracker_result(
         assert isinstance(grant, WorkItemAcquireGrant)
         run = _run_for(grant, _StartClient(started))
         try:
-            await run.start(claim_name="claim-1", sandbox_name="sandbox-1")
+            await run.start(
+                claim_name="claim-1",
+                sandbox_name="sandbox-1",
+                delivered_limits=UNOBSERVED_LIMITS,
+            )
             return run.is_tracker_result
         finally:
             await run.close()

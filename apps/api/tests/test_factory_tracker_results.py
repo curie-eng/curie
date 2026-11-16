@@ -326,6 +326,12 @@ def _start_running(client: Any, request_id: uuid.UUID) -> int:
                 claim_name=f"claim-{request_id.hex[:12]}",
                 sandbox_name=f"sbx-{request_id.hex[:12]}",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)
@@ -1741,6 +1747,12 @@ def _begin(triage: _Triage) -> None:
                 claim_name=f"claim-{triage.request_id.hex[:12]}",
                 sandbox_name=f"sbx-{triage.request_id.hex[:12]}",
                 context=triage.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)
@@ -1773,6 +1785,7 @@ def _finish(triage: _Triage, outcome: str, cause: str) -> Any:
                 ci_fix_round=None,
                 retry_safety="uncertain",
                 retry_condition=None,
+                exhausted_volume=None,
             )
 
     return triage.client.portal.call(go)

@@ -76,7 +76,8 @@ def _execution_at_0163(request_id: Any) -> str:
             "- 'coding_instructions_evidence' - 'retry_of_request_id' "
             "- 'retry_origin_request_id' - 'blocked_on' - 'retry_safety' "
             "- 'retry_condition_reason' - 'retry_condition_retry_at' "
-            "- 'retry_condition_scope_key')::text AS bytes "
+            "- 'retry_condition_scope_key' - 'delivered_limits' - 'resource_gate')::text "
+            "AS bytes "
             "FROM curie.execution_requests r WHERE id = :id",
             {"id": request_id},
         )[0]["bytes"]

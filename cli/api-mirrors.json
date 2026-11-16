@@ -153,6 +153,10 @@
         {
           "field": "retry_safety",
           "why": "cli/src/commands/work.rs does not decide retries. The worker's side effect fact (ADR 0269) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "resource_gate",
+          "why": "The CLI renders a blocked retry's named condition through the item's actionable_cause; the raised limit a resource gated retry waits for (#5427) is outside the versioned work-items/v2.2 JSON projection."
         }
       ]
     },

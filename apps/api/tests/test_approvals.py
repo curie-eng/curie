@@ -1133,6 +1133,12 @@ def test_stored_factory_approval_resume_wake_adopts_the_same_running_request(
                 "owner": "factory-worker", "generation": 1,
                 "claim_name": "acme-factory-claim", "sandbox_name": "acme-factory-sandbox",
                 "context": acquired.json()["context"],
+                "delivered_limits": {
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             },
             headers=worker,
         )

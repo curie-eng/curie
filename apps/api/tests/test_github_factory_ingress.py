@@ -804,6 +804,12 @@ def _mark_running(client: TestClient, request_id: uuid.UUID) -> None:
                 claim_name="claim-factory",
                 sandbox_name="sbx-factory",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
 

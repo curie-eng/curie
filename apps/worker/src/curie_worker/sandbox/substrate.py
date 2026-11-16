@@ -31,6 +31,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
 from aci_protocol import BootEnv
@@ -50,7 +51,7 @@ from ..binding import (
     boot_token_facts,
     caller_requester_facts,
 )
-from ..workitem_dispatch import TerminationObservation
+from ..workitem_dispatch import ResourceGate, TerminationObservation
 from . import tool_daemon
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
@@ -76,6 +77,7 @@ from .types import (
     ClaimProvenance,
     ClaimTimeoutError,
     ClaimView,
+    DeliveredLimits,
     KubeTransientError,
     MissingAgentPoolError,
     NoRouteError,
@@ -159,6 +161,9 @@ _CONTROL_REQUEST_TIMEOUT_S = 5.0
 _MIN_POLL_BUDGET_S = 0.5
 _GONE_READ_TIMEOUT_S = 1.0
 _POD_TERMINATION_TIMEOUT_S = 2.0
+_POD_LIMITS_TIMEOUT_S = 2.0
+# The gate dimensions whose current limit is a sandbox template fact.
+_SUBSTRATE_GATE_DIMENSIONS = frozenset({"memory", "ephemeral_storage", "scratch"})
 _probe_monotonic = time.monotonic
 
 
@@ -620,6 +625,106 @@ class SandboxSubstrate:
             since=since,
             request_timeout_seconds=_POD_TERMINATION_TIMEOUT_S,
         )
+
+    def delivered_limits(self, handle: SandboxHandle, *, max_turns: int | None) -> DeliveredLimits:
+        """The limits ``handle``'s runtime was actually given (ADR 0269, #5427).
+
+        Read from the created pod, never from desired configuration. An
+        unreadable pod reports every substrate limit as unobserved, which can
+        never release a later gate. ``max_turns`` is what the runtime booted with.
+        """
+
+        observed: DeliveredLimits | None = None
+        if handle.namespace == self._config.namespace:
+            try:
+                observed = self._k8s.pod_limits(
+                    handle.sandbox_name, request_timeout_seconds=_POD_LIMITS_TIMEOUT_S
+                )
+            except Exception as exc:  # noqa: BLE001 - an unread limit is unobserved
+                logger.warning("delivered limits unreadable (%s)", type(exc).__name__)
+        if observed is None:
+            return DeliveredLimits(
+                memory_bytes=None,
+                ephemeral_storage_bytes=None,
+                scratch_bytes={},
+                max_turns=max_turns,
+            )
+        return replace(observed, max_turns=max_turns)
+
+    def resource_gate_readiness(
+        self,
+        gate: ResourceGate,
+        *,
+        env: Mapping[str, str] | None,
+        workspace_repo: str | None,
+        agent_name: str | None,
+        runner_resources: dict[str, Any] | None,
+    ) -> int | None:
+        """The current limit for ``gate``'s dimension when a claim could deliver it, else None.
+
+        Creates nothing. The pool is the one a claim would select, and the limit
+        is that pool's template plus the override, resolved as a claim resolves
+        it. With admission configured, the resolved footprint must also fit the
+        configured hard ceiling, each quantity at most its hard value. That is
+        not live headroom: a full quota is a capacity wait at claim time. A
+        template that does not resolve, or a scratch volume it does not
+        declare, is None. Runner refusals raise as they do at claim.
+        """
+
+        if gate.dimension not in _SUBSTRATE_GATE_DIMENSIONS:
+            raise ValueError(f"{gate.dimension} is not a sandbox limit")
+        _runner, pool = self.select_runner(
+            workspace_repo=workspace_repo, env=env, agent_name=agent_name
+        )
+        admission = self._config.admission
+        try:
+            limits = self._k8s.claim_limits(
+                pool=pool, runner_resources=runner_resources, agent_name=agent_name
+            )
+            if admission is not None:
+                requested = resource_vector(
+                    self._k8s.claim_resources(
+                        pool=pool,
+                        runner_resources=runner_resources,
+                        agent_name=agent_name,
+                        executor_secret_names=None,
+                    )
+                )
+                hard = resource_vector(admission.hard)
+                if set(requested) != set(hard) or any(
+                    Decimal(requested[key]) > Decimal(hard[key]) for key in hard
+                ):
+                    return None
+        except Exception as exc:  # noqa: BLE001 - an unresolved template is not ready
+            logger.info("resource gate template unresolved (%s)", type(exc).__name__)
+            return None
+        if gate.dimension == "memory":
+            return limits.memory_bytes
+        if gate.dimension == "ephemeral_storage":
+            return limits.ephemeral_storage_bytes
+        return limits.scratch_bytes.get(gate.volume) if gate.volume is not None else None
+
+    def predecessor_absent(self, thread_key: str, claim_name: str) -> bool:
+        """Fence a failed predecessor's runtime before its successor claims (ADR 0269).
+
+        Releases ``claim_name`` only while the thread's route names it, then
+        confirms the claim object is gone and no route names it. Anything short
+        of that, including an unreadable claim, is False.
+        """
+
+        try:
+            # A release waits, bounded, for the claim and its sandbox to go.
+            self.release_if_claim(thread_key, claim_name, wait_gone=True)
+            record = self._affinity.get(thread_key)
+            if record is not None and record.handle.claim_name == claim_name:
+                return False
+            return (
+                self._k8s.get_claim(claim_name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S)
+                is None
+            )
+        except Exception as exc:  # noqa: BLE001 - unconfirmed absence is presence
+            logger.info("predecessor runtime absence unconfirmed (%s)", type(exc).__name__)
+            return False
 
     # -- claim / lookup -------------------------------------------------------
 

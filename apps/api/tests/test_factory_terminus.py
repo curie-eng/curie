@@ -479,6 +479,12 @@ def _start_running(client: Any, request_id: uuid.UUID) -> int:
                 claim_name="claim-factory",
                 sandbox_name="sbx-factory",
                 context=acquired.context,
+                delivered_limits={
+                    "memory_bytes": None,
+                    "ephemeral_storage_bytes": None,
+                    "scratch_bytes": {},
+                    "max_turns": None,
+                },
             )
             assert not isinstance(started, DispatchConflict), started
             return int(started.runtime_epoch)
@@ -2429,6 +2435,7 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(
                     extra_where=(),
                     retry_safety=None,
                     retry_condition=None,
+                    exhausted_volume=None,
                 )
                 assert isinstance(result, WorkItemConflict), result
                 assert result.code == "stale_version"
