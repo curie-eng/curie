@@ -423,6 +423,7 @@ async def _attempt_recovery(
                 ci_fix_round=None,
                 retry_safety="no_effects",
                 retry_condition=None,
+                exhausted_volume=None,
             )
         except WorkItemConflict as exc:
             # As at the approval_create_failed finish: the request already

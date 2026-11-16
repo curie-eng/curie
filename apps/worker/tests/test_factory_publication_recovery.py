@@ -68,6 +68,7 @@ from curie_worker.workitem_dispatch import WorkItemRun
 
 from apps.worker.tests import factory_retry_fixtures
 from apps.worker.tests.factory_retry_fixtures import (
+    UNOBSERVED_LIMITS,
     FactoryRetryCase,
     Item,
     factory_retry,
@@ -295,7 +296,11 @@ async def _retained_failure(case: FactoryRetryCase, owned: _Owned, root: Path) -
         on_stale=case.h.kernel._abandon_stale_work_item,
     )
     assert not run.is_publication_recovery
-    await run.start(claim_name=claimed.handle.claim_name, sandbox_name=claimed.handle.sandbox_name)
+    await run.start(
+        claim_name=claimed.handle.claim_name,
+        sandbox_name=claimed.handle.sandbox_name,
+        delivered_limits=UNOBSERVED_LIMITS,
+    )
     assert run.runtime_epoch is not None
     archive = b"".join(case.objects.get_stream(prepared.object_key))
     snapshot = await _snapshot(owned, root, archive, prepared.base_sha, prepared.repo_origin)
@@ -332,6 +337,7 @@ async def _retained_failure(case: FactoryRetryCase, owned: _Owned, root: Path) -
         ci_fix_round=None,
         retry_safety="no_effects",
         retry_condition=None,
+        exhausted_volume=None,
     )
     assert run.finished
     # The delivery ``finally`` of kernel/lifecycle.py for this run.

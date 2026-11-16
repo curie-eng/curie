@@ -39,6 +39,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from test_factory_retry import (
+    DELIVERED_LIMITS,
     OWNER,
     REQUESTER,
     WORKER,
@@ -148,6 +149,7 @@ async def _acquire_and_start(app: Any, request_id: uuid.UUID, generation: int) -
                 "claim_name": f"curie-thread-{request_id.hex[:12]}",
                 "sandbox_name": f"sbx-curie-thread-{request_id.hex[:12]}",
                 "context": grant["context"],
+                "delivered_limits": DELIVERED_LIMITS,
             },
             headers=WORKER,
         )
