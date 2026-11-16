@@ -1,0 +1,308 @@
+{
+  "comment": "Single source of truth for which reported rounds a progress declaration accepts when loops share a phase (#5203). The runner's report_progress tool (runner/src/curie_runner/progress.py: build_progress_tool, fed by load_phase_declaration) and the API's ProgressReport validation (apps/api/src/curie_api/factory_progress.py) ship in different images and must agree on every (phase, round), because a round only one side accepts is either never posted or stored by the API and never reachable by the model. The rule: a round is valid from 1 to the largest cap among the loops that name the phase as start or review, and a phase no loop names takes no round; a report without a round is always valid. Each case holds one declaration and its reports with the expected verdict (accepted true or false) for both sides, so the two orderings of the same two loops pin that declaration order changes nothing, and a declaration whose loops share no phase pins the unchanged per-loop cap. Read by runner/tests/test_progress.py, apps/api/tests/test_factory_progress.py and apps/api/tests/test_progress_round_caps.py, which also posts every report the runner accepts to the API's request model. Every reader rejects unknown keys so one added here cannot pass vacuously in a reader that cannot see it.",
+  "cases": [
+    {
+      "name": "shared start, larger cap declared first",
+      "declaration": {
+        "phases": [
+          {
+            "id": "plan",
+            "label": "Plan"
+          },
+          {
+            "id": "implement",
+            "label": "Implement"
+          },
+          {
+            "id": "review_diff",
+            "label": "Review diff"
+          },
+          {
+            "id": "publish",
+            "label": "Publish"
+          },
+          {
+            "id": "wait_ci",
+            "label": "Wait ci"
+          }
+        ],
+        "loops": [
+          {
+            "start": "implement",
+            "review": "review_diff",
+            "cap": 5
+          },
+          {
+            "start": "implement",
+            "review": "wait_ci",
+            "cap": 3
+          }
+        ]
+      },
+      "reports": [
+        {
+          "phase": "implement",
+          "round": 1,
+          "accepted": true
+        },
+        {
+          "phase": "implement",
+          "round": 4,
+          "accepted": true
+        },
+        {
+          "phase": "implement",
+          "round": 5,
+          "accepted": true
+        },
+        {
+          "phase": "implement",
+          "round": 6,
+          "accepted": false
+        },
+        {
+          "phase": "implement",
+          "round": 0,
+          "accepted": false
+        },
+        {
+          "phase": "review_diff",
+          "round": 5,
+          "accepted": true
+        },
+        {
+          "phase": "review_diff",
+          "round": 6,
+          "accepted": false
+        },
+        {
+          "phase": "wait_ci",
+          "round": 3,
+          "accepted": true
+        },
+        {
+          "phase": "wait_ci",
+          "round": 4,
+          "accepted": false
+        },
+        {
+          "phase": "wait_ci",
+          "round": 5,
+          "accepted": false
+        },
+        {
+          "phase": "plan",
+          "round": null,
+          "accepted": true
+        },
+        {
+          "phase": "plan",
+          "round": 1,
+          "accepted": false
+        },
+        {
+          "phase": "publish",
+          "round": 1,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "name": "shared start, smaller cap declared first",
+      "declaration": {
+        "phases": [
+          {
+            "id": "plan",
+            "label": "Plan"
+          },
+          {
+            "id": "implement",
+            "label": "Implement"
+          },
+          {
+            "id": "review_diff",
+            "label": "Review diff"
+          },
+          {
+            "id": "publish",
+            "label": "Publish"
+          },
+          {
+            "id": "wait_ci",
+            "label": "Wait ci"
+          }
+        ],
+        "loops": [
+          {
+            "start": "implement",
+            "review": "wait_ci",
+            "cap": 3
+          },
+          {
+            "start": "implement",
+            "review": "review_diff",
+            "cap": 5
+          }
+        ]
+      },
+      "reports": [
+        {
+          "phase": "implement",
+          "round": 1,
+          "accepted": true
+        },
+        {
+          "phase": "implement",
+          "round": 4,
+          "accepted": true
+        },
+        {
+          "phase": "implement",
+          "round": 5,
+          "accepted": true
+        },
+        {
+          "phase": "implement",
+          "round": 6,
+          "accepted": false
+        },
+        {
+          "phase": "implement",
+          "round": 0,
+          "accepted": false
+        },
+        {
+          "phase": "review_diff",
+          "round": 5,
+          "accepted": true
+        },
+        {
+          "phase": "review_diff",
+          "round": 6,
+          "accepted": false
+        },
+        {
+          "phase": "wait_ci",
+          "round": 3,
+          "accepted": true
+        },
+        {
+          "phase": "wait_ci",
+          "round": 4,
+          "accepted": false
+        },
+        {
+          "phase": "wait_ci",
+          "round": 5,
+          "accepted": false
+        },
+        {
+          "phase": "plan",
+          "round": null,
+          "accepted": true
+        },
+        {
+          "phase": "plan",
+          "round": 1,
+          "accepted": false
+        },
+        {
+          "phase": "publish",
+          "round": 1,
+          "accepted": false
+        }
+      ]
+    },
+    {
+      "name": "loops share no phase",
+      "declaration": {
+        "phases": [
+          {
+            "id": "plan",
+            "label": "Plan"
+          },
+          {
+            "id": "implement",
+            "label": "Implement"
+          },
+          {
+            "id": "review_diff",
+            "label": "Review diff"
+          },
+          {
+            "id": "publish",
+            "label": "Publish"
+          },
+          {
+            "id": "wait_ci",
+            "label": "Wait ci"
+          }
+        ],
+        "loops": [
+          {
+            "start": "implement",
+            "review": "review_diff",
+            "cap": 5
+          },
+          {
+            "start": "publish",
+            "review": "wait_ci",
+            "cap": 3
+          }
+        ]
+      },
+      "reports": [
+        {
+          "phase": "implement",
+          "round": 5,
+          "accepted": true
+        },
+        {
+          "phase": "implement",
+          "round": 6,
+          "accepted": false
+        },
+        {
+          "phase": "review_diff",
+          "round": 5,
+          "accepted": true
+        },
+        {
+          "phase": "review_diff",
+          "round": 6,
+          "accepted": false
+        },
+        {
+          "phase": "publish",
+          "round": 3,
+          "accepted": true
+        },
+        {
+          "phase": "publish",
+          "round": 4,
+          "accepted": false
+        },
+        {
+          "phase": "wait_ci",
+          "round": 3,
+          "accepted": true
+        },
+        {
+          "phase": "wait_ci",
+          "round": 4,
+          "accepted": false
+        },
+        {
+          "phase": "plan",
+          "round": 1,
+          "accepted": false
+        },
+        {
+          "phase": "implement",
+          "round": null,
+          "accepted": true
+        }
+      ]
+    }
+  ]
+}

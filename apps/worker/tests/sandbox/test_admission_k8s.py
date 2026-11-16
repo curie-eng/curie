@@ -3,19 +3,35 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Mapping
+import json
+import sys
+import threading
+import time as real_time
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from curie_worker.run import _substrate_config
+from curie_worker.sandbox import AffinityStore, SandboxSubstrate
 from curie_worker.sandbox import k8s as k8s_module
+from curie_worker.sandbox import substrate as substrate_module
 from curie_worker.sandbox.types import CapacityInventory, KubeTransientError
 from kubernetes import client as kube
 from kubernetes.utils.quantity import parse_quantity
 from urllib3.exceptions import MaxRetryError, ProtocolError, ReadTimeoutError
 
 from .test_k8s_claim import _chart_template_spec, _client, _FakeApi, _seed_chart
+
+# importlib import mode does not add the tests directory to sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from otel_fixtures import install  # noqa: E402
 
 
 class InventoryAPI(_FakeApi):
@@ -506,7 +522,8 @@ def test_pod_list_transient_http_status_preserves_cause_without_retry(status: in
         )
     assert error.value.__cause__ is fault
     assert len(api.pod_list_calls) == 1
-    assert [plural for plural, _selector in api.lists] == ["sandboxclaims", "sandboxes"]
+    # The three LISTs are concurrent (#5630), so only their set is fixed.
+    assert sorted(plural for plural, _selector in api.lists) == ["sandboxclaims", "sandboxes"]
     assert api.created == api.patches == []
     assert api.secrets == {}
 
@@ -532,35 +549,54 @@ def test_inventory_exhausted_budget_stops_before_next_kubernetes_request(
     budget: float,
 ) -> None:
     api = InventoryAPI()
-    elapsed = 0.0
-    calls: list[float] = []
-    real_list = api.list_namespaced_custom_object
-
-    def list_with_latency(*args: Any, **kwargs: Any) -> Any:
-        nonlocal elapsed
-        calls.append(kwargs["_request_timeout"])
-        elapsed += 0.01
-        return real_list(*args, **kwargs)
-
-    monkeypatch.setattr(api, "list_namespaced_custom_object", list_with_latency)
-    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: elapsed)
+    # A claim with no known footprint needs its pool's template read once the
+    # LISTs have answered: the next Kubernetes request after them.
+    api.seed(
+        "sandboxclaims",
+        "pending-claim",
+        {"warmPoolRef": {"name": "curie-agent-acme-a-runner-pool"}},
+    )
+    # Every LIST answers exactly as the whole budget runs out. The simulated
+    # clock hands all three the same issue instant, so each is issued with the
+    # whole budget; the call then raises either at its own deadline check or at
+    # the template read's, with the same TimeoutError either way.
+    issued = _slow_inventory_lists(
+        api, monkeypatch, _SimulatedClock(), dict.fromkeys(_INVENTORY_LISTS, 0.01)
+    )
     with pytest.raises(TimeoutError, match="capacity inventory deadline expired"):
         _client(api).capacity_inventory(
             priority_class="acme-sandbox",
             known_claim_resources={},
             request_timeout_seconds=budget,
         )
-    assert calls == ([0.01] if budget > 0 else [])
-    assert [plural for plural, _selector in api.lists] == (["sandboxclaims"] if budget > 0 else [])
+    if budget > 0:
+        # Each LIST issued once, concurrently, with the budget left at issue.
+        assert sorted(issued) == [(resource, budget) for resource in sorted(_INVENTORY_LISTS)]
+        assert sorted(plural for plural, _selector in api.lists) == [
+            "sandboxclaims",
+            "sandboxes",
+        ]
+    else:
+        assert issued == []
+        assert api.lists == []
+        assert api.pod_list_calls == []
+    assert [call for call in api.calls if call[0] == "get"] == []
     assert api.created == api.patches == []
     assert api.secrets == {}
 
 
-def test_short_inventory_budget_preserves_sdk_timeout_without_retry() -> None:
+def test_short_inventory_budget_preserves_sdk_timeout_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     api = InventoryAPI()
     # #5296 observed MaxRetryError caused by ReadTimeoutError on Pod LIST.
     cause = ReadTimeoutError(None, "/api/v1/namespaces/test-ns/pods", "read timed out")
     api.pod_list_error = MaxRetryError(None, cause.url, cause)
+    # A simulated clock keeps the short budget from expiring on a slow host
+    # before the concurrent LISTs are issued.
+    issued = _slow_inventory_lists(
+        api, monkeypatch, _SimulatedClock(), dict.fromkeys(_INVENTORY_LISTS, 0.0)
+    )
     with pytest.raises(MaxRetryError) as error:
         _client(api).capacity_inventory(
             priority_class="acme-sandbox",
@@ -568,5 +604,388 @@ def test_short_inventory_budget_preserves_sdk_timeout_without_retry() -> None:
             request_timeout_seconds=0.086,
         )
     assert error.value.reason is cause
-    assert [plural for plural, _selector in api.lists] == ["sandboxclaims", "sandboxes"]
+    # Each LIST issued once (no retry), none with more than the budget.
+    assert sorted(resource for resource, _timeout in issued) == sorted(_INVENTORY_LISTS)
+    assert all(0 < timeout <= 0.086 for _resource, timeout in issued)
+    assert sorted(plural for plural, _selector in api.lists) == ["sandboxclaims", "sandboxes"]
+    assert len(api.pod_list_calls) == 1
     assert api.created == api.patches == []
+
+
+# -- #5630: the three inventory LISTs share one budget concurrently -----------
+
+_INVENTORY_LISTS = ("sandboxclaims", "sandboxes", "pods")
+
+
+class _SimulatedClock:
+    """Monotonic time that only the fake Kubernetes API advances.
+
+    A fake LIST reads its issue instant, then reports the instant its own
+    response arrives. The thread that builds the clock is the caller's: a LIST
+    answered on it moves the clock at once, which is what a caller issuing the
+    LISTs one after another sees, so their latencies sum. A LIST answered on any
+    other thread belongs to a concurrent inventory group: its arrival is held
+    until every LIST of the group has reported, then the clock moves to the
+    latest of them and the next group starts. Until then every thread reads the
+    instant the group was issued at, so each LIST of a group sees the same issue
+    instant however the pool schedules it. Nothing blocks and nothing waits in
+    real time, so the result does not depend on thread scheduling.
+    """
+
+    def __init__(self, group: int = len(_INVENTORY_LISTS)) -> None:
+        self._now = 0.0
+        self._owner = threading.current_thread()
+        self._group = group
+        self._held: list[float] = []
+        self._lock = threading.Lock()
+
+    def monotonic(self) -> float:
+        with self._lock:
+            return self._now
+
+    def latest(self) -> float:
+        """The latest arrival any LIST has reported, applied or still held."""
+
+        with self._lock:
+            return max([self._now, *self._held])
+
+    def advance_to(self, instant: float) -> None:
+        with self._lock:
+            if threading.current_thread() is self._owner:
+                self._now = max(self._now, instant)
+                return
+            self._held.append(instant)
+            if len(self._held) == self._group:
+                self._now = max([self._now, *self._held])
+                self._held.clear()
+
+
+def _slow_inventory_lists(
+    api: InventoryAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _SimulatedClock,
+    latency: Mapping[str, float],
+    *,
+    barrier: threading.Barrier | None = None,
+) -> list[tuple[str, float]]:
+    """Give each inventory LIST a fixed server latency on ``clock``.
+
+    Only LISTs that carry ``_request_timeout`` are inventory reads; the reaper's
+    own claim and template LISTs pass straight through. A LIST whose latency
+    exceeds the timeout it was handed raises urllib3's ``ReadTimeoutError`` once
+    that timeout elapses, as a real server's client would; otherwise it answers
+    after its latency. Every LIST reports its arrival to ``clock`` as its last
+    step, after the fake API has recorded it, whether it answers or raises.
+    ``barrier`` holds each LIST until all three are in flight, which a
+    sequential caller never achieves. Returns the ``(resource, timeout)`` of
+    every inventory LIST issued.
+    """
+
+    issued: list[tuple[str, float]] = []
+    issued_lock = threading.Lock()
+
+    def timed(resource_of: Callable[[tuple[Any, ...]], str], inner: Callable[..., Any]) -> Any:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            timeout = kwargs.get("_request_timeout")
+            if timeout is None:
+                return inner(*args, **kwargs)
+            resource = resource_of(args)
+            issued_at = clock.monotonic()
+            with issued_lock:
+                issued.append((resource, float(timeout)))
+            if barrier is not None:
+                barrier.wait()
+            cost = latency[resource]
+            if cost > timeout:
+                clock.advance_to(issued_at + timeout)
+                raise ReadTimeoutError(None, resource, f"read timeout={timeout}")
+            try:
+                return inner(*args, **kwargs)
+            finally:
+                clock.advance_to(issued_at + cost)
+
+        return call
+
+    monkeypatch.setattr(
+        api,
+        "list_namespaced_custom_object",
+        timed(lambda args: str(args[3]), api.list_namespaced_custom_object),
+    )
+    monkeypatch.setattr(
+        api, "list_namespaced_pod", timed(lambda _args: "pods", api.list_namespaced_pod)
+    )
+    # Patch only the module's view of ``time``, so the executor and asyncio keep
+    # the real clock.
+    monkeypatch.setattr(
+        k8s_module, "time", SimpleNamespace(monotonic=clock.monotonic, time=real_time.time)
+    )
+    return issued
+
+
+def _seed_owned_inventory(api: InventoryAPI) -> None:
+    """One claim owning a sandbox owning a Pod, plus one unowned warm Pod."""
+
+    claim = api.seed(
+        "sandboxclaims",
+        "pending-claim",
+        {"warmPoolRef": {"name": "curie-agent-acme-a-runner-pool"}},
+    )
+    sandbox = api.seed("sandboxes", "owned-sandbox", {"operatingMode": "Running"})
+    sandbox["metadata"]["ownerReferences"] = [
+        {"kind": "SandboxClaim", "name": "pending-claim", "uid": claim["metadata"]["uid"]}
+    ]
+    api.pods = [_pod("owned", owner_uid=sandbox["metadata"]["uid"]), _pod("warm")]
+
+
+@pytest.mark.parametrize(
+    "slow_list",
+    [None, "sandboxclaims", "sandboxes", "pods"],
+    ids=["healthy", "slow-claims", "slow-sandboxes", "slow-pods"],
+)
+def test_inventory_lists_overlap_within_one_second_budget(
+    monkeypatch: pytest.MonkeyPatch, slow_list: str | None
+) -> None:
+    # Three healthy 0.45 s LISTs sum to 1.35 s, so issued one after another they
+    # exhaust the 1.0 s total (#5630); in flight together they fit inside it.
+    api = InventoryAPI()
+    _seed_owned_inventory(api)
+    latency = dict.fromkeys(_INVENTORY_LISTS, 0.45)
+    if slow_list is not None:
+        # The control: one LIST slower than the whole bound still fails closed.
+        latency[slow_list] = 1.1
+    clock = _SimulatedClock()
+    issued = _slow_inventory_lists(
+        api, monkeypatch, clock, latency, barrier=threading.Barrier(3, timeout=5)
+    )
+    client = _client(api)
+
+    def inventory() -> CapacityInventory:
+        return client.capacity_inventory(
+            priority_class="acme-sandbox", known_claim_resources={}, request_timeout_seconds=1.0
+        )
+
+    if slow_list is None:
+        result = inventory()
+        assert result.claims == frozenset({"pending-claim"})
+        assert result.sandboxes == {"owned-sandbox": "pending-claim"}
+        assert set(result.pods) == {"uid-owned", "uid-warm"}
+        assert result.pods["uid-owned"].claim_name == "pending-claim"
+        assert result.pods["uid-warm"].claim_name is None
+        assert set(result.claim_resources) == {"pending-claim"}
+        assert clock.monotonic() == pytest.approx(0.45)
+    else:
+        # The slow LIST's read timeout and the call's deadline fall on the same
+        # instant, so the caller may see either; both fail closed, and admission
+        # treats both as unavailable inventory.
+        with pytest.raises((ReadTimeoutError, TimeoutError)):
+            inventory()
+        # Bounded by the 1.0 s total, not by the slow LIST.
+        assert clock.latest() == pytest.approx(1.0)
+    # Each LIST issued exactly once (no retry), with a positive timeout no
+    # larger than the one-second bound.
+    assert sorted(resource for resource, _timeout in issued) == sorted(_INVENTORY_LISTS)
+    assert all(0 < timeout <= 1.0 for _resource, timeout in issued)
+    assert api.created == api.patches == []
+
+
+def test_reap_with_slow_healthy_lists_reconciles_admission(
+    monkeypatch: pytest.MonkeyPatch, affinity: AffinityStore, key_prefix: str
+) -> None:
+    api = InventoryAPI()
+    client = _footprint_client(api)
+    pool = "curie-agent-acme-a-runner-pool"
+    footprint = _selected(client)
+    hard = {key: str(parse_quantity(value) * 4) for key, value in footprint.items()}
+    api.quota = SimpleNamespace(
+        metadata=SimpleNamespace(name="acme-sandbox-quota", namespace="test-ns"),
+        spec=SimpleNamespace(hard=hard),
+        status=SimpleNamespace(hard=hard, used=dict.fromkeys(hard, "0")),
+    )
+    # A live claim with no ledger row: its footprint needs the template read
+    # that follows the LISTs on the sequential remainder of the budget.
+    api.seed("sandboxclaims", "pending-claim", {"warmPoolRef": {"name": pool}})
+    admission = {
+        "quota_name": "acme-sandbox-quota",
+        "priority_class": "acme-sandbox",
+        "ceiling": 4,
+        "hard": hard,
+    }
+    config = replace(
+        _substrate_config(
+            {"CURIE_NAMESPACE": "test-ns", "CURIE_SANDBOX_ADMISSION": json.dumps(admission)}
+        ),
+        namespace="test-ns",
+        key_prefix=key_prefix,
+    )
+    substrate = SandboxSubstrate(client, affinity, config)
+
+    # The client seam records the bound each caller hands the inventory.
+    phase = ["maintenance"]
+    bounds: list[tuple[str, float]] = []
+    real_inventory = client.capacity_inventory
+
+    def recording_inventory(**kwargs: Any) -> CapacityInventory:
+        bounds.append((phase[0], kwargs["request_timeout_seconds"]))
+        return real_inventory(**kwargs)
+
+    monkeypatch.setattr(client, "capacity_inventory", recording_inventory)
+    # No barrier: the simulated clock alone decides overlap. On the caller's
+    # thread, one LIST after another, the Pod LIST is left 0.1 s and times out.
+    issued = _slow_inventory_lists(
+        api, monkeypatch, _SimulatedClock(), dict.fromkeys(_INVENTORY_LISTS, 0.45)
+    )
+    probe = install(monkeypatch, substrate_module)
+
+    assert substrate.reap_orphans() == []
+
+    cleanup = [span for span in probe.spans if span.name == "curie.sandbox.cleanup"]
+    assert len(cleanup) == 1
+    assert cleanup[0].events == [("sandbox.cleanup.completed", {"outcome": "observed"})]
+    assert [point.attributes["outcome"] for point in probe.points("curie.sandbox.cleanup")] == [
+        "observed"
+    ]
+
+    phase[0] = "turn-admission"
+    assert (
+        substrate._evaluate_admission(
+            "admission-probe",
+            operation="inspect",
+            pool=pool,
+            runner_resources=None,
+            agent_name="acme-a",
+            executor_secret_names=None,
+        )
+        is None
+    )
+
+    assert [caller for caller, _bound in bounds] == ["maintenance", "turn-admission"]
+    assert all(0 < bound <= 1.0 for _caller, bound in bounds)
+    assert sorted(resource for resource, _timeout in issued) == sorted(_INVENTORY_LISTS * 2)
+    assert all(0 < timeout <= 1.0 for _resource, timeout in issued)
+
+
+# -- #5630: a deciding failure or the deadline ends the call, over real sockets --
+#
+# The simulated clock cannot show how long the call really waits, so these drive
+# the real Kubernetes SDK against a local HTTP server. The SDK turns a float
+# ``_request_timeout`` into ``urllib3.Timeout(total=...)`` (kubernetes 37.0.1,
+# ``kubernetes/client/rest.py``), and urllib3 2.8.0 documents that its read and
+# total timeouts "only measure the time between read operations on the socket
+# ... not the total amount of time for the request to return a complete
+# response" (``urllib3/util/timeout.py``). A server that keeps sending bytes in
+# gaps shorter than that timeout therefore holds a LIST open for as long as it
+# likes: only the inventory's own deadline bounds the call.
+
+_STREAM_GAP_S = 0.4
+_STREAM_GAPS = 4  # 1.6 s in all, past the 1.0 s bound, if never released
+
+
+@contextmanager
+def _streaming_inventory_server(
+    fail_fast: frozenset[str],
+) -> Iterator[tuple[k8s_module.KubernetesSandboxClient, threading.Event]]:
+    """A real client against a local API whose healthy LISTs stream slowly.
+
+    A LIST of a resource in ``fail_fast`` answers HTTP 503 at once. Every other
+    inventory LIST sends its headers and the start of an empty list, then one
+    padding byte every ``_STREAM_GAP_S`` until ``release`` is set or
+    ``_STREAM_GAPS`` gaps have passed, then finishes the body.
+    """
+
+    release = threading.Event()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            resource = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
+            if resource in fail_fast:
+                status = {
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "metadata": {},
+                    "status": "Failure",
+                    "message": "service unavailable",
+                    "reason": "ServiceUnavailable",
+                    "code": 503,
+                }
+                body = json.dumps(status).encode()
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(b'{"kind": "List", "apiVersion": "v1", "metadata": {}, "items": [')
+                self.wfile.flush()
+                for _gap in range(_STREAM_GAPS):
+                    # An Event wait, so ``release`` ends the stream at once.
+                    if release.wait(timeout=_STREAM_GAP_S):
+                        break
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                self.wfile.write(b"]}")
+            except OSError:
+                return  # the client gave up on this LIST
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    configuration = kube.Configuration()
+    configuration.host = f"http://127.0.0.1:{server.server_address[1]}"
+    # As KubernetesSandboxClient.__init__ sets it: no urllib3 retries.
+    configuration.retries = 0
+    api_client = kube.ApiClient(configuration=configuration)
+    client = k8s_module.KubernetesSandboxClient.__new__(k8s_module.KubernetesSandboxClient)
+    client._configuration = configuration  # type: ignore[attr-defined]
+    client._api = kube.CustomObjectsApi(api_client)  # type: ignore[attr-defined]
+    client._core_api = kube.CoreV1Api(api_client)  # type: ignore[attr-defined]
+    client._namespace = "test-ns"  # type: ignore[attr-defined]
+    try:
+        yield client, release
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        serving.join(timeout=5)
+        api_client.close()
+
+
+def test_inventory_fast_failure_does_not_wait_for_slow_siblings_over_real_sockets() -> None:
+    # The claims LIST fails at once while the sandboxes and Pod LISTs keep
+    # streaming. The sequential code raised the claims failure in milliseconds;
+    # a call that joins every LIST first waits about 1.6 s for the slow ones.
+    with _streaming_inventory_server(frozenset({"sandboxclaims"})) as (client, release):
+        started = real_time.monotonic()
+        with pytest.raises(kube.ApiException) as error:
+            client.capacity_inventory(
+                priority_class="acme-sandbox",
+                known_claim_resources={},
+                request_timeout_seconds=1.0,
+            )
+        elapsed = real_time.monotonic() - started
+        release.set()
+    assert error.value.status == 503
+    assert elapsed < 0.5
+
+
+def test_inventory_slow_healthy_lists_end_at_the_deadline_over_real_sockets() -> None:
+    # All three LISTs keep streaming past the bound, each read gap well inside
+    # the SDK's read timeout, so the inventory's own deadline ends the call.
+    with _streaming_inventory_server(frozenset()) as (client, release):
+        started = real_time.monotonic()
+        with pytest.raises(TimeoutError, match="capacity inventory deadline expired"):
+            client.capacity_inventory(
+                priority_class="acme-sandbox",
+                known_claim_resources={},
+                request_timeout_seconds=1.0,
+            )
+        elapsed = real_time.monotonic() - started
+        release.set()
+    assert 0.9 <= elapsed < 1.5

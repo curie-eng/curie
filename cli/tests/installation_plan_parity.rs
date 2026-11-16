@@ -4815,6 +4815,61 @@ fn migrate_store_import_exits_nonzero_when_the_target_listing_fails() {
 }
 
 #[test]
+fn migrate_store_import_refuses_an_empty_persisted_source() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    // The planned target is persisted and the live store matches it, and the
+    // staging pod holds objects, so only the empty source proof can fail.
+    fixture.seed_migration_evidence("rustfs", "");
+    let live = live_rustfs_statefulset();
+
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "import",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_STAGED_LIST", STAGED_OBJECT),
+            ("CURIE_TEST_TARGET_LIST", STAGED_OBJECT),
+        ],
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("/migration/source.list"),
+        "the import must read the persisted source inventory:\n{calls}"
+    );
+    assert!(
+        !output.status.success(),
+        "an empty persisted source inventory must refuse the import; stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        reported.contains("the final source inventory in the staging pod is empty"),
+        "the refusal must name the empty source inventory:\n{reported}"
+    );
+    assert!(
+        !calls.contains("KUBECTL_CALL: delete pod"),
+        "an empty source inventory must retain the staged copy:\n{calls}"
+    );
+}
+
+#[test]
 fn apply_import_failure_names_the_standalone_recovery_command() {
     let fixture = HelmFixture::new(
         installation_for_the_stateful_guard(),

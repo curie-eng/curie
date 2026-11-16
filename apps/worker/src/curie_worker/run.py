@@ -13,7 +13,6 @@ import logging
 import math
 import os
 import signal
-import socket
 import threading
 import time
 import uuid
@@ -53,6 +52,7 @@ from .attachments import (
     _file_transport,
 )
 from .binding import BindingResolver
+from .boot_grace import BOOT_GRACE_S, is_dependency_not_ready
 from .bundle_store import BundleStore
 from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
@@ -1305,50 +1305,6 @@ def _restart_delay_s(consecutive_failures: int, *, base_s: float, max_s: float) 
     return min(base_s * float(2**exponent), max_s)
 
 
-# How long after boot a dependency that is not reachable yet is expected rather
-# than a fault (#3079). On a fresh install postgres, Valkey and the object store
-# come up alongside the worker; for this window a supervised task that fails on
-# them logs a one-line warning and retries instead of a full traceback.
-_BOOT_GRACE_S = 120.0
-
-# Object-store error codes a fresh install returns until its bucket is created.
-_NOT_READY_S3_CODES = frozenset({"NoSuchBucket"})
-
-
-def _is_dependency_not_ready(exc: BaseException) -> bool:
-    """True when ``exc`` (or anything in its cause chain) means a dependency is
-    not reachable or not provisioned yet, rather than a bug in the task."""
-
-    import redis.exceptions
-    import sqlalchemy.exc
-
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        # Network failures only: a PermissionError or FileNotFoundError is a
-        # local fault, not a dependency warming up.
-        if isinstance(
-            current,
-            socket.gaierror
-            | ConnectionError
-            | TimeoutError
-            | redis.exceptions.ConnectionError
-            | redis.exceptions.TimeoutError
-            | sqlalchemy.exc.OperationalError
-            | sqlalchemy.exc.InterfaceError,
-        ):
-            return True
-        # botocore's ClientError, matched by shape so boto3 stays a lazy import.
-        response = getattr(current, "response", None)
-        if isinstance(response, dict):
-            code = response.get("Error", {}).get("Code")
-            if code in _NOT_READY_S3_CODES:
-                return True
-        current = current.__cause__ or current.__context__
-    return False
-
-
 def _record_supervised(name: str, outcome: str) -> None:
     try:
         record_metric(
@@ -1398,7 +1354,7 @@ async def _supervise(
     disables the give-up.
 
     For the first ``boot_grace_s`` after the supervisor starts, a crash caused by
-    a dependency that is not ready yet (see ``_is_dependency_not_ready``) logs a
+    a dependency that is not ready yet (see ``is_dependency_not_ready``) logs a
     one-line warning with the retry delay instead of a traceback (#3079). Any
     other crash, and any crash after that window, logs the full traceback.
 
@@ -1437,7 +1393,7 @@ async def _supervise(
                 base_s=restart_backoff_s,
                 max_s=max_restart_backoff_s,
             )
-            if clock() - booted < boot_grace_s and _is_dependency_not_ready(exc):
+            if clock() - booted < boot_grace_s and is_dependency_not_ready(exc):
                 logger.warning(
                     "worker task %s is waiting for a dependency that is not ready "
                     "yet; retrying in %.1fs (expected during startup) cause=%s: %s",
@@ -1479,7 +1435,7 @@ def _supervise_policy(config: WorkerConfig) -> _SupervisePolicy:
         "max_restart_backoff_s": config.supervise_restart_backoff_max_s,
         "max_consecutive_failures": config.supervise_max_consecutive_failures,
         "failure_reset_s": config.supervise_failure_reset_s,
-        "boot_grace_s": _BOOT_GRACE_S,
+        "boot_grace_s": BOOT_GRACE_S,
     }
 
 
@@ -2019,7 +1975,7 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             _CARD_MIGRATION_BUDGET_S,
         )
     except Exception as exc:
-        if _is_dependency_not_ready(exc):
+        if is_dependency_not_ready(exc):
             logger.warning(
                 "legacy approval card migration skipped: a dependency is not ready "
                 "yet (expected during startup) cause=%s: %s",
@@ -2037,7 +1993,7 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         except TimeoutError:
             logger.warning("work-item orphan boot sweep exceeded its budget; the loop resumes it")
         except Exception as exc:
-            if _is_dependency_not_ready(exc):
+            if is_dependency_not_ready(exc):
                 logger.warning(
                     "work-item orphan boot sweep deferred to its loop: a dependency "
                     "is not ready yet (expected during startup) cause=%s: %s",

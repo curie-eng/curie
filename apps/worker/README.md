@@ -311,6 +311,14 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   runner sent, and the SQL lifecycle owns the retry as a fresh request.
   Interactive, cron, CI fix and approval resume turns keep the classification
   list.
+  A `runner-error` whose turn start failed in the connect phase (no connection
+  was made, as when a recreated sandbox pod is not yet listening) opens one
+  retry window per delivery, as long as the sandbox claim timeout (90 s by
+  default) and never reset (#4733). Attempts inside the window do not consume
+  `max_attempts`, sleep at most 5 s each, run between attempts outside the
+  thread lock, and are still counted in the escalation text; after the window an
+  unreachable runner is an ordinary `runner-error`. Cron deliveries and
+  deliveries with a persisted side-effect flag get no window.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
   told apart from `runner-error`, which is a plain transport failure without
   confirmed sandbox termination. When Kubernetes confirms that the sandbox pod

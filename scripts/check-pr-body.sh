@@ -8,7 +8,7 @@
 #    --message-file so both surfaces share ONE matcher. AGENTS.md forbids
 #    attribution in commit messages and pull request bodies alike, but only the
 #    commit half was enforced, so agent-authored bodies kept arriving with the
-#    robot-emoji footer and were merged (#2225). The body is the half a human
+#    robot-emoji footer and were merged. The body is the half a human
 #    reviewer sees first and the half no rebase can rewrite.
 # 3. Reject a patch-release PR (title `Prepare the vX.Y.Z release` with Z not
 #    0) whose Trigger lacks issue numbers, or whose visible Live proof lacks
@@ -232,8 +232,8 @@ self_test() {
     patch10_title="$temp_dir/patch-10-title.txt"
     printf 'Describe a fix.\n\nCloses #1713\n' >"$real_newline_body"
     printf 'Describe a fix.\\n\\nCloses #1713\n' >"$literal_escape_body"
-    # The exact footer that reached #2225, and the same footer with no trailing
-    # newline, which is the shape a body pasted from a tool actually has.
+    # The exact footer shape agents append by default, and the same footer with
+    # no trailing newline, which is the shape a body pasted from a tool has.
     printf 'Describe a fix.\n\n\xf0\x9f\xa4\x96 Generated with [Claude Code](https://claude.com/claude-code)\n' \
         >"$attributed_body"
     printf 'Describe a fix.\n\n\xf0\x9f\xa4\x96 Generated with [Claude Code](https://claude.com/claude-code)' \

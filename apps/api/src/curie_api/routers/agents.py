@@ -1192,6 +1192,9 @@ async def read_version_connectors(
             e2e_install = settings.e2e_install()
             try:
                 declared = prepare_connectors(declared, e2e_install)
+                # #5550: the proxy gets a credential-free address and reads the
+                # password from the chart Secret; a missing Secret name is a 422.
+                grant_store = settings.connector_grant_store() if proxy is not None else None
                 manifests = bundles.render_connector_manifests(
                     declared,
                     release=release,
@@ -1200,7 +1203,7 @@ async def read_version_connectors(
                     app_name=app_name,
                     secret_name=secret_name,
                     proxy=proxy,
-                    grant_store_url=settings.valkey_dsn() if proxy is not None else "",
+                    grant_store=grant_store,
                     gated_tools=gated,
                     e2e=e2e_install,
                 )

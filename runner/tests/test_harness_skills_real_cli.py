@@ -19,12 +19,10 @@ what the CLI does with the options: no credential and no network.
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
 import anyio
-import claude_agent_sdk
 import pytest
 from aci_protocol import Event, Final, SessionStatus, parse_ndjson
 from aiohttp import web
@@ -40,9 +38,9 @@ from curie_runner.plugin import bundle_skill_names
 from curie_runner.session import SessionRunner
 from curie_runner.side_effects import CLAUDE_READONLY_TOOLS
 from curie_runner.tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
+from sdk_cli_support import sdk_cli_available
 
-_BUNDLED_CLI = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
-_CLI_AVAILABLE = _BUNDLED_CLI.is_file() or shutil.which("claude") is not None
+_CLI_AVAILABLE = sdk_cli_available()
 pytestmark = pytest.mark.skipif(
     not _CLI_AVAILABLE, reason="requires the Claude Code CLI the SDK spawns"
 )
