@@ -49,6 +49,7 @@ from curie_worker.sandbox.docker import DockerError, DockerSandboxClient
 from curie_worker.sandbox.types import (
     ClaimTimeoutError,
     DeliveredLimits,
+    RecordedPod,
     SandboxError,
     SandboxTermination,
 )
@@ -1122,10 +1123,16 @@ class FakeSandboxClient:
         return self.unschedulable_message
 
     def pod_termination(
-        self, name: str, *, request_timeout_seconds: float, since: datetime
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        since: datetime,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
         assert request_timeout_seconds > 0
         assert since.tzinfo is not None
+        del recorded
         self.termination_reads.append(name)
         return self.termination
 

@@ -735,6 +735,20 @@ class SandboxTermination:
 
 
 @dataclass(frozen=True)
+class RecordedPod:
+    """The runner pod's identity and wire spec as the worker read them at start.
+
+    Substrate-neutral data (ADR 0269, #5427): ``uid`` is the pod's own UID and
+    ``spec`` its spec as plain wire data. A later diagnosis binds an eviction
+    event to this UID and checks the limit it states against this spec, so an
+    event for another pod or another limit identifies nothing.
+    """
+
+    uid: str
+    spec: Mapping[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True)
 class DeliveredLimits:
     """The enforced limits one runtime actually got (ADR 0269, #5427).
 
@@ -749,6 +763,9 @@ class DeliveredLimits:
     ephemeral_storage_bytes: int | None
     scratch_bytes: Mapping[str, int]
     max_turns: int | None
+    # The pod these limits were read from, kept by the substrate for a later
+    # termination diagnosis. Never part of the start body.
+    recorded: RecordedPod | None = field(default=None, compare=False, repr=False)
 
     def to_wire(self) -> dict[str, Any]:
         """The start body's ``delivered_limits`` object."""
@@ -903,9 +920,19 @@ class SandboxClient(Protocol):
         ...
 
     def pod_termination(
-        self, name: str, *, since: datetime, request_timeout_seconds: float
+        self,
+        name: str,
+        *,
+        since: datetime,
+        request_timeout_seconds: float,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
-        """Confirmed pod termination, or None when the evidence is absent."""
+        """Confirmed pod termination, or None when the evidence is absent.
+
+        ``recorded`` is the pod identity the worker recorded at start. None
+        means no identity was recorded, and an eviction event then identifies
+        nothing.
+        """
 
         ...
 

@@ -95,6 +95,7 @@ from .types import (
     OperatingMode,
     QuotaRejection,
     QuotaStatus,
+    RecordedPod,
     ResourceExhaustion,
     SandboxError,
     SandboxTermination,
@@ -671,6 +672,55 @@ def _pod_exhaustion(pod: Any, reason: str) -> ResourceExhaustion | None:
     return None
 
 
+def _event_time(event: Any) -> object:
+    return (
+        getattr(getattr(event, "series", None), "last_observed_time", None)
+        or getattr(event, "last_timestamp", None)
+        or getattr(event, "event_time", None)
+        or getattr(getattr(event, "metadata", None), "creation_timestamp", None)
+    )
+
+
+def _bound_storage_eviction(
+    events: Any,
+    *,
+    pod_name: str,
+    recorded: RecordedPod | None,
+    since: datetime,
+    pod: Any = None,
+) -> SandboxTermination | None:
+    """A storage eviction named by the kubelet's own event for the recorded pod.
+
+    The sandbox controller replaces an evicted pod within seconds, so its own
+    status is often gone by the time a dropped stream is diagnosed. The event
+    is accepted only because it is bound to the UID and the limit this worker
+    recorded at start: the reason is exactly Evicted, the involved object is
+    the recorded pod, and the message is the kubelet's sentence in full,
+    stating the limit the recorded spec declares. Anything else names nothing.
+    """
+
+    if recorded is None or not isinstance(recorded.uid, str) or not recorded.uid:
+        return None
+    spec = dict(recorded.spec)
+    for event in getattr(events, "items", None) or []:
+        involved = getattr(event, "involved_object", None)
+        if (
+            getattr(event, "reason", None) != "Evicted"
+            or getattr(involved, "kind", None) != "Pod"
+            or getattr(involved, "name", None) != pod_name
+            or getattr(involved, "uid", None) != recorded.uid
+            or not _recent(_event_time(event), since=since)
+        ):
+            continue
+        message = getattr(event, "message", None)
+        exhaustion = _storage_exhaustion(spec, message)
+        if exhaustion is not None:
+            return SandboxTermination(
+                "Evicted", _safe_pod_message(message, pod), exhaustion=exhaustion
+            )
+    return None
+
+
 def _event_termination(
     events: Any,
     *,
@@ -691,13 +741,7 @@ def _event_termination(
             or (pod_uid is not None and getattr(involved, "uid", None) != pod_uid)
         ):
             continue
-        event_time = (
-            getattr(getattr(event, "series", None), "last_observed_time", None)
-            or getattr(event, "last_timestamp", None)
-            or getattr(event, "event_time", None)
-            or getattr(getattr(event, "metadata", None), "creation_timestamp", None)
-        )
-        if not _recent(event_time, since=since):
+        if not _recent(_event_time(event), since=since):
             continue
         reason = getattr(event, "reason", None)
         if reason in {"Evicted", "OOMKilled", "OOMKilling"}:
@@ -1297,7 +1341,13 @@ class KubernetesSandboxClient:
         except Exception:  # noqa: BLE001 - an unread pod is an unobserved limit
             return None
         spec = _pod_spec(pod)
-        return None if spec is None else spec_limits(spec)
+        if spec is None:
+            return None
+        limits = spec_limits(spec)
+        uid = getattr(getattr(pod, "metadata", None), "uid", None)
+        if isinstance(uid, str) and uid:
+            limits = replace(limits, recorded=RecordedPod(uid=uid, spec=spec))
+        return limits
 
     def capacity_inventory(
         self,
@@ -1969,7 +2019,12 @@ class KubernetesSandboxClient:
         return None
 
     def pod_termination(
-        self, name: str, *, since: datetime, request_timeout_seconds: float
+        self,
+        name: str,
+        *,
+        since: datetime,
+        request_timeout_seconds: float,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
         """Read exact pod state and a bounded set of its events within one budget."""
 
@@ -1988,21 +2043,26 @@ class KubernetesSandboxClient:
             pod_missing = exc.status == 404
         except Exception:  # noqa: BLE001 - diagnosis is best effort
             pass
-        # since is taken after the original pod was serving, and creation
-        # timestamps truncate to the second, so a pod created at or after it is
-        # a controller replacement. Its status and events describe another pod.
-        if pod is not None and _recent(
-            getattr(getattr(pod, "metadata", None), "creation_timestamp", None), since=since
-        ):
-            return SandboxTermination("Deleted", "replaced by a new pod with the same name")
-        status_termination = _pod_termination(pod, since=since) if pod is not None else None
-        if status_termination is not None:
-            status_termination = replace(
-                status_termination,
-                exhaustion=_pod_exhaustion(pod, status_termination.reason),
-            )
-        pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
-        event_termination: SandboxTermination | None = None
+        # The recorded pod's own Evicted events, read first: once the pod is
+        # gone or replaced they are the only evidence that names a limit.
+        evictions: Any = None
+        if recorded is not None and recorded.uid and time.monotonic() < deadline:
+            # A name's events list oldest first and a replacement shares the
+            # name, so the kubelet's Evicted event can sit past any first page
+            # of the generic list below. This list holds only that event.
+            try:
+                evictions = self._core_api.list_namespaced_event(
+                    self._namespace,
+                    field_selector=(
+                        f"involvedObject.kind=Pod,involvedObject.name={name},"
+                        f"involvedObject.uid={recorded.uid},reason=Evicted"
+                    ),
+                    limit=10,
+                    _request_timeout=max(0.001, deadline - time.monotonic()),
+                )
+            except Exception:  # noqa: BLE001 - an unread event is no evidence
+                evictions = None
+        events: Any = None
         if time.monotonic() < deadline:
             try:
                 events = self._core_api.list_namespaced_event(
@@ -2011,11 +2071,63 @@ class KubernetesSandboxClient:
                     limit=20,
                     _request_timeout=max(0.001, deadline - time.monotonic()),
                 )
-                event_termination = _event_termination(
-                    events, pod_name=name, pod_uid=pod_uid, since=since, pod=pod
-                )
             except Exception:  # noqa: BLE001 - pod state still provides evidence
-                pass
+                events = None
+        # since is taken after the original pod was serving, and creation
+        # timestamps truncate to the second, so a pod created at or after it is
+        # a controller replacement. Its status and events describe another pod;
+        # only an eviction event bound to the recorded pod still names a limit.
+        if pod is not None and _recent(
+            getattr(getattr(pod, "metadata", None), "creation_timestamp", None), since=since
+        ):
+            bound = _bound_storage_eviction(
+                evictions, pod_name=name, recorded=recorded, since=since
+            )
+            if bound is not None:
+                return bound
+            return SandboxTermination("Deleted", "replaced by a new pod with the same name")
+        result = self._status_or_event_termination(
+            pod, events, name=name, since=since, pod_missing=pod_missing
+        )
+        # A pod status that itself identified something always wins. Otherwise
+        # an Evicted event bound to the UID and limit this worker recorded at
+        # start identifies the storage exhaustion the vanished, unreadable or
+        # not yet terminal pod no longer shows.
+        if result is None or (
+            result.reason in {"Evicted", "Deleted"} and result.exhaustion is None
+        ):
+            pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
+            bound = _bound_storage_eviction(
+                evictions,
+                pod_name=name,
+                recorded=recorded,
+                since=since,
+                pod=pod if recorded is not None and pod_uid == recorded.uid else None,
+            )
+            if bound is not None:
+                if result is not None and result.exit_code is not None:
+                    return replace(bound, exit_code=result.exit_code)
+                return bound
+        return result
+
+    @staticmethod
+    def _status_or_event_termination(
+        pod: Any, events: Any, *, name: str, since: datetime, pod_missing: bool
+    ) -> SandboxTermination | None:
+        """The pod's own status, with its events supplying only a reason and text."""
+
+        status_termination = _pod_termination(pod, since=since) if pod is not None else None
+        if status_termination is not None:
+            status_termination = replace(
+                status_termination,
+                exhaustion=_pod_exhaustion(pod, status_termination.reason),
+            )
+        pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
+        event_termination = (
+            None
+            if events is None
+            else _event_termination(events, pod_name=name, pod_uid=pod_uid, since=since, pod=pod)
+        )
         if status_termination is not None and status_termination.reason not in {
             "Failed",
             "Terminated",

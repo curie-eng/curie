@@ -26,8 +26,10 @@ import asyncio
 import hashlib
 import logging
 import secrets
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -88,6 +90,7 @@ from .types import (
     PressureScanResult,
     ProvenanceMismatch,
     QuotaRejection,
+    RecordedPod,
     RepoRunnerPoolRefused,
     RouteChangedError,
     RouteRecord,
@@ -162,6 +165,8 @@ _MIN_POLL_BUDGET_S = 0.5
 _GONE_READ_TIMEOUT_S = 1.0
 _POD_TERMINATION_TIMEOUT_S = 2.0
 _POD_LIMITS_TIMEOUT_S = 2.0
+# Runner pod identities kept for termination diagnosis (#5427); one per live sandbox.
+_RECORDED_PODS_CAP = 1024
 # The gate dimensions whose current limit is a sandbox template fact.
 _SUBSTRATE_GATE_DIMENSIONS = frozenset({"memory", "ephemeral_storage", "scratch"})
 _probe_monotonic = time.monotonic
@@ -257,6 +262,10 @@ class SandboxSubstrate:
         self._boot_credential_revoker: Callable[[str, str], bool] | None = None
         self._boot_credential_minter: Callable[[Mapping[str, str]], dict[str, str]] | None = None
         self._pending_tool_probe: str | None = None
+        # The runner pod identity read at start, by sandbox name, with the
+        # claim it was read under. Bounded: the oldest record is dropped first.
+        self._recorded_pods: OrderedDict[str, tuple[str, RecordedPod]] = OrderedDict()
+        self._recorded_pods_lock = threading.Lock()
 
     def set_boot_credential_revoker(self, revoker: Callable[[str, str], bool]) -> None:
         """Report a released boot credential. The kernel wires the API call."""
@@ -620,11 +629,24 @@ class SandboxSubstrate:
 
         if handle.namespace != self._config.namespace:
             return None
+        with self._recorded_pods_lock:
+            entry = self._recorded_pods.get(handle.sandbox_name)
+        recorded = entry[1] if entry is not None and entry[0] == handle.claim_name else None
         return self._k8s.pod_termination(
             handle.sandbox_name,
             since=since,
             request_timeout_seconds=_POD_TERMINATION_TIMEOUT_S,
+            recorded=recorded,
         )
+
+    def _record_pod(self, handle: SandboxHandle, recorded: RecordedPod | None) -> None:
+        with self._recorded_pods_lock:
+            self._recorded_pods.pop(handle.sandbox_name, None)
+            if recorded is None:
+                return
+            self._recorded_pods[handle.sandbox_name] = (handle.claim_name, recorded)
+            while len(self._recorded_pods) > _RECORDED_PODS_CAP:
+                self._recorded_pods.popitem(last=False)
 
     def delivered_limits(self, handle: SandboxHandle, *, max_turns: int | None) -> DeliveredLimits:
         """The limits ``handle``'s runtime was actually given (ADR 0269, #5427).
@@ -642,6 +664,7 @@ class SandboxSubstrate:
                 )
             except Exception as exc:  # noqa: BLE001 - an unread limit is unobserved
                 logger.warning("delivered limits unreadable (%s)", type(exc).__name__)
+            self._record_pod(handle, None if observed is None else observed.recorded)
         if observed is None:
             return DeliveredLimits(
                 memory_bytes=None,
@@ -649,7 +672,8 @@ class SandboxSubstrate:
                 scratch_bytes={},
                 max_turns=max_turns,
             )
-        return replace(observed, max_turns=max_turns)
+        # The recorded pod stays behind the seam; the caller gets limits only.
+        return replace(observed, max_turns=max_turns, recorded=None)
 
     def resource_gate_readiness(
         self,
