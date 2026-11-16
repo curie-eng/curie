@@ -9,13 +9,18 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import re
-from collections.abc import Mapping, Sequence
+import socket
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.request import Request, urlopen
 
 import candidate_install as ci
+import factory_e2e as fe
+import resource_retry_support as rrs
 import tls_code_host as tch
 
 FLAG = "CURIE_FACTORY_PUBLICATION_RECOVERY_LIVE"
@@ -32,6 +37,18 @@ DEFAULT_BRANCH = "main"
 TRIGGER_LABEL = "pub-recovery-work"
 # One file the fake model writes into the checkout: the candidate's whole change.
 CHANGED_FILE = "recovery-proof.txt"
+# Write, then exactly one publish tool call. A write-file marker alone ends the
+# turn done and never reaches the publish pause where capture happens.
+STANDING_DIRECTIVE = f"[fake:write-file {CHANGED_FILE} recovered-bytes] [fake:publish-changes]"
+# Opt-in paid leg. Unset keeps the fake directive. Never executed by the unit tests.
+REAL_MODEL_FLAG = "CURIE_FACTORY_PUBLICATION_RECOVERY_REAL_MODEL"
+MODEL_KEY_FILE = "MODEL_KEY_FILE"
+# OpenRouter's usage counter lags a finished request. The paid leg waits this
+# long between the end of the run and the second reading.
+USAGE_LAG_S = 60.0
+# The request poll is 3 s. The usage snapshot uses this shorter poll so the
+# equality window does not start a whole request interval after capture.
+CAPTURE_POLL_S = 0.5
 SEED_FILES = {
     "README.md": "# acme-bot\n\nFixture repository for the publication recovery proof.\n",
     "example.py": 'def example() -> str:\n    return "example"\n',
@@ -53,6 +70,84 @@ API_PREFIX = "/api/v3"
 
 PULL_CREATE_PATH = f"{API_PREFIX}/repos/{re.escape(tch.STUB_REPO)}/pulls"
 _OWNER_KEY, _OWNER_VALUE = "owner", "factory-tools"
+
+
+class RealModel:
+    """A caller-supplied model credential. ``repr`` never includes the key."""
+
+    __slots__ = ("key", "model")
+
+    def __init__(self, key: str, model: str) -> None:
+        self.key = key
+        self.model = model
+
+    def __repr__(self) -> str:
+        return f"RealModel(model={self.model!r}, key='redacted')"
+
+
+def real_model_from_env(env: Mapping[str, str]) -> RealModel | None:
+    """The paid leg when its flag is ``1``, else None. The key stays in the object.
+
+    A missing or unreadable key file refuses before any cluster call. The
+    refusal names the variable, not the path or the key.
+    """
+
+    flag = env.get(REAL_MODEL_FLAG, "")
+    if flag == "":
+        return None
+    if flag != "1":
+        raise ci.Refused(f"{REAL_MODEL_FLAG} is set but not 1")
+    path = env.get(MODEL_KEY_FILE, "").strip()
+    if not path:
+        raise ci.Refused(f"{REAL_MODEL_FLAG}=1 needs {MODEL_KEY_FILE}")
+    try:
+        key = Path(path).read_text().strip()
+    except OSError:
+        raise ci.Refused(f"{MODEL_KEY_FILE} could not be read") from None
+    if not key or any(character.isspace() for character in key):
+        raise ci.Refused(f"{MODEL_KEY_FILE} could not be read")
+    model = (env.get("CURIE_FACTORY_MODEL") or fe.DEFAULT_MODEL).strip()
+    if not model:
+        raise ci.Refused("CURIE_FACTORY_MODEL is empty")
+    return RealModel(key, model)
+
+
+def provider_usage(key: str, *, opener: Callable[..., Any] | None = None) -> float:
+    """The provider's cumulative USD usage for ``key``. Errors omit the key."""
+
+    request = Request(fe.OPENROUTER_KEY_URL, headers={"Authorization": f"Bearer {key}"})
+    read = opener or urlopen
+    try:
+        with read(request, timeout=20) as response:
+            payload = json.load(response)
+        usage = float(payload["data"]["usage"])
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ci.Refused("provider usage could not be read") from None
+    if not math.isfinite(usage) or usage < 0:
+        raise ci.Refused("provider usage could not be read")
+    return usage
+
+
+def pause_for_usage_lag(pause: Callable[[float], None] | None = None) -> None:
+    """Wait out the provider usage lag before the second spend reading."""
+
+    (pause or rrs._pause)(USAGE_LAG_S)
+
+
+def provider_cidrs(lookup: Callable[[], Sequence[str]] | None = None) -> list[str]:
+    """OpenRouter IPv4 addresses as single-host CIDRs, for sandbox egress."""
+
+    try:
+        if lookup is None:
+            infos = socket.getaddrinfo(fe.OPENROUTER_HOST, 443, socket.AF_INET, socket.SOCK_STREAM)
+            addresses = sorted({str(info[4][0]) for info in infos})
+        else:
+            addresses = sorted({str(item) for item in lookup()})
+        if not addresses:
+            raise ValueError("no addresses")
+        return [host_cidr(address) for address in addresses]
+    except (OSError, ValueError):
+        raise ci.Refused("provider addresses could not be resolved") from None
 
 
 def proxy_host(namespace: str) -> str:
@@ -203,7 +298,13 @@ def _strings(node: Any) -> list[str]:
 
 
 def recovery_values(
-    base: Mapping[str, Any], *, namespace: str, stub_ip: str, proxy_ip: str
+    base: Mapping[str, Any],
+    *,
+    namespace: str,
+    stub_ip: str,
+    proxy_ip: str,
+    real_model: RealModel | None = None,
+    model_cidrs: Sequence[str] = (),
 ) -> dict[str, Any]:
     """The proof's install values over the candidate base values. Pure.
 
@@ -216,7 +317,9 @@ def recovery_values(
     one host. Workspaces and candidate
     retention are on (both off by default), the publication reconcile ceiling
     is ``RECONCILE_MAX_ATTEMPTS``, and the agent's fake model writes one file
-    into its checkout.
+    and then publishes. ``real_model`` turns the fake model off, installs that
+    credential and model, adds ``model_cidrs`` to sandbox egress, and sets no
+    fake directive. The stub forge and the fault proxy stay.
     """
 
     stub, stub_cidr = stub_origin(namespace), host_cidr(stub_ip)
@@ -236,9 +339,18 @@ def recovery_values(
     )
     sandbox = values["agentSandbox"]
     sandbox["runner"]["workspace"] = {"enabled": True}
-    sandbox["runnerEnv"] = {
-        AGENT: {"FAKE_MODEL_DIRECTIVE": f"[fake:write-file {CHANGED_FILE} recovered-bytes]"}
-    }
+    if real_model is None:
+        sandbox["runnerEnv"] = {AGENT: {"FAKE_MODEL_DIRECTIVE": STANDING_DIRECTIVE}}
+    else:
+        sandbox["runner"]["fakeModel"] = False
+        sandbox["runner"]["model"] = real_model.model
+        sandbox["runner"]["credentials"] = real_model.key
+        sandbox.pop("runnerEnv", None)
+        if model_cidrs:
+            allowed = values["security"]["networkPolicy"].setdefault("allowedEgress", [])
+            allowed.extend(
+                {"cidr": cidr, "ports": [{"protocol": "TCP", "port": 443}]} for cidr in model_cidrs
+            )
     worker = values.setdefault("worker", {})
     worker.setdefault("workspace", {})["publicationCandidates"] = {"enabled": True}
     worker.setdefault("publication", {})["reconcileMaxAttempts"] = RECONCILE_MAX_ATTEMPTS
@@ -314,8 +426,27 @@ def usage_shape(usage: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def objects_by_kind(rows: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    """Index candidate objects by kind. A row with no kind is not the patch."""
+
+    found: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        kind = row.get("kind")
+        if kind not in ("base", "patch"):
+            continue
+        assert kind not in found, f"more than one {kind} object"
+        found[str(kind)] = row
+    assert "patch" in found, "the candidate listing has no patch object"
+    return found
+
+
 def complete_candidate(listing: Mapping[str, Any]) -> dict[str, Any]:
-    """The one complete, available candidate of a candidate listing. Pure."""
+    """The one complete, available candidate of a candidate listing. Pure.
+
+    When the listing carries ``objects``, the patch digest must be the object
+    whose kind is ``patch``. The first object, or an object with no kind, is
+    not the patch.
+    """
 
     candidates = [c for c in listing.get("candidates") or [] if isinstance(c, dict)]
     assert len(candidates) == 1, f"{len(candidates)} candidates, expected exactly one"
@@ -324,11 +455,25 @@ def complete_candidate(listing: Mapping[str, Any]) -> dict[str, Any]:
     assert candidate.get("available") is True, "the retained candidate is not available"
     for kind in ("patch", "base"):
         part = candidate.get(kind) or {}
+        if part.get("kind") not in (None, kind):
+            raise AssertionError(f"the listing {kind} kind is {part.get('kind')!r}")
         assert re.fullmatch(r"[0-9a-f]{64}", str(part.get("sha256") or "")), f"no {kind} digest"
         assert int(part.get("size_bytes") or 0) > 0, f"the {kind} object is empty"
     assert re.fullmatch(r"[0-9a-f]{40}", str((candidate.get("base") or {}).get("base_commit"))), (
         "the candidate names no base commit"
     )
+    raw_objects = listing.get("objects")
+    if isinstance(raw_objects, list):
+        rows = [row for row in raw_objects if isinstance(row, dict)]
+        by_kind = objects_by_kind(rows)
+        assert (candidate.get("patch") or {}).get("sha256") == by_kind["patch"].get("sha256"), (
+            "the listing patch is not the patch-kind object"
+        )
+        base = by_kind.get("base")
+        if base is not None:
+            assert (candidate.get("base") or {}).get("sha256") == base.get("sha256"), (
+                "the listing base is not the base-kind object"
+            )
     return dict(candidate)
 
 
@@ -433,7 +578,14 @@ def judge_recovery(
     )
     # Fresh runtime authority: its own admitted request, started after the
     # original ended, on its own sandbox claim, with an epoch of its own.
-    assert int(successor.get("runtime_epoch") or 0) >= 1, "the successor never took an epoch"
+    # Admission inserts that request without copying or incrementing the
+    # predecessor epoch, so a one-run original and its one-run successor
+    # both finish at 1. Each must have taken an epoch; neither has to
+    # outrank the other.
+    original_epoch = int(original.get("runtime_epoch") or 0)
+    successor_epoch = int(successor.get("runtime_epoch") or 0)
+    assert original_epoch >= 1, f"the original runtime epoch {original_epoch} was never taken"
+    assert successor_epoch >= 1, f"the successor runtime epoch {successor_epoch} was never taken"
     assert successor.get("started_at") and original.get("terminal_at"), "missing start or end"
     started = datetime.fromisoformat(str(successor["started_at"]))
     assert started > datetime.fromisoformat(str(original["terminal_at"])), (
@@ -481,8 +633,16 @@ def judge_recovery(
     assert publication.get("title_sha256") == candidate_row.get("title_sha256"), (
         "the recovery publication's title is not the candidate's"
     )
-    assert publication.get("body_sha256") == candidate_row.get("body_sha256"), (
-        "the recovery publication's body is not the candidate's"
+    # Factory creation keeps the candidate body and appends the tracker's
+    # closing reference, the issue marker, and any applied-instruction line.
+    # The stored body is therefore not the candidate body alone.
+    published_body = str(publication.get("body") or "")
+    candidate_body = str(candidate_row.get("body") or "")
+    assert candidate_body and published_body.startswith(candidate_body), (
+        "the recovery publication's body does not start with the candidate's"
+    )
+    assert "Closes #" in published_body[len(candidate_body) :], (
+        "the recovery publication's body does not carry the closing reference"
     )
 
     # Exactly one branch, holding the commit the original attempt pushed.
@@ -499,12 +659,27 @@ def judge_recovery(
     pull = pulls[0]
     assert (pull.get("head") or {}).get("ref") == branch, "the pull request names another branch"
     assert (pull.get("head") or {}).get("sha") == commit, "the pull request head is not the commit"
+    assert str(pull.get("title") or "") == str(candidate_row.get("title") or ""), (
+        "the forge pull request title is not the candidate's"
+    )
+    forge_body = str(pull.get("body") or "")
+    assert forge_body == published_body, (
+        "the forge pull request body is not the published body "
+        f"({forge_body[:180]!r} vs {published_body[:180]!r})"
+    )
+    assert forge_body.startswith(candidate_body), (
+        "the forge pull request body does not start with the candidate's"
+    )
     assert publication.get("pr_number") == pull.get("number"), "the lineage names another PR"
     passed = [status for status, fault in creates if not fault]
     assert passed == [201], f"pull request creates that reached the forge: {passed}"
 
     before_shape, after_shape = usage_shape(usage_at_capture), usage_shape(usage_after)
-    assert before_shape["total_tokens"] > 0, "no model usage was recorded by capture time"
+    # The publish permission deny interrupts the fake turn before its
+    # scripted usage messages, and the interrupt result carries no usage.
+    # A capture reading of zero tokens is the honest one for that turn.
+    # What the recovery must hold is that the reading does not move
+    # afterwards and the successor recorded none.
     assert before_shape == after_shape, "model usage changed after the candidate was captured"
     successor_tokens = [t for rid, t in after_shape["requests"] if rid == str(successor.get("id"))]
     assert sum(successor_tokens) == 0, "the recovery request recorded model tokens"
@@ -513,6 +688,7 @@ def judge_recovery(
         "successor_id": successor.get("id"),
         "execution_kind": successor.get("execution_kind"),
         "successor_status": successor.get("status"),
+        "original_runtime_epoch": original.get("runtime_epoch"),
         "successor_runtime_epoch": successor.get("runtime_epoch"),
         "successor_claim": successor.get("runtime_claim_name"),
         **identity,

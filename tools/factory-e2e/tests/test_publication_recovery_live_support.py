@@ -29,6 +29,9 @@ CANDIDATE = "33333333-3333-3333-3333-333333333333"
 BASE_COMMIT = "a" * 40
 PUSHED = "b" * 40
 BRANCH = "curie/publication-0123"
+TITLE = "Publish the reviewed change"
+BODY = "Publish the file written in this turn."
+PUBLISHED_BODY = f"{BODY}\n\nCloses #1\n\n<!-- curie-factory-issue -->"
 
 
 # --------------------------------------------------------------------------
@@ -178,7 +181,9 @@ def test_recovery_values_route_every_forge_address_through_the_proxy() -> None:
     assert values["worker"]["workspace"]["publicationCandidates"] == {"enabled": True}
     assert values["worker"]["publication"]["reconcileMaxAttempts"] == prl.RECONCILE_MAX_ATTEMPTS
     directive = values["agentSandbox"]["runnerEnv"][prl.AGENT]["FAKE_MODEL_DIRECTIVE"]
-    assert directive.startswith(f"[fake:write-file {prl.CHANGED_FILE} ")
+    assert "[fake:write-file" in directive and "[fake:publish-changes]" in directive
+    assert directive.index("[fake:write-file") < directive.index("[fake:publish-changes]")
+    assert directive == prl.STANDING_DIRECTIVE
     assert values["factory"]["sandboxEgress"] == {"factory": True, prl.AGENT: True}
 
 
@@ -341,7 +346,7 @@ def _recovered(**override: Any) -> dict[str, Any]:
         "execution_kind": "publication_recovery",
         "status": "completed",
         "terminal_cause": "completed",
-        "runtime_epoch": 1,
+        "runtime_epoch": 2,
         "runtime_claim_name": "claim-b",
         "started_at": "2026-11-16T08:06:00+00:00",
         "model_session_reserved_at": None,
@@ -358,15 +363,24 @@ def _recovered(**override: Any) -> dict[str, Any]:
             "owner_request_id": SUCCESSOR,
             "title_sha256": "t" * 64,
             "body_sha256": "d" * 64,
+            "title": TITLE,
+            "body": BODY,
         },
         "candidate_after": _candidate(),
         "publications": [
             _publication(ORIGINAL, "failed", prl.RECONCILE_MAX_ATTEMPTS),
-            _publication(SUCCESSOR, "succeeded", 0, pr_number=1),
+            _publication(SUCCESSOR, "succeeded", 0, pr_number=1, title=TITLE, body=PUBLISHED_BODY),
         ],
         "heads_after_failure": {"main": BASE_COMMIT, BRANCH: PUSHED},
         "heads_after_recovery": {"main": BASE_COMMIT, BRANCH: PUSHED},
-        "pulls": [{"number": 1, "head": {"ref": BRANCH, "sha": PUSHED}}],
+        "pulls": [
+            {
+                "number": 1,
+                "head": {"ref": BRANCH, "sha": PUSHED},
+                "title": TITLE,
+                "body": PUBLISHED_BODY,
+            }
+        ],
         "creates": [*FAILED_CREATES, (201, False)],
         "usage_at_capture": _usage(),
         "usage_after": _usage(),
@@ -384,7 +398,21 @@ def test_judge_recovery_accepts_one_identical_model_free_publication() -> None:
     facts = prl.judge_recovery(**_recovered())
     assert facts["execution_kind"] == "publication_recovery"
     assert facts["pushed_commit"] == PUSHED and facts["pull_requests"] == 1
+    assert facts["original_runtime_epoch"] == 1
+    assert facts["successor_runtime_epoch"] == 2
     assert facts["tokens_at_capture"] == facts["tokens_after"] == 28
+
+
+def test_judge_recovery_accepts_a_successor_on_its_own_first_epoch() -> None:
+    facts = prl.judge_recovery(**_recovered(successor={"runtime_epoch": 1}))
+    assert facts["original_runtime_epoch"] == 1
+    assert facts["successor_runtime_epoch"] == 1
+
+
+def test_judge_recovery_accepts_a_capture_snapshot_with_no_flushed_tokens() -> None:
+    empty = {"total_tokens": 0, "models": [], "requests": []}
+    facts = prl.judge_recovery(**_recovered(usage_at_capture=empty, usage_after=empty))
+    assert facts["tokens_at_capture"] == facts["tokens_after"] == 0
 
 
 @pytest.mark.parametrize(
@@ -392,6 +420,11 @@ def test_judge_recovery_accepts_one_identical_model_free_publication() -> None:
     [
         ({"successor": {"execution_kind": "implementation"}}, "implementation"),
         ({"successor": {"status": "failed"}}, "expected completed"),
+        ({"successor": {"runtime_epoch": 0}}, "successor runtime epoch 0 was never taken"),
+        (
+            {"original": {**_original(), "runtime_epoch": 0}},
+            "original runtime epoch 0 was never taken",
+        ),
         ({"successor": {"runtime_claim_name": "claim-a"}}, "reused the original"),
         ({"successor": {"started_at": "2026-11-16T08:04:00+00:00"}}, "before the original"),
         ({"successor": {"recovery_candidate_id": "x"}}, "different candidate"),
@@ -431,11 +464,72 @@ def test_judge_recovery_accepts_one_identical_model_free_publication() -> None:
         (
             {
                 "pulls": [
-                    {"number": 1, "head": {"ref": BRANCH, "sha": PUSHED}},
-                    {"number": 2, "head": {"ref": BRANCH, "sha": PUSHED}},
+                    {
+                        "number": 1,
+                        "head": {"ref": BRANCH, "sha": PUSHED},
+                        "title": TITLE,
+                        "body": BODY,
+                    },
+                    {
+                        "number": 2,
+                        "head": {"ref": BRANCH, "sha": PUSHED},
+                        "title": TITLE,
+                        "body": BODY,
+                    },
                 ]
             },
             "2 pull requests",
+        ),
+        (
+            {
+                "pulls": [
+                    {
+                        "number": 1,
+                        "head": {"ref": BRANCH, "sha": PUSHED},
+                        "title": "other title",
+                        "body": BODY,
+                    }
+                ]
+            },
+            "forge pull request title",
+        ),
+        (
+            {
+                "pulls": [
+                    {
+                        "number": 1,
+                        "head": {"ref": BRANCH, "sha": PUSHED},
+                        "title": TITLE,
+                        "body": "other body",
+                    }
+                ]
+            },
+            "forge pull request body",
+        ),
+        (
+            {
+                "publications": [
+                    _publication(ORIGINAL, "failed", 2),
+                    _publication(SUCCESSOR, "succeeded", 0, pr_number=1, title=TITLE, body=BODY),
+                ]
+            },
+            "closing reference",
+        ),
+        (
+            {
+                "publications": [
+                    _publication(ORIGINAL, "failed", 2),
+                    _publication(
+                        SUCCESSOR,
+                        "succeeded",
+                        0,
+                        pr_number=1,
+                        title=TITLE,
+                        body="Unrelated proposal\n\nCloses #1",
+                    ),
+                ]
+            },
+            "does not start with the candidate",
         ),
         ({"creates": [*FAILED_CREATES, (201, False), (201, False)]}, "reached the forge"),
         ({"usage_after": _usage(extra_tokens=5)}, "usage changed"),
@@ -465,3 +559,133 @@ def test_judge_recovery_refuses_a_second_successor() -> None:
     kwargs["requests"] = [*kwargs["requests"], third]
     with pytest.raises(AssertionError, match="3 requests"):
         prl.judge_recovery(**kwargs)
+
+
+def _listing_with_objects(objects: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"candidates": [_candidate()], "objects": objects}
+
+
+def test_complete_candidate_accepts_the_patch_kind_when_it_is_not_first() -> None:
+    listing = _listing_with_objects(
+        [
+            {"kind": "base", "sha256": "2" * 64, "size_bytes": 4096},
+            {"kind": "patch", "sha256": "1" * 64, "size_bytes": 120},
+        ]
+    )
+    got = prl.complete_candidate(listing)
+    assert got["patch"]["sha256"] == "1" * 64
+
+
+def test_complete_candidate_refuses_an_object_that_has_no_kind() -> None:
+    listing = _listing_with_objects([{"sha256": "1" * 64, "size_bytes": 120}])
+    with pytest.raises(AssertionError, match="no patch"):
+        prl.complete_candidate(listing)
+
+
+def test_complete_candidate_refuses_a_patch_digest_that_is_not_the_patch_kind() -> None:
+    listing = _listing_with_objects(
+        [
+            {"kind": "base", "sha256": "1" * 64, "size_bytes": 120},
+            {"kind": "patch", "sha256": "9" * 64, "size_bytes": 120},
+        ]
+    )
+    with pytest.raises(AssertionError, match="patch-kind"):
+        prl.complete_candidate(listing)
+
+
+def test_the_usage_snapshot_poll_is_tighter_than_the_request_poll() -> None:
+    assert getattr(prl, "CAPTURE_POLL_S", 3) < 3
+    assert getattr(prl, "USAGE_LAG_S", None) == 60
+
+
+def test_real_model_mode_is_off_unless_the_caller_opts_in(tmp_path: Path) -> None:
+    assert prl.real_model_from_env({}) is None
+    with pytest.raises(ci.Refused, match="is set but not 1"):
+        prl.real_model_from_env({prl.REAL_MODEL_FLAG: "yes"})
+    with pytest.raises(ci.Refused, match=prl.MODEL_KEY_FILE):
+        prl.real_model_from_env({prl.REAL_MODEL_FLAG: "1"})
+    missing = tmp_path / "absent"
+    with pytest.raises(ci.Refused, match="could not be read"):
+        prl.real_model_from_env({prl.REAL_MODEL_FLAG: "1", prl.MODEL_KEY_FILE: str(missing)})
+
+
+def test_real_model_install_keeps_the_proxy_and_prints_no_key(tmp_path: Path) -> None:
+    key = "model-key-fixture"
+    path = tmp_path / "key"
+    path.write_text(key + "\n")
+    reader = getattr(prl, "real_model_from_env", None)
+    assert reader is not None, "real model mode is missing"
+    try:
+        model = reader(
+            {prl.REAL_MODEL_FLAG: "1", prl.MODEL_KEY_FILE: str(path), "CURIE_FACTORY_MODEL": "acme"}
+        )
+        values = prl.recovery_values(
+            _base(),
+            namespace="ns",
+            stub_ip=STUB_IP,
+            proxy_ip=PROXY_IP,
+            real_model=model,
+            model_cidrs=("203.0.113.9/32",),
+        )
+    except TypeError:
+        pytest.fail("real model mode is not accepted")
+    assert key not in repr(model)
+    dumped = json.dumps(values)
+    assert "[fake:" not in dumped
+    assert "runnerEnv" not in values["agentSandbox"]
+    runner = values["agentSandbox"]["runner"]
+    assert runner["fakeModel"] is False
+    assert runner["model"] == "acme"
+    assert runner["credentials"] == key
+    assert values["api"]["githubApiUrl"] == f"{PROXY}/api/v3"
+    assert "203.0.113.9/32" in dumped
+    assert STUB not in dumped
+
+
+def test_provider_usage_reads_the_counter_and_hides_the_key() -> None:
+    assert hasattr(prl, "provider_usage"), "provider usage reading is missing"
+    key = "model-key-fixture"
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_: object) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return b'{"data":{"usage":1.5}}'
+
+    assert prl.provider_usage(key, opener=lambda *_args, **_kwargs: _Response()) == 1.5
+
+    def _explode(*_args: object, **_kwargs: object) -> Any:
+        raise OSError(f"Bearer {key}")
+
+    with pytest.raises(ci.Refused, match="could not be read") as refused:
+        prl.provider_usage(key, opener=_explode)
+    assert key not in str(refused.value)
+
+
+def test_the_usage_lag_wait_is_sixty_seconds() -> None:
+    assert hasattr(prl, "pause_for_usage_lag"), "usage lag wait is missing"
+    seen: list[float] = []
+    prl.pause_for_usage_lag(seen.append)
+    assert seen == [60.0]
+
+
+def test_provider_cidrs_are_single_hosts() -> None:
+    assert hasattr(prl, "provider_cidrs"), "provider egress addresses are missing"
+    assert prl.provider_cidrs(lambda: ["203.0.113.9", "203.0.113.8"]) == [
+        "203.0.113.8/32",
+        "203.0.113.9/32",
+    ]
+    with pytest.raises(ci.Refused, match="could not be resolved"):
+        prl.provider_cidrs(lambda: [])
+
+
+def test_real_mode_refuses_a_missing_key_before_the_cluster(tmp_path: Path) -> None:
+    env = {**_complete_env(tmp_path), prl.REAL_MODEL_FLAG: "1"}
+    result = _run_driver(env)
+    assert result.returncode != 0, result.stdout[-2000:]
+    assert prl.MODEL_KEY_FILE in result.stdout
+    assert "helm" not in result.stdout.lower()
