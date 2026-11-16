@@ -5,8 +5,9 @@ import type { AppState, PromotedEvalCase } from "./types";
 const fresh = (): AppState => initialState();
 
 describe("navForPath", () => {
-  it("opens settings only for the claude plan path", () => {
+  it("opens settings only for the settings paths", () => {
     expect(navForPath("/settings/claude-plan")).toBe("settings");
+    expect(navForPath("/settings")).toBe("settings");
     expect(navForPath("/")).toBe("overview");
     expect(navForPath("/agents")).toBe("overview");
     expect(navForPath("/settings/claude-plan/extra")).toBe("overview");

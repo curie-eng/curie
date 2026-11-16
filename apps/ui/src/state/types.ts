@@ -1,4 +1,5 @@
 import type { EvalCaseOut } from "../api/client";
+import type { SettingsSection } from "./route";
 
 export type Nav =
   | "overview"
@@ -26,6 +27,8 @@ export interface DeployIssue {
 
 export interface AppState {
   nav: Nav;
+  // Which Settings section shows; its path is /settings or /settings/claude-plan.
+  settingsSection: SettingsSection;
   env: Env;
   obsTab: ObsTab;
   modal: ModalKind | null;
@@ -54,6 +57,9 @@ export type PromotedEvalCase = EvalCaseOut;
 
 export type Action =
   | { type: "go"; nav: Nav }
+  | { type: "settingsSection"; section: SettingsSection }
+  // The browser moved (Back, Forward): show what the path names.
+  | { type: "locate"; pathname: string }
   | { type: "openModal"; modal: ModalKind }
   | { type: "closeModal" }
   | { type: "toast"; message: string | null }
