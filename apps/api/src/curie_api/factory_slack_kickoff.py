@@ -49,7 +49,12 @@ a request id derived from the delivery. A refusal there answers
 enrollment answers ``enrollment_inactive``. The same transaction inserts the
 WorkItem's ``factory_slack_threads`` row with origin ``kickoff`` at this root
 and reads it back; any difference rolls the whole admission back
-(``thread_conflict``).
+(``thread_conflict``). The row also stores the sender's Slack user id as
+``requester_slack_user`` and the worker's ``placeholder_ts`` (the
+dispatcher's placeholder reply under the mention, None when it posted none)
+as ``card_ts``: the progress lane edits that placeholder into the run's card,
+or posts the card as the first reply when there is none. A replayed admission
+answers from the committed rows and writes nothing.
 
 A code host that cannot answer now raises `CodeHostUnavailable` (503), so the
 worker keeps the delivery pending. Logs carry codes and ids only, never the
@@ -732,6 +737,10 @@ async def _admit(
             root_ts=data.root_ts,
             first_sequence=request.sequence,
             origin=_ORIGIN,
+            # The dispatcher's placeholder becomes the run's progress card, and
+            # the sender is who the card's notify replies mention (#5715).
+            card_ts=data.placeholder_ts,
+            requester_slack_user=data.author,
         )
         .on_conflict_do_nothing()
     )

@@ -1,4 +1,4 @@
-"""Durable factory run progress in one Slack root per WorkItem (#5414, #5380).
+"""Durable factory run progress in one Slack thread per WorkItem (#5414, #5380, #5715).
 
 ``factory_slack_threads`` binds a WorkItem to its Slack root for the WorkItem's
 whole life, across revisions. Its ``origin`` says how the root came to be:
@@ -7,22 +7,42 @@ whole life, across revisions. Its ``origin`` says how the root came to be:
    factory run's progress to that channel, as the agent's one Slack binding
    for that channel (exactly one ``agent_channels`` row of kind ``slack`` with
    that address and an adapter; the adapter names the posting identity).
-   Discovery below inserts such a thread unrooted and owes its root post.
-   Nothing is discovered for an agent without a destination or whose
-   destination has no single bound identity. The thread stays in the channel
-   its root was posted to for as long as the agent has any destination:
-   changing the destination moves only WorkItems discovered afterwards, and
-   clearing it stops every configured thread.
+   Discovery below inserts such a thread unrooted and owes its root post, one
+   short line naming the repository and issue. Nothing is discovered for an
+   agent without a destination or whose destination has no single bound
+   identity. The thread stays in the channel its root was posted to for as
+   long as the agent has any destination: changing the destination moves only
+   WorkItems discovered afterwards, and clearing it stops every configured
+   thread.
 2. ``kickoff``: the API's Slack kickoff route inserts the thread already
    rooted at the message that started the run, so no root post is ever owed
    and discovery skips the WorkItem. It needs no destination: clearing,
    setting or changing ``factory_slack_channel`` neither stops nor moves it.
+   The route also stores the dispatcher's placeholder reply as ``card_ts`` and
+   the sender as ``requester_slack_user``.
 
 Origin is stored, never inferred from ``root_ts``. For both origins a thread
 is delivered only while its channel still holds exactly one adapter-bearing
 Slack binding of the agent and that binding names the thread's identity; a
-removed or changed binding leaves its posts owed and unsent until it is
-restored.
+removed or changed binding leaves its posts owed and its card unedited until
+it is restored.
+
+Each thread has one live progress card (``factory_slack_card``), the first
+reply under the root. It always shows the shown request: the latest
+implementation request at or after ``first_sequence``, so a steering revision
+or an automatic retry changes the card and never adds a second one. A kickoff
+thread's card is the placeholder. Any other thread owes one ``card`` post, a
+plain line the first edit replaces; it is owed while the shown request is
+live or ended within ``_CARD_LATE`` of the pass, so a thread whose run ended
+before this lane existed gets no card.
+
+Each pass re-renders every card whose shown request is live or ended after
+the card's last edit, under a per-thread lease, because a replace edit carries
+no revision and lands last write wins. An edit is a reply wire 1.3 replace and
+is sent only when the render's digest differs from the last acknowledged one,
+and, while the run is live, at least ``card_edit_spacing_seconds`` after the
+previous edit. A finished, stopped or needs a person render is sent at once.
+A refused edit keeps the lease's expiry as its retry time.
 
 ``factory_slack_posts`` is the owed outbox, with the lease discipline of
 ``remediation_receipts``. Each pass first materializes what is owed from
@@ -33,39 +53,33 @@ existing records, with no lifecycle hook:
    ``factory_slack_since`` (created then or later, still open, or ended then or
    later). ``first_sequence`` is the smallest eligible sequence, set once here
    and never advanced (a kickoff thread's is its kickoff request's);
-2. one ``phase`` post per phase report of a request at or after
-   ``first_sequence`` that has no ``phase:<report id>`` post yet, only when
-   phase lines are on. Eligibility is the request's sequence only, never a
-   report id floor: CI check writers append reports to requests that already
-   ended, so report ids do not follow request order. There is no advancing
-   cursor: report writers do not share one lock and an id is assigned before
-   its commit, so a report can commit after a higher one was already
-   materialized, and a later pass still finds it. An owed report is
-   materialized on any later pass regardless of age, and per-pass work is
-   bounded per request by the progress report limit;
-3. one ``pull_request`` post per lineage pull request;
-4. one ``terminal`` post per ended request at or after ``first_sequence``
-   whose status is ``failed`` or ``expired``. A request that ends
-   ``completed`` or ``cancelled`` gets that post only when phase lines are on.
-   A tracker-result request whose result is owed or delivered gets one
-   ``triage`` post once delivered instead (``factory_slack_triage``);
-   a delegated ticket's post waits for its handoff outcome (#5588).
+2. the card post described above;
+3. one ``needs_person`` reply per request at or after ``first_sequence`` that
+   ended ``failed`` or ``expired`` with no automatic retry admitted, and one
+   ``ready`` reply per implementation request whose own publication opened or
+   updated the WorkItem's pull request. Both mention the requester: the
+   kickoff sender, or for a configured thread the WorkItem owner's (else
+   requester's) one active Slack link in the posting identity's workspace,
+   and no one when there is none. A request a pre-card ``terminal`` or
+   ``pull_request`` post already announced owes neither. A tracker-result
+   request whose result is owed or delivered gets one ``triage`` post once
+   delivered instead (``factory_slack_triage``); a delegated ticket's post
+   waits for its handoff outcome (#5588).
+
+``phase``, ``pull_request`` and ``terminal`` rows from before the card are
+never delivered and never hold a later post back.
 
 ``factory_slack_refusal_posts`` is a second outbox, one row per intake notice
 that resolved an agent with a factory Slack channel. A refusal has no
 WorkItem, so it is one channel post and never a thread reply.
 
 Delivery of a WorkItem is ordered by (sequence, rank, ordinal): the root first,
-every other post only once the root has a ts, and never a deliverable post
-before an earlier unposted deliverable one of the same WorkItem. With phase
-lines off, phase rows and completed or cancelled terminals are not deliverable
-and do not hold back a later post. A rejected send stays owed and is retried
-after a backoff, including a send for an identity this worker has no token
-for; only an invalid target fails permanently. Delivery is at least once: a
-crash between the post and its record posts again. With phase lines on, a
-phase report is never skipped, but one that commits late is delivered when a
-pass finds it, so it can land after posts ordered behind it. Payloads hold
-structured fields only; text is rendered at delivery with Slack's ``&``,
+then the card, every other post only once the root has a ts, and never a post
+before an earlier unposted one of the same WorkItem. A rejected send stays
+owed and is retried after a backoff, including a send for an identity this
+worker has no token for; only an invalid target fails permanently. Delivery is
+at least once: a crash between the post and its record posts again. Payloads
+hold structured fields only; text is rendered at delivery with Slack's ``&``,
 ``<`` and ``>`` escaped.
 """
 
@@ -76,17 +90,34 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Final
 
 from channel_protocol import MESSAGE_VERSION, OutboundMessage
-from channel_protocol.reply import PROGRESS_REPLY_WIRE_VERSION, ReplyPost, ReplyTarget
+from channel_protocol.reply import (
+    PROGRESS_REPLY_WIRE_VERSION,
+    SCOPED_REPLY_WIRE_VERSION,
+    ReplyPost,
+    ReplyTarget,
+    ReplyUpdate,
+)
 from curie_channel_gateway.reply_errors import InvalidReplyTargetError
-from curie_internal.factory_cause import cause_text
 from sqlalchemy import text
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from .factory_slack_card import (
+    CardRender,
+    CardRequest,
+    CardSubject,
+    card_reports,
+    needs_person_text,
+    ready_text,
+    render_card,
+    starting_text,
+)
 from .factory_slack_triage import TRIAGE_KIND, render_triage
 from .reply_sink import ReplySink, TargetRoute
 
@@ -149,31 +180,66 @@ _REFUSAL_REASON_SQL = (
     "'installation_changed'"
 )
 assert _REFUSAL_REASON_SQL == ", ".join(repr(reason) for reason in _REFUSAL_REASONS)
-# Taken fields for an unposted root. Aliases are w, q and n.
+# The root line's fields for an unposted root. Aliases are w, q and n.
 _ROOT_PAYLOAD_SQL = """
     jsonb_strip_nulls(jsonb_build_object(
         'repository_path', w.repository_path,
         'issue_id', w.tracker_issue_id,
         'display_key', w.tracker_display_key,
         'title', n.subject_title,
-        'requester_login', NULLIF(split_part(q.requester, ':', 3), ''),
         'ticket_url', NULLIF(split_part(q.objective, '#', 1), '')
     ))
 """
-# True when {alias} is a post the current phase-lines setting delivers.
-_DELIVERABLE_SQL = """
-    NOT (
-        NOT CAST(:phase_lines AS boolean)
-        AND (
-            {alias}.kind = 'phase'
-            OR (
-                {alias}.kind = 'terminal'
-                AND {alias}.payload->>'status' IN ('completed', 'cancelled')
-            )
-        )
-    )
+# The kinds this lane delivers. Rows of the pre-card kinds stay in the table
+# and neither deliver nor hold a later post back.
+_DELIVERED_KINDS_SQL = "'root', 'card', 'needs_person', 'ready', 'triage'"
+_LIVE_SQL = "'queued', 'waiting', 'running', 'cancellation_requested'"
+# A card post is owed for an ended run only this soon after it ended.
+_CARD_LATE: Final = timedelta(minutes=10)
+# The latest implementation request at or after the thread's first sequence,
+# the one the card shows. Alias t is the thread.
+_SHOWN_SQL = """
+    SELECT s.*
+      FROM {requests} s
+     WHERE s.work_item_id = t.work_item_id
+       AND s.sequence >= t.first_sequence
+       AND s.completion_contract = 'implementation'
+     ORDER BY s.sequence DESC
+     LIMIT 1
 """
-_NEEDS_A_PERSON: Final[frozenset[str]] = frozenset({"failed", "expired"})
+# The Slack user a notify reply mentions. Aliases are t, w and a.
+_MENTION_SQL = """
+    CASE WHEN t.origin = 'kickoff' THEN COALESCE(
+        t.requester_slack_user,
+        (SELECT NULLIF(split_part(k.requester, ':', 2), '')
+           FROM {requests} k
+          WHERE k.work_item_id = t.work_item_id
+            AND k.sequence = t.first_sequence
+            AND k.requester LIKE 'slack:%')
+    ) ELSE (
+        SELECT min(l.provider_native_id)
+          FROM {identities} ci
+          JOIN {installations} pi ON pi.id = ci.provider_installation_id
+          JOIN {namespaces} ns
+            ON ns.tenant_id = ci.tenant_id
+           AND ns.provider = 'slack'
+           AND ns.kind = 'slack_workspace'
+           AND ns.authority = pi.authority
+           AND ns.key = pi.external_account_id
+           AND ns.status = 'active'
+          JOIN {links} l
+            ON l.identity_namespace_id = ns.id
+           AND l.tenant_id = ns.tenant_id
+           AND l.revoked_at IS NULL
+         WHERE ci.tenant_id = a.tenant_id
+           AND ci.provider = 'slack'
+           AND ci.name = t.channel_identity
+           AND NOT ci.installation_mismatch
+           AND pi.provider = 'slack'
+           AND l.principal_id = COALESCE(w.owner_principal_id, w.requester_principal_id)
+        HAVING count(*) = 1
+    ) END
+"""
 
 
 def _issue_label(payload: dict[str, Any]) -> str:
@@ -187,27 +253,12 @@ def _with_url(line: str, url: object) -> str:
     return line
 
 
-def _taken(payload: dict[str, Any]) -> str:
-    line = f"Taken: {_escaped(payload.get('repository_path') or '')} {_issue_label(payload)}"
+def _root_line(payload: dict[str, Any]) -> str:
+    line = f"Factory run: {_escaped(payload.get('repository_path') or '')} {_issue_label(payload)}"
     title = payload.get("title")
     if title:
         line += f" {_escaped(title)}"
-    login = payload.get("requester_login")
-    if login:
-        line += f" · started by {_escaped(login)}"
     return _with_url(line, payload.get("ticket_url"))
-
-
-def _needs_a_person(payload: dict[str, Any]) -> str:
-    sentence = cause_text(str(payload.get("cause") or ""))
-    return _with_url(f"Needs a person: {_escaped(sentence)}", payload.get("ticket_url"))
-
-
-def _retry_queued(payload: dict[str, Any]) -> str:
-    """A failed run whose automatic retry was admitted with it: nobody is needed yet."""
-
-    sentence = cause_text(str(payload.get("cause") or ""))
-    return _with_url(f"Automatic retry queued: {_escaped(sentence)}", payload.get("ticket_url"))
 
 
 def _refusal_sentence(reason: str, login: object) -> str:
@@ -236,31 +287,35 @@ def render_post(kind: str, payload: dict[str, Any]) -> str:
     """The message text of one owed post, from its structured payload only."""
 
     if kind == "root":
-        return _taken(payload)
-    if kind == "phase":
-        line = f"Phase {_escaped(payload.get('phase') or '')}"
-        if payload.get("round") is not None:
-            line += f" (round {_escaped(payload['round'])})"
-        note = payload.get("note")
-        if note:
-            line += f": {_escaped(note)}"
-        return line
-    if kind == "pull_request":
-        return f"PR open: {_escaped(payload.get('url') or '')}"
+        return _root_line(payload)
+    if kind == "card":
+        return starting_text(_subject(payload))
+    if kind == "needs_person":
+        return needs_person_text(_user(payload), _str(payload.get("cause")))
+    if kind == "ready":
+        return ready_text(_user(payload), str(payload.get("url") or ""))
     if kind == TRIAGE_KIND:
         return _escaped(render_triage(payload))
-    if kind == "terminal":
-        status = str(payload.get("status") or "")
-        if status in _NEEDS_A_PERSON:
-            if payload.get("retry_queued") is True:
-                return _retry_queued(payload)
-            return _needs_a_person(payload)
-        line = f"Run {_escaped(status or 'ended')}"
-        cause = payload.get("cause")
-        if cause:
-            line += f" ({_escaped(cause)})"
-        return line
     raise ValueError(f"unknown factory Slack post kind {kind!r}")
+
+
+def _str(value: object) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _user(payload: dict[str, Any]) -> str | None:
+    return _str(payload.get("user"))
+
+
+def _subject(payload: dict[str, Any]) -> CardSubject:
+    return CardSubject(
+        repository=str(payload.get("repository_path") or ""),
+        issue_label=str(payload.get("display_key") or f"#{payload.get('issue_id') or ''}"),
+        issue_title=_str(payload.get("title")),
+        issue_url=_str(payload.get("ticket_url")),
+        requester_slack_user=_str(payload.get("requester_slack_user")),
+        requester_login=_str(payload.get("requester_login")),
+    )
 
 
 def render_refusal(payload: dict[str, Any]) -> str:
@@ -304,6 +359,19 @@ class FactorySlackWork:
 
 
 @dataclass(frozen=True)
+class FactorySlackCard:
+    """One leased card: where it is and what it last showed."""
+
+    work_item_id: uuid.UUID
+    channel_identity: str
+    channel: str
+    root_ts: str
+    card_ts: str
+    digest: str | None
+    edited_at: datetime | None
+
+
+@dataclass(frozen=True)
 class FactorySlackRefusal:
     """One leased refusal post: what to say and which channel to say it in."""
 
@@ -315,8 +383,39 @@ class FactorySlackRefusal:
     channel: str
 
 
+def _render(row: RowMapping, reports: Sequence[RowMapping]) -> CardRender:
+    """The card for one thread's facts row and its shown request's reports."""
+
+    declaration = row["declaration"]
+    if isinstance(declaration, str):
+        declaration = json.loads(declaration)
+    published = row["published"] is True
+    subject = CardSubject(
+        repository=str(row["repository_path"]),
+        issue_label=str(row["tracker_display_key"] or f"#{row['tracker_issue_id']}"),
+        issue_title=_str(row["title"]),
+        issue_url=_str(row["ticket_url"]),
+        requester_slack_user=_str(row["requester_slack_user"]),
+        requester_login=_str(row["requester_login"]),
+    )
+    request = CardRequest(
+        status=str(row["status"]),
+        terminal_cause=_str(row["terminal_cause"]),
+        first=row["sequence"] == row["first_sequence"],
+        declaration=dict(declaration) if isinstance(declaration, dict) else None,
+        reports=card_reports([dict(report) for report in reports]),
+        started_at=row["started_at"],
+        terminal_at=row["terminal_at"],
+        published_at=row["published_at"] if published else None,
+        pr_number=int(row["pr_number"]) if published and row["pr_number"] is not None else None,
+        pr_url=_str(row["pr_url"]) if published else None,
+        pr_title=_str(row["pr_title"]) if published else None,
+    )
+    return render_card(subject, request, now=row["now"])
+
+
 class PostgresFactorySlackStore:
-    """Materializes owed posts and leases them one at a time without blocking peers."""
+    """Materializes owed posts and leases posts and cards without blocking peers."""
 
     def __init__(
         self,
@@ -327,14 +426,19 @@ class PostgresFactorySlackStore:
         lease_seconds: int = 60,
         backoff_base_seconds: float = 2.0,
         backoff_max_seconds: float = 300.0,
-        phase_lines: bool = False,
+        card_edit_spacing_seconds: float = 30.0,
     ) -> None:
         if not _SAFE_SCHEMA.fullmatch(schema):
             raise ValueError("factory Slack progress database schema is invalid")
         if not lease_owner:
             raise ValueError("factory Slack progress lease owner is required")
-        if lease_seconds <= 0 or backoff_base_seconds <= 0 or backoff_max_seconds <= 0:
-            raise ValueError("factory Slack progress lease and backoff must be positive")
+        if (
+            lease_seconds <= 0
+            or backoff_base_seconds <= 0
+            or backoff_max_seconds <= 0
+            or card_edit_spacing_seconds <= 0
+        ):
+            raise ValueError("factory Slack progress lease, backoff and spacing must be positive")
         self._engine = engine
         self._agents = f'"{schema}".agents'
         self._channels = f'"{schema}".agent_channels'
@@ -342,6 +446,7 @@ class PostgresFactorySlackStore:
         self._requests = f'"{schema}".execution_requests'
         self._reports = f'"{schema}".execution_request_phase_reports'
         self._lineages = f'"{schema}".thread_publication_lineages'
+        self._publications = f'"{schema}".publications'
         self._threads = f'"{schema}".factory_slack_threads'
         self._posts = f'"{schema}".factory_slack_posts'
         self._notices = f'"{schema}".factory_terminal_notices'
@@ -349,12 +454,34 @@ class PostgresFactorySlackStore:
         self._refusals = f'"{schema}".factory_slack_refusal_posts'
         self._deliveries = f'"{schema}".factory_tracker_result_deliveries'
         self._receipts = f'"{schema}".factory_tracker_result_receipts'
-        self._phase_lines = phase_lines
         self._handoffs = f'"{schema}".factory_triage_handoffs'
+        self._shown = _SHOWN_SQL.format(requests=self._requests)
+        self._mention = _MENTION_SQL.format(
+            requests=self._requests,
+            identities=f'"{schema}".channel_identities',
+            installations=f'"{schema}".provider_installations',
+            namespaces=f'"{schema}".identity_namespaces',
+            links=f'"{schema}".identity_links',
+        )
         self._lease_owner = lease_owner
         self._lease_seconds = lease_seconds
         self._backoff_base = backoff_base_seconds
         self._backoff_max = backoff_max_seconds
+        self._card_spacing = timedelta(seconds=card_edit_spacing_seconds)
+
+    def _bound(self, thread: str) -> str:
+        """True while ``thread``'s channel holds exactly its one bound identity."""
+
+        return f"""
+            (
+                SELECT array_agg(CAST(c.adapter AS text))
+                  FROM {self._channels} c
+                 WHERE c.agent_id = {thread}.agent_id
+                   AND c.kind = 'slack'
+                   AND c.address = {thread}.channel
+                   AND c.adapter IS NOT NULL
+            ) = ARRAY[{thread}.channel_identity]
+        """
 
     async def materialize(self) -> None:
         """Record every post now owed, once; repeated passes add nothing new."""
@@ -410,7 +537,7 @@ class PostgresFactorySlackStore:
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
-        # Posts delivered after this change pick up the taken fields. A root
+        # Posts delivered after this change pick up the root fields. A root
         # that already has a ts keeps the text it was posted with.
         refresh_roots = text(
             f"""
@@ -429,76 +556,67 @@ class PostgresFactorySlackStore:
         # A configured thread is live while its agent has any destination; a
         # kickoff thread needs none.
         live_threads = f"""
-            SELECT t.work_item_id, t.first_sequence
+            SELECT t.work_item_id, t.first_sequence, t.origin, t.channel_identity,
+                   t.requester_slack_user, t.card_ts, t.agent_id
               FROM {self._threads} t
               JOIN {self._agents} a ON a.id = t.agent_id
              WHERE t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL
         """
-        # Every report of an eligible request without its post, on every pass. The
-        # anti-join keeps a pass from rewriting recorded posts; the unique post
-        # key settles a race with a peer pass. Reports are capped per request
-        # (``factory_progress.REPORT_LIMIT``), so a pass reads a bounded set.
-        phases = text(
+        # The card's first post, for a thread with no placeholder. Ranked right
+        # after the root, so it is the thread's first reply.
+        cards = text(
             f"""
             INSERT INTO {self._posts} AS p
                    (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
-            SELECT t.work_item_id, 'phase:' || r.id, 'phase', q.sequence, 1, r.id,
-                   jsonb_build_object('phase', r.phase, 'note', r.note, 'round', r.loop_round)
-              FROM ({live_threads}) t
-              JOIN {self._requests} q
-                ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
-              JOIN {self._reports} r
-                ON r.execution_request_id = q.id
-             WHERE NOT EXISTS (
-                   SELECT 1
-                     FROM {self._posts} x
-                    WHERE x.work_item_id = t.work_item_id
-                      AND x.post_key = 'phase:' || r.id
-             )
-            ON CONFLICT (work_item_id, post_key) DO NOTHING
-            """
-        )
-        pull_requests = text(
-            f"""
-            INSERT INTO {self._posts} AS p
-                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
-            SELECT t.work_item_id, 'pr:' || l.id || ':' || l.pr_number, 'pull_request',
-                   (SELECT max(q.sequence) FROM {self._requests} q
-                     WHERE q.work_item_id = t.work_item_id),
-                   2, l.pr_number,
-                   jsonb_build_object('url', l.pr_url, 'number', l.pr_number)
-              FROM ({live_threads}) t
-              JOIN {self._work_items} w ON w.id = t.work_item_id
-              JOIN {self._lineages} l ON l.id = w.publication_lineage_id
-             WHERE l.pr_number IS NOT NULL
-               AND l.pr_url IS NOT NULL
-            ON CONFLICT (work_item_id, post_key) DO NOTHING
-            """
-        )
-        terminals = text(
-            f"""
-            INSERT INTO {self._posts} AS p
-                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
-            SELECT t.work_item_id, 'terminal:' || q.id, 'terminal', q.sequence, 3, 0,
+            SELECT t.work_item_id, 'card', 'card', 0, 0, 1,
                    jsonb_strip_nulls(jsonb_build_object(
-                       'status', q.status,
-                       'cause', q.terminal_cause,
-                       'retry_queued', CASE WHEN EXISTS (
-                           SELECT 1 FROM {self._requests} s
-                            WHERE s.retry_of_request_id = q.id
-                       ) THEN true END,
-                       'ticket_url', NULLIF(split_part(q.objective, '#', 1), '')
+                       'issue_id', w.tracker_issue_id,
+                       'display_key', w.tracker_display_key,
+                       'title', (
+                           SELECT n.subject_title
+                             FROM {self._notices} n
+                             JOIN {self._requests} r ON r.id = n.execution_request_id
+                            WHERE r.work_item_id = t.work_item_id
+                              AND n.subject_title IS NOT NULL
+                            ORDER BY r.sequence DESC
+                            LIMIT 1
+                       )
                    ))
               FROM ({live_threads}) t
+              JOIN {self._work_items} w ON w.id = t.work_item_id
+              CROSS JOIN LATERAL ({self._shown}) q
+             WHERE t.card_ts IS NULL
+               AND (q.terminal_at IS NULL OR q.terminal_at >= now() - CAST(:late AS interval))
+            ON CONFLICT (work_item_id, post_key) DO NOTHING
+            """
+        )
+        # One needs a person reply per request that ended needing one. An
+        # automatic retry admitted with the failure carries the card on, and a
+        # pre-card terminal post already announced its request.
+        needs_person = text(
+            f"""
+            INSERT INTO {self._posts} AS p
+                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
+            SELECT t.work_item_id, 'needs_person:' || q.id, 'needs_person', q.sequence, 3, 0,
+                   jsonb_strip_nulls(jsonb_build_object(
+                       'cause', q.terminal_cause,
+                       'user', {self._mention}
+                   ))
+              FROM ({live_threads}) t
+              JOIN {self._agents} a ON a.id = t.agent_id
+              JOIN {self._work_items} w ON w.id = t.work_item_id
               JOIN {self._requests} q
                 ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
              WHERE q.terminal_at IS NOT NULL
-               AND (
-                   q.status IN ('failed', 'expired')
-                   OR (
-                       CAST(:phase_lines AS boolean)
-                       AND q.status IN ('completed', 'cancelled')
-                   )
+               AND q.status IN ('failed', 'expired')
+               AND NOT EXISTS (
+                   SELECT 1 FROM {self._requests} s WHERE s.retry_of_request_id = q.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM {self._posts} x
+                    WHERE x.work_item_id = t.work_item_id
+                      AND x.post_key = 'terminal:' || q.id
                )
                AND (
                    q.completion_contract <> 'tracker_result'
@@ -512,18 +630,44 @@ class PostgresFactorySlackStore:
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
-        refresh_terminals = text(
+        # One ready reply per implementation request whose own publication
+        # succeeded on the WorkItem's pull request while it is still open; a
+        # merged or closed one is not ready for review. A pre-card
+        # pull_request post covers every request up to its sequence.
+        ready = text(
             f"""
-            UPDATE {self._posts} AS p
-               SET payload = p.payload || jsonb_strip_nulls(jsonb_build_object(
-                       'ticket_url', NULLIF(split_part(q.objective, '#', 1), '')
+            INSERT INTO {self._posts} AS p
+                   (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
+            SELECT t.work_item_id, 'ready:' || q.id, 'ready', q.sequence, 2, 0,
+                   jsonb_strip_nulls(jsonb_build_object(
+                       'url', l.pr_url,
+                       'number', l.pr_number,
+                       'user', {self._mention}
                    ))
-              FROM {self._requests} q
-             WHERE p.work_item_id = q.work_item_id
-               AND p.kind = 'terminal'
-               AND p.posted_at IS NULL
-               AND p.post_key = 'terminal:' || q.id
-               AND q.status IN ('failed', 'expired')
+              FROM ({live_threads}) t
+              JOIN {self._agents} a ON a.id = t.agent_id
+              JOIN {self._work_items} w ON w.id = t.work_item_id
+              JOIN {self._lineages} l ON l.id = w.publication_lineage_id
+              JOIN {self._requests} q
+                ON q.work_item_id = t.work_item_id AND q.sequence >= t.first_sequence
+             WHERE l.pr_url IS NOT NULL
+               AND l.status = 'open'
+               AND q.completion_contract = 'implementation'
+               AND EXISTS (
+                   SELECT 1
+                     FROM {self._publications} b
+                    WHERE b.execution_request_id = q.id
+                      AND b.lineage_id = l.id
+                      AND b.status = 'succeeded'
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM {self._posts} x
+                    WHERE x.work_item_id = t.work_item_id
+                      AND x.kind = 'pull_request'
+                      AND x.sequence >= q.sequence
+               )
+            ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
         refusals = text(
@@ -595,11 +739,9 @@ class PostgresFactorySlackStore:
         async with self._engine.begin() as connection:
             await connection.execute(discover)
             await connection.execute(refresh_roots)
-            if self._phase_lines:
-                await connection.execute(phases)
-            await connection.execute(pull_requests)
-            await connection.execute(terminals, {"phase_lines": self._phase_lines})
-            await connection.execute(refresh_terminals)
+            await connection.execute(cards, {"late": _CARD_LATE})
+            await connection.execute(needs_person)
+            await connection.execute(ready)
             await connection.execute(triages)
             await connection.execute(refusals)
 
@@ -619,22 +761,15 @@ class PostgresFactorySlackStore:
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
                AND (p.not_before IS NULL OR p.not_before <= now())
                AND (p.kind = 'root' OR t.root_ts IS NOT NULL)
-               AND {_DELIVERABLE_SQL.format(alias="p")}
-               AND (
-                   SELECT array_agg(CAST(c.adapter AS text))
-                     FROM {self._channels} c
-                    WHERE c.agent_id = t.agent_id
-                      AND c.kind = 'slack'
-                      AND c.address = t.channel
-                      AND c.adapter IS NOT NULL
-               ) = ARRAY[t.channel_identity]
+               AND p.kind IN ({_DELIVERED_KINDS_SQL})
+               AND {self._bound("t")}
                AND NOT EXISTS (
                    SELECT 1
                      FROM {self._posts} e
                     WHERE e.work_item_id = p.work_item_id
                       AND e.posted_at IS NULL
                       AND e.failed_at IS NULL
-                      AND {_DELIVERABLE_SQL.format(alias="e")}
+                      AND e.kind IN ({_DELIVERED_KINDS_SQL})
                       AND (e.sequence, e.rank, e.ordinal, e.id)
                           < (p.sequence, p.rank, p.ordinal, p.id)
                )
@@ -652,11 +787,7 @@ class PostgresFactorySlackStore:
             """
         )
         async with self._engine.begin() as connection:
-            row = (
-                (await connection.execute(owed, {"phase_lines": self._phase_lines}))
-                .mappings()
-                .first()
-            )
+            row = (await connection.execute(owed)).mappings().first()
             if row is None:
                 return None
             await connection.execute(
@@ -683,10 +814,10 @@ class PostgresFactorySlackStore:
         )
 
     async def mark_posted(self, work: FactorySlackWork, ref: str | None) -> None:
-        """Record the post, and a root's ts as the thread's root, in one transaction."""
+        """Record the post, and a root's or card's ts on the thread, in one transaction."""
 
-        if work.kind == "root" and not ref:
-            raise FactorySlackProgressError("a root post returned no Slack ts")
+        if work.kind in ("root", "card") and not ref:
+            raise FactorySlackProgressError(f"a {work.kind} post returned no Slack ts")
         async with self._engine.begin() as connection:
             updated = (
                 await connection.execute(
@@ -709,18 +840,259 @@ class PostgresFactorySlackStore:
             ).scalar_one_or_none()
             if updated is None:
                 raise FactorySlackProgressError("factory Slack post acknowledgement was lost")
-            if work.kind == "root":
+            if work.kind in ("root", "card"):
+                column = "root_ts" if work.kind == "root" else "card_ts"
                 await connection.execute(
                     text(
                         f"""
                         UPDATE {self._threads}
-                           SET root_ts = :ref
+                           SET {column} = :ref
                          WHERE work_item_id = :work_item_id
-                           AND root_ts IS NULL
+                           AND {column} IS NULL
                         """
                     ),
                     {"ref": ref, "work_item_id": work.work_item_id},
                 )
+
+    async def claim_cards(self, limit: int) -> list[FactorySlackCard]:
+        """Lease up to ``limit`` cards that may need an edit.
+
+        A card is a candidate while its shown request is live or ended after
+        the card's last edit. The spacing filter skips a live card edited
+        recently unless its run reached a final state (ended, or its own
+        publication succeeded); ``render_due`` repeats the decision on the
+        render itself.
+        """
+
+        due = text(
+            f"""
+            SELECT t.work_item_id, t.channel_identity, t.channel, t.root_ts, t.card_ts,
+                   t.card_digest, t.card_edited_at
+              FROM {self._threads} t
+              JOIN {self._agents} a ON a.id = t.agent_id
+              CROSS JOIN LATERAL ({self._shown}) q
+             WHERE (t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL)
+               AND t.card_ts IS NOT NULL
+               AND t.root_ts IS NOT NULL
+               AND (t.card_lease_expires_at IS NULL OR t.card_lease_expires_at < now())
+               AND (
+                   q.terminal_at IS NULL
+                   OR t.card_edited_at IS NULL
+                   OR t.card_edited_at <= q.terminal_at
+               )
+               AND (
+                   t.card_edited_at IS NULL
+                   OR t.card_edited_at <= now() - CAST(:spacing AS interval)
+                   OR q.status NOT IN ({_LIVE_SQL})
+                   OR EXISTS (
+                       SELECT 1
+                         FROM {self._publications} b
+                        WHERE b.execution_request_id = q.id
+                          AND b.status = 'succeeded'
+                   )
+               )
+               AND {self._bound("t")}
+             ORDER BY t.card_edited_at NULLS FIRST, t.work_item_id
+             LIMIT :limit
+             FOR UPDATE OF t SKIP LOCKED
+            """
+        )
+        lease = text(
+            f"""
+            UPDATE {self._threads}
+               SET card_lease_owner = :owner,
+                   card_lease_expires_at = now() + :lease
+             WHERE work_item_id = ANY(:ids)
+            """
+        )
+        async with self._engine.begin() as connection:
+            rows = (
+                (await connection.execute(due, {"spacing": self._card_spacing, "limit": limit}))
+                .mappings()
+                .all()
+            )
+            if not rows:
+                return []
+            await connection.execute(
+                lease,
+                {
+                    "ids": [row["work_item_id"] for row in rows],
+                    "owner": self._lease_owner,
+                    "lease": timedelta(seconds=self._lease_seconds),
+                },
+            )
+        return [
+            FactorySlackCard(
+                work_item_id=uuid.UUID(str(row["work_item_id"])),
+                channel_identity=str(row["channel_identity"]),
+                channel=str(row["channel"]),
+                root_ts=str(row["root_ts"]),
+                card_ts=str(row["card_ts"]),
+                digest=_str(row["card_digest"]),
+                edited_at=row["card_edited_at"],
+            )
+            for row in rows
+        ]
+
+    async def render(self, card: FactorySlackCard) -> tuple[CardRender, datetime] | None:
+        """The card's render from current records, and the database time it was read at."""
+
+        facts = text(
+            f"""
+            SELECT now() AS now,
+                   w.repository_path, w.tracker_issue_id, w.tracker_display_key,
+                   t.first_sequence, t.origin,
+                   COALESCE(
+                       t.requester_slack_user,
+                       CASE WHEN t.origin = 'kickoff' AND q.requester LIKE 'slack:%'
+                            THEN NULLIF(split_part(q.requester, ':', 2), '') END
+                   ) AS requester_slack_user,
+                   CASE WHEN q.requester LIKE 'github:%'
+                        THEN NULLIF(split_part(q.requester, ':', 3), '') END
+                       AS requester_login,
+                   NULLIF(split_part(q.objective, '#', 1), '') AS ticket_url,
+                   q.id AS request_id, q.sequence, q.status, q.terminal_cause,
+                   COALESCE(q.started_at, q.created_at) AS started_at, q.terminal_at,
+                   (
+                       SELECT n.subject_title
+                         FROM {self._notices} n
+                         JOIN {self._requests} r ON r.id = n.execution_request_id
+                        WHERE r.work_item_id = t.work_item_id
+                          AND n.subject_title IS NOT NULL
+                        ORDER BY r.sequence DESC
+                        LIMIT 1
+                   ) AS title,
+                   (
+                       SELECT n.declaration
+                         FROM {self._notices} n
+                         JOIN {self._requests} r ON r.id = n.execution_request_id
+                        WHERE r.work_item_id = t.work_item_id
+                          AND r.sequence <= q.sequence
+                          AND n.declaration IS NOT NULL
+                        ORDER BY r.sequence DESC
+                        LIMIT 1
+                   ) AS declaration,
+                   l.pr_url, l.pr_number, pub.title AS pr_title,
+                   COALESCE(pub.terminal_at, q.terminal_at) AS published_at,
+                   (pub.title IS NOT NULL) AS published
+              FROM {self._threads} t
+              JOIN {self._work_items} w ON w.id = t.work_item_id
+              CROSS JOIN LATERAL ({self._shown}) q
+              LEFT JOIN {self._lineages} l ON l.id = w.publication_lineage_id
+              LEFT JOIN LATERAL (
+                  SELECT b.title, b.terminal_at
+                    FROM {self._publications} b
+                   WHERE b.execution_request_id = q.id
+                     AND b.lineage_id = l.id
+                     AND b.status = 'succeeded'
+                   ORDER BY b.terminal_at NULLS LAST, b.id
+                   LIMIT 1
+              ) pub ON true
+             WHERE t.work_item_id = :work_item_id
+            """
+        )
+        reports = text(
+            f"""
+            SELECT id, phase, note, loop_round
+              FROM {self._reports}
+             WHERE execution_request_id = :request_id
+             ORDER BY id
+            """
+        )
+        async with self._engine.connect() as connection:
+            row = (
+                (await connection.execute(facts, {"work_item_id": card.work_item_id}))
+                .mappings()
+                .first()
+            )
+            if row is None:
+                return None
+            report_rows = (
+                (await connection.execute(reports, {"request_id": row["request_id"]}))
+                .mappings()
+                .all()
+            )
+        return _render(row, report_rows), row["now"]
+
+    async def ack_card(self, card: FactorySlackCard, render: CardRender, read_at: datetime) -> None:
+        """Record the edit Slack accepted and release the lease.
+
+        The edit time stored is ``read_at``, when its records were read, so a
+        run that ended after the read is still later than the edit and its
+        final render is owed on the next pass.
+        """
+
+        async with self._engine.begin() as connection:
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._threads}
+                           SET card_digest = :digest,
+                               card_edited_at = :read_at,
+                               card_lease_owner = NULL,
+                               card_lease_expires_at = NULL
+                         WHERE work_item_id = :work_item_id
+                           AND card_lease_owner = :owner
+                     RETURNING work_item_id
+                        """
+                    ),
+                    {
+                        "digest": render.digest,
+                        "read_at": read_at,
+                        "work_item_id": card.work_item_id,
+                        "owner": self._lease_owner,
+                    },
+                )
+            ).scalar_one_or_none()
+            if updated is None:
+                raise FactorySlackProgressError("factory Slack card acknowledgement was lost")
+
+    async def release_card(
+        self,
+        card: FactorySlackCard,
+        *,
+        settled_at: datetime | None = None,
+        retry: bool = False,
+    ) -> None:
+        """Release a card's lease with no edit sent.
+
+        ``settled_at`` records that the card already showed its final render
+        when the records were read then, so later passes skip it until the run
+        changes after that time. ``retry`` keeps the lease's expiry as the
+        time a refused edit is tried again.
+        """
+
+        async with self._engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f"""
+                    UPDATE {self._threads}
+                       SET card_edited_at = COALESCE(:settled_at, card_edited_at),
+                           card_lease_owner = NULL,
+                           card_lease_expires_at = CASE WHEN CAST(:retry AS boolean)
+                                                        THEN now() + :backoff END
+                     WHERE work_item_id = :work_item_id
+                       AND card_lease_owner = :owner
+                    """
+                ),
+                {
+                    "settled_at": settled_at,
+                    "retry": retry,
+                    "backoff": timedelta(seconds=self._backoff_max / 10),
+                    "work_item_id": card.work_item_id,
+                    "owner": self._lease_owner,
+                },
+            )
+
+    def render_due(self, card: FactorySlackCard, render: CardRender, now: datetime) -> bool:
+        """True when ``render`` should be sent now."""
+
+        if render.digest == card.digest:
+            return False
+        if render.final or card.edited_at is None:
+            return True
+        return now - card.edited_at >= self._card_spacing
 
     async def retry(self, work: FactorySlackWork, *, error: str, permanent: bool) -> None:
         """Release the lease: back off a rejected send, or fail it when it never can post."""
@@ -999,13 +1371,83 @@ class FactorySlackProgressLoop:
         logger.info("factory Slack refusal %s posted", work.notice_id)
         return True
 
+    async def _edit_card(self, card: FactorySlackCard) -> bool:
+        """Render one leased card and send it when due; True when an edit went out."""
+
+        try:
+            rendered = await self._store.render(card)
+        except BaseException:
+            await self._store.release_card(card)
+            raise
+        if rendered is None:
+            await self._store.release_card(card)
+            return False
+        render, now = rendered
+        if not self._store.render_due(card, render, now):
+            # An ended run whose card already shows its last render is settled.
+            await self._store.release_card(
+                card, settled_at=now if render.final and render.digest == card.digest else None
+            )
+            return False
+        try:
+            await self._replies.emit(
+                ReplyUpdate(
+                    version=SCOPED_REPLY_WIRE_VERSION,
+                    event="reply.update",
+                    target=ReplyTarget(
+                        kind=_SLACK_KIND,
+                        address=card.channel,
+                        conversation_id=card.root_ts,
+                        reply_ref=card.card_ts,
+                    ),
+                    message=render.message,
+                    message_mode="replace",
+                ),
+                route=TargetRoute(adapter=card.channel_identity),
+                best_effort_unreachable=False,
+            )
+        except asyncio.CancelledError:
+            await self._store.release_card(card)
+            raise
+        except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
+            await self._store.release_card(card, retry=True)
+            logger.warning(
+                "factory Slack card for work item %s refused (%s); retrying after backoff",
+                card.work_item_id,
+                type(exc).__name__,
+            )
+            return False
+        await self._store.ack_card(card, render, now)
+        logger.info(
+            "factory Slack card for work item %s edited (%s)", card.work_item_id, render.state
+        )
+        return True
+
+    async def edit_cards(self) -> int:
+        """Send every due card edit, up to ``batch_limit``; returns edits sent."""
+
+        cards = await self._store.claim_cards(self._batch_limit)
+        edited = 0
+        for index, card in enumerate(cards):
+            try:
+                if await self._edit_card(card):
+                    edited += 1
+            except BaseException:
+                for leased in cards[index + 1 :]:
+                    await self._store.release_card(leased)
+                raise
+        return edited
+
     async def deliver_once(self) -> bool:
         """Attempt one due post; False when nothing is due."""
 
         return await self._deliver() is not None
 
     async def run_pass(self) -> int:
-        """Materialize, then attempt up to ``batch_limit`` posts; returns posts delivered."""
+        """Materialize, attempt up to ``batch_limit`` posts, then edit due cards.
+
+        Returns posts delivered plus card edits sent.
+        """
 
         await self._store.materialize()
         delivered = 0
@@ -1015,7 +1457,7 @@ class FactorySlackProgressLoop:
                 break
             if outcome:
                 delivered += 1
-        return delivered
+        return delivered + await self.edit_cards()
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
         """Run a pass each interval until ``shutdown`` is set."""
@@ -1034,6 +1476,7 @@ class FactorySlackProgressLoop:
 
 
 __all__ = [
+    "FactorySlackCard",
     "FactorySlackProgressError",
     "FactorySlackProgressLoop",
     "FactorySlackRefusal",

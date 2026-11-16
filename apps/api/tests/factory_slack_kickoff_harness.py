@@ -482,9 +482,13 @@ def kickoff_answers(stack: SteeringStack) -> list[tuple[int, Any]]:
 
 @dataclass
 class Kick:
+    """One native kickoff attempt: the route's answers, the turn's edits of the
+    placeholder, and every other message posted after the delivery."""
+
     delivery: Delivery
     answers: list[tuple[int, Any]]
     edits: list[SlackCall]
+    posts: list[SlackCall]
 
     @property
     def answer(self) -> dict[str, Any]:
@@ -509,7 +513,12 @@ def kick(stack: SteeringStack, user: str, text_: str, *, thread_ts: str | None =
         and delivery.placeholder is not None
         and call.params.get("ts") == delivery.placeholder
     ]
-    return Kick(delivery, kickoff_answers(stack)[answered:], edits)
+    posts = [
+        call
+        for call in stack.slack.calls[calls:]
+        if call.method == "chat.postMessage" and call.text != PLACEHOLDER
+    ]
+    return Kick(delivery, kickoff_answers(stack)[answered:], edits, posts)
 
 
 # --- state reads ----------------------------------------------------------------------
@@ -545,7 +554,8 @@ def requests_of(work_item_id: uuid.UUID) -> list[dict[str, Any]]:
 def threads_at(root_ts: str) -> list[dict[str, Any]]:
     return _rows(
         "SELECT work_item_id, agent_id, channel_identity, channel, root_ts, first_sequence, "
-        "origin FROM curie.factory_slack_threads WHERE root_ts = :root",
+        "origin, card_ts, requester_slack_user "
+        "FROM curie.factory_slack_threads WHERE root_ts = :root",
         {"root": root_ts},
     )
 

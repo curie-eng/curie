@@ -1,23 +1,31 @@
-"""Factory run progress into the Slack root a kickoff started (#5380 AC3, ADR 0268).
+"""Factory run progress in the Slack root a kickoff started, and the card's edits (#5380, #5715).
 
 A Slack kickoff records its WorkItem's thread already rooted at the message
 that started it, with origin ``kickoff``. The production
-``PostgresFactorySlackStore`` then owes that thread no root post, posts every
-phase, pull request and terminal into it, and needs no configured progress
+``PostgresFactorySlackStore`` then owes that thread no root post, posts the
+one live progress card into it (as the root's first reply when no dispatcher
+placeholder was recorded), edits that card in place, and posts the needs a
+person and ready replies under it. It needs no configured progress
 destination: setting, changing or clearing ``factory_slack_channel`` neither
 stops nor moves it. A thread discovered from the configured destination
-(origin ``configured``) keeps its existing behavior. For both origins posts
-stop while the thread's channel no longer holds the one binding naming its
-identity, and stay owed until it does again.
+(origin ``configured``) keeps its one line root. For both origins posts and
+card edits stop while the thread's channel no longer holds the one binding
+naming its identity, and stay owed until it does again.
+
+The card is edited only when its render changed: a live render waits until
+at least 30 seconds after the previous edit, a final render (finished,
+stopped, needs a person) is sent at once, and a restarted worker resends
+nothing it already delivered.
 
 The boundary is ``test_factory_slack_runtime``'s stack: the real API
 (``create_app()`` on uvicorn over a disposable migrated Postgres, real Valkey
 and RustFS) whose internal WorkItem, progress and agent routes write the
 records, and the production ``FactorySlackProgressLoop`` (``run_pass`` over
-``materialize``, ``claim_next`` and ``mark_posted``) posting through the
-production ``SlackReplyAdapter``. Only the Slack Web API is a stand-in
-(``FakeSlack``, answering the documented shape of
-https://docs.slack.dev/reference/methods/chat.postMessage).
+``materialize``, ``claim_next``, ``mark_posted`` and the card edits) posting
+through the production ``SlackReplyAdapter``. Only the Slack Web API is a
+stand-in (``FakeSlack``, answering the documented shapes of
+https://docs.slack.dev/reference/methods/chat.postMessage and
+https://docs.slack.dev/reference/methods/chat.update).
 
 The kickoff association row is fixture state: the row the API's kickoff
 route commits (plan interface contract 7), written here so the store is
@@ -25,9 +33,9 @@ judged on its own. The route's own insert is proven end to end in
 ``apps/worker/tests/test_factory_steering.py`` and
 ``apps/api/tests/test_factory_slack_kickoff.py``.
 
-The first six tests fail with the store change reverted (a kickoff thread
-whose agent has no destination posts nothing). The last is a regression guard
-for configured threads and passes before and after.
+The kickoff tests fail with the store change reverted (a kickoff thread whose
+agent has no destination posts nothing). The configured thread test is a
+regression guard for discovery and clearing.
 """
 
 from __future__ import annotations
@@ -52,58 +60,38 @@ from apps.api.tests.conftest import identity_fence_backend as identity_fence_bac
 from apps.api.tests.conftest import identity_fence_key as identity_fence_key
 from apps.api.tests.conftest import migrated as migrated
 from apps.api.tests.test_factory_slack_runtime import (
+    CARD_POST,
     CHANNEL,
     DEFAULT_TOKEN,
+    NEEDS_YOU,
     OTHER_CHANNEL,
+    READY,
     REPO,
     Stack,
+    _age_card,
+    _card_edits,
+    _card_ts,
     _channel_posts,
+    _chat_since,
+    _kickoff_thread,
+    _last_card,
+    _post_kinds,
+    _replies,
     _rows,
-    _thread_texts,
 )
 from apps.api.tests.test_factory_slack_runtime import stack as stack
 
 _ISSUES = itertools.count(8401)
 _PULLS = itertools.count(9401)
-_ROOTS = itertools.count(1)
 
 
 # --- fixture state and views ---------------------------------------------------------
 
 
-def _kickoff_thread(
-    stack: Stack, work_item_id: uuid.UUID, request_id: uuid.UUID, *, channel: str = CHANNEL
-) -> str:
-    """The association a kickoff commits: rooted at the person's message, origin kickoff.
-
-    ``first_sequence`` is the kickoff request's, so a WorkItem's older runs
-    never post into the new root.
-    """
-
-    root_ts = f"1800000900.{next(_ROOTS):06d}"
-    (request,) = _rows(
-        "SELECT sequence FROM curie.execution_requests WHERE id = :id", {"id": request_id}
-    )
-    _rows(
-        "INSERT INTO curie.factory_slack_threads "
-        "(work_item_id, agent_id, channel_identity, channel, root_ts, first_sequence, origin) "
-        "VALUES (:item, :agent, :identity, :channel, :root, :sequence, 'kickoff')",
-        {
-            "item": work_item_id,
-            "agent": uuid.UUID(stack.agent_id),
-            "identity": stack.identity,
-            "channel": channel,
-            "root": root_ts,
-            "sequence": request["sequence"],
-        },
-    )
-    return root_ts
-
-
 def _thread(work_item_id: uuid.UUID) -> dict[str, Any]:
     (row,) = _rows(
-        "SELECT channel, root_ts, first_sequence, origin FROM curie.factory_slack_threads "
-        "WHERE work_item_id = :id",
+        "SELECT channel, root_ts, first_sequence, origin, card_ts "
+        "FROM curie.factory_slack_threads WHERE work_item_id = :id",
         {"id": work_item_id},
     )
     return row
@@ -117,8 +105,12 @@ def _posts(work_item_id: uuid.UUID) -> list[dict[str, Any]]:
     )
 
 
-def _chat_calls_since(stack: Stack, since: int) -> list[Any]:
-    return [call for call in stack.slack.calls[since:] if call.method.startswith("chat.")]
+def _texts(stack: Stack, root_ts: str) -> list[str]:
+    return [call.text for call in stack.slack.thread_posts(stack.factory_token, root_ts)]
+
+
+def _updates_since(stack: Stack, since: int) -> list[Any]:
+    return [call for call in _chat_since(stack, since) if call.method == "chat.update"]
 
 
 def _destination(stack: Stack, channel: str | None) -> None:
@@ -169,7 +161,6 @@ async def _pass_as(lease_owner: str, slack_url: str, identity: str, token: str) 
                 engine,
                 schema=get_settings().db_schema,
                 lease_owner=lease_owner,
-                phase_lines=True,
             ),
             replies=SlackReplyAdapter(
                 DEFAULT_TOKEN, identity_tokens={identity: token}, base_url=slack_url
@@ -194,7 +185,6 @@ async def _lease_and_crash(lease_owner: str) -> str | None:
             engine,
             schema=get_settings().db_schema,
             lease_owner=lease_owner,
-            phase_lines=True,
         )
         await store.materialize()
         work = await store.claim_next()
@@ -206,14 +196,15 @@ async def _lease_and_crash(lease_owner: str) -> str | None:
 # --- AC3 ------------------------------------------------------------------------------
 
 
-def test_a_kickoff_thread_owes_no_root_and_posts_progress_pr_and_terminal_into_its_origin(
+def test_a_kickoff_thread_owes_no_root_and_posts_its_card_and_ready_reply_into_its_origin(
     stack: Stack,
 ) -> None:
     """Every post of a kickoff run lands in the root its message started, none elsewhere.
 
-    The agent never had a progress destination. Phases, the pull request and
-    the terminal post in order into the kickoff root, escaped; no root post is
-    owed or sent, and the thread keeps its root and origin.
+    The agent never had a progress destination. The card post and the ready
+    reply land in order in the kickoff root, and the card's edits carry the
+    escaped notes; no root post is owed or sent, and the thread keeps its root
+    and origin.
     """
 
     number, request_id, work_item_id, epoch, root_ts = _kickoff_run(stack)
@@ -221,28 +212,27 @@ def test_a_kickoff_thread_owes_no_root_and_posts_progress_pr_and_terminal_into_i
     pr = next(_PULLS)
     stack.own_pull_request(work_item_id, pr)
     stack.drain()
+    assert "Planned from the kickoff" in _last_card(stack, work_item_id)
     stack.report(request_id, "implement", "<!channel> rebuilt & retested")
     stack.finish(request_id, epoch, published=True)
     stack.drain(fresh=True)
 
-    texts = _thread_texts(stack, root_ts)
-    assert len(texts) == 4, texts
-    assert "Planned from the kickoff" in texts[0]
-    assert f"https://github.com/{REPO}/pull/{pr}" in texts[1]
-    assert "&lt;!channel&gt; rebuilt &amp; retested" in texts[2]
-    assert "Run completed" in texts[3]
-    for call in stack.slack.delivered_posts(stack.factory_token):
+    pr_url = f"https://github.com/{REPO}/pull/{pr}"
+    assert _texts(stack, root_ts) == [f"{CARD_POST}#{number}", f"{READY}{pr_url}"]
+    final = _last_card(stack, work_item_id)
+    assert "Factory run: finished" in final
+    assert "&lt;!channel&gt; rebuilt &amp; retested" in final
+    for call in [
+        *stack.slack.delivered_posts(stack.factory_token),
+        *_card_edits(stack, work_item_id),
+    ]:
         assert call.params["channel"] == CHANNEL, call.params
-        assert call.params.get("thread_ts") == root_ts, call.params
         assert "<!channel>" not in call.haystack
+    for call in stack.slack.delivered_posts(stack.factory_token):
+        assert call.params.get("thread_ts") == root_ts, call.params
     assert stack.slack.roots(stack.factory_token) == []
     assert stack.slack.delivered_posts(DEFAULT_TOKEN) == []
-    assert [post["kind"] for post in _posts(work_item_id)] == [
-        "phase",
-        "pull_request",
-        "phase",
-        "terminal",
-    ]
+    assert _post_kinds(work_item_id) == ["card", "ready"]
     thread = _thread(work_item_id)
     assert (thread["channel"], thread["root_ts"], thread["origin"]) == (CHANNEL, root_ts, "kickoff")
     (agent,) = _rows(
@@ -250,18 +240,17 @@ def test_a_kickoff_thread_owes_no_root_and_posts_progress_pr_and_terminal_into_i
         {"id": uuid.UUID(stack.agent_id)},
     )
     assert agent["factory_slack_channel"] is None
-    assert f"#{number}" not in " ".join(texts)
 
 
 def test_a_failed_run_with_an_automatic_retry_queued_does_not_ask_for_a_person(
     stack: Stack,
 ) -> None:
-    """A failure settled together with its automatic retry says the retry is queued.
+    """A failure settled together with its automatic retry asks nobody for anything.
 
     The run fails flag clean with a cause the factory retries, so the API
-    admits the successor in the same settlement. Nobody is needed yet, and the
-    thread must not say so. A failure that admits nothing keeps the needs a
-    person line (the tests around this one).
+    admits the successor in the same settlement. Nobody is needed yet: no
+    needs a person reply is owed, and the card shows the retry as working. A
+    failure that admits nothing gets the reply (the tests around this one).
     """
 
     _number, request_id, work_item_id, epoch, root_ts = _kickoff_run(stack)
@@ -283,21 +272,23 @@ def test_a_failed_run_with_an_automatic_retry_queued_does_not_ask_for_a_person(
     assert successors == [{"status": "waiting"}], successors
     stack.drain(fresh=True)
 
-    texts = _thread_texts(stack, root_ts)
-    assert len(texts) == 1, texts
-    assert texts[0].startswith(f"Automatic retry queued: {cause_text('model_unreachable')}")
-    assert "Needs a person" not in texts[0]
-    assert [post["kind"] for post in _posts(work_item_id)] == ["terminal"]
+    texts = _texts(stack, root_ts)
+    assert len(texts) == 1 and texts[0].startswith(CARD_POST), texts
+    assert all("needs you" not in text for text in texts), texts
+    card = _last_card(stack, work_item_id)
+    assert "Factory run: working" in card
+    assert "needs a person" not in card
+    assert _post_kinds(work_item_id) == ["card"]
 
 
 def test_origin_delivery_when_the_configured_progress_channel_differs(stack: Stack) -> None:
     """A kickoff run posts in its own root while the destination names another channel.
 
     Configured destination ``C0EXAMPLE2``, kickoff root in ``C0EXAMPLE1``: the
-    kickoff run's posts land in its root and nothing of it reaches the
-    destination, while a tracker-started run is discovered there as before.
-    Clearing the destination then stops the configured thread and not the
-    kickoff thread.
+    kickoff run's card and replies land in its root and nothing of it reaches
+    the destination, while a tracker-started run is discovered there as
+    before. Clearing the destination then stops the configured thread and not
+    the kickoff thread.
     """
 
     _bind(stack, OTHER_CHANNEL, stack.identity)
@@ -310,18 +301,21 @@ def test_origin_delivery_when_the_configured_progress_channel_differs(stack: Sta
     stack.report(tracked, "plan", "Tracker planned")
     stack.drain()
 
-    texts = _thread_texts(stack, root_ts)
-    assert len(texts) == 1 and "Kickoff planned" in texts[0], texts
+    assert _texts(stack, root_ts) == [f"{CARD_POST}#{number}"]
+    assert "Kickoff planned" in _last_card(stack, work_item_id)
     (tracked_root,) = stack.slack.roots(stack.factory_token)
     assert tracked_root.params["channel"] == OTHER_CHANNEL
     assert f"#{tracked_number}" in tracked_root.haystack
+    assert "Tracker planned" in _last_card(stack, tracked_item)
     for call in _channel_posts(stack, OTHER_CHANNEL):
         assert f"#{number}" not in call.haystack
-        assert "Kickoff planned" not in call.haystack
+    for call in stack.slack.calls:
+        if call.params.get("channel") == OTHER_CHANNEL:
+            assert "Kickoff planned" not in call.haystack
     assert _thread(work_item_id)["channel"] == CHANNEL
     assert _thread(work_item_id)["origin"] == "kickoff"
     assert _thread(tracked_item)["origin"] == "configured"
-    assert [post["kind"] for post in _posts(work_item_id)] == ["phase"]
+    assert _post_kinds(work_item_id) == ["card"]
 
     _destination(stack, None)
     since = len(stack.slack.calls)
@@ -329,10 +323,14 @@ def test_origin_delivery_when_the_configured_progress_channel_differs(stack: Sta
     stack.finish(tracked, tracked_epoch)
     stack.finish(request_id, epoch)
     stack.drain(fresh=True)
-    sent = _chat_calls_since(stack, since)
-    assert len(sent) == 1, sent
-    assert sent[0].params["thread_ts"] == root_ts
-    assert f"Needs a person: {cause_text('runner_failed')}" in sent[0].text
+    sent = _chat_since(stack, since)
+    assert sorted(call.method for call in sent) == ["chat.postMessage", "chat.update"], sent
+    (reply,) = [call for call in sent if call.method == "chat.postMessage"]
+    assert reply.params["thread_ts"] == root_ts
+    assert reply.text == f"{NEEDS_YOU}{cause_text('runner_failed')}"
+    (edit,) = [call for call in sent if call.method == "chat.update"]
+    assert edit.params["ts"] == _card_ts(work_item_id)
+    assert "Factory run: needs a person" in edit.haystack
     for call in stack.slack.calls:
         assert "Tracker implemented after clearing" not in call.haystack
 
@@ -341,7 +339,7 @@ def test_a_kickoff_thread_needs_no_configured_destination(stack: Stack) -> None:
     """With no destination ever set, a kickoff thread materializes from its own request on.
 
     The WorkItem's older run, before the kickoff request, owes nothing in the
-    new root: its phase and terminal are never materialized or posted.
+    new root: it gets no needs a person reply and never reaches the card.
     """
 
     number = next(_ISSUES)
@@ -363,38 +361,37 @@ def test_a_kickoff_thread_needs_no_configured_destination(stack: Stack) -> None:
     )
     assert agent == {"factory_slack_channel": None, "factory_slack_since": None}, agent
     keys = {post["post_key"] for post in _posts(work_item_id)}
-    assert keys == {
-        f"phase:{report['id']}"
-        for report in _rows(
-            "SELECT id FROM curie.execution_request_phase_reports WHERE execution_request_id = :id",
-            {"id": current},
-        )
-    } | {f"terminal:{current}"}, keys
-    texts = _thread_texts(stack, root_ts)
-    assert len(texts) == 2, texts
-    assert "Kickoff run planned" in texts[0]
-    assert f"Needs a person: {cause_text('runner_failed')}" in texts[1]
+    assert keys == {"card", f"needs_person:{current}"}, keys
+    assert _texts(stack, root_ts) == [
+        f"{CARD_POST}#{number}",
+        f"{NEEDS_YOU}{cause_text('runner_failed')}",
+    ]
+    card = _last_card(stack, work_item_id)
+    assert "Factory run: needs a person" in card
+    assert "Kickoff run planned" in card
     for call in stack.slack.calls:
         assert "Older run planned" not in call.haystack
     assert stack.slack.roots(stack.factory_token) == []
 
 
 def test_owed_kickoff_posts_survive_a_worker_restart_and_post_once(stack: Stack) -> None:
-    """A post owed across a refused send and a crashed lease posts once after a restart.
+    """A card post owed across a refused send and a crashed lease posts once after a restart.
 
     The first pass's send is refused and stays owed; a second process leases
     the post and dies before sending. A replacement process, with its own
-    engine, store and lease owner, delivers it once the lease and backoff have
-    lapsed, and a further pass sends nothing.
+    engine, store and lease owner, delivers it and edits it once the lease and
+    backoff have lapsed, and a further pass sends nothing.
     """
 
-    _number, request_id, work_item_id, _epoch, root_ts = _kickoff_run(stack)
+    number, request_id, work_item_id, _epoch, root_ts = _kickoff_run(stack)
     stack.report(request_id, "plan", "Owed across the restart")
     stack.slack.fail_next("chat.postMessage", token=stack.factory_token)
     stack.drain()
     (owed,) = _posts(work_item_id)
+    assert owed["kind"] == "card", owed
     assert owed["posted_at"] is None and owed["attempts"] == 1, owed
-    assert _thread_texts(stack, root_ts) == []
+    assert _texts(stack, root_ts) == []
+    assert _card_ts(work_item_id) is None
 
     # Skip the retry backoff rather than sleep through it.
     _rows(
@@ -419,19 +416,20 @@ def test_owed_kickoff_posts_survive_a_worker_restart_and_post_once(stack: Stack)
     replacement = f"factory-slack-replacement-{stack.tag}"
     args = (stack.slack.base_url, stack.identity, stack.factory_token)
     stack.client.portal.call(_pass_as, replacement, *args)
-    texts = _thread_texts(stack, root_ts)
-    assert len(texts) == 1 and "Owed across the restart" in texts[0], texts
+    assert _texts(stack, root_ts) == [f"{CARD_POST}#{number}"]
     (posted,) = _posts(work_item_id)
     assert posted["posted_at"] is not None, posted
+    (edit,) = _card_edits(stack, work_item_id)
+    assert "Owed across the restart" in edit.haystack
 
     since = len(stack.slack.calls)
     stack.client.portal.call(_pass_as, f"factory-slack-third-{stack.tag}", *args)
-    assert _chat_calls_since(stack, since) == []
-    assert len(_thread_texts(stack, root_ts)) == 1
+    assert _chat_since(stack, since) == []
+    assert len(_texts(stack, root_ts)) == 1
 
 
 def test_repeated_passes_materialize_nothing_new(stack: Stack) -> None:
-    """Once a kickoff run's posts are owed and sent, further passes add nothing."""
+    """Once a kickoff run's posts are owed, sent and its card final, further passes add nothing."""
 
     _number, request_id, work_item_id, epoch, root_ts = _kickoff_run(stack)
     stack.report(request_id, "plan", "Planned once")
@@ -439,49 +437,56 @@ def test_repeated_passes_materialize_nothing_new(stack: Stack) -> None:
     stack.finish(request_id, epoch, published=True)
     stack.drain()
     owed = _posts(work_item_id)
-    assert [post["kind"] for post in owed] == ["phase", "pull_request", "terminal"], owed
+    assert [post["kind"] for post in owed] == ["card", "ready"], owed
     assert all(post["posted_at"] is not None for post in owed), owed
-    assert len(_thread_texts(stack, root_ts)) == 3
+    assert len(_texts(stack, root_ts)) == 2
+    assert len(_card_edits(stack, work_item_id)) == 1
 
     since = len(stack.slack.calls)
     stack.drain()
     stack.drain(fresh=True)
     stack.drain(fresh=True)
     assert _posts(work_item_id) == owed
-    assert _chat_calls_since(stack, since) == []
-    assert len(_thread_texts(stack, root_ts)) == 3
+    assert _chat_since(stack, since) == []
+    assert len(_texts(stack, root_ts)) == 2
 
 
 def test_a_disconnected_or_mismatched_origin_binding_stops_delivery(stack: Stack) -> None:
-    """A kickoff thread posts only while its channel holds its one binding.
+    """A kickoff thread posts and edits its card only while its channel holds its one binding.
 
     Removing the binding, then binding the channel to another identity,
-    leaves the next post owed and unsent; restoring the thread's own binding
-    delivers it once into the same root.
+    leaves the needs a person reply owed and the card unedited; restoring the
+    thread's own binding delivers both once into the same root.
     """
 
-    _number, request_id, work_item_id, _epoch, root_ts = _kickoff_run(stack)
+    _number, request_id, work_item_id, epoch, root_ts = _kickoff_run(stack)
     stack.report(request_id, "plan", "Before the unbind")
     stack.drain()
-    assert len(_thread_texts(stack, root_ts)) == 1
+    assert len(_texts(stack, root_ts)) == 1
+    assert len(_card_edits(stack, work_item_id)) == 1
 
     _unbind(stack, CHANNEL, stack.identity)
     stack.report(request_id, "implement", "While unbound")
+    stack.finish(request_id, epoch)
     since = len(stack.slack.calls)
     stack.drain(fresh=True)
-    assert _chat_calls_since(stack, since) == []
+    assert _chat_since(stack, since) == []
 
     _bind(stack, CHANNEL, "default")
     stack.drain(fresh=True)
-    assert _chat_calls_since(stack, since) == []
+    assert _chat_since(stack, since) == []
     owed = [post for post in _posts(work_item_id) if post["posted_at"] is None]
-    assert [(post["kind"], post["attempts"]) for post in owed] == [("phase", 0)], owed
+    assert [(post["kind"], post["attempts"]) for post in owed] == [("needs_person", 0)], owed
 
     _unbind(stack, CHANNEL, "default")
     _bind(stack, CHANNEL, stack.identity)
     stack.drain(fresh=True)
-    texts = _thread_texts(stack, root_ts)
-    assert len(texts) == 2 and "While unbound" in texts[1], texts
+    texts = _texts(stack, root_ts)
+    assert len(texts) == 2 and texts[1].startswith(NEEDS_YOU), texts
+    edits = _card_edits(stack, work_item_id)
+    assert len(edits) == 2
+    assert "Factory run: needs a person" in edits[-1].haystack
+    assert "While unbound" in edits[-1].haystack
     assert stack.slack.roots(stack.factory_token) == []
     assert _thread(work_item_id)["root_ts"] == root_ts
 
@@ -490,8 +495,8 @@ def test_tracker_started_runs_keep_configured_channel_behavior(stack: Stack) -> 
     """Regression guard: discovery roots a configured thread, and clearing stops it.
 
     The discovered thread is recorded with origin ``configured``, owes and
-    posts its root in the destination, and posts nothing once the destination
-    is cleared.
+    posts its one line root and then its card in the destination, and posts
+    or edits nothing once the destination is cleared.
     """
 
     number = next(_ISSUES)
@@ -503,19 +508,19 @@ def test_tracker_started_runs_keep_configured_channel_behavior(stack: Stack) -> 
 
     (root,) = stack.slack.roots(stack.factory_token)
     assert root.params["channel"] == CHANNEL
-    assert f"#{number}" in root.haystack
+    assert root.text.startswith(f"Factory run: {REPO} #{number}"), root.text
     thread = _thread(work_item_id)
     assert (thread["origin"], thread["root_ts"]) == ("configured", root.response["ts"])
-    assert [post["kind"] for post in _posts(work_item_id)] == ["root", "phase"]
-    texts = _thread_texts(stack, root.response["ts"])
-    assert len(texts) == 1 and "Tracker run planned" in texts[0], texts
+    assert [post["kind"] for post in _posts(work_item_id)] == ["root", "card"]
+    assert _texts(stack, root.response["ts"]) == [f"{CARD_POST}#{number}"]
+    assert "Tracker run planned" in _last_card(stack, work_item_id)
 
     _destination(stack, None)
     since = len(stack.slack.calls)
     stack.report(request_id, "implement", "Implemented after clearing")
     stack.finish(request_id, epoch)
     stack.drain(fresh=True)
-    assert _chat_calls_since(stack, since) == []
+    assert _chat_since(stack, since) == []
     for call in stack.slack.calls:
         assert "Implemented after clearing" not in call.haystack
 
@@ -551,3 +556,118 @@ def test_label_enrollment_inactive_renders_the_disconnected_plan_sentence() -> N
         "Refused: acme/widgets #18 · the account has no connected personal Claude plan. "
         "They connect it, then apply the label again."
     )
+
+
+# --- AC4: the card is edited only when it changed, and live edits are spaced ------------
+
+
+def test_progress_card_unchanged_render_sends_no_edit(stack: Stack) -> None:
+    """A pass whose render matches the last acknowledged one sends nothing.
+
+    Even once the spacing has passed, and from a restarted process, a card
+    whose records did not change gets no ``chat.update``.
+    """
+
+    _number, request_id, work_item_id, _epoch, root_ts = _kickoff_run(stack)
+    stack.report(request_id, "plan", "Planned and then quiet")
+    stack.drain()
+    assert len(_card_edits(stack, work_item_id)) == 1
+
+    since = len(stack.slack.calls)
+    stack.drain()
+    assert _chat_since(stack, since) == []
+
+    _age_card(work_item_id)
+    stack.drain()
+    stack.drain(fresh=True)
+    assert _chat_since(stack, since) == []
+    assert len(_card_edits(stack, work_item_id)) == 1
+    assert len(_texts(stack, root_ts)) == 1
+
+
+def test_progress_card_live_edits_are_at_least_30_seconds_apart(stack: Stack) -> None:
+    """A live change inside the spacing waits; once 30 seconds have passed it is sent.
+
+    With the default spacing, a new phase report right after an edit sends no
+    edit. With the last edit recorded 31 seconds earlier, the next pass sends
+    exactly one, carrying the new report.
+    """
+
+    _number, request_id, work_item_id, _epoch, _root_ts = _kickoff_run(stack)
+    stack.report(request_id, "plan", "First step")
+    stack.drain()
+    assert len(_card_edits(stack, work_item_id)) == 1
+
+    stack.report(request_id, "implement", "Second step inside the spacing")
+    since = len(stack.slack.calls)
+    stack.drain()
+    stack.drain(fresh=True)
+    assert _updates_since(stack, since) == []
+
+    _age_card(work_item_id)
+    stack.drain()
+    (edit,) = _updates_since(stack, since)
+    assert edit.params["ts"] == _card_ts(work_item_id)
+    assert "Factory run: working" in edit.haystack
+    assert "Second step inside the spacing" in edit.haystack
+
+    stack.report(request_id, "review_diff", "Third step inside the spacing again")
+    stack.drain()
+    assert len(_updates_since(stack, since)) == 1
+
+
+def test_progress_card_final_render_is_sent_at_once_inside_the_spacing(stack: Stack) -> None:
+    """A run that ends right after an edit gets its final card at once, with its reply."""
+
+    _number, request_id, work_item_id, epoch, root_ts = _kickoff_run(stack)
+    stack.report(request_id, "plan", "About to fail")
+    stack.drain()
+    assert len(_card_edits(stack, work_item_id)) == 1
+
+    stack.finish(request_id, epoch)
+    since = len(stack.slack.calls)
+    stack.drain()
+    (edit,) = _updates_since(stack, since)
+    assert "Factory run: needs a person" in edit.haystack
+    assert "The run ended without a result." in edit.haystack
+    (recorded,) = _rows(
+        "SELECT card_edited_at > now() - interval '30 seconds' AS recent "
+        "FROM curie.factory_slack_threads WHERE work_item_id = :id",
+        {"id": work_item_id},
+    )
+    assert recorded["recent"] is True
+    assert _replies(stack, root_ts, NEEDS_YOU) == [f"{NEEDS_YOU}{cause_text('runner_failed')}"]
+
+
+def test_progress_card_restarted_worker_resends_no_notify_card_post_or_unchanged_edit(
+    stack: Stack,
+) -> None:
+    """A restarted worker resends neither a reply nor the card post, nor an unchanged edit.
+
+    While the run is live, a restarted process past the spacing finds the
+    render unchanged and sends nothing. Once the run ended, its final card and
+    its needs a person reply went out once, and two more restarted processes
+    send nothing at all.
+    """
+
+    _number, request_id, work_item_id, epoch, root_ts = _kickoff_run(stack)
+    stack.report(request_id, "plan", "Live before the restart")
+    stack.drain()
+    _age_card(work_item_id)
+    since = len(stack.slack.calls)
+    stack.drain(fresh=True)
+    assert _chat_since(stack, since) == []
+
+    stack.finish(request_id, epoch)
+    stack.drain()
+    assert _replies(stack, root_ts, NEEDS_YOU) == [f"{NEEDS_YOU}{cause_text('runner_failed')}"]
+    assert len(_card_edits(stack, work_item_id)) == 2
+
+    since = len(stack.slack.calls)
+    stack.drain(fresh=True)
+    stack.drain(fresh=True)
+    assert _chat_since(stack, since) == []
+    assert len(_replies(stack, root_ts, CARD_POST)) == 1
+    assert len(_replies(stack, root_ts, NEEDS_YOU)) == 1
+    assert [post["kind"] for post in _posts(work_item_id)] == ["card", "needs_person"]
+    assert all(post["posted_at"] is not None for post in _posts(work_item_id))
