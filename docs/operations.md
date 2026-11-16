@@ -2148,13 +2148,13 @@ Use it in this order:
 
 A refusal writes nothing and names its code: `stale_version` (read the item
 again), `work_item_cancelled`, `readmit_pending` (a relabel is already
-pending), `active_execution` (a request is waiting, queued or running),
+pending), `active_execution` (a request is waiting, queued, running or being cancelled),
 `no_failed_request` (the newest request completed, expired or was cancelled),
 `teardown_unconfirmed` (a lost run's teardown is not observed yet),
 `allowance_exhausted` (it names the used count and the last cause; nothing here
 adds more), `not_retryable` (for example `no_pull_request`, a denial or
-`budget_exceeded`), `side_effects_unproven` (the failed run was `flagged` or
-`uncertain`) and `admission_refused` (a fence inside the automatic admission
+`budget_exceeded`), `side_effects_unproven` (the failed run was `flagged`,
+`uncertain` or carries no safety fact) and `admission_refused` (a fence inside the automatic admission
 still holds).
 
 Each factory execution request owns exactly one App-authored status comment.
