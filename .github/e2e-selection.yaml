@@ -134,6 +134,7 @@ pytest_impact:
     - examples/tests/test_sre_bot_observability_runtime.py
     - tools/factory-e2e/tests/test_c4_dry_run.py
     - tools/factory-e2e/tests/test_factory_resource_retry.py
+    - tools/factory-e2e/tests/test_factory_retry_live.py
     - tools/ci-retry-gate
     - tools/ci-workflow-paths
     - tools/ci-release-target-parity

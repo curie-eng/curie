@@ -1141,6 +1141,7 @@ def _runtime_exclusions() -> set[tuple[str, str]]:
         ("--ignore", "examples/tests/test_sre_bot_observability_runtime.py"),
         ("--ignore", "tools/factory-e2e/tests/test_c4_dry_run.py"),
         ("--ignore", "tools/factory-e2e/tests/test_factory_resource_retry.py"),
+        ("--ignore", "tools/factory-e2e/tests/test_factory_retry_live.py"),
         ("--ignore", "tools/ci-retry-gate"),
         ("--ignore", "tools/ci-workflow-paths"),
         ("--ignore", "tools/ci-release-target-parity"),

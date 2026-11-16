@@ -152,6 +152,8 @@ tools/factory-e2e/tests/test_factory_e2e.py
 tools/factory-e2e/tests/test_factory_e2e_loop.py
 tools/factory-e2e/tests/test_factory_publication_recovery_live.py
 tools/factory-e2e/tests/test_factory_resource_retry.py
+tools/factory-e2e/tests/test_factory_retry_live.py
+tools/factory-e2e/tests/test_factory_retry_live_support.py
 tools/factory-e2e/tests/test_forge_fault_proxy.py
 tools/factory-e2e/tests/test_forge_instance_harness.py
 tools/factory-e2e/tests/test_gitlab_acceptance.py
