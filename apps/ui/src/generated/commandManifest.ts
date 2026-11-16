@@ -8314,6 +8314,42 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Operator retry of the work item's failed request (`POST /work-items/{id}/retry`). Requires the ID, --request-id, --expected-version and --reason, and --yes for a real call",
+              "id": "rerun",
+              "long": "rerun",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Idempotency key (a UUID) for --rerun; replaying it returns the stored result",
+              "id": "request_id",
+              "long": "request-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The work item version you read (--rerun refuses when it moved)",
+              "id": "expected_version",
+              "long": "expected-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Why the operator reruns it, 1 to 500 characters (--rerun)",
+              "id": "reason",
+              "long": "reason",
+              "positional": false,
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -8356,7 +8392,19 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Print what would be requested and exit without making a request",
+              "help": "Confirm a real --rerun; without it the call is refused",
+              "id": "yes",
+              "long": "yes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be requested and exit without making a request. With --rerun, ask the API for the exact plan and write nothing",
               "id": "dry_run",
               "long": "dry-run",
               "positional": false,

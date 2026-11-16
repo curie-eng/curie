@@ -2170,7 +2170,7 @@ async def terminalize_execution(
         )
         # Before settlement, so the successor keeps the transcript (ADR 0269).
         work_item = await reload_work_item(session, work_item_id)
-        if await _admit_automatic_successor(
+        if await admit_automatic_successor(
             session, work_item, request, origin="ordinary", disposition=disposition
         ):
             work_item = await reload_work_item(session, work_item_id)
@@ -3279,7 +3279,7 @@ async def record_runtime_termination_where(
             settings=get_settings(),
         )
     # Before settlement, so the successor keeps the transcript (ADR 0206).
-    if await _admit_automatic_successor(
+    if await admit_automatic_successor(
         session, work_item, request, origin="owner_loss", disposition=None
     ):
         work_item = await reload_work_item(session, work_item_id)
@@ -3298,7 +3298,7 @@ async def automatic_successor_of(
     return row
 
 
-async def _admit_automatic_successor(
+async def admit_automatic_successor(
     session: AsyncSession,
     work_item: WorkItem,
     predecessor: ExecutionRequest,
@@ -3458,7 +3458,7 @@ async def _admit_publication_recovery(
 ) -> bool:
     """Admit one publication recovery successor for a failed publication (#5429).
 
-    Called from ``_admit_automatic_successor`` after its common refusals, in
+    Called from ``admit_automatic_successor`` after its common refusals, in
     the predecessor's settling transaction. The successor reruns no model, so
     only a worker reported ``uncertain`` effect refuses; ``no_effects``,
     ``flagged`` and an API settlement with no worker fact are allowed. The

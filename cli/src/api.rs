@@ -16,7 +16,7 @@ use crate::api_requests::{
     GroupFilterMutation, MemoryEntryCreate, MemoryGuidanceIn, OperatorMutation,
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
-    RoutingCheckRequest, VersionCreate,
+    RoutingCheckRequest, VersionCreate, WorkItemRetryRequest,
 };
 
 pub struct ApiClient {
@@ -1657,6 +1657,28 @@ pub struct WorkItemOutcome {
     pub requests: Vec<WorkItemRequest>,
 }
 
+/// `WorkItemRetryOut`: the answer to `POST /work-items/{id}/retry` (#5431),
+/// for a real admission, an idempotent replay and a dry run alike. Carried
+/// through verbatim so `--json` is exactly the API's contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemRetry {
+    pub work_item_id: String,
+    pub request_id: String,
+    pub dry_run: bool,
+    pub replayed: bool,
+    pub disposition: String,
+    pub predecessor_request_id: String,
+    pub predecessor_cause: String,
+    pub successor_request_id: Option<String>,
+    pub successor_dispatch_not_before: String,
+    pub successor_blocked_on: Option<String>,
+    pub work_item_version: i64,
+    pub retries_used: i64,
+    pub retry_limit: i64,
+    pub actor_kind: String,
+    pub recorded_at: Option<String>,
+}
+
 /// `WorkItemTrackerOut`: the tracker issue that keys the work item (ADR 0197).
 /// `scope_id` and `issue_id` are the tracker's immutable ids as text;
 /// `display_key` (a Jira key) is display only; `url` is the tracker's own link.
@@ -2459,6 +2481,61 @@ fn mint_channel_token_body(
 /// Both of the failures this guards against happened for real: a CLI with
 /// `--target` against an API that predated the resolver, and a CLI that
 /// applied connectors against an API that could not render them.
+/// The 409 and 404 answers of `POST /work-items/{id}/retry`: a failure (exit
+/// 1) naming the API `code` and `message` with one fix sentence per code.
+fn work_item_retry_refusal(status: reqwest::StatusCode, body: &str) -> crate::exit::CliError {
+    let detail = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("detail").cloned());
+    let field = |name: &str| {
+        detail
+            .as_ref()
+            .and_then(|d| d.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let code = field("code").unwrap_or_else(|| {
+        if status == reqwest::StatusCode::NOT_FOUND {
+            "not_found".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    });
+    let message = field("message");
+    let text = match message {
+        Some(message) => format!("work item retry refused ({code}): {message}"),
+        None => format!("work item retry refused ({code})"),
+    };
+    let fix = match code.as_str() {
+        "stale_version" => {
+            "reread with `curie cluster work-items ID` and pass the current version as --expected-version"
+        }
+        "idempotency_conflict" => {
+            "this --request-id was already used with different facts; use a new --request-id"
+        }
+        "active_execution" => "wait for the active request to finish, then rerun",
+        "allowance_exhausted" => {
+            "no retry authority remains; readmit through the tracker if policy allows"
+        }
+        "not_found" => "run `curie cluster work-items` without an id to list the known work items",
+        "work_item_cancelled" => "a cancelled work item cannot be rerun; readmit it through the tracker",
+        "readmit_pending" => "a readmission is already pending; wait for it to be admitted",
+        "no_failed_request" => {
+            "only a work item whose newest request failed can be rerun; reread it with `curie cluster work-items ID`"
+        }
+        "teardown_unconfirmed" => "wait for the failed request's teardown to be confirmed, then rerun",
+        "not_retryable" => "this failure is not retryable by policy; fix the cause and readmit through the tracker",
+        "side_effects_unproven" => {
+            "the failed request may have had side effects; inspect it before readmitting through the tracker"
+        }
+        "admission_refused" => {
+            "a lifecycle fence refused the admission now; reread the work item and rerun when it clears"
+        }
+        _ => "reread the work item with `curie cluster work-items ID` and check the API message",
+    };
+    crate::exit::CliError::failure(text).with_fix(fix)
+}
+
 fn is_unrouted(status: reqwest::StatusCode, body: &str) -> bool {
     status == reqwest::StatusCode::NOT_FOUND
         && serde_json::from_str::<serde_json::Value>(body)
@@ -4763,6 +4840,64 @@ impl ApiClient {
             .json()
             .await
             .context("decoding the work item")
+    }
+
+    /// Operator retry of a failed work item: `POST /work-items/{id}/retry`
+    /// (#5431). The API owns every refusal; this client names the API `code`
+    /// and `message` and adds a fix per code.
+    pub async fn retry_work_item(
+        &self,
+        work_item_id: &str,
+        body: &WorkItemRetryRequest,
+    ) -> Result<WorkItemRetry> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/work-items/{work_item_id}/retry", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<WorkItemRetryRequest>(body)
+                    .timeout(std::time::Duration::from_secs(60)),
+                "POST /work-items/{id}/retry",
+            )
+            .await?;
+        use reqwest::StatusCode;
+        let status = resp.status();
+        let error = match status {
+            StatusCode::OK => {
+                return resp
+                    .json()
+                    .await
+                    .context("decoding the work item retry answer")
+            }
+            StatusCode::CONFLICT | StatusCode::NOT_FOUND => {
+                let text = resp.text().await.unwrap_or_default();
+                work_item_retry_refusal(status, &text)
+            }
+            StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => {
+                crate::exit::CliError::transient(format!("work item retry failed with {status}"))
+                    .with_fix("retry the same command with the same --request-id; a replay is safe")
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                crate::exit::CliError::failure(format!("work item retry failed with {status}"))
+                    .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API")
+            }
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                let text = resp.text().await.unwrap_or_default();
+                crate::exit::CliError::usage(format!(
+                    "work item retry rejected with {status}: {}",
+                    text.trim()
+                ))
+                .with_fix(
+                    "pass --request-id as a UUID, --expected-version as a positive integer and \
+                     --reason as 1 to 500 characters",
+                )
+            }
+            _ => return Err(Self::expect_ok(resp, "work item retry").await.unwrap_err()),
+        };
+        Err(anyhow::Error::from(error))
     }
 
     /// Status classes for the work item reads (ADR 0021/0041): 404 is a

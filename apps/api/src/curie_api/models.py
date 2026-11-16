@@ -1872,6 +1872,64 @@ class FactoryStatusComment(Base):
     )
 
 
+class WorkItemOperatorRetry(Base):
+    """One operator retry admission and its durable idempotency record (#5431).
+
+    The operator's request UUID is the key. ``facts_sha256`` binds it to the
+    WorkItem, expected version, stripped reason and server derived actor, so
+    a replay with equal facts answers ``result`` and different facts conflict.
+    Only an admission writes a row; refusals and dry runs write nothing.
+    Migration 0176 freezes the CHECKs copied here.
+    """
+
+    __tablename__ = "work_item_operator_retries"
+    __table_args__ = (
+        CheckConstraint(
+            "actor_kind IN ('platform_key', 'console_session')",
+            name="work_item_operator_retries_actor_kind_ck",
+        ),
+        CheckConstraint(
+            "char_length(reason) BETWEEN 1 AND 500",
+            name="work_item_operator_retries_reason_ck",
+        ),
+        CheckConstraint(
+            "disposition IN ('implementation', 'publication_recovery')",
+            name="work_item_operator_retries_disposition_ck",
+        ),
+        CheckConstraint(
+            "expected_version >= 1", name="work_item_operator_retries_expected_version_ck"
+        ),
+        CheckConstraint(
+            "facts_sha256 ~ '^[0-9a-f]{64}$'", name="work_item_operator_retries_facts_sha_ck"
+        ),
+        CheckConstraint(
+            "jsonb_typeof(result) = 'object'", name="work_item_operator_retries_result_ck"
+        ),
+        UniqueConstraint("successor_request_id", name="work_item_operator_retries_successor_key"),
+        Index("ix_work_item_operator_retries_work_item_id", "work_item_id"),
+    )
+
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    actor_kind: Mapped[str] = mapped_column(Text)
+    # ``principal:<id>`` or ``session:<id>`` for a console session; NULL for the key.
+    actor_subject: Mapped[str | None] = mapped_column(Text, default=None)
+    reason: Mapped[str] = mapped_column(Text)
+    expected_version: Mapped[int] = mapped_column(Integer)
+    facts_sha256: Mapped[str] = mapped_column(Text)
+    disposition: Mapped[str] = mapped_column(Text)
+    predecessor_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    successor_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 # Tracker result delivery (ADR 0277, #5585). Migrations 0162 and 0167 (#5586)
 # freeze the CHECKs copied here. No column below except the artifact's ``content`` holds
 # text a proposal submitted: codes are CHECK constrained to snake case, and

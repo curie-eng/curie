@@ -63,8 +63,9 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # Triage handoff storage requires 0171, which stays below this floor.
     # Factory retry allowance columns require 0172, which stays below this floor.
     # Factory resource gate columns require 0174, which stays below this floor.
-    # Publication recovery requests require 0175.
-    assert window == {"schema_min": "0175", "schema_head": "0175"}
+    # Publication recovery requests require 0175, which stays below this floor.
+    # Operator retry records require 0176.
+    assert window == {"schema_min": "0176", "schema_head": "0176"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -95,7 +96,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-56:] == [
+    assert data["revisions"][-57:] == [
         "0095",
         "0096",
         "0097",
@@ -152,6 +153,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0173",
         "0174",
         "0175",
+        "0176",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -204,6 +206,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0173"] == "expand"
     assert kinds["0174"] == "expand"
     assert kinds["0175"] == "expand"
+    assert kinds["0176"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -261,7 +264,7 @@ def test_released_0076_startup_refuses_without_migrating_then_candidate_starts(
                 pass
         assert current_revision() == "0100"
         command.upgrade(alembic_config(), load_window().schema_head)
-        assert current_revision() == "0175"
+        assert current_revision() == "0176"
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200
@@ -302,7 +305,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0175"
+    assert current_revision() == "0176"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]

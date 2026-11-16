@@ -20516,6 +20516,159 @@
         "title": "WorkItemRequestOut",
         "type": "object"
       },
+      "WorkItemRetryIn": {
+        "additionalProperties": false,
+        "description": "An operator's request to admit one fresh request for a failed WorkItem (#5431).\n\n``request_id`` is the operator's idempotency key. ``expected_version`` is\nthe WorkItem version the operator read. ``dry_run`` answers the exact plan\nand writes nothing, reserving neither the key nor a retry slot.",
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "reason": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "expected_version",
+          "reason"
+        ],
+        "title": "WorkItemRetryIn",
+        "type": "object"
+      },
+      "WorkItemRetryOut": {
+        "description": "The admission an operator retry made, would make (dry run) or made before (replay).\n\n``disposition`` is the successor's kind: ``implementation`` reruns the\nwork, ``publication_recovery`` publishes the retained candidate without a\nmodel run. ``retries_used`` counts the slot this admission spends.\n``successor_request_id`` and ``recorded_at`` are null in a dry run.",
+        "properties": {
+          "actor_kind": {
+            "enum": [
+              "platform_key",
+              "console_session"
+            ],
+            "title": "Actor Kind",
+            "type": "string"
+          },
+          "disposition": {
+            "enum": [
+              "implementation",
+              "publication_recovery"
+            ],
+            "title": "Disposition",
+            "type": "string"
+          },
+          "dry_run": {
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "predecessor_cause": {
+            "title": "Predecessor Cause",
+            "type": "string"
+          },
+          "predecessor_request_id": {
+            "format": "uuid",
+            "title": "Predecessor Request Id",
+            "type": "string"
+          },
+          "recorded_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recorded At"
+          },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          },
+          "request_id": {
+            "format": "uuid",
+            "title": "Request Id",
+            "type": "string"
+          },
+          "retries_used": {
+            "title": "Retries Used",
+            "type": "integer"
+          },
+          "retry_limit": {
+            "title": "Retry Limit",
+            "type": "integer"
+          },
+          "successor_blocked_on": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Successor Blocked On"
+          },
+          "successor_dispatch_not_before": {
+            "format": "date-time",
+            "title": "Successor Dispatch Not Before",
+            "type": "string"
+          },
+          "successor_request_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Successor Request Id"
+          },
+          "work_item_id": {
+            "format": "uuid",
+            "title": "Work Item Id",
+            "type": "string"
+          },
+          "work_item_version": {
+            "title": "Work Item Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "work_item_id",
+          "request_id",
+          "dry_run",
+          "replayed",
+          "disposition",
+          "predecessor_request_id",
+          "predecessor_cause",
+          "successor_request_id",
+          "successor_dispatch_not_before",
+          "successor_blocked_on",
+          "work_item_version",
+          "retries_used",
+          "retry_limit",
+          "actor_kind",
+          "recorded_at"
+        ],
+        "title": "WorkItemRetryOut",
+        "type": "object"
+      },
       "WorkItemStageOut": {
         "description": "One stage of the factory progress strip, as the status card shows it.",
         "properties": {
@@ -41054,6 +41207,76 @@
         "summary": "Object Download",
         "tags": [
           "workspace-recovery"
+        ]
+      }
+    },
+    "/work-items/{work_item_id}/retry": {
+      "post": {
+        "description": "Admit one fresh request for a failed WorkItem, as automatic recovery would (#5431).\n\nReruns the automatic successor admission against the newest failed\nrequest, inside the same shared allowance. ``request_id`` makes the call\nidempotent; ``dry_run`` answers the exact plan and writes nothing. The\nactor is the authenticated credential, never the body. Refusals are 409\nwith a named ``code``; a missing WorkItem is 404.",
+        "operationId": "retry_work_item_work_items__work_item_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "work_item_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Work Item Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkItemRetryIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkItemRetryOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retry Work Item",
+        "tags": [
+          "work-items"
         ]
       }
     },

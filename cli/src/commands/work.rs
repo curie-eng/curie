@@ -397,6 +397,102 @@ pub fn validated_work_item_id(id: Option<String>) -> Result<Option<String>> {
     }
 }
 
+/// Validated inputs of `cluster work-items ID --rerun` (#5431).
+pub struct WorkItemRetryOpts {
+    pub id: String,
+    pub request_id: uuid::Uuid,
+    pub expected_version: u64,
+    pub reason: String,
+    pub dry_run: bool,
+}
+
+/// Validate a `--rerun` call before any network access or stdin read: the
+/// ID and request id are UUIDs, the reason is 1 to 500 characters after
+/// trimming, and a real call carries `--yes`.
+pub fn validated_work_item_retry(
+    id: Option<String>,
+    request_id: Option<String>,
+    expected_version: Option<u64>,
+    reason: Option<String>,
+    yes: bool,
+    dry_run: bool,
+) -> Result<WorkItemRetryOpts> {
+    let id = id.ok_or_else(|| crate::exit::usage("--rerun needs the work item ID"))?;
+    let request_id = request_id.ok_or_else(|| crate::exit::usage("--rerun needs --request-id"))?;
+    let expected_version =
+        expected_version.ok_or_else(|| crate::exit::usage("--rerun needs --expected-version"))?;
+    let reason = reason.ok_or_else(|| crate::exit::usage("--rerun needs --reason"))?;
+    let request_id = uuid::Uuid::parse_str(&request_id).map_err(|_| {
+        crate::exit::usage(format!("--request-id must be a UUID, got {request_id:?}"))
+    })?;
+    let reason = reason.trim().to_string();
+    let length = reason.chars().count();
+    if length == 0 || length > 500 {
+        return Err(crate::exit::usage(format!(
+            "--reason must be 1 to 500 characters after trimming, got {length}"
+        )));
+    }
+    if !dry_run && !yes {
+        return Err(crate::exit::usage(
+            "--rerun admits a new request; pass --yes to confirm (or --dry-run to see the plan)",
+        ));
+    }
+    Ok(WorkItemRetryOpts {
+        id,
+        request_id,
+        expected_version,
+        reason,
+        dry_run,
+    })
+}
+
+/// Output of `cluster work-items ID --rerun`: the API's `WorkItemRetryOut`.
+pub struct WorkItemRetryOutput(pub crate::api::WorkItemRetry);
+
+impl crate::ui::CliOutput for WorkItemRetryOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.0).unwrap_or_default()
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        let r = &self.0;
+        let outcome = match (&r.successor_request_id, r.dry_run) {
+            (Some(id), _) => format!("successor {id}"),
+            (None, true) => "dry run: nothing written".to_string(),
+            (None, false) => "no successor".to_string(),
+        };
+        ui.payload(&format!(
+            "{}: {} after {} ({}); retries {}/{}{}",
+            r.work_item_id,
+            r.disposition,
+            r.predecessor_request_id,
+            r.predecessor_cause,
+            r.retries_used,
+            r.retry_limit,
+            if r.replayed { "; replayed" } else { "" },
+        ));
+        ui.payload(&outcome);
+    }
+}
+
+/// `cluster work-items ID --rerun`: `POST /work-items/{id}/retry`.
+pub async fn work_item_retry(
+    api_url: String,
+    api_key: String,
+    opts: WorkItemRetryOpts,
+) -> Result<WorkItemRetryOutput> {
+    let client = ApiClient::new(&api_url, &api_key)?;
+    let body = crate::api_requests::WorkItemRetryRequest {
+        dry_run: Some(opts.dry_run),
+        expected_version: opts.expected_version,
+        reason: opts.reason,
+        request_id: opts.request_id,
+    };
+    Ok(WorkItemRetryOutput(
+        client.retry_work_item(&opts.id, &body).await?,
+    ))
+}
+
 /// Inputs for `<tier> work-items [ID] [--agent NAME_OR_ID]` (#2577).
 pub struct WorkItemsOpts {
     pub api_url: String,
