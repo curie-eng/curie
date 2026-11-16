@@ -529,13 +529,13 @@ def test_a_wait_with_no_scope_key_is_terminal_and_spends_no_retry(
     # credential failure the runner could not scope. No probe could ever
     # release such a wait, so none is admitted (#5424).
     cause, reason, _ = KINDS[kind]
-    ref, _ = _fail_with(gate_api, auth_headers, 54272, cause, _condition(reason, None, None))
+    ref, agent_id = _fail_with(gate_api, auth_headers, 54272, cause, _condition(reason, None, None))
     assert _request(ref.request_id)["retry_condition_scope_key"] is None
     assert _successor(ref.request_id) is None
     assert _used(ref.work_item_id) == 0
 
     # Liveness: the same refusal on a probed scope waits blocked.
-    item = _blocked(gate_api, auth_headers, 54279, kind)
+    item = _blocked(gate_api, auth_headers, 54279, kind, agent_id=agent_id)
     assert _used(item.ref.work_item_id) == 1
 
 
