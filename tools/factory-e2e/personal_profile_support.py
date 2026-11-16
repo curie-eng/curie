@@ -25,6 +25,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -344,21 +345,32 @@ class ChannelScan:
 
 
 class TokenScan:
-    """Counts per channel; records booleans and counts only."""
+    """Counts per channel; records booleans and counts only.
+
+    Scans run on several threads at once (one per followed container log), so
+    every update holds ``_lock``, and a hit only ever sets
+    ``token_bytes_found``: a concurrent miss never writes it back to False.
+    """
 
     def __init__(self, scrubber: Scrubber, channels: Sequence[str] = ()) -> None:
         self.scrubber = scrubber
         self.channels: dict[str, ChannelScan] = {name: ChannelScan() for name in channels}
         self._tails: dict[tuple[str, str], bytes] = {}
+        self._lock = threading.Lock()
 
     def __repr__(self) -> str:
         return "<token scan>"
 
+    def _count(self, channel: str, size: int, hit: bool) -> None:
+        with self._lock:
+            entry = self.channels.setdefault(channel, ChannelScan())
+            entry.scanned_bytes += size
+            if hit:
+                entry.token_bytes_found = True
+
     def scan(self, channel: str, data: bytes) -> bool:
-        entry = self.channels.setdefault(channel, ChannelScan())
-        entry.scanned_bytes += len(data)
         hit = self.scrubber.found(data)
-        entry.token_bytes_found |= hit
+        self._count(channel, len(data), hit)
         return hit
 
     def scan_stream(self, channel: str, key: str, data: bytes) -> bool:
@@ -368,13 +380,13 @@ class TokenScan:
         is scanned again with this chunk; only new bytes are counted.
         """
 
-        entry = self.channels.setdefault(channel, ChannelScan())
-        entry.scanned_bytes += len(data)
-        joined = self._tails.get((channel, key), b"") + data
-        hit = self.scrubber.found(joined)
-        entry.token_bytes_found |= hit
         keep = max(0, self.scrubber.longest() - 1)
-        self._tails[(channel, key)] = joined[-keep:] if keep else b""
+        with self._lock:
+            # One swap: the tail this chunk joins and the tail it leaves.
+            joined = self._tails.get((channel, key), b"") + data
+            self._tails[(channel, key)] = joined[-keep:] if keep else b""
+        hit = self.scrubber.found(joined)
+        self._count(channel, len(data), hit)
         return hit
 
     def as_json(self) -> dict[str, Any]:
@@ -1122,9 +1134,14 @@ class Ledger:
             raise Refusal("arguments_invalid", "--run-id already has a live start")
         self.record("rehearsal", "marker", True)
 
+    def _live_refused(self, db: sqlite3.Connection) -> bool:
+        """A live start is refused on a rehearsal ledger."""
+
+        return self._rehearsal(db)
+
     def begin_live(self, *, now: float, grant_expires_at: float) -> None:
         with self.transaction() as db:
-            if self._rehearsal(db):
+            if self._live_refused(db):
                 raise Refusal("rehearsal_run_id", "--run-id")
             row = db.execute(
                 "SELECT live_starts, live_started_at FROM runs WHERE run_id=?", (self.run_id,)
@@ -1913,6 +1930,9 @@ def settle_attempt(
 # /proc/<pid>/environ; the value never leaves the program. It reads no other
 # variable and no credential file, and the git children get a fresh minimal
 # environment.
+#: Seconds between the harvester's size reports (``harvest_config``).
+HARVEST_SYNC_SECONDS = 0.05
+
 HARVEST_PROGRAM = r"""
 import base64, glob, hashlib, json, os, subprocess, sys, time
 cfg = json.loads(sys.argv[1])
@@ -2084,22 +2104,25 @@ def processes():
             continue
     return {"kind": "process", "count": len(found), "processes": found}
 deadline = time.monotonic() + float(cfg["max_seconds"])
+slow_due = 0.0
 emit(container_credential())
 while True:
     scan_files()
     emit({"kind": "sync", "sizes": dict(offsets), "at": round(time.time(), 3)})
-    scan_reviews()
-    record = workspace()
-    if record != state["workspace"]:
-        state["workspace"] = record
-        emit(record)
-    record = processes()
-    if record != state["process"]:
-        state["process"] = record
-        emit(record)
+    if cfg.get("once") or time.monotonic() >= slow_due:
+        scan_reviews()
+        record = workspace()
+        if record != state["workspace"]:
+            state["workspace"] = record
+            emit(record)
+        record = processes()
+        if record != state["process"]:
+            state["process"] = record
+            emit(record)
+        slow_due = time.monotonic() + float(cfg["interval"])
     if cfg.get("once") or time.monotonic() >= deadline:
         break
-    time.sleep(float(cfg["interval"]))
+    time.sleep(float(cfg["sync_interval"]))
 emit({"kind": "end"})
 """
 
@@ -2113,9 +2136,20 @@ def harvest_config(
     proc_root: str = "/proc",
     git: str = "git",
     interval: float = 0.5,
+    sync_interval: float = HARVEST_SYNC_SECONDS,
     max_seconds: float = LIVE_SECONDS,
     once: bool = False,
 ) -> str:
+    """The harvester's config: transcripts and a size report every ``sync_interval``.
+
+    The workspace, review and process scans (git subprocesses and a /proc walk)
+    run only every ``interval``. The size report is what proves a capture
+    complete after a moment (``HarvestState.terminal_after``), and the product
+    can delete a parked runner's pod within a second of the park, so it is
+    taken often enough that the last one before the container dies follows
+    the park.
+    """
+
     return json.dumps(
         {
             "credential_name": PERSONAL_GRANT_ENV,
@@ -2125,6 +2159,7 @@ def harvest_config(
             "proc_root": proc_root,
             "git": git,
             "interval": interval,
+            "sync_interval": sync_interval,
             "max_seconds": max_seconds,
             "once": once,
             "nonce": nonce,
