@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+import xml.etree.ElementTree as ET
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
+from curie_api.factory_card import HEIGHT, CardInput, render_card
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
-from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
 from curie_api.factory_reply_target import is_issue_follow_up, is_relabel_objective
 from curie_api.forges.github.comments import GitHubMarkedComments, static_token
 from curie_api.forges.github.marked_comments import (
@@ -25,7 +28,8 @@ from curie_api.forges.types import (
     RepositoryRef,
     TrackerIssueRef,
 )
-from curie_api.models import FactoryStatusComment
+from curie_api.models import ExecutionRequestPhaseReport, FactoryStatusComment
+from curie_internal.factory_phase_view import PhaseSlot, PhaseView, StageSlot, phase_view
 
 REQUEST = uuid.UUID("00000000-0000-0000-0000-000000003125")
 CARD = "https://curie.example.com/v1/factory/cards/abc.svg"
@@ -614,3 +618,102 @@ def test_admission_wait_expiry_result_uses_neutral_wording() -> None:
     )
     assert "Cause: capacity_wait_expired" in body
     assert "no runner capacity" not in body
+
+
+BUNDLE_PHASES = (
+    Path(__file__).resolve().parents[3] / "examples" / "dark-factory" / "progress" / "phases.json"
+)
+SVG_NS = "{http://www.w3.org/2000/svg}"
+SEVEN_STAGES = [
+    ("read_issue", "Reading the issue"),
+    ("plan", "Planning the change"),
+    ("plan_review", "Reviewing the plan"),
+    ("implement", "Writing the change"),
+    ("review_diff", "Reviewing the diff"),
+    ("publish", "Opening the pull request"),
+    ("wait_ci", "Waiting for CI"),
+]
+_FULL_RUN = (
+    "read_issue",
+    "pin_criteria",
+    "plan",
+    "plan_review",
+    "failing_test",
+    "implement",
+    "review_diff",
+    "publish",
+    "wait_ci",
+)
+
+
+def _bundle_card(status: str, phases: tuple[str, ...]) -> tuple[PhaseView, str]:
+    declaration = json.loads(BUNDLE_PHASES.read_text())
+    reports = [
+        ExecutionRequestPhaseReport(
+            id=index + 1, execution_request_id=REQUEST, phase=phase, loop_round=None
+        )
+        for index, phase in enumerate(phases)
+    ]
+    terminal = None if status == "running" else status
+    view = phase_view(declaration, reports, status, terminal)
+    now = datetime(2026, 11, 16, 12, 30, 5, tzinfo=UTC)
+    svg = render_card(
+        CardInput(
+            repo="acme-corp/acme-bot",
+            issue_number=42,
+            title="Add Kelvin to the unit converter",
+            revision_pr=None,
+            status=status,
+            publishing=False,
+            started_at=now - timedelta(minutes=12),
+            terminal_at=None if terminal is None else now,
+            now=now,
+            activity=None,
+            note=None,
+            phase_view=view,
+            cause_text=None,
+        )
+    )
+    return view, svg
+
+
+@pytest.mark.parametrize(
+    ("status", "phases", "pill", "states"),
+    [
+        (
+            "running",
+            (*_FULL_RUN, "implement"),
+            "RUNNING",
+            ["done", "done", "done", "current", "done", "pending", "redo"],
+        ),
+        ("completed", _FULL_RUN, "SUCCEEDED", ["done"] * 7),
+    ],
+)
+def test_status_body_embeds_the_card_of_the_seven_bundle_stages(
+    status: str, phases: tuple[str, ...], pill: str, states: list[str]
+) -> None:
+    view, svg = _bundle_card(status, phases)
+    result = (
+        None if status == "running" else "Opened https://github.com/acme-corp/acme-bot/pull/7\n"
+    )
+    body = status_body(
+        request_id=REQUEST, card_url=CARD, pill_label=pill, phase_view=view, result=result
+    )
+    assert f"![Curie status]({CARD})" in body
+    assert f"Status: {pill}" in body
+
+    root = ET.fromstring(svg)
+    groups = [g for g in root.iter(f"{SVG_NS}g") if g.get("data-stage")]
+    assert [g.get("data-stage") for g in groups] == [stage for stage, _label in SEVEN_STAGES]
+    labels = []
+    for group in groups:
+        (label,) = [e for e in group if "label" in (e.get("class") or "").split()]
+        labels.append(" ".join(part.strip() for part in label.itertext() if part.strip()))
+    assert labels == [label for _stage, label in SEVEN_STAGES]
+    assert [(g.get("class") or "").split()[-1] for g in groups] == states
+    # Wrapped labels and round labels stay above the footer line.
+    footer_y = HEIGHT - 16
+    for group in groups:
+        for element in group.iter():
+            if element.get("y") is not None and element.tag != f"{SVG_NS}circle":
+                assert float(element.get("y") or "0") <= footer_y - 15, element.attrib
