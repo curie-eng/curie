@@ -167,9 +167,17 @@ only (traces named `curie-run:...`), so the platform's own request and
 background traces never show up as runs; tokens and cost sum every model call
 outside eval traces.
 
-**Not wired yet (honest stubs, no demo data):** Usage and Settings
-render a `ComingSoon` placeholder (`src/views/wired/WiredStubs.tsx`). These state
-plainly what is not wired yet rather than showing fictional data.
+**Not wired yet (honest stubs, no demo data):** Usage and the Workspace section of
+Settings render a `ComingSoon` placeholder (`src/views/wired/WiredStubs.tsx`). These
+state plainly what is not wired yet rather than showing fictional data.
+
+**Settings paths.** The console has no router. Settings has two sections with paths:
+`/settings` (Workspace) and `/settings/claude-plan` (Claude plan, the frozen route other
+tickets link to). The store pushes the path when the section changes and restores it on
+`popstate` (`src/state/route.ts`). The Claude plan section (`WiredClaudePlan.tsx`) drives
+`GET`, `PUT` and `DELETE /personal-claude/enrollment` with the principal session; it holds
+the pasted token only in component state until the request settles and keeps it out of
+every cache, storage and log.
 
 **API access.** The console never holds the platform key (ADR-0083).
 - A login screen exchanges a code from `curie local console login` or
@@ -243,7 +251,7 @@ Config reference: `.env.example`.
 
 ## Wiring the rest
 
-- The remaining `ComingSoon` stubs (Usage, Settings) each bind to their
+- The remaining `ComingSoon` stubs (Usage, Workspace settings) each bind to their
   API endpoint once it exists; until then they must stay honest stubs, never
   demo data.
 - The Runs path renders the API's `ObservationNode` tree directly.
