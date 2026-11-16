@@ -327,7 +327,10 @@ def _free_port() -> int:
 
 
 def _wait_healthy(url: str, process: subprocess.Popen[bytes], log: pathlib.Path) -> None:
+    # The API is another process with no readiness notification to wait on,
+    # so its health is rechecked on a short pause (as static_shell.wait_until does).
     deadline = time.monotonic() + 120
+    pause = threading.Event()
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(
@@ -340,7 +343,7 @@ def _wait_healthy(url: str, process: subprocess.Popen[bytes], log: pathlib.Path)
                     return
         except (urllib.error.URLError, OSError):
             pass
-        time.sleep(0.5)
+        pause.wait(0.2)
     raise RuntimeError(
         f"the API was not healthy within 120 s\n{log.read_text(errors='replace')[-4000:]}"
     )
