@@ -925,9 +925,41 @@ def test_label_enrollment_inactive_refuses_a_disconnected_plan(
 ) -> None:
     """A linked labeller with no active enrollment is told to connect a plan."""
 
+    guide = (
+        Path(__file__).resolve().parents[3] / "docs/guides/personal-subscription.md"
+    ).read_text()
+    assert "refused `personal_owner_required` before a" not in guide
+    assert "no WorkItem is refused" in guide
+    assert "`not_admitted`" in guide
+    assert "Review feedback with no WorkItem is ignored." in guide
+    assert "admitted as service before the switch" in guide
+
     _client, github, agent = factory
     _personal(monkeypatch)
     _link_labeller(agent, active=False)
+    number = github.plant_issue(age=timedelta(minutes=5))
+    _observe(factory, path, number)
+
+    rows = _notices(number)
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "enrollment_inactive"
+    assert rows[0]["actor_login"] == SENDER
+    visible = _visible_notice(github, number)
+    assert f"`{SENDER}` is linked, but their personal Claude plan is not connected." in visible
+    assert "They connect their plan, then apply the label again." in visible
+    assert _work(number) == []
+    assert _requests(number) == []
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_label_enrollment_inactive_refuses_a_linked_labeller_with_no_enrollment(
+    factory: Any, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A linked labeller with no enrollment row is refused enrollment_inactive."""
+
+    _client, github, agent = factory
+    _personal(monkeypatch)
+    _link_labeller(agent, active=None)
     number = github.plant_issue(age=timedelta(minutes=5))
     _observe(factory, path, number)
 

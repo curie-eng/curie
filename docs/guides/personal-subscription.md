@@ -194,9 +194,11 @@ a declared test driver on a test installation, are in
    `personal_owner_required`. A linked labeller with no active enrollment is
    refused `enrollment_inactive`. Each refusal is answered by an issue comment
    and, when a factory Slack channel is configured, one channel post.
-   Mentioning the app on the issue, or sending review feedback, does not start
-   a personal run. That intake is refused `personal_owner_required` before a
-   WorkItem exists.
+   Mentioning the app on an issue that has no WorkItem is refused
+   `not_admitted`. Review feedback with no WorkItem is ignored. A WorkItem
+   admitted as service before the switch refuses its tracker mentions, review
+   feedback, and Slack steering with `personal_owner_required`. No owner is
+   invented for it.
 2. Ordinary Slack chat that is not a kickoff is refused before a claim or a
    model call: "This installation runs personal subscriptions, and this request
    has no owner to run it as (personal_owner_required). Nothing was started."
