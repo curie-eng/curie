@@ -131,7 +131,9 @@ STARTUP_SECONDS = 600.0
 RECEIPT_SECONDS = 90.0
 ADMISSION_SECONDS = 180.0
 REPLY_SECONDS = 240.0
-TERMINAL_POST_SECONDS = 600.0
+NOTIFY_POST_SECONDS = 600.0
+CARD_SETTLE_SECONDS = 120.0
+PLACEHOLDER_SECONDS = 30.0
 CONTROL_QUIET_SECONDS = 30.0
 TEARDOWN_SECONDS = 600.0
 IDENTITY_SECONDS = 300.0
@@ -2891,6 +2893,7 @@ class LiveRun:
         self.ledger.record("progress", "expected_thread", expected_thread)
         self.wait_until(self.admitted, seconds=ADMISSION_SECONDS, what="the kickoff admission")
         self.record_admission()
+        self.record_placeholder(kit, ts)
 
     def run_grant_probe(self) -> None:
         """Right before the first reservation, recorded under grant_probe before it runs."""
@@ -2977,6 +2980,33 @@ class LiveRun:
         self.ledger.record("admission", "thread", thread)
         self.ledger.record("owner", "work_item_owner", sks.owner_tuple(items[0] if items else None))
         self.ledger.record("owner", "request_owners", [sks.owner_tuple(row) for row in requests])
+
+    def record_placeholder(self, kit: SlackKit, root_ts: str) -> None:
+        """The dispatcher's placeholder: the first reply by Curie under the kickoff mention.
+
+        The progress card edits this message in place, so its ts is the card's ts.
+        Read before the run progresses; None when the dispatcher posted none.
+        """
+
+        found: dict[str, str | None] = {"ts": None}
+
+        def placeholder_seen() -> bool:
+            for message in sks.thread_replies(kit.sender.replies(kit.channel, root_ts), root_ts):
+                if message.get("user") == kit.curie_auth.user_id:
+                    found["ts"] = str(message["ts"])
+                    return True
+            return False
+
+        with contextlib.suppress(StepFailed):
+            self.wait_until(placeholder_seen, seconds=PLACEHOLDER_SECONDS, what="the placeholder")
+        self.ledger.record("progress", "placeholder_ts", found["ts"])
+
+    def card_row(self) -> dict[str, Any]:
+        rows = self.sql(
+            "SELECT card_ts, requester_slack_user FROM curie.factory_slack_threads "
+            f"WHERE work_item_id = '{self.work_item_id}'"
+        )
+        return rows[0] if len(rows) == 1 else {}
 
     def slack_thread(self) -> dict[str, Any] | None:
         rows = self.sql(
@@ -3815,15 +3845,26 @@ class LiveRun:
     def phase_read_back(self) -> None:
         kit = self.require_kit()
 
-        def terminal_settled() -> bool:
+        def notify_settled() -> bool:
             rows = self.post_rows()
-            return any(row.get("kind") == sks.TERMINAL_POST for row in rows) and all(
-                row.get("posted") or row.get("failed") for row in rows
-            )
+            return any(
+                row.get("kind") in (sks.READY_POST, sks.NEEDS_PERSON_POST) for row in rows
+            ) and all(row.get("posted") or row.get("failed") for row in rows)
+
+        def card_settled() -> bool:
+            card_ts = self.card_row().get("card_ts")
+            for message in kit.sender.replies(kit.channel, self.kickoff_ts):
+                if card_ts and message.get("ts") == card_ts:
+                    return sks.card_header(message) in sks.CARD_TERMINAL_HEADERS
+            return False
 
         with contextlib.suppress(StepFailed):
             self.wait_until(
-                terminal_settled, seconds=TERMINAL_POST_SECONDS, what="the terminal post", every=5
+                notify_settled, seconds=NOTIFY_POST_SECONDS, what="the notify reply", every=5
+            )
+        with contextlib.suppress(StepFailed):
+            self.wait_until(
+                card_settled, seconds=CARD_SETTLE_SECONDS, what="the finished card", every=5
             )
         rows = self.post_rows()
         messages = kit.sender.replies(kit.channel, self.kickoff_ts)
@@ -3832,10 +3873,15 @@ class LiveRun:
             f"p.execution_request_id = r.id WHERE r.work_item_id = '{self.work_item_id}'"
         )
         pull_request = False
+        pull_request_url: str | None = None
         for row in publications:
             record = self.publication(sks.sql_uuid(row.get("id")))
             self.track_publication(record)
             pull_request = pull_request or bool(record.get("pr_number") or record.get("pr_url"))
+            if pull_request_url is None and record.get("pr_url"):
+                pull_request_url = str(record["pr_url"])
+        card = self.card_row()
+        bot_user, sender_user = kit.curie_auth.user_id, kit.sender_auth.user_id
         self.ledger.record("progress", "thread", self.slack_thread())
         self.ledger.record(
             "progress",
@@ -3859,12 +3905,35 @@ class LiveRun:
         self.ledger.record(
             "progress", "root_posts", sum(1 for row in rows if row.get("kind") == sks.ROOT_POST)
         )
+        self.ledger.record("progress", "card_ts", card.get("card_ts"))
+        self.ledger.record("progress", "requester_slack_user", card.get("requester_slack_user"))
+        self.ledger.record("progress", "bot_user", bot_user)
+        self.ledger.record("progress", "sender_user", sender_user)
         self.ledger.record(
             "progress",
-            "kickoff_reply_outcome",
-            sks.reply_outcome(messages, author=kit.curie_auth.user_id),
+            "thread_replies",
+            [
+                {
+                    "ts": message.get("ts"),
+                    "user": message.get("user"),
+                    "text": message.get("text"),
+                    "blocks": message.get("blocks"),
+                }
+                for message in sks.thread_replies(messages, self.kickoff_ts)
+            ],
         )
+        self.ledger.record("progress", "pull_request_url", pull_request_url)
         self.ledger.record("progress", "pull_request_exists", pull_request)
+        # The judge prints this dump (`judge --criterion progress`) for the PR body.
+        self.ledger.record(
+            "progress",
+            "thread_dump",
+            sks.anonymize_thread(
+                messages,
+                root_ts=self.kickoff_ts,
+                roles={sender_user: "SENDER", bot_user: "CURIE"},
+            ),
+        )
 
     def publication(self, publication_id: str) -> dict[str, Any]:
         value = self.require_api().get(f"/publications/{publication_id}")
