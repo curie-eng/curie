@@ -127,6 +127,8 @@ class Api:
                     "context": factory_context(AGENT_ID, wake).model_dump(mode="json"),
                     "execution_kind": "implementation",
                     "recovery_candidate_id": None,
+                    "resource_gate": None,
+                    "predecessor_claim_name": None,
                 }
             else:
                 assert body["context"] == self.acquire_grant["context"]
@@ -759,6 +761,7 @@ def test_finish_committed_before_response_loss_settles_without_rerunning(
                     "ci_fix_round": None,
                     "retry_safety": "flagged",
                     "retry_condition": None,
+                    "exhausted_volume": None,
                 }
                 finish_attempts = [body for path, body in api.posts if path.endswith("/finish")]
                 assert len(finish_attempts) == (failed_attempts + 2 if deferred else 2)

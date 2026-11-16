@@ -2489,6 +2489,8 @@ class _FactoryWorkItems(AbsentRequesterContext):
             execution_kind="implementation",
             recovery_candidate_id=None,
             context=factory_context(uuid.UUID("11111111-1111-4111-8111-111111114180"), wake),
+            resource_gate=None,
+            predecessor_claim_name=None,
         )
 
     async def start(

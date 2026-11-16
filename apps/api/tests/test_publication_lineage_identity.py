@@ -494,6 +494,12 @@ def _start_publication_request(
             "claim_name": "publication-claim",
             "sandbox_name": "publication-sandbox",
             "context": acquired.json()["context"],
+            "delivered_limits": {
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         },
         headers=WORKER_HEADERS,
     )

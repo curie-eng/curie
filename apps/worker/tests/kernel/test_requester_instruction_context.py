@@ -90,6 +90,7 @@ from curie_worker.requester_context import (
 )
 from curie_worker.runner_client import RunnerClient
 from curie_worker.sandbox import SandboxHandle
+from curie_worker.sandbox.types import DeliveredLimits
 from curie_worker.workitem_dispatch import WorkItemDispatchClient, WorkItemRun
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -114,6 +115,9 @@ from test_work_item_workspace import (  # noqa: E402
     _Workspace,
 )
 
+UNOBSERVED_LIMITS = DeliveredLimits(
+    memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+).to_wire()
 RUNNER_TOKEN = "requester-context-runner-token"
 CANARY = "CANARY-REQUESTER-BOUNDARY-5592-c41f"
 TEXT = f"{CANARY}\nName tests after the behavior they prove.\n"
@@ -205,7 +209,11 @@ class _Stage:
         return run
 
     async def begin(self, run: WorkItemRun) -> None:
-        await run.start(claim_name=f"claim-{run.request_id.hex[:8]}", sandbox_name="sbx-requester")
+        await run.start(
+            claim_name=f"claim-{run.request_id.hex[:8]}",
+            sandbox_name="sbx-requester",
+            delivered_limits=UNOBSERVED_LIMITS,
+        )
         assert run.runtime_epoch is not None
 
     async def acquired(self, *, selected: bool) -> WorkItemRun:
@@ -418,6 +426,7 @@ async def _assert_failed(
         ci_fix_round=None,
         retry_safety="uncertain",
         retry_condition=None,
+        exhausted_volume=None,
     )
     (row,) = await stage.sql(
         "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",

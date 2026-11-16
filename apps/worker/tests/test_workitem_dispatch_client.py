@@ -13,6 +13,7 @@ import httpx
 import pytest
 from curie_worker import workitem_dispatch
 from curie_worker.binding import FactoryContext, FactoryWake
+from curie_worker.sandbox.types import DeliveredLimits
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemDispatchClient,
@@ -21,6 +22,11 @@ from curie_worker.workitem_dispatch import (
     WorkItemStartRefused,
     WorkItemTransportError,
 )
+
+UNOBSERVED_LIMITS = DeliveredLimits(
+    memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+).to_wire()
+
 
 REQUEST_ID = uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 WORK_ITEM_ID = uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -49,6 +55,8 @@ def _grant() -> WorkItemAcquireGrant:
         execution_kind="implementation",
         recovery_candidate_id=None,
         context=CONTEXT,
+        resource_gate=None,
+        predecessor_claim_name=None,
     )
 
 
@@ -77,6 +85,8 @@ BASE = {
     "context": CONTEXT.model_dump(mode="json"),
     "execution_kind": "implementation",
     "recovery_candidate_id": None,
+    "resource_gate": None,
+    "predecessor_claim_name": None,
 }
 
 
@@ -91,6 +101,7 @@ def test_acquire_grant_carries_the_work_item_repository() -> None:
         "generation", "work_item_id", "conversation_id",
         "wait_deadline", "repository_path", "context",
         "execution_kind", "recovery_candidate_id",
+        "resource_gate", "predecessor_claim_name",
     ],
 )
 def test_acquire_refuses_a_missing_required_field(field: str) -> None:
@@ -232,8 +243,14 @@ def test_acquire_sends_wake_and_initial_authority_explicitly() -> None:
 
 
 def _running_body() -> dict[str, object]:
-    # The running lookup carries no execution kind: only acquire grants one.
-    acquire_only = {"execution_kind", "recovery_candidate_id"}
+    # The running lookup carries no execution kind, gate or fence: only acquire
+    # grants them, and a running request is past its start.
+    acquire_only = {
+        "execution_kind",
+        "recovery_candidate_id",
+        "resource_gate",
+        "predecessor_claim_name",
+    }
     return {
         **{key: value for key, value in BASE.items() if key not in acquire_only},
         "request_id": str(REQUEST_ID),
@@ -451,6 +468,7 @@ def test_run_settlement_retries_transports_but_not_conflicts(
                         ci_fix_round=None,
                         retry_safety="uncertain",
                         retry_condition=None,
+                        exhausted_volume=None,
                     )
                 elif operation == "hold_for_approval":
                     await run.hold_for_approval()
@@ -521,6 +539,7 @@ def test_run_finish_clamps_retry_budget_to_execution_deadline(monkeypatch) -> No
                     ci_fix_round=None,
                     retry_safety="uncertain",
                     retry_condition=None,
+                    exhausted_volume=None,
                 )
         assert 2.9 <= sum(sleeps) <= 3
 
@@ -566,6 +585,7 @@ def test_settlement_empty_transport_message_retains_the_exception_type(
                     ci_fix_round=None,
                     retry_safety="uncertain",
                     retry_condition=None,
+                    exhausted_volume=None,
                     budget_s=3,
                 )
 
@@ -872,7 +892,11 @@ def test_acquire_renewal_stops_after_start_defer_or_close_at_thirty_seconds(
                 await clock.advance(20.0)
                 await clock.advance(30.0)
                 if operation == "start":
-                    await run.start(claim_name="acme-claim", sandbox_name="acme-sandbox")
+                    await run.start(
+                        claim_name="acme-claim",
+                        sandbox_name="acme-sandbox",
+                        delivered_limits=UNOBSERVED_LIMITS,
+                    )
                 elif operation == "defer":
                     await run.defer("thread_busy", capacity=False, start_failure_detail=None)
                 else:
@@ -1007,7 +1031,11 @@ def test_failed_start_keeps_renewing_the_acquisition(
                 await clock.advance(20.0)
                 await clock.advance(30.0)
                 with pytest.raises(WorkItemTransportError):
-                    await run.start(claim_name="acme-claim", sandbox_name="acme-sandbox")
+                    await run.start(
+                        claim_name="acme-claim",
+                        sandbox_name="acme-sandbox",
+                        delivered_limits=UNOBSERVED_LIMITS,
+                    )
                 await clock.advance(40.0)
                 assert seen == [(20.0, "acquire"), (30.0, "start"), (40.0, "acquire")]
                 assert not run.started
@@ -1037,7 +1065,11 @@ def test_a_refused_start_still_records_the_claim_and_sandbox_names(
             run = _renewing_run(_renewal_client(http))
             try:
                 with pytest.raises(WorkItemConflict) as refused:
-                    await run.start(claim_name="acme-claim", sandbox_name="acme-sandbox")
+                    await run.start(
+                        claim_name="acme-claim",
+                        sandbox_name="acme-sandbox",
+                        delivered_limits=UNOBSERVED_LIMITS,
+                    )
                 assert refused.value.code == "not_dispatchable"
                 assert seen == ["start"]
                 assert run.claim_name == "acme-claim"
@@ -1117,7 +1149,11 @@ def test_factory_renewal_refusal_fences_subsequent_start_without_another_http_wr
                     run.ensure_acquired()
                 assert refused.value.code == code
                 with pytest.raises(WorkItemStartRefused) as start_refused:
-                    await run.start(claim_name="owned-claim", sandbox_name="owned-sandbox")
+                    await run.start(
+                        claim_name="owned-claim",
+                        sandbox_name="owned-sandbox",
+                        delivered_limits=UNOBSERVED_LIMITS,
+                    )
                 assert start_refused.value.code == code
                 assert run.claim_name == "owned-claim"
                 assert run.sandbox_name == "owned-sandbox"
@@ -1135,3 +1171,138 @@ def test_factory_renewal_refusal_fences_subsequent_start_without_another_http_wr
                 await run.close()
 
     asyncio.run(go())
+
+
+# --- #5427 resource gate, predecessor fence, delivered limits ------------------
+
+_MEMORY_GATE = {
+    "condition": "memory_limit",
+    "dimension": "memory",
+    "volume": None,
+    "failed_limit": 50331648,
+    "current_limit": None,
+}
+
+
+def test_acquire_grant_carries_the_resource_gate_and_predecessor_claim() -> None:
+    grant = _acquire(
+        {**BASE, "resource_gate": _MEMORY_GATE, "predecessor_claim_name": "curie-thread-old"}
+    )
+    assert grant.resource_gate == workitem_dispatch.ResourceGate(
+        condition="memory_limit",
+        dimension="memory",
+        volume=None,
+        failed_limit=50331648,
+        current_limit=None,
+    )
+    assert grant.predecessor_claim_name == "curie-thread-old"
+    scratch = _acquire(
+        {
+            **BASE,
+            "resource_gate": {
+                **_MEMORY_GATE,
+                "condition": "scratch_limit",
+                "dimension": "scratch",
+                "volume": "workspace",
+                "failed_limit": 8388608,
+            },
+        }
+    )
+    assert scratch.resource_gate is not None
+    assert scratch.resource_gate.volume == "workspace"
+    history = _acquire(
+        {
+            **BASE,
+            "resource_gate": {
+                **_MEMORY_GATE,
+                "condition": "history_capacity",
+                "dimension": "history_capacity",
+                "current_limit": 2048,
+            },
+        }
+    )
+    assert history.resource_gate is not None
+    assert history.resource_gate.current_limit == 2048
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [
+        "memory_limit",
+        {**_MEMORY_GATE, "dimension": "cpu"},
+        {**_MEMORY_GATE, "volume": "workspace"},
+        {**_MEMORY_GATE, "dimension": "scratch"},
+        {**_MEMORY_GATE, "failed_limit": 0},
+        {**_MEMORY_GATE, "failed_limit": True},
+        {**_MEMORY_GATE, "failed_limit": "50331648"},
+        {**_MEMORY_GATE, "current_limit": -1},
+        {**_MEMORY_GATE, "condition": ""},
+        {key: value for key, value in _MEMORY_GATE.items() if key != "current_limit"},
+        {**_MEMORY_GATE, "source_request_id": str(REQUEST_ID)},
+    ],
+)
+def test_acquire_refuses_a_malformed_resource_gate(gate: object) -> None:
+    with pytest.raises(WorkItemTransportError):
+        _acquire({**BASE, "resource_gate": gate})
+
+
+@pytest.mark.parametrize("claim", ["", 7, ["curie-thread-old"]])
+def test_acquire_refuses_an_unusable_predecessor_claim(claim: object) -> None:
+    with pytest.raises(WorkItemTransportError):
+        _acquire({**BASE, "predecessor_claim_name": claim})
+
+
+def test_start_and_finish_send_delivered_limits_and_exhausted_volume() -> None:
+    seen: list[httpx.Request] = []
+    limits = DeliveredLimits(
+        memory_bytes=67108864,
+        ephemeral_storage_bytes=12582912,
+        scratch_bytes={"workspace": 8388608},
+        max_turns=1000,
+    ).to_wire()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/start"):
+            return httpx.Response(
+                200,
+                json={
+                    "runtime_epoch": 1,
+                    "execution_deadline": "2099-01-01T00:00:00+00:00",
+                    "remaining_s": 60.0,
+                    "heartbeat_interval_s": 15.0,
+                },
+            )
+        return httpx.Response(200, json={})
+
+    async def call(client: WorkItemDispatchClient) -> None:
+        await client.start(
+            REQUEST_ID,
+            owner="worker-1",
+            generation=1,
+            claim_name="claim-1",
+            sandbox_name="sandbox-1",
+            context=CONTEXT,
+            delivered_limits=limits,
+        )
+        await client.finish(
+            REQUEST_ID,
+            runtime_epoch=1,
+            outcome="failed",
+            cause="sandbox_scratch_exhausted",
+            detail=None,
+            ci_fix_round=None,
+            retry_safety="no_effects",
+            retry_condition=None,
+            exhausted_volume="workspace",
+        )
+
+    _run(handler, call)
+    start, finish = (json.loads(request.content) for request in seen)
+    assert start["delivered_limits"] == {
+        "memory_bytes": 67108864,
+        "ephemeral_storage_bytes": 12582912,
+        "scratch_bytes": {"workspace": 8388608},
+        "max_turns": 1000,
+    }
+    assert finish["exhausted_volume"] == "workspace"

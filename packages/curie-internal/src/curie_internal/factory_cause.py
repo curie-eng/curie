@@ -37,9 +37,31 @@ _CAUSE_TEXT = {
         "reason below, then retry after addressing the sandbox failure."
     ),
     "workspace_error": "the repository workspace could not be prepared for the run.",
+    # Resource exhaustion the substrate positively identified (#5427). A clean
+    # run retries automatically once the named limit delivered is larger.
+    "sandbox_memory_exhausted": (
+        "the runner ran out of memory. Raise the agent's memory limit with "
+        "curie cluster overrides <agent> --runner-resources; the automatic retry "
+        "starts once the limit delivered to the sandbox is larger."
+    ),
+    "sandbox_storage_exhausted": (
+        "the sandbox ran out of ephemeral storage. Raise the agent's ephemeral-storage "
+        "limit with curie cluster overrides <agent> --runner-resources; the automatic "
+        "retry starts once the limit delivered to the sandbox is larger."
+    ),
+    "sandbox_scratch_exhausted": (
+        "a sandbox scratch volume filled up. Raise that volume's size limit in the "
+        "chart's agentSandbox.resourceProfiles; the automatic retry starts once the "
+        "size delivered to the sandbox is larger."
+    ),
+    "sandbox_node_disrupted": (
+        "the Kubernetes node running the sandbox was disrupted. A run with no side "
+        "effects is retried automatically."
+    ),
     "history_capacity": (
-        "conversation history capacity exceeded. Work may have happened. "
-        "Inspect the result and retry."
+        "conversation history capacity exceeded. Raise api.transcriptMaxThreadBytes "
+        "(TRANSCRIPT_MAX_THREAD_BYTES); a run with no side effects retries automatically "
+        "once the cap is larger. If work may have happened, inspect the result and retry."
     ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
     "runner_error": "the runner reported an error the run could not recover from.",
@@ -53,7 +75,8 @@ _CAUSE_TEXT = {
     ),
     "max_turns": (
         "the run used its whole turn budget. Raise worker.workItemMaxTurns "
-        "(CURIE_WORK_ITEM_MAX_TURNS) to allow more turns, then retry."
+        "(CURIE_WORK_ITEM_MAX_TURNS); a run with no side effects retries automatically "
+        "once the budget is larger. If work may have happened, inspect the result and retry."
     ),
     "runner_failed": "the run ended without a result.",
     "approval_create_failed": (

@@ -613,6 +613,8 @@ def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
                         address="acme/widgets",
                         adapter=None,
                     ),
+                    resource_gate=None,
+                    predecessor_claim_name=None,
                 ),
                 wake=FactoryWake(
                     kind="github", address="acme/widgets", adapter=None,

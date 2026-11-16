@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -18,7 +19,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from curie_api.crud import channels as crud_channels
-from curie_api.workitems import lifecycle
+from curie_api.workitems import lifecycle, resource_gate
 from curie_api.workitems.lifecycle import (
     ExecutionRequestSnapshot,
     RetryConditionFact,
@@ -90,6 +91,14 @@ logger = logging.getLogger(__name__)
 # example the kernel's ``thread_busy`` while another turn holds the thread: it
 # keeps the flat base backoff, is not counted, and never ends the request.
 START_DEFERRAL_REASON_PREFIX = "not_started:"
+# A gated retry's current limit is not yet strictly larger than the one that
+# failed (#5427). The worker defers with it before any sandbox claim, or after
+# a start refused on the gate; it is never counted and waits one probe.
+RESOURCE_GATE_UNMET = "resource_gate_unmet"
+# A fenced successor's predecessor sandbox claim is still present (#5427). The
+# worker defers with it before any claim of its own; it is never counted and
+# waits one probe.
+PREDECESSOR_RUNTIME_PRESENT = "predecessor_runtime_present"
 
 # #4930: the stored bound on a pre-start workspace diagnostic. Redaction runs
 # before the clip, so a clip can never cut a credential into a shape the
@@ -136,6 +145,8 @@ RefusalCode = Literal[
     # in a tracker result; that contract has no pull request to revise
     # (ADR 0277, #5586).
     "tracker_result_no_revision",
+    # A gated retry's start did not deliver a strictly larger limit (#5427).
+    "resource_gate_unmet",
     # Execution owner admission refusals (#5376).
     OwnerRefusalCode,
 ]
@@ -204,6 +215,12 @@ class AcquireGrant:
     # publishes (#5429), read from the request row.
     execution_kind: ExecutionKindName
     recovery_candidate_id: uuid.UUID | None
+    # The resource gate a retry waits on, with the current limit of an API
+    # owned dimension; None for an ungated request (#5427).
+    resource_gate: dict[str, Any] | None
+    # The predecessor's sandbox claim a fenced automatic successor must see
+    # gone before it claims its own; None when no fence applies (#5427).
+    predecessor_claim_name: str | None
 
 
 class FactoryWake(BaseModel):
@@ -752,8 +769,16 @@ async def claim_due(
             ExecutionRequest.status == "waiting",
             ExecutionRequest.wait_deadline > func.clock_timestamp(),
             ExecutionRequest.dispatch_not_before <= func.clock_timestamp(),
-            # A successor blocked on a typed condition is never dispatched (ADR 0269).
-            ExecutionRequest.blocked_on.is_(None),
+            # A successor blocked on a typed condition is never dispatched
+            # (ADR 0269), except a resource gate, which is offered every probe
+            # so the worker can check the current limit (#5427).
+            or_(
+                ExecutionRequest.blocked_on.is_(None),
+                and_(
+                    ExecutionRequest.resource_gate.is_not(None),
+                    ExecutionRequest.blocked_on.in_(sorted(resource_gate.GATE_CONDITIONS)),
+                ),
+            ),
             ExecutionRequest.objective.is_not(None),
             ~exists().where(
                 WorkItem.id == ExecutionRequest.work_item_id,
@@ -1338,6 +1363,18 @@ async def acquire(
                 generation=generation,
                 refusal="not_dispatchable",
             )
+    gate = (
+        None
+        if request.resource_gate is None
+        else resource_gate.grant_view(
+            request.resource_gate,
+            history_capacity_bytes=get_settings().transcript_max_thread_bytes,
+            # Exactly the value a start now would set its deadline from.
+            execution_seconds=await lifecycle.execution_deadline_seconds(
+                session, work_item.agent_id
+            ),
+        )
+    )
     grant = AcquireGrant(
         generation=generation,
         work_item_id=work_item.id,
@@ -1348,9 +1385,32 @@ async def acquire(
         completion_contract=_contract_name(request),
         execution_kind=_execution_kind(request),
         recovery_candidate_id=request.recovery_candidate_id,
+        resource_gate=gate,
+        predecessor_claim_name=await _fenced_predecessor_claim(session, request),
     )
     await session.commit()
     return grant
+
+
+async def _fenced_predecessor_claim(session: AsyncSession, request: ExecutionRequest) -> str | None:
+    """The predecessor claim a resource or node disruption successor fences on.
+
+    The failed attempt's pod and runner must be confirmed absent before the
+    new attempt claims a sandbox (#5427), so the grant names the claim the
+    predecessor recorded at its start.
+    """
+
+    if request.retry_of_request_id is None:
+        return None
+    predecessor = await session.get(ExecutionRequest, request.retry_of_request_id)
+    if predecessor is None:
+        return None
+    if (
+        request.resource_gate is None
+        and predecessor.terminal_cause not in resource_gate.FENCED_PREDECESSOR_CAUSES
+    ):
+        return None
+    return predecessor.runtime_claim_name
 
 
 def _backoff_seconds(settings: Settings, count: int) -> int:
@@ -1406,6 +1466,13 @@ async def defer(
         or request.acquire_expires_at <= now
     ):
         return await _refuse(session, "not_dispatchable", request_id=request.id)
+    if reason == RESOURCE_GATE_UNMET and (capacity or request.resource_gate is None):
+        # Only a gated retry may wait on its gate; anything else would be an
+        # uncounted wait a worker could hold a request in forever.
+        return await _refuse(session, "not_dispatchable", request_id=request.id)
+    if reason == PREDECESSOR_RUNTIME_PRESENT and (capacity or request.retry_of_request_id is None):
+        # Only an automatic successor has a predecessor to fence on.
+        return await _refuse(session, "not_dispatchable", request_id=request.id)
     return await _apply_deferral(
         session,
         work_item,
@@ -1443,6 +1510,8 @@ async def _apply_deferral(
     if capacity:
         delay = _backoff_seconds(settings, request.capacity_deferrals)
         values["capacity_deferrals"] = ExecutionRequest.capacity_deferrals + 1
+    elif reason in (RESOURCE_GATE_UNMET, PREDECESSOR_RUNTIME_PRESENT):
+        delay = settings.work_item_resource_gate_probe_seconds
     elif not counts_as_start:
         delay = settings.work_item_backoff_base_seconds
     else:
@@ -1525,6 +1594,7 @@ async def start(
     claim_name: str,
     sandbox_name: str,
     context: FactoryContext,
+    delivered_limits: Mapping[str, Any],
 ) -> StartResult | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -1596,6 +1666,7 @@ async def start(
             "acquire_owner": None,
             "acquire_expires_at": None,
         },
+        delivered_limits=delivered_limits,
     )
     if isinstance(result, WorkItemConflict):
         mapped = _map_start_conflict(result)
@@ -1654,6 +1725,9 @@ def _map_start_conflict(result: WorkItemConflict) -> RefusalCode:
         # #5378: the worker keeps a personal request waiting on these.
         "enrollment_inactive",
         "enrollment_generation_mismatch",
+        # #5427: the request stays waiting with its acquire held, so the worker
+        # releases its claim and defers ``resource_gate_unmet``.
+        "resource_gate_unmet",
     }:
         return cast(RefusalCode, result.code)
     return "not_dispatchable"
@@ -1944,6 +2018,7 @@ async def finish(
     ci_fix_round: int | None,
     retry_safety: RetrySafety,
     retry_condition: RetryConditionFact | None,
+    exhausted_volume: str | None,
 ) -> WorkItemOutcome | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -1982,6 +2057,7 @@ async def finish(
         extra_where=(ExecutionRequest.runtime_epoch == runtime_epoch,),
         retry_safety=retry_safety,
         retry_condition=retry_condition,
+        exhausted_volume=exhausted_volume,
     )
     if isinstance(result, WorkItemConflict):
         # The conflict path commits and expires this row.

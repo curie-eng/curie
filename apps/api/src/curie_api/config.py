@@ -688,6 +688,17 @@ class Settings(BaseSettings):
             "WORK_ITEM_BACKOFF_MAX_SECONDS",
         ),
     )
+    # How often a retry gated on a raised resource limit is offered again
+    # (#5427): the dispatch delay after its admission and after every
+    # ``resource_gate_unmet`` defer, which is never counted as a start.
+    work_item_resource_gate_probe_seconds: int = Field(
+        default=300,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_RESOURCE_GATE_PROBE_SECONDS",
+            "WORK_ITEM_RESOURCE_GATE_PROBE_SECONDS",
+        ),
+    )
     # How long a sealed tracker result stays owed after submission before it is
     # recorded failed (ADR 0277, #5585). Read only by
     # `factory_tracker_result_delivery.submit_result`; an int, so finite.

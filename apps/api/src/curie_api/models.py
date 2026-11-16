@@ -1465,7 +1465,7 @@ class ExecutionRequest(Base):
             "OR (retry_condition_retry_at IS NULL AND retry_condition_scope_key IS NULL)",
             name="execution_requests_retry_condition_ck",
         ),
-        # Migration 0174 (#5429): a publication recovery request names one
+        # Migration 0175 (#5429): a publication recovery request names one
         # retained candidate by id and digest; a trigger keeps them immutable.
         CheckConstraint(
             "execution_kind IN ('implementation', 'publication_recovery')",
@@ -1487,6 +1487,16 @@ class ExecutionRequest(Base):
         CheckConstraint(
             "recovery_candidate_sha256 IS NULL OR recovery_candidate_sha256 ~ '^[0-9a-f]{64}$'",
             name="execution_requests_recovery_candidate_sha_ck",
+        ),
+        # Migration 0174 (#5427): a delivered limits record and a resource gate
+        # are JSON objects when present, never a JSON null or scalar.
+        CheckConstraint(
+            "delivered_limits IS NULL OR jsonb_typeof(delivered_limits) = 'object'",
+            name="execution_requests_delivered_limits_ck",
+        ),
+        CheckConstraint(
+            "resource_gate IS NULL OR jsonb_typeof(resource_gate) = 'object'",
+            name="execution_requests_resource_gate_ck",
         ),
         UniqueConstraint(
             "work_item_id",
@@ -1640,7 +1650,7 @@ class ExecutionRequest(Base):
         DateTime(timezone=True), default=None
     )
     retry_condition_scope_key: Mapped[str | None] = mapped_column(Text, default=None)
-    # What the request runs (migration 0174, #5429): an ``implementation`` runs
+    # What the request runs (migration 0175, #5429): an ``implementation`` runs
     # the model; a ``publication_recovery`` successor verifies and publishes the
     # retained candidate it names, with no model run. Fixed at admission.
     execution_kind: Mapped[str] = mapped_column(
@@ -1650,6 +1660,16 @@ class ExecutionRequest(Base):
         UUID(as_uuid=True), default=None
     )
     recovery_candidate_sha256: Mapped[str | None] = mapped_column(String(64), default=None)
+    # The limits actually delivered to this request's attempt, recorded by its
+    # start, and the gate an automatic successor of a limit failure waits on
+    # (migration 0174, #5427). ``none_as_null`` keeps a Python None SQL NULL,
+    # which the object-shape checks require.
+    delivered_limits: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
+    resource_gate: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
     # Where the factory status reply lands (ADR 0197 decision fact 4): the
     # tracker issue, a pull request conversation, or one review thread. A
     # revision answers on its pull request; every other request on the issue.
@@ -2807,7 +2827,7 @@ class Publication(Base):
     revision_number: Mapped[int | None] = mapped_column(default=None)
     expected_prior_head: Mapped[str | None] = mapped_column(default=None)
     # The earlier failed revisions of this lineage whose pushed commit this
-    # publication may adopt instead of pushing its own (migration 0174, #5429).
+    # publication may adopt instead of pushing its own (migration 0175, #5429).
     # Computed once at creation; non-empty only for a publication recovery
     # request's publication. A trigger refuses any update.
     adoptable_revision_ids: Mapped[list[uuid.UUID]] = mapped_column(

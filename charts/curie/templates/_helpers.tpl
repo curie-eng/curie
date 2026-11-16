@@ -1,12 +1,4 @@
-{{/*
-Shared template helpers for the Curie umbrella chart.
-
-Naming: every backing store's Service name is derived here so both the store's
-own template and its consumers (Langfuse, the OTel Collector) agree. When a
-store is BYO (`<dep>.deploy: false`), the helper returns the operator-supplied
-host instead of the in-cluster Service name. This is the single-block BYO idiom
-lifted from Langfuse's chart: flip `deploy` and fill `host` on the same block.
-*/}}
+{{/* Shared helpers for the Curie chart. Store Service names are derived here; with `<dep>.deploy: false` (BYO) the operator host is returned. */}}
 
 {{- define "curie.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
@@ -45,9 +37,7 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 {{- end -}}
 
-{{/* Stable labels for backing StatefulSet pod templates. Release metadata
-     stays on the owning objects, while chart and application version labels
-     stay out of pod templates so metadata updates do not restart data pods. */}}
+{{/* Stable labels for backing StatefulSet pod templates; no chart or app version labels, so metadata updates do not restart data pods. */}}
 {{- define "curie.statefulPodLabels" -}}
 app.kubernetes.io/name: {{ include "curie.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
@@ -62,35 +52,7 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
-{{/* Resolve one named placement class. Pass a dict with "root" (the top
-     context) and "class" (the placement class name). Every class lookup in the
-     chart goes through this helper rather than indexing the placement values
-     directly, so that a legacy release whose retained values carry
-     `placement: null` (issue #2008) degrades to the chart's empty defaults
-     instead of crashing the render. Helm's coalescing deletes a null-valued key
-     outright, so when `helm upgrade --reuse-values` replays the stored config of
-     a release created before placement classes existed, the placement map is nil
-     -- even though values.yaml defines all five classes -- and every direct
-     per-class dereference in a template would panic on that nil. The
-     empty-dict substitution on the class lookup itself likewise covers a
-     placement map that is present but missing this class.
-
-     The kind checks are the fail-CLOSED half of that tolerance, and they are
-     not optional: this helper hands its result to consumers as YAML, and
-     Helm's `fromYaml` on a non-map document returns an error map rather than
-     raising, so a malformed class (say `placement.platform: spot`) would
-     resolve `.podLabels`, `.annotations`, and `.nodeSelector` to nothing and
-     render clean -- silently dropping every scheduling constraint the operator
-     meant to apply and letting workloads land on unintended nodes. The
-     pre-#2008 templates dereferenced the class directly and aborted on that
-     shape; refusing here keeps that behavior while still degrading a *nil*
-     placement to the chart's empty defaults. The refusal lives in the template
-     rather than in `values.schema.json` because that schema is deliberately
-     permissive and does not type `placement` at all (see charts/curie/CLAUDE.md),
-     so a template-level refusal is this chart's established backstop for the
-     gap. Note the kind tests use `kindIs`/`kindOf` and not truthiness: an
-     `and $class (...)` guard would read a `false` or `0` class as absent and
-     default it away, which is the same fail-open bug in a different costume. */}}
+{{/* Resolve one placement class (dict: root, class); never index placement directly, since `placement: null` on legacy releases (#2008) must degrade to empty defaults. A non-map class is refused so constraints are never silently dropped. */}}
 {{- define "curie.placement.class" -}}
 {{- $classes := .root.Values.placement | default dict -}}
 {{- if not (kindIs "map" $classes) -}}
@@ -138,13 +100,7 @@ affinity:
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
 {{- end -}}
 
-{{/* ---- Chart-owned runner token Secret name (issue #3821) ----
-     The warm-pod runner bearer lives in its own chart-owned Secret,
-     independent of every `existingSecret` override, so a BYO credentials
-     Secret never has to carry it. runner-token.yaml renders it, and
-     agent-sandbox.yaml (through `curie.sandboxTemplate`: the generic template,
-     every per-agent template, and the security probe fixtures) references it,
-     both by this one name. */}}
+{{/* Chart-owned runner token Secret name (#3821), independent of every existingSecret override. */}}
 {{- define "curie.runnerTokenSecretName" -}}
 {{- printf "%s-runner-token" (include "curie.fullname" .) -}}
 {{- end -}}
@@ -159,49 +115,23 @@ affinity:
 {{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{/* ADR 0217: the per-run Docker daemon namespace. factory.docker is read
-     through default dict because it is nil under --reuse-values for a release
-     that predates it. */}}
+{{/* ADR 0217: per-run Docker daemon namespace; factory.docker is read through default dict for --reuse-values. */}}
 {{- define "curie.factory.dockerNamespace" -}}
 {{- $docker := get (.Values.factory | default dict) "docker" | default dict -}}
 {{- get $docker "namespace" | default (printf "%s-%s-docker" .Release.Namespace (include "curie.fullname" .)) | toString | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{/* ---- Reserved connector-secret boot-env names (#457, ADR-0009) ----
-     The non-CURIE_-prefixed runner credential keys a per-agent connector
-     secret must never declare, kept in list-parity with the Python source of
-     truth in packages/plugin-format (module reserved_env). This is the
-     unavoidable second copy -- Helm cannot import Python -- so the completeness
-     pin apps/worker/tests/binding/test_reserved_boot_env_pin.py parses THIS
-     define's body and fails CI if the two lists drift.
-
-     IMPORTANT: the pin scans this body for env-name-shaped uppercase tokens, so
-     the body must contain EXACTLY the enumerated keys and no other stray ones (this
-     comment lives OUTSIDE the define so it is never scanned): the four runner
-     credential keys plus the transport-control keys. The whole
-     CURIE_ namespace is fenced separately by the hasPrefix rule in the
-     connector-secret guard, so it is intentionally absent here. Emitted
-     space-separated for consumption via `splitList " "`. */}}
+{{/* Reserved connector-secret boot-env names (#457, ADR-0009), parity copy of plugin-format reserved_env. test_reserved_boot_env_pin.py parses this body: keep exactly the enumerated keys. */}}
 {{- define "curie.reservedConnectorSecretNames" -}}
 ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY ALL_PROXY SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED NODE_OPTIONS ANTHROPIC_CUSTOM_HEADERS https_proxy http_proxy all_proxy ssl_cert_file ssl_cert_dir node_extra_ca_certs node_tls_reject_unauthorized node_options anthropic_custom_headers
 {{- end -}}
 
-{{/* @spec ACTION-EXECUTOR-16: the reserved snapshot sealing key names. The
-     source of truth is packages/curie-internal (module sealing_key); Helm
-     cannot import Python, so this is the second copy. Kept apart from
-     curie.reservedConnectorSecretNames because these are not boot-env names:
-     they are refused for a different reason (key custody) with a different
-     message, and the boot-env drift pin scans that define exactly. Emitted
-     space-separated for consumption via `splitList " "`. */}}
+{{/* @spec ACTION-EXECUTOR-16: reserved snapshot sealing key names, kept apart from the boot-env drift-pinned define. */}}
 {{- define "curie.sealingKeyNames" -}}
 SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED
 {{- end -}}
 
-{{/* Per-agent literal runner environment. Missing values stay empty on retained
-     releases. Environment names follow plugin_format.reserved_env.SECRET_NAME_RE
-     in the frozen plugin-format package: uppercase letters, digits and
-     underscores, with a letter or underscore first. Credential and telemetry
-     names have their own configuration paths. */}}
+{{/* Per-agent literal runner environment; names follow plugin_format.reserved_env.SECRET_NAME_RE. */}}
 {{- define "curie.agentSandboxRunnerEnv" -}}
 {{- $env := dict -}}
 {{- if hasKey .Values.agentSandbox "runnerEnv" -}}
@@ -246,29 +176,7 @@ SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED
 {{- end -}}
 {{- end -}}
 
-{{/* Per-driver TLS query suffix for a Postgres DSN (#2431, #2507). ONE helper,
-     included from BOTH curie.env.postgres (SQLAlchemy/asyncpg: ?ssl=require)
-     and curie.langfuse.env (Prisma: ?sslmode=require&sslaccept=accept_invalid_certs):
-     the two driver families disagree on the spelling, so an operator cannot
-     put a suffix in postgres.auth.database.
-
-     Empty (the default, and a missing key on --reuse-values of a release
-     created before this existed) renders nothing, so an existing in-cluster
-     install is byte-identical on upgrade. "require" is the only other
-     accepted value; everything else, including false and 0, which Sprig
-     default would swallow, fails at render naming postgres.sslMode. The
-     value is read raw for that reason.
-
-     Why the deploy guard. The in-chart Postgres StatefulSet serves no TLS
-     listener, so sslMode=require against it would break every consumer at
-     once behind a healthy-looking manifest. Refuse at render, naming both
-     keys. Neither rendered suffix verifies the server certificate; a
-     verify-full mode needs a mounted CA bundle and is a second step (#2508).
-
-     Why not sslmode=no-verify for Prisma. Prisma/quaint accepts only
-     disable|prefer|require; an unknown value is logged at debug and treated
-     as prefer, so #2476's no-verify suffix did not enforce TLS. sslaccept=
-     accept_invalid_certs is the no-CA posture matching asyncpg ssl=require. */}}
+{{/* Per-driver TLS suffix for a Postgres DSN (#2431, #2507), shared by curie.env.postgres and curie.langfuse.env. Only "require" is accepted (read raw). Refused with the in-chart Postgres (no TLS). No certificate verification (#2508, #2476). */}}
 {{- define "curie.postgres.dsnParams" -}}
 {{- $root := required "curie.postgres.dsnParams requires root" .root -}}
 {{- $driver := required "curie.postgres.dsnParams requires driver" .driver -}}
@@ -296,25 +204,7 @@ SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED
 {{- end -}}
 {{- end -}}
 
-{{/* Whether consumers reach Valkey over TLS, as the literal string "true" or
-     "false" (#2315). ONE helper, included from BOTH curie.env.valkey and
-     curie.langfuse.env: the bug class this chart has hit twice (#2052, #2327)
-     is "two consumer groups read the same valkey.* field and only one of them
-     was updated", and a shared helper makes that divergence structurally
-     impossible rather than merely tested against.
-
-     Why the guard. The in-chart valkey/valkey:8-alpine StatefulSet is started
-     with --requirepass and serves no TLS listener, so rendering TLS against it
-     would break every consumer at once behind a perfectly healthy-looking
-     manifest and no failing preflight -- silent and total. Refuse at render
-     time instead, naming both keys and both ways out.
-
-     Why toString. Go templates read any non-empty string as truthy, so a
-     quoted "false" arriving from --set-string would otherwise turn TLS on
-     against a cleartext store; this is the same scar curie.managedSecret
-     carries for security.allowDevDefaults. A nil -- a --reuse-values upgrade
-     of a release created before this key existed coalesces it away -- is not
-     "true" either, and renders the pre-change "false". */}}
+{{/* Whether consumers reach Valkey over TLS, "true" or "false" (#2315). One helper for curie.env.valkey and curie.langfuse.env so groups cannot diverge (#2052, #2327). Refused against the in-chart Valkey. */}}
 {{- define "curie.valkey.tls" -}}
 {{- $tls := eq (toString .Values.valkey.tls) "true" -}}
 {{- if and $tls .Values.valkey.deploy -}}
@@ -331,11 +221,7 @@ SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED
 {{- end -}}
 {{- end -}}
 
-{{/* URL scheme for the ClickHouse endpoint Langfuse connects to (#2314).
-     Same shape as curie.rustfs.scheme (#1447): an explicit clickhouse.scheme
-     wins, otherwise a BYO server on the conventional ClickHouse HTTPS port
-     (8443) is assumed to speak TLS and everything else stays cleartext. The
-     chart-owned server is always http. */}}
+{{/* ClickHouse URL scheme for Langfuse (#2314), like curie.rustfs.scheme (#1447): explicit clickhouse.scheme, else 8443 is TLS, else http. */}}
 {{- define "curie.clickhouse.scheme" -}}
 {{- $scheme := .Values.clickhouse.scheme | default "" -}}
 {{- if $scheme -}}
@@ -350,24 +236,17 @@ http
 {{- end -}}
 {{- end -}}
 
-{{/* The one HTTP endpoint every ClickHouse consumer uses. Call sites include
-     this helper rather than re-composing scheme://host:port (#2314). */}}
+{{/* The one HTTP endpoint every ClickHouse consumer uses; do not re-compose scheme://host:port (#2314). */}}
 {{- define "curie.clickhouse.httpUrl" -}}
 {{- include "curie.clickhouse.scheme" . }}://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.httpPort }}
 {{- end -}}
 
-{{/* Langfuse's ClickHouse migration DSN, on the native port. Deliberately
-     bare: Langfuse's `up.sh` appends its own query string
-     (`${CLICKHOUSE_MIGRATION_URL}?username=...`), so anything added here would
-     produce two `?` and break the migration. TLS is selected out of band by
-     CLICKHOUSE_MIGRATION_SSL (curie.clickhouse.migrationSsl). */}}
+{{/* Langfuse ClickHouse migration DSN on the native port. Keep it bare: Langfuse's up.sh appends its own query string. */}}
 {{- define "curie.clickhouse.migrationUrl" -}}
 clickhouse://{{ include "curie.clickhouse.host" . }}:{{ .Values.clickhouse.nativePort }}
 {{- end -}}
 
-{{/* Whether the Langfuse migration connection on the native port uses TLS
-     (#2314). Tracks the HTTP scheme: a TLS ClickHouse endpoint terminates TLS
-     on both ports. */}}
+{{/* Whether the Langfuse migration connection on the native port uses TLS (#2314); tracks the HTTP scheme. */}}
 {{- define "curie.clickhouse.migrationSsl" -}}
 {{- if eq (include "curie.clickhouse.scheme" .) "https" -}}
 true
@@ -445,15 +324,7 @@ http
 {{- include "curie.rustfs.scheme" . }}://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
 {{- end -}}
 
-{{/* Storage request for the RustFS `data` claim template (#4408).
-
-     StatefulSet volumeClaimTemplates are immutable, so rendering a new default
-     size against an existing StatefulSet fails every `helm upgrade` that picks
-     up chart defaults. Given the StatefulSet `lookup` returned (an empty dict
-     on a fresh install or under `helm template`/Argo CD), this returns the
-     storage its `data` claim template already requests, else `default`. A
-     pure function of its arguments, so the CI script drives it with a
-     fixture. */}}
+{{/* RustFS data claim storage request (#4408). volumeClaimTemplates are immutable, so keep the existing StatefulSet's size, else default. */}}
 {{- define "curie.rustfs.claimSize" -}}
 {{- $size := "" -}}
 {{- range (dig "spec" "volumeClaimTemplates" list (.statefulSet | default dict)) -}}
@@ -464,26 +335,7 @@ http
 {{- $size | default .default -}}
 {{- end -}}
 
-{{/* Whether the object-store clients (api, worker, and the sandbox
-     bundle-fetch init container) present static credentials.
-
-     Non-empty when `rustfs.auth.accessKey` is set, which is the default and the
-     only mode the in-chart RustFS supports. Empty when the operator cleared it,
-     which is the BYO key-free path (#1325): every credential env var is omitted
-     so the AWS SDK falls through its provider chain to the web-identity
-     provider (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`), fed by a
-     projected ServiceAccount token.
-
-     Web identity is the ONLY key-free path this chart supports, deliberately.
-     The instinct on AWS is to drop the keys and let the node's instance role
-     answer, and that must not be made to work here: Rail 1 denies
-     169.254.169.254 by construction, and `security-networkpolicy.yaml` computes
-     an `except` so a broad operator `allowedEgress` CIDR cannot re-permit the
-     metadata address. NetworkPolicy selects pods, not containers, so opening
-     IMDS for the bundle-fetch init container would also open it for the runner
-     -- a prompt-injectable agent -- handing it the node's IAM role. Web
-     identity reads a mounted token instead of a network endpoint, so it needs
-     no metadata access and leaves Rail 1 intact. */}}
+{{/* Whether object-store clients present static credentials. Empty rustfs.auth.accessKey is the BYO key-free path (#1325): credential env is omitted and the SDK uses web identity. Web identity is the only key-free path; do not make the node instance role work, since Rail 1 denies 169.254.169.254 and IMDS would expose the node IAM role to the runner. */}}
 {{- define "curie.rustfs.staticCredentials" -}}
 {{- if .Values.rustfs.auth.accessKey -}}
 {{- if and .Values.rustfs.deploy (not .Values.rustfs.existingSecret) (not .Values.rustfs.auth.secretKey) -}}
@@ -503,10 +355,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* URL scheme for the Langfuse endpoint every consumer talks to (#2314).
-     Same shape as curie.rustfs.scheme (#1447): an explicit langfuse.scheme
-     wins, otherwise a BYO endpoint on 443 is assumed to speak TLS and
-     everything else stays cleartext. The chart-owned Service is always http. */}}
+{{/* Langfuse URL scheme (#2314), like curie.rustfs.scheme (#1447): explicit langfuse.scheme, else BYO on 443 is TLS, else http. */}}
 {{- define "curie.langfuse.scheme" -}}
 {{- $scheme := .Values.langfuse.scheme | default "" -}}
 {{- if $scheme -}}
@@ -521,49 +370,22 @@ http
 {{- end -}}
 {{- end -}}
 
-{{/* The one Langfuse base URL. Call sites include this helper rather than
-     re-composing scheme://host:port, which is how the hardcoded `http://`
-     reached five consumers at once (#2314). */}}
+{{/* The one Langfuse base URL; call sites include this helper rather than re-composing scheme://host:port (#2314). */}}
 {{- define "curie.langfuse.url" -}}
 {{- include "curie.langfuse.scheme" . }}://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
 {{- end -}}
 
-{{/* Shared ServiceAccount name for both Langfuse Deployments. Empty
-     langfuse.serviceAccount.name falls back to <release>-langfuse so a
-     key-free install can bind one role without duplicating the name on
-     web and worker (#2211). */}}
+{{/* Shared ServiceAccount name for both Langfuse Deployments; empty langfuse.serviceAccount.name falls back to <release>-langfuse (#2211). */}}
 {{- define "curie.langfuse.serviceAccountName" -}}
 {{- .Values.langfuse.serviceAccount.name | default (printf "%s-langfuse" (include "curie.fullname" .)) -}}
 {{- end -}}
 
-{{/* Base URL of the platform API for a first-party service that calls it. Call
-     with a dict: root (the top context) and baseUrl (the caller's own BYO
-     override). An empty override derives the in-chart API Service; a set value
-     renders verbatim and is the BYO answer, including when api.deploy is false.
-     Keep this separate from curie.env.api so callers such as the mail adapter
-     can receive the API URL without also receiving the platform API key. */}}
+{{/* Platform API base URL for first-party callers (dict: root, baseUrl BYO override); separate from curie.env.api so callers do not get the API key. */}}
 {{- define "curie.api.url" -}}
 {{- .baseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .root) .root.Values.api.service.port) -}}
 {{- end -}}
 
-{{/* base64("<publicKey>:<secretKey>") for the OTel Collector config checksum,
-     and the operand the default-credential gate judges. The header this chart
-     actually emits is resolved in secrets.yaml, from the managed-secret value
-     of the Langfuse init project secret key; this helper composes from the raw
-     .Values inputs instead, so a generated per-release credential does not
-     churn the checksum.
-
-     Three branches (issue #1563):
-       1. the operator override wins whenever it is set;
-       2. when the collector reads a Secret this chart does not manage, this
-          renders EMPTY. The header lives in the operator's Secret, which a
-          .Values composition cannot read, so the helper must report only what
-          this chart actually ships and never a dev-key-derived value the chart
-          puts nowhere. Deciding that off curie.otlpAuthHeaderSecretName is also
-          what keeps this helper and the secrets.yaml emission condition the
-          same decision;
-       3. otherwise the chart-managed Secret is the one the collector reads, so
-          the header derives from the Langfuse init keys. */}}
+{{/* base64(publicKey:secretKey) for the collector checksum and default-credential gate (#1563), from raw .Values so generated credentials do not churn it. Empty when the collector reads a Secret this chart does not manage. */}}
 {{- define "curie.otlpAuthHeader" -}}
 {{- if .Values.otelCollector.otlpAuthHeader -}}
 {{- .Values.otelCollector.otlpAuthHeader -}}
@@ -573,13 +395,7 @@ http
 {{- end -}}
 {{- end -}}
 
-{{/* Secret the OTel Collector reads its otlpAuthHeader key from. An explicit
-     otelCollector.otlpAuthHeader materialises into the chart-managed Secret, so
-     that override reads from the chart's own Secret; otherwise the collector
-     follows the same BYO idiom as every other Langfuse consumer (#169).
-     This MUST agree with the otlpAuthHeader emission condition in secrets.yaml:
-     they are the same decision written twice, and disagreement is the desync
-     issue #1563 closes. */}}
+{{/* Secret the collector reads otlpAuthHeader from: the chart Secret when otelCollector.otlpAuthHeader is set, else Langfuse BYO (#169). Must agree with secrets.yaml (#1563). */}}
 {{- define "curie.otlpAuthHeaderSecretName" -}}
 {{- if .Values.otelCollector.otlpAuthHeader -}}
 {{- include "curie.secretName" . -}}
@@ -588,9 +404,7 @@ http
 {{- end -}}
 {{- end -}}
 
-{{/* Reject absent, malformed, negative, and zero-equivalent retry durations.
-     Keep max_interval and max_elapsed_time on this one validation path so the
-     finite retry bound cannot harden one field while leaving its sibling open. */}}
+{{/* Reject absent, malformed, negative and zero-equivalent retry durations; keep max_interval and max_elapsed_time on this one validation path. */}}
 {{- define "curie.otelCollector.requirePositiveDuration" -}}
 {{- $value := trim (toString .value) -}}
 {{- $durationPattern := "^\\+?(?:(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:ns|us|µs|μs|ms|s|m|h))+$" -}}
@@ -647,9 +461,7 @@ http
 {{- $_ := set $seenTraceProcessors $processor true -}}
 {{- end -}}
 {{- $builtInExporters := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true -}}
-{{- /* Reserve built-in names even when the development-only debug exporter is disabled.
-      An extra exporter with one of these keys would otherwise replace chart-owned
-      configuration in the rendered ConfigMap. */ -}}
+{{- /* Reserve built-in exporter names even when the debug exporter is disabled, so an extra exporter cannot replace chart-owned configuration. */ -}}
 {{- $reservedExporterNames := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true "debug" true -}}
 {{- if $debugEnabled -}}
 {{- $_ := set $builtInExporters "debug" true -}}
@@ -669,17 +481,14 @@ http
 {{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
 {{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
 {{- end -}}
-{{- /* traces/langfuse always exports the filtered stream to Langfuse. The
-     unfiltered traces pipeline exists only for debug and extra trace exporters,
-     which still want platform spans (#5496). */ -}}
+{{- /* traces/langfuse always exports the filtered stream to Langfuse; the unfiltered pipeline is for debug and extra exporters (#5496). */ -}}
 {{- $extraTraceExporters := .Values.otelCollector.extraPipelineExporters | default list -}}
 {{- $unfilteredTraceExporters := list -}}
 {{- if $debugEnabled -}}
 {{- $unfilteredTraceExporters = append $unfilteredTraceExporters "debug" -}}
 {{- end -}}
 {{- $unfilteredTraceExporters = concat $unfilteredTraceExporters $extraTraceExporters -}}
-{{- /* @spec charts/curie/README.md: Collector exporters without exporterhelper.
-     Keep each exemption explicit, documented, and attached to a configured exporter. */ -}}
+{{- /* @spec charts/curie/README.md: Collector exporters without exporterhelper. Keep each exemption explicit, documented, and attached to a configured exporter. */ -}}
 {{- $noHelper := .Values.otelCollector.exportersWithoutExporterHelper | default dict -}}
 {{- range $name, $reason := $noHelper -}}
 {{- if not (hasKey $.Values.otelCollector.extraExporters $name) -}}
@@ -877,10 +686,7 @@ service:
       exporters: [nop/metrics{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraMetricPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
 
-{{/* Chart-owned OTLP destination (#1819). In-cluster Service while deploy is
-     true; otelCollector.endpoint when the operator brings their own collector.
-     Empty when telemetry is explicitly disabled or when no-endpoint mode is
-     valid (gate off, deploy false, endpoint empty). */}}
+{{/* Chart-owned OTLP destination (#1819): in-cluster Service while deploy is true, else otelCollector.endpoint; empty when telemetry is disabled. */}}
 {{- define "curie.otel.endpoint" -}}
 {{- if .Values.otelCollector.deploy -}}
 http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
@@ -889,13 +695,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- end -}}
 {{- end -}}
 
-{{/* Fail closed on contradictory OTEL values always. Fail closed on accidental
-     missing only when security.checkDefaultCredentials is on: local/offline
-     no-endpoint remains valid outside that gate. The instrumented set is
-     exactly the workloads that include curie.env.otel, recorded in
-     charts/curie/CLAUDE.md; extraEnv-only does not satisfy the production gate
-     because it would configure each of them independently and any one can
-     drift. */}}
+{{/* Fail closed on contradictory OTEL values always; on accidental missing only when security.checkDefaultCredentials is on. */}}
 {{- define "curie.otel.validate" -}}
 {{- $otel := .Values.otelCollector -}}
 {{- if and $otel.telemetryDisabled $otel.deploy -}}
@@ -933,9 +733,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- end -}}
 {{- end -}}
 
-{{/* Standard OTEL_EXPORTER_OTLP_* env for every instrumented workload. extraEnv
-     still wins per variable. Include with nindent 12. Call with
-     dict "root" $ "extraEnv" .Values.<workload>.extraEnv */}}
+{{/* Standard OTEL_EXPORTER_OTLP_* env for every instrumented workload; extraEnv wins per variable. nindent 12. Dict: root, extraEnv. */}}
 {{- define "curie.env.otel" -}}
 {{- include "curie.otel.validate" .root -}}
 {{- $extra := .extraEnv | default list -}}
@@ -978,42 +776,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- end }}
 {{- end -}}
 
-{{/* ---- Default-credential gate (issue #198) ----
-     When security.checkDefaultCredentials is on, refuse to render if a Langfuse
-     chart input for a bootstrap identity still carries the published dev default
-     from values.yaml. The first two checks compare INPUTS, before managed secret
-     resolution: with security.allowDevDefaults on, that input is what ships, and
-     an operator who leaves the published value in a values file has said what
-     they intend regardless of what the sealed path would have generated. These
-     init identities seed the org/project on first boot (a different lifecycle
-     from the nine store/control-plane secrets), so #57 deliberately excludes them
-     from its render-time gate; this closes that gap. The published admin password
-     is a Langfuse admin-takeover risk on a reachable UI, and on the path where
-     the chart-managed Secret is the one the collector reads, the project secret
-     key also feeds the OTel Collector auth header. The operator clears these two
-     checks by overriding the value or pointing langfuse.existingSecret at a
-     Secret this chart does not manage (the #169 secretKeyRef escape carries both
-     keys, and on that path the operator's Secret supplies otlpAuthHeader
-     directly).
-
-     The guard is "does the chart-managed Secret still supply these credentials",
-     written with the same existingSecret-defaults-to-our-own-Secret idiom every
-     other consumer uses, NOT "is existingSecret non-empty". Naming the chart's
-     own Secret changes nothing about where the credentials come from: the chart
-     still fills those keys from the langfuse.init values, so the checks have to
-     run there. Guarding on non-emptiness disabled the check on a path that ships
-     a default credential.
-
-     The third check, on the rendered collector header (issue #1563), is
-     unconditional: langfuse.existingSecret does NOT clear it, because that
-     header ships to the collector whatever the Langfuse credential source is,
-     whether it came from an otelCollector.otlpAuthHeader override or the chart
-     composed it from the langfuse.init keys.
-
-     Off by default so the flagship zero-secret bare install stays green and the
-     dev/e2e overlays render unchanged; flip it on for a shared/production
-     cluster. #57 will fold the store/control-plane secrets into this same helper
-     (hence the general name) once its design pass lands. */}}
+{{/* Default-credential gate (#198): with security.checkDefaultCredentials on, refuse a Langfuse bootstrap input carrying the published dev default. The first two checks compare inputs and are cleared by an override or an existingSecret this chart does not manage (#169); do not guard on existingSecret merely being non-empty. The third, on the rendered collector header (#1563), is unconditional. */}}
 {{- define "curie.checkDefaultCredentials" -}}
 {{- if .Values.security.checkDefaultCredentials -}}
 {{- if eq (include "curie.storeSecretName" (dict "root" . "store" .Values.langfuse)) (include "curie.secretName" .) -}}
@@ -1024,48 +787,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- fail "security.checkDefaultCredentials is on but langfuse.init.userPassword is still the published dev default \"curie-dev-password\". Override it (or set langfuse.existingSecret) before installing on a shared/production cluster -- the published admin password allows Langfuse admin takeover on a reachable UI." -}}
 {{- end -}}
 {{- end -}}
-{{/* Outside the existingSecret guard on purpose (issue #1563): the header
-     reaches the collector on every path, so a BYO Langfuse Secret does not make
-     the published header safe. That is the case this check exists for: with a
-     foreign langfuse.existingSecret the two checks above are skipped entirely,
-     and an otelCollector.otlpAuthHeader carrying the published dev credential
-     would otherwise render unchallenged.
-
-     The operand is the RENDERED header (curie.otlpAuthHeader), not the
-     otelCollector.otlpAuthHeader input, so the same expression covers the
-     override and the composed-from-langfuse.init spellings without enumerating
-     them. The composed spelling is in practice preempted by the projectSecretKey
-     check above, which fires first on exactly the inputs that would compose it;
-     reading the rendered header keeps the two in agreement rather than relying
-     on that ordering. Composed via b64enc rather than pasted so it cannot drift
-     from curie.otlpAuthHeader.
-
-     THREAT MODEL, so the next reader stops enumerating spellings: this guards
-     against an operator shipping this repository's published credential by
-     accident. It is not an adversarial control, and cannot be one: anyone who
-     can set otelCollector.otlpAuthHeader can equally set
-     security.checkDefaultCredentials=false. Normalising the scheme's case and
-     the credential's whitespace covers the spellings a copy/paste, a line wrap
-     or a templating tool actually produces; it deliberately does NOT chase
-     encodings only a deliberate bypass would produce.
-
-     The header is split ONCE into scheme and credential, on its first run of
-     whitespace, and each half is then normalised on its own terms. The scheme
-     token is case-insensitive (RFC 9110), so it is compared lowercased against
-     "basic". The credential is compared with ALL whitespace removed and base64
-     padding stripped, because the receiver strips whitespace before decoding:
-     interior whitespace from a wrapped paste decodes to the same credential,
-     and taking the last whitespace-separated field instead would compare only
-     its tail. The credential is NOT lowercased: base64 is case-significant, and
-     folding its case would widen the match to strings that are not this
-     credential. An empty rendered header (the chart ships nothing, the
-     operator's Secret carries it) yields an empty scheme, which is not "basic",
-     so it matches nothing. b64dec is not usable here, since sprig returns an
-     error string rather than the plaintext for unpadded input.
-
-     Deliberately independent of otelCollector.deploy: the chart writes this
-     credential into its Secret either way, so a release that does not run a
-     collector still ships the published dev key for one that later does. */}}
+{{/* Outside the existingSecret guard on purpose (#1563): the header reaches the collector on every path. Operand is the rendered curie.otlpAuthHeader. Guards accidental shipping of the published credential, not an adversary: normalise only scheme case and whitespace, do not chase deliberate encodings. Independent of otelCollector.deploy. */}}
 {{- $header := trim (include "curie.otlpAuthHeader" .) -}}
 {{- $parts := regexSplit "[[:space:]]+" $header 2 -}}
 {{- $scheme := first $parts -}}
@@ -1080,20 +802,7 @@ http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.
 {{- include "curie.otel.validate" . -}}
 {{- end -}}
 
-{{/*
-Resolve the installation identity once for the whole render. The full managed
-Secret is memoized separately from its data so callers can reuse generated
-credentials without losing access to the Secret UID used by the legacy-upgrade
-bridge.
-
-Sealed fresh installs always mint a new identity, including adoption of a
-retained Secret. Dev installs derive an identity from namespace/release for
-reproducible renders; reinstalling that pair in dev reuses the identity. Upgrades reuse the stored identity; the first upgrade from a chart that
-predates installationId adopts the live Secret UID and enables the one-release
-legacy bridge. A client-only upgrade has no lookup result, so it receives one
-memoized placeholder and marks the identity unobserved for the hook to refuse
-before contacting Valkey.
-*/}}
+{{/* Resolve the installation identity once per render. Sealed installs mint a new identity; dev derives one from namespace and release; upgrades reuse the stored one (the first upgrade from a chart without installationId adopts the live Secret UID). A client-only upgrade gets a placeholder marked unobserved so the hook refuses before contacting Valkey. */}}
 {{- define "curie.installationIdentity.init" -}}
 {{- if not (hasKey . "_curieManagedSecret") -}}
 {{- $managedSecret := lookup "v1" "Secret" .Release.Namespace (include "curie.secretName" .) | default dict -}}
@@ -1104,8 +813,7 @@ before contacting Valkey.
 {{- $legacy := false -}}
 {{- if .Release.IsInstall -}}
 {{- if eq (toString .Values.security.allowDevDefaults) "true" -}}
-{{- /* #1135, ADR-0144: dev renders are reproducible. Reinstalling the same
-namespace/release in dev reuses its identity; sealed installs remain unique. */ -}}
+{{- /* #1135, ADR-0144: dev renders are reproducible; sealed installs remain unique. */ -}}
 {{- $installationId = (list .Release.Namespace .Release.Name | toJson | sha256sum | trunc 32) -}}
 {{- else -}}
 {{- $installationId = randAlphaNum 32 -}}
@@ -1131,8 +839,7 @@ namespace/release in dev reuses its identity; sealed installs remain unique. */ 
 {{- end -}}
 {{- else -}}
 {{- if eq (toString .Values.security.allowDevDefaults) "true" -}}
-{{- /* #1135, ADR-0144: dev renders are reproducible. Reinstalling the same
-namespace/release in dev reuses its identity; sealed installs remain unique. */ -}}
+{{- /* #1135, ADR-0144: dev renders are reproducible; sealed installs remain unique. */ -}}
 {{- $installationId = (list .Release.Namespace .Release.Name | toJson | sha256sum | trunc 32) -}}
 {{- else -}}
 {{- $installationId = randAlphaNum 32 -}}
@@ -1159,58 +866,7 @@ namespace/release in dev reuses its identity; sealed installs remain unique. */ 
 {{- get . "_curieUpgradeLegacyQuiesce" | toString -}}
 {{- end -}}
 
-{{/* ---- Auto-generated per-release chart credential (issue #195) ----
-     Resolve one chart-owned secret value, generating a strong random per release
-     for a sealed install instead of shipping the published dev default. Call with
-     a dict: root (the top context), key (the stringData key, matching an existing
-     Secret's data), value (.Values.<path>), default (the published dev default),
-     hex (true for the 64-hex encryption key, else false).
-
-     The existing Secret's data is looked up ONCE by installationIdentity.init and
-     passed by secretContent.init as `.existingData` (an always-present dict, empty under `helm
-     template`/--dry-run/first install), so this helper does no per-key lookup.
-
-     A legacy retained values set can omit a key that a newer chart adds. Treat
-     that nil as the declared default before applying the four branches below,
-     so it is not mistaken for an explicit override. A persisted key whose
-     decoded value is blank is likewise absent: retaining it would keep every
-     consumer crash looping instead of healing the release.
-
-     Four branches, in PRECEDENCE order, and WHY this order is correct:
-       1. allowDevDefaults: the deterministic dev/CI escape hatch (values-dev.yaml
-          sets it true). Return the value verbatim so the dev/e2e path renders the
-          published defaults unchanged, byte-for-byte reproducible. Taking this
-          first also means `--dev` reverts to the defaults even if a random was
-          previously generated into the release Secret. Gate on positive equality
-          against the literal "true" (`eq (toString ...) "true"`), NOT plain
-          truthiness: Go templates treat any non-empty string as truthy, so a
-          quoted `--set security.allowDevDefaults="false"` would otherwise read as
-          truthy and ship the published default -- a fail-OPEN regression.
-       2. Explicit override: if the operator/CLI supplied a value that differs from
-          the published default (`ne value default`), it wins even on `helm
-          upgrade`. For the eleven non init credentials, this supports rotation or
-          recovery. The Langfuse init credentials are first boot inputs, so an
-          upgrade only changes the Secret; it does not rotate Langfuse records.
-          The override must sit ahead of the persist branch or an explicit value
-          on upgrade would be silently ignored.
-       3. Persist existing: no override, so if a prior install already GENERATED
-          this key with a nonblank value, re-use it. `helm upgrade` must NEVER rotate a live store
-          credential (Postgres would reject the new password against its persisted
-          data), so we return the stored value from `.existingData` when present.
-          Generated secrets always have value==published-default (nobody set them),
-          so they never take branch 2 and always land here on upgrade -- exactly
-          the "upgrade must not rotate" guarantee. `.existingData` is always a dict
-          (the caller applies `| default dict`), empty under `helm
-          template`/--dry-run and on first install, so a missing key falls through
-          to generation.
-       4. Generate: a first sealed install (value still equals the published
-          default, no prior Secret) gets a strong random. `randAlphaNum` is
-          crypto-backed (Sprig). hex=true hashes it to 64 lowercase-hex chars (the
-          encryption key format); otherwise a 32-char alphanumeric.
-
-     Net effect: an operator who forgets to re-pass `--set` on a later upgrade
-     safely reverts value to the default, which then reuses the persisted generated
-     value via branch 3 rather than rotating it. */}}
+{{/* Resolve one chart-owned secret value (#195); dict: root, key, value, default, hex. Precedence: 1 allowDevDefaults via eq (toString) "true", not truthiness. 2 explicit override wins on upgrade, before persist. 3 persist a nonblank .existingData value: upgrade must never rotate a live store credential. 4 generate randAlphaNum. */}}
 {{- define "curie.managedSecret" -}}
 {{- $value := .value -}}
 {{- if kindIs "invalid" $value -}}
@@ -1233,9 +889,7 @@ namespace/release in dev reuses its identity; sealed installs remain unique. */ 
 {{- end -}}
 {{- end -}}
 
-{{/* Resolve the full plaintext Secret once per root render (#1135). Every
-consumer checksum and the Secret emission read this same dict, so generated
-credentials and the derived collector header cannot disagree. */}}
+{{/* Resolve the full plaintext Secret once per root render (#1135) so checksums, emission and the derived collector header cannot disagree. */}}
 {{- define "curie.secretContent.init" -}}
 {{- if not (hasKey . "_curieSecretContent") -}}
 {{- include "curie.checkDefaultCredentials" . }}
@@ -1289,8 +943,7 @@ credentials and the derived collector header cannot disagree. */}}
 {{- $_ := set $content "apiKey" ((include "curie.managedSecret" (dict "root" . "key" "apiKey" "value" .Values.api.apiKey "default" "curie-dev-key" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "approvalChatAttesterSecret" ((include "curie.managedSecret" (dict "root" . "key" "approvalChatAttesterSecret" "value" .Values.api.approvalChatAttesterSecret "default" "curie-dev-approval-chat-attester" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "remediationAuthorityKey" ((include "curie.managedSecret" (dict "root" . "key" "remediationAuthorityKey" "value" .Values.api.remediationAuthorityKey "default" "curie-dev-remediation-authority" "hex" false "existingData" $existingSecretData)) | toString) -}}
-{{/* The values check above cannot see a credential the managed Secret retained
-     from an earlier install; compare what the Secret will actually hold. */}}
+{{/* Compare what the managed Secret will actually hold, not only the values. */}}
 {{- if eq (index $content "remediationAuthorityKey") (index $content "apiKey") -}}
 {{- fail "api.remediationAuthorityKey and api.apiKey resolve to the same retained credential. Set api.remediationAuthorityKey to an independent value (ADR 0231); neither value is printed because both are live credentials." -}}
 {{- end -}}
@@ -1318,10 +971,7 @@ credentials and the derived collector header cannot disagree. */}}
 {{- end -}}
 {{- end -}}
 
-{{/* Hash only chart-owned keys consumed by this pod. Call with root, keys
-(unconditional chart keys), refs (resolved secretKeyRefs), and env (rendered
-shared/extraEnv fragments). Foreign Secret contents are never looked up here.
-An absent optional key hashes null rather than inventing a credential. */}}
+{{/* Hash only chart-owned keys this pod consumes (dict: root, keys, refs, env). Never look up foreign Secret contents. */}}
 {{- define "curie.secretChecksum" -}}
 {{- include "curie.secretContent.init" .root -}}
 {{- $secretName := include "curie.secretName" .root -}}
@@ -1346,10 +996,7 @@ An absent optional key hashes null rather than inventing a credential. */}}
 
 {{/* ---- Shared first-party-app environment fragments ---- */}}
 
-{{/* Postgres connection env for the app services. POSTGRES_PASSWORD comes from
-     the Secret and DATABASE_URL is composed with $(POSTGRES_PASSWORD) so the
-     password never lands in the rendered manifest. Both the API and the worker
-     use the asyncpg driver and the dedicated `curie` schema. */}}
+{{/* Postgres env for app services: DATABASE_URL is composed with $(POSTGRES_PASSWORD) so the password never lands in the manifest. */}}
 {{- define "curie.env.postgres" -}}
 - name: POSTGRES_PASSWORD
   valueFrom:
@@ -1362,12 +1009,7 @@ An absent optional key hashes null rather than inventing a credential. */}}
   value: curie
 {{- end -}}
 
-{{/* Valkey connection env for the app services (host/port + password from the
-     Secret, plus the transport). The apps build their own redis DSN from these
-     parts, and TLS is one of the parts -- rendered always, both values, so an
-     install that never set valkey.tls cannot be confused with a broken
-     template and a --reuse-values upgrade cannot leave a stale "true" behind
-     (#2315). */}}
+{{/* Valkey env for app services. TLS is always rendered, both values, so --reuse-values cannot leave a stale "true" (#2315). */}}
 {{- define "curie.env.valkey" -}}
 - name: VALKEY_HOST
   value: {{ include "curie.valkey.host" . | quote }}
@@ -1382,23 +1024,7 @@ An absent optional key hashes null rather than inventing a credential. */}}
   value: {{ include "curie.valkey.tls" . | quote }}
 {{- end -}}
 
-{{/* Platform API connection env for first party services that call the API.
-     Keep the URL and key as separate helpers so callers can include only the
-     credentials they need. The composed helper preserves the existing
-     dispatcher contract.
-
-     The API URL env has been forgotten three times on new callers because
-     those callers had a shared helper to include and the worker did not.
-     New API callers should include the granular URL helper rather than derive
-     the URL inline. This follows the same shared helper pattern as
-     `curie.env.postgres` and `curie.env.valkey`.
-
-     The BYO override is .Values.dispatcher.apiBaseUrl. Note the deliberate
-     absence of a `required` call for the api.deploy=false case that the sibling
-     `X.host` helpers use: an empty override with api.deploy=false yields a
-     CrashLoopBackOff by design (documented in NOTES.txt and the README), not a
-     render-time failure. Include with `nindent 12` to land at a container's env
-     column. */}}
+{{/* Platform API env for first-party services; URL and key are separate helpers. New API callers must include the URL helper, not derive it inline. BYO override is .Values.dispatcher.apiBaseUrl; no `required` for api.deploy=false, which CrashLoopBackOffs by design. nindent 12. */}}
 {{- define "curie.env.apiUrl" -}}
 # Where the platform API lives. The dispatcher POSTs an approval
 # resolve here when someone clicks Approve in Slack, so an unwired
@@ -1429,11 +1055,7 @@ An absent optional key hashes null rather than inventing a credential. */}}
 {{ include "curie.env.apiKey" . }}
 {{- end -}}
 
-{{/* Literal extraEnv value for one name, or the sentinel __valueFrom__ when
-     the entry exists without a string value. Empty when the name is absent.
-     A present empty value is the sentinel __empty__: worker.yaml treats name
-     presence as an override, so Rail 1 must not fall through to the in-chart
-     URL. valueFrom cannot be proven in-cluster at render. */}}
+{{/* Literal extraEnv value for a name, sentinel __valueFrom__ when it has no string value, empty when absent. A present empty value is __empty__: worker.yaml treats presence as an override, so Rail 1 must not fall back to the in-chart URL. */}}
 {{- define "curie.extraEnv.lookup" -}}
 {{- $found := "" -}}
 {{- range (.env | default list) -}}
@@ -1454,10 +1076,7 @@ An absent optional key hashes null rather than inventing a credential. */}}
 {{- $found -}}
 {{- end -}}
 
-{{/* Hostname of a URL, port stripped for host:port. Bracketed IPv6 is left
-     intact; those hosts are never this chart's in-cluster Service DNS. A
-     host:port with no scheme (sprig urlParse leaves host empty) is treated
-     as the raw string so curie-api:8000 still matches the in-chart Service. */}}
+{{/* Hostname of a URL, port stripped. Bracketed IPv6 stays intact; a scheme-less host:port is taken raw so curie-api:8000 still matches. */}}
 {{- define "curie.endpoint.host" -}}
 {{- $raw := trim . -}}
 {{- if $raw -}}
@@ -1474,24 +1093,14 @@ An absent optional key hashes null rather than inventing a credential. */}}
 {{- end -}}
 {{- end -}}
 
-{{/* TCP port a URL actually dials. Same urlParse plus :[0-9]+$ plus
-     scheme-default pattern as curie.mailAdapter.otelEgressPort: the URL
-     port wins; else https => 443, http => 80. Empty scheme and no
-     explicit port emit empty -- do not invent 4318. Does not fail. */}}
+{{/* TCP port a URL dials: the URL port, else https 443, http 80. Empty scheme and no port emit empty; do not invent 4318. Does not fail. */}}
 {{- define "curie.endpoint.dialPort" -}}
 {{- $raw := trim . -}}
 {{- if $raw -}}
 {{- $parsed := urlParse $raw -}}
 {{- $hostPort := $parsed.host | default "" -}}
 {{- $scheme := lower ($parsed.scheme | default "") -}}
-{{/* A bracketed IPv6 host is NOT skipped here, which is the opposite of
-     curie.endpoint.host: that helper leaves brackets intact because such a host
-     is never in-chart Service DNS, whereas this helper must still find the
-     port. ":[0-9]+$" is safe on a literal address because a bare bracketed host
-     ends in "]" -- only a real port can follow the closing bracket, so a hextet
-     is never mistaken for one. Skipping brackets instead left $urlPort empty,
-     fell through to the scheme default, and opened 443 while the SDK dialled
-     the port the URL actually named. */}}
+{{/* Unlike curie.endpoint.host, a bracketed IPv6 host is not skipped here: the port must be found. */}}
 {{- $urlPort := trimPrefix ":" (regexFind ":[0-9]+$" $hostPort) -}}
 {{- if $urlPort -}}
 {{- $urlPort -}}
@@ -1515,9 +1124,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* API URL a spawned runner actually dials (#2367). worker.extraEnv
-     CURIE_RUNNER_API_URL wins, then CURIE_API_URL, then dispatcher.apiBaseUrl
-     / the in-chart API Service. Matches apps/worker runner_facing_api_base_url. */}}
+{{/* API URL a spawned runner dials (#2367): extraEnv CURIE_RUNNER_API_URL, then CURIE_API_URL, then dispatcher.apiBaseUrl or the in-chart Service. */}}
 {{- define "curie.runner.effectiveApiUrl" -}}
 {{- $runner := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_RUNNER_API_URL") | trim -}}
 {{- $api := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_API_URL") | trim -}}
@@ -1555,11 +1162,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* True when the operator overrode the runner-facing API URL, including an
-     in-chart Service DNS leftover. The deploy-false BYO gate uses this so
-     api.deploy false plus dispatcher.apiBaseUrl=http://<release>-api still
-     requires api.egress (#2317), while empty apiBaseUrl with no extraEnv
-     still dead-ends at dispatcher boot. */}}
+{{/* True when the operator overrode the runner-facing API URL, so api.deploy false plus dispatcher.apiBaseUrl still requires api.egress (#2317). */}}
 {{- define "curie.runner.apiOverrideSet" -}}
 {{- $base := trim (printf "%v" (.Values.dispatcher.apiBaseUrl | default "")) -}}
 {{- $runner := include "curie.extraEnv.lookup" (dict "env" .Values.worker.extraEnv "name" "CURIE_RUNNER_API_URL") | trim -}}
@@ -1569,9 +1172,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* OTLP URL the runner sandbox actually dials (#2367). Signal-specific
-     extraEnv (traces, then metrics, then logs) wins over the generic
-     OTEL_EXPORTER_OTLP_ENDPOINT, then the chart-owned curie.otel.endpoint. */}}
+{{/* OTLP URL the runner sandbox dials (#2367): signal-specific extraEnv, then OTEL_EXPORTER_OTLP_ENDPOINT, then curie.otel.endpoint. */}}
 {{- define "curie.runner.effectiveOtlpEndpoint" -}}
 {{- $traces := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") | trim -}}
 {{- $metrics := include "curie.extraEnv.lookup" (dict "env" .Values.agentSandbox.runner.extraEnv "name" "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") | trim -}}
@@ -1619,26 +1220,12 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* OTLP URL the mail adapter actually dials (#2361). The adapter passes
-     curie.env.otel an EMPTY extraEnv list on purpose -- there is no
-     mailAdapter.extraEnv key, so this pod cannot be repointed independently --
-     which makes its effective endpoint exactly curie.otel.endpoint. That is
-     written as its own named helper anyway: the reason is then recorded next to
-     the runner's equivalent, and if a mailAdapter.extraEnv surface is ever
-     accepted there is one place to teach it rather than a bare
-     curie.otel.endpoint include scattered through the template. */}}
+{{/* OTLP URL the mail adapter dials (#2361): exactly curie.otel.endpoint, since the adapter has no extraEnv key. */}}
 {{- define "curie.mailAdapter.effectiveOtlpEndpoint" -}}
 {{- include "curie.otel.endpoint" . | trim -}}
 {{- end -}}
 
-{{/* True when the adapter's effective endpoint is one the rendered in-chart
-     collector peer does NOT cover (#2361). Deliberately keyed off deploy AND
-     the host, not the host alone: otelCollector.deploy=false with an endpoint
-     that still names this release's collector Service is the dangerous leftover
-     shape -- the host looks in-chart while no such pod exists, so the
-     pod-selector rule the adapter would otherwise get selects nothing. Empty
-     endpoint (telemetry disabled, or no-endpoint mode) exports nothing and is
-     therefore not external: it needs no peer at all. */}}
+{{/* True when the adapter's endpoint is not covered by the in-chart collector peer (#2361); keyed off deploy and host. */}}
 {{- define "curie.mailAdapter.otlpIsExternal" -}}
 {{- $url := include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim -}}
 {{- if empty $url -}}
@@ -1648,33 +1235,15 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* TCP port the adapter's external-OTLP ipBlock rule opens (#2361).
-     Precedence: an explicit mailAdapter.otelEgress.port, else the port the
-     endpoint URL names, else the scheme default. A rule on the wrong port looks
-     configured and still drops every export, so a disagreement between the two
-     operator statements is refused rather than resolved by picking a winner --
-     whichever lost would have been discarded silently. Only meaningful, and
-     only included, on the external path. */}}
+{{/* TCP port for the adapter's external-OTLP ipBlock rule (#2361): explicit port, else the URL's port, else the scheme default; a disagreement is refused. */}}
 {{- define "curie.mailAdapter.otelEgressPort" -}}
 {{- $endpoint := include "curie.mailAdapter.effectiveOtlpEndpoint" . | trim -}}
 {{- $parsed := urlParse $endpoint -}}
 {{- $hostPort := $parsed.host | default "" -}}
 {{- $scheme := lower ($parsed.scheme | default "") -}}
-{{/* A bracketed IPv6 host is NOT skipped here, which is the opposite of
-     curie.endpoint.host: that helper leaves brackets intact because such a host
-     is never in-chart Service DNS, whereas this helper must still find the
-     port. ":[0-9]+$" is safe on a literal address because a bare bracketed host
-     ends in "]" -- only a real port can follow the closing bracket, so a hextet
-     is never mistaken for one. Skipping brackets instead left $urlPort empty,
-     fell through to the scheme default, and opened 443 while the SDK dialled
-     the port the URL actually named. */}}
+{{/* Unlike curie.endpoint.host, a bracketed IPv6 host is not skipped here: the port must be found. */}}
 {{- $urlPort := trimPrefix ":" (regexFind ":[0-9]+$" $hostPort) -}}
-{{/* The port the SDK will actually dial, whether or not the URL writes it: a
-     portless https:// endpoint is dialled on 443 just as definitely as an
-     explicit :4318. The explicit key is compared against THIS, not against the
-     presence of a ":port" substring -- otherwise an explicit 4318 beside a
-     portless https:// URL passed unchallenged and rendered a 4318 peer for a
-     443 dial. */}}
+{{/* The port the SDK dials, written or not (portless https:// is 443). The explicit key is compared against this, not a ":port" substring. */}}
 {{- $dialPort := $urlPort -}}
 {{- if not $dialPort -}}
 {{- if eq $scheme "https" -}}
@@ -1699,16 +1268,7 @@ true
 {{- $port -}}
 {{- end -}}
 
-{{/* Coalesce the worker's chart-managed egress credentials and the first-party
-     mail adapter's chart-managed paired credential. The chart Secret and the
-     worker rollout checksum must use this same rendered JSON so a rotation
-     reaches both sides. mailAdapter.egressSecret is the source of truth on
-     that path; accepting an equal hand-written worker entry keeps migrations
-     from hand-rolled manifests possible, while a disagreement fails rather
-     than deploying a reply path that can only return 401. When the adapter
-     uses egressSecretExistingSecret, the required external worker map is the
-     independent source of truth: never derive from or compare the unused plain
-     Helm value. */}}
+{{/* Coalesce worker egress credentials and the mail adapter's paired credential; chart Secret and worker checksum use this same JSON. mailAdapter.egressSecret is the source; a disagreeing worker entry fails. With egressSecretExistingSecret the worker map is the source: never compare the plain value. */}}
 {{- define "curie.adapterCredentials" -}}
 {{- $creds := deepCopy (.Values.worker.adapterCredentials | default dict) -}}
 {{- if and .Values.mailAdapter.deploy (not .Values.mailAdapter.egressSecretExistingSecret) -}}
@@ -1728,30 +1288,12 @@ true
 
 {{/* Keep the historical inline checksum byte-for-byte while also rolling the
      worker when an operator switches the BYO Secret source. */}}
-{{/* The connector caller key pair the release Secret carries (ADR-0168
-     decision 7): the operator's inline halves, or, with
-     security.allowDevDefaults exactly "true" and neither half set, the
-     published dev pair, as every other published dev credential ships (#195).
-     Without a pair the API refuses to render a hosted connector (#3552), so a
-     dev install could deploy no bundle that hosts one. Decided here from the
-     effective value and never written to the release values, so a later
-     sealed `cluster up` sees no recorded pair and mints a fresh one. The seed
-     is the 32 ASCII bytes `curie-dev-connector-caller-seed!`;
-     cli/tests/connector_caller_dev_pair.rs proves the public half is its
-     Ed25519 public key. */}}
+{{/* Connector caller key pair in the release Secret (ADR-0168 decision 7): operator halves, or with security.allowDevDefaults exactly "true" and neither set, the published dev pair (#195). Without a pair the API refuses hosted connectors (#3552). */}}
 {{- define "curie.connectorCallerDevSigningKey" -}}Y3VyaWUtZGV2LWNvbm5lY3Rvci1jYWxsZXItc2VlZCE={{- end -}}
 
 {{- define "curie.connectorCallerDevVerifyKey" -}}tkmNbO5SSLE0IM84sH4uJ94DxtriNZ/APXha3FiyP6c={{- end -}}
 
-{{/* Refuse to leave dev mode with no replacement pair while the release Secret
-     still holds the published one. The api and worker would roll onto no key,
-     but hosted connector proxies already rendered keep trusting the published
-     key, and #3552's refusal stops the reconciler from re-rendering them, so
-     published credentials would stay accepted. Supplying any pair, or naming
-     an existingSecret, lets the upgrade through and rolls the api and worker
-     onto it; a sealed `cluster up` supplies a generated one. A rendered proxy
-     moves to the new key when it is next rendered: the next `cluster deploy`
-     of its agent, or the next pass when worker.connectorReconciler is on. */}}
+{{/* Refuse leaving dev mode with no replacement pair while the Secret holds the published one (#3552). */}}
 {{- define "curie.connectorCallerRefuseKeylessDevExit" -}}
 {{- $caller := .root.Values.connectorCaller | default dict -}}
 {{- $live := "" -}}
@@ -1783,13 +1325,7 @@ true
 {{- $verify -}}
 {{- end -}}
 
-{{/* What rolls the api and worker when the caller pair they trust changes.
-     Both read it as env at boot, so leaving dev mode, supplying a first pair,
-     or replacing one would otherwise leave them on the old key, still trusting
-     the published dev pair after dev defaults are off. Public material and
-     references only: the effective public key, the previous one, and the BYO
-     Secret name and keys. A BYO Secret's content rotated in place under the
-     same name still needs a manual rollout, as every existingSecret here does. */}}
+{{/* What rolls the api and worker when the caller pair changes: public material and references only. */}}
 {{- define "curie.connectorCallerChecksumSource" -}}
 {{- $caller := .Values.connectorCaller | default dict -}}
 {{- printf "%s|%s|%s|%s|%s" (include "curie.connectorCallerVerifyKey" .) ((get $caller "previousVerifyKey") | default "") ((get $caller "existingSecret") | default "") ((get $caller "signingKeyKey") | default "") ((get $caller "verifyKeyKey") | default "") -}}
@@ -1804,12 +1340,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* Heartbeat exec probes for the worker and dispatcher. Neither has an HTTP
-     port, so an exec probe checks CURIE_HEARTBEAT_FILE freshness (< 30s)
-     instead of hitting a port. Each Deployment sets its own heartbeat path via
-     that env var, so the probe body is path-agnostic and both callers share
-     identical timings -- the helper therefore takes no params. Include with
-     `nindent 10` so the probe keys land at the container's 10-space column. */}}
+{{/* Heartbeat exec probes for worker and dispatcher: CURIE_HEARTBEAT_FILE fresher than 30s; no params. Include with nindent 10. */}}
 {{- define "curie.heartbeatProbes" -}}
 readinessProbe:
   exec:
@@ -1842,16 +1373,7 @@ livenessProbe:
 {{/* ---- Langfuse shared environment (mirrors compose.dev.yaml's
         x-langfuse-env anchor). Rendered into both web and worker. ---- */}}
 {{- define "curie.langfuse.env" -}}
-{{- /* These three honour their store's own existingSecret, the same escape
-       curie.env.postgres and the CLICKHOUSE_PASSWORD/REDIS_AUTH refs below
-       already use. They were pinned to the chart Secret while every sibling
-       read the BYO one. On a BYO-Postgres install the api and worker
-       authenticated against the real instance while both Langfuse Deployments
-       presented the chart-generated password and crash-looped at Prisma auth,
-       with every other component green. On a BYO langfuse.existingSecret
-       install the operator's langfuseEncryptionKey was silently unused, and a
-       later regeneration of the chart Secret left previously written encrypted
-       columns undecryptable. See #2327. */}}
+{{- /* These three honour their store's own existingSecret like curie.env.postgres (#2327). */}}
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
@@ -1878,23 +1400,13 @@ livenessProbe:
 - name: CLICKHOUSE_URL
   value: {{ include "curie.clickhouse.httpUrl" . }}
 {{- if eq (include "curie.clickhouse.migrationSsl" .) "true" }}
-{{- /* Langfuse's documented switch for a TLS migration connection on the
-       native port; its migrator appends `secure=true` to the DSN itself, which
-       is why CLICKHOUSE_MIGRATION_URL above stays bare. Rendered only on the
-       https path so a cleartext install is byte-identical (#2314). */}}
+{{- /* TLS migration switch on the native port; only on the https path so cleartext installs stay byte-identical (#2314). The URL stays bare. */}}
 - name: CLICKHOUSE_MIGRATION_SSL
   value: "true"
 {{- end }}
 - name: CLICKHOUSE_USER
   value: {{ .Values.clickhouse.auth.username | quote }}
-{{- /* Both of these honour the store's own existingSecret, the same escape
-       clickhouse.yaml:101 and curie.env.valkey already use. They were pinned to
-       the chart Secret while every other consumer read the BYO one, so a
-       `deploy=false` + `host` + `existingSecret` install left Langfuse alone
-       authenticating with the chart-generated password and trace ingestion died
-       silently with the rest of the release healthy. With clickhouse.deploy=true
-       and clickhouse.existingSecret set it was worse: the in-chart server and
-       Langfuse disagreed on the same password (split-brain auth). See #2052. */}}
+{{- /* Both honour the store's own existingSecret like curie.env.valkey (#2052). */}}
 - name: CLICKHOUSE_PASSWORD
   valueFrom:
     secretKeyRef:
@@ -1911,27 +1423,15 @@ livenessProbe:
     secretKeyRef:
       name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) }}
       key: valkeyPassword
-{{- /* Same helper as curie.env.valkey, so the two Langfuse Deployments and the
-       first-party apps cannot disagree about the transport of the one store
-       they share (#2315). Langfuse's REDIS_TLS_CA/_CERT/_KEY siblings are
-       deliberately NOT rendered: system-CA verification is the boundary for
-       every consumer here, and giving Langfuse alone a private-CA capability
-       is the asymmetry this helper exists to prevent. */}}
+{{- /* Same helper as curie.env.valkey (#2315). REDIS_TLS_CA, _CERT, _KEY are deliberately NOT rendered. */}}
 - name: REDIS_TLS_ENABLED
   value: {{ include "curie.valkey.tls" . | quote }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_BUCKET
   value: {{ .Values.rustfs.bucket | quote }}
-{{- /* Both upload regions come from rustfs.region, never the literal
-       `auto` that in-chart RustFS accepts. Real S3 rejects `auto` with
-       AuthorizationHeaderMalformed and drops every trace while the
-       release reports healthy. See #2214. */}}
+{{- /* Both upload regions come from rustfs.region, never the literal `auto`: real S3 rejects it and drops every trace. See #2214. */}}
 - name: LANGFUSE_S3_EVENT_UPLOAD_REGION
   value: {{ .Values.rustfs.region | quote }}
-{{- /* Credential env is gated the same way as api/worker/bundle-fetch
-       (#2211). An empty rustfs.auth.accessKey on the key-free path must
-       omit these, not emit them empty: Langfuse's AWS SDK treats an empty
-       explicit credential as a credential and never reaches the
-       web-identity provider. */}}
+{{- /* Credential env gated like api/worker/bundle-fetch (#2211): with empty rustfs.auth.accessKey omit these, never emit empty. */}}
 {{- if include "curie.rustfs.staticCredentials" . }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID
   value: {{ .Values.rustfs.auth.accessKey | quote }}
@@ -1941,11 +1441,7 @@ livenessProbe:
       name: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.rustfs) }}
       key: rustfsSecretKey
 {{- end }}
-{{- /* Both endpoints go through curie.rustfs.endpoint, never a literal
-       scheme. They were hardcoded http:// while api/worker/sandbox used the
-       helper, so a BYO store on rustfs.port 443 got https:// everywhere except
-       Langfuse, and trace ingestion died at the TLS handshake -- with the rest
-       of the release healthy, which is why nothing pointed at the cause. */}}
+{{- /* Both endpoints go through curie.rustfs.endpoint, never a literal http://, or a BYO store on 443 breaks Langfuse ingestion. */}}
 - name: LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT
   value: {{ include "curie.rustfs.endpoint" . }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE
@@ -1973,31 +1469,8 @@ livenessProbe:
   value: media/
 {{- end -}}
 
-{{/* ---- gVisor tri-state (security.gvisor.mode: auto|require|off) ----
-
-     curie.gvisor.className: the RuntimeClass NAME to use/verify when gVisor is
-     intended at all (empty only for mode=off). Deterministic (no cluster lookup);
-     used by the enforcement preflight, the optional RuntimeClass object, and the
-     probe's admission test.
-
-     curie.gvisor.requiredRuntimeClassName: the class a real install must stamp,
-     with no lookup. Empty for mode=off and for fake-model auto. The configured
-     runtimeClassName (default gvisor) for mode=require, and for mode=auto when a
-     real model is in effect (not fakeModel, OR inference.deploy). Real-model
-     auto therefore stamps the class even when lookup is empty (helm template,
-     Argo CD, Flux). Fake-model auto stays empty here even if lookup would hit.
-
-     curie.gvisor.runtimeClassName: the EFFECTIVE runtimeClassName to stamp on a
-     runner pod. A non-empty requiredRuntimeClassName is returned immediately
-     (that covers require, and real-model auto). Otherwise today's order:
-     off -> empty; installRuntimeClass -> className; auto -> className only if
-     lookup finds the class. The installRuntimeClass shortcut exists because
-     lookup cannot see the RuntimeClass the same install is about to create (nor
-     anything under helm template/--dry-run). Fake-model auto still omits the
-     class when that lookup is empty. */}}
-{{/* gVisor's sentry reports LinuxVersion via uname -v, independent of pod names.
-     Source: https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/version/version.go
-     Older releases use the same LinuxVersion in pkg/sentry/syscalls/linux/linux64.go. */}}
+{{/* gVisor tri-state (security.gvisor.mode: auto, require, off). requiredRuntimeClassName is stamped by a real install: empty for off and fake-model auto, set for require and real-model auto (not fakeModel, or inference.deploy). runtimeClassName: required if non-empty; else off is empty, installRuntimeClass gives className, auto gives it only if lookup finds the class. */}}
+{{/* gVisor's sentry reports LinuxVersion via uname -v, independent of pod names (google/gvisor pkg/sentry/kernel/version/version.go). */}}
 {{- define "curie.gvisor.sentryKernelVersion" -}}
 {{- "#1 SMP Sun Jan 10 15:06:54 PST 2016" -}}
 {{- end -}}
@@ -2039,18 +1512,7 @@ livenessProbe:
 {{- end -}}
 {{- end -}}
 
-{{/* ---- gVisor enforcement gate ----
-     curie.gvisor.preflightRequired: non-empty ("true") when the blocking
-     gVisor enforcement preflight Job must render, else empty. It renders in
-     `require` (always) and in `auto` WHEN the runner runs a real (non-fake)
-     model -- i.e. untrusted agent code executes, so a missing/downgraded runsc
-     RuntimeClass must fail the install CLOSED instead of silently landing on
-     the host kernel. `auto` with the fake model (the bare-install default)
-     still degrades gracefully with only a NOTES warning; `off` never renders.
-     Real-model detection mirrors the CURIE_FAKE_MODEL gate in
-     agent-sandbox.yaml (fake is in effect only when runner.fakeModel AND NOT
-     inference.deploy), so real code runs when `(not fakeModel) OR inference.deploy`.
-     Also respects security.gvisorPreflight.enabled and agentSandbox.deploy. */}}
+{{/* gVisor enforcement gate: preflightRequired is "true" when the blocking preflight Job must render, in require and in auto with a real model (not fakeModel, or inference.deploy), so a missing runsc class fails closed. */}}
 {{- define "curie.gvisor.preflightRequired" -}}
 {{- $mode := .Values.security.gvisor.mode | default "auto" -}}
 {{- $realModel := or (not .Values.agentSandbox.runner.fakeModel) .Values.inference.deploy -}}
@@ -2061,18 +1523,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* ---- First-party image reference ----
-     Render a fully-qualified image ref for a first-party (GHCR) workload,
-     preferring an immutable content digest over a mutable tag. Call with a dict:
-       repository  the image repo (e.g. ghcr.io/curie-eng/curie-api)
-       tag         optional explicit tag; empty falls back to defaultTag
-       digest      optional "sha256:..." -- when set, wins and pins by digest
-       defaultTag  the fallback tag when `tag` is empty (pass .Chart.AppVersion)
-     - digest set -> "<repository>@sha256:..."  (fully immutable + verifiable)
-     - else       -> "<repository>:<tag|defaultTag>"
-     An empty tag defaulting to the chart appVersion is what makes a given chart
-     version render a deterministic image ref (same chart version -> same ref,
-     installable and rollback-able) without every install pinning a field.  */}}
+{{/* First-party image ref (dict: repository, tag, digest, defaultTag). A digest wins; else repository:tag, falling back to defaultTag for a deterministic ref. */}}
 {{- define "curie.image" -}}
 {{- $repo := required "image.repository is required" .repository -}}
 {{- if .digest -}}
@@ -2082,39 +1533,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* ---- BYO existingSecret escape for a direct-passthrough credential
-     (issue #1759) ----
-
-     Eleven keys (agentCredentials, adapterCredentials, githubToken,
-     sealingPrivateKey, sealingPreviousPrivateKey, slackAppToken,
-     slackBotToken, slackSigningSecret, mailChannelToken, mailEgressSecret,
-     mailAgentmailApiKey) each grew a per-field
-     `<field>ExistingSecret` / `<field>ExistingSecretKey` pair mirroring
-     api.githubAppExistingSecret (ADR-0092): set, it wins over the plain
-     value and the consumer's secretKeyRef points straight at the operator's
-     Secret, so a BYO Secret missing the key fails that pod loudly with
-     CreateContainerConfigError instead of the chart emitting an empty
-     credential.
-
-     One generic helper for all eleven, following the dict-argument pattern
-     `curie.image`/`curie.managedSecret` already use in this file, rather than
-     a bespoke per-key helper or a hand-copied if/else at each consumer: every
-     consumer of the SAME key -- there are three for slackBotToken, two for
-     agentCredentials -- calls this with the same arguments and so cannot
-     resolve the escape differently, exactly the parity-seam trap
-     `curie.env.postgres`/`curie.env.valkey` already exist to avoid for the
-     backing stores; a single-consumer key gets the same guarantee for free
-     if it ever grows a second one.
-
-     Pass a dict:
-       root               the top context
-       existingSecret     .Values.<field>ExistingSecret
-       existingSecretKey  .Values.<field>ExistingSecretKey
-       defaultKey         this credential's published key in the chart's own
-                           Secret (secrets.yaml), used when existingSecret is
-                           empty
-     Renders the two lines a secretKeyRef needs (`name:` / `key:`); include
-     with `nindent 18` to land at a container's secretKeyRef column. */}}
+{{/* BYO existingSecret escape for a direct-passthrough credential (#1759, ADR-0092), for the eleven `<field>ExistingSecret` and `<field>ExistingSecretKey` pairs: set, it wins and a missing key fails loudly. One helper so all consumers of a key agree. Dict: root, existingSecret, existingSecretKey, defaultKey. nindent 18. */}}
 {{- define "curie.secretRef" -}}
 {{- if .existingSecret -}}
 name: {{ .existingSecret | quote }}
@@ -2125,15 +1544,7 @@ key: {{ .defaultKey }}
 {{- end -}}
 {{- end -}}
 
-{{/* ---- Dispatcher gating ----
-     The Slack dispatcher only deploys when the identity `default` has both
-     tokens: from dispatcher.slack, where a token counts as present whether it
-     arrives as the plain value or via its *ExistingSecret (issue #1759), or
-     from a dispatcher.slack.identities entry named `default`. A non-empty list
-     is enough here because curie.slack.identities fails the render unless the
-     list leaves `default` with both. Without them the dispatcher would
-     crash-loop the reconnect supervisor forever, so a token-less default
-     install skips the Deployment entirely (NOTES prints the connect command). */}}
+{{/* Dispatcher gating: deploys only when identity `default` has both Slack tokens (#1759), else it would crash-loop. */}}
 {{- define "curie.dispatcher.enabled" -}}
 {{- $appTokenSet := or .Values.dispatcher.slack.appToken .Values.dispatcher.slack.appTokenExistingSecret -}}
 {{- $botTokenSet := or .Values.dispatcher.slack.botToken .Values.dispatcher.slack.botTokenExistingSecret -}}
@@ -2143,14 +1554,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* ---- Sandbox container hardening (Rail 3) ----
-     The identical container-level lockdown applied to the runner and every
-     helper container in the sandbox pod (bundle-fetch, bundle-extract,
-     workspace-init).
-     Extracted so the four copies cannot drift (#493); callers keep their own
-     `{{- if $runner.hardening.enabled }}` guard and apply `nindent 10`. This is
-     the container securityContext only -- the pod-level securityContext
-     (runAsUser/fsGroup/seccomp) is a separate, non-duplicated block. */}}
+{{/* Sandbox container hardening (Rail 3) shared by runner and helper containers (#493); nindent 10. */}}
 {{- define "curie.sandboxHardening.securityContext" -}}
 securityContext:
   allowPrivilegeEscalation: false
@@ -2160,40 +1564,18 @@ securityContext:
     drop: [ALL]
 {{- end -}}
 
-{{/* ---- First-party service container securityContext ----
-     The `securityContext:` + `toYaml` wrapper the four first-party services (api,
-     worker, dispatcher, ui) each render from their own
-     `.Values.<svc>.containerSecurityContext`. Extracted so the wrapper lives once
-     (#493). Call with the container-security-context VALUE inside the existing
-     `{{- with .Values.<svc>.containerSecurityContext }}` guard and apply
-     `nindent 10`; the `with` handles the empty case exactly as before. */}}
+{{/* Container securityContext wrapper shared by api, worker, dispatcher, ui (#493); nindent 10. */}}
 {{- define "curie.containerSecurityContext" -}}
 securityContext:
 {{- toYaml . | nindent 2 }}
 {{- end -}}
 
-{{/* ---- ADR-0131 drain-budget relationship (worker) ----
-     The worker's termination grace must cover
-     `worker.deliveryBudgetSeconds` + `worker.deliveryShutdownReserveSeconds`.
-     Since #3071 the chart DERIVES the effective grace as
-     max(`worker.terminationGracePeriodSeconds`, budget + reserve), so the
-     invariant holds by construction: raising the budget (up to 10800 s)
-     raises the grace with it instead of failing the render. The configured
-     value is a floor an operator may raise, never a cap that can undercut the
-     budget. This one helper feeds BOTH the Pod's
-     `spec.terminationGracePeriodSeconds` and the worker's
-     `CURIE_TERMINATION_GRACE_PERIOD_S`, so the worker's boot validator (the
-     backstop for Compose and bare env) always sees a value that satisfies it. */}}
+{{/* ADR-0131 drain budget (worker). Since #3071 effective grace is max(terminationGracePeriodSeconds, deliveryBudgetSeconds + deliveryShutdownReserveSeconds): the configured value is a floor. */}}
 {{- define "curie.worker.terminationGrace" -}}
 {{- max (int64 .Values.worker.terminationGracePeriodSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
 {{- end -}}
 
-{{/* Drop extraEnv entries whose names collide with first-class worker timeout
-     and delivery-budget env. A v0.8.4 retained worker.extraEnv override of
-     CURIE_RUNNER_TOTAL_TIMEOUT_S used to render a second copy next to the
-     first-class key; Kubernetes then rejected the Deployment patch after Helm
-     had begun applying other resources (#2097, 2026-09-04 soak). First-class
-     values win. Non-colliding extraEnv entries still render. */}}
+{{/* Drop extraEnv entries colliding with first-class worker timeout and budget env; first-class wins (#2097). */}}
 {{- define "curie.worker.extraEnv" -}}
 {{- $reserved := dict
   "CURIE_CLAIM_TIMEOUT_SECONDS" true
@@ -2219,15 +1601,7 @@ securityContext:
 {{- end -}}
 {{- end -}}
 
-{{/* ---- Resume reconciler grace arithmetic (API) ----
-     The reconciler must wait through a worker's complete delivery budget and
-     terminal-settlement reserve before it can enqueue a replacement resume
-     turn. The default therefore derives from those two worker settings.
-
-     An explicit api.resumeReconciler.graceSeconds is an operator-selected
-     extension of that wait, not an independent timeout. Refusing a value below
-     the derived floor prevents a clean Helm operation from producing a
-     reconciler that can enqueue while the preceding delivery remains active. */}}
+{{/* Resume reconciler grace (API): default derives from the worker delivery budget plus shutdown reserve; a lower explicit value is refused. */}}
 {{- define "curie.api.resumeReconciler.grace" -}}
 {{- $budget := int64 .Values.worker.deliveryBudgetSeconds -}}
 {{- $reserve := int64 .Values.worker.deliveryShutdownReserveSeconds -}}
@@ -2243,13 +1617,7 @@ securityContext:
 {{- end -}}
 {{- end -}}
 
-{{/* ---- Runner ceiling / delivery-budget relationship (worker) ----
-     Each runner request is bounded by `worker.runnerTotalTimeoutSeconds`, but
-     the request still has to fit inside the delivery's overall
-     `worker.deliveryBudgetSeconds`. JSON Schema cannot express this
-     cross-field relationship, so refuse it before an invalid worker Pod is
-     created. The worker's boot validator remains the backstop for non-Helm
-     configuration. */}}
+{{/* Runner ceiling vs delivery budget (worker): runnerTotalTimeoutSeconds must fit inside deliveryBudgetSeconds. */}}
 {{- define "curie.worker.validateRunnerBudget" -}}
 {{- $runnerCeiling := float64 .Values.worker.runnerTotalTimeoutSeconds -}}
 {{- $deliveryBudget := float64 .Values.worker.deliveryBudgetSeconds -}}
@@ -2258,26 +1626,7 @@ securityContext:
 {{- end -}}
 {{- end -}}
 
-{{/* ---- Upgrade drain gate arithmetic (issue #2010) ----
-     The gate's two clocks are DERIVED, with the values as floors, and only a
-     self-contradictory pair is refused outright. The split is deliberate.
-
-     `timeoutSeconds` vs the delivery budget is a CROSS-FAMILY relationship an
-     operator does not author together: raising `deliveryBudgetSeconds` is a
-     decision about how long a turn may run, made for reasons that have nothing
-     to do with upgrades. Refusing that render would break configurations that
-     are valid today, on a chart upgrade, for a value the operator never touched
-     -- so the effective wait is raised to cover the budget instead. The gate
-     must never give up on a delivery that is still inside the budget ADR-0131
-     already promised it; a gate that refuses upgrades during ordinary traffic
-     is a gate that gets switched off in its first week.
-
-     The quiesce TTL is the ROLL HOLD written after a clean drain, and it is
-     capped AT the effective wait (#3127). While waiting, the gate holds the
-     marker as a short lease renewed every poll, so the hold no longer has to
-     outlast the wait; a hold longer than the wait would only strand a paused
-     fleet for longer than the upgrade could ever have waited when the roll
-     never follows. */}}
+{{/* Upgrade drain gate arithmetic (#2010): both clocks are derived with values as floors; only a self-contradictory pair is refused. The wait covers deliveryBudgetSeconds (ADR-0131); quiesce TTL is capped at it (#3127). */}}
 {{- define "curie.worker.upgradeDrain.timeout" -}}
 {{- max (int64 .Values.worker.upgradeDrain.timeoutSeconds) (add (int64 .Values.worker.deliveryBudgetSeconds) (int64 .Values.worker.deliveryShutdownReserveSeconds)) -}}
 {{- end -}}
@@ -2287,8 +1636,7 @@ securityContext:
 {{- add (int64 (include "curie.worker.upgradeDrain.timeout" .)) 120 -}}
 {{- end -}}
 
-{{/* The upgrade timeout covers the complete drain Job deadline, one worker
-     termination grace, and 60 seconds for scheduling and Helm operations. */}}
+{{/* Upgrade timeout covers the drain Job deadline, one worker grace, and 60 seconds for scheduling and Helm. */}}
 {{- define "curie.worker.minimumHelmTimeoutSeconds" -}}
 {{- add (int64 (include "curie.worker.upgradeDrain.jobDeadline" .)) (int64 (include "curie.worker.terminationGrace" .)) 60 -}}
 {{- end -}}
@@ -2298,61 +1646,13 @@ securityContext:
 {{- min (int64 .Values.worker.upgradeDrain.quiesceTtlSeconds) (int64 (include "curie.worker.upgradeDrain.timeout" .)) -}}
 {{- end -}}
 
-{{/* No ordering rule between quiesceTtlSeconds and timeoutSeconds remains
-     (#3127): the hold is capped at the wait above, and the schema keeps both
-     positive. Kept as a hook for the templates that include it. */}}
+{{/* No ordering rule between quiesceTtlSeconds and timeoutSeconds remains (#3127). Kept as a hook for including templates. */}}
 {{- define "curie.worker.validateUpgradeDrain" -}}
 {{- end -}}
 
-{{/* ---- Langfuse Postgres startup gate (issues #1853, #2330) ----
-     Shared by BOTH Langfuse Deployments because both run their Prisma boot
-     migrations against the same Postgres. #1853 filed the crash-loop against
-     the web pod and keyed the gate under `langfuse.web.postgresReadiness`, a
-     per-Deployment path that was structurally unreachable from the worker; the
-     worker then reproduced the identical symptom (Prisma `P1001`,
-     `reason: Error`, namespace `BackOff`), which is #2330. The gate is now
-     chart-level (`langfuse.postgresReadiness`, the shape
-     `langfuse.clickhouseReadiness` already had) and rendered from one define on
-     both Deployments, ordered before the ClickHouse gate on both.
-
-     The probe is credential-free: `pg_isready` speaks the startup protocol
-     only, so no password or Secret reaches this container. It is bounded on
-     purpose -- after `attempts` polls it exits non-zero and hands the decision
-     back to the kubelet, which keeps a genuinely-down Postgres visible instead
-     of hanging forever.
-
-     `securityContext` is the CALLER's own container securityContext, floored to
-     non-root: the gate runs the POSTGRES image, not the Langfuse image, so
-     runAsUser 1001 (#351) is a floor rather than an inheritance. It is always
-     emitted, even for a blank caller context.
-
-     `langfuse.web.postgresReadiness` survives as a DEPRECATED ALIAS resolved by
-     `curie.langfuse.postgresReadinessValues`, and it is honoured for BOTH
-     Deployments -- a stored `enabled: false` or a BYO `image` must never
-     silently become web-only.
-
-     Call with a dict: `root` (the chart context) and `containerSecurityContext`
-     (the component's own). */}}
+{{/* Langfuse Postgres startup gate (#1853, #2330), shared by both Langfuse Deployments, before the ClickHouse gate. `langfuse.postgresReadiness` is canonical; `langfuse.web.postgresReadiness` is a deprecated alias honoured for both. Bounded pg_isready on the Postgres image, so securityContext is the caller's floored to non-root (runAsUser 1001, #351). Dict: root, containerSecurityContext. */}}
 {{- define "curie.langfuse.postgresReadinessValues" -}}
-{{/* Resolves the EFFECTIVE Postgres readiness config for both Deployments.
-
-     Starts from a deepCopy of the canonical `langfuse.postgresReadiness` block
-     and merges any operator-supplied `langfuse.web.postgresReadiness` over it,
-     so a PARTIAL legacy override (`--set langfuse.web.postgresReadiness.attempts=30`)
-     still inherits every other canonical field instead of blanking them.
-
-     Detection is sound only because `values.yaml` no longer ships a default at
-     the legacy path: anything present there came from an operator. A null or
-     empty legacy value falls through to the canonical block rather than
-     merging a null over it, and `langfuse.web` itself is guarded so a
-     `langfuse.web: null` release cannot crash the render. Neither path fails --
-     `helm upgrade --reuse-values` replays an operator's stored user-supplied
-     blob, so a `fail` here would abort upgrades on exactly the releases that
-     need the gate.
-
-     `keyPath` rides along solely so the validation `fail` in
-     `curie.langfuse.postgresGate` can name the path the operator actually set.
-     It is never rendered into a manifest. */}}
+{{/* Effective Postgres readiness config: `langfuse.postgresReadiness` with `langfuse.web.postgresReadiness` merged over it. Never fail here: --reuse-values replays stored blobs. `keyPath` only names the path in curie.langfuse.postgresGate's fail. */}}
 {{- $root := . -}}
 {{- $effective := deepCopy $root.Values.langfuse.postgresReadiness -}}
 {{- $keyPath := "langfuse.postgresReadiness" -}}
@@ -2430,30 +1730,7 @@ securityContext:
       value: {{ $postgresReadiness.probeTimeoutSeconds | quote }}
 {{- end -}}
 
-{{/* ---- Langfuse ClickHouse startup gate (issue #2009) ----
-     Both Langfuse deployments run their ClickHouse migrations during boot, so a
-     Helm upgrade that recreates the ClickHouse Service can start them before the
-     name resolves; Langfuse then exits with `failed to open database: dial tcp:
-     lookup <release>-clickhouse ... no such host` and the rollout converges only
-     through CrashLoopBackOff. This init container polls ClickHouse's HTTP
-     `/ping` until it answers 200, so the application container is not started
-     until the dependency is actually accepting connections -- the same
-     wait-then-hand-over shape `templates/api.yaml` uses for Postgres.
-
-     `node` is the Langfuse images' own runtime, so the probe needs no extra
-     tooling in the image. Bounded like the Postgres gate: after `maxAttempts`
-     polls the container exits non-zero and the kubelet restarts it, which keeps
-     a genuinely-down ClickHouse visible instead of hanging forever. Every probe
-     setting (attempts, interval, per-request timeout) comes from values rather
-     than the template, per the chart's probe-settings invariant -- a BYO
-     ClickHouse that answers slowly needs a longer timeout, not a patched chart.
-
-     Call with a dict: `root` (the chart context), `image` (the component's
-     fully-rendered image reference, built by curie.image so a digest pin
-     reaches the gate too), `containerSecurityContext` and `resources` (the
-     component's, so the gate inherits the same posture and the pod's effective
-     request is unchanged -- init and app container requests are maxed, not
-     summed). */}}
+{{/* Langfuse ClickHouse startup gate (#2009): bounded init container polling ClickHouse /ping until 200. Dict: root, image, containerSecurityContext, resources. */}}
 {{- define "curie.langfuse.clickhouseGate" -}}
 {{- $root := .root -}}
 - name: wait-for-clickhouse
@@ -2499,35 +1776,8 @@ securityContext:
   resources:
     {{- toYaml .resources | nindent 4 }}
 {{- end -}}
-{{/*
-Render the runner-sandbox egress rules for a list of {cidr, ports, except?}
-entries. The argument is a dict: `entries` is the entry list and `root` is the
-chart context (read for security.networkPolicy.clusterCidrs). The caller
-supplies the indentation:
-
-    {{- include "curie.egress.ipBlockRules" (dict "entries" .Values.api.egress "root" $) | trim | nindent 4 }}
-
-Inside this helper `$` is that wrapper dict, not the chart context, so the root
-is captured from `.root` once, before the range rebinds the dot.
-
-Every ipBlock peer rail 1 renders goes through here, so the carve-outs are
-stated ONCE. They are the security invariant: NetworkPolicy allows are
-additive, so an entry broad enough to contain 169.254.169.254 or a private range
-re-permits what rail 1 otherwise denies. Per entry the except list is the
-explicit per-entry `except:` when set (an empty one is refused before render by
-curie.objectStore.egressEntry, because it would drop the carve-out), else
-curie.metadataExcept (same-family, subset-safe metadata carve-outs for ANY CIDR
-that contains a metadata address, not just an exact /0); then every
-curie.privateExcept range (private, link-local, CGNAT, ULA and
-security.networkPolicy.clusterCidrs ranges the CIDR strictly contains, #3842)
-not already listed is appended. A narrow entry equal to or inside a private
-range gets no private except, which is the re-allow path for a private peer.
-See those helpers for the containment/family rules.
-*/}}
-{{/* The except list of one egress entry as JSON: its own `except`, else the
-     metadata carve-out, plus every private range its CIDR strictly contains.
-     Args: dict "entry" "root". Shared by ipBlockRules and the publication Job
-     policy so both carve the same ranges. */}}
+{{/* Runner-sandbox egress rules (dict: entries, root). Every rail 1 ipBlock goes through here so carve-outs live once: allows are additive, so a broad entry must not re-permit 169.254.169.254 or private ranges. Except list: per-entry except (empty refused by curie.objectStore.egressEntry), else curie.metadataExcept, plus curie.privateExcept ranges (#3842). */}}
+{{/* Except list of one egress entry as JSON: its own `except`, else the metadata carve-out, plus private ranges its CIDR contains. Shared with the publication Job policy. */}}
 {{- define "curie.egress.ipBlockExcept" -}}
 {{- $excepts := list }}
 {{- if .entry.except }}
@@ -2560,28 +1810,12 @@ See those helpers for the containment/family rules.
 {{- end }}
 {{- end -}}
 
-{{/* ---- Claim-env no-op notice for the sandbox init containers (#2612) ----
-     Every staging init container below takes a silent no-op path when its own
-     env is empty, which is correct for a warm or unbound pod and WRONG-looking
-     for a hand-written SandboxClaim: a `spec.env` entry with no `containerName`
-     is injected into the runner container only, so the init container keeps the
-     template's baked empty default, logs "nothing to do", and exits 0. Every
-     container reported success and the runner then crash-looped on an unrelated
-     [manifest.missing]. The no-op stays a no-op -- the pod must still boot warm
-     -- but it now names the one mistake that produces it, in the log of the
-     container that took it.
-     Args: dict "key" <env var name> "container" <this init container's name>. */}}
+{{/* Claim-env no-op notice for sandbox init containers (#2612): a SandboxClaim spec.env entry without containerName reaches only the runner. The no-op stays (warm pods must boot) but logs it. */}}
 {{- define "curie.sandbox.claimEnvNoOpNotice" -}}
 no {{ .key }} in this container's env: nothing to stage. This is expected for a warm or unbound pod. If you set {{ .key }} on a SandboxClaim and expected staging, note that a spec.env entry with no containerName reaches the RUNNER container only -- repeat it with containerName: {{ .container }}.
 {{- end -}}
 
-{{/*
-Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
-array: every connectorSecrets agent, every registryEgress agent (#3083), and
-every runnerImages agent (ADR-0173), every runnerEnv agent, every workspaceSizeLimits agent (#3523),
-every agentResourceProfiles agent (#4889), every true factory.sandboxEgress, and every string in
-agentSandbox.poolAgents.
-*/}}
+{{/* Agents with a per-agent runner SandboxTemplate and warm pool, as a JSON array: connectorSecrets, registryEgress (#3083), runnerImages (ADR-0173), runnerEnv, workspaceSizeLimits (#3523), agentResourceProfiles (#4889), factory.sandboxEgress, poolAgents. */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
 {{- $extra := list -}}
 {{- if kindIs "slice" .Values.agentSandbox.poolAgents -}}
@@ -2591,27 +1825,12 @@ agentSandbox.poolAgents.
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}
 
-{{/*
-The action executor switch (ACTION-EXECUTOR-1): one value, rendered as "true"
-or "false" into both the API and the worker, so the two processes can never
-disagree about whether executions are created and claimed. Read through
-`default dict` because `actionExecutor` is a top level key a release that
-predates it does not carry under --reuse-values (#3505, #3544).
-*/}}
+{{/* Action executor switch (ACTION-EXECUTOR-1): one "true" or "false" into API and worker so they cannot disagree (#3505, #3544). */}}
 {{- define "curie.actionExecutorEnabled" -}}
 {{- if (get (.Values.actionExecutor | default dict) "enabled") -}}true{{- else -}}false{{- end -}}
 {{- end -}}
 
-{{/*
-The executor's own connector reads without the reconcile loop (#4800,
-ACTION-EXECUTOR-12 as amended): "true" or "false". On, the worker Role gains a
-single-object `get` on Deployments (and nothing else) and the worker reads the
-acting connector's Deployment and the in-force digest itself, while
-worker.connectorReconciler stays off. It requires the executor, and is refused
-with the reconciler on, where the executor already reads through the
-reconciler's rules. Read through `default dict` for --reuse-values from a
-release that predates the key.
-*/}}
+{{/* Executor connector reads without the reconcile loop (#4800, ACTION-EXECUTOR-12): "true" or "false". Requires the executor; refused with the reconciler on. */}}
 {{- define "curie.actionExecutorConnectorReads" -}}
 {{- if (get (.Values.actionExecutor | default dict) "connectorReadsWithoutReconciler") -}}
 {{- if ne (include "curie.actionExecutorEnabled" .) "true" -}}
@@ -2624,24 +1843,13 @@ true
 {{- else -}}false{{- end -}}
 {{- end -}}
 
-{{/*
-The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12, executor
-amendment E9): one value, rendered as the same integer literal into both the
-API (whose claim route enforces it) and the worker (whose executor loop runs up
-to that many at once). values.schema.json keeps it an integer of at least 1.
-*/}}
+{{/* Installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12, amendment E9): one integer rendered into both API and worker. */}}
 {{- define "curie.actionExecutorMaxConcurrentSandboxes" -}}
 {{- $cap := get (.Values.actionExecutor | default dict) "maxConcurrentSandboxes" -}}
 {{- if kindIs "invalid" $cap -}}2{{- else -}}{{ int $cap }}{{- end -}}
 {{- end -}}
 
-{{/*
-The automated remediation switch (AUTOMATED-REMEDIATION-1): one value, rendered
-as "true" or "false" into both the API and the worker. Enabling it requires the
-action executor, so a render with remediation on and the executor off fails
-here, in the one helper both workloads include. Read through `default dict`
-for --reuse-values from a release that predates the key.
-*/}}
+{{/* Automated remediation switch (AUTOMATED-REMEDIATION-1): "true" or "false" into API and worker. Requires the action executor. */}}
 {{- define "curie.remediationEnabled" -}}
 {{- if (get (.Values.remediation | default dict) "enabled") -}}
 {{- if ne (include "curie.actionExecutorEnabled" .) "true" -}}
@@ -2651,13 +1859,7 @@ true
 {{- else -}}false{{- end -}}
 {{- end -}}
 
-{{/*
-Workspace recovery (ADR 0251): off by default. Enabling it requires a positive
-integer installation-wide byte cap that counts every recovery byte. Read
-through `default dict` for --reuse-values from a release that predates the key.
-The one helper both the API and the worker include, so a bad cap fails the
-render instead of starting an API that refuses to boot.
-*/}}
+{{/* Workspace recovery (ADR 0251): off by default; enabling requires a positive installation-wide byte cap. One helper for API and worker. */}}
 {{- define "curie.workspaceRecoveryEnabled" -}}
 {{- $recovery := dig "workspace" "recovery" dict (.Values.worker | default dict) -}}
 {{- if get $recovery "enabled" -}}
@@ -2869,11 +2071,7 @@ true
 {{- fail (printf "%s credential appId %s differs from api.githubAppId %s; the factory and git-flow must use one GitHub App" $where (include "curie.factory.str" $own) $appId) -}}
 {{- end -}}
 {{- end -}}
-{{- /* One binding per tracker scope (#4622, ADR 0197), whether or not
-factory.enabled: CURIE_FORGES renders from these lists either way and the API's
-ForgesConfig.check_references refuses the same document at boot. The scope is
-(tracker kind, host stripped and lowercased, trackerScopeId), as the runtime
-resolves it, so two tracker entries for one site cannot hide a duplicate. */ -}}
+{{- /* One binding per tracker scope (#4622, ADR 0197), whether or not factory.enabled. Scope is (tracker kind, host stripped and lowercased, trackerScopeId). */ -}}
 {{- $trackers := dict -}}
 {{- range $index, $tracker := (get $factory "trackers" | default list) -}}
 {{- $name := get $tracker "name" | default "" | toString -}}
@@ -2900,10 +2098,7 @@ resolves it, so two tracker entries for one site cannot hide a duplicate. */ -}}
 {{- $tracker := get $trackers $trackerName -}}
 {{- $kind := get $tracker "kind" | default "" | toString -}}
 {{- $host := get $tracker "host" | default "" | toString | trim | lower -}}
-{{- /* A trackerScopeId is a nonempty string, taken as is like the runtime, or
-a whole number below 2^53 in magnitude, which Helm's float64 holds exactly and
-renders as plain decimal digits. Anything else (missing, null, empty, a list
-or map, a fraction, a larger number) is refused, as the CLI preflight does. */ -}}
+{{- /* A trackerScopeId is a nonempty string taken as is, or a whole number below 2^53. Anything else is refused, as the CLI preflight does. */ -}}
 {{- $rawScope := get $binding "trackerScopeId" -}}
 {{- $validScope := false -}}
 {{- if kindIs "string" $rawScope }}{{ $validScope = ne $rawScope "" }}
@@ -2922,9 +2117,7 @@ or map, a fraction, a larger number) is refused, as the CLI preflight does. */ -
 {{- end -}}
 {{- $_ := set $scopes $key $name -}}
 {{- end -}}
-{{- /* factory.enabled needs a tracker and a code host of any installed kind (#4399).
-A GitHub entry in either list keeps GitHub's own pairing: a github tracker and a
-github code host together. */ -}}
+{{- /* factory.enabled needs a tracker and a code host of any installed kind (#4399); a GitHub entry in either list keeps GitHub's own pairing. */ -}}
 {{- if get $factory "enabled" -}}
 {{- $anyGithub := false -}}
 {{- range concat (get $factory "trackers" | default list) (get $factory "codeHosts" | default list) }}{{ if eq (get . "kind" | default "") "github" }}{{ $anyGithub = true }}{{ end }}{{ end -}}
@@ -3107,9 +2300,7 @@ github code host together. */ -}}
 {{- toJson $out -}}
 {{- end -}}
 
-{{/* HTTP identity operator files (@spec HTTP-INVOCATION-EXECUTION-20). Each names an
-     operator-created Secret, or renders empty. Read through dig so a retained
-     release whose values predate httpIdentity renders unchanged. */}}
+{{/* HTTP identity operator files (@spec HTTP-INVOCATION-EXECUTION-20): each names an operator-created Secret or renders empty. Read through dig for --reuse-values. */}}
 {{- define "curie.httpIdentity.apiSecret" -}}
 {{- dig "httpIdentity" "existingSecret" "" (.Values.api | default dict) -}}
 {{- end -}}

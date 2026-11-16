@@ -16,8 +16,8 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from curie_internal.requester_coding_instructions import EvidenceState
 from curie_telemetry.redact import redact_text
-from sqlalchemy import and_, case, exists, func, or_, select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import and_, case, exists, func, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -72,6 +72,7 @@ from ..requester_instruction_admission import (
     selection_columns,
 )
 from ..schemas.workitems import CodingInstructionsMetadata
+from . import resource_gate
 
 if TYPE_CHECKING:
     # factory_base reaches this module through factory_notices at import time.
@@ -102,6 +103,8 @@ ConflictCode = Literal[
     "publication_ineligible",
     "publication_pending",
     "termination_observation_required",
+    # A gated request's start did not deliver a strictly larger limit (#5427).
+    "resource_gate_unmet",
     # An explicit personal owner that differs from the WorkItem it raced to (#5376).
     OwnerMismatchCode,
 ]
@@ -155,6 +158,15 @@ def automatic_retry_delay_seconds(work_item_id: uuid.UUID, slot: int) -> float:
     digest = sha256(f"{work_item_id}:{slot}".encode()).digest()
     unit = int.from_bytes(digest[:8], "big") / 2**64
     return base * (1 - AUTOMATIC_RETRY_JITTER + 2 * AUTOMATIC_RETRY_JITTER * unit)
+
+
+# The worker limits of a start that claimed no sandbox: nothing was observed.
+NO_DELIVERED_LIMITS: Mapping[str, Any] = {
+    "memory_bytes": None,
+    "ephemeral_storage_bytes": None,
+    "scratch_bytes": {},
+    "max_turns": None,
+}
 
 
 _NO_READMIT: dict[str, Any] = {
@@ -1241,7 +1253,17 @@ async def start_execution_where(
     expected_request_version: int,
     extra_where: Sequence[ColumnElement[bool]],
     extra_values: Mapping[str, Any],
+    delivered_limits: Mapping[str, Any],
 ) -> WorkItemResult:
+    """Start a waiting request.
+
+    ``delivered_limits`` holds the limits the worker read from the sandbox it
+    claimed for this attempt (#5427). The start records them with the two
+    allowances the API enforces, and a gated request starts only when the
+    record delivers strictly more of its gated dimension; otherwise the start
+    is refused ``resource_gate_unmet`` and nothing changes.
+    """
+
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
         return await _conflict(
@@ -1271,12 +1293,16 @@ async def start_execution_where(
         )
     # Same transaction as the transition: the owning agent's operator override,
     # else the platform default (#3071).
-    agent_deadline = await session.scalar(
-        select(Agent.execution_deadline_seconds).where(Agent.id == work_item.agent_id)
+    deadline_seconds = await execution_deadline_seconds(session, work_item.agent_id)
+    record = resource_gate.delivered_record(
+        delivered_limits,
+        history_capacity_bytes=get_settings().transcript_max_thread_bytes,
+        execution_seconds=deadline_seconds,
     )
-    deadline_seconds = (
-        agent_deadline if agent_deadline is not None else DEFAULT_EXECUTION_DEADLINE_SECONDS
-    )
+    if request.resource_gate is not None and not resource_gate.gate_met(
+        request.resource_gate, record
+    ):
+        return await _conflict(session, "resource_gate_unmet", work_item=work_item, request=request)
     values: dict[str, Any] = {
         "status": "running",
         "started_at": now,
@@ -1286,8 +1312,16 @@ async def start_execution_where(
         # A started request is no longer failing preparation (#4930). Cleared
         # by this same CAS, so a refused or stale start leaves it intact.
         "last_start_failure_detail": None,
+        # A gate is satisfied only by this start, so it clears with it.
+        "blocked_on": None,
         **extra_values,
     }
+    # The record names the epoch this same UPDATE writes, read from the row's
+    # values as the statement assigns them.
+    epoch = values.get("runtime_epoch", ExecutionRequest.runtime_epoch)
+    values["delivered_limits"] = func.jsonb_build_object("runtime_epoch", epoch).op(
+        "||", return_type=JSONB
+    )(literal(record, type_=JSONB))
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -1319,6 +1353,15 @@ async def start_execution_where(
     request = await reload_request(session, request_id)
     await _bound_grant_to_deadline(session, request)
     return await outcome(session, work_item, request)
+
+
+async def execution_deadline_seconds(session: AsyncSession, agent_id: uuid.UUID) -> int:
+    """The agent's operator execution deadline override, else the platform default."""
+
+    agent_deadline = await session.scalar(
+        select(Agent.execution_deadline_seconds).where(Agent.id == agent_id)
+    )
+    return agent_deadline if agent_deadline is not None else DEFAULT_EXECUTION_DEADLINE_SECONDS
 
 
 async def _bound_grant_to_deadline(session: AsyncSession, request: ExecutionRequest) -> None:
@@ -1403,6 +1446,8 @@ async def start_execution(
         expected_request_version=expected_request_version,
         extra_where=(),
         extra_values={"execution_attempts": 1},
+        # No worker claimed a sandbox for this start, so it observed no limit.
+        delivered_limits=NO_DELIVERED_LIMITS,
     )
 
 
@@ -1900,6 +1945,7 @@ async def terminalize_execution(
     extra_where: Sequence[ColumnElement[bool]],
     retry_safety: RetrySafety | None,
     retry_condition: RetryConditionFact | None,
+    exhausted_volume: str | None,
 ) -> WorkItemResult:
     """Settle a running request completed or failed.
 
@@ -1907,7 +1953,10 @@ async def terminalize_execution(
     (ADR 0269); a settlement the API makes itself passes None for both. They
     are written by the terminal UPDATE, and a failed request whose facts the
     factory policy allows may admit its automatic successor in this same
-    transaction, before terminal settlement.
+    transaction, before terminal settlement. ``exhausted_volume`` is the
+    scratch volume a ``sandbox_scratch_exhausted`` finish named (#5427); the
+    terminal UPDATE adds it to the request's delivered limits record, where
+    the successor's gate reads it.
     """
 
     work_item = await lock_work_item(session, work_item_id)
@@ -2053,6 +2102,17 @@ async def terminalize_execution(
     deadline_guard = (
         () if opened else (ExecutionRequest.execution_deadline > func.clock_timestamp(),)
     )
+    # A request with no delivered record keeps none: concatenation with NULL
+    # is NULL, so a named volume alone never makes a record a gate could use.
+    volume_values: dict[str, Any] = (
+        {}
+        if exhausted_volume is None
+        else {
+            "delivered_limits": ExecutionRequest.delivered_limits.op("||", return_type=JSONB)(
+                func.jsonb_build_object(resource_gate.EXHAUSTED_VOLUME_KEY, exhausted_volume)
+            )
+        }
+    )
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -2075,6 +2135,7 @@ async def terminalize_execution(
             ),
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
+            **volume_values,
         )
         .returning(ExecutionRequest.id)
     )
@@ -2140,6 +2201,7 @@ async def complete_execution(
         extra_where=(),
         retry_safety=retry_safety,
         retry_condition=retry_condition,
+        exhausted_volume=None,
     )
 
 
@@ -2167,6 +2229,7 @@ async def fail_execution(
         extra_where=(),
         retry_safety=retry_safety,
         retry_condition=retry_condition,
+        exhausted_volume=None,
     )
 
 
@@ -2296,6 +2359,7 @@ async def settle_ci_verdict(
                 extra_where=(),
                 retry_safety=None,
                 retry_condition=None,
+                exhausted_volume=None,
             )
         if isinstance(result, WorkItemOutcome):
             await session.execute(
@@ -2324,6 +2388,7 @@ async def settle_ci_verdict(
         extra_where=(),
         retry_safety=None,
         retry_condition=None,
+        exhausted_volume=None,
     )
 
 
@@ -3257,6 +3322,11 @@ async def _admit_automatic_successor(
     ordinary failure needs the worker's proved ``no_effects``, a policy
     disposition that allows a successor, and no queued newer revision. A
     publication failure instead goes to ``_admit_publication_recovery``.
+
+    A limit condition (#5427) admits a gated successor instead: it carries the
+    limit the predecessor's attempt actually had, and the reconciler offers
+    it every probe interval until a start delivers strictly more. A
+    predecessor without that delivered value admits no successor.
     """
 
     if (
@@ -3314,6 +3384,7 @@ async def _admit_automatic_successor(
     slot = work_item.automatic_retries_used + 1
     dispatch_not_before = now
     blocked_on: str | None = None
+    gate: dict[str, Any] | None = None
     if origin == "ordinary":
         assert disposition is not None
         due = now + timedelta(seconds=automatic_retry_delay_seconds(work_item.id, slot))
@@ -3335,6 +3406,20 @@ async def _admit_automatic_successor(
             dispatch_not_before = wait_deadline
         else:
             dispatch_not_before = due
+        if disposition.condition in resource_gate.GATE_CONDITIONS:
+            gate = resource_gate.gate_for(
+                disposition.condition,
+                predecessor.delivered_limits,
+                source_request_id=predecessor.id,
+                source_runtime_epoch=predecessor.runtime_epoch,
+            )
+            if gate is None:
+                return False
+            # A gated wait is probed, not slept until its deadline.
+            blocked_on = disposition.condition
+            dispatch_not_before = now + timedelta(
+                seconds=get_settings().work_item_resource_gate_probe_seconds
+            )
     admitted = await _insert_waiting_request(
         session,
         work_item,
@@ -3359,6 +3444,7 @@ async def _admit_automatic_successor(
             "retry_origin_request_id": predecessor.retry_origin_request_id or predecessor.id,
             "dispatch_not_before": dispatch_not_before,
             "blocked_on": blocked_on,
+            "resource_gate": gate,
         },
     )
     # The WorkItem is locked and its count was checked above, so the

@@ -157,6 +157,7 @@ from curie_runner.history import (
     DEFAULT_REPLAY_MAX_BYTES, DEFAULT_REPLAY_MAX_TURNS,
     build_conversation_replay, resolve_history,
 )
+
 async def read():
     config = RunnerConfig.from_env(os.environ)
     records = await resolve_history(config.history_ref, os.environ).load()
@@ -2532,6 +2533,7 @@ class Launcher:
         from channel_protocol.work_item_events import execute_event_id
         from curie_worker.binding import RUNNER_TOKEN_ENV
         from curie_worker.personal_custody import PersonalGrant
+        from curie_worker.sandbox.types import DeliveredLimits
         from curie_worker.workitem_dispatch import WorkItemRun
 
         view = await self.http.get(
@@ -2587,7 +2589,13 @@ class Launcher:
             agent_name=resolved.agent_name,
         )
         del env
-        await run.start(claim_name=handle.claim_name, sandbox_name=handle.sandbox_name)
+        await run.start(
+            claim_name=handle.claim_name,
+            sandbox_name=handle.sandbox_name,
+            delivered_limits=DeliveredLimits(
+                memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+            ).to_wire(),
+        )
         return Launched(
             request_id=request_id, generation=generation, run=run,
             claim_name=handle.claim_name, sandbox_name=handle.sandbox_name,
@@ -2643,6 +2651,7 @@ class Launcher:
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
 
     async def revalidate(self) -> tuple[int, dict[str, Any]]:

@@ -1,0 +1,266 @@
+{
+ "source": "kubelet on k3s v1.36.2, recorded 2026-11-15; pod spec, status and events trimmed to the fields diagnosis reads; identifiers anonymized",
+ "pods": {
+  "oom-probe": {
+   "metadata": {
+    "name": "oom-probe",
+    "uid": "00000000-0000-0000-0000-000000000001"
+   },
+   "spec": {
+    "containers": [
+     {
+      "name": "runner",
+      "resources": {
+       "limits": {
+        "cpu": "200m",
+        "ephemeral-storage": "64Mi",
+        "memory": "48Mi"
+       },
+       "requests": {
+        "cpu": "50m",
+        "ephemeral-storage": "16Mi",
+        "memory": "32Mi"
+       }
+      },
+      "volumeMounts": []
+     }
+    ],
+    "volumes": []
+   },
+   "status": {
+    "phase": "Failed",
+    "conditions": [
+     {
+      "type": "PodReadyToStartContainers",
+      "status": "False"
+     },
+     {
+      "type": "Initialized",
+      "status": "True"
+     },
+     {
+      "type": "Ready",
+      "status": "False",
+      "reason": "PodFailed"
+     },
+     {
+      "type": "ContainersReady",
+      "status": "False",
+      "reason": "PodFailed"
+     },
+     {
+      "type": "PodScheduled",
+      "status": "True"
+     }
+    ],
+    "containerStatuses": [
+     {
+      "name": "runner",
+      "state": {
+       "terminated": {
+        "exitCode": 137,
+        "reason": "OOMKilled",
+        "finishedAt": "2026-11-15T14:44:15Z",
+        "startedAt": "2026-11-15T14:44:14Z"
+       }
+      },
+      "lastState": {}
+     }
+    ]
+   },
+   "events": []
+  },
+  "scratch-probe": {
+   "metadata": {
+    "name": "scratch-probe",
+    "uid": "00000000-0000-0000-0000-000000000002"
+   },
+   "spec": {
+    "containers": [
+     {
+      "name": "runner",
+      "resources": {
+       "limits": {
+        "cpu": "200m",
+        "ephemeral-storage": "64Mi",
+        "memory": "64Mi"
+       },
+       "requests": {
+        "cpu": "50m",
+        "ephemeral-storage": "16Mi",
+        "memory": "32Mi"
+       }
+      },
+      "volumeMounts": [
+       {
+        "name": "workspace",
+        "mountPath": "/workspace"
+       }
+      ]
+     }
+    ],
+    "volumes": [
+     {
+      "emptyDir": {
+       "sizeLimit": "8Mi"
+      },
+      "name": "workspace"
+     }
+    ]
+   },
+   "status": {
+    "phase": "Failed",
+    "reason": "Evicted",
+    "message": "Usage of EmptyDir volume \"workspace\" exceeds the limit \"8Mi\". ",
+    "conditions": [
+     {
+      "type": "PodReadyToStartContainers",
+      "status": "False"
+     },
+     {
+      "type": "Initialized",
+      "status": "True"
+     },
+     {
+      "type": "Ready",
+      "status": "False",
+      "reason": "PodFailed"
+     },
+     {
+      "type": "ContainersReady",
+      "status": "False",
+      "reason": "PodFailed"
+     },
+     {
+      "type": "PodScheduled",
+      "status": "True"
+     }
+    ],
+    "containerStatuses": [
+     {
+      "name": "runner",
+      "state": {
+       "terminated": {
+        "exitCode": 137,
+        "reason": "Error",
+        "finishedAt": "2026-11-15T14:44:23Z",
+        "startedAt": "2026-11-15T14:44:14Z"
+       }
+      },
+      "lastState": {}
+     }
+    ]
+   },
+   "events": [
+    {
+     "reason": "Evicted",
+     "message": "Usage of EmptyDir volume \"workspace\" exceeds the limit \"8Mi\". ",
+     "type": "Warning",
+     "involvedObject": {
+      "kind": "Pod",
+      "name": "scratch-probe"
+     }
+    },
+    {
+     "reason": "Killing",
+     "message": "Stopping container runner",
+     "type": "Normal",
+     "involvedObject": {
+      "kind": "Pod",
+      "name": "scratch-probe"
+     }
+    }
+   ]
+  },
+  "ephemeral-probe": {
+   "metadata": {
+    "name": "ephemeral-probe",
+    "uid": "00000000-0000-0000-0000-000000000003"
+   },
+   "spec": {
+    "containers": [
+     {
+      "name": "runner",
+      "resources": {
+       "limits": {
+        "cpu": "200m",
+        "ephemeral-storage": "12Mi",
+        "memory": "64Mi"
+       },
+       "requests": {
+        "cpu": "50m",
+        "ephemeral-storage": "4Mi",
+        "memory": "32Mi"
+       }
+      },
+      "volumeMounts": []
+     }
+    ],
+    "volumes": []
+   },
+   "status": {
+    "phase": "Failed",
+    "reason": "Evicted",
+    "message": "Pod ephemeral local storage usage exceeds the total limit of containers 12Mi. ",
+    "conditions": [
+     {
+      "type": "PodReadyToStartContainers",
+      "status": "False"
+     },
+     {
+      "type": "Initialized",
+      "status": "True"
+     },
+     {
+      "type": "Ready",
+      "status": "False",
+      "reason": "PodFailed"
+     },
+     {
+      "type": "ContainersReady",
+      "status": "False",
+      "reason": "PodFailed"
+     },
+     {
+      "type": "PodScheduled",
+      "status": "True"
+     }
+    ],
+    "containerStatuses": [
+     {
+      "name": "runner",
+      "state": {
+       "terminated": {
+        "exitCode": 137,
+        "reason": "Error",
+        "finishedAt": "2026-11-15T14:44:25Z",
+        "startedAt": "2026-11-15T14:44:14Z"
+       }
+      },
+      "lastState": {}
+     }
+    ]
+   },
+   "events": [
+    {
+     "reason": "Evicted",
+     "message": "Pod ephemeral local storage usage exceeds the total limit of containers 12Mi. ",
+     "type": "Warning",
+     "involvedObject": {
+      "kind": "Pod",
+      "name": "ephemeral-probe"
+     }
+    },
+    {
+     "reason": "Killing",
+     "message": "Stopping container runner",
+     "type": "Normal",
+     "involvedObject": {
+      "kind": "Pod",
+      "name": "ephemeral-probe"
+     }
+    }
+   ]
+  }
+ }
+}

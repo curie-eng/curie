@@ -202,6 +202,12 @@ def _start(request_id: uuid.UUID) -> int:
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
             context=acquired.context,
+            delivered_limits={
+                "memory_bytes": None,
+                "ephemeral_storage_bytes": None,
+                "scratch_bytes": {},
+                "max_turns": None,
+            },
         )
         return int(started.runtime_epoch)  # type: ignore[union-attr]
 
@@ -220,6 +226,7 @@ def _fail(request_id: uuid.UUID, epoch: int) -> None:
             ci_fix_round=None,
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
         assert getattr(result, "code", None) is None, result
 

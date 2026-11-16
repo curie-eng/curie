@@ -241,6 +241,7 @@ def test_stale_runtime_epoch_finish_is_refused_and_the_live_owner_settles(
                 ci_fix_round=None,
                 retry_safety="no_effects",
                 retry_condition=None,
+                exhausted_volume=None,
             )
         assert refused.value.code == "stale_owner"
         row = await case.row(item.request_id)

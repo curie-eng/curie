@@ -135,7 +135,7 @@ def publication_revision_ids(publication: Publication) -> frozenset[uuid.UUID]:
     """The revision markers a commit may carry to stand for ``publication``.
 
     Its own revision, and the earlier failed revisions it may adopt, fixed at
-    creation (migration 0174, #5429).
+    creation (migration 0175, #5429).
     """
 
     return frozenset((publication.id, *publication.adoptable_revision_ids))

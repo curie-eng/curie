@@ -92,6 +92,7 @@ from curie_worker.publication_candidates import PublicationCandidateClient
 from curie_worker.publication_validation import validate_snapshot_against_base
 from curie_worker.runner_client import RunnerClient, RunnerWorkspaceSnapshot
 from curie_worker.sandbox import DockerSandboxClient
+from curie_worker.sandbox.types import DeliveredLimits
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemDispatchClient,
@@ -565,7 +566,15 @@ class _Stage:
 
     async def start_run(self) -> WorkItemRun:
         run = await self.acquired_run()
-        await run.start(claim_name=self.handle.claim_name, sandbox_name=self.handle.sandbox_name)
+        # This suite proves candidate capture, not resource gates (#5427).
+        unobserved = DeliveredLimits(
+            memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+        )
+        await run.start(
+            claim_name=self.handle.claim_name,
+            sandbox_name=self.handle.sandbox_name,
+            delivered_limits=unobserved.to_wire(),
+        )
         assert run.started and run.runtime_epoch is not None
         self.run = run
         return run
@@ -702,6 +711,7 @@ class _Stage:
             # Unproven safety earns no automatic successor, so this disposition is final.
             retry_safety="uncertain",
             retry_condition=None,
+            exhausted_volume=None,
         )
         assert run.finished
         await self.sql(

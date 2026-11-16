@@ -118,6 +118,27 @@ ModelAuthMode = Literal["service", "personal"]
 RetryKind = Literal["owner_loss", "failure"]
 
 
+class ResourceGateOut(BaseModel):
+    """The raised limit a blocked retry of a resource failure waits for (#5427).
+
+    ``failed_limit`` is the limit the failed attempt actually had; the retry
+    starts only when the limit delivered to its own sandbox is larger.
+    ``volume`` names the scratch volume for a scratch gate.
+    """
+
+    condition: str
+    dimension: Literal[
+        "memory",
+        "ephemeral_storage",
+        "scratch",
+        "max_turns",
+        "history_capacity",
+        "execution_seconds",
+    ]
+    volume: str | None
+    failed_limit: int
+
+
 class CodingInstructionsMetadata(BaseModel):
     """Public selection metadata; the private snapshot text is never serialized."""
 
@@ -160,6 +181,8 @@ class WorkItemRequestOut(BaseModel):
     dispatch_not_before: datetime
     # The named condition a blocked retry waits for; null when nothing blocks it.
     blocked_on: str | None
+    # The raised limit a resource gated retry waits for; null when ungated.
+    resource_gate: ResourceGateOut | None
     # The worker's side effect fact from this request's finish; null when the
     # request did not end through a worker finish.
     retry_safety: RetrySafety | None

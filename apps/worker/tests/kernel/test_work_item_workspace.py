@@ -249,6 +249,8 @@ class _WorkItems(AbsentRequesterContext):
             execution_kind="implementation",
             recovery_candidate_id=None,
             context=factory_context(AGENT_ID, wake),
+            resource_gate=None,
+            predecessor_claim_name=None,
         )
         self.acquisitions[request_id] = grant
         return grant

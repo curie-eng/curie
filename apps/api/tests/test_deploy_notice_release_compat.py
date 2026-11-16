@@ -73,9 +73,9 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # Refusal posts require 0170, which stays below this floor.
     # Triage handoff storage requires 0171, which stays below this floor.
     # Factory retry allowance columns require 0172, which stays below this floor.
-    # Publication candidate retention requires 0173, which stays below this floor.
-    # Publication recovery requests require 0174.
-    candidate = {"schema_min": "0174", "schema_head": "0174"}
+    # Factory resource gate columns require 0174, which stays below this floor.
+    # Publication recovery requests require 0175.
+    candidate = {"schema_min": "0175", "schema_head": "0175"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -83,7 +83,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-55:] == [
+    assert catalog["revisions"][-56:] == [
         "0095",
         "0096",
         "0097",
@@ -139,6 +139,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0172",
         "0173",
         "0174",
+        "0175",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

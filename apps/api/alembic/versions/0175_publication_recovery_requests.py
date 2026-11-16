@@ -20,8 +20,8 @@ The downgrade refuses before any DDL while a recovery request exists, because
 dropping the kind would turn it into an implementation request that reruns the
 model.
 
-Revision ID: 0174
-Revises: 0173
+Revision ID: 0175
+Revises: 0174
 """
 
 from collections.abc import Sequence
@@ -29,8 +29,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0174"
-down_revision: str = "0173"
+revision: str = "0175"
+down_revision: str = "0174"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 S = "curie"

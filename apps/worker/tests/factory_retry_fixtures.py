@@ -63,6 +63,7 @@ from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.binding import FactoryWake
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.sandbox.types import DeliveredLimits
 from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -76,6 +77,11 @@ from apps.worker.tests.start_wait_fixtures import (
     WORKER_TOKEN,
     StartWaitCase,
 )
+
+UNOBSERVED_LIMITS = DeliveredLimits(
+    memory_bytes=None, ephemeral_storage_bytes=None, scratch_bytes={}, max_turns=None
+).to_wire()
+
 
 VECTORS_PATH = ROOT / "tests/vectors/factory-retry-dispositions.json"
 REQUESTER = "U0REQUEST1"
@@ -715,6 +721,7 @@ class FactoryRetryCase(StartWaitCase):
             claim_name=claim_name,
             sandbox_name=f"sbx-{claim_name}",
             context=grant.context,
+            delivered_limits=UNOBSERVED_LIMITS,
         )
         await self.dispatch.hold_for_approval(item.request_id, runtime_epoch=started.runtime_epoch)
         return started.runtime_epoch

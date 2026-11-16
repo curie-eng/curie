@@ -50,6 +50,7 @@ class _SettlingWorkItem:
     ci_fix_round: int | None
     retry_safety: RetrySafety
     retry_condition: RetryCondition | None
+    exhausted_volume: str | None
     task: asyncio.Task[None] | None = None
     cleaned: bool = False
 
@@ -83,6 +84,7 @@ def _begin_settling(
     ci_fix_round: int | None,
     retry_safety: RetrySafety,
     retry_condition: RetryCondition | None,
+    exhausted_volume: str | None,
 ) -> None:
     """Hand off only the report, synchronously retaining ownership (#4174)."""
 
@@ -96,6 +98,7 @@ def _begin_settling(
         ci_fix_round=ci_fix_round,
         retry_safety=retry_safety,
         retry_condition=retry_condition,
+        exhausted_volume=exhausted_volume,
     )
     self._settling_work_items[run.request_id] = pending
     if self._work_item_runs.get(run.request_id) is run:
@@ -115,6 +118,7 @@ async def _finish_or_settle(
     ci_fix_round: int | None,
     retry_safety: RetrySafety,
     retry_condition: RetryCondition | None,
+    exhausted_volume: str | None,
 ) -> None:
     try:
         await run.finish(
@@ -124,6 +128,7 @@ async def _finish_or_settle(
             ci_fix_round=ci_fix_round,
             retry_safety=retry_safety,
             retry_condition=retry_condition,
+            exhausted_volume=exhausted_volume,
         )
     except WorkItemConflict as exc:
         if exc.code != "not_running":
@@ -143,6 +148,7 @@ async def _finish_or_settle(
             ci_fix_round=ci_fix_round,
             retry_safety=retry_safety,
             retry_condition=retry_condition,
+            exhausted_volume=exhausted_volume,
         )
     else:
         _mark_recovery_eligible(run, outcome)
@@ -172,6 +178,7 @@ async def _settle_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
                     ci_fix_round=pending.ci_fix_round,
                     retry_safety=pending.retry_safety,
                     retry_condition=pending.retry_condition,
+                    exhausted_volume=pending.exhausted_volume,
                 )
             except WorkItemConflict as exc:
                 if exc.code in {"not_running", "publication_pending"}:
@@ -457,6 +464,7 @@ async def _adopt_resumed_work_item(
                 ci_fix_round=None,
                 retry_safety="uncertain",
                 retry_condition=None,
+                exhausted_volume=None,
             )
         except WorkItemConflict as exc:
             logger.info("refused factory continuation finish for %s: %s", event_id, exc.code)

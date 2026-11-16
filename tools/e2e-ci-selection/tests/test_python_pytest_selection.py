@@ -110,6 +110,7 @@ CONTAINER_FILES = (
 )
 DRY_RUN_JOB = "python-dry-run-fixture"
 DRY_RUN_FILE = "tools/factory-e2e/tests/test_c4_dry_run.py"
+RESOURCE_RETRY_FILE = "tools/factory-e2e/tests/test_factory_resource_retry.py"
 SHARD_NEIGHBOR = "tools/factory-e2e/tests/test_c4_reinstall_publication.py"
 PRIVATE_IMPORT_STEP = "API private import boundaries"
 ALWAYS_RUN_PYTHON_STEPS = (
@@ -764,7 +765,10 @@ def _without_runtime_exclusion(arguments: list[str], runtime: str) -> list[str]:
 def _without_owned_runtime_exclusions(arguments: list[str]) -> list[str]:
     expected = {
         *(("--deselect", runtime) for runtime in ADMITTED_AGENT_RUNTIMES),
-        *(("--ignore", runtime) for runtime in (*CONTAINER_FILES, DRY_RUN_FILE)),
+        *(
+            ("--ignore", runtime)
+            for runtime in (*CONTAINER_FILES, DRY_RUN_FILE, RESOURCE_RETRY_FILE)
+        ),
     }
     remaining = []
     excluded = []
@@ -1488,6 +1492,7 @@ def _assert_owned_kind_modules_excluded(argv: list[str]) -> None:
         "tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "tools/factory-e2e/tests/test_c4_cluster_up.py",
         "tools/factory-e2e/tests/test_c4_forge_instances.py",
+        RESOURCE_RETRY_FILE,
         *CONTAINER_FILES,
         DRY_RUN_FILE,
     ):

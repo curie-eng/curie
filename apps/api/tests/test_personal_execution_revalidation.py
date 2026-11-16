@@ -947,6 +947,7 @@ def test_a_start_refused_for_a_moved_enrollment_rebinds_after_its_defer_and_star
             claim_name=support.CLAIM_NAME,
             sandbox_name=support.SANDBOX_NAME,
             context=context,
+            delivered_limits=lifecycle.NO_DELIVERED_LIMITS,
         )
     )
     assert isinstance(refused, DispatchConflict), refused

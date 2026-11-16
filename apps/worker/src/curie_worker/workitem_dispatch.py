@@ -64,6 +64,38 @@ EXECUTION_PUBLICATION_RECOVERY: ExecutionKind = "publication_recovery"
 # automatic successor only for ``no_effects``.
 RetrySafety = Literal["no_effects", "flagged", "uncertain"]
 
+# ADR 0269 (#5427): the uncounted defers of a resource successor. The first
+# leaves it waiting for a strictly larger limit, the second for its failed
+# predecessor's runtime to be gone.
+RESOURCE_GATE_UNMET = "resource_gate_unmet"
+PREDECESSOR_RUNTIME_PRESENT = "predecessor_runtime_present"
+
+ResourceDimension = Literal[
+    "memory", "ephemeral_storage", "scratch", "max_turns", "history_capacity", "execution_seconds"
+]
+_RESOURCE_DIMENSIONS: frozenset[str] = frozenset(
+    {"memory", "ephemeral_storage", "scratch", "max_turns", "history_capacity", "execution_seconds"}
+)
+_RESOURCE_GATE_KEYS = frozenset(
+    {"condition", "dimension", "volume", "failed_limit", "current_limit"}
+)
+
+
+@dataclass(frozen=True)
+class ResourceGate:
+    """What a resource successor waits on before it may claim a sandbox.
+
+    ``failed_limit`` is the limit the failed predecessor was actually given.
+    ``current_limit`` is the API's own value for the dimensions it owns
+    (history capacity, execution seconds) and None for the worker's.
+    """
+
+    condition: str
+    dimension: ResourceDimension
+    volume: str | None
+    failed_limit: int
+    current_limit: int | None
+
 
 @dataclass(frozen=True)
 class WorkItemEvent:
@@ -99,6 +131,11 @@ class WorkItemAcquireGrant:
     # retained candidate it publishes; an implementation request names none.
     execution_kind: ExecutionKind
     recovery_candidate_id: uuid.UUID | None
+    # ADR 0269 (#5427): the gate a resource successor waits on, and the
+    # recorded claim of the failed predecessor whose runtime must be gone
+    # before this request claims. None on every other request.
+    resource_gate: ResourceGate | None
+    predecessor_claim_name: str | None
     # How the request completes (ADR 0277, #5586): an implementation request
     # ends in a pull request, a tracker_result request in one tracker result.
     # An API that predates the field sends none, which means implementation.
@@ -248,6 +285,35 @@ def _required_positive_int(value: object) -> int:
     return value
 
 
+def _resource_gate(value: object) -> ResourceGate | None:
+    """The acquire grant's ``resource_gate``; any malformed gate is refused."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != _RESOURCE_GATE_KEYS:
+        raise ValueError("resource gate has the wrong fields")
+    dimension = value["dimension"]
+    if dimension not in _RESOURCE_DIMENSIONS:
+        raise ValueError("resource gate names an unknown dimension")
+    volume = value["volume"]
+    if dimension == "scratch":
+        volume = _required_string(volume)
+    elif volume is not None:
+        raise ValueError("only a scratch gate names a volume")
+    current = value["current_limit"]
+    return ResourceGate(
+        condition=_required_string(value["condition"]),
+        dimension=dimension,
+        volume=volume,
+        failed_limit=_required_positive_int(value["failed_limit"]),
+        current_limit=None if current is None else _required_positive_int(current),
+    )
+
+
+def _optional_name(value: object) -> str | None:
+    return None if value is None else _required_string(value)
+
+
 def _completion_contract(body: dict[str, Any]) -> CompletionContract:
     """The request's completion contract; absent means implementation.
 
@@ -338,6 +404,8 @@ class WorkItemDispatchClient:
                 context=FactoryContext.model_validate(body["context"]),
                 execution_kind=execution_kind,
                 recovery_candidate_id=recovery_candidate_id,
+                resource_gate=_resource_gate(body["resource_gate"]),
+                predecessor_claim_name=_optional_name(body["predecessor_claim_name"]),
                 completion_contract=_completion_contract(body),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -392,6 +460,7 @@ class WorkItemDispatchClient:
         claim_name: str,
         sandbox_name: str,
         context: FactoryContext,
+        delivered_limits: dict[str, Any],
     ) -> WorkItemStartGrant:
         try:
             body = await self._post(
@@ -402,6 +471,7 @@ class WorkItemDispatchClient:
                     "claim_name": claim_name,
                     "sandbox_name": sandbox_name,
                     "context": context.model_dump(mode="json"),
+                    "delivered_limits": delivered_limits,
                 },
             )
         except WorkItemConflict as exc:
@@ -523,6 +593,7 @@ class WorkItemDispatchClient:
         ci_fix_round: int | None,
         retry_safety: RetrySafety,
         retry_condition: RetryCondition | None,
+        exhausted_volume: str | None,
         budget_s: float = DEFAULT_BUDGET_S,
     ) -> None:
         await self._post_settlement(
@@ -539,6 +610,7 @@ class WorkItemDispatchClient:
                     if retry_condition is not None
                     else None
                 ),
+                "exhausted_volume": exhausted_volume,
             },
             budget_s=budget_s,
         )
@@ -823,6 +895,13 @@ class WorkItemRun:
         self.recovery_candidate_id: uuid.UUID | None = (
             grant.recovery_candidate_id if isinstance(grant, WorkItemAcquireGrant) else None
         )
+        # Only a waiting request is gated or fenced; an adopted running one is
+        # already past its start.
+        self.resource_gate: ResourceGate | None = None
+        self.predecessor_claim_name: str | None = None
+        if isinstance(grant, WorkItemAcquireGrant):
+            self.resource_gate = grant.resource_gate
+            self.predecessor_claim_name = grant.predecessor_claim_name
         self.event_id = event_id
         self.thread_key = thread_key
         self.started = False
@@ -881,7 +960,9 @@ class WorkItemRun:
         if not self.started and self._acquire_refusal is not None:
             raise WorkItemStartRefused(self._acquire_refusal)
 
-    async def start(self, *, claim_name: str, sandbox_name: str) -> WorkItemStartGrant:
+    async def start(
+        self, *, claim_name: str, sandbox_name: str, delivered_limits: dict[str, Any]
+    ) -> WorkItemStartGrant:
         # Recorded before the API call so a start refused on a terminal code
         # (#3208) still knows the claim it made, and its release stays fenced
         # to that claim (#4331). runtime_epoch stays the started-ness signal.
@@ -898,6 +979,7 @@ class WorkItemRun:
                 claim_name=claim_name,
                 sandbox_name=sandbox_name,
                 context=self.context,
+                delivered_limits=delivered_limits,
             )
             self.started = True
             self.runtime_epoch = grant.runtime_epoch
@@ -963,6 +1045,7 @@ class WorkItemRun:
         ci_fix_round: int | None,
         retry_safety: RetrySafety,
         retry_condition: RetryCondition | None,
+        exhausted_volume: str | None,
     ) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
@@ -975,6 +1058,7 @@ class WorkItemRun:
             ci_fix_round=ci_fix_round,
             retry_safety=retry_safety,
             retry_condition=retry_condition,
+            exhausted_volume=exhausted_volume,
             budget_s=self._write_budget_s(),
         )
         self.finished = True

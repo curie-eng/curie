@@ -48,8 +48,23 @@ from .claim_tokens import (
     personal_withheld_names,
     split_claim_tokens,
 )
-from .quota import ADMISSION_DIMENSIONS, quota_has_live_headroom, quota_rejection_is_valid
-from .resources import claim_resources_spec, pod_resources, prepare_resources_claim
+from .quota import (
+    ADMISSION_DIMENSIONS,
+    quantity_bytes,
+    quota_has_live_headroom,
+    quota_rejection_is_valid,
+)
+from .resources import (
+    RUNNER_CONTAINER,
+    claim_resources_spec,
+    emptydir_size_limits,
+    pod_ephemeral_storage_limit,
+    pod_resources,
+    prepare_resources_claim,
+    runner_ephemeral_storage_limit,
+    runner_memory_limit,
+    spec_limits,
+)
 from .tool_probe import (
     PROBE_PREFIX,
     ProbeResult,
@@ -72,11 +87,13 @@ from .types import (
     ClaimView,
     DaemonObjectKind,
     DaemonObjectView,
+    DeliveredLimits,
     KubeTransientError,
     ListableDaemonKind,
     OperatingMode,
     QuotaRejection,
     QuotaStatus,
+    ResourceExhaustion,
     SandboxError,
     SandboxTermination,
     SandboxView,
@@ -526,6 +543,129 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
                 fallback="Failed" if phase == "Failed" else "Completed",
             )
         )
+    return None
+
+
+# The kubelet's own eviction sentences (pkg/kubelet/eviction), matched whole.
+# Anything else, including node pressure, names no exhausted limit.
+_QUANTITY_TEXT = r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+|[KMGTPE]i|[numkMGTPE])?"
+_EMPTYDIR_EVICTION = re.compile(
+    rf'Usage of EmptyDir volume "([a-z0-9](?:[a-z0-9.-]{{0,61}}[a-z0-9])?)" '
+    rf'exceeds the limit "({_QUANTITY_TEXT})"\. ?'
+)
+_POD_STORAGE_EVICTION = re.compile(
+    rf"Pod ephemeral local storage usage exceeds the total limit of containers "
+    rf"({_QUANTITY_TEXT})\. ?"
+)
+_CONTAINER_STORAGE_EVICTION = re.compile(
+    rf"Container ([a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?) exceeded its local ephemeral "
+    rf'storage limit "({_QUANTITY_TEXT})"\. ?'
+)
+# DisruptionTarget reasons that name a disruption outside the sandbox: the
+# taint manager, pod garbage collection and an Eviction API call (a node
+# drain). Neither this worker nor the chart evicts sandbox pods through the
+# Eviction API; pressure retirement deletes the claim. TerminationByKubelet
+# (node pressure) and PreemptionByScheduler are deliberately absent.
+_EXTERNAL_DISRUPTION_REASONS = frozenset(
+    {"DeletionByTaintManager", "DeletionByPodGC", "EvictionByEvictionAPI"}
+)
+
+
+def _wire(value: Any) -> Any:
+    """A Kubernetes client model as its camelCase wire dict.
+
+    Raises TypeError for anything that is not a client model, plain JSON data
+    or a list or dict of those, so an unknown object never reads as a spec.
+    """
+
+    if value is None or isinstance(value, str | int | float):
+        return value
+    if isinstance(value, list):
+        return [_wire(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _wire(item) for key, item in value.items()}
+    attribute_map = getattr(value, "attribute_map", None)
+    openapi_types = getattr(value, "openapi_types", None)
+    if not isinstance(attribute_map, dict) or not isinstance(openapi_types, dict):
+        raise TypeError(f"{type(value).__name__} is not a Kubernetes model")
+    return {
+        attribute_map[name]: _wire(getattr(value, name))
+        for name in openapi_types
+        if getattr(value, name) is not None
+    }
+
+
+def _pod_spec(pod: Any) -> dict[str, Any] | None:
+    """The wire spec of a pod read from the API, or None when it has none."""
+
+    try:
+        spec = _wire(getattr(pod, "spec", None))
+    except (TypeError, KeyError):
+        return None
+    return spec if isinstance(spec, dict) else None
+
+
+def _storage_exhaustion(spec: dict[str, Any], message: object) -> ResourceExhaustion | None:
+    """The storage limit an Evicted pod's own status message names, checked against its spec.
+
+    The message limit must equal the spec limit as a quantity, so a message
+    for another limit, a volume the spec does not declare, or a total that
+    differs from the containers' sum names nothing.
+    """
+
+    if not isinstance(message, str):
+        return None
+    scratch = _EMPTYDIR_EVICTION.fullmatch(message)
+    if scratch is not None:
+        volume, text = scratch.groups()
+        declared = emptydir_size_limits(spec).get(volume)
+        stated = quantity_bytes(text)
+        if declared is None or stated != declared:
+            return None
+        return ResourceExhaustion("scratch", volume, declared)
+    total = pod_ephemeral_storage_limit(spec)
+    if total is None:
+        return None
+    pod_level = _POD_STORAGE_EVICTION.fullmatch(message)
+    if pod_level is not None:
+        if quantity_bytes(pod_level.group(1)) != total:
+            return None
+        return ResourceExhaustion("ephemeral_storage", None, total)
+    container_level = _CONTAINER_STORAGE_EVICTION.fullmatch(message)
+    if container_level is not None:
+        container, text = container_level.groups()
+        own = runner_ephemeral_storage_limit(spec)
+        if container != RUNNER_CONTAINER or own is None or quantity_bytes(text) != own:
+            return None
+        return ResourceExhaustion("ephemeral_storage", None, total)
+    return None
+
+
+def _pod_exhaustion(pod: Any, reason: str) -> ResourceExhaustion | None:
+    """Positive identification of what ended the runner, from one readable pod.
+
+    ``reason`` is that same pod's status termination reason. OOMKilled comes
+    only from the runner container's own terminated state, Evicted only from
+    the pod's own status message, and a node disruption only from an
+    allowlisted DisruptionTarget condition. Events never identify anything.
+    """
+
+    spec = _pod_spec(pod)
+    if spec is None:
+        return None
+    status = getattr(pod, "status", None)
+    if reason == "OOMKilled":
+        limit = runner_memory_limit(spec)
+        return None if limit is None else ResourceExhaustion("memory", None, limit)
+    if reason == "Evicted":
+        return _storage_exhaustion(spec, getattr(status, "message", None))
+    for condition in getattr(status, "conditions", None) or []:
+        if (
+            getattr(condition, "type", None) == "DisruptionTarget"
+            and getattr(condition, "status", None) == "True"
+            and getattr(condition, "reason", None) in _EXTERNAL_DISRUPTION_REASONS
+        ):
+            return ResourceExhaustion("node_disruption", None, None)
     return None
 
 
@@ -1074,6 +1214,31 @@ class KubernetesSandboxClient:
             pod["overhead"] = runtime_class_overheads[runtime_class]
         return pod
 
+    def _claim_pod_spec(
+        self,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+        *,
+        request_timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """The pod spec the next claim from ``pool`` would run, read only.
+
+        The source template ``pool`` names plus the override, as the claim
+        resolves it. Raises when the template does not resolve.
+        """
+
+        source = self._source_template_spec(
+            self._pool_template_name(pool, request_timeout_seconds=request_timeout_seconds),
+            request_timeout_seconds=request_timeout_seconds,
+        )
+        if runner_resources is not None:
+            if not agent_name:
+                raise ValueError("runner resources require an agent name")
+            source = claim_resources_spec(source, runner_resources)
+        spec: dict[str, Any] = source["podTemplate"]["spec"]
+        return spec
+
     def claim_resources(
         self,
         *,
@@ -1084,18 +1249,40 @@ class KubernetesSandboxClient:
     ) -> dict[str, str]:
         del executor_secret_names
         timeout = 1.0
-        source = self._source_template_spec(
-            self._pool_template_name(pool, request_timeout_seconds=timeout),
-            request_timeout_seconds=timeout,
+        return pod_resources(
+            self._capacity_pod_spec(
+                self._claim_pod_spec(
+                    pool, runner_resources, agent_name, request_timeout_seconds=timeout
+                ),
+                runtime_class_overheads={},
+                request_timeout_seconds=timeout,
+            )
         )
-        if runner_resources is not None:
-            if not agent_name:
-                raise ValueError("runner resources require an agent name")
-            source = claim_resources_spec(source, runner_resources)
-        return pod_resources(self._capacity_pod_spec(
-            source["podTemplate"]["spec"], runtime_class_overheads={},
-            request_timeout_seconds=timeout,
-        ))
+
+    def claim_limits(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+    ) -> DeliveredLimits:
+        return spec_limits(
+            self._claim_pod_spec(pool, runner_resources, agent_name, request_timeout_seconds=1.0)
+        )
+
+    def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:
+        """The limits in the pod's own spec, which a warm pod may hold apart from its template."""
+
+        try:
+            pod = self._core_api.read_namespaced_pod(
+                name,
+                self._namespace,
+                _request_timeout=request_timeout_seconds,
+            )
+        except Exception:  # noqa: BLE001 - an unread pod is an unobserved limit
+            return None
+        spec = _pod_spec(pod)
+        return None if spec is None else spec_limits(spec)
 
     def capacity_inventory(
         self,
@@ -1741,6 +1928,11 @@ class KubernetesSandboxClient:
         ):
             return SandboxTermination("Deleted", "replaced by a new pod with the same name")
         status_termination = _pod_termination(pod, since=since) if pod is not None else None
+        if status_termination is not None:
+            status_termination = replace(
+                status_termination,
+                exhaustion=_pod_exhaustion(pod, status_termination.reason),
+            )
         pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
         event_termination: SandboxTermination | None = None
         if time.monotonic() < deadline:
@@ -1766,7 +1958,15 @@ class KubernetesSandboxClient:
             event_termination.reason == "Evicted" or pod is None or status_termination is not None
         ):
             if status_termination is not None and status_termination.exit_code is not None:
-                return replace(event_termination, exit_code=status_termination.exit_code)
+                # Only the pod's own status identifies an exhaustion; the
+                # event chosen for its text never does.
+                return replace(
+                    event_termination,
+                    exit_code=status_termination.exit_code,
+                    exhaustion=status_termination.exhaustion,
+                )
+            if status_termination is not None:
+                return replace(event_termination, exhaustion=status_termination.exhaustion)
             return event_termination
         if pod_missing:
             return SandboxTermination("Deleted")
