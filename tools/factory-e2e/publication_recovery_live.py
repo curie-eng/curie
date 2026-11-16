@@ -182,15 +182,15 @@ def proxy_manifests(
     return [source, pod, service]
 
 
-def _swap(node: Any, origins: tuple[str, str], cidrs: tuple[str, str]) -> Any:
-    """``node`` with one origin replaced inside strings and one CIDR replaced whole. Pure."""
+def _swap(node: Any, origin: tuple[str, str], exact: Mapping[str, str]) -> Any:
+    """``node`` with one origin replaced inside strings and whole strings replaced. Pure."""
 
     if isinstance(node, dict):
-        return {key: _swap(value, origins, cidrs) for key, value in node.items()}
+        return {key: _swap(value, origin, exact) for key, value in node.items()}
     if isinstance(node, list):
-        return [_swap(value, origins, cidrs) for value in node]
+        return [_swap(value, origin, exact) for value in node]
     if isinstance(node, str):
-        return cidrs[1] if node == cidrs[0] else node.replace(*origins)
+        return exact[node] if node in exact else node.replace(*origin)
     return node
 
 
@@ -209,22 +209,27 @@ def recovery_values(
 
     The fault proxy stands in for the forge everywhere the base values name
     the stub: the GitHub API and clone bases, the factory's code host and
-    tracker entries, and the stub address in every egress rule (sandbox and
-    publication Job) becomes the proxy's. The API derives its GitHub identity
-    host from ``api.githubApiUrl`` and checks the forge's answers against it,
-    so every forge URL Curie sees must name one host. Workspaces and candidate
+    tracker entries (API base and identity host), and the stub address in
+    every egress rule (sandbox and publication Job) becomes the proxy's. The
+    API derives its GitHub identity host from ``api.githubApiUrl`` and checks
+    the forge's answers against it, so every forge URL Curie sees must name
+    one host. Workspaces and candidate
     retention are on (both off by default), the publication reconcile ceiling
     is ``RECONCILE_MAX_ATTEMPTS``, and the agent's fake model writes one file
     into its checkout.
     """
 
     stub, stub_cidr = stub_origin(namespace), host_cidr(stub_ip)
+    stub_authority = stub.removeprefix("https://")
     values: dict[str, Any] = _swap(
         json.loads(json.dumps(base)),
         (stub, proxy_origin(namespace)),
-        (stub_cidr, host_cidr(proxy_ip)),
+        {
+            stub_cidr: host_cidr(proxy_ip),
+            stub_authority: proxy_origin(namespace).removeprefix("https://"),
+        },
     )
-    left = [s for s in _strings(values) if stub in s or s == stub_cidr]
+    left = [s for s in _strings(values) if stub_authority in s or s == stub_cidr]
     assert not left, f"the base values still route to the stub directly: {left}"
     assert values["api"]["githubApiUrl"] == proxy_base_url(namespace), (
         "the base values name the stub's API base somewhere other than api.githubApiUrl"

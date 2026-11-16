@@ -31,6 +31,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import factory_e2e as fe
 import personal_owner_enforcement_support as poe
@@ -714,6 +715,13 @@ class CandidateInstall:
             port=STUB_PORT,
             model_cidrs=(),
         )
+        # The API refuses to start unless every GitHub code host's identity host
+        # is the host of its GitHub API base (Settings._validate_forge_github_host),
+        # so the factory entries name the stub's authority, not github.com.
+        authority = urlsplit(values["api"]["githubApiUrl"]).netloc
+        for entry in (*values["factory"]["codeHosts"], *values["factory"]["trackers"]):
+            if entry.get("kind") == "github":
+                entry["host"] = authority
         pull = self.inputs.pull_policy
         for component in ("api", "worker"):
             values[component]["image"] = image_values(self.inputs.images[component], pull)
@@ -764,9 +772,13 @@ class CandidateInstall:
             for workload in self.kubectl(
                 "-n", self.inputs.namespace, "get", kind, "-o", "name"
             ).split():
-                self.kubectl(
-                    "-n", self.inputs.namespace, "rollout", "status", workload, "--timeout=15m"
-                )
+                try:
+                    self.kubectl(
+                        "-n", self.inputs.namespace, "rollout", "status", workload, "--timeout=15m"
+                    )
+                except fe.PreflightFailed:
+                    self.report_unready_pods()
+                    raise
         pods = json.loads(self.kubectl("-n", self.inputs.namespace, "get", "pods", "-o", "json"))[
             "items"
         ]
@@ -782,6 +794,49 @@ class CandidateInstall:
             for pod in selected:
                 self.assert_digest(pod, component, component)
         self.log("installed; api and worker pods run the candidate digests")
+
+    def report_unready_pods(self) -> None:
+        """Log every unready container's state and log tail, so a failed rollout says why."""
+
+        listing = self.kubectl(
+            "-n", self.inputs.namespace, "get", "pods", "-o", "json", check=False
+        )
+        try:
+            pods = json.loads(listing).get("items") or []
+        except ValueError:
+            pods = []
+        for pod in pods:
+            name = pod["metadata"]["name"]
+            status = pod.get("status") or {}
+            for entry in [
+                *(status.get("initContainerStatuses") or []),
+                *(status.get("containerStatuses") or []),
+            ]:
+                if (
+                    entry.get("ready")
+                    or (entry.get("state") or {}).get("terminated", {}).get("exitCode") == 0
+                ):
+                    continue
+                state, last = json.dumps(entry.get("state")), json.dumps(entry.get("lastState"))
+                self.log(
+                    f"unready {name}/{entry.get('name')}: state {state} last {last} "
+                    f"restarts {entry.get('restartCount')}"
+                )
+                for previous in ("--previous", None):
+                    tail = self.kubectl(
+                        "-n",
+                        self.inputs.namespace,
+                        "logs",
+                        name,
+                        "-c",
+                        str(entry.get("name")),
+                        "--tail=40",
+                        *([previous] if previous else []),
+                        check=False,
+                    )
+                    if tail.strip():
+                        self.log(f"log tail {name}/{entry.get('name')}:\n{tail.rstrip()}")
+                        break
 
     def assert_digest(self, pod: dict[str, Any], container: str, component: str) -> None:
         seen = pod_digests([pod], container)

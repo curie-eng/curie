@@ -134,8 +134,9 @@ def _base() -> dict[str, Any]:
         {
             "agentSandbox": {"runner": {"fakeModel": True}},
             "factory": {
-                "codeHosts": [{"name": "github"}],
-                "trackers": [{"name": "github"}],
+                # As base_values leaves them: the identity host is the stub's authority.
+                "codeHosts": [{"name": "github", "kind": "github", "host": STUB[8:]}],
+                "trackers": [{"name": "github", "kind": "github", "host": STUB[8:]}],
                 "sandboxEgress": {"factory": True},
             },
         },
@@ -165,6 +166,8 @@ def test_recovery_values_route_every_forge_address_through_the_proxy() -> None:
     assert values["api"]["githubCloneBase"] == PROXY
     assert values["factory"]["codeHosts"][0]["apiUrl"] == f"{PROXY}/api/v3"
     assert values["factory"]["trackers"][0]["apiUrl"] == f"{PROXY}/api/v3"
+    for entry in (*values["factory"]["codeHosts"], *values["factory"]["trackers"]):
+        assert entry["host"] == PROXY.removeprefix("https://")
     assert set(_egress_cidrs(values)) == {f"{PROXY_IP}/32"}
     assert STUB not in json.dumps(values) and STUB_IP not in json.dumps(values)
     # Everything else the stub values set is kept.
