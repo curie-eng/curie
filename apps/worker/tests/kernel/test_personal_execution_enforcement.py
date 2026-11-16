@@ -58,6 +58,7 @@ from curie_worker.sandbox.types import (
     OWNER_PRINCIPAL_LABEL,
     ClaimProvenance,
     ClaimView,
+    RecordedPod,
     SandboxTermination,
 )
 from curie_worker.workitem_dispatch import (
@@ -377,10 +378,15 @@ class _OwnerK8s(FakeK8s):
             hook()
 
     def pod_termination(
-        self, name: str, *, request_timeout_seconds: float, since: datetime
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        since: datetime,
+        recorded: RecordedPod | None = None,
     ) -> Any | None:
         found = super().pod_termination(
-            name, request_timeout_seconds=request_timeout_seconds, since=since
+            name, request_timeout_seconds=request_timeout_seconds, since=since, recorded=recorded
         )
         hook, self.after_termination_read = self.after_termination_read, None
         if hook is not None:

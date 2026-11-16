@@ -63,7 +63,13 @@ from curie_worker.sandbox import (
     QuotaRejection,
     SandboxSubstrate,
 )
-from curie_worker.sandbox.types import ClaimView, DeliveredLimits, SandboxClient, SandboxView
+from curie_worker.sandbox.types import (
+    ClaimView,
+    DeliveredLimits,
+    RecordedPod,
+    SandboxClient,
+    SandboxView,
+)
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -723,10 +729,16 @@ class FakeK8s:
         return self.unschedulable_message
 
     def pod_termination(
-        self, name: str, *, request_timeout_seconds: float, since: datetime
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        since: datetime,
+        recorded: RecordedPod | None = None,
     ) -> Any | None:
         assert request_timeout_seconds > 0
         assert since.tzinfo is not None
+        del recorded
         self.termination_queries.append(name)
         return self.termination
 

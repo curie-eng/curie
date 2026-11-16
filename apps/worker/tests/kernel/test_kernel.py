@@ -3550,7 +3550,13 @@ def test_late_oomkilled_after_side_effect_finishes_sandbox_terminated(make_harne
             first: dict[str, float | None] = {"at": None}
             returned: list[object] = []
 
-            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+            def diagnose(
+                name: str,
+                *,
+                request_timeout_seconds: float,
+                since: datetime,
+                recorded: object = None,
+            ):
                 assert request_timeout_seconds > 0
                 assert since.tzinfo is not None
                 h.fake_k8s.termination_queries.append(name)
@@ -3611,7 +3617,13 @@ def test_stream_drop_without_termination_ends_runner_error_at_the_10_s_bound(
             items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
             read_at: list[float] = []
 
-            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+            def diagnose(
+                name: str,
+                *,
+                request_timeout_seconds: float,
+                since: datetime,
+                recorded: object = None,
+            ):
                 assert request_timeout_seconds > 0
                 h.fake_k8s.termination_queries.append(name)
                 read_at.append(clock.now)
@@ -3664,7 +3676,13 @@ def test_sandbox_release_waits_for_termination_classification(
             first: dict[str, float | None] = {"at": None}
             original_delete = h.fake_k8s.delete_claim
 
-            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+            def diagnose(
+                name: str,
+                *,
+                request_timeout_seconds: float,
+                since: datetime,
+                recorded: object = None,
+            ):
                 order.append("pod_termination")
                 h.fake_k8s.termination_queries.append(name)
                 if scenario == "none":
@@ -3708,7 +3726,7 @@ def _eviction_then_no_diagnosis(h: Any, monkeypatch: pytest.MonkeyPatch) -> None
     )
 
     def diagnose(
-        name: str, *, request_timeout_seconds: float, since: datetime
+        name: str, *, request_timeout_seconds: float, since: datetime, recorded: object = None
     ) -> SandboxTermination | None:
         h.fake_k8s.termination_queries.append(name)
         return next(diagnoses)

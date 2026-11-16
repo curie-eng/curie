@@ -100,6 +100,7 @@ from .types import (
     PersonalModeUnsupported,
     QuotaRejection,
     QuotaStatus,
+    RecordedPod,
     SandboxError,
     SandboxTermination,
     SandboxView,
@@ -847,10 +848,15 @@ class DockerSandboxClient(ClaimInputStaging):
         return None
 
     def pod_termination(
-        self, name: str, *, since: datetime, request_timeout_seconds: float
+        self,
+        name: str,
+        *,
+        since: datetime,
+        request_timeout_seconds: float,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
         # Docker has no Kubernetes pod status or events.
-        del name, since, request_timeout_seconds
+        del name, since, request_timeout_seconds, recorded
         return None
 
     def _isolation_args(self, runner_resources: dict[str, Any] | None) -> list[str]:

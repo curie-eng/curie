@@ -124,6 +124,7 @@ from .types import (
     PersonalModeUnsupported,
     QuotaRejection,
     QuotaStatus,
+    RecordedPod,
     SandboxError,
     SandboxTermination,
     SandboxView,
@@ -1216,9 +1217,14 @@ class StaticPoolSandboxClient(ClaimInputStaging):
         return None
 
     def pod_termination(
-        self, name: str, *, since: datetime, request_timeout_seconds: float
+        self,
+        name: str,
+        *,
+        since: datetime,
+        request_timeout_seconds: float,
+        recorded: RecordedPod | None = None,
     ) -> SandboxTermination | None:
-        del name, since, request_timeout_seconds
+        del name, since, request_timeout_seconds, recorded
         return None
 
     def pod_limits(self, name: str, *, request_timeout_seconds: float) -> DeliveredLimits | None:

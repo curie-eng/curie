@@ -18,12 +18,14 @@ from typing import Any
 import pytest
 from curie_worker.sandbox import k8s as k8s_module
 from curie_worker.sandbox.affinity import AffinityStore
-from curie_worker.sandbox.resources import claim_resources_spec
+from curie_worker.sandbox.resources import claim_resources_spec, spec_limits
 from curie_worker.sandbox.substrate import SandboxSubstrate
 from curie_worker.sandbox.types import (
     AdmissionConfig,
     DeliveredLimits,
+    RecordedPod,
     ResourceExhaustion,
+    SandboxHandle,
     SandboxTermination,
     SubstrateConfig,
 )
@@ -218,13 +220,241 @@ def test_an_oom_event_alone_identifies_nothing() -> None:
     assert termination.exhaustion is None
 
 
-def test_a_recorded_eviction_event_for_an_unreadable_pod_identifies_nothing() -> None:
+def _recorded(shape: dict[str, Any]) -> RecordedPod:
+    """The identity the worker read at start: the shape's UID and wire spec."""
+
+    return RecordedPod(uid=shape["metadata"]["uid"], spec=copy.deepcopy(shape["spec"]))
+
+
+def _eviction(
+    shape: dict[str, Any],
+    *,
+    message: str | None = None,
+    reason: str = "Evicted",
+    uid: str | None = None,
+    at: datetime | None = None,
+) -> Any:
+    """The shape's recorded Evicted event, about ``uid`` (the shape's own by default)."""
+
+    raw = dict(shape["events"][0])
+    raw["reason"] = reason
+    if message is not None:
+        raw["message"] = message
+    return _event(
+        raw,
+        uid=shape["metadata"]["uid"] if uid is None else uid,
+        at=datetime.now(UTC) if at is None else at,
+    )
+
+
+def _replacement(shape: dict[str, Any]) -> dict[str, Any]:
+    """The controller's new pod under the same name: created now, another UID."""
+
+    replacement = copy.deepcopy(shape)
+    replacement["metadata"]["creationTimestamp"] = datetime.now(UTC).isoformat()
+    replacement["metadata"]["uid"] = "00000000-0000-0000-0000-0000000000ff"
+    replacement["status"] = {"phase": "Pending"}
+    return replacement
+
+
+def _after_start(
+    shape: dict[str, Any],
+    pod_state: str,
+    events: list[Any],
+    recorded: RecordedPod | None,
+    since: datetime | None = None,
+) -> SandboxTermination | None:
+    """Diagnose ``shape``'s name once the pod is ``missing``, ``unreadable`` or ``replaced``."""
+
+    if pod_state == "missing":
+        api = _Api(None, events=events, pod_error=k8s_client.ApiException(status=404))
+    elif pod_state == "unreadable":
+        api = _Api(None, events=events, pod_error=k8s_client.ApiException(status=403))
+    else:
+        assert pod_state == "replaced"
+        api = _Api(_pod(_replacement(shape)), events=events)
+    return _client(api).pod_termination(
+        shape["metadata"]["name"],
+        since=since or datetime.now(UTC) - timedelta(minutes=5),
+        request_timeout_seconds=0.5,
+        recorded=recorded,
+    )
+
+
+@pytest.mark.parametrize("pod_state", ["missing", "unreadable"])
+@pytest.mark.parametrize(
+    ("shape_name", "exhaustion"),
+    [
+        ("scratch-probe", ResourceExhaustion("scratch", "workspace", 8 * MI)),
+        ("ephemeral-probe", ResourceExhaustion("ephemeral_storage", None, 12 * MI)),
+    ],
+)
+def test_a_kubelet_eviction_event_bound_to_the_recorded_pod_identifies_the_storage_limit(
+    shape_name: str, exhaustion: ResourceExhaustion, pod_state: str
+) -> None:
+    # The evicted pod is gone (404) or unreadable (403): only the kubelet's own
+    # Evicted event is left, and it is about the UID the worker recorded at
+    # start, stating the limit the recorded spec declares.
+    shape = _shape(shape_name)
+
+    termination = _after_start(shape, pod_state, [_eviction(shape)], _recorded(shape))
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.exhaustion == exhaustion
+
+
+@pytest.mark.parametrize(
+    ("shape_name", "exhaustion"),
+    [
+        ("scratch-probe", ResourceExhaustion("scratch", "workspace", 8 * MI)),
+        ("ephemeral-probe", ResourceExhaustion("ephemeral_storage", None, 12 * MI)),
+    ],
+)
+def test_a_replacement_pod_leaves_the_recorded_pods_eviction_identified(
+    shape_name: str, exhaustion: ResourceExhaustion
+) -> None:
+    # The controller replaced the evicted pod before the read; the event still
+    # names the original, recorded UID.
+    shape = _shape(shape_name)
+
+    termination = _after_start(shape, "replaced", [_eviction(shape)], _recorded(shape))
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.exhaustion == exhaustion
+
+
+def test_a_replacement_pod_without_a_recorded_identity_identifies_nothing() -> None:
     shape = _shape("scratch-probe")
-    event = _event(shape["events"][0], uid=shape["metadata"]["uid"], at=datetime.now(UTC))
-    since = datetime.now(UTC) - timedelta(minutes=5)
-    termination = _client(
-        _Api(None, events=[event], pod_error=k8s_client.ApiException(status=403))
-    ).pod_termination("scratch-probe", since=since, request_timeout_seconds=0.5)
+
+    termination = _after_start(shape, "replaced", [_eviction(shape)], None)
+
+    assert termination == SandboxTermination("Deleted", "replaced by a new pod with the same name")
+
+
+def _scratch_spec(size_limit: str) -> RecordedPod:
+    shape = _shape("scratch-probe")
+    shape["spec"]["volumes"][0]["emptyDir"]["sizeLimit"] = size_limit
+    return _recorded(shape)
+
+
+_SCRATCH = _shape("scratch-probe")
+_EPHEMERAL = _shape("ephemeral-probe")
+# case -> (shape, event fields, recorded: None = the shape's own, "none" = no identity)
+_UNBOUND_EVICTIONS: dict[str, tuple[dict[str, Any], dict[str, Any], Any]] = {
+    "another uid": (_SCRATCH, {"uid": "00000000-0000-0000-0000-0000000000aa"}, None),
+    "event states another limit": (
+        _SCRATCH,
+        {"message": 'Usage of EmptyDir volume "workspace" exceeds the limit "16Mi". '},
+        None,
+    ),
+    "recorded spec states another limit": (_SCRATCH, {}, _scratch_spec("16Mi")),
+    "node pressure": (
+        _SCRATCH,
+        {
+            "message": "The node was low on resource: ephemeral-storage. "
+            "Threshold quantity: 1Gi, available: 512Mi. "
+        },
+        None,
+    ),
+    "trailing text": (
+        _SCRATCH,
+        {"message": 'Usage of EmptyDir volume "workspace" exceeds the limit "8Mi". x'},
+        None,
+    ),
+    "volume the recorded spec lacks": (
+        _SCRATCH,
+        {"message": 'Usage of EmptyDir volume "cache" exceeds the limit "8Mi". '},
+        None,
+    ),
+    "pod total the recorded spec does not sum to": (
+        _EPHEMERAL,
+        {
+            "message": "Pod ephemeral local storage usage exceeds the total limit "
+            "of containers 24Mi. "
+        },
+        None,
+    ),
+    "no recorded identity": (_SCRATCH, {}, "none"),
+    "an oom event": (
+        _SCRATCH,
+        {"reason": "OOMKilling", "message": "Memory cgroup out of memory: Killed process 1"},
+        None,
+    ),
+    "older than since": (_SCRATCH, {"at": datetime.now(UTC) - timedelta(minutes=10)}, None),
+}
+
+
+@pytest.mark.parametrize("pod_state", ["missing", "replaced"])
+@pytest.mark.parametrize("case", list(_UNBOUND_EVICTIONS))
+def test_an_eviction_event_not_bound_to_the_recorded_pod_and_limit_identifies_nothing(
+    case: str, pod_state: str
+) -> None:
+    template, event_fields, recorded_override = _UNBOUND_EVICTIONS[case]
+    shape = copy.deepcopy(template)
+    if recorded_override == "none":
+        recorded = None
+    elif recorded_override is None:
+        recorded = _recorded(shape)
+    else:
+        recorded = recorded_override
+
+    termination = _after_start(shape, pod_state, [_eviction(shape, **event_fields)], recorded)
+
+    assert termination is not None
+    assert termination.exhaustion is None
+    if pod_state == "replaced":
+        assert termination == SandboxTermination(
+            "Deleted", "replaced by a new pod with the same name"
+        )
+
+
+def test_the_pods_own_oom_kill_outranks_a_bound_storage_eviction() -> None:
+    shape = _shape("oom-probe")
+    event = _eviction(
+        _shape("ephemeral-probe"),
+        message="Pod ephemeral local storage usage exceeds the total limit of containers 64Mi. ",
+        uid=shape["metadata"]["uid"],
+    )
+    event.involved_object.name = "oom-probe"
+
+    termination = _client(_Api(_pod(shape), events=[event])).pod_termination(
+        "oom-probe",
+        since=datetime.now(UTC) - timedelta(minutes=5),
+        request_timeout_seconds=0.5,
+        recorded=_recorded(shape),
+    )
+
+    assert termination is not None
+    assert termination.reason == "OOMKilled"
+    assert termination.exhaustion == ResourceExhaustion("memory", None, 48 * MI)
+
+
+def test_a_bound_eviction_identifies_a_recorded_pod_not_yet_terminal() -> None:
+    # The kubelet's event can land before the pod's own status turns Failed.
+    shape = _shape("scratch-probe")
+    running = copy.deepcopy(shape)
+    running["status"] = {"phase": "Running"}
+
+    termination = _client(_Api(_pod(running), events=[_eviction(shape)])).pod_termination(
+        "scratch-probe",
+        since=datetime.now(UTC) - timedelta(minutes=5),
+        request_timeout_seconds=0.5,
+        recorded=_recorded(shape),
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.exhaustion == ResourceExhaustion("scratch", "workspace", 8 * MI)
+
+
+def test_an_eviction_event_for_an_unreadable_pod_without_a_recorded_identity_names_nothing() -> (
+    None
+):
+    shape = _shape("scratch-probe")
+
+    termination = _after_start(shape, "unreadable", [_eviction(shape)], None)
 
     assert termination is not None
     assert termination.reason == "Evicted"
@@ -291,15 +521,6 @@ def test_an_oom_kill_without_a_runner_memory_limit_identifies_nothing() -> None:
     assert termination.exhaustion is None
 
 
-def test_a_replacement_pod_identifies_nothing() -> None:
-    shape = _shape("oom-probe")
-    shape["metadata"]["creationTimestamp"] = datetime.now(UTC).isoformat()
-
-    termination = _terminate(shape)
-
-    assert termination == SandboxTermination("Deleted", "replaced by a new pod with the same name")
-
-
 def test_an_attribute_pod_that_is_no_client_model_identifies_nothing() -> None:
     # Older tests and odd clients hand back plain objects; they never read as a spec.
     pod = SimpleNamespace(
@@ -339,6 +560,18 @@ def test_pod_limits_read_the_recorded_specs() -> None:
         scratch_bytes={"workspace": 8 * MI},
         max_turns=None,
     )
+
+
+def test_pod_limits_record_the_pods_uid_and_wire_spec() -> None:
+    shape = _shape("scratch-probe")
+
+    limits = _client(_Api(_pod(shape))).pod_limits("scratch-probe", request_timeout_seconds=1.0)
+
+    assert limits is not None and limits.recorded is not None
+    assert limits.recorded.uid == shape["metadata"]["uid"]
+    assert limits.recorded.spec["volumes"] == shape["spec"]["volumes"]
+    assert spec_limits(limits.recorded.spec) == limits
+    assert "recorded" not in limits.to_wire()
 
 
 def test_pod_limits_of_an_unreadable_pod_are_unobserved() -> None:
@@ -521,3 +754,65 @@ def test_module_diagnosis_reads_only_the_pod_status() -> None:
         "scratch", "workspace", 8 * MI
     )
     assert k8s_module._pod_exhaustion(_pod(shape), "Error") is None
+
+
+def _handle(claim_name: str, sandbox_name: str) -> SandboxHandle:
+    return SandboxHandle(
+        thread_key="thread-evicted",
+        claim_name=claim_name,
+        sandbox_name=sandbox_name,
+        namespace="test-ns",
+        service_fqdn=f"{sandbox_name}.test-ns.svc.cluster.local",
+        port=8080,
+        session_id="session",
+    )
+
+
+@pytest.mark.parametrize(
+    ("diagnosed_claim", "exhaustion"),
+    [
+        ("claim-a", ResourceExhaustion("scratch", "workspace", 8 * MI)),
+        # The same sandbox name under another claim is another pod's runtime.
+        ("claim-b", None),
+    ],
+)
+def test_delivered_limits_record_the_pod_that_a_later_diagnosis_binds_to(
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    diagnosed_claim: str,
+    exhaustion: ResourceExhaustion | None,
+) -> None:
+    shape = _shape("scratch-probe")
+    api = _Api(_pod(shape), events=[_eviction(shape)])
+    substrate = SandboxSubstrate(_client(api), affinity, config)
+    started = _handle("claim-a", "scratch-probe")
+
+    limits = substrate.delivered_limits(started, max_turns=40)
+    # The kubelet evicted the pod and the controller deleted it.
+    api.pod_error = k8s_client.ApiException(status=404)
+    termination = substrate.pod_termination(
+        _handle(diagnosed_claim, "scratch-probe"),
+        since=datetime.now(UTC) - timedelta(minutes=5),
+    )
+
+    assert limits == DeliveredLimits(64 * MI, 64 * MI, {"workspace": 8 * MI}, 40)
+    assert limits.recorded is None
+    assert termination is not None and termination.reason == "Evicted"
+    assert termination.exhaustion == exhaustion
+
+
+def test_an_unreadable_pod_at_start_drops_the_earlier_record(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    shape = _shape("scratch-probe")
+    api = _Api(_pod(shape), events=[_eviction(shape)])
+    substrate = SandboxSubstrate(_client(api), affinity, config)
+    handle = _handle("claim-a", "scratch-probe")
+
+    substrate.delivered_limits(handle, max_turns=None)
+    api.pod_error = k8s_client.ApiException(status=403)
+    substrate.delivered_limits(handle, max_turns=None)
+    api.pod_error = k8s_client.ApiException(status=404)
+    termination = substrate.pod_termination(handle, since=datetime.now(UTC) - timedelta(minutes=5))
+
+    assert termination is not None and termination.exhaustion is None

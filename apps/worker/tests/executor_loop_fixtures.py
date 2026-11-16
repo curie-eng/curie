@@ -38,7 +38,7 @@ import httpx
 from aiohttp import web
 from curie_api.action_execution_codes import CodeRejected, outcome_code
 from curie_worker import connector_grant
-from curie_worker.sandbox.types import ClaimView, QuotaRejection, SandboxView
+from curie_worker.sandbox.types import ClaimView, QuotaRejection, RecordedPod, SandboxView
 
 if TYPE_CHECKING:
     from curie_worker.sandbox.types import ToolDaemonMount
@@ -893,8 +893,14 @@ class FakeSandboxes:
         return None
 
     def pod_termination(
-        self, name: str, *, request_timeout_seconds: float, since: datetime
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        since: datetime,
+        recorded: RecordedPod | None = None,
     ) -> Any | None:
+        del recorded
         return None
 
     def pod_limits(self, name: str, *, request_timeout_seconds: float) -> Any | None:

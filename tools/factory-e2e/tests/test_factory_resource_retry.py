@@ -68,6 +68,7 @@ pod-level ephemeral-storage eviction fires, not the volume's own limit.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import re
 import shutil
@@ -238,6 +239,68 @@ def exhaustion_seen(pods: list[dict[str, Any]], dimension: str) -> bool:
     return False
 
 
+# The kubelet's own storage eviction sentences (pkg/kubelet/eviction), matched whole.
+_POD_STORAGE_EVICTION = re.compile(
+    r"Pod ephemeral local storage usage exceeds the total limit of containers (\S+)\. ?"
+)
+_RUNNER_STORAGE_EVICTION = re.compile(
+    r'Container runner exceeded its local ephemeral storage limit "(\S+)"\. ?'
+)
+
+
+def _sentence_bytes(pattern: re.Pattern[str], message: Any) -> int | None:
+    match = pattern.fullmatch(str(message or ""))
+    if match is None:
+        return None
+    try:
+        return quantity_bytes(match.group(1))
+    except ValueError:
+        return None
+
+
+def eviction_event_seen(
+    events: list[dict[str, Any]], pods: list[dict[str, Any]], limit_bytes: int
+) -> bool:
+    """Whether the kubelet's Evicted event names one of ``pods`` and its storage limit. Pure.
+
+    An evicted runner pod is replaced in seconds, so the watch may never see
+    its Evicted status. The core/v1 Event the kubelet wrote is the same
+    observation: reason Evicted, about a pod UID observed for the failed
+    claim, and the pod-level sentence stating ``limit_bytes``, the containers'
+    total from that pod's spec (or the runner's container-level sentence
+    stating the runner's own limit).
+    """
+
+    uids = {
+        uid
+        for pod in pods
+        if isinstance(uid := (pod.get("metadata") or {}).get("uid"), str) and uid
+    }
+    runner_limits: set[int] = set()
+    for pod in pods:
+        for container in (pod.get("spec") or {}).get("containers") or []:
+            if container.get("name") != "runner":
+                continue
+            raw = ((container.get("resources") or {}).get("limits") or {}).get("ephemeral-storage")
+            if raw is not None:
+                runner_limits.add(quantity_bytes(raw))
+    for event in events:
+        involved = event.get("involvedObject") or {}
+        if (
+            event.get("reason") != "Evicted"
+            or involved.get("kind") != "Pod"
+            or involved.get("uid") not in uids
+        ):
+            continue
+        message = event.get("message")
+        if _sentence_bytes(_POD_STORAGE_EVICTION, message) == limit_bytes:
+            return True
+        container_limit = _sentence_bytes(_RUNNER_STORAGE_EVICTION, message)
+        if container_limit is not None and container_limit in runner_limits:
+            return True
+    return False
+
+
 def _brief(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if row is None:
         return None
@@ -257,6 +320,7 @@ def _brief(row: dict[str, Any] | None) -> dict[str, Any] | None:
         "delivered_limits",
         "resource_gate",
         "retry_of_request_id",
+        "dispatch_generation",
         "dispatch_not_before",
         "version",
     )
@@ -391,11 +455,32 @@ def prove_phase(live: Live, phase: Phase) -> None:
     assert claim, f"the failed attempt recorded no sandbox claim: {_brief(first)}"
     failed_pods = live.pods_for(str(claim))
     assert failed_pods, f"no pod of claim {claim} was observed"
-    assert exhaustion_seen(failed_pods, phase.dimension), (
-        f"no observed state of claim {claim}'s pod shows the {phase.dimension} exhaustion: "
-        f"{[(p.get('status') or {}).get('reason') for p in failed_pods]}"
-    )
     spec_limit = runner_limit(failed_pods[0], phase.dimension)
+    seen = exhaustion_seen(failed_pods, phase.dimension)
+    evictions: list[dict[str, Any]] = []
+    if not seen and phase.dimension == "ephemeral_storage":
+        # The evicted pod can vanish before the watch sees its Evicted status;
+        # the kubelet's own event about that pod's UID is the same observation.
+        evictions = json.loads(
+            live.kubectl(
+                "-n",
+                live.inputs.namespace,
+                "get",
+                "events",
+                "--field-selector",
+                "reason=Evicted",
+                "-o",
+                "json",
+            )
+        )["items"]
+        seen = eviction_event_seen(evictions, failed_pods, spec_limit)
+    assert seen, (
+        f"no observed state of claim {claim}'s pod shows the {phase.dimension} exhaustion: "
+        f"pod reasons {[(p.get('status') or {}).get('reason') for p in failed_pods]}, "
+        f"pod uids {sorted({(p.get('metadata') or {}).get('uid') for p in failed_pods} - {None})}, "
+        f"Evicted events {[(e.get('involvedObject') or {}).get('uid') for e in evictions]} "
+        f"{[e.get('message') for e in evictions]}"
+    )
     delivered = (first.get("delivered_limits") or {}).get(phase.delivered_key)
     assert delivered == spec_limit == phase.low_bytes, (
         f"the failed attempt delivered {phase.delivered_key}={delivered}, its pod spec enforced "
@@ -423,7 +508,9 @@ def prove_phase(live: Live, phase: Phase) -> None:
     pod_claims_before = live.sandbox_pod_claims()
     deferrals = successor["start_deferrals"]
     probed = False
-    versions = {successor["version"]}
+    # A resource gate re-probe defers the row by bumping its dispatch generation
+    # and not-before; the row version does not move.
+    probes = {(successor.get("dispatch_generation"), successor.get("dispatch_not_before"))}
 
     def still_gated() -> None:
         nonlocal probed
@@ -436,8 +523,8 @@ def prove_phase(live: Live, phase: Phase) -> None:
             and not current.get("started_at")
         ), f"the gated successor moved under the unchanged limit: {_brief(current)}"
         if current.get("last_deferral_reason") == "resource_gate_unmet":
-            versions.add(current["version"])
-            probed = probed or len(versions) > 1
+            probes.add((current.get("dispatch_generation"), current.get("dispatch_not_before")))
+            probed = probed or len(probes) > 1
 
     rrs.observe_for(GATE_WINDOW_SECONDS, still_gated, interval=3)
     assert probed, (
