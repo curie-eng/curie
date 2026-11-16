@@ -387,7 +387,8 @@ class PostgresPublicationStore:
             f"""
             SELECT p.id, p.approval_id, p.repo_full_name, p.status, p.version,
                    p.lineage_id, p.revision_number, p.expected_prior_head,
-                   p.base_sha, p.patch_bytes, p.changed_paths, p.title, p.body,
+                   p.adoptable_revision_ids, p.base_sha, p.patch_bytes,
+                   p.changed_paths, p.title, p.body,
                    p.reply_kind, p.reply_channel, p.reply_placeholder,
                    p.reply_endpoint, p.reply_adapter,
                    l.version AS lineage_version, l.branch, l.pr_number,
@@ -513,6 +514,9 @@ class PostgresPublicationStore:
             ),
             version=version,
             lease_owner=self._lease_owner,
+            adoptable_revision_ids=tuple(
+                uuid.UUID(str(revision)) for revision in row["adoptable_revision_ids"]
+            ),
             owner_running=bool(row["owner_running"]),
             branch_prefix=(str(row["branch_prefix"]) if row["branch_prefix"] is not None else None),
         )

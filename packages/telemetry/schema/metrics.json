@@ -597,10 +597,11 @@
           "start",
           "steer",
           "finish-race",
-          "observed"
+          "observed",
+          "publication-recovery"
         ]
       },
-      "cardinality_bound": 7
+      "cardinality_bound": 8
     },
     "curie.attachments.ledger.append": {
       "type": "counter",
@@ -637,10 +638,11 @@
           "start",
           "steer",
           "finish-race",
-          "observed"
+          "observed",
+          "publication-recovery"
         ]
       },
-      "cardinality_bound": 7
+      "cardinality_bound": 8
     },
     "curie.thread.route.active": {
       "type": "gauge",
@@ -661,10 +663,11 @@
           "start",
           "steer",
           "finish-race",
-          "observed"
+          "observed",
+          "publication-recovery"
         ]
       },
-      "cardinality_bound": 7
+      "cardinality_bound": 8
     },
     "curie.sandbox.lifecycle": {
       "type": "counter",
@@ -1510,6 +1513,7 @@
           "/v1/internal/publication-candidates/release-reader",
           "/v1/internal/publication-candidates/claim-collection",
           "/v1/internal/publication-candidates/finalize-collection",
+          "/v1/internal/publication-candidates/recovery",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -1582,7 +1586,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9680
+      "cardinality_bound": 9720
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1786,6 +1790,7 @@
           "/v1/internal/publication-candidates/release-reader",
           "/v1/internal/publication-candidates/claim-collection",
           "/v1/internal/publication-candidates/finalize-collection",
+          "/v1/internal/publication-candidates/recovery",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -1858,7 +1863,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9680
+      "cardinality_bound": 9720
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -2062,6 +2067,7 @@
           "/v1/internal/publication-candidates/release-reader",
           "/v1/internal/publication-candidates/claim-collection",
           "/v1/internal/publication-candidates/finalize-collection",
+          "/v1/internal/publication-candidates/recovery",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -2127,7 +2133,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1936
+      "cardinality_bound": 1944
     },
     "curie.background.loop": {
       "type": "counter",

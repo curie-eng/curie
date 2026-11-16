@@ -2122,7 +2122,7 @@
         "disposition": "publication_recovery",
         "condition": null,
         "not_before": null,
-        "policy_successor": false,
+        "policy_successor": true,
         "successor": false,
         "blocked_on": null,
         "timing": null
@@ -2146,7 +2146,7 @@
         "disposition": "publication_recovery",
         "condition": null,
         "not_before": null,
-        "policy_successor": false,
+        "policy_successor": true,
         "successor": false,
         "blocked_on": null,
         "timing": null
@@ -2166,7 +2166,7 @@
         "disposition": "publication_recovery",
         "condition": null,
         "not_before": null,
-        "policy_successor": false,
+        "policy_successor": true,
         "successor": false,
         "blocked_on": null,
         "timing": null
@@ -2190,7 +2190,7 @@
         "disposition": "publication_recovery",
         "condition": null,
         "not_before": null,
-        "policy_successor": false,
+        "policy_successor": true,
         "successor": false,
         "blocked_on": null,
         "timing": null
@@ -2225,7 +2225,7 @@
         "disposition": "publication_recovery",
         "condition": null,
         "not_before": null,
-        "policy_successor": false,
+        "policy_successor": true,
         "successor": false,
         "blocked_on": null,
         "timing": null
@@ -2245,7 +2245,7 @@
         "disposition": "publication_recovery",
         "condition": null,
         "not_before": null,
-        "policy_successor": false,
+        "policy_successor": true,
         "successor": false,
         "blocked_on": null,
         "timing": null

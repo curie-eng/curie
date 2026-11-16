@@ -336,7 +336,10 @@ def _replace_execution(case: dict[str, Any], **shape: Any) -> None:
 def _mint(case: dict[str, Any], request_id: uuid.UUID | None = None) -> dict[str, Any]:
     response = case["client"].post(
         MINT_URL,
-        json={"execution_request_id": str(request_id or case["request_id"])},
+        json={
+            "execution_request_id": str(request_id or case["request_id"]),
+            "publication_recovery": False,
+        },
         headers=WORKER_HEADERS,
     )
     assert response.status_code == 200, response.text
@@ -702,10 +705,10 @@ def test_mint_requires_the_worker_credential_and_a_live_execution(
     issue_case: dict[str, Any], auth_headers: dict[str, str]
 ) -> None:
     case = issue_case
-    body = {"execution_request_id": str(case["request_id"])}
+    body = {"execution_request_id": str(case["request_id"]), "publication_recovery": False}
     assert case["client"].post(MINT_URL, json=body).status_code == 401
     assert case["client"].post(MINT_URL, json=body, headers=auth_headers).status_code == 401
-    unknown = {"execution_request_id": str(uuid.uuid4())}
+    unknown = {"execution_request_id": str(uuid.uuid4()), "publication_recovery": False}
     assert case["client"].post(MINT_URL, json=unknown, headers=WORKER_HEADERS).status_code == 409
     # Minting at sandbox boot precedes the start grant.
     _, waiting = _insert_execution(

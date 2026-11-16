@@ -366,6 +366,8 @@ async def _owned_run(h: Any, api: TeardownApi, http: httpx.AsyncClient, thread_k
             conversation_id="slack:example",
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path="acme-corp/widgets",
+            execution_kind="implementation",
+            recovery_candidate_id=None,
             context=factory_context(AGENT_ID, wake),
             resource_gate=None,
             predecessor_claim_name=None,

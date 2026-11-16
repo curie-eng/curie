@@ -181,6 +181,9 @@ class PublicationPayload:
     branch: str
     title: str
     transport: PublicationTransport
+    # Earlier failed revisions whose pushed commit the Job may adopt with
+    # proof instead of pushing (#5429); empty for an ordinary publication.
+    adoptable_revision_ids: tuple[uuid.UUID, ...]
     branch_prefix: str | None = None
 
 
@@ -198,6 +201,19 @@ class PublicationResources:
     secret: dict[str, Any]
     job: dict[str, Any]
     owner_uid: str
+
+
+_ADOPTED_REVISION_MARKER = re.compile(
+    r"^CURIE_ADOPTED_REVISION=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+    re.MULTILINE,
+)
+
+
+def marker_adopted_revision(logs: str) -> uuid.UUID | None:
+    """The earlier revision whose pushed commit the Job adopted, from its marker."""
+
+    match = _ADOPTED_REVISION_MARKER.search(logs)
+    return uuid.UUID(match.group(1)) if match else None
 
 
 def deterministic_publication_branch(publication_id: uuid.UUID) -> str:
@@ -320,9 +336,57 @@ if ! git_with_timeout cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
 fi
 git_with_timeout checkout --detach "$BASE_SHA" 2> >(redact >&2)
 git_with_timeout switch -c "$BRANCH" 2> >(redact >&2)
+# A publication recovery (#5429) may find the branch already holding the commit
+# an earlier failed revision of this lineage pushed. It adopts that head only
+# with proof: the commit is the branch tip it fetched, has one parent on the
+# expected history, carries exactly one revision marker naming an adoptable
+# revision, and its tree is exactly this patch on that parent, replayed as
+# this script replays it. It prints the adopted revision and pushes nothing.
+adoptable_head_revision() {
+  local head=$1 fetched markers revision parent proof_commit
+  local -a fields
+  [[ -n "${ADOPTABLE_REVISION_IDS:-}" && -n "$head" ]] || return 1
+  git_with_timeout fetch --no-tags origin "refs/heads/$BRANCH" >&2 2> >(redact >&2) || return 1
+  fetched=$(git_with_timeout rev-parse --verify 'FETCH_HEAD^{commit}') || return 1
+  [[ "$fetched" == "$head" ]] || return 1
+  read -r -a fields <<<"$(git_with_timeout rev-list --parents -n 1 "$head")" || return 1
+  [[ "${#fields[@]}" -eq 2 && "${fields[0]}" == "$head" ]] || return 1
+  parent=${fields[1]}
+  if [[ "$parent" != "$BASE_SHA" ]]; then
+    # Only a first publication replays onto a moved base tip.
+    [[ -z "$EXPECTED_REMOTE_HEAD" ]] || return 1
+    git_with_timeout merge-base --is-ancestor "$BASE_SHA" "$parent" || return 1
+  fi
+  markers=$(git_with_timeout log -1 --format=%B "$head" | grep -E '^Curie-Revision: ') || return 1
+  [[ "$markers" != *$'\n'* ]] || return 1
+  revision=${markers#Curie-Revision: }
+  [[ "$revision" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+  [[ " $ADOPTABLE_REVISION_IDS " == *" $revision "* ]] || return 1
+  git_with_timeout apply --check --binary "$patch_path" >&2 || return 1
+  git_with_timeout apply --binary "$patch_path" >&2 || return 1
+  git_with_timeout add --all >&2 || return 1
+  ! git_with_timeout diff --cached --quiet || return 1
+  git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit \
+    -m "adoption proof" >&2 || return 1
+  proof_commit=$(git_with_timeout rev-parse HEAD) || return 1
+  if [[ "$parent" != "$BASE_SHA" ]]; then
+    git_with_timeout checkout --detach "$parent" >&2 2> >(redact >&2) || return 1
+    git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" \
+      cherry-pick "$proof_commit" >&2 2> >(redact >&2) || return 1
+  fi
+  [[ "$(git_with_timeout rev-parse --verify 'HEAD^{tree}')" == \
+    "$(git_with_timeout rev-parse --verify "$head^{tree}")" ]] || return 1
+  printf '%s\n' "$revision"
+}
+
 remote_head=$(git_with_timeout ls-remote origin "refs/heads/$BRANCH" \
   2> >(redact >&2) | awk '{print $1}')
 if [[ "$remote_head" != "$EXPECTED_REMOTE_HEAD" ]]; then
+  if adopted_revision=$(adoptable_head_revision "$remote_head"); then
+    echo "CURIE_ADOPTED_REVISION=$adopted_revision"
+    echo "CURIE_COMMIT_SHA=$remote_head"
+    exit 0
+  fi
   echo "publication branch head conflict" >&2
   exit 1
 fi
@@ -537,6 +601,10 @@ def build_publication_resources(
         raise PublicationResourceError("publication expected remote head is invalid")
     if payload.revision_number <= 0:
         raise PublicationResourceError("publication revision number must be positive")
+    if payload.revision_id in payload.adoptable_revision_ids or len(
+        set(payload.adoptable_revision_ids)
+    ) != len(payload.adoptable_revision_ids):
+        raise PublicationResourceError("publication adoptable revisions are invalid")
     ca_mount = _check_transport(payload, settings)
     ca_pem = _read_ca_bundle(settings) if ca_mount is not None else None
     config_map_bytes = len(payload.patch) + len(_PUBLISH_SCRIPT.encode())
@@ -587,6 +655,11 @@ def build_publication_resources(
     }
     if ca_pem is not None:
         contract["ca_bundle_sha256"] = hashlib.sha256(ca_pem.encode()).hexdigest()
+    adoptable = " ".join(str(revision) for revision in payload.adoptable_revision_ids)
+    if adoptable:
+        # Absent for an ordinary publication, so its hash input is unchanged
+        # and a worker upgrade still adopts the Jobs it left running.
+        contract["adoptable_revision_ids"] = adoptable
     annotations = {
         "curietech.ai/publication-contract-sha256": hashlib.sha256(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
@@ -636,6 +709,8 @@ def build_publication_resources(
         {"name": "GIT_USER_EMAIL", "value": settings.git_user_email},
         {"name": "GIT_TIMEOUT_SECONDS", "value": str(settings.git_timeout_seconds)},
     ]
+    if adoptable:
+        env.append({"name": "ADOPTABLE_REVISION_IDS", "value": adoptable})
     volume_mounts: list[dict[str, Any]] = [
         {"name": "publication", "mountPath": "/publication", "readOnly": True},
         {"name": "credentials", "mountPath": "/credentials", "readOnly": True},
@@ -1211,6 +1286,7 @@ class KubernetesPublicationCluster:
         return PublicationJobObservation(
             phase=phase,
             commit_sha=commit_match.group(1) if commit_match else None,
+            adopted_revision_id=marker_adopted_revision(logs),
             logs=logs,
             error=error,
             transport=job_transport(job),

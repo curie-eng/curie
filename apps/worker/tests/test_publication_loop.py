@@ -154,6 +154,7 @@ async def publication_store() -> AsyncIterator[tuple[AsyncEngine, str, PostgresP
                     "repo_full_name text NOT NULL, status text NOT NULL DEFAULT 'approved', "
                     "version integer NOT NULL DEFAULT 1, revision_number integer DEFAULT 1, "
                     "expected_prior_head text NOT NULL, base_sha text NOT NULL, "
+                    "adoptable_revision_ids uuid[] NOT NULL DEFAULT '{}', "
                     "patch_bytes bytea, changed_paths text[], title text, body text, "
                     "observed_title_sha256 text, observed_body_sha256 text, "
                     "reply_kind text, reply_channel text, reply_placeholder text, "
@@ -434,6 +435,35 @@ async def test_timeout_recovery_stale_version_is_refused_by_real_api_crud_and_re
         assert credentials.redeemed == 1
     finally:
         await competitor.dispose()
+
+
+async def test_claim_carries_the_stored_adoptable_revisions(
+    publication_store: tuple[AsyncEngine, str, PostgresPublicationStore],
+) -> None:
+    """The Job receives exactly the set the API fixed at creation (#5429)."""
+
+    engine, schema, store = publication_store
+    ordinary = await store.claim_next()
+    assert ordinary is not None
+    assert ordinary.adoptable_revision_ids == ()
+    await store.release(ordinary.publication_id)
+    adoptable = (
+        uuid.UUID("99999999-9999-4999-8999-999999999999"),
+        uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+    )
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                f'UPDATE "{schema}".publications '
+                "SET adoptable_revision_ids = CAST(:ids AS uuid[]) WHERE id = :id"
+            ),
+            {"ids": [str(revision) for revision in adoptable], "id": PUBLICATION_ID},
+        )
+
+    recovery = await store.claim_next()
+
+    assert recovery is not None
+    assert recovery.adoptable_revision_ids == adoptable
 
 
 async def test_charged_retry_blocks_claim_for_fifteen_seconds_then_reclaims(
@@ -1420,6 +1450,7 @@ def _work(
         ),
         version=1,
         lease_owner="publication-loop-test",
+        adoptable_revision_ids=(),
     )
 
 
@@ -1457,6 +1488,7 @@ def _lineage_work(
         route=TargetRoute(endpoint=None, adapter=None),
         version=1,
         lease_owner="publication-loop-test",
+        adoptable_revision_ids=(),
     )
 
 
@@ -2489,6 +2521,88 @@ async def test_foreign_remote_head_is_never_adopted_as_the_approved_revision(
     assert store.retries == [
         (PUBLICATION_ID, "pull request head no longer matches the stored lineage head")
     ]
+
+
+# A publication recovery adopts an earlier failed revision's pushed commit only
+# through its Job's proof (#5429).
+PREDECESSOR_REVISION = uuid.UUID("99999999-9999-4999-8999-999999999999")
+UNRELATED_REVISION = uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+PREDECESSOR_HEAD = "e" * 40
+
+
+def _adopting_job(module: Any, revision: uuid.UUID) -> Any:
+    return _job(
+        module,
+        "succeeded",
+        logs=(f"CURIE_ADOPTED_REVISION={revision}\nCURIE_COMMIT_SHA={PREDECESSOR_HEAD}\n"),
+    )
+
+
+def _recovery_loop(
+    module: Any, adopted: uuid.UUID
+) -> tuple[Any, _Store, _Cluster, _CodeHost, _Replies]:
+    loop, store, _credentials, cluster, github, replies = _loop(module)
+    # The predecessor's Job pushed; its publication failed before recording it.
+    github.branch_head = PREDECESSOR_HEAD
+    github.recovered_head_sha = PREDECESSOR_HEAD
+    github.allow_exact_revision(PREDECESSOR_HEAD, PREDECESSOR_REVISION, PRIOR_HEAD)
+    github.allow_exact_revision(PREDECESSOR_HEAD, UNRELATED_REVISION, PRIOR_HEAD)
+    cluster.observation = _adopting_job(module, adopted)
+    return loop, store, cluster, github, replies
+
+
+@pytest.mark.parametrize("adopted", [PREDECESSOR_REVISION, UNRELATED_REVISION])
+async def test_recovery_adopts_only_a_job_proven_adoptable_predecessor_commit(
+    publication: Any, adopted: uuid.UUID
+) -> None:
+    loop, store, cluster, github, replies = _recovery_loop(publication, adopted)
+    work = replace(_work(publication), adoptable_revision_ids=(PREDECESSOR_REVISION,))
+
+    await loop.reconcile(work)
+
+    # The strict own-revision proof refuses the foreign head, so nothing is
+    # adopted before the Job, which alone can prove the tree.
+    assert github.verify_calls[0] == (PUBLICATION_ID, PREDECESSOR_HEAD, REVISION_ID, PRIOR_HEAD)
+    assert len(cluster.applied) == 1
+    env = _job_env(cluster.applied[0])
+    assert env["ADOPTABLE_REVISION_IDS"] == str(PREDECESSOR_REVISION)
+    assert env["EXPECTED_REMOTE_HEAD"] == ""
+    if adopted == PREDECESSOR_REVISION:
+        assert github.verify_calls[1:] == [
+            (PUBLICATION_ID, PREDECESSOR_HEAD, PREDECESSOR_REVISION, PRIOR_HEAD)
+        ]
+        assert github.recover_calls == [(PUBLICATION_ID, PREDECESSOR_HEAD, False)]
+        assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+        assert [advance["head_sha"] for advance in loop._lineage.advances] == [PREDECESSOR_HEAD]
+        assert len(replies.events) == 1
+    else:
+        # A marker outside this publication's set is never sent for proof.
+        assert github.verify_calls[1:] == []
+        assert github.recover_calls == []
+        assert store.completed == {}
+        assert loop._lineage.advances == []
+        assert store.retries == [(PUBLICATION_ID, "the revision to verify is not adoptable")]
+
+
+async def test_ordinary_publication_never_launches_over_a_foreign_first_branch_head(
+    publication: Any,
+) -> None:
+    loop, store, cluster, github, replies = _recovery_loop(publication, PREDECESSOR_REVISION)
+
+    await loop.reconcile(_work(publication))
+
+    assert github.verify_calls == [(PUBLICATION_ID, PREDECESSOR_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert cluster.applied == []
+    assert github.recover_calls == []
+    assert store.completed == {}
+    assert loop._lineage.advances == []
+    assert len(store.retries) == 1
+    # Liveness: the same remote state with the predecessor adoptable publishes.
+    loop, store, cluster, github, replies = _recovery_loop(publication, PREDECESSOR_REVISION)
+    await loop.reconcile(
+        replace(_work(publication), adoptable_revision_ids=(PREDECESSOR_REVISION,))
+    )
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
 
 
 async def test_nonapproved_work_is_inert_in_the_job_reconciler(publication: Any) -> None:

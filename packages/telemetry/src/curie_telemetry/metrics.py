@@ -195,7 +195,17 @@ _ATTACHMENT_LEDGER_ATTRIBUTES = {
 _THREAD_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "source": ["worker"],
-    "outcome": ["acquired", "contended", "timeout", "start", "steer", "finish-race", "observed"],
+    "outcome": [
+        "acquired",
+        "contended",
+        "timeout",
+        "start",
+        "steer",
+        "finish-race",
+        "observed",
+        # #5429: a publication recovery route boots its runtime and opens no turn.
+        "publication-recovery",
+    ],
 }
 _SANDBOX_ATTRIBUTES = {
     "service.name": ["curie-worker"],
@@ -527,6 +537,7 @@ _HTTP_OPERATIONS = [
     "/v1/internal/publication-candidates/release-reader",
     "/v1/internal/publication-candidates/claim-collection",
     "/v1/internal/publication-candidates/finalize-collection",
+    "/v1/internal/publication-candidates/recovery",
     "/v1/internal/workspaces/{deployment_id}/credential",
     "/v1/internal/workspaces/{deployment_id}/selection",
     "/v1/internal/work-items/admissions",

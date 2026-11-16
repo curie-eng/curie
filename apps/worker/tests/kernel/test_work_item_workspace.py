@@ -246,6 +246,8 @@ class _WorkItems(AbsentRequesterContext):
             conversation_id=factory_conversation(wake),
             wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path=WORK_ITEM_REPO,
+            execution_kind="implementation",
+            recovery_candidate_id=None,
             context=factory_context(AGENT_ID, wake),
             resource_gate=None,
             predecessor_claim_name=None,
@@ -337,7 +339,9 @@ class _WorkItems(AbsentRequesterContext):
         self.deadline_holds.discard(request_id)
         return WorkItemHeartbeat(status="running", terminal_cause=None, work_item_cancelled=False)
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         self.calls.append("issue_read_context")
         return f"{WORK_ITEM_REPO}#7", f"wir.capability-for-{request_id}"
 

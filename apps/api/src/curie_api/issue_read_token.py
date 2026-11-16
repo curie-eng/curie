@@ -32,6 +32,9 @@ class IssueReadClaims(BaseModel):
     tracker_host: str = Field(min_length=1, max_length=512)
     tracker_scope_id: str = Field(min_length=1, max_length=512)
     tracker_issue_id: str = Field(min_length=1, max_length=512)
+    # Signed so the completion contract answers publication_recovery only to
+    # the recovery execute delivery's runner (#5429).
+    publication_recovery: bool
     iat: int = Field(ge=0)
     exp: int = Field(gt=0)
 

@@ -116,7 +116,8 @@ def graph_payload() -> dict[str, Any]:
         ("0171", False),
         ("0172", False),
         ("0173", False),
-        ("0174", True),
+        ("0174", False),
+        ("0175", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -157,11 +158,13 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     which stays below this floor. Refusal posts require 0170, which stays
     below this floor. Triage handoff storage requires 0171, which stays below
     this floor. Factory retry allowance columns require 0172, which stays below
-    this floor. Factory resource gate columns require 0174.
+    this floor. Publication candidate retention requires 0173, which stays below
+    this floor. Factory resource gate columns require 0174, which stays below
+    this floor. Publication recovery requests require 0175.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0174"
-    assert window.schema_head == "0174"
+    assert window.schema_min == "0175"
+    assert window.schema_head == "0175"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

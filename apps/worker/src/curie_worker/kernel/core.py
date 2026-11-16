@@ -60,6 +60,7 @@ from . import (
     lifecycle,
     memory,
     publication,
+    publication_recovery,
     route_tokens,
     routing,
     sweep_slices,
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
     from ..factory_steering import FactorySteeringClient
     from ..personal_execution import PersonalExecution
     from ..publication_candidate_capture import PublicationCandidateCapture
+    from ..publication_candidate_storage import CandidateReader
 
 
 class Kernel:
@@ -113,6 +115,7 @@ class Kernel:
         bundles: BundleReader | None = None,
         recovery: WorkspaceRecoveryCapture | None = None,
         publication_candidates: PublicationCandidateCapture | None = None,
+        publication_candidate_reader: CandidateReader | None = None,
         factory_steering: FactorySteeringClient | None = None,
         personal_execution: PersonalExecution | None = None,
     ) -> None:
@@ -157,6 +160,10 @@ class Kernel:
         # disabled configuration, validates every publication snapshot exactly
         # as before; wired, a started WorkItem run's snapshot is retained first.
         self._publication_candidates = publication_candidates
+        # The candidate reader a publication recovery run reads its one
+        # retained candidate through (#5429). None refuses every recovery run
+        # ``recovery_unavailable``; no other run reads it.
+        self._publication_candidate_reader = publication_candidate_reader
         # The inbound-attachment lane (#2567), optional on exactly the same
         # terms as the workspace lane above: a deployment that has not wired it
         # runs every turn unchanged rather than discovering a missing attribute.
@@ -379,6 +386,7 @@ class Kernel:
     _bind_publication_context = publication._bind_publication_context
     _request_not_running = publication._request_not_running
     _continue_unpublished = publication._continue_unpublished
+    _recover_publication = publication_recovery._recover_publication
     _target_for = routing._kernel_target_for
     _adopt_ref = routing._adopt_ref
     _reply_for = routing._reply_for

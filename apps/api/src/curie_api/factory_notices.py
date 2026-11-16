@@ -110,6 +110,11 @@ _PROVIDER_MESSAGE_CAUSES = frozenset(
         "model_unreachable",
     }
 )
+# Publication refusals can quote caller-supplied paths (#3617), so their
+# detail is rendered as one inert line.
+_PUBLICATION_REFUSAL_CAUSES = frozenset(
+    {"approval_create_failed", "publication_refused", "publication_recovery_refused"}
+)
 # A run that ended without publishing carries the agent's own last message
 # (#3128). Quote each line and neutralize HTML, image syntax and mentions.
 _AGENT_MESSAGE_CAUSES = frozenset(
@@ -458,7 +463,7 @@ def result_section(
             text += f"{retries_used} of {AUTOMATIC_RETRY_LIMIT} automatic retries used.\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
-        elif cause == "approval_create_failed" and detail is not None and detail.strip():
+        elif cause in _PUBLICATION_REFUSAL_CAUSES and detail is not None and detail.strip():
             # The API refusal can quote caller-supplied paths (#3617): one line,
             # so it cannot add a ``Cause:`` line, and no HTML comment opener.
             text += f"Details: {_inert_line(detail)}\n"
@@ -492,6 +497,10 @@ class RetrySuccessor:
     slot: int
     dispatch_not_before: datetime
     blocked_on: str | None
+    # A publication recovery (#5429) publishes the retained candidate it names
+    # with no model run.
+    publication_recovery: bool
+    candidate_id: uuid.UUID | None
 
 
 def utc_text(value: datetime) -> str:
@@ -538,6 +547,13 @@ def _retrying_section(cause: str, successor: RetrySuccessor, *, feedback_url: st
             f"the sandbox teardown and admitted {retry} as a new run. Work the lost run "
             "already did is not ruled out.\n"
         )
+    elif successor.publication_recovery:
+        text = (
+            "Recovering publication: this run's finished change is retained as candidate "
+            f"{code_span(str(successor.candidate_id))}, so Curie admitted publication recovery "
+            f"{successor.slot} of {AUTOMATIC_RETRY_LIMIT} to verify and publish it without "
+            "another model run.\n"
+        )
     else:
         text = f"Retrying: this run failed with no side effects, so Curie admitted {retry}.\n"
     state = retry_state_line(
@@ -574,6 +590,8 @@ async def retry_successor(
         slot=int(slot or 0),
         dispatch_not_before=retry_state_time(successor),
         blocked_on=successor.blocked_on,
+        publication_recovery=successor.execution_kind == "publication_recovery",
+        candidate_id=successor.recovery_candidate_id,
     )
 
 

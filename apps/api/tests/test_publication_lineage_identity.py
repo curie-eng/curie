@@ -663,7 +663,7 @@ def _advance_lineage(
         expected_publication_version, lease_owner = _claim_publication_lease(
             publication_id, "lineage-identity-test-worker"
         )
-    with _publication_commit_http(client, publication_id, head_sha):
+    with _publication_commit_http(client, publication_id, head_sha, marker_revision=publication_id):
         return _patch_lineage(
             client,
             publication_id,
@@ -1787,7 +1787,11 @@ def test_settlement_rechecks_stored_authority_after_remote_read_without_partial_
 def _real_proof(client: TestClient, publication_id: str, head_sha: str) -> Any:
     from curie_api.crud import publication_queries
     from curie_api.factory_rediscovery import publishing_code_host
-    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+    from curie_api.publication_verification import (
+        publication_base_ref,
+        publication_revision_ids,
+        verify_publication_commit,
+    )
     from curie_api.repository_access import lineage_repository
 
     async def prove() -> Any:
@@ -1802,7 +1806,12 @@ def _real_proof(client: TestClient, publication_id: str, head_sha: str) -> Any:
             )
             branch = await publication_base_ref(session, code_host, publication, repository)
             return await verify_publication_commit(
-                code_host, repository, publication, commit_sha=head_sha, base_branch=branch
+                code_host,
+                repository,
+                publication,
+                commit_sha=head_sha,
+                base_branch=branch,
+                revision_ids=publication_revision_ids(publication),
             )
 
     return client.portal.call(prove)

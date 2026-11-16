@@ -363,7 +363,10 @@ def test_lost_response_adopts_only_the_marked_revision_with_expected_parent(
     commit = _with_host(handler, lambda host: host.read_commit(_repository(), REVISION_HEAD))
 
     refusal = revision_refusal(
-        commit, commit_sha=REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+        commit,
+        commit_sha=REVISION_HEAD,
+        revision_ids=frozenset({REVISION_ID}),
+        expected_parent=PRIOR_HEAD,
     )
     assert refusal is not None and error in refusal
 
@@ -384,10 +387,58 @@ def test_lost_response_adopts_the_exact_marked_revision_commit() -> None:
     assert commit.sha == REVISION_HEAD
     assert (
         revision_refusal(
-            commit, commit_sha=REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+            commit,
+            commit_sha=REVISION_HEAD,
+            revision_ids=frozenset({REVISION_ID}),
+            expected_parent=PRIOR_HEAD,
         )
         is None
     )
+
+
+_PREDECESSOR_REVISION = uuid.UUID("99999999-9999-4999-8999-999999999999")
+_UNRELATED_REVISION = uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+
+
+@pytest.mark.parametrize(
+    ("revision_ids", "parents", "refused"),
+    [
+        (frozenset({REVISION_ID, _PREDECESSOR_REVISION}), [PRIOR_HEAD], None),
+        (frozenset({REVISION_ID}), [PRIOR_HEAD], "revision marker"),
+        (frozenset({REVISION_ID, _UNRELATED_REVISION}), [PRIOR_HEAD], "revision marker"),
+        (frozenset({REVISION_ID, _PREDECESSOR_REVISION}), ["c" * 40], "expected parent"),
+        (
+            frozenset({REVISION_ID, _PREDECESSOR_REVISION}),
+            [PRIOR_HEAD, "c" * 40],
+            "expected parent",
+        ),
+    ],
+    ids=("adoptable", "own-only", "outside-set", "wrong-parent", "two-parents"),
+)
+def test_recovery_accepts_an_adoptable_marker_only_on_the_expected_parent(
+    revision_ids: frozenset[uuid.UUID], parents: list[str], refused: str | None
+) -> None:
+    """A predecessor's pushed commit stands for a recovery only by its marker (#5429)."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "sha": REVISION_HEAD,
+                "message": f"Approved revision\n\nCurie-Revision: {_PREDECESSOR_REVISION}",
+                "parents": [{"sha": parent} for parent in parents],
+            },
+        )
+
+    commit = _with_host(handler, lambda host: host.read_commit(_repository(), REVISION_HEAD))
+
+    refusal = revision_refusal(
+        commit, commit_sha=REVISION_HEAD, revision_ids=revision_ids, expected_parent=PRIOR_HEAD
+    )
+    if refused is None:
+        assert refusal is None
+    else:
+        assert refusal is not None and refused in refusal
 
 
 def test_missing_job_recovery_reads_the_exact_lineage_branch_head() -> None:

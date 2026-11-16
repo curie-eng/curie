@@ -90,3 +90,10 @@ async def finalize_collection(
     body: wire.CandidateFinalizeCollection, session: SessionDep
 ) -> wire.CandidateFinalized:
     return await _transaction(session, ledger.finalize_collection(session, body))
+
+
+@router.post("/recovery", response_model=wire.CandidateRecovery)
+async def recovery(
+    body: wire.CandidateCaptureAuthority, session: SessionDep
+) -> wire.CandidateRecovery:
+    return await _transaction(session, ledger.recovery(session, get_settings(), body))

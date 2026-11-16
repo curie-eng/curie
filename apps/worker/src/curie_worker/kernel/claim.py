@@ -533,6 +533,8 @@ async def _route_and_start(
     if owned_run is not None and owned_run.agent_id != agent_id:
         raise WorkItemStartRefused("factory_agent_mismatch")
     caller_run = str(owned_run.request_id) if owned_run is not None else None
+    # #5429: a publication recovery run never steers and never opens a turn.
+    recovery = owned_run is not None and owned_run.is_publication_recovery
     # #5378: whose grant a runtime for this delivery boots with. None is a
     # service delivery, which never inherits a personal runtime either.
     launch = constants._PERSONAL_LAUNCH.get()
@@ -1174,7 +1176,7 @@ async def _route_and_start(
                 or capacity_status.get("turn_active") is not False
             ):
                 raise CapacityWaitRequested()
-    elif source.is_job or verified_review is not None or event.tool_access is not None:
+    elif source.is_job or verified_review is not None or event.tool_access is not None or recovery:
         # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
         # a webhook must never fold itself into whatever a person is currently
         # saying. A verified review likewise owns a separately reserved
@@ -1456,6 +1458,12 @@ async def _route_and_start(
         if run.event_id == queued_event_id:
             run.claim_name = handle.claim_name
             run.sandbox_name = handle.sandbox_name
+    if run is not None and run.event_id == queued_event_id and run.is_publication_recovery:
+        # #5429: the started, booted runtime is the validation runtime. No
+        # requester context, publication context or turn: the attempt reads
+        # the retained candidate instead (kernel/publication_recovery.py).
+        routing._record_route("publication-recovery")
+        return routing._RouteResult(steered=False, handle=handle)
     if agent_id is not None:
         self._register_run(agent_id, thread_key)
     turn: TurnStream | None = None

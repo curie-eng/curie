@@ -5426,6 +5426,81 @@
         "title": "CandidateReader",
         "type": "object"
       },
+      "CandidateRecovery": {
+        "additionalProperties": false,
+        "description": "The exact retained candidate a publication recovery request publishes (#5429).",
+        "properties": {
+          "base_commit": {
+            "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "body": {
+            "maxLength": 65536,
+            "pattern": "^[^\\x00]*$",
+            "title": "Body",
+            "type": "string"
+          },
+          "candidate_id": {
+            "format": "uuid",
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "changed_paths": {
+            "items": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "pattern": "^[^\\x00]+$",
+              "type": "string"
+            },
+            "maxItems": 4096,
+            "title": "Changed Paths",
+            "type": "array"
+          },
+          "contains_workflow_files": {
+            "title": "Contains Workflow Files",
+            "type": "boolean"
+          },
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "patch": {
+            "$ref": "#/components/schemas/CandidateObjectReceipt"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/CandidateRepository"
+          },
+          "target_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Target Branch",
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 256,
+            "pattern": "^[^\\x00]*$",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_id",
+          "content_sha256",
+          "repository",
+          "base_commit",
+          "target_branch",
+          "changed_paths",
+          "contains_workflow_files",
+          "title",
+          "body",
+          "patch"
+        ],
+        "title": "CandidateRecovery",
+        "type": "object"
+      },
       "CandidateReleaseReader": {
         "additionalProperties": false,
         "properties": {
@@ -7223,12 +7298,13 @@
         "type": "object"
       },
       "CompletionContractOut": {
-        "description": "How the execution completes (ADR 0277, #5586): by a pull request\n(``implementation``) or by one delivered tracker result (``tracker_result``).\n\n``result_kinds`` are the kinds the deployed policy allows and\n``session_usd_allowance`` the per-session model allowance in USD (the\nagent's dollar limit, else 5); both empty for ``implementation``.",
+        "description": "How the execution completes (ADR 0277, #5586): by a pull request\n(``implementation``), by one delivered tracker result (``tracker_result``),\nor by publishing a retained publication candidate with no model run\n(``publication_recovery``, #5429).\n\n``result_kinds`` are the kinds the deployed policy allows and\n``session_usd_allowance`` the per-session model allowance in USD (the\nagent's dollar limit, else 5); both empty for ``implementation`` and\n``publication_recovery``. A ``publication_recovery`` answer also carries\nno ``execution``: that process runs no model, so it waits for no requester\ncontext.",
         "properties": {
           "completion_contract": {
             "enum": [
               "implementation",
-              "tracker_result"
+              "tracker_result",
+              "publication_recovery"
             ],
             "title": "Completion Contract",
             "type": "string"
@@ -11416,10 +11492,15 @@
             "format": "uuid",
             "title": "Execution Request Id",
             "type": "string"
+          },
+          "publication_recovery": {
+            "title": "Publication Recovery",
+            "type": "boolean"
           }
         },
         "required": [
-          "execution_request_id"
+          "execution_request_id",
+          "publication_recovery"
         ],
         "title": "IssueReadContextMint",
         "type": "object"
@@ -36666,6 +36747,65 @@
         ]
       }
     },
+    "/v1/internal/publication-candidates/recovery": {
+      "post": {
+        "operationId": "recovery_v1_internal_publication_candidates_recovery_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateCaptureAuthority"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateRecovery"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recovery",
+        "tags": [
+          "internal-publication-candidates"
+        ]
+      }
+    },
     "/v1/internal/publication-candidates/release-reader": {
       "post": {
         "operationId": "release_reader_v1_internal_publication_candidates_release_reader_post",
@@ -37501,7 +37641,7 @@
     },
     "/v1/internal/publications/{publication_id}/revision-commit": {
       "post": {
-        "description": "Prove the marked revision and its authoritative publication parent.",
+        "description": "Prove the marked revision and its authoritative publication parent.\n\nThe named revision is the publication's own, or for a publication recovery\none of the earlier failed revisions it may adopt (#5429). Only that one\nrevision's marker is accepted, so a caller proving its own push never\naccepts a predecessor's commit by accident.",
         "operationId": "verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post",
         "parameters": [
           {
@@ -40413,7 +40553,7 @@
     },
     "/work-items/completion-contract": {
       "post": {
-        "description": "The execution's completion contract; for a tracker result request, the\nreservation of its one model session.\n\nThe first call for a tracker result request reads the source issue's\ntitle and body, mints the request's grant and reserves the session; any\nlater call is 409 ``session_already_started``, so a second runner starts\nno model. An implementation request reserves nothing and gets no grant.",
+        "description": "The execution's completion contract; for a tracker result request, the\nreservation of its one model session.\n\nThe first call for a tracker result request reads the source issue's\ntitle and body, mints the request's grant and reserves the session; any\nlater call is 409 ``session_already_started``, so a second runner starts\nno model. An implementation request reserves nothing and gets no grant.\nA publication recovery request (#5429) passes the same fences as an\nimplementation request, reserves nothing, and is answered\n``publication_recovery`` with no execution binding, so its runner\nconstructs no model session.",
         "operationId": "read_completion_contract_work_items_completion_contract_post",
         "parameters": [
           {

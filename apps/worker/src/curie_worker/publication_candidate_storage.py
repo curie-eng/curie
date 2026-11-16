@@ -660,6 +660,12 @@ class CandidateReader:
         self._ttl = reference_ttl_seconds
         self._wall_clock = wall_clock
 
+    @property
+    def ledger(self) -> PublicationCandidateClient:
+        """The ledger client the leases are taken through."""
+
+        return self._ledger
+
     async def acquire(
         self, *, work_item_id: uuid.UUID, candidate_id: uuid.UUID, holder_id: str
     ) -> CandidateReadLease:

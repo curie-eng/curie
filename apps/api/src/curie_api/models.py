@@ -33,7 +33,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .approval_wording import approval_display, describe_approval
@@ -1465,6 +1465,29 @@ class ExecutionRequest(Base):
             "OR (retry_condition_retry_at IS NULL AND retry_condition_scope_key IS NULL)",
             name="execution_requests_retry_condition_ck",
         ),
+        # Migration 0175 (#5429): a publication recovery request names one
+        # retained candidate by id and digest; a trigger keeps them immutable.
+        CheckConstraint(
+            "execution_kind IN ('implementation', 'publication_recovery')",
+            name="execution_requests_execution_kind_ck",
+        ),
+        CheckConstraint(
+            "(recovery_candidate_id IS NULL) = (recovery_candidate_sha256 IS NULL)",
+            name="execution_requests_recovery_candidate_pair_ck",
+        ),
+        CheckConstraint(
+            "(execution_kind = 'publication_recovery') = (recovery_candidate_id IS NOT NULL)",
+            name="execution_requests_recovery_candidate_kind_ck",
+        ),
+        CheckConstraint(
+            "execution_kind <> 'publication_recovery' "
+            "OR (completion_contract = 'implementation' AND retry_of_request_id IS NOT NULL)",
+            name="execution_requests_recovery_shape_ck",
+        ),
+        CheckConstraint(
+            "recovery_candidate_sha256 IS NULL OR recovery_candidate_sha256 ~ '^[0-9a-f]{64}$'",
+            name="execution_requests_recovery_candidate_sha_ck",
+        ),
         # Migration 0174 (#5427): a delivered limits record and a resource gate
         # are JSON objects when present, never a JSON null or scalar.
         CheckConstraint(
@@ -1627,6 +1650,16 @@ class ExecutionRequest(Base):
         DateTime(timezone=True), default=None
     )
     retry_condition_scope_key: Mapped[str | None] = mapped_column(Text, default=None)
+    # What the request runs (migration 0175, #5429): an ``implementation`` runs
+    # the model; a ``publication_recovery`` successor verifies and publishes the
+    # retained candidate it names, with no model run. Fixed at admission.
+    execution_kind: Mapped[str] = mapped_column(
+        Text, default="implementation", server_default="implementation"
+    )
+    recovery_candidate_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    recovery_candidate_sha256: Mapped[str | None] = mapped_column(String(64), default=None)
     # The limits actually delivered to this request's attempt, recorded by its
     # start, and the gate an automatic successor of a limit failure waits on
     # (migration 0174, #5427). ``none_as_null`` keeps a Python None SQL NULL,
@@ -2764,6 +2797,11 @@ class Publication(Base):
             "AND branch_prefix NOT LIKE '%./')",
             name="publications_branch_prefix_ck",
         ),
+        CheckConstraint(
+            "array_position(adoptable_revision_ids, NULL) IS NULL "
+            "AND NOT (id = ANY(adoptable_revision_ids))",
+            name="publications_adoptable_revision_ids_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -2788,6 +2826,13 @@ class Publication(Base):
     )
     revision_number: Mapped[int | None] = mapped_column(default=None)
     expected_prior_head: Mapped[str | None] = mapped_column(default=None)
+    # The earlier failed revisions of this lineage whose pushed commit this
+    # publication may adopt instead of pushing its own (migration 0175, #5429).
+    # Computed once at creation; non-empty only for a publication recovery
+    # request's publication. A trigger refuses any update.
+    adoptable_revision_ids: Mapped[list[uuid.UUID]] = mapped_column(
+        ARRAY(UUID(as_uuid=True)), default=list, server_default=text("'{}'::uuid[]")
+    )
     repo_full_name: Mapped[str]
     status: Mapped[str] = mapped_column(server_default="pending")
     # Snapshotted from the agent policy at creation. Human policy stores false

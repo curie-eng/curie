@@ -125,6 +125,8 @@ class Api:
                     "wait_deadline": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                     "repository_path": "acme-corp/widgets",
                     "context": factory_context(AGENT_ID, wake).model_dump(mode="json"),
+                    "execution_kind": "implementation",
+                    "recovery_candidate_id": None,
                     "resource_gate": None,
                     "predecessor_claim_name": None,
                 }
@@ -1546,7 +1548,7 @@ def _issue_read_context(body: dict[str, Any]) -> tuple[str, str]:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example-token", client=http
             )
-            return await client.issue_read_context(request_id)
+            return await client.issue_read_context(request_id, publication_recovery=False)
 
     return asyncio.run(go())
 

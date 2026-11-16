@@ -247,7 +247,9 @@ class _WorkItems(AbsentRequesterContext):
         self.calls.append("finish")
         self.finishes.append((request_id, kwargs))
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         return "acme widgets issue 7", f"wir.capability-for-{request_id}"
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]

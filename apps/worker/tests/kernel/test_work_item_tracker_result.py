@@ -94,10 +94,13 @@ class _ContractWorkItems(_WorkItems):
         *,
         mint: BaseException | asyncio.Event | None = None,
         defer_refusal: str | None = None,
+        recovery_candidate_id: uuid.UUID | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.contract = contract
+        # A publication recovery grant (#5429) when a candidate is named.
+        self.recovery_candidate_id = recovery_candidate_id
         self.mint = mint
         self.defer_refusal = defer_refusal
         self.defers: list[dict[str, object]] = []
@@ -112,6 +115,13 @@ class _ContractWorkItems(_WorkItems):
         if grant.completion_contract != self.contract:
             grant = replace(grant, completion_contract=self.contract)
             self.acquisitions[request_id] = grant
+        if self.recovery_candidate_id is not None:
+            grant = replace(
+                grant,
+                execution_kind="publication_recovery",
+                recovery_candidate_id=self.recovery_candidate_id,
+            )
+            self.acquisitions[request_id] = grant
         return grant
 
     async def start(self, request_id: uuid.UUID, **kwargs: Any) -> WorkItemStartGrant:
@@ -124,13 +134,17 @@ class _ContractWorkItems(_WorkItems):
         self.starts[request_id] = started
         return started
 
-    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+    async def issue_read_context(
+        self, request_id: uuid.UUID, *, publication_recovery: bool
+    ) -> tuple[str, str]:
         self.calls.append("issue_read_context")
         if isinstance(self.mint, asyncio.Event):
             await self.mint.wait()
         elif isinstance(self.mint, BaseException):
             raise self.mint
-        return await super().issue_read_context(request_id)
+        return await super().issue_read_context(
+            request_id, publication_recovery=publication_recovery
+        )
 
     async def defer(
         self, request_id: uuid.UUID, *, reason: str, capacity: bool, **_: object
@@ -420,13 +434,16 @@ def test_an_execution_deadline_stop_starts_no_further_turn(
 # --- Capability mint fails closed --------------------------------------------------
 
 
+@pytest.mark.parametrize("kind", ["tracker_result", "publication_recovery"])
 @pytest.mark.parametrize(
     "failure",
     ["conflict", "transport", "deadline", "unexpected"],
 )
 def test_a_failed_capability_mint_defers_without_a_sandbox_or_a_turn(
-    make_harness, monkeypatch: pytest.MonkeyPatch, failure: str
+    make_harness, monkeypatch: pytest.MonkeyPatch, failure: str, kind: str
 ) -> None:
+    # A publication recovery runner (#5429) learns from the capability to
+    # construct no model session, so its mint fails closed as well.
     async def exercise() -> None:
         mint: BaseException | asyncio.Event
         if failure == "conflict":
@@ -440,7 +457,13 @@ def test_a_failed_capability_mint_defers_without_a_sandbox_or_a_turn(
         else:
             mint = RuntimeError("unexpected mint fault")
         async with _harness(make_harness, _CountingPublicationApi()) as h:
-            items = _ContractWorkItems(TRACKER_RESULT, mint=mint)
+            items = (
+                _ContractWorkItems(TRACKER_RESULT, mint=mint)
+                if kind == "tracker_result"
+                else _ContractWorkItems(
+                    IMPLEMENTATION, mint=mint, recovery_candidate_id=uuid.uuid4()
+                )
+            )
 
             event_id = await _drive(h, items, [[_done(MUST_NOT_RUN)]])
 
@@ -513,6 +536,8 @@ _ACQUIRE_BODY: dict[str, object] = {
     "wait_deadline": "2099-01-01T00:00:00+00:00",
     "repository_path": WORK_ITEM_REPO,
     "context": _CONTEXT.model_dump(mode="json"),
+    "execution_kind": "implementation",
+    "recovery_candidate_id": None,
     "resource_gate": None,
     "predecessor_claim_name": None,
 }

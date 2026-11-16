@@ -509,6 +509,8 @@ async def acquire_work_item_request(
         "repository_path": result.repository_path,
         "context": result.context,
         "completion_contract": result.completion_contract,
+        "execution_kind": result.execution_kind,
+        "recovery_candidate_id": result.recovery_candidate_id,
         "resource_gate": result.resource_gate,
         "predecessor_claim_name": result.predecessor_claim_name,
     }

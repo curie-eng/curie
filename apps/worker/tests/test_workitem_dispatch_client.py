@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import uuid
@@ -51,6 +52,8 @@ def _grant() -> WorkItemAcquireGrant:
         conversation_id="slack:C0EXAMPLE1:thread",
         wait_deadline=datetime(2099, 1, 1, tzinfo=UTC),
         repository_path="acme-corp/widgets",
+        execution_kind="implementation",
+        recovery_candidate_id=None,
         context=CONTEXT,
         resource_gate=None,
         predecessor_claim_name=None,
@@ -80,6 +83,8 @@ BASE = {
     "wait_deadline": "2026-09-23T02:00:00+00:00",
     "repository_path": "acme-corp/widgets",
     "context": CONTEXT.model_dump(mode="json"),
+    "execution_kind": "implementation",
+    "recovery_candidate_id": None,
     "resource_gate": None,
     "predecessor_claim_name": None,
 }
@@ -95,6 +100,7 @@ def test_acquire_grant_carries_the_work_item_repository() -> None:
     [
         "generation", "work_item_id", "conversation_id",
         "wait_deadline", "repository_path", "context",
+        "execution_kind", "recovery_candidate_id",
         "resource_gate", "predecessor_claim_name",
     ],
 )
@@ -103,6 +109,81 @@ def test_acquire_refuses_a_missing_required_field(field: str) -> None:
     del body[field]
     with pytest.raises(WorkItemTransportError):
         _acquire(body)
+
+
+def test_acquire_grant_carries_the_publication_recovery_candidate() -> None:
+    candidate = uuid.uuid4()
+    grant = _acquire(
+        {
+            **BASE,
+            "execution_kind": "publication_recovery",
+            "recovery_candidate_id": str(candidate),
+        }
+    )
+    assert grant.execution_kind == "publication_recovery"
+    assert grant.recovery_candidate_id == candidate
+    plain = _acquire(BASE)
+    assert (plain.execution_kind, plain.recovery_candidate_id) == ("implementation", None)
+
+
+@pytest.mark.parametrize(
+    ("kind", "candidate"),
+    [
+        ("publication_recovery", None),
+        ("implementation", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        ("recovery", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+        (None, None),
+        ("publication_recovery", "not-a-uuid"),
+    ],
+)
+def test_acquire_refuses_an_unusable_execution_kind(kind: object, candidate: object) -> None:
+    with pytest.raises(WorkItemTransportError):
+        _acquire({**BASE, "execution_kind": kind, "recovery_candidate_id": candidate})
+
+
+def test_only_an_acquired_recovery_run_is_a_publication_recovery() -> None:
+    candidate = uuid.uuid4()
+
+    async def go() -> tuple[WorkItemRun, WorkItemRun]:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(500))
+        ) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example", worker_token="example-token", client=http
+            )
+            runs = []
+            for grant in (
+                dataclasses.replace(
+                    _grant(),
+                    execution_kind="publication_recovery",
+                    recovery_candidate_id=candidate,
+                ),
+                _grant(),
+            ):
+                run = WorkItemRun(
+                    client=client,
+                    request_id=REQUEST_ID,
+                    owner="worker-1",
+                    grant=grant,
+                    wake=WAKE,
+                    event_id=f"work-item-{REQUEST_ID}-execute-1",
+                    thread_key="slack:C0EXAMPLE1:thread",
+                    on_stop=_noop_stop,
+                    on_stale=_noop_stop,
+                )
+                await run.close()
+                runs.append(run)
+            return runs[0], runs[1]
+
+    recovery, implementation = asyncio.run(go())
+    assert recovery.is_publication_recovery
+    assert recovery.recovery_candidate_id == candidate
+    assert not implementation.is_publication_recovery
+    assert implementation.recovery_candidate_id is None
+
+
+async def _noop_stop(_thread_key: str, _run: WorkItemRun) -> None:
+    return None
 
 
 @pytest.mark.parametrize("repository", [None, "", " ", 42])
@@ -162,14 +243,16 @@ def test_acquire_sends_wake_and_initial_authority_explicitly() -> None:
 
 
 def _running_body() -> dict[str, object]:
-    # A running request is past its start: it carries no gate and no fence.
-    acquired = {
-        key: value
-        for key, value in BASE.items()
-        if key not in {"resource_gate", "predecessor_claim_name"}
+    # The running lookup carries no execution kind, gate or fence: only acquire
+    # grants them, and a running request is past its start.
+    acquire_only = {
+        "execution_kind",
+        "recovery_candidate_id",
+        "resource_gate",
+        "predecessor_claim_name",
     }
     return {
-        **acquired,
+        **{key: value for key, value in BASE.items() if key not in acquire_only},
         "request_id": str(REQUEST_ID),
         "agent_id": str(AGENT_ID),
         "runtime_epoch": 7,

@@ -11,6 +11,9 @@ matched exactly: an underscored terminal cause, or one of the hyphenated
 kernel classification tokens named in ``_TOKEN_ALIASES``. Nothing is inferred
 by rewriting a string.
 
+A publication failure allows a publication recovery successor; the lifecycle
+admits it only when an exact retained candidate exists, and it reruns no model.
+
 Owner loss is terminal here on purpose. Its successor is admitted only by the
 observed teardown path (ADR 0206), so a worker that reports ``owner_lost`` by
 name through a finish earns nothing.
@@ -206,7 +209,9 @@ def decide(facts: RetryFacts) -> Disposition:
     if cause == "start_failed":
         return Disposition(DispositionKind.TERMINAL, condition="start_preparation")
     if cause in _PUBLICATION_RECOVERY:
-        return Disposition(DispositionKind.PUBLICATION_RECOVERY)
+        # The lifecycle admits a recovery only for an exact retained candidate
+        # (#5429); without one this admits nothing.
+        return Disposition(DispositionKind.PUBLICATION_RECOVERY, successor=True)
     if cause in _CI_OBSERVATION:
         return Disposition(DispositionKind.CI_OBSERVATION)
     if cause in _LINEAGE_WAIT:

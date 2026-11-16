@@ -964,6 +964,130 @@ async def transfer_ownership(
     return candidate
 
 
+def _recoverable(
+    candidate: Candidate, objects: list[CandidateObject], now: datetime
+) -> CandidateObject | None:
+    """The candidate's patch when it and the live base are complete and it is unexpired."""
+
+    patch = next(
+        (obj for obj in objects if obj.candidate_id == candidate.id and obj.kind == "patch"),
+        None,
+    )
+    base = _live_base(objects)
+    if (
+        candidate.status != "complete"
+        or not _unexpired(candidate, now)
+        or patch is None
+        or patch.status != "complete"
+        or base is None
+        or base.status != "complete"
+    ):
+        return None
+    return patch
+
+
+async def recovery_candidate(
+    session: AsyncSession, work_item: WorkItem, predecessor: ExecutionRequest
+) -> Candidate | None:
+    """The exact candidate a publication recovery of ``predecessor`` would publish (#5429).
+
+    Called in the predecessor's settling transaction with the WorkItem and the
+    predecessor already locked; takes the installation row, the group and the
+    candidates in module order. The newest complete candidate the predecessor
+    owns qualifies only when it is unexpired, its patch and the live base are
+    complete, and the retained repository and base still equal the WorkItem's.
+    An older candidate never stands in for a newest one that does not qualify.
+    None otherwise; nothing is transferred here.
+    """
+
+    await _installation(session)
+    group = await _group(session, work_item.id)
+    if group is None or _group_identity(group) != _item_identity(work_item):
+        return None
+    candidate = await session.scalar(
+        select(Candidate)
+        .where(
+            Candidate.work_item_id == work_item.id,
+            Candidate.owner_request_id == predecessor.id,
+            Candidate.status == "complete",
+        )
+        .order_by(Candidate.created_at.desc(), Candidate.id.desc())
+        .limit(1)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if candidate is None:
+        return None
+    await _fix_expiry(session, candidate)
+    now = await database_now(session)
+    if _recoverable(candidate, await _objects(session, work_item.id), now) is None:
+        return None
+    return candidate
+
+
+async def recovery(
+    session: AsyncSession, settings: Settings, body: wire.CandidateCaptureAuthority
+) -> wire.CandidateRecovery:
+    """The exact candidate a started publication recovery request publishes (#5429).
+
+    Live authority only: the running request must be the WorkItem's newest,
+    with an unexpired heartbeat and deadline. It answers the candidate the
+    request names, by id and digest, only while that request owns it and it is
+    complete and unexpired with complete objects, and only while the retained
+    repository and base still equal the WorkItem's. It never renews retention
+    or changes ownership.
+    """
+
+    _enabled(settings)
+    item, request = await _authority(session, body, live=True)
+    if (
+        request.execution_kind != "publication_recovery"
+        or request.recovery_candidate_id is None
+        or request.recovery_candidate_sha256 is None
+    ):
+        raise CandidateRefusal("recovery_not_requested")
+    await _installation(session)
+    group = await _group(session, item.id)
+    if group is None:
+        raise CandidateRefusal("recovery_candidate_unavailable")
+    candidate = await session.scalar(
+        select(Candidate)
+        .where(Candidate.id == request.recovery_candidate_id, Candidate.work_item_id == item.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if candidate is None:
+        raise CandidateRefusal("recovery_candidate_unavailable")
+    await _fix_expiry(session, candidate)
+    now = await database_now(session)
+    patch = _recoverable(candidate, await _objects(session, item.id), now)
+    if (
+        patch is None
+        or candidate.owner_request_id != request.id
+        or candidate.content_sha256 != request.recovery_candidate_sha256
+    ):
+        raise CandidateRefusal("recovery_candidate_unavailable")
+    if _group_identity(group) != _item_identity(item):
+        raise CandidateRefusal("recovery_base_changed")
+    return wire.CandidateRecovery(
+        candidate_id=candidate.id,
+        content_sha256=candidate.content_sha256,
+        repository=wire.CandidateRepository(
+            provider=group.repository_provider,
+            host=group.repository_host,
+            project_id=group.repository_project_id,
+            path=group.repository_path,
+        ),
+        base_commit=group.base_commit,
+        target_branch=group.target_branch,
+        changed_paths=list(candidate.changed_paths),
+        contains_workflow_files=candidate.contains_workflow_files,
+        title=candidate.title,
+        body=candidate.body,
+        patch=_receipt(patch),
+    )
+
+
 async def list_metadata(session: AsyncSession, work_item_id: uuid.UUID) -> wire.CandidatePublicList:
     """Operator metadata: ids, statuses, timestamps, counts, sizes and digests only."""
 

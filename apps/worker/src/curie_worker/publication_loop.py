@@ -37,6 +37,7 @@ from .publication_k8s import (
     build_publication_resources,
     clean_origin,
     deterministic_publication_branch,
+    marker_adopted_revision,
     publication_branch_is_valid,
     publication_resource_names,
     valid_repository_path,
@@ -140,6 +141,9 @@ class PublicationJobObservation:
     phase: str
     logs: str
     commit_sha: str | None = None
+    # The earlier revision whose pushed commit a recovery's Job adopted with
+    # proof instead of pushing (#5429); None when the Job pushed its own.
+    adopted_revision_id: uuid.UUID | None = None
     error: str | None = None
     exists: bool = True
     # The transport facts the existing Job was built with; adoption rebuilds
@@ -172,6 +176,10 @@ class PublicationWork:
     route: TargetRoute
     version: int
     lease_owner: str
+    # Earlier failed revisions of this lineage whose pushed commit this
+    # publication may adopt with the Job's proof (#5429); empty unless it is a
+    # publication recovery's.
+    adoptable_revision_ids: tuple[uuid.UUID, ...]
     # False only when this publication already launched and its execution is
     # no longer running. New launches stay excluded by the claim query.
     owner_running: bool = True
@@ -751,6 +759,7 @@ class PublicationReconciler:
         new_head: str | None = None,
         names: PublicationResourceNames,
         metadata_updated_at: datetime | None,
+        verified_commit: PublicationRevisionCommit | None,
     ) -> None:
         # The durable outcome is the source of truth. Resource cleanup and reply
         # delivery are independent outboxes; result claims remain gated until
@@ -766,6 +775,7 @@ class PublicationReconciler:
                 pr_number=pr_number,
                 new_head=new_head,
                 metadata_updated_at=metadata_updated_at,
+                verified_commit=verified_commit,
             )
         await self._persist_result(
             work,
@@ -785,6 +795,7 @@ class PublicationReconciler:
         pr_number: int,
         new_head: str,
         metadata_updated_at: datetime | None,
+        verified_commit: PublicationRevisionCommit | None,
     ) -> None:
         # ADR 0143: the API verifies GitHub identity and advances the lineage
         # with the publication outcome in one compare-and-set, fenced by this
@@ -810,7 +821,11 @@ class PublicationReconciler:
         except PublicationRemoteTerminalError as terminal:
             first_parent_sha = None
             if work.expected_remote_head is None:
-                verified = await self._verify_revision(work, new_head)
+                verified = verified_commit
+                if verified is None or verified.commit_sha != new_head:
+                    verified = await self._verify_revision(
+                        work, new_head, revision_id=work.revision_id
+                    )
                 first_parent_sha = verified.parent_sha
             await self._mark_lineage_terminal(
                 work,
@@ -926,6 +941,7 @@ class PublicationReconciler:
             branch=work.branch,
             title=work.title,
             transport=transport,
+            adoptable_revision_ids=work.adoptable_revision_ids,
             branch_prefix=work.branch_prefix,
         )
 
@@ -951,13 +967,21 @@ class PublicationReconciler:
         return pull
 
     async def _verify_revision(
-        self, work: PublicationWork, commit_sha: str
+        self, work: PublicationWork, commit_sha: str, *, revision_id: uuid.UUID
     ) -> PublicationRevisionCommit:
+        """Prove ``commit_sha`` is ``revision_id``'s marked commit on the expected parent.
+
+        ``revision_id`` is this publication's own revision, or an adoptable
+        one only when its Job proved the remote commit is this patch (#5429).
+        """
+
+        if revision_id != work.revision_id and revision_id not in work.adoptable_revision_ids:
+            raise PublicationReconcileError("the revision to verify is not adoptable")
         verified = await _resolve(
             self._code_host.verify_revision_commit(
                 work.publication_id,
                 commit_sha,
-                revision_id=work.revision_id,
+                revision_id=revision_id,
                 expected_parent=work.expected_prior_head,
             )
         )
@@ -1145,10 +1169,18 @@ class PublicationReconciler:
             if branch_head == work.expected_prior_head:
                 return credential, pull, None
         try:
-            verified_commit = await self._verify_revision(work, branch_head)
+            verified_commit = await self._verify_revision(
+                work, branch_head, revision_id=work.revision_id
+            )
         except PublicationIdentityUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001 - preserve the stored-lineage refusal
+            if work.adoptable_revision_ids and not rejected_job:
+                # A recovery may find an earlier failed revision's pushed
+                # commit (#5429). Only its Job can prove that commit is this
+                # patch, so nothing is adopted here: the Job adopts it with
+                # proof or refuses the foreign head, and pushes nothing.
+                return credential, None, None
             if pull is not None:
                 raise PublicationReconcileError(
                     "pull request head no longer matches the stored lineage head"
@@ -1213,6 +1245,7 @@ class PublicationReconciler:
                     ),
                     names=names,
                     metadata_updated_at=None,
+                    verified_commit=None,
                 )
                 return
             if pull.head_sha == work.expected_prior_head:
@@ -1249,7 +1282,9 @@ class PublicationReconciler:
         first_parent_sha = None
         if pull.head_sha != trusted_head:
             try:
-                verified = await self._verify_revision(work, pull.head_sha)
+                verified = await self._verify_revision(
+                    work, pull.head_sha, revision_id=work.revision_id
+                )
             except PublicationReconcileError:
                 if trusted_head is None:
                     raise PublicationReconcileError(
@@ -1324,6 +1359,7 @@ class PublicationReconciler:
             new_head=pushed_head,
             names=names,
             metadata_updated_at=metadata_updated_at,
+            verified_commit=verified_commit,
         )
 
     async def _settle_pushed(
@@ -1333,15 +1369,18 @@ class PublicationReconciler:
         names: PublicationResourceNames,
         *,
         job_uid: str | None,
+        revision_id: uuid.UUID,
     ) -> None:
         """After the Job's push: prove the commit, then find or open its pull request.
 
         The Job's marker is not authority on its own: the API proves the
         remote commit is this revision's marked commit on the expected parent
-        before anything is recorded.
+        before anything is recorded. A recovery's Job that adopted an earlier
+        revision's commit names that revision, and the API proves its marker
+        instead (#5429).
         """
 
-        verified = await self._verify_revision(work, commit_sha)
+        verified = await self._verify_revision(work, commit_sha, revision_id=revision_id)
         if work.pr_number is None:
             recovered = await self._recover_pull_request(
                 work,
@@ -1384,7 +1423,14 @@ class PublicationReconciler:
         # The commit marker is the script's final line, printed only after the
         # push, so it settles the publication now instead of waiting on pod
         # exit and Job status (#3074). The API finds or opens the pull request.
-        await self._settle_pushed(work, commit_sha, names, job_uid=observation.job_uid)
+        adopted = observation.adopted_revision_id or marker_adopted_revision(observation.logs)
+        await self._settle_pushed(
+            work,
+            commit_sha,
+            names,
+            job_uid=observation.job_uid,
+            revision_id=adopted if adopted is not None else work.revision_id,
+        )
         return True
 
     async def _publish_metadata(self, work: PublicationWork) -> None:
@@ -1658,6 +1704,7 @@ class PublicationReconciler:
                     error=error,
                     names=names,
                     metadata_updated_at=None,
+                    verified_commit=None,
                 )
                 return
             try:

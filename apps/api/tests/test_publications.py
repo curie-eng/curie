@@ -63,7 +63,7 @@ from fastapi import Response
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -628,11 +628,14 @@ def _advance_lineage(
     pr_number: int = PR_NUMBER,
     pr_url: str = PR_URL,
     lease: tuple[int, str] | None = None,
+    marker_revision: str | None = None,
 ) -> Any:
     if lease is None:
         owner = "api-test-worker"
         lease = (_claim_publication_lease(publication_id, owner), owner)
-    with _publication_commit_http(client, publication_id, head_sha):
+    with _publication_commit_http(
+        client, publication_id, head_sha, marker_revision=marker_revision or publication_id
+    ):
         return _patch_lineage(
             client,
             publication_id,
@@ -648,7 +651,7 @@ def _advance_lineage(
 
 @contextmanager
 def _publication_commit_http(
-    client: TestClient, publication_id: str, head_sha: str
+    client: TestClient, publication_id: str, head_sha: str, *, marker_revision: str
 ) -> Iterator[None]:
     rows = _rows(
         "SELECT expected_prior_head, repo_full_name FROM curie.publications WHERE id = :id",
@@ -684,7 +687,7 @@ def _publication_commit_http(
                     json={
                         "sha": sha,
                         "parents": [{"sha": parent}],
-                        "message": f"Publish\n\nCurie-Revision: {publication_id}\n",
+                        "message": f"Publish\n\nCurie-Revision: {marker_revision}\n",
                     },
                 )
             if sha == parent:
@@ -7732,7 +7735,9 @@ def test_worker_lineage_patch_captures_immutable_identity_in_real_postgres(
             lease_owner="lineage-patch-worker",
         )
 
-    with _publication_commit_http(client, publication["id"], FIRST_REVISION_SHA):
+    with _publication_commit_http(
+        client, publication["id"], FIRST_REVISION_SHA, marker_revision=publication["id"]
+    ):
         work, cluster, transcript, replies = client.portal.call(reconcile)
 
     assert truth["calls"]
@@ -7944,7 +7949,9 @@ def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
             lease_owner="terminal-lineage-worker",
         )
 
-    with _publication_commit_http(client, publication["id"], FIRST_REVISION_SHA):
+    with _publication_commit_http(
+        client, publication["id"], FIRST_REVISION_SHA, marker_revision=publication["id"]
+    ):
         work, cluster, transcript, replies = client.portal.call(reconcile)
 
     assert truth["calls"]
@@ -8918,3 +8925,124 @@ def test_custom_policy_refuses_a_path_outside_its_selection(
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.required_python_ci_unselected"
     assert "unitconv/convert.py" in refused.json()["detail"]["message"]
+
+
+def _arrange_adoptable_revisions(publication_id: str, revisions: Sequence[uuid.UUID]) -> None:
+    """Arrange the set the API fixes at creation for a publication recovery (#5429).
+
+    The column is immutable to every writer, so this arrangement alone skips
+    the trigger for its own transaction.
+    """
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(
+                    text(
+                        "UPDATE curie.publications "
+                        "SET adoptable_revision_ids = CAST(:ids AS uuid[]) WHERE id = :id"
+                    ),
+                    {
+                        "ids": [str(revision) for revision in revisions],
+                        "id": uuid.UUID(publication_id),
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_an_adopted_predecessor_commit_advances_the_lineage_only_from_the_set(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+) -> None:
+    """A recovery records a failed predecessor's pushed commit as its own (#5429).
+
+    The commit carries the predecessor revision's marker on the approved base.
+    A marker outside the recovery's adoptable set is refused, and an ordinary
+    publication never accepts the predecessor's marker; each refusal sits beside
+    a control that advances exactly as an ordinary first publication does.
+    """
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    predecessor = uuid.uuid4()
+    published: dict[str, dict[str, Any]] = {}
+    for conversation in ("thread-adopt-recovery", "thread-adopt-ordinary"):
+        _, publication = _create_publication(
+            client,
+            _publication_payload(
+                deployment["id"],
+                conversation_id=conversation,
+                dedupe_key=f"{conversation}-revision-one",
+            ),
+        )
+        approved = _resolve(client, auth_headers, publication["approval_id"])
+        assert approved.status_code == 200, approved.text
+        published[conversation] = publication
+    recovery = published["thread-adopt-recovery"]
+    ordinary = published["thread-adopt-ordinary"]
+    _arrange_adoptable_revisions(recovery["id"], [predecessor])
+    with pytest.raises(DBAPIError, match="publication adoptable revisions are immutable"):
+        _execute(
+            "UPDATE curie.publications SET adoptable_revision_ids = '{}' WHERE id = :id",
+            {"id": uuid.UUID(recovery["id"])},
+        )
+
+    def lineage(publication: dict[str, Any]) -> dict[str, Any]:
+        (row,) = _rows(
+            "SELECT head_sha, pr_number, version, latest_revision "
+            "FROM curie.thread_publication_lineages WHERE id = :id",
+            {"id": uuid.UUID(publication["lineage_id"])},
+        )
+        return row
+
+    unrelated = _advance_lineage(
+        client,
+        recovery["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+        marker_revision=str(uuid.uuid4()),
+    )
+    assert unrelated.status_code == 409, unrelated.text
+    assert unrelated.json()["detail"]["code"] == "publication.revision_mismatch"
+    assert lineage(recovery)["head_sha"] is None
+
+    adopted = _advance_lineage(
+        client,
+        recovery["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+        marker_revision=str(predecessor),
+    )
+    assert adopted.status_code == 200, adopted.text
+
+    foreign = _advance_lineage(
+        client,
+        ordinary["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+        marker_revision=str(predecessor),
+    )
+    assert foreign.status_code == 409, foreign.text
+    assert foreign.json()["detail"]["code"] == "publication.revision_mismatch"
+    assert lineage(ordinary)["head_sha"] is None
+
+    own = _advance_lineage(
+        client,
+        ordinary["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+    assert own.status_code == 200, own.text
+    # The adopted lineage is indistinguishable from the ordinary one.
+    assert lineage(recovery) == lineage(ordinary)
+    assert lineage(recovery)["head_sha"] == FIRST_REVISION_SHA
+    assert lineage(recovery)["pr_number"] == PR_NUMBER
