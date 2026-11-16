@@ -1,11 +1,13 @@
 """When a blocked provider gate may release its factory successor (#5426, ADR 0269).
 
 A failed request whose provider refused it (an invalid credential, depleted
-credit or a usage limit without a typed reset time) leaves its automatic
-successor waiting, blocked on ``provider_credential``, ``provider_credit`` or
-``provider_usage_reset``. The worker's provider probe writes what a
-non-generating read showed into the shared provider gate ledger
-(``curie_internal.provider_gate_ledger``); this module decides from those
+credit or a usage limit without a typed reset time) on a probed provider scope
+leaves its automatic successor waiting, blocked on ``provider_credential``,
+``provider_credit`` or ``provider_usage_reset``. A refusal no probe could
+verify admits no successor at all (``factory_retry_policy``, #5424). The
+worker's provider probe writes what a non-generating read showed into the
+shared provider gate ledger (``curie_internal.provider_gate_ledger``); this
+module decides from those
 observations and the predecessor's persisted condition whether the block may
 lift. ``clearance`` is pure; ``observe`` reads the ledger for one candidate and
 ``candidates`` lists the blocked successors worth reading.
@@ -14,7 +16,8 @@ Every rule fails closed. A missing scope, a typed reset time, an unknown or
 unprobed provider, a stale, rejected or unreadable probe, an unchanged
 credential, or an allowance that did not grow by a strictly greater limit all
 keep the block, and the successor expires visibly as
-``retry_condition_expired``. Nothing here logs.
+``retry_condition_expired``. Admission refuses the rows this module could
+never clear, so a block that holds is one a probe could still release. Nothing here logs.
 """
 
 from __future__ import annotations

@@ -121,7 +121,7 @@ def credit_exhausted_condition(provider_text: str, scope: ProviderScope | None) 
         return RetryCondition(reason=RetryReason.CREDIT_EXHAUSTED, scope_key=_scope_key(scope))
     # An account-level refusal (an OpenRouter 402 or the SDK's billing_error,
     # or any other credit text): the refused scope is the account, so no key
-    # probe can verify it, and the wait expires visibly.
+    # probe can verify it, and the API settles the run needs-human with no wait.
     return RetryCondition(reason=RetryReason.CREDIT_EXHAUSTED, scope_key=None)
 
 

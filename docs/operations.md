@@ -2262,8 +2262,10 @@ credits, including an OpenRouter key's HTTP 403 spend limit, ends the run as
 `model_credit_exhausted` without retrying in the same run. An SDK `rate_limit` error or a
 subscription session, weekly or model usage limit ends the run as
 `model_usage_limited` with failure class `model-usage-limited`, without retrying in the
-same run. A flag clean run of either cause gets a blocked automatic retry, as
-described above.
+same run. A flag clean run of either cause gets an automatic retry only as
+described above: a usage reset time inside the waiting deadline is scheduled,
+and a wait blocks only on a probed provider scope with no reset time. Otherwise
+the run settles needs-human at once and spends no retry.
 When no retry was admitted, the status comment says that the model provider's
 usage limit for the credential was reached; re-add the factory label after the
 limit resets. Ordinary usage
