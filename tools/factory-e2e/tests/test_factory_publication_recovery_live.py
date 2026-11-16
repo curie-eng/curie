@@ -14,10 +14,12 @@ Everything inside the changed path is the candidate: API, worker, reconciler,
 runner and chart run from the caller's candidate images and chart, driven
 through the candidate CLI. This rehearsal leg uses two fixtures: the model is
 the runner's offline fake tier (no paid call; the agent's standing directive
-writes one file into the checkout), and the forge is the recorded TLS GitHub
-stub (tools/github-stub), one Pod in the owned namespace. The paid leg AC3
-also requires (the real supported model and fixture forge, with the spend
-check and credentials) is a separate run.
+writes one file and then calls publish_changes), and the forge is the recorded
+TLS GitHub stub (tools/github-stub), one Pod in the owned namespace. The paid
+leg is opt-in with ``CURIE_FACTORY_PUBLICATION_RECOVERY_REAL_MODEL=1`` and
+``MODEL_KEY_FILE``. It uses the same stub and fault proxy, sets no fake
+directive, and prints the provider usage delta. Do not set that flag for the
+rehearsal.
 
 The failure injection
 ---------------------
@@ -70,8 +72,9 @@ What it asserts
 3. Identical bytes: the candidate's patch and base digests, sizes and base
    commit are unchanged; the recovery publication's base is the candidate's
    base commit and its title and body are the candidate's.
-4. No model call after capture: the WorkItem usage at capture equals the
-   usage after recovery, and the recovery request recorded no tokens.
+4. No model call after capture: the WorkItem usage read on the first
+   complete-candidate poll (half a second, not the 3 second request poll)
+   equals the usage after recovery, and the recovery request recorded no tokens.
 5. Exactly one branch, publication and pull request: the forge's one branch
    still holds the commit the original attempt pushed (adopted, not
    rewritten), one publication succeeded, the forge holds one pull request on
@@ -105,10 +108,11 @@ The install values this driver sets over the candidate base values:
 ``agentSandbox.runner.workspace.enabled=true``,
 ``worker.workspace.publicationCandidates.enabled=true`` (candidate retention
 is off by default and needs workspaces), ``worker.publication.
-reconcileMaxAttempts=2``, every forge address the proxy (above), the fake
-model, and a per-agent ``FAKE_MODEL_DIRECTIVE`` through
-``agentSandbox.runnerEnv``. The
-agent's publication policy is ``auto``.
+reconcileMaxAttempts=2``, every forge address the proxy (above), and the fake
+model. The standing directive is a write-file plus ``[fake:publish-changes]``.
+``CURIE_FACTORY_PUBLICATION_RECOVERY_REAL_MODEL=1`` replaces that directive
+with the caller's credential and leaves the proxy in place. The agent's
+publication policy is ``auto``.
 
 Teardown is registered before each resource it removes is created and runs on
 every exit: stop the port-forward and the pod watch, uninstall, delete the
@@ -145,7 +149,9 @@ if prl.FLAG not in os.environ:
     )
 
 ADMISSION_TIMEOUT_S = 300.0
-# The model run, capture, the push and two charged attempts (15 s and 30 s backoff).
+# The model run, capture, the push, the 15 s backoff after the first charged
+# failure, and the second charged attempt. That second attempt meets the
+# reconcile ceiling and does not back off.
 ORIGINAL_TIMEOUT_S = 1800.0
 SUCCESSOR_TIMEOUT_S = 600.0
 RECOVERY_TIMEOUT_S = 1800.0
@@ -299,7 +305,7 @@ class Recovery(ci.CandidateInstall):
         rows = self.sql(
             "SELECT coalesce(json_agg(row_to_json(r)), '[]'::json) FROM ("
             "SELECT c.id, c.origin_request_id, c.owner_request_id, c.previous_owner_request_id, "
-            "c.status, c.content_sha256, "
+            "c.status, c.content_sha256, c.title, c.body, "
             "encode(sha256(convert_to(c.title, 'UTF8')), 'hex') AS title_sha256, "
             "encode(sha256(convert_to(c.body, 'UTF8')), 'hex') AS body_sha256 "
             "FROM curie.publication_candidates c "
@@ -315,7 +321,20 @@ class Recovery(ci.CandidateInstall):
     def candidates(self) -> dict[str, Any]:
         listing = self.api("GET", f"/work-items/{self.work_item_id}/publication-candidates")
         assert isinstance(listing, dict), "the candidate listing is not an object"
+        listing["objects"] = self.candidate_objects()
         return listing
+
+    def candidate_objects(self) -> list[dict[str, Any]]:
+        """Complete candidate objects, including kind, for the listing filter."""
+
+        rows = self.sql(
+            "SELECT coalesce(json_agg(row_to_json(r) ORDER BY r.kind), '[]'::json) FROM ("
+            "SELECT o.kind, o.sha256, o.size_bytes "
+            "FROM curie.publication_candidate_objects o "
+            f"WHERE o.work_item_id = '{self.require_work_item()}' AND o.status = 'complete') r"
+        )
+        assert isinstance(rows, list), f"unexpected candidate object listing {rows!r}"
+        return [row for row in rows if isinstance(row, dict)]
 
     def usage(self) -> dict[str, Any]:
         usage = self.api("GET", f"/work-items/{self.work_item_id}/usage")
@@ -377,7 +396,18 @@ def candidate_curie(inputs: ci.Inputs, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def live(inputs: ci.Inputs) -> Iterator[Recovery]:
+def real_model() -> prl.RealModel | None:
+    """The paid leg, or None. A bad flag or key fails before the cluster fixture."""
+
+    try:
+        return prl.real_model_from_env(dict(os.environ))
+    except ci.Refused as exc:
+        pytest.fail(str(exc), pytrace=False)
+
+
+@pytest.fixture
+def live(inputs: ci.Inputs, real_model: prl.RealModel | None) -> Iterator[Recovery]:
+    del real_model
     workdir = Path(tempfile.mkdtemp(prefix="publication-recovery-"))
     workdir.chmod(0o700)
     harness = Recovery(inputs=inputs, workdir=workdir)
@@ -407,7 +437,10 @@ def live(inputs: ci.Inputs) -> Iterator[Recovery]:
 # --------------------------------------------------------------------------
 
 
-def _install(live: Recovery) -> None:
+def _install(live: Recovery, real_model: prl.RealModel | None) -> None:
+    cidrs: tuple[str, ...] = ()
+    if real_model is not None:
+        cidrs = tuple(prl.provider_cidrs())
     live.create_namespace()
     live.start_stub(prl.SEED_FILES, prl.SEED_ISSUE)
     live.start_proxy()
@@ -417,6 +450,8 @@ def _install(live: Recovery) -> None:
             namespace=live.inputs.namespace,
             stub_ip=live.stub_ip,
             proxy_ip=live.proxy_ip,
+            real_model=real_model,
+            model_cidrs=cidrs,
         )
     )
     live.port_forward()
@@ -455,14 +490,24 @@ def _original(live: Recovery) -> tuple[dict[str, Any], dict[str, Any], dict[str,
     def ended() -> dict[str, Any] | None:
         if not usage_at_capture:
             listing = live.candidates()
-            if any(c.get("status") == "complete" for c in listing.get("candidates") or []):
+            if any(
+                isinstance(c, dict) and c.get("status") == "complete"
+                for c in listing.get("candidates") or []
+            ):
+                # Same probe that first sees the candidate, on CAPTURE_POLL_S,
+                # so the snapshot is not one 3 s request poll late.
                 usage_at_capture.update(live.usage())
         row = next((r for r in live.rows() if r["id"] == first["id"]), None)
         return row if row is not None and row["status"] in ci.TERMINAL else None
 
-    original = ci.wait_for("the original request to end", ORIGINAL_TIMEOUT_S, ended, live.brief)
+    original = rrs.poll_until(ended, timeout=ORIGINAL_TIMEOUT_S, interval=prl.CAPTURE_POLL_S)
+    if original is None:
+        raise AssertionError(
+            f"timed out after {int(ORIGINAL_TIMEOUT_S)}s waiting for the original "
+            f"request to end; observed {live.brief()}"
+        )
     if not usage_at_capture:
-        # The request ended between two polls; nothing runs a model after it ends.
+        # The request ended without a complete candidate between probes.
         usage_at_capture.update(live.usage())
     candidate = prl.complete_candidate(live.candidates())
     creates = prl.pull_creates(live.read_proxy_logs())
@@ -538,11 +583,21 @@ def _recovery(
 
 
 def test_failed_publication_recovers_from_the_retained_candidate(
-    live: Recovery, candidate_curie: Path
+    live: Recovery, candidate_curie: Path, real_model: prl.RealModel | None
 ) -> None:
     assert os.environ["CURIE_BIN"] == str(candidate_curie)
     driver = Path(__file__).read_bytes()
     evidence("0-driver", driver_sha256=hashlib.sha256(driver).hexdigest())
-    _install(live)
+    before: float | None = None
+    if real_model is not None:
+        before = prl.provider_usage(real_model.key)
+        evidence("provider-usage-before", usd=before)
+    _install(live, real_model)
     original, candidate, usage_at_capture = _original(live)
     _recovery(live, original, candidate, usage_at_capture)
+    if real_model is not None and before is not None:
+        prl.pause_for_usage_lag()
+        after = prl.provider_usage(real_model.key)
+        delta = after - before
+        print(f"publication-recovery-live provider-usage-delta {delta}", flush=True)
+        evidence("provider-usage-after", usd=after, delta_usd=delta)
