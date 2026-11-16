@@ -100,8 +100,14 @@ def mentions_factory(body: str, mention: str, app_slug: str | None) -> bool:
     ``app_slug`` is the App login from ``GitHubCredentials.app_slug``. None
     means that login could not be read, and only the configured mention matches.
     ``[`` is a token boundary, so ``@slug[bot]`` matches the slug.
+
+    A factory status comment carries ``<!-- curie-execution-request:`` and the
+    ask line, which names the mention. That comment is the factory speaking,
+    not a new ask.
     """
 
+    if "<!-- curie-execution-request:" in body:
+        return False
     if mentions_login(body, mention):
         return True
     if app_slug is None or app_slug.casefold() == mention.casefold():

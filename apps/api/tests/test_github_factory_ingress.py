@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 import pytest
 from curie_api.config import get_settings
+from curie_api.factory_comment_text import marker_for
 from curie_api.forges.github.identity import issue_lock_keys_for
 from curie_api.forges.hosts import github_issue_ref
 from curie_api.github_factory import (
@@ -431,6 +432,32 @@ def test_app_slug_mention_on_an_issue_with_a_work_item_is_admitted(
     assert mention.json()["status"] == "factory_queued", mention.text
     rows = _requests(number)
     assert [row["status"] for row in rows] == ["waiting", "queued"]
+
+
+@pytest.mark.parametrize("handle", (APP_SLUG, f"{APP_SLUG}[bot]"))
+def test_status_comment_that_names_the_mention_is_not_a_new_ask(
+    factory_app: tuple[TestClient, GitHubAPI], handle: str
+) -> None:
+    client, api = factory_app
+    number = next(_ISSUES)
+    api.issue_number = number
+    assert (
+        _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL})).json()[
+            "status"
+        ]
+        == "factory_admitted"
+    )
+    body = (
+        f"Status: QUEUED\n{marker_for(uuid.uuid4())}\n"
+        f"Ask the factory: mention @{handle} on this pull request."
+    )
+    api.comment_body = body
+    mention = _post(client, "issue_comment", _comment_event(number, body, next(_SLUG_COMMENTS)))
+
+    assert mention.status_code == 200, mention.text
+    assert mention.json()["status"] == "factory_ignored", mention.text
+    assert _code(mention) == "ordinary_comment"
+    assert [row["status"] for row in _requests(number)] == ["waiting"]
 
 
 @pytest.mark.parametrize("handle", (APP_SLUG, f"{APP_SLUG}[bot]"))
