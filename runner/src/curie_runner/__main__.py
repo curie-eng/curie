@@ -1641,6 +1641,9 @@ def build_runner(
                     name: derived_mcp_servers[name]
                     for name in proxied_connector_servers(derived_mcp_servers)
                 },
+                # The real session's cwd, so a scripted write lands in the
+                # mounted checkout a factory turn publishes (#5429).
+                cwd=workspace_cwd,
             )
         assert real_options is not None
         nonlocal sdk_generation
