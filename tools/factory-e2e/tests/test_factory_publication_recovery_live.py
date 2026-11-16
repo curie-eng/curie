@@ -72,7 +72,9 @@ What it asserts
    which now owns the candidate.
 3. Identical bytes: the candidate's patch and base digests, sizes and base
    commit are unchanged; the recovery publication's base is the candidate's
-   base commit and its title and body are the candidate's.
+   base commit and its title is the candidate's. Its body starts with the
+   candidate's and carries the tracker's closing reference, which is the
+   body the forge pull request holds.
 4. No model call after capture: the WorkItem usage read on the first
    complete-candidate poll (half a second, not the 3 second request poll)
    equals the usage after recovery, and the recovery request recorded no
@@ -295,6 +297,7 @@ class Recovery(ci.CandidateInstall):
             "SELECT coalesce(json_agg(row_to_json(r) ORDER BY r.created_at), '[]'::json) FROM ("
             "SELECT p.id, p.execution_request_id, p.status, p.reconcile_attempts, p.error, "
             "p.base_sha, p.revision_number, p.created_at, l.branch, l.pr_number, l.head_sha, "
+            "p.title, p.body, "
             "encode(sha256(convert_to(p.title, 'UTF8')), 'hex') AS title_sha256, "
             "encode(sha256(convert_to(p.body, 'UTF8')), 'hex') AS body_sha256 "
             "FROM curie.publications p "

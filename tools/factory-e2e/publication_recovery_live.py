@@ -633,8 +633,16 @@ def judge_recovery(
     assert publication.get("title_sha256") == candidate_row.get("title_sha256"), (
         "the recovery publication's title is not the candidate's"
     )
-    assert publication.get("body_sha256") == candidate_row.get("body_sha256"), (
-        "the recovery publication's body is not the candidate's"
+    # Factory creation keeps the candidate body and appends the tracker's
+    # closing reference, the issue marker, and any applied-instruction line.
+    # The stored body is therefore not the candidate body alone.
+    published_body = str(publication.get("body") or "")
+    candidate_body = str(candidate_row.get("body") or "")
+    assert candidate_body and published_body.startswith(candidate_body), (
+        "the recovery publication's body does not start with the candidate's"
+    )
+    assert "Closes #" in published_body[len(candidate_body) :], (
+        "the recovery publication's body does not carry the closing reference"
     )
 
     # Exactly one branch, holding the commit the original attempt pushed.
@@ -654,8 +662,13 @@ def judge_recovery(
     assert str(pull.get("title") or "") == str(candidate_row.get("title") or ""), (
         "the forge pull request title is not the candidate's"
     )
-    assert str(pull.get("body") or "") == str(candidate_row.get("body") or ""), (
-        "the forge pull request body is not the candidate's"
+    forge_body = str(pull.get("body") or "")
+    assert forge_body == published_body, (
+        "the forge pull request body is not the published body "
+        f"({forge_body[:180]!r} vs {published_body[:180]!r})"
+    )
+    assert forge_body.startswith(candidate_body), (
+        "the forge pull request body does not start with the candidate's"
     )
     assert publication.get("pr_number") == pull.get("number"), "the lineage names another PR"
     passed = [status for status, fault in creates if not fault]

@@ -31,6 +31,7 @@ PUSHED = "b" * 40
 BRANCH = "curie/publication-0123"
 TITLE = "Publish the reviewed change"
 BODY = "Publish the file written in this turn."
+PUBLISHED_BODY = f"{BODY}\n\nCloses #1\n\n<!-- curie-factory-issue -->"
 
 
 # --------------------------------------------------------------------------
@@ -368,12 +369,17 @@ def _recovered(**override: Any) -> dict[str, Any]:
         "candidate_after": _candidate(),
         "publications": [
             _publication(ORIGINAL, "failed", prl.RECONCILE_MAX_ATTEMPTS),
-            _publication(SUCCESSOR, "succeeded", 0, pr_number=1),
+            _publication(SUCCESSOR, "succeeded", 0, pr_number=1, title=TITLE, body=PUBLISHED_BODY),
         ],
         "heads_after_failure": {"main": BASE_COMMIT, BRANCH: PUSHED},
         "heads_after_recovery": {"main": BASE_COMMIT, BRANCH: PUSHED},
         "pulls": [
-            {"number": 1, "head": {"ref": BRANCH, "sha": PUSHED}, "title": TITLE, "body": BODY}
+            {
+                "number": 1,
+                "head": {"ref": BRANCH, "sha": PUSHED},
+                "title": TITLE,
+                "body": PUBLISHED_BODY,
+            }
         ],
         "creates": [*FAILED_CREATES, (201, False)],
         "usage_at_capture": _usage(),
@@ -499,6 +505,31 @@ def test_judge_recovery_accepts_a_capture_snapshot_with_no_flushed_tokens() -> N
                 ]
             },
             "forge pull request body",
+        ),
+        (
+            {
+                "publications": [
+                    _publication(ORIGINAL, "failed", 2),
+                    _publication(SUCCESSOR, "succeeded", 0, pr_number=1, title=TITLE, body=BODY),
+                ]
+            },
+            "closing reference",
+        ),
+        (
+            {
+                "publications": [
+                    _publication(ORIGINAL, "failed", 2),
+                    _publication(
+                        SUCCESSOR,
+                        "succeeded",
+                        0,
+                        pr_number=1,
+                        title=TITLE,
+                        body="Unrelated proposal\n\nCloses #1",
+                    ),
+                ]
+            },
+            "does not start with the candidate",
         ),
         ({"creates": [*FAILED_CREATES, (201, False), (201, False)]}, "reached the forge"),
         ({"usage_after": _usage(extra_tokens=5)}, "usage changed"),
