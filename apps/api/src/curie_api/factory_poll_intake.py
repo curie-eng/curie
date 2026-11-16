@@ -88,7 +88,7 @@ from .forges.registry import forges_registry
 from .forges.surfaces import bound_labels
 from .forges.types import TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
-from .github_factory_events import FactoryNotice, mentions_login
+from .github_factory_events import FactoryNotice, mentions_factory
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
 from .github_review_truth import VerifiedRepository
 from .models import (
@@ -824,6 +824,7 @@ async def _admit_mentions(
             sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
         )
     )
+    app_slug = await tracker.app_slug()
     for comment in listed:
         if not isinstance(comment, dict):
             continue
@@ -881,7 +882,7 @@ async def _admit_mentions(
                 verified=verified,
             )
             continue
-        if number not in factory_issues or not mentions_login(body, tracker.mention):
+        if number not in factory_issues or not mentions_factory(body, tracker.mention, app_slug):
             continue
         sender_id, sender_login = sender
         notice = FactoryNotice(

@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 import pytest
 from curie_api.config import get_settings
+from curie_api.factory_comment_text import github_ask_line
 from curie_api.factory_rediscovery import issue_marker
 from curie_api.forges.registry import forges_registry
 from curie_api.forges.types import TrackerIssueRef
@@ -120,7 +121,7 @@ def test_a_github_body_that_already_closes_the_issue_keeps_its_text(
     created = _post_factory_publication(client, payload)
 
     assert created.status_code == 201, created.text
-    marked = f"{body.rstrip()}\n\n{_marker(request_id)}"
+    marked = f"{body.rstrip()}\n\n{_marker(request_id)}\n\n{github_ask_line('curie')}"
     assert created.json()["body"] == marked
     assert _factory_publication_body(created.json()["id"]) == marked
 
@@ -137,7 +138,9 @@ def test_a_github_body_without_the_closing_reference_gains_it_once(
 
     assert created.status_code == 201, created.text
     stored = _factory_publication_body(created.json()["id"])
-    assert stored == f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}"
+    assert stored == (
+        f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}\n\n{github_ask_line('curie')}"
+    )
     assert stored.count(reference) == 1
 
 
@@ -213,6 +216,7 @@ def test_a_jira_body_gains_the_issue_key_and_url(
     reference = f"Jira: {key} {jira_fake.SITE}/browse/{key}"
     stored = _factory_publication_body(created.json()["id"])
     assert stored == f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}"
+    assert "Ask the factory" not in stored
     # The key is read by issue id, with the bot's credential; nothing is written.
     reads = fake.requests_of("issue")
     assert reads and all(r.method == "GET" for r in reads)

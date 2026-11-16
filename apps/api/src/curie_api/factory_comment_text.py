@@ -12,6 +12,25 @@ from urllib.parse import urlsplit
 
 from curie_telemetry.redact import redact_text
 
+
+def github_ask_line(mention: str) -> str:
+    """How to ask the factory, for a GitHub tracker. Other forges do not use it."""
+
+    return f"Ask the factory: mention @{mention} on this pull request."
+
+
+def append_github_ask_line(body: str, mention: str) -> str:
+    """Put that line last, dropping any earlier copy of the same line."""
+
+    line = github_ask_line(mention)
+    kept = [part for part in body.splitlines() if part.strip() != line]
+    text = "\n".join(kept).rstrip()
+    text = f"{text}\n\n{line}" if text else line
+    if body.endswith("\n"):
+        text += "\n"
+    return text
+
+
 _FACTORY_URL = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
 _KEY_MANAGEMENT_PATH = re.compile(
     r"/(?:api[-_]?keys|keys|key[-_]management)(?:[/?#]|$)", re.IGNORECASE

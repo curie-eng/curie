@@ -46,6 +46,7 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
+from ..factory_comment_text import append_github_ask_line
 from ..factory_rediscovery import issue_marker, publishing_code_host
 from ..factory_tracker_result_runtime import CONTRACT_TRACKER_RESULT
 from ..forges.config import RepositoryBindingConfig
@@ -496,6 +497,29 @@ async def _refresh_publication_lineage(
     return lineage
 
 
+async def _github_publication_mention(
+    request: Request, session: AsyncSession, work_item_request_id: uuid.UUID
+) -> str | None:
+    """The GitHub tracker's mention for this request, or None for any other kind."""
+
+    execution = await session.get(ExecutionRequest, work_item_request_id)
+    if execution is None:
+        return None
+    work_item = await session.get(WorkItem, execution.work_item_id)
+    if work_item is None or work_item.tracker_kind != GITHUB:
+        return None
+    registry = getattr(request.app.state, "forges", None)
+    if registry is None:
+        return None
+    tracker = registry.github_tracker()
+    if tracker is None:
+        return None
+    mention = tracker.config.mention
+    if not isinstance(mention, str) or not mention.strip():
+        return None
+    return mention
+
+
 @internal_router.post(
     "",
     response_model=PublicationOut,
@@ -638,6 +662,13 @@ async def create_publication(
                 body = f"{body.rstrip()}\n\n{marker}"
             if body != data.body:
                 data = data.model_copy(update={"body": body})
+        # The ask line sits immediately before the ADR 0278 evidence line, which
+        # stays last. With no applied selection the ask line is last. GitHub only.
+        mention = await _github_publication_mention(request, session, work_item_request_id)
+        if mention is not None:
+            asked = append_github_ask_line(data.body or "", mention)
+            if asked != (data.body or ""):
+                data = data.model_copy(update={"body": asked})
         # Last, from the acknowledged execution record (ADR 0278 section 6), and
         # before the publication contract is captured below.
         digest = await requester_instruction_context.applied_digest(session, work_item_request_id)

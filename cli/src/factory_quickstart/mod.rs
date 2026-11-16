@@ -801,7 +801,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 ..
             } => {
                 let mention_note = if *mention_inferred {
-                    "inferred from the App slug"
+                    "the factory default"
                 } else {
                     "set explicitly"
                 };

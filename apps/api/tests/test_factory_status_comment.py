@@ -35,8 +35,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api import factory_notices
 from curie_api.config import get_settings
-from curie_api.factory_comment_text import marker_for
-from curie_api.factory_notices import FINAL_MARKER, result_section, sync_status_comments
+from curie_api.factory_comment_text import github_ask_line, marker_for
+from curie_api.factory_notices import (
+    FINAL_MARKER,
+    github_status_mention,
+    result_section,
+    sync_status_comments,
+)
 from curie_api.forges.types import (
     MarkedComment,
     PullRequest,
@@ -51,6 +56,7 @@ from forge_fakes import factory_wake
 from forge_fakes.github import (
     INSTALLATION_ID,
     LABEL,
+    MENTION,
     REPO_ID,
     _issue_event,
     _post,
@@ -900,7 +906,7 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert WAITING in body
     assert FINAL_MARKER not in body
     assert "![Curie status]" not in body
-    assert body.rstrip().endswith(marker_for(request_id))
+    assert body.rstrip().endswith(github_ask_line(MENTION))
     assert _curie_labels(sink, number) == {"curie-factory:queued"}
     # Human and admission labels are never touched.
     assert {LABEL, "bug"} <= sink.issue_labels[number]
@@ -961,7 +967,31 @@ def test_a_card_url_replaces_the_checklist_as_phases_advance(
     assert "- [" not in body
     assert "Read issue" not in body
     assert WAITING not in body
-    assert body.rstrip().endswith(marker_for(request_id))
+    assert marker_for(request_id) in body
+    assert body.rstrip().endswith(github_ask_line(MENTION))
+
+
+def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9929
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+
+    body = _posts(sink)[0][1] or ""
+    ask = github_ask_line(MENTION)
+    assert "Status: QUEUED" in body
+    assert WAITING in body
+    assert marker_for(request_id) in body
+    assert body.rstrip().endswith(ask)
+    assert body.count(ask) == 1
+
+
+def test_non_github_status_comments_omit_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
+    assert admitted
+    settings = get_settings()
+    for kind in ("gitlab", "bitbucket_cloud", "bitbucket_dc", "jira_cloud"):
+        assert github_status_mention(settings, kind) is None
+    assert github_status_mention(settings, "github") == MENTION
 
 
 # --- 2: edited in place as phases advance --------------------------------------------

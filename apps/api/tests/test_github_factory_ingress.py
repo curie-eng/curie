@@ -41,6 +41,7 @@ from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from fastapi.testclient import TestClient
 from forge_fakes import factory_wake
 from forge_fakes.github import (
+    APP_SLUG,
     INSTALLATION_ID,
     LABEL,
     LABEL_ACTOR_PERMISSIONS,
@@ -406,6 +407,49 @@ def test_authorized_issue_mention_is_queued_while_a_request_is_active(
     assert rows[1]["objective"].endswith("#issuecomment-7002")
 
 
+_SLUG_COMMENTS = itertools.count(7200)
+
+
+@pytest.mark.parametrize("handle", (APP_SLUG, f"{APP_SLUG}[bot]"))
+def test_app_slug_mention_on_an_issue_with_a_work_item_is_admitted(
+    factory_app: tuple[TestClient, GitHubAPI], handle: str
+) -> None:
+    client, api = factory_app
+    number = next(_ISSUES)
+    api.issue_number = number
+    assert (
+        _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL})).json()[
+            "status"
+        ]
+        == "factory_admitted"
+    )
+    body = f"@{handle} please revise"
+    api.comment_body = body
+    mention = _post(client, "issue_comment", _comment_event(number, body, next(_SLUG_COMMENTS)))
+
+    assert mention.status_code == 200, mention.text
+    assert mention.json()["status"] == "factory_queued", mention.text
+    rows = _requests(number)
+    assert [row["status"] for row in rows] == ["waiting", "queued"]
+
+
+@pytest.mark.parametrize("handle", (APP_SLUG, f"{APP_SLUG}[bot]"))
+def test_app_slug_mention_on_an_issue_with_no_work_item_is_not_admitted(
+    factory_app: tuple[TestClient, GitHubAPI], handle: str
+) -> None:
+    client, api = factory_app
+    number = next(_ISSUES)
+    api.issue_number = number
+    body = f"@{handle} please start"
+    api.comment_body = body
+    mention = _post(client, "issue_comment", _comment_event(number, body, next(_SLUG_COMMENTS)))
+
+    assert mention.status_code == 200, mention.text
+    assert mention.json()["status"] == "factory_ignored", mention.text
+    assert _code(mention) == "not_admitted"
+    assert _requests(number) == []
+
+
 def test_label_removal_cancels_waiting_work_and_blocks_publication(
     factory_app: tuple[TestClient, GitHubAPI],
 ) -> None:
@@ -504,6 +548,7 @@ def test_admission_retains_issue_lock_until_caller_commit(
         str(uuid.uuid4()),
         labels={LABEL},
         mention=MENTION,
+        app_slug=None,
     )
     classid, objid = issue_lock_keys_for(REPO_ID, number)
     _, api = factory_app

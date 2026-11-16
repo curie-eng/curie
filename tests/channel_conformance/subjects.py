@@ -719,6 +719,7 @@ class GitHubSubject(_KernelEgressSubject):
                 str(uuid.uuid4()),
                 labels={"factory"},
                 mention=_GITHUB_MENTION,
+                app_slug=None,
             )
             # A GitHub issue replies on its repository; no forge entry is read.
             issue = TrackerIssueRef(

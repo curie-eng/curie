@@ -46,7 +46,12 @@ from starlette.concurrency import run_in_threadpool
 
 from .code_host_trust import code_host_verify
 from .config import Settings
-from .factory_comment_text import marker_for, redact_factory_comment, status_marker
+from .factory_comment_text import (
+    append_github_ask_line,
+    marker_for,
+    redact_factory_comment,
+    status_marker,
+)
 from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
 from .factory_reply_target import stored_reply_target
 from .factory_retry_policy import condition_text
@@ -1259,6 +1264,23 @@ def _lineage_pr_link(
     return stored_url
 
 
+def github_status_mention(settings: Settings, tracker_kind: str) -> str | None:
+    """The GitHub tracker's mention, or None for every other tracker kind.
+
+    Status comments append the GitHub ask line only when this returns a mention.
+    """
+
+    if tracker_kind != GITHUB:
+        return None
+    tracker = forges_registry(settings).github_tracker()
+    if tracker is None:
+        return None
+    mention = tracker.config.mention
+    if not isinstance(mention, str) or not mention.strip():
+        return None
+    return mention
+
+
 async def _render(
     session: AsyncSession,
     settings: Settings,
@@ -1485,6 +1507,9 @@ async def _render(
         else:
             line = f"Checks were not verified: {code_span(observation.reason or 'invalidated')}."
         body += f"\n\n{line}"
+    mention = github_status_mention(settings, work_item.tracker_kind)
+    if mention is not None:
+        body = append_github_ask_line(body, mention)
     return body
 
 
