@@ -2047,8 +2047,25 @@ retry, and they share the same two slots:
 2. An ordinary failure whose worker reported `retry_safety` `no_effects`: no
    side effect flag on the turn and an observed end of the turn. A `flagged`
    or `uncertain` run never earns a retry. The cause must also be one the
-   factory policy retries, such as `model_unreachable`, `model_rate_limited`
-   or `model_error`.
+   factory policy retries: `model_unreachable`, `model_rate_limited`,
+   `model_error` or `sandbox_node_disrupted`; `workspace_error`,
+   `runner_error`, `runner_failed`, `runner_timeout` or `sandbox_terminated`
+   only with a diagnosed `transient_service` condition; a provider credential,
+   credit or usage refusal only as described below; or a limit exhaustion
+   under a resource gate.
+
+Some failures settle needs-human at once and spend no retry, because nothing
+Curie runs today could release a wait on them (#5424). These are a
+`workspace_error`, `runner_error`, `runner_failed`, `runner_timeout` or
+`sandbox_terminated` failure without a diagnosed `transient_service`
+condition; a credential, credit or usage refusal that names no probed provider
+scope, such as an account-level credit refusal, a workspace daily budget with
+no readable reset time, or any refusal on an Anthropic credential; a credential
+or credit refusal that carries a provider time; and a provider time at or past
+the retry's waiting deadline. `merge_conflict` and `pull_request_not_adopted`
+are terminal as well: a person changes the pull request lineage, then relabels
+the issue. The status comment says needs-human with the cause and promises no
+wait.
 
 Curie admits the retry in the same transaction that settles the failed
 request, and reserves its slot there. Relabelling the issue, a revision, an
@@ -2061,10 +2078,12 @@ A retry is either scheduled or blocked. A scheduled retry is dispatched after a
 backoff of about 30 seconds for the first retry and about 120 seconds for the
 second, each with a fixed 20 percent jitter keyed by the WorkItem, or later
 when the worker reported a provider time. A provider rate limit or usage reset
-time is used plus 60 seconds. A blocked retry waits for a named condition, such
-as `provider_usage_reset` or `runner_fault_diagnosis`, and is never dispatched
-while it is blocked. A provider rate limit that names no reset time is blocked
-on `provider_rate_limit`, which nothing releases before its deadline.
+time is used plus 60 seconds, and a provider rate limit that names no reset
+time takes the plain backoff. A blocked retry exists only where something can
+release it: a provider gate (`provider_credential`, `provider_credit` or
+`provider_usage_reset`) whose failed run named a probed provider scope and no
+reset time, or a resource gate, described below. It is never dispatched while
+it is blocked.
 
 Three provider waits can be released before their deadline. A retry blocked
 on `provider_credential` is released once the worker runs with a different
@@ -2079,8 +2098,8 @@ releases a wait. The reconciler rechecks the evidence, the WorkItem and the
 failed request's condition in the same transaction that lifts the block, and
 the released retry is dispatched in that same pass. Releasing spends no retry
 and keeps the waiting deadline. A resource gate, described below, is released
-only at a start whose delivered limit is strictly larger. Every other block,
-and every provider wait nothing released, ends `expired` with cause `retry_condition_expired` when its
+only at a start whose delivered limit is strictly larger. A blocked retry that
+nothing released ends `expired` with cause `retry_condition_expired` when its
 waiting deadline passes, unless a person relabels the issue first. Only a wait
 that was not blocked expires as `capacity_wait_expired`. The counted `not_started` deferrals carry across the
 retries of one WorkItem, so `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` bounds the
@@ -2123,10 +2142,13 @@ key or a live console session. It reruns exactly the automatic admission
 against the WorkItem's newest request, so it admits only what automatic
 recovery would admit now: the same two shared slots, the same backoff, and a
 publication recovery of the exact retained candidate in preference to a new
-implementation run. It helps when the fence that refused the automatic retry
-has since cleared (a publication of the same conversation was still in
-flight, a newer revision was queued) or when the failure settled before
-automatic retries existed. It never grants a slot, resets a count, writes a
+implementation run. It helps only when a fence that refused the automatic
+retry has since cleared: a publication of the same conversation was still in
+flight, or a newer revision was queued. It does not cover a failure that
+settled before automatic retries existed: that request has no `retry_safety`
+fact, so a cause the policy would retry is refused `side_effects_unproven`. A
+cause the policy settles terminal, such as an undiagnosed `runner_error`, is
+refused `not_retryable`. It never grants a slot, resets a count, writes a
 tracker label or posts a notice. The successor's status comment follows the
 normal flow.
 
@@ -2240,8 +2262,10 @@ credits, including an OpenRouter key's HTTP 403 spend limit, ends the run as
 `model_credit_exhausted` without retrying in the same run. An SDK `rate_limit` error or a
 subscription session, weekly or model usage limit ends the run as
 `model_usage_limited` with failure class `model-usage-limited`, without retrying in the
-same run. A flag clean run of either cause gets a blocked automatic retry, as
-described above.
+same run. A flag clean run of either cause gets an automatic retry only as
+described above: a usage reset time inside the waiting deadline is scheduled,
+and a wait blocks only on a probed provider scope with no reset time. Otherwise
+the run settles needs-human at once and spends no retry.
 When no retry was admitted, the status comment says that the model provider's
 usage limit for the credential was reached; re-add the factory label after the
 limit resets. Ordinary usage

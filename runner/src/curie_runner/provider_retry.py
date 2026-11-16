@@ -5,9 +5,10 @@ classification into the ``RetryCondition`` that rides the same ``ErrorEvent``.
 A condition is never built from ``ErrorEvent.classification`` alone: every
 caller hands over the provider text or the typed SDK field it classified, at
 the point it classified it. ``scope_key`` comes from the turn's
-``ProviderScope`` and is None when the runner could not name the scope, or
-when the refused scope is wider than the turn's credential (an account or a
-workspace), so no probe of the key could verify it.
+``ProviderScope`` and is None when the runner could not name the scope, when
+the provider has no probe (only ``PROBED_PROVIDERS`` do), or when the refused
+scope is wider than the turn's credential (an account or a workspace), so no
+probe of the key could verify it.
 
 Nothing here logs, and nothing here keeps the provider text.
 """
@@ -18,7 +19,7 @@ import re
 from datetime import UTC, datetime
 
 from aci_protocol import RetryCondition, RetryReason
-from curie_internal.provider_scope import ProviderScope
+from curie_internal.provider_scope import PROBED_PROVIDERS, ProviderScope
 
 # Observed 2026-10-29 (#5163, fixture ``_OPENROUTER_WORKSPACE_BUDGET_403`` in
 # runner/tests/test_translate.py): an OpenRouter workspace daily budget refusal
@@ -57,7 +58,11 @@ _ANTHROPIC_AUTHENTICATION_ERROR = re.compile(r'"type"\s*:\s*"authentication_erro
 
 
 def _scope_key(scope: ProviderScope | None) -> str | None:
-    return None if scope is None else scope.scope_key
+    # A provider with no non-generating allowance read cannot be probed, so a
+    # key on its condition would name a wait nothing can release (#5424).
+    if scope is None or scope.provider not in PROBED_PROVIDERS:
+        return None
+    return scope.scope_key
 
 
 def _parse_utc_reset(value: str) -> datetime | None:
@@ -116,7 +121,7 @@ def credit_exhausted_condition(provider_text: str, scope: ProviderScope | None) 
         return RetryCondition(reason=RetryReason.CREDIT_EXHAUSTED, scope_key=_scope_key(scope))
     # An account-level refusal (an OpenRouter 402 or the SDK's billing_error,
     # or any other credit text): the refused scope is the account, so no key
-    # probe can verify it, and the wait expires visibly.
+    # probe can verify it, and the API settles the run needs-human with no wait.
     return RetryCondition(reason=RetryReason.CREDIT_EXHAUSTED, scope_key=None)
 
 

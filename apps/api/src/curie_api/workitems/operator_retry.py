@@ -179,6 +179,7 @@ def _facts(request: ExecutionRequest) -> RetryFacts:
         safety=_safety(request),
         condition_reason=request.retry_condition_reason,
         condition_retry_at=request.retry_condition_retry_at,
+        condition_scope_key=request.retry_condition_scope_key,
     )
 
 

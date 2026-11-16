@@ -776,6 +776,19 @@ class EndToEnd:
         assert successor is not None and successor["status"] == "waiting", successor
         return finish, predecessor, successor
 
+    async def fail_terminal(self, item: Item) -> tuple[Call, dict[str, Any]]:
+        """Dispatch ``item``'s request; it settles with no successor and no slot (#5424)."""
+
+        case = self.case
+        await case.publish_wake(item.request_id)
+        finish = await case.finished(item.request_id)
+        await case.settle()
+        predecessor = await case.row(item.request_id)
+        assert predecessor["status"] == "failed", predecessor
+        assert await case.successor(item.request_id) is None
+        assert await case.used(item.work_item_id) == 0
+        return finish, predecessor
+
     async def assert_asleep(self, request_id: uuid.UUID) -> None:
         """The request is waiting, was never woken and was never acquired."""
 
@@ -896,7 +909,7 @@ def test_ordinary_throttle_backs_off_until_the_typed_reset(
     _end_to_end(case, body)
 
 
-def test_ordinary_throttle_without_a_reset_time_stays_blocked_until_it_expires(
+def test_ordinary_throttle_without_a_reset_time_takes_the_plain_backoff(
     factory_retry: FactoryRetryCase,
 ) -> None:
     case = factory_retry
@@ -913,13 +926,20 @@ def test_ordinary_throttle_without_a_reset_time_stays_blocked_until_it_expires(
             predecessor["retry_condition_reason"],
             predecessor["retry_condition_retry_at"],
         ) == ("rate_limited", None)
-        # No guessed timer: blocked until the waiting deadline.
-        assert successor["blocked_on"] == "provider_rate_limit"
-        assert successor["dispatch_not_before"] == successor["wait_deadline"]
+        # No probe verifies a rate window, so no block: the first slot's backoff,
+        # 30 s with its 20 percent jitter (#5424).
+        assert successor["blocked_on"] is None
+        delay = successor["dispatch_not_before"] - predecessor["terminal_at"]
+        assert timedelta(seconds=24) <= delay <= timedelta(seconds=37), delay
 
         await e2e.reconcile(passes=2)
         await e2e.assert_asleep(successor["id"])
         assert _turns(failing) == 1 and _turns(later) == 0
+
+        await case.make_due(successor["id"])
+        await e2e.reconcile()
+        await e2e.assert_ran_once(successor["id"])
+        assert [runner.turns for runner in later] == [1, 0]
 
     _end_to_end(case, body)
 
@@ -1027,7 +1047,7 @@ def test_depleted_credit_releases_only_on_a_raised_limit(
     _end_to_end(case, body)
 
 
-def test_generic_403_and_unscoped_rejections_stay_blocked_while_a_valid_control_releases(
+def test_generic_403_and_unscoped_rejections_settle_terminal_while_a_valid_control_releases(
     factory_retry: FactoryRetryCase,
 ) -> None:
     case = factory_retry
@@ -1048,21 +1068,20 @@ def test_generic_403_and_unscoped_rejections_stay_blocked_while_a_valid_control_
 
         # Each WorkItem is admitted only once the one before it settled, so the
         # pooled runners are claimed in this order.
-        finish, predecessor, generic_successor = await e2e.fail(case.item)
+        # Nothing could release a wait on either, so neither admits one (#5424).
+        finish, predecessor = await e2e.fail_terminal(case.item)
         # Classification unchanged and no condition on the wire.
         assert finish.body["cause"] == "model_credential_rejected"
         assert finish.body["retry_condition"] is None
         assert predecessor["retry_condition_reason"] is None
         assert predecessor["retry_condition_scope_key"] is None
-        assert generic_successor["blocked_on"] == "provider_credential"
 
-        finish, predecessor, unscoped_successor = await e2e.fail(await case.admit())
+        finish, predecessor = await e2e.fail_terminal(await case.admit())
         assert finish.body["cause"] == "model_credential_rejected"
         assert (
             predecessor["retry_condition_reason"],
             predecessor["retry_condition_scope_key"],
         ) == ("credential_rejected", None)
-        assert unscoped_successor["blocked_on"] == "provider_credential"
 
         finish, predecessor, control_successor = await e2e.fail(await case.admit())
         assert (
@@ -1081,16 +1100,13 @@ def test_generic_403_and_unscoped_rejections_stay_blocked_while_a_valid_control_
         await e2e.reconcile(passes=3)
 
         await e2e.assert_ran_once(control_successor["id"])
-        for blocked in (generic_successor, unscoped_successor):
-            await e2e.assert_asleep(blocked["id"])
-            assert (await case.row(blocked["id"]))["blocked_on"] == "provider_credential"
         assert [_turns(generic), _turns(unscoped), _turns(control)] == [1, 1, 1]
         assert [runner.turns for runner in later] == [1, 0]
 
     _end_to_end(case, body)
 
 
-def test_daily_budget_without_a_utc_reset_stays_blocked_while_a_valid_control_releases(
+def test_daily_budget_without_a_utc_reset_settles_terminal_while_a_valid_control_releases(
     factory_retry: FactoryRetryCase,
 ) -> None:
     case = factory_retry
@@ -1117,9 +1133,10 @@ def test_daily_budget_without_a_utc_reset_stays_blocked_while_a_valid_control_re
 
         # Each WorkItem is admitted only once the one before it settled, so the
         # pooled runners are claimed in this order.
-        waiting: list[dict[str, Any]] = []
+        # A workspace budget has no key scope and no readable reset here, so
+        # nothing could release a wait on it (#5424).
         for first in (True, False):
-            finish, predecessor, successor = await e2e.fail(
+            finish, predecessor = await e2e.fail_terminal(
                 case.item if first else await case.admit()
             )
             assert finish.body["cause"] == "model_credit_exhausted"
@@ -1128,8 +1145,6 @@ def test_daily_budget_without_a_utc_reset_stays_blocked_while_a_valid_control_re
                 predecessor["retry_condition_retry_at"],
                 predecessor["retry_condition_scope_key"],
             ) == ("usage_reset", None, None)
-            assert successor["blocked_on"] == "provider_credit"
-            waiting.append(successor)
         _finish, predecessor, control_successor = await e2e.fail(await case.admit())
         assert (
             predecessor["retry_condition_reason"],
@@ -1141,16 +1156,12 @@ def test_daily_budget_without_a_utc_reset_stays_blocked_while_a_valid_control_re
         e2e.script.steps.extend([_key_body(25, 0.5), _key_body(50, 25)])
         await e2e.probe(KEY, offset=timedelta(seconds=1))
         await e2e.reconcile(passes=2)
-        for successor in (*waiting, control_successor):
-            await e2e.assert_asleep(successor["id"])
+        await e2e.assert_asleep(control_successor["id"])
         await e2e.probe(KEY, offset=timedelta(seconds=32))
         assert len(e2e.script.requests) == 2
         await e2e.reconcile(passes=3)
 
         await e2e.assert_ran_once(control_successor["id"])
-        for successor in waiting:
-            await e2e.assert_asleep(successor["id"])
-            assert (await case.row(successor["id"]))["blocked_on"] == "provider_credit"
         assert [_turns(offset), _turns(missing), _turns(control)] == [1, 1, 1]
         assert [runner.turns for runner in later] == [1, 0]
 

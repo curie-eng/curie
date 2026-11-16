@@ -521,19 +521,22 @@ def test_unknown_provider_scope_never_releases(
     _assert_still_blocked(item, "provider_credit", version)
 
 
-@pytest.mark.parametrize("kind", ["credit", "credential"])
-def test_unknown_scope_never_releases(
+@pytest.mark.parametrize("kind", ["credit", "credential", "usage"])
+def test_a_wait_with_no_scope_key_is_terminal_and_spends_no_retry(
     gate_api: TestClient, auth_headers: dict[str, str], kind: GateKind
 ) -> None:
     # An account-level credit refusal carries no key scope; neither does a
-    # credential failure the runner could not scope.
-    item = _blocked(gate_api, auth_headers, 54272, kind, scope_key=None)
-    version = _request(item.successor_id)["version"]
-    assert _request(item.ref.request_id)["retry_condition_scope_key"] is None
-    _raise_limit(_now())
-    _replace_credential(_now())
-    _reconcile()
-    _assert_still_blocked(item, KINDS[kind][2], version)
+    # credential failure the runner could not scope. No probe could ever
+    # release such a wait, so none is admitted (#5424).
+    cause, reason, _ = KINDS[kind]
+    ref, agent_id = _fail_with(gate_api, auth_headers, 54272, cause, _condition(reason, None, None))
+    assert _request(ref.request_id)["retry_condition_scope_key"] is None
+    assert _successor(ref.request_id) is None
+    assert _used(ref.work_item_id) == 0
+
+    # Liveness: the same refusal on a probed scope waits blocked.
+    item = _blocked(gate_api, auth_headers, 54279, kind, agent_id=agent_id)
+    assert _used(item.ref.work_item_id) == 1
 
 
 def test_an_unprobed_provider_scope_never_releases(
@@ -550,9 +553,11 @@ def test_an_unprobed_provider_scope_never_releases(
     _assert_still_blocked(item, "provider_credit", version)
 
 
-def test_rate_limit_and_diagnosis_blocks_are_never_released_here(
+def test_rate_limit_past_the_deadline_and_diagnosis_waits_are_never_admitted(
     gate_api: TestClient, auth_headers: dict[str, str]
 ) -> None:
+    # Nothing releases a block on a provider time past the waiting deadline or
+    # on an undiagnosed runner fault, so neither admits a successor (#5424).
     agent_id = _agent(gate_api, auth_headers)
     beyond = _now() + timedelta(seconds=get_settings().work_item_wait_budget_seconds + 3600)
     limited, _ = _fail_with(
@@ -571,24 +576,10 @@ def test_rate_limit_and_diagnosis_blocks_are_never_released_here(
         _condition("rate_limited", FAILED, None),
         agent_id=agent_id,
     )
-    rows = {}
-    for ref, blocked_on in (
-        (limited, "provider_rate_limit"),
-        (diagnosed, "runner_fault_diagnosis"),
-    ):
-        successor = _successor(ref.request_id)
-        assert successor is not None and successor["blocked_on"] == blocked_on
-        rows[ref.request_id] = successor
-    _raise_limit(_now())
-    _replace_credential(_now())
-    _reconcile()
-    for successor in rows.values():
-        after = _request(successor["id"])
-        assert (after["blocked_on"], after["version"]) == (
-            successor["blocked_on"],
-            successor["version"],
-        )
-        assert _no_wake(successor["id"])
+    for ref in (limited, diagnosed):
+        assert _request(ref.request_id)["status"] == "failed"
+        assert _successor(ref.request_id) is None
+        assert _used(ref.work_item_id) == 0
 
 
 def test_a_block_the_policy_does_not_derive_is_refused(

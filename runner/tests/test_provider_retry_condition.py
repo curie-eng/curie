@@ -36,7 +36,12 @@ from claude_agent_sdk.types import AssistantMessageError, RateLimitInfo
 from curie_internal.provider_scope import ProviderScope, provider_scope
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
-from curie_runner.provider_retry import rate_limited_condition
+from curie_runner.provider_retry import (
+    credential_rejected_condition,
+    credit_exhausted_condition,
+    rate_limited_condition,
+    usage_limited_condition,
+)
 from curie_runner.session import SessionRunner
 from curie_runner.translate import TurnState, translate_message
 
@@ -45,6 +50,10 @@ _OPENROUTER_PLACEHOLDER_KEY = "sk-or-v1-" + "0" * 64
 _SCOPE = provider_scope({"CURIE_CREDENTIALS": _OPENROUTER_PLACEHOLDER_KEY})
 assert _SCOPE is not None
 _SCOPE_KEY = _SCOPE.scope_key
+_ANTHROPIC_PLACEHOLDER_KEY = "sk-ant-api03-" + "0" * 64
+_ANTHROPIC = provider_scope({"CURIE_CREDENTIALS": _ANTHROPIC_PLACEHOLDER_KEY})
+assert _ANTHROPIC is not None
+_ANTHROPIC_SCOPE: ProviderScope = _ANTHROPIC
 
 # Observed 2026-10-29 (#5163, the same fixture as test_translate.py and
 # test_session.py): an OpenRouter workspace daily budget refusal is HTTP 403,
@@ -488,6 +497,26 @@ def test_no_scope_gives_a_condition_with_no_scope_key() -> None:
     halted = _errors(_drain(runner))
     assert halted[0].retry_condition == RetryCondition(
         reason=RetryReason.CREDENTIAL_REJECTED, scope_key=None
+    )
+
+
+def test_an_unprobed_provider_scope_gives_no_scope_key() -> None:
+    # Anthropic has a scope but no allowance probe, so a key on its condition
+    # would name a wait nothing can release (#5424).
+    assert _ANTHROPIC_SCOPE.provider == "anthropic"
+    assert _ANTHROPIC_SCOPE.scope_key.startswith("sha256:")
+    for scope, key in ((_ANTHROPIC_SCOPE, None), (_SCOPE, _SCOPE_KEY)):
+        assert credit_exhausted_condition(_OPENROUTER_KEY_LIMIT_403, scope).scope_key == key
+        assert usage_limited_condition(scope).scope_key == key
+        assert rate_limited_condition(None, scope).scope_key == key
+        credential = credential_rejected_condition(_OPENROUTER_401, scope)
+        assert credential is not None and credential.scope_key == key
+
+    errors = _translate(
+        _errored("authentication_failed", _OPENROUTER_KEY_LIMIT_403), _state(_ANTHROPIC_SCOPE)
+    )
+    assert errors[0].retry_condition == RetryCondition(
+        reason=RetryReason.CREDIT_EXHAUSTED, retry_at=None, scope_key=None
     )
 
 

@@ -1,11 +1,13 @@
 """When a blocked provider gate may release its factory successor (#5426, ADR 0269).
 
 A failed request whose provider refused it (an invalid credential, depleted
-credit or a usage limit without a typed reset time) leaves its automatic
-successor waiting, blocked on ``provider_credential``, ``provider_credit`` or
-``provider_usage_reset``. The worker's provider probe writes what a
-non-generating read showed into the shared provider gate ledger
-(``curie_internal.provider_gate_ledger``); this module decides from those
+credit or a usage limit without a typed reset time) on a probed provider scope
+leaves its automatic successor waiting, blocked on ``provider_credential``,
+``provider_credit`` or ``provider_usage_reset``. A refusal no probe could
+verify admits no successor at all (``factory_retry_policy``, #5424). The
+worker's provider probe writes what a non-generating read showed into the
+shared provider gate ledger (``curie_internal.provider_gate_ledger``); this
+module decides from those
 observations and the predecessor's persisted condition whether the block may
 lift. ``clearance`` is pure; ``observe`` reads the ledger for one candidate and
 ``candidates`` lists the blocked successors worth reading.
@@ -14,7 +16,8 @@ Every rule fails closed. A missing scope, a typed reset time, an unknown or
 unprobed provider, a stale, rejected or unreadable probe, an unchanged
 credential, or an allowance that did not grow by a strictly greater limit all
 keep the block, and the successor expires visibly as
-``retry_condition_expired``. Nothing here logs.
+``retry_condition_expired``. Admission refuses the rows this module could
+never clear, so a block that holds is one a probe could still release. Nothing here logs.
 """
 
 from __future__ import annotations
@@ -36,26 +39,19 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from .factory_retry_policy import PROVIDER_GATE_REASONS, PROVIDER_GATES
 from .models import ExecutionRequest, WorkItem
 
 PROVIDER_CREDENTIAL: Final = "provider_credential"
 PROVIDER_CREDIT: Final = "provider_credit"
 PROVIDER_USAGE_RESET: Final = "provider_usage_reset"
-# The blocked conditions a provider probe can release. Every other condition
-# (``provider_rate_limit``, ``provider_service``, the diagnosis and limit waits)
-# is never released here.
-PROVIDER_GATES: Final[frozenset[str]] = frozenset(
-    {PROVIDER_CREDENTIAL, PROVIDER_CREDIT, PROVIDER_USAGE_RESET}
-)
+# PROVIDER_GATES, the blocked conditions a provider probe can release, and the
+# predecessor reasons each accepts live with the retry policy, which admits a
+# blocked row only where this module could clear it. Every other condition
+# (``provider_rate_limit``, ``provider_service``, the limit waits) is never
+# released here.
 # How old a probe may be, either side of now, and still count.
 PROBE_FRESH_S: Final[int] = 120
-
-# The predecessor's condition reasons each gate accepts.
-_GATE_REASONS: Final[dict[str, frozenset[str]]] = {
-    PROVIDER_CREDENTIAL: frozenset({"credential_rejected"}),
-    PROVIDER_CREDIT: frozenset({"credit_exhausted", "usage_reset"}),
-    PROVIDER_USAGE_RESET: frozenset({"usage_reset"}),
-}
 
 
 @dataclass(frozen=True)
@@ -119,7 +115,7 @@ def clearance(facts: GateFacts, observed: GateObservation, now: datetime) -> boo
     blocked_on = facts.blocked_on
     if blocked_on is None or blocked_on not in PROVIDER_GATES:
         return False
-    if facts.reason not in _GATE_REASONS[blocked_on]:
+    if facts.reason not in PROVIDER_GATE_REASONS[blocked_on]:
         return False
     if facts.scope_key is None or facts.retry_at is not None or facts.terminal_at is None:
         return False

@@ -32,15 +32,22 @@ import personal_execution_support as support
 import pytest
 import redis
 import redis.asyncio as aredis
-from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
+from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, RetryReason
 from channel_protocol.work_item_events import execute_event_id
+from curie_api import factory_provider_gate, factory_retry_policy
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import utc_text
-from curie_api.factory_retry_policy import RetryFacts, condition_text, decide
+from curie_api.factory_retry_policy import (
+    Disposition,
+    DispositionKind,
+    RetryFacts,
+    condition_text,
+    decide,
+)
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
-from curie_api.workitems import lifecycle
+from curie_api.workitems import lifecycle, resource_gate
 from curie_worker.binding import FactoryWake
 from curie_worker.workitem_dispatch import TerminationObservation, WorkItemDispatchClient
 from fastapi.testclient import TestClient
@@ -67,6 +74,9 @@ VECTORS_PATH = Path(__file__).resolve().parents[3] / "tests/vectors/factory-retr
 VECTORS: dict[str, Any] = json.loads(VECTORS_PATH.read_text(encoding="utf-8"))
 CASES: list[dict[str, Any]] = VECTORS["cases"]
 PLACEHOLDER_AT = "2030-01-01T00:00:00Z"
+# A probed provider scope, the only scope a blocked provider wait may name (#5424).
+PROBED_SCOPE = "sha256:" + "a" * 64
+USAGE_ON_A_PROBED_SCOPE = {"reason": "usage_reset", "scope_key": PROBED_SCOPE}
 _ABSENT = object()
 LIMIT = VECTORS["allowance"]["limit"]
 # Every start delivers a limit for every worker dimension, so a resource gated
@@ -1070,7 +1080,10 @@ def test_owner_loss_admits_without_a_safety_fact_inside_the_shared_count(
 
 def _blocked_successor(api: TestClient, ref: Ref) -> dict[str, Any]:
     epoch = _dispatch(api, ref.request_id)
-    assert _finish(api, ref.request_id, epoch, "model_usage_limited").status_code == 200
+    finished = _finish(
+        api, ref.request_id, epoch, "model_usage_limited", condition=USAGE_ON_A_PROBED_SCOPE
+    )
+    assert finished.status_code == 200, finished.text
     successor = _successor(ref.request_id)
     assert successor is not None
     assert successor["blocked_on"] == "provider_usage_reset"
@@ -1129,9 +1142,9 @@ def test_unblocked_wait_expiry_stays_capacity_wait_expired(
         )
 
 
-@pytest.mark.parametrize(("offset", "blocked"), [(600, False), (86370, True)])
-def test_time_condition_inside_the_deadline_is_scheduled_and_past_it_is_blocked(
-    api: TestClient, auth_headers: dict[str, str], offset: int, blocked: bool
+@pytest.mark.parametrize(("offset", "past"), [(600, False), (86370, True)])
+def test_time_condition_inside_the_deadline_is_scheduled_and_past_it_admits_nothing(
+    api: TestClient, auth_headers: dict[str, str], offset: int, past: bool
 ) -> None:
     item = _admit(api, _agent(api, auth_headers), 54267)
     epoch = _dispatch(api, item.request_id)
@@ -1145,11 +1158,12 @@ def test_time_condition_inside_the_deadline_is_scheduled_and_past_it_is_blocked(
         reset,
     )
     successor = _successor(item.request_id)
-    assert successor is not None
-    if blocked:
-        assert successor["blocked_on"] == "provider_usage_reset"
-        assert successor["dispatch_not_before"] == successor["wait_deadline"]
+    if past:
+        # Nothing could release a wait past its own deadline (#5424).
+        assert successor is None
+        assert _used(item.work_item_id) == 0
     else:
+        assert successor is not None
         assert successor["blocked_on"] is None
         assert successor["dispatch_not_before"] == reset + timedelta(seconds=60)
 
@@ -1403,6 +1417,7 @@ def test_policy_matches_every_vector(case: dict[str, Any]) -> None:
             safety=facts["retry_safety"],
             condition_reason=None if condition is None else condition["reason"],
             condition_retry_at=None if condition is None else _parse_at(condition["retry_at"]),
+            condition_scope_key=None if condition is None else condition["scope_key"],
         )
     )
     expected = case["expected"]
@@ -1686,19 +1701,27 @@ def _tracker_issue(client: TestClient, github: Any, number: int) -> Ref:
     return Ref(row["id"], row["work_item_id"])
 
 
-def _tracker_fail(client: TestClient, request_id: uuid.UUID, cause: str) -> None:
+def _tracker_fail(
+    client: TestClient,
+    request_id: uuid.UUID,
+    cause: str,
+    condition: dict[str, Any] | None = None,
+) -> None:
     """Start the request and finish it flag clean through the real finish route."""
 
     epoch = _start_running(client, request_id)
+    body: dict[str, Any] = {
+        "runtime_epoch": epoch,
+        "outcome": "failed",
+        "cause": cause,
+        "retry_safety": "no_effects",
+    }
+    if condition is not None:
+        body["retry_condition"] = condition
     finished = client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=TRACKER_WORKER,
-        json={
-            "runtime_epoch": epoch,
-            "outcome": "failed",
-            "cause": cause,
-            "retry_safety": "no_effects",
-        },
+        json=body,
     )
     assert finished.status_code == 200, finished.text
     _reconcile_and_sync()
@@ -1790,7 +1813,7 @@ def test_blocked_successor_shows_queued_label_and_named_condition_not_needs_huma
     client, github, sink = admitted
     number = 54293
     item = _tracker_issue(client, github, number)
-    _tracker_fail(client, item.request_id, "model_usage_limited")
+    _tracker_fail(client, item.request_id, "model_usage_limited", USAGE_ON_A_PROBED_SCOPE)
 
     successor = _successor(item.request_id)
     assert successor is not None
@@ -1883,3 +1906,205 @@ def test_blocked_successor_expiry_outcome_names_the_condition(
         f"deadline {expired['wait_deadline'].isoformat()} elapsed"
     )
     assert view["requests"][-1]["blocked_on"] == "provider_usage_reset"
+
+
+# -- #5424 correction: no retry waits without a releaser ---------------------------
+
+# Every condition a blocked successor may wait on, keyed to what releases it.
+RELEASERS = factory_provider_gate.PROVIDER_GATES | resource_gate.GATE_CONDITIONS
+
+
+def _policy_causes() -> set[str]:
+    """Every cause the policy names, every vector cause and one unknown string."""
+
+    policy = factory_retry_policy
+    named: set[str] = {"start_failed", "workspace_timeout", "completed", "owner_lost"}
+    named |= set(policy._TOKEN_ALIASES) | set(policy._TOKEN_ALIASES.values())
+    named |= policy._OBSERVE_ONLY_TOKENS | policy._SAME_REQUEST_TOKENS
+    named |= policy._PROVIDER_TRANSIENT | policy._DIAGNOSED_TRANSIENT_ONLY
+    named |= set(policy._LIMIT_CONDITIONS) | policy._NODE_DISRUPTION
+    named |= policy._PUBLICATION_RECOVERY | policy._CI_OBSERVATION | policy._LINEAGE_WAIT
+    named |= {case["finish"]["cause"] for case in CASES}
+    return named | {"never_a_cause"}
+
+
+def test_every_condition_wait_names_a_releaser_across_the_whole_fact_space() -> None:
+    """Every cause x safety x reason x reset time x scope key (#5424)."""
+
+    base = datetime(2030, 1, 1, tzinfo=UTC)
+    deadline = timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+    resets = (None, base + timedelta(seconds=600), base + deadline + timedelta(hours=1))
+    reasons = [None, *(reason.value for reason in RetryReason)]
+    emitted: set[str] = set()
+    for cause in sorted(_policy_causes()):
+        for safety in ("no_effects", "flagged", "uncertain", None):
+            for reason in reasons:
+                for at in resets:
+                    for scope in (None, PROBED_SCOPE):
+                        facts = RetryFacts(
+                            cause=cause,
+                            safety=safety,
+                            condition_reason=reason,
+                            condition_retry_at=at,
+                            condition_scope_key=scope,
+                        )
+                        found = decide(facts)
+                        if found.kind == DispositionKind.TERMINAL:
+                            assert not found.successor, facts
+                        if found.kind != DispositionKind.CONDITION_WAIT:
+                            continue
+                        assert found.successor, facts
+                        if found.not_before is not None:
+                            # Timed: the clock releases it; only a provider
+                            # reset is a timed condition.
+                            assert found.condition == "provider_usage_reset", facts
+                            continue
+                        assert found.condition in RELEASERS, facts
+                        emitted.add(found.condition)
+                        if found.condition in factory_provider_gate.PROVIDER_GATES:
+                            assert scope is not None and at is None, facts
+                            assert factory_retry_policy.provider_gate_releasable(
+                                found.condition, reason, at, scope
+                            ), facts
+    # A new condition with no releaser, or a releaser nothing reaches, fails here.
+    assert emitted == RELEASERS
+
+
+def test_settled_vectors_leave_only_releasable_blocks_and_refusals_need_a_human(
+    api: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """Settle every finish vector on real Postgres, then read every block back (#5424)."""
+
+    agent_id = _agent(api, auth_headers)
+    refused: list[tuple[str, Ref]] = []
+    for offset, case in enumerate(FINISH_CASES):
+        item = _admit(api, agent_id, 55000 + offset)
+        epoch = _dispatch(api, item.request_id)
+        carrier, _ = _carrier(case, _now())
+        facts = case["finish"]
+        finished = _finish(
+            api,
+            item.request_id,
+            epoch,
+            facts["cause"],
+            facts["retry_safety"],
+            condition=_ABSENT if carrier is None else carrier,
+            exhausted_volume=facts.get("exhausted_volume"),
+        )
+        assert finished.status_code == 200, (case["id"], finished.text)
+        if not case["expected"]["successor"]:
+            refused.append((case["id"], item))
+
+    blocked = _rows(
+        "SELECT s.id, s.blocked_on, s.resource_gate, "
+        "p.retry_condition_reason AS reason, p.retry_condition_retry_at AS retry_at, "
+        "p.retry_condition_scope_key AS scope_key "
+        "FROM curie.execution_requests s "
+        "JOIN curie.execution_requests p ON p.id = s.retry_of_request_id "
+        "WHERE s.blocked_on IS NOT NULL"
+    )
+    assert blocked, "the provider and resource gate vectors must leave blocked rows"
+    for row in blocked:
+        if row["blocked_on"] in resource_gate.GATE_CONDITIONS:
+            assert row["resource_gate"] is not None, row
+        else:
+            assert row["blocked_on"] in factory_provider_gate.PROVIDER_GATES, row
+            assert row["scope_key"] is not None and row["retry_at"] is None, row
+            assert factory_retry_policy.provider_gate_releasable(
+                row["blocked_on"], row["reason"], row["retry_at"], row["scope_key"]
+            ), row
+    orphans = _rows(
+        "SELECT id FROM curie.execution_requests "
+        "WHERE blocked_on IS NOT NULL AND retry_of_request_id IS NULL"
+    )
+    assert orphans == []
+
+    assert refused
+    for case_id, item in refused:
+        assert _successor(item.request_id) is None, case_id
+        assert _used(item.work_item_id) == 0, case_id
+        view = _outcome(api, item.work_item_id)
+        # A failed outcome carries the needs-human label; waiting would be queued.
+        assert view["state"] == "failed", (case_id, view["state"])
+        assert "automatic retry" not in view["actionable_cause"], (case_id, view)
+
+
+def _unclassified_with_a_probed_credit_carrier(api: TestClient, ref: Ref) -> None:
+    epoch = _dispatch(api, ref.request_id)
+    carrier = {"reason": "credit_exhausted", "scope_key": PROBED_SCOPE}
+    finished = _finish(api, ref.request_id, epoch, "unclassified", condition=carrier)
+    assert finished.status_code == 200, finished.text
+    assert _successor(ref.request_id) is None
+
+
+def _admit_with(ref: Ref, disposition: Disposition) -> bool:
+    async def body(session: AsyncSession) -> bool:
+        work_item = await lifecycle.lock_work_item(session, ref.work_item_id)
+        assert work_item is not None
+        predecessor = await lifecycle.reload_request(session, ref.request_id)
+        admitted = await lifecycle.admit_automatic_successor(
+            session, work_item, predecessor, origin="ordinary", disposition=disposition
+        )
+        await session.commit()
+        return admitted
+
+    return _db(body)
+
+
+@pytest.mark.parametrize(
+    "disposition",
+    [
+        # A scheduled condition wait still needs a named releaser.
+        Disposition(
+            DispositionKind.CONDITION_WAIT,
+            condition="a_condition_nothing_releases",
+            not_before=datetime(2000, 1, 1, tzinfo=UTC),
+            successor=True,
+        ),
+        Disposition(
+            DispositionKind.CONDITION_WAIT, condition="runner_fault_diagnosis", successor=True
+        ),
+        Disposition(DispositionKind.CONDITION_WAIT, condition=None, successor=True),
+        # A releaser name the predecessor's facts cannot clear.
+        Disposition(
+            DispositionKind.CONDITION_WAIT, condition="provider_credential", successor=True
+        ),
+    ],
+    ids=["scheduled_unknown", "retired_diagnosis", "unnamed", "unreleasable_gate"],
+)
+def test_admission_refuses_a_condition_with_no_releaser_and_spends_nothing(
+    api: TestClient, auth_headers: dict[str, str], disposition: Disposition
+) -> None:
+    item = _admit(api, _agent(api, auth_headers), 54310)
+    _unclassified_with_a_probed_credit_carrier(api, item)
+    assert not _admit_with(item, disposition)
+    assert _successor(item.request_id) is None
+    assert _used(item.work_item_id) == 0
+
+    # Liveness: a releaser this predecessor's facts can clear admits once.
+    gate = Disposition(DispositionKind.CONDITION_WAIT, condition="provider_credit", successor=True)
+    assert _admit_with(item, gate)
+    successor = _successor(item.request_id)
+    assert successor is not None and successor["blocked_on"] == "provider_credit"
+    assert _used(item.work_item_id) == 1
+
+
+def test_a_cause_with_no_releaser_writes_needs_human_at_once_promising_no_wait(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 54311
+    item = _tracker_issue(client, github, number)
+    _tracker_fail(client, item.request_id, "runner_error")
+
+    assert _successor(item.request_id) is None
+    assert _used(item.work_item_id) == 0
+    body = _marked_body(sink, item.request_id)
+    assert "Status: NEEDS HUMAN" in body
+    assert "Cause: runner_error" in body
+    for promise in ("Retrying:", "Blocked:", "Scheduled:", "automatic retr"):
+        assert promise not in body, body
+    assert _needs_human_applications(sink) == 1
+    assert _state_labels(sink, number) == {NEEDS_HUMAN}
+    view = _outcome(client, item.work_item_id)
+    assert (view["state"], view["automatic_retries_used"]) == ("failed", 0)
