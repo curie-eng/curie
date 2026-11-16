@@ -2110,6 +2110,7 @@ def _assert_no_token(response: httpx.Response, token: str) -> None:
 
 
 def test_principal_session_get_names_the_person(oidc_client: TestClient, idp: TestIdP) -> None:
+    idp.name = "  Alice Example  "
     token = _session_token(_login(oidc_client))
     (principal,) = _principal_rows()
 

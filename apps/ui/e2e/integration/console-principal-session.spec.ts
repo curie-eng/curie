@@ -14,6 +14,10 @@ const issuerHost = process.env.CURIE_OIDC_ISSUER_HOST ?? "";
 const issuerMap = process.env.CURIE_OIDC_ISSUER_MAP ?? "";
 const email = process.env.CURIE_OIDC_TEST_EMAIL ?? "owner-a@example.com";
 const password = process.env.CURIE_OIDC_TEST_PASSWORD ?? "password";
+// This Dex password user has no separate name. Dex presents the username as
+// the name claim, and the console shows that. The overview notice is only on
+// Overview; the settings landing names the person in the top bar.
+const accountName = email.split("@")[0] ?? email;
 
 test.use({
   launchOptions: {
@@ -46,8 +50,8 @@ test.describe("principal_session", () => {
     await expect(notice).toBeVisible();
     await expect(notice).toContainText("Signed in as");
     await expect(notice).toContainText("`curie cluster subscription`");
-    await expect(notice).toContainText(email);
-    await expect(page.getByTestId("console-principal")).toContainText(email);
+    await expect(notice).toContainText(accountName);
+    await expect(page.getByTestId("console-principal")).toContainText(accountName);
     await expect(page.getByTestId("console-login")).toHaveCount(0);
   });
 
@@ -57,6 +61,7 @@ test.describe("principal_session", () => {
     await signInAtDex(page);
     await expect(page).toHaveURL(/\/settings\/claude-plan$/);
     await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
-    await expect(page.getByTestId("console-principal-notice")).toContainText(email);
+    await expect(page.getByTestId("console-principal")).toContainText(accountName);
+    await expect(page.getByTestId("console-login")).toHaveCount(0);
   });
 });
