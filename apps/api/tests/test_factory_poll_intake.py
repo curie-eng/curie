@@ -1399,6 +1399,126 @@ def _stored_labels(number: int) -> list[str | None]:
     return [row["trigger_label"] for row in rows]
 
 
+def test_poll_admits_the_app_slug_once_and_refuses_status_and_lookalike_comments(
+    poll_factory: tuple[TestClient, PollGitHub],
+) -> None:
+    """``poll_once`` admits ``@<slug>`` and ``@<slug>[bot]`` through ``_admit_mentions``.
+
+    The same comment on the next pass is not a second request. A factory status
+    comment that carries the ask line, and a login that only starts with the
+    slug, are not admitted.
+    """
+
+    from curie_api.factory_comment_text import marker_for
+    from forge_fakes.github import APP_SLUG
+
+    client, github = poll_factory
+    number, _row = _admit_label(client, github)
+    slug_id, bot_id, status_id, lookalike_id = 73201, 73202, 73203, 73204
+    github.add_issue_comment(number, slug_id, f"@{APP_SLUG} please revise the helper")
+    github.add_issue_comment(number, bot_id, f"@{APP_SLUG}[bot] please revise the helper")
+    github.add_issue_comment(
+        number,
+        status_id,
+        (
+            f"Status: QUEUED\n{marker_for(uuid.uuid4())}\n"
+            f"Ask the factory: mention @{APP_SLUG} on this pull request."
+        ),
+    )
+    github.add_issue_comment(number, lookalike_id, f"@{APP_SLUG}-x please revise the helper")
+
+    _run_once(github)
+
+    ids = [row["id"] for row in _requests(number)]
+    assert _mention_request_id(slug_id) in ids
+    assert _mention_request_id(bot_id) in ids
+    assert _mention_request_id(status_id) not in ids
+    assert _mention_request_id(lookalike_id) not in ids
+    assert len(ids) == 3
+
+    _run_once(github)
+
+    assert [row["id"] for row in _requests(number)] == ids
+
+
+def test_tracker_poll_admits_the_app_slug_once_and_refuses_status_and_lookalike_comments() -> None:
+    """``GitHubTracker.poll_marked`` is the other poll, at ``_mention_notice``."""
+
+    from curie_api.factory_comment_text import marker_for
+    from curie_api.forges.github.comments import static_token
+    from curie_api.forges.github.tracker import GitHubTracker
+    from curie_api.forges.types import Disposition
+    from forge_fakes.github import APP_SLUG, REPO, REPO_ID
+
+    slug = APP_SLUG
+    comments = [
+        _poll_comment(73211, 12, f"@{slug} please revise the helper"),
+        _poll_comment(73212, 12, f"@{slug}[bot] please revise the helper"),
+        _poll_comment(
+            73213,
+            12,
+            (
+                f"Status: QUEUED\n{marker_for(uuid.uuid4())}\n"
+                f"Ask the factory: mention @{slug} on this pull request."
+            ),
+        ),
+        _poll_comment(73214, 12, f"@{slug}-x please revise the helper"),
+    ]
+
+    async def own_login() -> str:
+        return f"{slug}[bot]"
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/issues/events"):
+            return httpx.Response(200, json=[])
+        if path.endswith("/issues/comments"):
+            listed = sorted(comments, key=lambda item: int(item["id"]), reverse=True)
+            return httpx.Response(200, json=listed)
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    async def poll() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            tracker = GitHubTracker(
+                client,
+                api="https://api.github.com",
+                html_base="https://github.com",
+                repo_full_name=REPO,
+                repository_id=REPO_ID,
+                token=static_token("fixture-installation-token"),
+                label=LABEL,
+                mention=MENTION,
+                app_id="51",
+                own_login=own_login,
+                page_size=10,
+            )
+            first = await tracker.poll_marked(None, running=())
+            admitted = [
+                notice for notice in first.notices if notice.disposition is Disposition.MENTION
+            ]
+            assert {int(notice.event_id) for notice in admitted} == {73211, 73212}
+            again = await tracker.poll_marked(first.cursor, running=())
+            repeated = [
+                notice for notice in again.notices if notice.disposition is Disposition.MENTION
+            ]
+            assert repeated == []
+
+    asyncio.run(poll())
+
+
+def _poll_comment(comment_id: int, number: int, body: str) -> dict[str, Any]:
+    return {
+        "id": comment_id,
+        "body": body,
+        "user": {"id": SENDER_ID, "login": SENDER, "type": "User"},
+        "created_at": "2026-11-16T12:00:00Z",
+        "updated_at": "2026-11-16T12:00:00Z",
+        "performed_via_github_app": None,
+        "html_url": f"https://github.com/{REPO}/issues/{number}#issuecomment-{comment_id}",
+        "issue_url": f"https://api.github.com/repos/{REPO}/issues/{number}",
+    }
+
+
 def test_poll_admits_a_mention_once(poll_factory: tuple[TestClient, PollGitHub]) -> None:
     client, github = poll_factory
     number, _row = _admit_label(client, github)

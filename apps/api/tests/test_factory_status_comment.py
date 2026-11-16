@@ -994,6 +994,81 @@ def test_non_github_status_comments_omit_the_factory_ask_line(admitted: Any) -> 
     assert github_status_mention(settings, "github") == MENTION
 
 
+class _RecordedComments:
+    """The port the status sync posts through, keeping each rendered body."""
+
+    def __init__(self) -> None:
+        self.bodies: list[str] = []
+
+    async def upsert_marked(self, target: Any, marker: str, body: str) -> UpsertResult:
+        self.bodies.append(body)
+        return UpsertResult(MarkedComment("1", target, body), written=True)
+
+
+class _RecordingTracker:
+    def __init__(self, posted: _RecordedComments) -> None:
+        self.marked_comments = posted
+        self.capabilities: dict[Any, Any] = {}
+
+    async def set_state_label(self, issue: Any, *, add: str | None, remove: Any) -> None:
+        return None
+
+
+def _retarget_tracker(work_item_id: uuid.UUID, kind: str) -> None:
+    """Point one admitted work item at another tracker kind.
+
+    The identity trigger guards ``tracker_kind``, so it is off for this write,
+    the same way a row an earlier admission stored is rewritten in tests.
+    """
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text("SET LOCAL session_replication_role = replica"))
+                await connection.execute(
+                    text("UPDATE curie.work_items SET tracker_kind = :kind WHERE id = :id"),
+                    {"kind": kind, "id": work_item_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("kind", ["gitlab", "bitbucket_cloud", "bitbucket_dc"])
+def test_gitlab_and_bitbucket_status_comments_omit_the_ask_line(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """The reconciler renders the comment, then the port posts that body."""
+
+    client, github, sink = admitted
+    number = {"gitlab": 9941, "bitbucket_cloud": 9942, "bitbucket_dc": 9943}[kind]
+    request_id = _admit(client, github, sink, number)
+    _retarget_tracker(_request(number)["work_item_id"], kind)
+    posted = _RecordedComments()
+    monkeypatch.setattr(
+        factory_notices,
+        "tracker_for_work_item",
+        lambda *_args, **_kwargs: _RecordingTracker(posted),
+    )
+    monkeypatch.setattr(
+        factory_notices, "code_host_for_repository", lambda *_args, **_kwargs: object()
+    )
+
+    _reconcile()
+
+    assert len(posted.bodies) == 1
+    body = posted.bodies[0]
+    assert "Status: QUEUED" in body
+    assert WAITING in body
+    assert marker_for(request_id) in body
+    assert "Ask the factory" not in body
+    assert github_ask_line(MENTION) not in body
+
+
 # --- 2: edited in place as phases advance --------------------------------------------
 
 
