@@ -2326,9 +2326,35 @@ class FactorySlackThread(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # The progress card (#5715). A kickoff stores the dispatcher's placeholder
+    # ts as ``card_ts`` at admission; any other thread stores its card post's.
+    card_ts: Mapped[str | None] = mapped_column(Text, default=None)
+    # The digest of the last render Slack acknowledged, and when it was sent.
+    card_digest: Mapped[str | None] = mapped_column(Text, default=None)
+    card_edited_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # One worker edits a card at a time: replace edits land last write wins.
+    card_lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    card_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # The Slack user id that sent a kickoff mention; the notify replies mention it.
+    requester_slack_user: Mapped[str | None] = mapped_column(Text, default=None)
 
 
-FACTORY_SLACK_POST_KINDS = ("root", "phase", "pull_request", "terminal", "triage")
+# ``phase``, ``terminal`` and ``pull_request`` are rows written before #5715; the
+# progress lane no longer materializes or delivers them.
+FACTORY_SLACK_POST_KINDS = (
+    "root",
+    "phase",
+    "pull_request",
+    "terminal",
+    "triage",
+    "card",
+    "needs_person",
+    "ready",
+)
 
 
 class FactorySlackPost(Base):
