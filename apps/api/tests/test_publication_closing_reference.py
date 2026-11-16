@@ -251,41 +251,94 @@ def test_a_gitlab_publication_body_omits_the_ask_line(
 
 def test_a_bitbucket_publication_body_omits_the_ask_line(
     _factory_publication_case: Case,
+    admitted: Any,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """Bitbucket is a code host, not a tracker kind the forge config accepts.
+    """A Jira tracker whose binding publishes onto a Bitbucket repository.
 
-    ``create_publication`` still builds the body: the port answers the closing
-    reference, and the GitHub ask line is not appended.
+    ``create_publication`` builds the body from that tracker. The publication
+    target is the Bitbucket repository, and the body has no GitHub ask line.
     """
 
-    from curie_api.forges.memory import InMemoryTracker
-    from curie_api.routers import publications as publication_routes
+    from forge_fakes import config_samples as samples
 
     client, request_id, payload = _factory_publication_case
-    number = str(_issue_number(payload))
-    host, scope = "bitbucket.example", "8801"
-    tracker = InMemoryTracker(kind="bitbucket_cloud", host=host, scope_id=scope, mention="bb-bot")
-    tracker.seed_issue("Widget parser", "Drops the last field.", issue_id=number)
+    _client, github, _comments = admitted
+    fake = jira_fake.JiraFake()
+    issue = fake.seed_issue(JIRA_SUMMARY, "Parsing a three-field line yields two fields.")
+    document = jira_fake.jira_document()
+    document["code_hosts"] = [
+        {
+            **samples.bitbucket_code_host(),
+            "host": "bitbucket.org",
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": samples.static_token(),
+        }
+    ]
+    project_id = "{6f1c0000-0000-4000-8000-000000000003}"
+    path = "acme/web"
+    binding = document["bindings"][0]
+    binding["repos"] = [
+        {
+            "alias": "web",
+            "code_host": "bitbucket",
+            "project_id": project_id,
+            "path": path,
+        }
+    ]
+    binding["default_repo"] = "web"
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, tmp_path / "forges"))
+    get_settings.cache_clear()
+    client.app.state.forges = forges_registry(get_settings())
     _rewrite_stored_identity(
-        "UPDATE curie.work_items SET tracker_kind = 'bitbucket_cloud', tracker_host = :host, "
-        "tracker_scope_id = :scope WHERE id = ("
-        "SELECT work_item_id FROM curie.execution_requests WHERE id = :request)",
-        {"host": host, "scope": scope, "request": request_id},
+        "UPDATE curie.work_items SET tracker_kind = 'jira_cloud', tracker_host = :site, "
+        "tracker_scope_id = :cloud, tracker_issue_id = :issue, tracker_display_key = :key, "
+        "code_host_kind = 'bitbucket_cloud', code_host_host = 'bitbucket.org', "
+        "repository_project_id = :project, repository_path = :path, "
+        "code_host_installation_id = NULL "
+        "WHERE id = (SELECT work_item_id FROM curie.execution_requests WHERE id = :request)",
+        {
+            "site": jira_fake.SITE_HOST,
+            "cloud": jira_fake.CLOUD_ID,
+            "issue": str(issue.id),
+            "key": issue.key,
+            "project": project_id,
+            "path": path,
+            "request": request_id,
+        },
     )
-    monkeypatch.setattr(
-        publication_routes,
-        "tracker_for_work_item",
-        lambda *_args, **_kwargs: tracker,
-    )
-    _passed(client, request_id)
-
-    created = _post_factory_publication(client, payload)
+    original = client.app.state.http_client
+    routed = httpx.AsyncClient(transport=_ByHost(fake, httpx.MockTransport(github.handle)))
+    client.app.state.http_client = routed
+    payload = {**payload, "repo_full_name": path}
+    try:
+        _passed(client, request_id)
+        created = _post_factory_publication(client, payload)
+    finally:
+        client.app.state.http_client = original
+        client.portal.call(routed.aclose)
+        get_settings.cache_clear()
 
     assert created.status_code == 201, created.text
+    assert created.json()["repo_full_name"] == path
+    reference = f"Jira: {issue.key} {jira_fake.SITE}/browse/{issue.key}"
     stored = _factory_publication_body(created.json()["id"])
-    assert stored == f"{payload['body']}\n\nCloses #{number}\n\n{_marker(request_id)}"
+    assert stored == f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}"
     assert "Ask the factory" not in stored
+    assert "Closes" not in stored
+    (row,) = _rows(
+        "SELECT code_host_kind, code_host_host, repository_project_id, repository_path "
+        "FROM curie.work_items w JOIN curie.execution_requests r ON r.work_item_id = w.id "
+        "WHERE r.id = :request",
+        {"request": request_id},
+    )
+    assert (
+        row["code_host_kind"],
+        row["code_host_host"],
+        row["repository_project_id"],
+        row["repository_path"],
+    ) == ("bitbucket_cloud", "bitbucket.org", project_id, path)
 
 
 def test_a_jira_body_gains_the_issue_key_and_url(

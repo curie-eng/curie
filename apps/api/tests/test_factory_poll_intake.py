@@ -1435,9 +1435,34 @@ def test_poll_admits_the_app_slug_once_and_refuses_status_and_lookalike_comments
     assert _mention_request_id(status_id) not in ids
     assert _mention_request_id(lookalike_id) not in ids
     assert len(ids) == 3
+    assert ids.count(_mention_request_id(slug_id)) == 1
 
+    # The stored ETag would answer 304 and skip the comments. A new ETag makes
+    # the second poll return 200. The cursor's inclusive ``since`` is the newest
+    # comment, so these four keep that timestamp and are listed again.
+    newest = max(comment["updated_at"] for comment in github.comments.values())
+    for comment_id in (slug_id, bot_id, status_id, lookalike_id):
+        github.comments[comment_id]["created_at"] = newest
+        github.comments[comment_id]["updated_at"] = newest
+    github._etags["issue-comments"] = '"slug-comments-redelivered"'
+    statuses: list[int] = []
+    pages: list[list[dict[str, Any]]] = []
+    original = github._page
+
+    def _page(request: httpx.Request, family: str, items: list[Any]) -> httpx.Response:
+        response = original(request, family, items)
+        if family == "issue-comments":
+            statuses.append(response.status_code)
+            if response.status_code == 200:
+                pages.append(response.json())
+        return response
+
+    github._page = _page  # type: ignore[method-assign]
     _run_once(github)
 
+    assert statuses == [200]
+    redelivered = {item["id"] for page in pages for item in page}
+    assert {slug_id, bot_id, status_id, lookalike_id} <= redelivered
     assert [row["id"] for row in _requests(number)] == ids
 
 
