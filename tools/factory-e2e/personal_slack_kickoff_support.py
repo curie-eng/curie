@@ -3077,6 +3077,18 @@ _PULL_NUMBER = re.compile(r"/pull/(\d+)(?:[/?#]|$)")
 _FINISHED_IN = re.compile(r"Finished in \d+m \d{2}s")
 
 
+# conversations.replies returns a bare URL in a message's text wrapped in
+# Slack link markup, `<https://...>`, though the post sent it bare (observed
+# on a live kickoff thread in a test Slack workspace, 2026-11-16).
+_SLACK_AUTOLINK = re.compile(r"<(https?://[^|>\s]+)>")
+
+
+def slack_plain(text: str) -> str:
+    """``text`` with Slack's autolink markup around bare URLs removed."""
+
+    return _SLACK_AUTOLINK.sub(r"\1", text)
+
+
 def ready_text(sender_user: str, pull_request_url: str) -> str:
     return f"<@{sender_user}> your pull request is ready for review: {pull_request_url}"
 
@@ -3175,7 +3187,7 @@ def _judge_progress(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
             mentions_sender
             and bool(url_text)
             and len(notify) == 1
-            and notify[0].get("text") == ready_text(str(sender), url_text)
+            and slack_plain(str(notify[0].get("text") or "")) == ready_text(str(sender), url_text)
         )
         card_final = card is not None and bool(url_text) and _card_finished_ok(card, url_text)
     else:

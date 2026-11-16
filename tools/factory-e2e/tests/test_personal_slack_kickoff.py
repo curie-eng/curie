@@ -3604,8 +3604,11 @@ def _progress_observations() -> dict[str, Any]:
     """What a finished kickoff thread records: the card, then one ready reply."""
 
     card = _bot_reply(CARD_TS, _card_body(), _finished_card_blocks())
+    # The read-back shape: conversations.replies wraps the bare URL the reply
+    # posted in Slack link markup (observed on a live kickoff thread in a test
+    # Slack workspace, 2026-11-16).
     ready = _bot_reply(
-        READY_TS, f"<@{SENDER_USER}> your pull request is ready for review: {PULL_URL}"
+        READY_TS, f"<@{SENDER_USER}> your pull request is ready for review: <{PULL_URL}>"
     )
     return {
         "thread": THREAD,
@@ -4200,6 +4203,13 @@ def _ready_without_mention(observed: dict[str, Any]) -> None:
     observed["thread_replies"][1]["text"] = f"your pull request is ready for review: {PULL_URL}"
 
 
+def _ready_for_another_pull_request(observed: dict[str, Any]) -> None:
+    other = "https://github.com/acme-corp/acme-fixture/pull/9"
+    observed["thread_replies"][1]["text"] = (
+        f"<@{SENDER_USER}> your pull request is ready for review: <{other}>"
+    )
+
+
 def _button_elsewhere(observed: dict[str, Any]) -> None:
     observed["thread_replies"][0]["blocks"] = _finished_card_blocks(
         "https://github.com/acme-corp/acme-fixture/pull/9"
@@ -4247,6 +4257,7 @@ def _post_elsewhere(observed: dict[str, Any]) -> None:
         (_extra_bot_reply, ["one_ready_reply", "nothing_else_from_the_bot"]),
         (_drop_ready, ["one_ready_reply", "nothing_else_from_the_bot"]),
         (_ready_without_mention, ["one_ready_reply"]),
+        (_ready_for_another_pull_request, ["one_ready_reply"]),
         (lambda o: o.update(requester_slack_user=CURIE_USER), ["one_ready_reply"]),
         (_button_elsewhere, ["card_finished"]),
         (_pending_step, ["card_finished"]),
@@ -4355,7 +4366,7 @@ def test_progress_card_thread_dump_is_anonymized_and_printed_by_the_judge(tmp_pa
     assert dump[1]["edited"] is True
     assert dump[2]["text"] == (
         "<@SENDER> your pull request is ready for review: "
-        "https://github.com/example-org/example-repo/pull/8"
+        "<https://github.com/example-org/example-repo/pull/8>"
     )
     blocks = dump[1]["blocks"]
     assert [block["type"] for block in blocks] == ["header", "section", "actions", "context"]
