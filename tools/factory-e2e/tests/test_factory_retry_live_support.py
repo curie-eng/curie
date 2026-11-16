@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 import candidate_install as ci
 import factory_retry_live as frl
 import pytest
+import tls_code_host as tch
 
 ROOT = Path(__file__).resolve().parents[3]
 DRIVER = "tools/factory-e2e/tests/test_factory_retry_live.py"
@@ -271,6 +273,13 @@ def test_a_correct_chain_passes_every_judgement() -> None:
     assert frl.fresh_attempt_problems([origin, second, third]) == []
 
 
+def test_a_successor_admitted_inside_the_settling_transaction_passes() -> None:
+    # Recorded 2026-11-16: created_at 18:26:06.457, predecessor terminal_at 18:26:06.461.
+    origin, second, _ = _chain()
+    second["created_at"] = _at(1060 - 0.004)
+    assert frl.successor_problems(origin, second, origin=origin) == []
+
+
 @pytest.mark.parametrize(
     ("change", "fragment"),
     [
@@ -498,3 +507,35 @@ def test_a_refusal_or_dry_run_that_wrote_is_caught() -> None:
     assert frl.unchanged_problems(before, {**before, "version": 4}, 1, 1)
     assert frl.unchanged_problems(before, {**before, "automatic_retries_used": 1}, 1, 1)
     assert frl.unchanged_problems(before, dict(before), 1, 2)
+
+
+def test_close_issue_program_closes_as_the_human_author(tmp_path: Path) -> None:
+    """Intake cancels only on a ``closed`` event by a person, so the close writes one."""
+
+    database = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE objects(kind TEXT, id INTEGER, body TEXT)")
+    human = {"login": "octocat", "type": "User"}
+    for number in (tch.STUB_ISSUE, 9):
+        issue = {"number": number, "state": "open", "user": human}
+        connection.execute("INSERT INTO objects VALUES('issue', ?, ?)", (number, json.dumps(issue)))
+    connection.execute("INSERT INTO objects VALUES('event', 4, '{}')")
+    connection.commit()
+    connection.close()
+    program = frl.CLOSE_ISSUE_PROGRAM.replace(repr(tch.STUB_DATABASE), repr(str(database)))
+    assert program != frl.CLOSE_ISSUE_PROGRAM
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", program, "9"], capture_output=True, text=True, check=True
+    )
+    assert json.loads(done.stdout) == {"number": 9, "event": 5}
+    connection = sqlite3.connect(database)
+    issue = json.loads(
+        connection.execute("SELECT body FROM objects WHERE kind='issue' AND id=9").fetchone()[0]
+    )
+    event = json.loads(
+        connection.execute("SELECT body FROM objects WHERE kind='event' AND id=5").fetchone()[0]
+    )
+    connection.close()
+    assert issue["state"] == "closed" and issue["closed_at"]
+    assert event["event"] == "closed" and event["issue_number"] == 9
+    assert event["actor"] == human and event["performed_via_github_app"] is None

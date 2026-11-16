@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Any
 
 import candidate_install as ci
+import tls_code_host as tch
 
 FLAG = "CURIE_FACTORY_RETRY_LIVE"
 NAMES = ci.InputNames(
@@ -84,6 +85,46 @@ HOLD = "[fake:fill-scratch 8]"
 # What every agent's runner says until its leg sets its own directive: a
 # terminal refusal that admits nothing.
 INSTALLED_DIRECTIVE = GENERIC_403
+
+
+# Run inside the stub Pod: close one issue the way a person does on GitHub. The
+# stub's PATCH only flips the state; GitHub also records a ``closed`` issue
+# event by that person, which is what tracker intake reads to cancel a running
+# issue (forges/github/tracker.py ``_removal``). The actor is the stub's human,
+# the author of its seed issue, as in candidate_install.SEED_ISSUE_PROGRAM.
+CLOSE_ISSUE_PROGRAM = f"""
+import json, sqlite3, sys
+from datetime import UTC, datetime
+number = int(sys.argv[1])
+now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+connection = sqlite3.connect({tch.STUB_DATABASE!r}, timeout=30, isolation_level="IMMEDIATE")
+try:
+    connection.execute("UPDATE objects SET kind=kind WHERE 0")
+    seed = json.loads(connection.execute(
+        "SELECT body FROM objects WHERE kind='issue' AND id=?", ({tch.STUB_ISSUE},)
+    ).fetchone()[0])
+    issue = json.loads(connection.execute(
+        "SELECT body FROM objects WHERE kind='issue' AND id=?", (number,)
+    ).fetchone()[0])
+    issue.update(state="closed", closed_at=now, updated_at=now)
+    connection.execute(
+        "UPDATE objects SET body=? WHERE kind='issue' AND id=?", (json.dumps(issue), number)
+    )
+    event = int(connection.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM objects WHERE kind='event'"
+    ).fetchone()[0]) + 1
+    row = {{
+        "id": event, "issue_number": number, "event": "closed", "actor": seed["user"],
+        "commit_id": None, "created_at": now, "performed_via_github_app": None,
+    }}
+    connection.execute(
+        "INSERT INTO objects(kind, id, body) VALUES('event', ?, ?)", (event, json.dumps(row))
+    )
+    connection.commit()
+finally:
+    connection.close()
+print(json.dumps({{"number": number, "event": event}}))
+"""
 
 
 @dataclass(frozen=True)
@@ -291,9 +332,11 @@ def successor_problems(
         problems.append("retry_origin_request_id does not name the original request")
     if bool(successor.get("owner_lost_retry")) is not owner_loss:
         problems.append(f"owner_lost_retry {successor.get('owner_lost_retry')!r}, not {owner_loss}")
-    created, admitted = when(successor.get("created_at")), when(predecessor.get("terminal_at"))
-    if created is None or admitted is None or created < admitted:
-        problems.append("the successor was not admitted at or after its predecessor settled")
+    # The settling transaction admits the successor before it stamps the
+    # predecessor's terminal time, so the two differ by milliseconds either way.
+    created, settled = epoch(successor.get("created_at")), epoch(predecessor.get("terminal_at"))
+    if created is None or settled is None or abs(created - settled) > TIME_SLACK_S:
+        problems.append("the successor was not admitted when its predecessor settled")
     previous_wait = when(predecessor.get("wait_deadline"))
     wait = when(successor.get("wait_deadline"))
     if wait is None or previous_wait is None or wait <= previous_wait:

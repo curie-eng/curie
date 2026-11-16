@@ -198,10 +198,15 @@ class Live(ci.CandidateInstall):
         return {label["name"] for label in body.get("labels") or []}
 
     def close_issue(self, leg: frl.Leg) -> None:
+        """Close the leg's issue as its human author, with GitHub's ``closed`` event."""
+
+        out = self.stub_exec("python3", "-c", frl.CLOSE_ISSUE_PROGRAM, str(self.issues[leg.key]))
+        closed = json.loads(out.strip().splitlines()[-1])
         status, issue = self.stub_api(
-            "PATCH", f"/repos/{tch.STUB_REPO}/issues/{self.issues[leg.key]}", {"state": "closed"}
+            "GET", f"/repos/{tch.STUB_REPO}/issues/{self.issues[leg.key]}"
         )
-        assert status == 200 and issue.get("state") == "closed", f"close answered {status}"
+        assert status == 200 and issue.get("state") == "closed", f"close read back {status}"
+        self.log(f"leg {leg.key}: issue closed by its author (event {closed['event']})")
 
     # --- disruption ---------------------------------------------------------
 
