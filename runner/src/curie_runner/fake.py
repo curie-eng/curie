@@ -483,6 +483,9 @@ def gated_connector_tool_turn(name: str, args: dict[str, Any]) -> list[Any]:
 # permission gate let the call run. It is the offline proof that an approved
 # file write runs exactly once after resume (#5571). Nothing outside the
 # working directory is ever written: ``<name>`` is a single path component.
+# The working directory is the session's own (the mounted managed checkout on a
+# workspace sandbox, as the real CLI's ``cwd`` option), else the process's, so
+# a factory turn on the fake tier changes the checkout it publishes (#5429).
 WRITE_FILE_MARKER = "[fake:write-file"
 _WRITE_FILE_RE = re.compile(r"\[fake:write-file ([A-Za-z0-9._-]+) (\S+)\]")
 
@@ -496,13 +499,16 @@ class _FileWrite:
     content: str
 
 
-def write_file_turn(last: str) -> list[Any]:
-    """A turn that writes one file in the working directory, then answers."""
+def write_file_turn(last: str, cwd: str | None = None) -> list[Any]:
+    """A turn that writes one file in the working directory, then answers.
+
+    ``cwd`` is the session's working directory; None means the process's.
+    """
 
     match = _WRITE_FILE_RE.search(last)
     if match is None or match.group(1) in {".", ".."}:
         return default_turn()
-    path = os.path.join(os.getcwd(), match.group(1))
+    path = os.path.join(cwd or os.getcwd(), match.group(1))
     content = match.group(2)
     return [
         _assistant(TextBlock(text="Writing the file")),
@@ -765,8 +771,12 @@ class FakeModelSession:
         turn_progress: TurnProgress | None = None,
         tool_access: TurnToolAccess | None = None,
         connector_servers: Mapping[str, Mapping[str, Any]] | None = None,
+        cwd: str | None = None,
     ) -> None:
         self._script_factory = script_factory or self._default_script
+        # The session's working directory, as the real CLI's ``cwd`` option;
+        # None means the process's own.
+        self._cwd = cwd
         self._connector_servers: Mapping[str, Mapping[str, Any]] = connector_servers or {}
         # The session's progress holder (ADR 0130); None when the tool is not
         # mounted, which the demo answers as "not shown", like no capability.
@@ -822,7 +832,7 @@ class FakeModelSession:
         if PROGRESS_DEMO_MARKER in last:
             return progress_demo_turn()
         if WRITE_FILE_MARKER in last:
-            return write_file_turn(last)
+            return write_file_turn(last, self._cwd)
         if HOLD_MEMORY_MARKER in last:
             return hold_memory_turn(last)
         if FILL_SCRATCH_MARKER in last:

@@ -108,3 +108,21 @@ def test_a_directive_naming_anything_but_one_file_writes_nothing(cwd: Path, dire
         for block in getattr(message, "content", []) or []
     )
     assert sorted(cwd.iterdir()) == []
+
+
+def test_the_write_lands_in_the_session_working_directory(
+    cwd: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A workspace session's cwd is the mounted checkout, not the process's (#5429)."""
+
+    checkout = tmp_path_factory.mktemp("checkout")
+    fake = FakeModelSession(cwd=str(checkout))
+
+    async def run() -> list[Any]:
+        await fake.query(_DIRECTIVE)
+        return [message async for message in fake.receive_turn()]
+
+    messages = anyio.run(run)
+    assert _write_input(messages) == {"file_path": str(checkout / "note.txt"), "content": "hello"}
+    assert (checkout / "note.txt").read_text() == "hello"
+    assert sorted(cwd.iterdir()) == []
