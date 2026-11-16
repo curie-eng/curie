@@ -20,12 +20,14 @@ import tempfile
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 import anyio
 import httpx2
 from claude_agent_sdk import (
     AssistantMessage,
+    RateLimitEvent,
     ResultMessage,
     TextBlock,
     ToolResultBlock,
@@ -35,9 +37,11 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import (
     CanUseTool,
     PermissionResultDeny,
+    RateLimitInfo,
     ToolPermissionContext,
 )
 from mcp import ClientSession
+from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .adapter import PartialMessageBoundary
 from .approval import (
@@ -55,6 +59,26 @@ from .turn_progress import NOT_SHOWN_TEXT, TurnProgress
 
 def _assistant(*blocks: Any, usage: dict[str, Any] | None = None) -> AssistantMessage:
     return AssistantMessage(content=list(blocks), model="fake-model", usage=usage)
+
+
+_SdkError = Literal[
+    "authentication_failed",
+    "billing_error",
+    "rate_limit",
+    "invalid_request",
+    "server_error",
+    "unknown",
+]
+
+
+def _errored(error: _SdkError, text: str) -> AssistantMessage:
+    """An assistant message carrying a provider error, as the SDK delivers one."""
+
+    return AssistantMessage(
+        content=[TextBlock(text=text)] if text else [],
+        model="fake-model",
+        error=error,
+    )
 
 
 def _result(
@@ -521,6 +545,115 @@ def write_file_turn(last: str, cwd: str | None = None) -> list[Any]:
     ]
 
 
+# ``[fake:publish-changes]`` is read only together with a parsed write-file
+# directive (#5429). The turn is that write, then exactly one
+# ``mcp__curie__publish_changes`` tool use. The call goes through the same
+# permission gate as any other scripted tool, so a gated publish pauses the
+# turn where candidate capture happens. A publish marker without a parsed
+# write does not take the turn.
+PUBLISH_CHANGES_MARKER = "[fake:publish-changes]"
+# A fixed proposal the publication gate can record. The directive takes no
+# arguments; title and body stay inside the limits ``ApprovalGate`` accepts.
+PUBLISH_CHANGES_INPUT: dict[str, str] = {
+    "title": "Publish the reviewed change",
+    "body": "Publish the file written in this turn.",
+}
+
+
+def publish_changes_turn(last: str, cwd: str | None = None) -> list[Any]:
+    """The write-file turn followed by one publication tool use."""
+
+    match = _WRITE_FILE_RE.search(last)
+    if match is None or match.group(1) in {".", ".."}:
+        return default_turn()
+    written = write_file_turn(last, cwd)
+    publish = _assistant(
+        ToolUseBlock(id="p1", name=PLATFORM_PUBLISH_TOOL_NAME, input=dict(PUBLISH_CHANGES_INPUT))
+    )
+    return [*written[:3], publish, *written[3:]]
+
+
+# ``[fake:model-fault <kind>]`` emits the SDK shape the real provider uses for
+# that refusal (#5429, #5424, #5426), and nothing else. The production
+# translator classifies it. A marker whose argument does not parse falls back
+# to the default turn and does not fall through to a later directive.
+# ``<s>`` is the provider reset as a Unix timestamp in whole seconds, the same
+# instant ``RateLimitInfo.resets_at`` and the daily-budget RFC 3339 clause name.
+MODEL_FAULT_MARKER = "[fake:model-fault"
+_MODEL_FAULT_RE = re.compile(
+    r"\[fake:model-fault (?:"
+    r"rate-limit (?P<rate>\d+)"
+    r"|daily-budget (?P<budget>\d+)"
+    r"|rate-limit-untimed"
+    r"|generic-403"
+    r"|unreachable"
+    r")\]"
+)
+# Observed 2026-10-29 (#5163): an OpenRouter workspace daily budget refusal.
+# The reset clause is filled from the directive's timestamp. Built by
+# concatenation so the JSON braces are not a format string.
+# A 403 with no credit, budget or documented 401 text (test_translate.py).
+_GENERIC_403_TEXT = 'API Error: 403 {"error":{"message":"invalid api key","code":403}}'
+# #4333: the SDK reports a transport failure as server_error plus this text.
+_UNREACHABLE_TEXT = "API Error: 500 Connection refused"
+
+
+def _utc_stamp(seconds: int) -> str | None:
+    """RFC 3339 UTC for ``seconds``, or None when it is not a real instant."""
+
+    try:
+        when = datetime.fromtimestamp(seconds, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return when.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _rate_limit_event(resets_at: int | None) -> RateLimitEvent:
+    info = RateLimitInfo(status="rejected", resets_at=resets_at)
+    return RateLimitEvent(rate_limit_info=info, uuid="fake-rate-limit", session_id="fake-session")
+
+
+def model_fault_turn(last: str) -> list[Any]:
+    """One provider-fault turn, or the default turn when the argument is bad."""
+
+    match = _MODEL_FAULT_RE.search(last)
+    if match is None:
+        return default_turn()
+    if match.group("rate") is not None:
+        seconds = int(match.group("rate"))
+        if _utc_stamp(seconds) is None:
+            return default_turn()
+        return [
+            _rate_limit_event(seconds),
+            _result(is_error=True, text="model rate limit reached"),
+        ]
+    if match.group("budget") is not None:
+        seconds = int(match.group("budget"))
+        stamp = _utc_stamp(seconds)
+        if stamp is None:
+            return default_turn()
+        text = (
+            'API Error: 403 {"error":{"message":"Workspace daily budget of $20.00 exceeded. '
+            "Contact your org admin. $20.08 of $20.00 used; resets " + stamp + '.",'
+            '"code":403}}'
+        )
+        return [_errored("authentication_failed", text), _result(is_error=True, text=text)]
+    if "rate-limit-untimed" in match.group(0):
+        return [
+            _rate_limit_event(None),
+            _result(is_error=True, text="model rate limit reached"),
+        ]
+    if "generic-403" in match.group(0):
+        return [
+            _errored("authentication_failed", _GENERIC_403_TEXT),
+            _result(is_error=True, text=_GENERIC_403_TEXT),
+        ]
+    return [
+        _errored("server_error", _UNREACHABLE_TEXT),
+        _result(is_error=True, text=_UNREACHABLE_TEXT),
+    ]
+
+
 # Resource exhaustion directives (#5427). ``[fake:hold-memory <MiB>]`` allocates
 # that many MiB inside the runner process, touching every page so the memory
 # is resident, holds it, releases it and answers. ``[fake:fill-scratch <MiB>]``
@@ -831,7 +964,17 @@ class FakeModelSession:
             return reversible_turn()
         if PROGRESS_DEMO_MARKER in last:
             return progress_demo_turn()
+        # A model fault outranks write-file and gated-connector-tool: the turn
+        # is the provider refusal and makes no tool call. A bad fault argument
+        # returns the default turn here and does not fall through. publish-changes
+        # is not its own branch; it only extends a parsed write-file turn, which
+        # keeps its place above the resource directives and gated-connector-tool.
+        # A bare publish marker falls through.
+        if MODEL_FAULT_MARKER in last:
+            return model_fault_turn(last)
         if WRITE_FILE_MARKER in last:
+            if PUBLISH_CHANGES_MARKER in last:
+                return publish_changes_turn(last, self._cwd)
             return write_file_turn(last, self._cwd)
         if HOLD_MEMORY_MARKER in last:
             return hold_memory_turn(last)
