@@ -189,7 +189,9 @@ class EgressHandler(BaseHTTPRequestHandler):
             self._respond(413, {"detail": "request body is too large"})
             self._drain_rejected_body(length)
             return
-        content_type = (self.headers.get("Content-Type") or "").partition(";")[0].strip().lower()
+        content_type = (
+            (self.headers.get("Content-Type") or "").partition(";")[0].strip().lower()
+        )
         if content_type != "application/json":
             return self._respond(415, {"detail": "Content-Type must be application/json"})
         try:
@@ -203,7 +205,10 @@ class EgressHandler(BaseHTTPRequestHandler):
         except (OSError, UnicodeDecodeError, ValueError, ValidationError):
             logger.warning("invalid reply event")
             return self._respond(400, {"detail": "invalid reply event"})
-        if event.target.kind != CHANNEL_KIND or event.target.address != self.adapter.inbox_address:
+        if (
+            event.target.kind != CHANNEL_KIND
+            or event.target.address != self.adapter.inbox_address
+        ):
             return self._respond(
                 422,
                 {"detail": "event target does not belong to this adapter"},

@@ -28,7 +28,9 @@ from pydantic import TypeAdapter, ValidationError
 
 _EVENTS: TypeAdapter[ReplyEvent] = TypeAdapter(ReplyEvent)
 _CORPUS: dict[str, Any] = json.loads(
-    (Path(__file__).parents[1] / "schema" / "reply-wire.corpus.json").read_text(encoding="utf-8")
+    (Path(__file__).parents[1] / "schema" / "reply-wire.corpus.json").read_text(
+        encoding="utf-8"
+    )
 )
 _PROGRESS_WIRE_KEYS = ("delivery_id", "progress")
 

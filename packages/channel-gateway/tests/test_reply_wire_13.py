@@ -61,11 +61,15 @@ def test_wire_13_replace_edit_updates_generic_blocks_not_an_approval_card(
 ) -> None:
     sink = SlackReplyAdapter("xoxb-test")
     calls: list[dict[str, Any]] = []
+    posts: list[dict[str, Any]] = []
 
     async def chat_update(**kwargs: Any) -> None:
         calls.append(kwargs)
 
-    _install(sink, chat_update=chat_update)
+    async def chat_postMessage(**kwargs: Any) -> None:
+        posts.append(kwargs)
+
+    _install(sink, chat_update=chat_update, chat_postMessage=chat_postMessage)
 
     def _forbid(called: str):
         def render(*_args: object, **_kwargs: object) -> None:
@@ -79,6 +83,7 @@ def test_wire_13_replace_edit_updates_generic_blocks_not_an_approval_card(
     ack = asyncio.run(sink.emit(_replace(), route=ReplyDestination()))
 
     assert ack.ref == "1720000000.000400"
+    assert posts == []
     assert len(calls) == 1
     assert calls[0]["channel"] == "C0EXAMPLE1"
     assert calls[0]["ts"] == "1720000000.000400"
@@ -124,14 +129,43 @@ def test_wire_13_audience_post_is_ephemeral_for_one_user() -> None:
     assert ephemeral[0]["text"] == "only you can see this"
 
 
+def test_wire_13_audience_post_drops_a_non_timestamp_conversation_id() -> None:
+    sink = SlackReplyAdapter("xoxb-test")
+    ephemeral: list[dict[str, Any]] = []
+
+    async def chat_postEphemeral(**kwargs: Any) -> dict[str, str]:
+        ephemeral.append(kwargs)
+        return {"ok": "true", "message_ts": "1720000000.000900"}
+
+    _install(sink, chat_postEphemeral=chat_postEphemeral)
+    event = _audience().model_copy(
+        update={
+            "target": _TARGET.model_copy(update={"conversation_id": "hook:acme:nightly"}),
+        }
+    )
+    ack = asyncio.run(sink.emit(event, route=ReplyDestination()))
+
+    assert ack.ref == "1720000000.000900"
+    assert len(ephemeral) == 1
+    assert "thread_ts" not in ephemeral[0]
+
+
 @pytest.mark.parametrize("verb", ["chat_update", "chat_postEphemeral"])
-def test_wire_13_block_rejection_retries_text_only(verb: str) -> None:
+def test_wire_13_block_rejection_retries_text_only(
+    verb: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     sink = SlackReplyAdapter("xoxb-test")
     calls: list[dict[str, Any]] = []
+    metrics: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        slack_sink_module,
+        "record_metric",
+        lambda name, *, attributes: metrics.append((name, attributes)),
+    )
 
     async def rejected(**kwargs: Any) -> dict[str, str]:
         calls.append(kwargs)
-        if "blocks" in kwargs:
+        if kwargs.get("blocks"):
             raise SlackApiError("invalid_blocks", {"ok": False, "error": "invalid_blocks"})
         return {"ok": "true", "message_ts": "1720000000.000900"}
 
@@ -140,10 +174,23 @@ def test_wire_13_block_rejection_retries_text_only(verb: str) -> None:
     ack = asyncio.run(sink.emit(event, route=ReplyDestination()))
 
     assert len(calls) == 2
-    assert "blocks" in calls[0]
-    assert "blocks" not in calls[1]
+    assert calls[0].get("blocks")
     assert calls[1]["text"] == event.message.text
+    operation = "update" if verb == "chat_update" else "post"
     if verb == "chat_update":
+        assert calls[1]["blocks"] == []
         assert ack.ref == "1720000000.000400"
     else:
+        assert "blocks" not in calls[1]
         assert ack.ref == "1720000000.000900"
+    assert metrics == [
+        (
+            "curie.reply.retry",
+            {
+                "service.name": "curie-worker",
+                "operation": operation,
+                "role": "client",
+                "retry_class": "block-fallback",
+            },
+        )
+    ]

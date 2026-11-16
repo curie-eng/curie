@@ -276,7 +276,7 @@ class ReplyUpdate(_DeliveredEvent):
         description=(
             "Reply wire 1.3. Replace the posted message target.reply_ref names "
             "with message. The body then carries no text, settled, nav, progress "
-            "or text_mode."
+            "or text_mode, and message.interaction is absent."
         ),
     )
 
@@ -291,6 +291,7 @@ class ReplyUpdate(_DeliveredEvent):
             )
         if (
             self.message is None
+            or self.message.interaction is not None
             or self.target.reply_ref is None
             or any(
                 value is not None
@@ -300,7 +301,7 @@ class ReplyUpdate(_DeliveredEvent):
             raise PydanticCustomError(
                 "replace_shape",
                 "a replace update carries a message and a reply_ref, and no text, "
-                "settled, nav, progress or text_mode",
+                "settled, nav, progress or text_mode, and its message carries no interaction",
             )
 
     @model_validator(mode="after")

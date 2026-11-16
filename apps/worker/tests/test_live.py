@@ -144,9 +144,7 @@ def _one_page_pdf(code: str) -> bytes:
             b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
         ),
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        b"<< /Length "
-        + str(len(content)).encode("ascii")
-        + b" >>\nstream\n"
+        b"<< /Length " + str(len(content)).encode("ascii") + b" >>\nstream\n"
         + content
         + b"endstream",
     )
@@ -225,8 +223,12 @@ def _remaining(deadline: float) -> float:
     return min(15.0, remaining)
 
 
-def _preflight(web: httpx.Client, redis_client: Redis, config: _LiveConfig, deadline: float) -> str:
-    identity = _slack_call(web, config.slack_token, "auth.test", timeout=_remaining(deadline))
+def _preflight(
+    web: httpx.Client, redis_client: Redis, config: _LiveConfig, deadline: float
+) -> str:
+    identity = _slack_call(
+        web, config.slack_token, "auth.test", timeout=_remaining(deadline)
+    )
     user_id = identity.get("user_id")
     if not isinstance(user_id, str) or not user_id:
         raise _ProofError("Slack identity prerequisite returned no bot identity")
@@ -261,9 +263,12 @@ def _preflight(web: httpx.Client, redis_client: Redis, config: _LiveConfig, dead
     agent_id = agent.get("id")
     if not isinstance(agent_id, str) or not agent_id:
         raise _ProofError("Curie agent prerequisite returned no agent identity")
-    deployments = _api_get(web, config, f"/deployments?agent_id={agent_id}", _remaining(deadline))
+    deployments = _api_get(
+        web, config, f"/deployments?agent_id={agent_id}", _remaining(deadline)
+    )
     if not any(
-        row.get("agent_id") == agent_id and row.get("status") == "active" for row in deployments
+        row.get("agent_id") == agent_id and row.get("status") == "active"
+        for row in deployments
     ):
         raise _ProofError("Curie agent prerequisite found no active deployment")
     try:
@@ -626,7 +631,9 @@ def _slack_answer(data: object) -> dict[str, Any]:
         }
     message = data.get("message")
     if isinstance(message, dict):
-        kept["message"] = {key: message[key] for key in ("ts", "client_msg_id") if key in message}
+        kept["message"] = {
+            key: message[key] for key in ("ts", "client_msg_id") if key in message
+        }
     kept["keys"] = sorted(data)
     return kept
 

@@ -210,6 +210,10 @@ def _thread_ts(conversation_id: str | None) -> str | None:
     return conversation_id
 
 
+
+
+
+
 def _missing_token(identity: str) -> str:
     return (
         f"no Slack bot token is configured on this worker for identity {identity!r}; "
@@ -508,7 +512,7 @@ class SlackReplyAdapter:
                 ref = await self._post_audience(
                     channel=target.address,
                     user=event.audience_user,
-                    thread_ts=target.conversation_id,
+                    thread_ts=_thread_ts(target.conversation_id),
                     message=event.message,
                     endpoint=endpoint,
                     best_effort_unreachable=best_effort_unreachable,
@@ -1144,7 +1148,9 @@ class SlackReplyAdapter:
 
         Provider contract: https://docs.slack.dev/reference/methods/chat.update/
         ``text`` is the plain ``message.text`` fallback, not mrkdwn. A Block Kit
-        rejection retries once without blocks. A rate limit still raises.
+        rejection retries once with ``blocks=[]``. ``chat.update`` keeps the
+        previous blocks when the call omits them, so an empty list is what
+        clears the old card. A rate limit still raises.
         """
         text = message.text
         blocks = to_blocks(_reply_from_message(message))
@@ -1155,8 +1161,9 @@ class SlackReplyAdapter:
             except SlackApiError as exc:
                 if _slack_retry_class(exc) == "rate-limit":
                     raise
+                _record_reply_retry("update", _slack_retry_class(exc))
                 logger.warning("chat_update with blocks rejected for %s; retrying text-only", ts)
-                await client.chat_update(channel=channel, ts=ts, text=text)
+                await client.chat_update(channel=channel, ts=ts, text=text, blocks=[])
 
         await self._with_transport_fallback(
             endpoint,
@@ -1181,8 +1188,10 @@ class SlackReplyAdapter:
         """Post one message only ``user`` can see, and return Slack's ``message_ts``.
 
         Provider contract: https://docs.slack.dev/reference/methods/chat.postEphemeral/
-        ``thread_ts`` is the target ``conversation_id`` when that is set. The ack
-        is ``message_ts``, not ``ts``.
+        ``thread_ts`` is ``_thread_ts`` of the target conversation id, so a
+        non-timestamp id such as ``hook:<agent>:<name>`` posts at channel level
+        instead of failing with ``invalid_thread_ts``. The ack is ``message_ts``,
+        not ``ts``.
         """
         text = message.text
         blocks = to_blocks(_reply_from_message(message))
@@ -1196,6 +1205,7 @@ class SlackReplyAdapter:
             except SlackApiError as exc:
                 if _slack_retry_class(exc) == "rate-limit":
                     raise
+                _record_reply_retry("post", _slack_retry_class(exc))
                 logger.warning("chat_postEphemeral with blocks rejected; retrying text-only")
                 return await client.chat_postEphemeral(**kwargs)
 
@@ -1244,8 +1254,7 @@ class SlackReplyAdapter:
                 resolved_at=next(
                     (
                         parse_decision_time(item.value)
-                        for item in message.fields
-                        if item.label == "Decided"
+                        for item in message.fields if item.label == "Decided"
                     ),
                     None,
                 ),

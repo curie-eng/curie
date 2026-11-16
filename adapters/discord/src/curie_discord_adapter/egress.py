@@ -73,7 +73,9 @@ class DiscordReplyService:
                 if known is not None:
                     return ReplyAck(ref=known)
             text = (
-                progress_text(event.progress) if event.progress is not None else event.message.text
+                progress_text(event.progress)
+                if event.progress is not None
+                else event.message.text
             )
             ref = await self._discord.post_message(channel_id, text)
             if event.delivery_id is not None:
@@ -93,7 +95,9 @@ class DiscordReplyService:
             )
             return ReplyAck(ref=event.target.reply_ref)
         text = (
-            event.text if event.text is not None else (event.message.text if event.message else "")
+            event.text
+            if event.text is not None
+            else (event.message.text if event.message else "")
         )
         if event.settled is not None:
             if event.settled.decision is None:

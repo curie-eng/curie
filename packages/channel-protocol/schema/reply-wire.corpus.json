@@ -1621,6 +1621,41 @@
       }
     },
     {
+      "name": "replace-with-interaction",
+      "body": {
+        "version": "1.3",
+        "event": "reply.update",
+        "target": {
+          "kind": "slack",
+          "address": "C0EXAMPLE1",
+          "conversation_id": "1720000000.000100",
+          "reply_ref": "1720000000.000400"
+        },
+        "message": {
+          "version": "1.0",
+          "text": "replacement body",
+          "interaction": {
+            "kind": "confirm",
+            "id": "00000000-0000-4000-8000-00000000a001",
+            "prompt": "Deploy acme-bot to production?",
+            "confirm": {
+              "label": "Approve",
+              "value": "approve"
+            },
+            "cancel": {
+              "label": "Reject",
+              "value": "reject"
+            },
+            "allow_free_text": false
+          }
+        },
+        "message_mode": "replace"
+      },
+      "error": {
+        "type": "replace_shape"
+      }
+    },
+    {
       "name": "audience-with-progress",
       "body": {
         "version": "1.3",

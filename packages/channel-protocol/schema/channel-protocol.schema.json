@@ -672,7 +672,7 @@
             }
           ],
           "default": null,
-          "description": "Reply wire 1.3. Replace the posted message target.reply_ref names with message. The body then carries no text, settled, nav, progress or text_mode.",
+          "description": "Reply wire 1.3. Replace the posted message target.reply_ref names with message. The body then carries no text, settled, nav, progress or text_mode, and message.interaction is absent.",
           "title": "Message Mode"
         },
         "nav": {

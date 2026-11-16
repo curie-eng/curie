@@ -158,6 +158,11 @@ def test_wire_13_delivery_id_may_be_present_and_absent_fields_are_omitted() -> N
             "replace_shape",
             id="replace-null-ref",
         ),
+        pytest.param(
+            _replace(message={**_MESSAGE, "interaction": _CONFIRM}),
+            "replace_shape",
+            id="replace-interaction",
+        ),
         pytest.param(_audience(progress=_CARD), "audience_shape", id="audience-progress"),
         pytest.param(
             _audience(message={"version": "1.0", "text": "hi", "interaction": _CONFIRM}),
