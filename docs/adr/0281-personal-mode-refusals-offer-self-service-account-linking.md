@@ -5,7 +5,8 @@ Date: 2026-11-16
 Status: Accepted
 
 Accepted with maintainer approval from TheConnMan, recorded as an approving
-review on the publishing pull request.
+review on the publishing pull request
+([#5721](https://github.com/curie-eng/curie/pull/5721)).
 
 This ADR builds on
 [ADR 0166](0166-tenant-boundary-and-principal-identity-land-together.md),
