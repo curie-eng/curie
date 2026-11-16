@@ -258,45 +258,44 @@ def _sentence_bytes(pattern: re.Pattern[str], message: Any) -> int | None:
         return None
 
 
-def eviction_event_seen(
-    events: list[dict[str, Any]], pods: list[dict[str, Any]], limit_bytes: int
-) -> bool:
+def eviction_event_seen(events: list[dict[str, Any]], pods: list[dict[str, Any]]) -> bool:
     """Whether the kubelet's Evicted event names one of ``pods`` and its storage limit. Pure.
 
     An evicted runner pod is replaced in seconds, so the watch may never see
     its Evicted status. The core/v1 Event the kubelet wrote is the same
     observation: reason Evicted, about a pod UID observed for the failed
-    claim, and the pod-level sentence stating ``limit_bytes``, the containers'
-    total from that pod's spec (or the runner's container-level sentence
-    stating the runner's own limit).
+    claim, and either the pod-level sentence stating that pod's containers'
+    total or the runner's container-level sentence stating that pod's runner
+    limit.
     """
 
-    uids = {
-        uid
-        for pod in pods
-        if isinstance(uid := (pod.get("metadata") or {}).get("uid"), str) and uid
-    }
-    runner_limits: set[int] = set()
+    limits: dict[str, tuple[int | None, int | None]] = {}
     for pod in pods:
+        uid = (pod.get("metadata") or {}).get("uid")
+        if not isinstance(uid, str) or not uid:
+            continue
+        try:
+            total: int | None = runner_limit(pod, "ephemeral_storage")
+        except (KeyError, TypeError, ValueError):
+            total = None
+        runner: int | None = None
         for container in (pod.get("spec") or {}).get("containers") or []:
-            if container.get("name") != "runner":
-                continue
             raw = ((container.get("resources") or {}).get("limits") or {}).get("ephemeral-storage")
-            if raw is not None:
-                runner_limits.add(quantity_bytes(raw))
+            if container.get("name") == "runner" and raw is not None:
+                runner = quantity_bytes(raw)
+        limits[uid] = (total, runner)
     for event in events:
         involved = event.get("involvedObject") or {}
-        if (
-            event.get("reason") != "Evicted"
-            or involved.get("kind") != "Pod"
-            or involved.get("uid") not in uids
-        ):
+        bound = limits.get(involved.get("uid"))
+        if event.get("reason") != "Evicted" or involved.get("kind") != "Pod" or bound is None:
             continue
+        total, runner = bound
         message = event.get("message")
-        if _sentence_bytes(_POD_STORAGE_EVICTION, message) == limit_bytes:
+        pod_level = _sentence_bytes(_POD_STORAGE_EVICTION, message)
+        if pod_level is not None and pod_level == total:
             return True
-        container_limit = _sentence_bytes(_RUNNER_STORAGE_EVICTION, message)
-        if container_limit is not None and container_limit in runner_limits:
+        container_level = _sentence_bytes(_RUNNER_STORAGE_EVICTION, message)
+        if container_level is not None and container_level == runner:
             return True
     return False
 
@@ -473,7 +472,7 @@ def prove_phase(live: Live, phase: Phase) -> None:
                 "json",
             )
         )["items"]
-        seen = eviction_event_seen(evictions, failed_pods, spec_limit)
+        seen = eviction_event_seen(evictions, failed_pods)
     assert seen, (
         f"no observed state of claim {claim}'s pod shows the {phase.dimension} exhaustion: "
         f"pod reasons {[(p.get('status') or {}).get('reason') for p in failed_pods]}, "

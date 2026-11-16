@@ -36,8 +36,10 @@ from .conftest import FakeSandboxClient
 from .recorded_pods import MI, POOL
 from .recorded_pods import client as _client
 from .recorded_pods import event as _event
+from .recorded_pods import event_page as _event_page
 from .recorded_pods import pod as _pod
 from .recorded_pods import shape as _shape
+from .recorded_pods import startup_events as _startup_events
 from .recorded_pods import templates as _templates
 
 OVERRIDE = {
@@ -62,6 +64,7 @@ class _Api:
         self.pod_error = pod_error
         self.objects = objects or {}
         self.pod_reads: list[str] = []
+        self.event_selectors: list[str] = []
 
     def read_namespaced_pod(self, name: str, namespace: str, *, _request_timeout: float) -> Any:
         assert namespace == "test-ns" and _request_timeout > 0
@@ -72,9 +75,10 @@ class _Api:
 
     def list_namespaced_event(
         self, namespace: str, *, field_selector: str, limit: int, _request_timeout: float
-    ) -> SimpleNamespace:
-        del namespace, field_selector, limit, _request_timeout
-        return SimpleNamespace(items=self.events)
+    ) -> Any:
+        assert namespace == "test-ns" and limit > 0 and _request_timeout > 0
+        self.event_selectors.append(field_selector)
+        return _event_page(self.events, field_selector=field_selector, limit=limit)
 
     def get_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, name: str, **_: Any
@@ -319,6 +323,51 @@ def test_a_replacement_pod_leaves_the_recorded_pods_eviction_identified(
     shape = _shape(shape_name)
 
     termination = _after_start(shape, "replaced", [_eviction(shape)], _recorded(shape))
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.exhaustion == exhaustion
+
+
+# The init containers a production sandbox template runs ahead of the runner.
+_INIT_CONTAINERS = ["init-0", "init-1", "init-2", "init-3"]
+
+
+@pytest.mark.parametrize("pod_state", ["missing", "replaced"])
+@pytest.mark.parametrize(
+    ("shape_name", "exhaustion"),
+    [
+        ("scratch-probe", ResourceExhaustion("scratch", "workspace", 8 * MI)),
+        ("ephemeral-probe", ResourceExhaustion("ephemeral_storage", None, 12 * MI)),
+    ],
+)
+def test_an_eviction_past_the_first_page_of_the_pods_events_is_still_identified(
+    shape_name: str, exhaustion: ResourceExhaustion, pod_state: str
+) -> None:
+    # Each container's Pulling, Pulled, Created and Started put more than one
+    # page of events ahead of the kubelet's Evicted event under the pod's name,
+    # and the replacement's own startup follows it.
+    shape = _shape(shape_name)
+    name = shape["metadata"]["name"]
+    since = datetime.now(UTC) - timedelta(minutes=5)
+    containers = _INIT_CONTAINERS + [container["name"] for container in shape["spec"]["containers"]]
+    started = _startup_events(
+        name, containers, uid=shape["metadata"]["uid"], start=since + timedelta(seconds=1)
+    )
+    replacement = _startup_events(
+        name,
+        containers,
+        uid=_replacement(shape)["metadata"]["uid"],
+        start=since + timedelta(seconds=90),
+    )
+    events = [*started, _eviction(shape, at=since + timedelta(seconds=60)), *replacement]
+    first_page = _event_page(
+        events, field_selector=f"involvedObject.kind=Pod,involvedObject.name={name}", limit=20
+    )
+    assert len(started) > 20
+    assert "Evicted" not in {item.reason for item in first_page.items}
+
+    termination = _after_start(shape, pod_state, events, _recorded(shape), since=since)
 
     assert termination is not None
     assert termination.reason == "Evicted"

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import datetime
+from collections.abc import Callable, Iterable
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,76 @@ def event(raw: dict[str, Any], *, uid: str | None, at: datetime) -> Any:
         "lastTimestamp": at.isoformat(),
     }
     return k8s_client.ApiClient()._ApiClient__deserialize(body, "CoreV1Event")  # type: ignore[attr-defined]
+
+
+# The core/v1 Event field selectors the API server supports that the client
+# sends, each as the field it reads on the client's own model.
+_EVENT_SELECTOR_FIELDS: dict[str, Callable[[Any], object]] = {
+    "involvedObject.kind": lambda item: item.involved_object.kind,
+    "involvedObject.name": lambda item: item.involved_object.name,
+    "involvedObject.uid": lambda item: item.involved_object.uid,
+    "reason": lambda item: item.reason,
+}
+
+
+def _first_seen(item: Any) -> datetime:
+    when = (
+        item.first_timestamp
+        or item.last_timestamp
+        or item.event_time
+        or item.metadata.creation_timestamp
+    )
+    assert isinstance(when, datetime), item
+    return when
+
+
+def event_page(events: Iterable[Any], *, field_selector: str, limit: int) -> Any:
+    """The one page the API server answers a field-selected event list with.
+
+    Events are named ``<involvedObject.name>.<hex unix nanos>`` and listed in
+    key order, so a name's events come oldest first. The client follows no
+    continue token, so only the first ``limit`` matches reach it. A selector
+    key outside the supported set fails the test instead of matching all.
+    """
+
+    wanted: dict[str, str] = {}
+    for term in field_selector.split(","):
+        key, equals, value = term.partition("=")
+        assert equals and key in _EVENT_SELECTOR_FIELDS, f"unsupported selector {term!r}"
+        wanted[key] = value
+    matches = [
+        item
+        for item in events
+        if all(_EVENT_SELECTOR_FIELDS[key](item) == value for key, value in wanted.items())
+    ]
+    matches.sort(key=_first_seen)
+    return k8s_client.CoreV1EventList(items=matches[:limit])
+
+
+def startup_events(pod_name: str, containers: list[str], *, uid: str, start: datetime) -> list[Any]:
+    """A pod's startup events, one second apart from ``start``, as the kubelet writes them."""
+
+    raws = [("Scheduled", "Successfully assigned the pod to a node")]
+    for container in containers:
+        raws += [
+            ("Pulling", f'Pulling image "{container}:recorded"'),
+            ("Pulled", f'Successfully pulled image "{container}:recorded"'),
+            ("Created", f"Created container: {container}"),
+            ("Started", f"Started container {container}"),
+        ]
+    return [
+        event(
+            {
+                "reason": reason,
+                "message": message,
+                "type": "Normal",
+                "involvedObject": {"kind": "Pod", "name": pod_name},
+            },
+            uid=uid,
+            at=start + timedelta(seconds=index),
+        )
+        for index, (reason, message) in enumerate(raws)
+    ]
 
 
 def client(api: Any) -> KubernetesSandboxClient:

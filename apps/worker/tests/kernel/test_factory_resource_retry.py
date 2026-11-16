@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -42,14 +42,18 @@ from apps.worker.tests.sandbox.recorded_pods import (
     TEMPLATE,
     client,
     event,
+    event_page,
     pod,
     shape,
+    startup_events,
     templates,
 )
 
 __all__ = ["factory_retry", "factory_retry_database"]
 
 RUNNING: dict[str, Any] = {"phase": "Running"}
+# The init containers a production sandbox template runs ahead of the runner.
+_INIT_CONTAINERS = ["init-0", "init-1", "init-2", "init-3"]
 
 
 def _node_disruption() -> dict[str, Any]:
@@ -102,6 +106,9 @@ class RecordedCluster:
         self.after_failure: str | None = None
         # While set, the failure's events name this UID instead of the pod's own.
         self.event_uid: str | None = None
+        # While set, the pod's name already holds more than one page of startup
+        # events ahead of the failure's, and a replacement's startup follows them.
+        self.startup_events = False
         self._diagnosing = False
         self.held: list[str] = []
         self._create_claim = fake.create_claim
@@ -206,13 +213,13 @@ class RecordedCluster:
         self, namespace: str, *, field_selector: str, limit: int, _request_timeout: float
     ) -> Any:
         assert namespace == NAMESPACE and limit > 0 and _request_timeout > 0
-        name = field_selector.rsplit("involvedObject.name=", 1)[1]
-        if self.failure is None or name not in self.specs:
+        if self.failure is None:
             return k8s_client.CoreV1EventList(items=[])
-        uid = self.event_uid or self._recorded(name)["metadata"]["uid"]
         now = datetime.now(UTC)
-        return k8s_client.CoreV1EventList(
-            items=[
+        events: list[Any] = []
+        for name in self.specs:
+            uid = self.event_uid or self._recorded(name)["metadata"]["uid"]
+            failed = [
                 event(
                     {**raw, "involvedObject": {**raw["involvedObject"], "name": name}},
                     uid=uid,
@@ -220,7 +227,27 @@ class RecordedCluster:
                 )
                 for raw in self.failure.get("events", [])
             ]
-        )
+            if self.startup_events:
+                containers = _INIT_CONTAINERS + [
+                    container["name"] for container in self.specs[name]["containers"]
+                ]
+                failed = [
+                    *startup_events(
+                        name,
+                        containers,
+                        uid=self._recorded(name)["metadata"]["uid"],
+                        start=now - timedelta(seconds=len(containers) * 4 + 2),
+                    ),
+                    *failed,
+                    *startup_events(
+                        name,
+                        containers,
+                        uid=self._replacement(name)["metadata"]["uid"],
+                        start=now + timedelta(seconds=1),
+                    ),
+                ]
+            events += failed
+        return event_page(events, field_selector=field_selector, limit=limit)
 
     def get_namespaced_custom_object(
         self, group: str, version: str, namespace: str, plural: str, name: str, **_: Any
@@ -495,6 +522,7 @@ GONE_STORAGE_CASES = [
         {
             "failure": "ephemeral-probe",
             "after": after,
+            "startup_events": startup,
             "cause": "sandbox_storage_exhausted",
             "volume": None,
             "gate": {
@@ -505,14 +533,16 @@ GONE_STORAGE_CASES = [
             },
             "first": {"memory": 64 * MI, "storage": 12 * MI, "scratch": {}},
         },
-        id=f"ephemeral-storage-{after}",
+        id=f"ephemeral-storage-{after}" + ("-past-a-page-of-startup-events" if startup else ""),
     )
     for after in ("missing", "replaced")
+    for startup in (False, True)
 ] + [
     pytest.param(
         {
             "failure": "scratch-probe",
             "after": "missing",
+            "startup_events": False,
             "cause": "sandbox_scratch_exhausted",
             "volume": "workspace",
             "gate": {
@@ -538,6 +568,7 @@ def test_storage_eviction_of_a_vanished_pod_is_diagnosed_from_its_bound_event(
     case = factory_retry
     cluster = RecordedCluster(case.h.fake_k8s, shape(gone["failure"])["spec"])
     cluster.after_failure = gone["after"]
+    cluster.startup_events = gone["startup_events"]
     turns = case.h.config.work_item_max_turns
 
     async def exercise() -> None:

@@ -2043,6 +2043,25 @@ class KubernetesSandboxClient:
             pod_missing = exc.status == 404
         except Exception:  # noqa: BLE001 - diagnosis is best effort
             pass
+        # The recorded pod's own Evicted events, read first: once the pod is
+        # gone or replaced they are the only evidence that names a limit.
+        evictions: Any = None
+        if recorded is not None and recorded.uid and time.monotonic() < deadline:
+            # A name's events list oldest first and a replacement shares the
+            # name, so the kubelet's Evicted event can sit past any first page
+            # of the generic list below. This list holds only that event.
+            try:
+                evictions = self._core_api.list_namespaced_event(
+                    self._namespace,
+                    field_selector=(
+                        f"involvedObject.kind=Pod,involvedObject.name={name},"
+                        f"involvedObject.uid={recorded.uid},reason=Evicted"
+                    ),
+                    limit=10,
+                    _request_timeout=max(0.001, deadline - time.monotonic()),
+                )
+            except Exception:  # noqa: BLE001 - an unread event is no evidence
+                evictions = None
         events: Any = None
         if time.monotonic() < deadline:
             try:
@@ -2061,7 +2080,9 @@ class KubernetesSandboxClient:
         if pod is not None and _recent(
             getattr(getattr(pod, "metadata", None), "creation_timestamp", None), since=since
         ):
-            bound = _bound_storage_eviction(events, pod_name=name, recorded=recorded, since=since)
+            bound = _bound_storage_eviction(
+                evictions, pod_name=name, recorded=recorded, since=since
+            )
             if bound is not None:
                 return bound
             return SandboxTermination("Deleted", "replaced by a new pod with the same name")
@@ -2077,7 +2098,7 @@ class KubernetesSandboxClient:
         ):
             pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
             bound = _bound_storage_eviction(
-                events,
+                evictions,
                 pod_name=name,
                 recorded=recorded,
                 since=since,
