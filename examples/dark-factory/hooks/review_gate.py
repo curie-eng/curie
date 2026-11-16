@@ -159,7 +159,13 @@ One script handles every hook event the bundle registers:
     checkout the diff reviewer already approved is refused (cause
     ``already_approved``): go to publish. An approval of another checkout is
     cleared. Then the timing check. A checkout identical to the last one that
-    got ``CHANGES`` is refused without a stop (cause ``no_progress``). With
+    got ``CHANGES`` is refused without a stop (cause ``no_progress``). A
+    pull-request follow-up, recognized because its opening prompt contains
+    "review feedback on this work item's pull request", refuses a diff review
+    whose candidate patch is empty (cause ``empty_candidate_patch``) without
+    stopping the run. Plan review of that same empty checkout stays admitted,
+    and an issue run's empty diff review stays admitted, so a change request
+    can still pass plan review before it edits. With
     ``DIFF_ROUNDS`` rounds completed the run stops and writes ``curie_gate:
     review_refused`` with cause ``round_cap``, stage ``review_diff``, the
     completed ``round`` and the ``cap``. Each later diff review that the stop
@@ -573,6 +579,18 @@ def _bounded(text: str) -> str:
     return text if len(text) <= FINDINGS_LIMIT else f"{text[:FINDINGS_LIMIT]}\n[truncated]"
 
 
+def _pull_request_follow_up(prompt: str) -> bool:
+    """Whether the opening prompt is review feedback on this work item's pull request.
+
+    The phrase is the one both follow-up objectives write. It is read from the
+    user message inside a sender frame, so a frame header cannot hide it or
+    supply it. Old state files omit the flag; callers treat a missing key as false.
+    """
+
+    message = "\n".join(_message_lines(prompt))
+    return "review feedback on this work item's pull request" in message
+
+
 def _fresh(prompt: str = "") -> dict[str, Any]:
     """Fresh state for a new run, or for a CI fix round.
 
@@ -607,6 +625,9 @@ def _fresh(prompt: str = "") -> dict[str, Any]:
         "findings": None,
         # The fingerprint of the last diff candidate that got CHANGES.
         "rejected": None,
+        # Set from the opening prompt. An empty candidate refuses diff review
+        # only when this is true. Plan review stays admitted either way.
+        "pull_request_follow_up": _pull_request_follow_up(prompt),
     }
 
 
@@ -1537,6 +1558,16 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         # C is only built against a commit id, so the base is one here.
         if built is None or built.patch is None or not _is_commit(base):
             return _deny(UNVERIFIABLE)
+        # A question on a pull request has no diff. Refuse this review without
+        # stopping the run, so a later non-empty patch can still be reviewed.
+        # Plan review is not refused: it runs on the clean tree before edits.
+        if state.get("pull_request_follow_up") and (
+            not built.changed_paths or not built.patch.strip()
+        ):
+            emit_gate(state, "review_refused", cause="empty_candidate_patch", stage="review_diff")
+            return _deny(
+                "Diff review refused: the candidate patch is empty, so there is no diff to review."
+            )
         digest = candidate_digest(base, built.tree)
         try:
             patch_path = write_candidate_patch(built.tree, built.patch)

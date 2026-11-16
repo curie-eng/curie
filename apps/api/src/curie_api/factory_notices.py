@@ -300,6 +300,11 @@ _DESIRED_LABEL = {
 }
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
 _WAITING_FOR_PROGRESS = "_Waiting for the agent to report progress._"
+_READING_PULL_REQUEST = "Reading the pull request and its Decisions"
+# A running pull request follow-up hides its checklist until a phase other than
+# these is reported. verification_preflight is the platform's own check, not
+# the agent entering the revision pipeline.
+_EARLY_FOLLOW_UP_PHASES = frozenset({VERIFICATION_PREFLIGHT_PHASE, "read_issue"})
 _MARKDOWN_SPECIAL = set("\\`*_[]()#<>!|")
 # #3127 AC2: queued work isn't stuck, it's waiting out an upgrade.
 _PAUSED_FOR_UPGRADE_LINE = (
@@ -667,6 +672,7 @@ def status_body(
     paused_for_upgrade: bool = False,
     waiting_line: str | None = None,
     base_line: str | None = None,
+    progress_line: str | None = None,
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
@@ -674,13 +680,15 @@ def status_body(
     last nonempty note as one inert line. A final result can also include the
     agent's last message as a neutralized Markdown quote. With a card, the checklist
     and waiting placeholder are left out; without one the checklist is the
-    fallback (#3125).
+    fallback (#3125). A ``progress_line`` replaces both the card and the checklist.
     """
 
     parts: list[str] = []
     if result is not None:
         parts.append(result.rstrip("\n"))
-    if card_url:
+    if progress_line:
+        parts.append(progress_line)
+    elif card_url:
         parts.append(f"![Curie status]({card_url})")
     elif phase_view is not None and phase_view.phases:
         parts.append("\n".join(_checklist(phase_view, final=result is not None)))
@@ -1300,6 +1308,7 @@ async def _render(
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
     retrying = False
+    unchanged = False
     triage = await _terminal_triage_text(session, work_item, request, handoff)
     if triage is not None:
         result = triage
@@ -1403,7 +1412,17 @@ async def _render(
         )
     ) is not None
     view: PhaseView | None = None
-    if row.declaration is not None or (result is not None and cause == "budget_exceeded"):
+    follow_up_running = (
+        result is None
+        and request.status == "running"
+        and target.kind in {"pull_request", "review_thread"}
+    )
+    reports: list[ExecutionRequestPhaseReport] = []
+    if (
+        row.declaration is not None
+        or (result is not None and cause == "budget_exceeded")
+        or follow_up_running
+    ):
         reports = list(
             await session.scalars(
                 select(ExecutionRequestPhaseReport)
@@ -1431,7 +1450,19 @@ async def _render(
                 label = labels.get(latest_note.phase, latest_note.phase)
                 progress = _inert_line(f"Last progress note: {label}: {latest_note.note}")[:300]
                 result += progress + "\n"
-    pill_label, _color, _live = pill_for(request.status, publishing, retrying=retrying)
+    # An unchanged completion answered a question: the checklist would show
+    # steps that did not run. The card image stays.
+    answered = unchanged and request.status == "completed" and cause == "completed"
+    if answered:
+        view = None
+    progress_line: str | None = None
+    if follow_up_running and not any(
+        report.phase not in _EARLY_FOLLOW_UP_PHASES for report in reports
+    ):
+        progress_line = _READING_PULL_REQUEST
+    pill_label, _color, _live = pill_for(
+        request.status, publishing, retrying=retrying, answered=answered
+    )
     pending_count = await session.scalar(
         select(func.count(ExecutionRequest.id)).where(
             ExecutionRequest.work_item_id == work_item.id,
@@ -1462,15 +1493,19 @@ async def _render(
         .limit(1)
     )
     base = forges_registry(settings).card_base_url
+    card_url = (
+        None if progress_line or not base else f"{base}/v1/factory/cards/{row.card_token}.svg"
+    )
     body = status_body(
         request_id=row.execution_request_id,
-        card_url=f"{base}/v1/factory/cards/{row.card_token}.svg" if base else None,
+        card_url=card_url,
         pill_label=pill_label,
-        phase_view=view,
+        phase_view=None if progress_line else view,
         result=result,
         paused_for_upgrade=paused_for_upgrade,
         waiting_line=waiting_line,
         base_line=render_base_line(work_item, transition),
+        progress_line=progress_line,
     )
     if (
         request.status in {"queued", "waiting", "running", "cancellation_requested"}

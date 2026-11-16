@@ -2004,7 +2004,7 @@ def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
     path = f"/repos/{REPO}/issues/{number}/comments"
     assert [posted_path for posted_path, _body in posts] == [path]
     body = _assert_one_final_comment([comment["body"] for comment in sink.lists[path]], revision)
-    assert "Status: SUCCEEDED" in body
+    assert "Status: ANSWERED" in body
     assert (
         "No changes needed: the open pull request already covers this request: "
         f"https://github.com/{REPO}/pull/{pr}"
@@ -2062,7 +2062,7 @@ def _assert_lead_in_unchanged_completion(
     path = f"/repos/{REPO}/issues/{number}/comments"
     assert [posted_path for posted_path, _body in posts] == [path]
     body = _assert_one_final_comment([comment["body"] for comment in sink.lists[path]], revision)
-    assert "Status: SUCCEEDED" in body
+    assert "Status: ANSWERED" in body
     assert (
         "No changes needed: the open pull request already covers this request: "
         f"https://github.com/{REPO}/pull/{pr}"
@@ -2153,7 +2153,7 @@ def test_a_review_revision_with_no_changes_completes_in_its_thread(
     path = f"/repos/{REPO}/pulls/{pr}/comments/88121/replies"
     assert [posted_path for posted_path, _body in posts] == [path]
     body = posts[0][1] or ""
-    assert "Status: SUCCEEDED" in body
+    assert "Status: ANSWERED" in body
     assert "No changes needed: this pull request is unchanged." in body
     assert f"In response to https://github.com/{REPO}/pull/{pr}#discussion_r88121" in body
     assert "Agent's last message:" in body
@@ -2300,7 +2300,7 @@ def test_a_relabel_with_no_changes_on_an_adopted_pull_request_completes(
     body = _assert_one_final_comment(
         [comment["body"] for comment in sink.lists[path]], second["id"]
     )
-    assert "Status: SUCCEEDED" in body
+    assert "Status: ANSWERED" in body
     assert (
         "No changes needed: the open pull request already covers this request: "
         f"https://github.com/{REPO}/pull/{number}"

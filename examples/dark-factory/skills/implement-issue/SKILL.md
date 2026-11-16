@@ -237,7 +237,9 @@ instructions still apply. Keep the table current from `plan` through every
 
 ## 1. Read the issue (phase `read_issue`)
 
-Call report_progress with phase `read_issue`.
+A pull request follow-up that asks a question and does not ask for a change is answered before any `mcp__curie__report_progress` call. Read the supplied issue, `pull_request_body`, and the current diff. Answer from the Decisions section and the current diff first. Make no edits and do not call `mcp__curie__publish_changes`. Do not call `mcp__curie__report_progress`. Reply with `No changes needed:` in fewer than 3000 characters. Cite the Decisions entry number when it records the reason. When it does not, say plainly that the reason was not recorded. A plausible explanation from the current code is not a historical decision record. Start the revision pipeline only when the comment asks for a change. Such an answer never enters plan review or publication, so a review gate notice about the checkout does not stop it. Answer from the sources you can read and name any you could not.
+
+Call `mcp__curie__report_progress` with phase `read_issue` only when this run is not that question.
 
 Your message is the issue link, for example
 `https://github.com/<owner>/<repo>/issues/<number>` for a GitHub issue or
@@ -254,16 +256,7 @@ If the issue cannot be read (the tool is missing, refused, or returns an
 error), stop: say that the issue could not be read and why. Never guess what
 an issue says from its title or number.
 
-For a follow-up that asks a question about an existing pull request without
-requesting a change, read the supplied issue, `pull_request_body`, diff and
-relevant repository context. Make no edits and do not call
-`mcp__curie__publish_changes`. Reply with `No changes needed:` in fewer than
-3000 characters, answer the question from that evidence, and cite the
-Decisions entry number when it records the reason. When it does not, say
-plainly that the reason was not recorded. A plausible explanation from the
-current code is not a historical decision record. Such an answer never enters
-plan review or publication, so a review gate notice about the checkout does
-not stop it; answer from the sources you can read and name any you could not.
+A question follow-up is answered at the start of this step, before this phase's progress report.
 
 ## 2. Pin the acceptance criteria (phase `pin_criteria`)
 
