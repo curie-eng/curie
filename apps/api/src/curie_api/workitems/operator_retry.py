@@ -2,7 +2,7 @@
 
 One administrative operation in one transaction. It never builds its own
 admission: it reruns the automatic successor admission
-(``lifecycle._admit_automatic_successor``) against the WorkItem's newest
+(``lifecycle.admit_automatic_successor``) against the WorkItem's newest
 request, with the disposition ``factory_retry_policy.decide`` derives from that
 request's stored typed facts. So an operator can admit now exactly what
 automatic recovery would admit now, inside the same shared allowance, fences,
@@ -40,7 +40,7 @@ from ..factory_tracker_result_runtime import CONTRACT_TRACKER_RESULT
 from ..models import ExecutionRequest, WorkItemOperatorRetry
 from ..schemas.workitems import WorkItemRetryIn, WorkItemRetryOut
 from . import lifecycle
-from .lifecycle import AUTOMATIC_RETRY_LIMIT, _admit_automatic_successor
+from .lifecycle import AUTOMATIC_RETRY_LIMIT, admit_automatic_successor
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +286,7 @@ async def retry_work_item(
         elif safety != "no_effects":
             raise await refuse("side_effects_unproven", cause=cause, retry_safety=safety)
 
-    admitted = await _admit_automatic_successor(
+    admitted = await admit_automatic_successor(
         session, work_item, predecessor, origin=origin, disposition=disposition
     )
     successor = await lifecycle.automatic_successor_of(session, predecessor) if admitted else None
