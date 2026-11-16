@@ -396,3 +396,13 @@ pub enum TargetLiteral {
     Bool(bool),
     Text(String),
 }
+
+/// Request body of `POST /work-items/{id}/retry` (`WorkItemRetryIn`, #5431).
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkItemRetryRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+    pub expected_version: u64,
+    pub reason: String,
+    pub request_id: uuid::Uuid,
+}

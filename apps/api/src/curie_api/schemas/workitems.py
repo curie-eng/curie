@@ -1,10 +1,17 @@
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from curie_internal.requester_coding_instructions import AbsenceReason
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StrictBool
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+)
 
 from curie_api.factory_retry_policy import RetrySafety
 
@@ -482,3 +489,49 @@ class FactorySlackKickoffOut(BaseModel):
     issue_url: str | None = None
     replayed: bool = False
     reason: str | None = None
+
+
+# The operator's reason for a retry, stripped before validation, hashing and storage.
+RetryReason = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+
+
+class WorkItemRetryIn(BaseModel):
+    """An operator's request to admit one fresh request for a failed WorkItem (#5431).
+
+    ``request_id`` is the operator's idempotency key. ``expected_version`` is
+    the WorkItem version the operator read. ``dry_run`` answers the exact plan
+    and writes nothing, reserving neither the key nor a retry slot.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: uuid.UUID
+    expected_version: int = Field(ge=1)
+    reason: RetryReason
+    dry_run: StrictBool = False
+
+
+class WorkItemRetryOut(BaseModel):
+    """The admission an operator retry made, would make (dry run) or made before (replay).
+
+    ``disposition`` is the successor's kind: ``implementation`` reruns the
+    work, ``publication_recovery`` publishes the retained candidate without a
+    model run. ``retries_used`` counts the slot this admission spends.
+    ``successor_request_id`` and ``recorded_at`` are null in a dry run.
+    """
+
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    dry_run: bool
+    replayed: bool
+    disposition: Literal["implementation", "publication_recovery"]
+    predecessor_request_id: uuid.UUID
+    predecessor_cause: str
+    successor_request_id: uuid.UUID | None
+    successor_dispatch_not_before: datetime
+    successor_blocked_on: str | None
+    work_item_version: int
+    retries_used: int
+    retry_limit: int
+    actor_kind: Literal["platform_key", "console_session"]
+    recorded_at: datetime | None

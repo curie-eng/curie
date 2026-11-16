@@ -502,6 +502,12 @@
       "version": "1.0"
     },
     {
+      "result": "WorkItemRetryOutput",
+      "kind": "CliOutput",
+      "schema": "work-item-retry.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "WorkItemsOutput",
       "kind": "CliOutput",
       "schema": "work-items.schema.json",

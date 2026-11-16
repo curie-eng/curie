@@ -197,6 +197,7 @@ mod upgrade_drill;
 mod valkey_required_gate;
 mod verify_fix_pin;
 mod wake_operator;
+mod work_item_retry;
 mod work_items;
 mod worker_claims;
 

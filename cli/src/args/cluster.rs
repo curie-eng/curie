@@ -1353,11 +1353,35 @@ pub(crate) enum ClusterAction {
         #[arg(value_name = "ID")]
         id: Option<String>,
         /// Scope to one agent (name or id).
-        #[arg(long, value_name = "NAME_OR_ID")]
+        #[arg(long, value_name = "NAME_OR_ID", conflicts_with = "rerun")]
         agent: Option<String>,
+        /// Operator retry of the work item's failed request
+        /// (`POST /work-items/{id}/retry`). Requires the ID, --request-id,
+        /// --expected-version and --reason, and --yes for a real call.
+        #[arg(long)]
+        rerun: bool,
+        /// Idempotency key (a UUID) for --rerun; replaying it returns the
+        /// stored result.
+        #[arg(long, value_name = "UUID", requires = "rerun")]
+        request_id: Option<String>,
+        /// The work item version you read (--rerun refuses when it moved).
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "rerun",
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        expected_version: Option<u64>,
+        /// Why the operator reruns it, 1 to 500 characters (--rerun).
+        #[arg(long, value_name = "TEXT", requires = "rerun")]
+        reason: Option<String>,
         #[command(flatten)]
         conn: ClusterConn,
+        /// Confirm a real --rerun; without it the call is refused.
+        #[arg(long, requires = "rerun")]
+        yes: bool,
         /// Print what would be requested and exit without making a request.
+        /// With --rerun, ask the API for the exact plan and write nothing.
         #[arg(long)]
         dry_run: bool,
     },

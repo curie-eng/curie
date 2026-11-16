@@ -54,6 +54,11 @@
       "omissions": []
     },
     {
+      "struct": "WorkItemRetry",
+      "schema": "WorkItemRetryOut",
+      "omissions": []
+    },
+    {
       "struct": "WorkItemOutcome",
       "schema": "WorkItemOutcomeOut",
       "omissions": [
@@ -689,6 +694,11 @@
   "_requests_comment": "Typed request bodies (#3834). Every platform JSON send in cli/src/api.rs is a .json::<T>(..) call on self.http.<method>(format!(\"{}<path>\", self.base_url, ..)). request_mirrors maps each body struct (cli/src/api_requests.rs, or a shared Serialize DTO in cli/src/api.rs) to its OpenAPI request schema, with justified omissions just like mirrors. requests binds each sending fn to the struct, method and OpenAPI path it sends; the gate checks the method and path against the source and the operation's requestBody schema against the mirror. Check with: curie dev field-parity",
   "request_mirrors": [
     {
+      "struct": "WorkItemRetryRequest",
+      "schema": "WorkItemRetryIn",
+      "omissions": []
+    },
+    {
       "struct": "AgentCreate",
       "schema": "AgentCreate",
       "omissions": [
@@ -960,6 +970,12 @@
     }
   ],
   "requests": [
+    {
+      "function": "retry_work_item",
+      "struct": "WorkItemRetryRequest",
+      "method": "post",
+      "path": "/work-items/{work_item_id}/retry"
+    },
     {
       "function": "create_agent",
       "struct": "AgentCreate",

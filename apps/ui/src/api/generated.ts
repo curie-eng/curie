@@ -4983,6 +4983,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/{work_item_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Work Item
+         * @description Admit one fresh request for a failed WorkItem, as automatic recovery would (#5431).
+         *
+         *     Reruns the automatic successor admission against the newest failed
+         *     request, inside the same shared allowance. ``request_id`` makes the call
+         *     idempotent; ``dry_run`` answers the exact plan and writes nothing. The
+         *     actor is the authenticated credential, never the body. Refusals are 409
+         *     with a named ``code``; a missing WorkItem is 404.
+         */
+        post: operations["retry_work_item_work_items__work_item_id__retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/{work_item_id}/usage": {
         parameters: {
             query?: never;
@@ -13588,6 +13614,89 @@ export interface components {
             termination_observation: string | null;
             /** Wait Deadline */
             wait_deadline: string | null;
+        };
+        /**
+         * WorkItemRetryIn
+         * @description An operator's request to admit one fresh request for a failed WorkItem (#5431).
+         *
+         *     ``request_id`` is the operator's idempotency key. ``expected_version`` is
+         *     the WorkItem version the operator read. ``dry_run`` answers the exact plan
+         *     and writes nothing, reserving neither the key nor a retry slot.
+         */
+        WorkItemRetryIn: {
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run?: boolean;
+            /** Expected Version */
+            expected_version: number;
+            /** Reason */
+            reason: string;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+        };
+        /**
+         * WorkItemRetryOut
+         * @description The admission an operator retry made, would make (dry run) or made before (replay).
+         *
+         *     ``disposition`` is the successor's kind: ``implementation`` reruns the
+         *     work, ``publication_recovery`` publishes the retained candidate without a
+         *     model run. ``retries_used`` counts the slot this admission spends.
+         *     ``successor_request_id`` and ``recorded_at`` are null in a dry run.
+         */
+        WorkItemRetryOut: {
+            /**
+             * Actor Kind
+             * @enum {string}
+             */
+            actor_kind: "platform_key" | "console_session";
+            /**
+             * Disposition
+             * @enum {string}
+             */
+            disposition: "implementation" | "publication_recovery";
+            /** Dry Run */
+            dry_run: boolean;
+            /** Predecessor Cause */
+            predecessor_cause: string;
+            /**
+             * Predecessor Request Id
+             * Format: uuid
+             */
+            predecessor_request_id: string;
+            /** Recorded At */
+            recorded_at: string | null;
+            /** Replayed */
+            replayed: boolean;
+            /**
+             * Request Id
+             * Format: uuid
+             */
+            request_id: string;
+            /** Retries Used */
+            retries_used: number;
+            /** Retry Limit */
+            retry_limit: number;
+            /** Successor Blocked On */
+            successor_blocked_on: string | null;
+            /**
+             * Successor Dispatch Not Before
+             * Format: date-time
+             */
+            successor_dispatch_not_before: string;
+            /** Successor Request Id */
+            successor_request_id: string | null;
+            /**
+             * Work Item Id
+             * Format: uuid
+             */
+            work_item_id: string;
+            /** Work Item Version */
+            work_item_version: number;
         };
         /**
          * WorkItemStageOut
@@ -24387,6 +24496,43 @@ export interface operations {
                 };
                 content: {
                     "application/octet-stream": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_work_item_work_items__work_item_id__retry_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                work_item_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorkItemRetryIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkItemRetryOut"];
                 };
             };
             /** @description Validation Error */

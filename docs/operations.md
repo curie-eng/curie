@@ -2115,6 +2115,48 @@ earlier release omits it, its finish is refused with 422, and its request ends
 `expired` with cause `execution_deadline` instead of the real cause. Roll the
 workers together with the API.
 
+An operator can ask for the same admission again instead of relabelling the
+issue (#5431):
+`curie cluster work-items <ID> --rerun --request-id <UUID> --expected-version <N> --reason <TEXT> --yes`,
+which calls the administrative `POST /work-items/{id}/retry` with the platform
+key or a live console session. It reruns exactly the automatic admission
+against the WorkItem's newest request, so it admits only what automatic
+recovery would admit now: the same two shared slots, the same backoff, and a
+publication recovery of the exact retained candidate in preference to a new
+implementation run. It helps when the fence that refused the automatic retry
+has since cleared (a publication of the same conversation was still in
+flight, a newer revision was queued) or when the failure settled before
+automatic retries existed. It never grants a slot, resets a count, writes a
+tracker label or posts a notice. The successor's status comment follows the
+normal flow.
+
+Use it in this order:
+
+1. Read the WorkItem with `curie cluster work-items <ID>` and note its
+   version and newest request.
+2. Pick a new UUID for `--request-id` and give a reason of at most 500
+   characters. The reason and the authenticated actor are recorded; the
+   credential is not.
+3. Run the command with `--dry-run` first. It answers the exact plan, the
+   disposition (`implementation` or `publication_recovery`), the retries used
+   after this one and the successor's due time, and writes nothing, so the
+   same UUID stays free.
+4. Run it again with `--yes` and the same UUID. Repeating that exact call
+   returns the same result with `replayed` true, even after the version moved;
+   the same UUID with another reason, version or actor is refused as
+   `idempotency_conflict`.
+
+A refusal writes nothing and names its code: `stale_version` (read the item
+again), `work_item_cancelled`, `readmit_pending` (a relabel is already
+pending), `active_execution` (a request is waiting, queued or running),
+`no_failed_request` (the newest request completed, expired or was cancelled),
+`teardown_unconfirmed` (a lost run's teardown is not observed yet),
+`allowance_exhausted` (it names the used count and the last cause; nothing here
+adds more), `not_retryable` (for example `no_pull_request`, a denial or
+`budget_exceeded`), `side_effects_unproven` (the failed run was `flagged` or
+`uncertain`) and `admission_refused` (a fence inside the automatic admission
+still holds).
+
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it
 in place; there is no separate final comment. While the run is live the

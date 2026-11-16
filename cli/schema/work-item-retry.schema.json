@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/work-item-retry/v1.json",
+  "title": "curie cluster work-items ID --rerun --json",
+  "description": "The agent-facing payload of `curie cluster work-items ID --rerun`: the platform API's WorkItemRetryOut, for a real admission, an idempotent replay (`replayed` true) and a dry run (`dry_run` true, `successor_request_id` and `recorded_at` null).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "work_item_id",
+    "request_id",
+    "dry_run",
+    "replayed",
+    "disposition",
+    "predecessor_request_id",
+    "predecessor_cause",
+    "successor_request_id",
+    "successor_dispatch_not_before",
+    "successor_blocked_on",
+    "work_item_version",
+    "retries_used",
+    "retry_limit",
+    "actor_kind",
+    "recorded_at"
+  ],
+  "properties": {
+    "work_item_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "request_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "replayed": {
+      "type": "boolean"
+    },
+    "disposition": {
+      "enum": [
+        "implementation",
+        "publication_recovery"
+      ]
+    },
+    "predecessor_request_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "predecessor_cause": {
+      "type": "string"
+    },
+    "successor_request_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "successor_dispatch_not_before": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "successor_blocked_on": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "work_item_version": {
+      "type": "integer"
+    },
+    "retries_used": {
+      "type": "integer"
+    },
+    "retry_limit": {
+      "type": "integer"
+    },
+    "actor_kind": {
+      "enum": [
+        "platform_key",
+        "console_session"
+      ]
+    },
+    "recorded_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    }
+  }
+}
