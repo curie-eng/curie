@@ -3,6 +3,13 @@
 Date: 2026-11-04
 Status: Accepted
 
+**Partially amended by [ADR 0281](0281-personal-mode-refusals-offer-self-service-account-linking.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+decision 2's sentence "No new identity namespace or automatic identity linking
+is implied." In personal mode, ADR 0281 lets a person link their own Slack and
+GitHub accounts to their principal on proof of control of each account. No
+link is made without that action, and no new identity namespace is added.
+
 Accepted 2026-11-04 with explicit maintainer approval from Brian Conn (TheConnMan), recorded in #5371.
 
 ## Context

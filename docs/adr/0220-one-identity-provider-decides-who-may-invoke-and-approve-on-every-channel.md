@@ -4,6 +4,12 @@ Date: 2026-10-13
 
 Status: Accepted
 
+**Partially amended by [ADR 0281](0281-personal-mode-refusals-offer-self-service-account-linking.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0281 amends section 3's issuance scope by letting a personal-mode tenant
+without a directory-synced identity provider issue a connect token, with the
+Console OIDC issuer as its issuer.
+
 **Partially amended by [ADR 0272](0272-approver-dm-delivery-uses-one-selected-recipient.md)**
 (back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 ADR 0272 amends decision 10's card-location clause by adding one selected
