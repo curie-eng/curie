@@ -3650,8 +3650,9 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
         (named_steps, "curie-upgrade"),
         (negative_steps, "curie-upgrade-negative"),
     ):
+        config = f"kind-{cluster.removeprefix('curie-')}-config.yaml"
         assert owner_steps[setup_name]["run"] == (
-            f"bash .github/scripts/prepare-kind.sh {cluster} kind-{cluster.removeprefix('curie-')}-config.yaml"
+            f"bash .github/scripts/prepare-kind.sh {cluster} {config}"
         )
     matrix_disk = next(
         step["run"]
