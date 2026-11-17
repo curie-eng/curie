@@ -5,7 +5,9 @@ The PDF proof requires ``CURIE_LIVE_PDF_PROOF=1`` and the platform, Slack, and
 Valkey environment named in ``_REQUIRED_ENV``; the external driver owns the
 isolated stack, Valkey database, worker, runner, and their teardown. The
 progress proof (ADR-0130) requires ``CURIE_LIVE_PROGRESS_PROOF=1`` and only the
-Slack environment named in ``_PROGRESS_REQUIRED_ENV``. Run them with
+Slack environment named in ``_PROGRESS_REQUIRED_ENV``. The reply wire 1.3 proof
+requires ``CURIE_LIVE_REPLY_WIRE_PROOF=1`` and the same Slack environment. The
+pytest job sets none of these, so each proof skips there. Run them with
 ``uv run pytest apps/worker/tests/test_live.py -q -s``; ``-s`` shows what the
 progress proof records.
 """
@@ -843,10 +845,19 @@ def test_live_wire_13_replace_edit_and_audience_post() -> None:
     Slack answers ok, and the SDK raises when it does not. That raise is the
     ok proof.
 
+    The merge-queue pytest job does not provide Slack credentials. The proof
+    runs only with ``CURIE_LIVE_REPLY_WIRE_PROOF=1``. A requested proof with
+    either credential missing fails.
+
     Provider contract: https://docs.slack.dev/reference/methods/chat.postEphemeral/
     and https://docs.slack.dev/reference/methods/chat.update/
     """
 
+    if os.environ.get("CURIE_LIVE_REPLY_WIRE_PROOF") != "1":
+        pytest.skip(
+            "set CURIE_LIVE_REPLY_WIRE_PROOF=1, SLACK_BOT_TOKEN and "
+            "SLACK_TEST_CHANNEL to run the live reply wire 1.3 proof"
+        )
     if not os.environ.get("SLACK_BOT_TOKEN") or not os.environ.get("SLACK_TEST_CHANNEL"):
         pytest.fail("SLACK_BOT_TOKEN and SLACK_TEST_CHANNEL are required", pytrace=False)
     token = os.environ["SLACK_BOT_TOKEN"]
