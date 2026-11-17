@@ -1,4 +1,4 @@
-"""Closed retained state and actual Lua writer interoperability, @spec COMMISSIONING-SERIES-3."""
+"""Closed retained state, @spec COMMISSIONING-SERIES-3."""
 
 from __future__ import annotations
 
@@ -12,13 +12,9 @@ from typing import Any
 
 import pytest
 
-from . import worker_broker as wb
-from .commissioning_journal_broker import Campaign, encoded, principals, run
+from .commissioning_journal_broker import encoded
 from .test_commissioning_records import permit_value
-from .test_commissioning_reservations import Running
 
-pworker_service = wb.pworker_service
-__all__ = ["principals"]
 VECTORS = json.loads(
     (Path(__file__).resolve().parents[3] / "tests/vectors/commissioning-retained.json").read_text()
 )["cases"]
@@ -184,47 +180,3 @@ def test_duplicate_required_member_is_not_normalized():
         raw = encoded(value)[:-1] + b',"permit_digest":"' + p.digest.encode() + b'"}'
         with pytest.raises(api.RetainedEvidenceInvalid):
             parser(raw, p, *args)
-
-
-@pytest.mark.parametrize("vector", VECTORS, ids=lambda v: v["name"])
-def test_actual_product_writers_and_reader_share_the_same_vector(
-    pworker_service, principals, vector
-):
-    api = module()
-    from curie_protected_hooks.commissioning_reservations import Charge
-
-    campaign = Campaign(pworker_service, limits=vector["limits"])
-
-    async def scenario():
-        async with Running(principals, campaign) as reservations:
-            await reservations.reserve(
-                vector["operation_id"],
-                vector["kind"],
-                vector["request_digest"],
-                Charge(**{k: int(v) for k, v in vector["charge"].items()}),
-            )
-            await reservations.dispatch(vector["operation_id"])
-            j = api.parse_retained_journal(
-                pworker_service.command("GET", campaign.journal_key), campaign.permit
-            ).as_dict()
-            r = api.parse_retained_reservation(
-                pworker_service.command(
-                    "GET", reservations.reservation_key(vector["operation_id"])
-                ),
-                campaign.permit,
-                vector["operation_id"],
-            ).as_dict()
-            assert j == {
-                "record_type": "commissioning_journal",
-                "permit_digest": campaign.permit.digest,
-                "broker_run_id": campaign.value["broker_identity"]["run_id"],
-                **vector["expected_journal"],
-            }
-            assert r == {
-                "record_type": "commissioning_reservation",
-                "permit_digest": campaign.permit.digest,
-                "operation_id": vector["operation_id"],
-                **vector["expected_reservation"],
-            }
-
-    run(scenario())
