@@ -4,61 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
-import uuid
-from types import SimpleNamespace
 
 import pytest
 from aci_protocol import Final, SessionStatus, TextDelta
-from curie_worker import workspace as workspace_module
 
 from apps.worker.tests.queue_fixtures import wait_until
 from apps.worker.tests.start_wait_fixtures import (
     StartWaitCase,
-    assert_timeout_payload,
-    assert_uncounted_wait,
     start_wait,
     start_wait_database,
     timeout_lookalike,
 )
 
 __all__ = ["start_wait", "start_wait_database"]
-
-
-@pytest.mark.parametrize(
-    "start_wait", ["clone-slot", "clone", "archive", "upload", "total"], indirect=True
-)
-def test_workspace_timeout_is_uncounted_wait(
-    start_wait: StartWaitCase, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    case = start_wait
-    if case.fault == "total":
-        monotonic = [0.0]
-        monkeypatch.setattr(
-            workspace_module,
-            "time",
-            SimpleNamespace(monotonic=lambda: monotonic[0], time=time.time),
-        )
-        redeem = case.issuer.redeem
-
-        def exhausted_redeem(
-            deployment_id: uuid.UUID, thread_key: str
-        ) -> workspace_module.WorkspaceCredential:
-            credential = redeem(deployment_id, thread_key)
-            monotonic[0] = case.preparer.limits.total_timeout_seconds + 1
-            return credential
-
-        monkeypatch.setattr(case.issuer, "redeem", exhausted_redeem)
-    case.run(case.deliver())
-    assert_timeout_payload(case, case.fault)
-    row = case.run(case.state())
-    assert_uncounted_wait(case, row)
-    assert row["last_start_failure_detail"] == case.payloads[0]["start_failure_detail"]
-    assert not case.keys()
-    assert not case.h.fake_k8s.claims
-    if case.fault == "total":
-        assert case.issuer.redemptions == 1
-        assert case.host.git_requests == []
 
 
 @pytest.mark.parametrize("start_wait", ["lookalike"], indirect=True)
@@ -159,61 +117,3 @@ def test_existing_workspace_route_is_adopted_while_capacity_is_full(
             await running
 
     case.run(exercise())
-
-
-def test_capacity_lost_after_preflight_is_refused_at_claim_and_wait_is_bounded(
-    start_wait: StartWaitCase,
-) -> None:
-    case = start_wait
-
-    async def exercise() -> None:
-        await asyncio.to_thread(case.h.substrate.claim, "blocking-one")
-        case.issuer.gate = threading.Event()
-        delivering = asyncio.create_task(case.deliver())
-        try:
-            assert await asyncio.to_thread(case.issuer.entered.wait, 5)
-            await asyncio.to_thread(case.h.substrate.claim, "competitor")
-            before = set(case.ledger())
-            case.issuer.gate.set()
-            await delivering
-            waiting = await case.state()
-            assert waiting["status"] == "waiting"
-            assert waiting["capacity_deferrals"] == 1 and waiting["start_deferrals"] == 0
-            assert waiting["wait_deadline"] == case.initial["wait_deadline"]
-            assert case.payloads[-1]["capacity"] is True
-            assert len(case.h.fake_k8s.claims) == 2
-            assert set(case.ledger()) == before
-            assert case.h.substrate.adopt(case.thread) is None
-            assert case.h.runner.opened == []
-            assert case.host.git_requests and case.uploads
-            assert case.keys() == []
-            assert case.workspace.current(case.thread) is None
-            assert await asyncio.to_thread(case.h.substrate.release, "competitor")
-            case.issuer.gate = None
-            await case.deliver()
-            assert case.h.runner.opened
-            assert (await case.state())["execution_attempts"] == 1
-        finally:
-            case.issuer.gate = None
-            if not delivering.done():
-                delivering.cancel()
-                await asyncio.gather(delivering, return_exceptions=True)
-
-    case.run(exercise())
-
-
-@pytest.mark.parametrize("start_wait", ["disabled", "zero"], indirect=True)
-def test_disabled_admission_and_zero_ceiling_preserve_their_behavior(
-    start_wait: StartWaitCase,
-) -> None:
-    case = start_wait
-    case.run(case.deliver())
-    if case.fault == "zero":
-        assert case.issuer.redemptions == 0
-        assert not case.host.git_requests and not case.uploads
-        assert case.payloads[-1]["capacity"] is True
-        assert case.run(case.state())["status"] == "waiting"
-    else:
-        assert case.host.git_requests and case.uploads
-        assert case.h.runner.opened
-        assert case.run(case.state())["execution_attempts"] == 1

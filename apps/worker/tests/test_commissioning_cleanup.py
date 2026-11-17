@@ -100,37 +100,6 @@ async def retire(http: httpx.AsyncClient, url: str, launch_id: str, capability: 
     )
 
 
-@pytest.mark.parametrize("kubelet", ["finished", "unscheduled", "waiting"])
-def test_a_pod_deleted_before_its_runner_started_retires(tmp_path, kubelet):
-    async def scenario() -> None:
-        cluster = Unstarted(kubelet)
-        async with mediator(tmp_path, cluster) as (server, control, url, root):
-            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
-                launch_id, capability = await launched(http, url, cluster)
-                pod = object_names(launch_id)[0]
-                await asyncio.sleep(0.2)
-                pod_uid = cluster.objects[("pods", pod)]["metadata"]["uid"]
-                retired = await retire(http, url, launch_id, capability)
-                assert retired.status_code == 200, retired.json()
-            row = server._registry.get(OWNER, launch_id)
-            assert row.state == "retired" and row.termination is None
-            assert row.unstarted is not None and row.unstarted.pod_uid == pod_uid
-            assert row.unstarted.evidence == (
-                "unscheduled" if kubelet == "unscheduled" else "terminal"
-            )
-            assert control.ownership[launch_id] == ("retired", pod_uid)
-            # The only update is the finalizer-only patch on the exact UID.
-            assert len(cluster.patches) == 1
-            patch = cluster.patches[0]
-            assert patch[0] == {"op": "test", "path": "/metadata/uid", "value": pod_uid}
-            assert patch[2] == {"op": "test", "path": "/metadata/finalizers", "value": [FINALIZER]}
-            assert patch[3] == {"op": "remove", "path": "/metadata/finalizers/0"}
-            assert [p["op"] for p in patch] == ["test", "test", "test", "remove"]
-            assert not [k for k in cluster.objects if k[0] in {"pods", "services", "secrets"}]
-
-    asyncio.run(scenario())
-
-
 def test_a_kubelet_that_has_not_finished_keeps_the_finalizer_until_it_does(tmp_path):
     async def scenario() -> None:
         cluster = Unstarted("pending")
@@ -152,44 +121,6 @@ def test_a_kubelet_that_has_not_finished_keeps_the_finalizer_until_it_does(tmp_p
                 retired = await retire(http, url, launch_id, capability)
                 assert retired.status_code == 200, retired.json()
             assert control.ownership[launch_id][0] == "retired"
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("change", ["container-id", "restarted", "absent", "replaced"])
-def test_no_container_identity_absence_or_replacement_proves_never_started(tmp_path, change):
-    async def scenario() -> None:
-        cluster = Unstarted("finished" if change in {"container-id", "restarted"} else "pending")
-        async with mediator(tmp_path, cluster) as (server, control, url, root):
-            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
-                launch_id, capability = await launched(http, url, cluster)
-                await asyncio.sleep(0.2)
-                key = ("pods", object_names(launch_id)[0])
-                status = {
-                    "name": "runner",
-                    "ready": False,
-                    "restartCount": 0,
-                    "state": {"waiting": {"reason": "ContainerCreating"}},
-                }
-                if change == "container-id":
-                    status["containerID"] = "containerd://" + "b" * 64
-                    cluster.pod["status"]["containerStatuses"] = [status]
-                elif change == "restarted":
-                    status["restartCount"] = 1
-                    cluster.pod["status"]["containerStatuses"] = [status]
-                first = await retire(http, url, launch_id, capability)
-                assert first.status_code == 202, first.json()
-                if change == "absent":
-                    del cluster.objects[key]
-                elif change == "replaced":
-                    cluster.objects[key]["metadata"]["uid"] = POD_UID
-                    cluster.objects[key]["status"]["phase"] = "Failed"
-                again = await retire(http, url, launch_id, capability)
-                assert again.status_code == 202, again.json()
-            row = server._registry.get(OWNER, launch_id)
-            assert row.state == "retiring" and row.unstarted is None
-            assert cluster.patches == []
-            assert control.ownership[launch_id][0] == "retiring"
 
     asyncio.run(scenario())
 

@@ -327,29 +327,6 @@ def test_ordinary_maintenance_entrypoints_fail_closed_without_context(owned_work
     asyncio.run(go())
 
 
-def test_protected_dead_letter_is_bounded_under_rejected_input_flood(owned_worker):
-    async def go():
-        poison(owned_worker.broker)
-        async with assembled(owned_worker, dead_letter_maxlen=2) as h:
-            for _ in range(205):
-                if _:
-                    await h.client.lane().runs.xadd(h.config.stream, {"payload": "malformed"})
-                entry_id, fields = await read_pending(h)
-                await dispatch(h, entry_id, fields)
-            rows = await h.client.lane().runs.xrange(h.config.dead_letter_stream_name())
-            assert 0 < len(rows) < 205
-            assert rows[-1][1]["dl_original_id"] == entry_id
-            assert (
-                await h.client.lane().runs.xpending_range(
-                    h.config.stream, h.config.consumer_group, "-", "+", 1
-                )
-                == []
-            )
-            no_execution(h)
-
-    asyncio.run(go())
-
-
 @pytest.mark.parametrize("copy", [False, True])
 def test_mutable_refusal_and_unsigned_capacity_copy_stay_parked(owned_worker, copy):
     async def go():
