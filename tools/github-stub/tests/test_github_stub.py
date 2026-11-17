@@ -18,6 +18,7 @@ from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -133,6 +134,67 @@ def _seconds(recording: dict[str, Any], instant: str) -> float:
         datetime.fromisoformat(instant.replace("Z", "+00:00"))
         - datetime.fromisoformat(recording["epoch"].replace("Z", "+00:00"))
     ).total_seconds()
+
+
+def test_github_link_oauth_identity_revoke_and_label_actor(stub: Any, github: httpx.Client) -> None:
+    params = {
+        "client_id": stub.oauth_client_id,
+        "state": "EXAMPLE-state-sentinel",
+        "redirect_uri": "https://console.example.com/api/identity/me/github-link/callback",
+    }
+    page = github.get("/login/oauth/authorize", params=params)
+    assert page.status_code == 200
+    assert "Authorize GitHub link" in page.text
+    authorized = github.get("/login/oauth/authorize", params={**params, "approved": "1"})
+    assert authorized.status_code == 302
+    returned = parse_qs(urlsplit(authorized.headers["location"]).query)
+    assert returned["state"] == [params["state"]]
+    form = {
+        "client_id": stub.oauth_client_id,
+        "client_secret": stub.oauth_client_secret,
+        "redirect_uri": params["redirect_uri"],
+        "code": returned["code"][0],
+    }
+    refused = github.post("/login/oauth/access_token", data={**form, "client_secret": "wrong"})
+    assert refused.status_code == 401
+    exchanged = github.post("/login/oauth/access_token", data=form)
+    assert exchanged.status_code == 200
+    token = exchanged.json()["access_token"]
+    assert (
+        github.post("/login/oauth/access_token", data=form).json()["error"]
+        == "bad_verification_code"
+    )
+    headers = {"Authorization": "Bearer " + token}
+    assert github.get("/api/v3/user", headers=headers).json()["id"] == 6601
+    revoke_path = f"/api/v3/applications/{stub.oauth_client_id}/token"
+    assert github.request("DELETE", revoke_path, json={"access_token": token}).status_code == 401
+    assert (
+        github.request(
+            "DELETE",
+            revoke_path,
+            auth=(stub.oauth_client_id, stub.oauth_client_secret),
+            json={"access_token": token},
+        ).status_code
+        == 204
+    )
+    assert github.get("/api/v3/user", headers=headers).status_code == 401
+    labelled = github.post(
+        f"/repos/{REPO}/issues/3815/labels",
+        json={"labels": ["github-link-fixture"]},
+        headers={"Authorization": "Bearer example-human-token"},
+    )
+    assert labelled.status_code == 200
+    events = github.get(f"/repos/{REPO}/issues/3815/events").json()
+    event = next(
+        item for item in events if item.get("label", {}).get("name") == "github-link-fixture"
+    )
+    assert event["actor"]["id"] == 6601
+    with sqlite3.connect(stub._database) as connection:
+        rows = str(connection.execute("SELECT * FROM oauth_codes").fetchall()) + str(
+            connection.execute("SELECT * FROM oauth_tokens").fetchall()
+        )
+    for sentinel in (token, returned["code"][0], params["state"], stub.oauth_client_secret):
+        assert sentinel not in rows + str(stub.request_log)
 
 
 def test_tls_requires_the_generated_ca(stub: Any) -> None:

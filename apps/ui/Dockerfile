@@ -78,6 +78,18 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
+    location ^~ /api/identity/me/github-link/ {
+        access_log off;
+        error_log /dev/null;
+        add_header Cache-Control "private, no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip off;
+        proxy_pass ${CURIE_API_TARGET}/identity/me/github-link/;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
     location = /api/console/oidc/callback {
         access_log off;
         error_log /dev/null;

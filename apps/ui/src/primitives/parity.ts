@@ -30,6 +30,7 @@ export interface WiredAction {
   readonly label: string;
   /** Its CLI mapping: a real command, or an explicit no-equivalent marker. */
   readonly mapping: CliMapping;
+  readonly operatorRoute?: string;
 }
 
 // The wired actions, grouped by surface in comments. `deploy`/`status`/`message`
@@ -88,6 +89,8 @@ export const WIRED_ACTIONS = [
   { id: "claude-plan-replace", label: "Replace the personal Claude plan token", mapping: { command: "cluster.subscription.replace" } },
   { id: "claude-plan-reconnect", label: "Reconnect a personal Claude plan", mapping: { command: "cluster.subscription.reconnect" } },
   { id: "claude-plan-disconnect", label: "Disconnect a personal Claude plan", mapping: { command: "cluster.subscription.disconnect" } },
+  { id: "github-account-link", label: "Link your GitHub account", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },
+  { id: "account-unlink", label: "Unlink your own account", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE }, operatorRoute: "POST /identity/admin/{tenant_id}/links/{link_id}/revoke" },
 
   // Genuinely-unmapped actions: no dedicated CLI verb exists yet. These render
   // the honest amber glyph linking to the parity epic instead of a command.

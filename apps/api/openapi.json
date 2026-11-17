@@ -10583,6 +10583,19 @@
         "title": "GateKind",
         "type": "string"
       },
+      "GithubLinkStartOut": {
+        "properties": {
+          "authorize_url": {
+            "title": "Authorize Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorize_url"
+        ],
+        "title": "GithubLinkStartOut",
+        "type": "object"
+      },
       "GraderOut": {
         "description": "A deterministic grader, mirroring the frozen eval-case Grader shape\n(`apps/worker/schema/eval-cases.schema.json`). Do not let this drift from the\nworker's `Grader` model.",
         "properties": {
@@ -12351,6 +12364,57 @@
           "expected_version"
         ],
         "title": "OperatorMutation",
+        "type": "object"
+      },
+      "OwnedLinkOut": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "display_label": {
+            "title": "Display Label",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "provider",
+          "display_label",
+          "created_at"
+        ],
+        "title": "OwnedLinkOut",
+        "type": "object"
+      },
+      "OwnedLinksOut": {
+        "properties": {
+          "github_link_available": {
+            "title": "Github Link Available",
+            "type": "boolean"
+          },
+          "links": {
+            "items": {
+              "$ref": "#/components/schemas/OwnedLinkOut"
+            },
+            "title": "Links",
+            "type": "array"
+          }
+        },
+        "required": [
+          "links",
+          "github_link_available"
+        ],
+        "title": "OwnedLinksOut",
         "type": "object"
       },
       "Owner": {
@@ -33245,6 +33309,221 @@
         "summary": "Confirm Connection",
         "tags": [
           "identity-connect"
+        ]
+      }
+    },
+    "/identity/me/github-link": {
+      "post": {
+        "operationId": "start_github_link_identity_me_github_link_post",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubLinkStartOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Github Link",
+        "tags": [
+          "identity-me"
+        ]
+      }
+    },
+    "/identity/me/github-link/callback": {
+      "get": {
+        "operationId": "github_link_callback_identity_me_github_link_callback_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_github_link_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Github Link Session"
+            }
+          }
+        ],
+        "responses": {
+          "307": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Github Link Callback",
+        "tags": [
+          "identity-me"
+        ]
+      }
+    },
+    "/identity/me/links": {
+      "get": {
+        "operationId": "list_links_identity_me_links_get",
+        "parameters": [
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnedLinksOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Links",
+        "tags": [
+          "identity-me"
+        ]
+      }
+    },
+    "/identity/me/links/{link_id}": {
+      "delete": {
+        "operationId": "unlink_identity_me_links__link_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Link Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityLinkRevokedOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink",
+        "tags": [
+          "identity-me"
         ]
       }
     },

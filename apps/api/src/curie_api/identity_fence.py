@@ -25,6 +25,8 @@ return false
 
 
 def protects(method: str, path: str) -> bool:
+    if method == "GET" and path == "/identity/me/github-link/callback":
+        return True
     if method in {"GET", "HEAD", "OPTIONS"}:
         return False
     if path == "/identity/resolve":
@@ -307,6 +309,12 @@ async def prepare(request: Request) -> bool:
     # Starlette's cached Request forwards these bytes to the route parser.
     request._body = body
     key = request.headers.get("X-API-Key")
+    if request.url.path.startswith("/identity/me/github-link"):
+        from .identity.github_link import CALLBACK, require_configuration
+
+        require_configuration(get_settings())
+        if request.url.path == CALLBACK:
+            return True
     if request.url.path.startswith(("/identity/authorities", "/identity/roles")):
         await require_platform_key(key)
         return True

@@ -731,6 +731,20 @@ export type ApprovalResolveInput = Schemas["ApprovalResolve"];
 export type ConsoleSession = Schemas["ConsoleSessionOut"];
 export type ConsoleSignInMethods = Schemas["ConsoleSignInMethodsOut"];
 
+export type OwnedLink = Schemas["OwnedLinkOut"];
+
+export async function getOwnedLinks(): Promise<Schemas["OwnedLinksOut"]> {
+  return jsonOrThrow(await request("/identity/me/links", { cache: "no-store" }));
+}
+
+export async function startGithubLink(): Promise<Schemas["GithubLinkStartOut"]> {
+  return jsonOrThrow(await request("/identity/me/github-link", { method: "POST" }));
+}
+
+export async function unlinkOwnedAccount(id: string): Promise<void> {
+  await jsonOrThrow(await request(`/identity/me/links/${encodeURIComponent(id)}`, { method: "DELETE" }));
+}
+
 // Inspect the HttpOnly same-origin console session. No platform key is sent:
 // the ambient cookie is the only credential on this identity boundary.
 // Bypasses request() on purpose: a 401 here means signed out, not an expired

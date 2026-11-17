@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import html
 import ipaddress
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import sqlite3
@@ -19,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 REPOSITORY = "acme-corp/acme-bot"
 HUMAN = {"id": 6601, "login": "octocat", "type": "User"}
@@ -98,6 +102,10 @@ class GithubStub:
                     ) from None
         self.root = root.resolve()
         self.recording = recording
+        self.oauth_client_id = os.environ.get("CURIE_GITHUB_STUB_OAUTH_CLIENT_ID", "Iv1.example")
+        self.oauth_client_secret = os.environ.get(
+            "CURIE_GITHUB_STUB_OAUTH_CLIENT_SECRET", "EXAMPLE-github-client-secret-sentinel"
+        )
         self.host = host
         self.bind = bind_address
         self.port = port
@@ -203,6 +211,8 @@ class GithubStub:
                 " PRIMARY KEY(kind,id)); CREATE TABLE unsupported(request TEXT);"
                 "CREATE TABLE tokens(token TEXT PRIMARY KEY, permissions TEXT);"
                 "CREATE TABLE request_log(method TEXT NOT NULL, path TEXT NOT NULL);"
+                "CREATE TABLE oauth_codes(code_hash TEXT PRIMARY KEY, redirect_uri TEXT NOT NULL);"
+                "CREATE TABLE oauth_tokens(token_hash TEXT PRIMARY KEY);"
                 "CREATE TABLE collaborators(login TEXT PRIMARY KEY, permission TEXT NOT NULL,"
                 " user TEXT NOT NULL);"
                 "CREATE TABLE permission_faults(login TEXT PRIMARY KEY, status INTEGER NOT NULL);"
@@ -697,6 +707,13 @@ class GithubStub:
         if path.startswith("/api/v3/"):
             path = path.removeprefix("/api/v3")
         body = handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
+        if path in {
+            "/login/oauth/authorize",
+            "/login/oauth/access_token",
+            "/user",
+        } or path.startswith("/applications/"):
+            self._github_link_request(handler, path, parse_qs(parsed.query), body)
+            return
         if path.startswith(f"/{REPOSITORY}.git/"):
             if handler.command not in {"GET", "POST"} or not (
                 path.endswith("/info/refs")
@@ -712,7 +729,12 @@ class GithubStub:
             return
         try:
             payload = json.loads(body) if body else {}
-            result = self._rest(handler.command, path, parse_qs(parsed.query), payload)
+            actor = (
+                HUMAN
+                if handler.headers.get("Authorization") == "Bearer example-human-token"
+                else BOT
+            )
+            result = self._rest(handler.command, path, parse_qs(parsed.query), payload, actor=actor)
         except (ValueError, KeyError, subprocess.CalledProcessError) as exc:
             self._json(handler, 422, {"message": str(exc)})
             return
@@ -723,6 +745,111 @@ class GithubStub:
             self._raw(handler, result[0], result[2])
         else:
             self._json(handler, *result)
+
+    def _github_link_request(
+        self, handler: BaseHTTPRequestHandler, path: str, query: dict[str, list[str]], raw: bytes
+    ) -> None:
+        # GitHub App user flow and token revoke shapes:
+        # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app
+        # https://docs.github.com/en/rest/apps/oauth-applications#delete-an-app-token
+        method = handler.command
+        if method == "GET" and path == "/login/oauth/authorize":
+            if (
+                query.get("client_id") != [self.oauth_client_id]
+                or not query.get("state")
+                or not query.get("redirect_uri")
+            ):
+                self._json(handler, 400, {"error": "invalid_request"})
+                return
+            redirect = query["redirect_uri"][0]
+            if urlsplit(redirect).scheme != "https":
+                self._json(handler, 400, {"error": "invalid_redirect"})
+                return
+            if query.get("approved") == ["1"]:
+                code = secrets.token_urlsafe(32)
+                with sqlite3.connect(self._database) as connection:
+                    connection.execute(
+                        "INSERT INTO oauth_codes VALUES(?,?)",
+                        (hashlib.sha256(code.encode()).hexdigest(), redirect),
+                    )
+                handler.send_response(302)
+                handler.send_header(
+                    "Location",
+                    redirect + "?" + urlencode({"code": code, "state": query["state"][0]}),
+                )
+                handler.send_header("Cache-Control", "no-store")
+                handler.end_headers()
+                return
+            fields = "".join(
+                f'<input type="hidden" name="{html.escape(name)}" '
+                f'value="{html.escape(query[name][0], quote=True)}">'
+                for name in ("client_id", "state", "redirect_uri")
+            )
+            page = (
+                '<form action="/login/oauth/authorize" method="get">'
+                + fields
+                + '<input type="hidden" name="approved" value="1"><p>Authorize octocat</p>'
+                "<button>Authorize GitHub link</button></form>"
+            ).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html")
+            handler.send_header("Content-Length", str(len(page)))
+            handler.end_headers()
+            handler.wfile.write(page)
+            return
+        if method == "POST" and path == "/login/oauth/access_token":
+            form = parse_qs(raw.decode())
+            if form.get("client_id") != [self.oauth_client_id] or form.get("client_secret") != [
+                self.oauth_client_secret
+            ]:
+                self._json(handler, 401, {"error": "incorrect_client_credentials"})
+                return
+            code = form.get("code", [""])[0]
+            with sqlite3.connect(self._database) as connection:
+                row = connection.execute(
+                    "DELETE FROM oauth_codes WHERE code_hash=? RETURNING redirect_uri",
+                    (hashlib.sha256(code.encode()).hexdigest(),),
+                ).fetchone()
+                if row is None or form.get("redirect_uri") != [row[0]]:
+                    self._json(handler, 200, {"error": "bad_verification_code"})
+                    return
+                token = "ghu_" + secrets.token_urlsafe(32)
+                connection.execute(
+                    "INSERT INTO oauth_tokens VALUES(?)",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                )
+            self._json(handler, 200, {"access_token": token, "token_type": "bearer", "scope": ""})
+            return
+        token = handler.headers.get("Authorization", "").removeprefix("Bearer ")
+        if method == "GET" and path == "/user":
+            with sqlite3.connect(self._database) as connection:
+                found = connection.execute(
+                    "SELECT 1 FROM oauth_tokens WHERE token_hash=?",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                ).fetchone()
+            self._json(
+                handler, 200 if found else 401, HUMAN if found else {"message": "Bad credentials"}
+            )
+            return
+        if method == "DELETE" and path == f"/applications/{self.oauth_client_id}/token":
+            expected = (
+                "Basic "
+                + base64.b64encode(
+                    f"{self.oauth_client_id}:{self.oauth_client_secret}".encode()
+                ).decode()
+            )
+            if handler.headers.get("Authorization") != expected:
+                self._json(handler, 401, {"message": "Bad credentials"})
+                return
+            token = json.loads(raw).get("access_token", "")
+            with sqlite3.connect(self._database) as connection:
+                connection.execute(
+                    "DELETE FROM oauth_tokens WHERE token_hash=?",
+                    (hashlib.sha256(token.encode()).hexdigest(),),
+                )
+            self._json(handler, 204, {})
+            return
+        self._json(handler, 404, {"message": "Not Found"})
 
     def _raw(self, handler: BaseHTTPRequestHandler, status: int, payload: bytes) -> None:
         handler.send_response(status)
@@ -786,7 +913,13 @@ class GithubStub:
         handler.wfile.write(content)
 
     def _rest(
-        self, method: str, path: str, query: dict[str, list[str]], body: Any
+        self,
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        body: Any,
+        *,
+        actor: dict[str, Any] = BOT,
     ) -> tuple[int, Any] | tuple[int, Any, bytes] | None:
         if method == "GET" and path == "/app":
             # The authenticated App; its bot user, ``<slug>[bot]``, authors what
@@ -984,9 +1117,9 @@ class GithubStub:
                     self._put("issue", number, issue)
                     current = {label["name"] for label in issue["labels"]}
                     for label in sorted(current - previous):
-                        self._label_event(number, label, "labeled", BOT)
+                        self._label_event(number, label, "labeled", actor)
                     for label in sorted(previous - current):
-                        self._label_event(number, label, "unlabeled", BOT)
+                        self._label_event(number, label, "unlabeled", actor)
                 return 200, issue["labels"]
             if suffix.startswith("labels/") and method == "DELETE":
                 removed = suffix.removeprefix("labels/")

@@ -5445,6 +5445,7 @@ class IdentityLink(Base):
         UUID(as_uuid=True), default=None
     )
     created_by_directory: Mapped[str | None] = mapped_column(default=None)
+    display_label: Mapped[str | None] = mapped_column(String, default=None)
     verified_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -5508,6 +5509,23 @@ class IdentityAuditEvent(Base):
     team_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GithubLinkState(Base):
+    __tablename__ = "github_link_states"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="github_link_states_principal_fkey",
+        ),
+    )
+
+    state_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
 class IdentityConnectToken(Base):
