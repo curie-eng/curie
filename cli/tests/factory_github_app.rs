@@ -1988,8 +1988,8 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
     let text = combined(&output);
     assert_eq!(output.status.code(), Some(0), "output: {text}");
     assert!(
-        text.contains(SLUG),
-        "output must announce the mention: {text}"
+        text.contains("mention: curie-factory (factory default)"),
+        "output must announce the default mention: {text}"
     );
     assert!(
         text.contains("acme/bot") && text.contains("acme/web"),
@@ -2082,7 +2082,10 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
         .get("api")
         .unwrap_or_else(|| panic!("no api in {values}"));
     let tracker = github_tracker(&values);
-    assert_eq!(tracker.get("mention"), Some(&serde_json::json!(SLUG)));
+    assert_eq!(
+        tracker.get("mention"),
+        Some(&serde_json::json!("curie-factory"))
+    );
     assert_eq!(
         tracker.get("label"),
         Some(&serde_json::json!("curie-factory"))
@@ -2123,6 +2126,9 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
     let output = fx.run(&strs(&argv));
     assert!(output.status.success(), "{}", combined(&output));
     let value = stdout_json(&output);
+    assert_eq!(value["github_app"]["slug"], SLUG);
+    assert_eq!(value["github_app"]["mention"], "curie-factory");
+    assert_eq!(value["github_app"]["mention_inferred"], true);
     assert_eq!(value["github_app"]["repos_inferred"], true);
     assert_eq!(
         value["github_app"]["repos"],

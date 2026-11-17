@@ -85,7 +85,7 @@ from curie_api.forges.types import (
     publication_url,
     valid_output_identity,
 )
-from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_login
+from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_factory
 from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from curie_api.github_review_truth import verify_sender_write_permission
 from curie_api.repo_full_name import repo_url_path
@@ -312,6 +312,23 @@ class GitHubTracker:
             app_id=app_id,
         )
 
+    async def app_slug(self) -> str | None:
+        """The App login this tracker writes as, or None when it cannot be read.
+
+        ``own_login`` is ``<slug>[bot]``. A login that is not that shape is not
+        an App slug, and a lookup failure leaves the configured mention as the
+        only match.
+        """
+
+        try:
+            login = await self._own_login()
+        except Unavailable:
+            return None
+        if not isinstance(login, str) or not login.endswith("[bot]"):
+            return None
+        slug = login[: -len("[bot]")]
+        return slug or None
+
     @property
     def marked_comments(self) -> GitHubMarkedComments:
         return self._comments
@@ -501,7 +518,9 @@ class GitHubTracker:
             occurred_at=parse_time(event.get("created_at")),
         )
 
-    def _mention_notice(self, comment: Any, cursor: str) -> MarkedNotice | None:
+    def _mention_notice(
+        self, comment: Any, cursor: str, app_slug: str | None
+    ) -> MarkedNotice | None:
         if not isinstance(comment, dict) or comment.get("performed_via_github_app") is not None:
             return None
         comment_id = _positive_int(comment.get("id"))
@@ -512,7 +531,7 @@ class GitHubTracker:
             comment_id is None
             or not isinstance(body, str)
             or not body.strip()
-            or not mentions_login(body, self.mention)
+            or not mentions_factory(body, self.mention, app_slug)
             or not isinstance(issue_url, str)
             # A pull request conversation comment is review feedback, not a marking.
             or (isinstance(html_url, str) and "/pull/" in html_url)
@@ -567,6 +586,7 @@ class GitHubTracker:
             newer_than=comments_after,
         )
         notices: list[MarkedNotice] = []
+        app_slug = await self.app_slug()
         newest_event = events_after
         fresh = [
             event
@@ -586,7 +606,7 @@ class GitHubTracker:
             if comment_id is None:
                 continue
             newest_comment = max(newest_comment, comment_id)
-            notice = self._mention_notice(comment, f"{newest_event}:{comment_id}")
+            notice = self._mention_notice(comment, f"{newest_event}:{comment_id}", app_slug)
             if notice is not None:
                 notices.append(notice)
         next_cursor = f"{newest_event}:{newest_comment}"
@@ -629,7 +649,7 @@ class GitHubTracker:
             and isinstance(user, dict)
             and str(user.get("id")) == notice.actor.id
             and isinstance(body, str)
-            and mentions_login(body, self.mention)
+            and mentions_factory(body, self.mention, await self.app_slug())
         )
 
     async def marking_actor(self, issue: TrackerIssueRef, marker: str) -> Actor | None:
@@ -1183,8 +1203,12 @@ class GitHubTracker:
                 await self._verify_mention(notice, token)
         if notice.disposition != "admit":
             await verify_sender_write_permission(
-                self._client, api=self._api, token=token, repo_path=self._repo_path,
-                sender_id=notice.sender_id, sender_login=notice.sender_login,
+                self._client,
+                api=self._api,
+                token=token,
+                repo_path=self._repo_path,
+                sender_id=notice.sender_id,
+                sender_login=notice.sender_login,
             )
         default_branch = repository.get("default_branch")
         return IssueFacts(
@@ -1196,8 +1220,12 @@ class GitHubTracker:
         """Authorize a canonical actor after duplicate and delegated-output checks."""
         try:
             await verify_sender_write_permission(
-                self._client, api=self._api, token=await self._token(), repo_path=self._repo_path,
-                sender_id=notice.sender_id, sender_login=notice.sender_login,
+                self._client,
+                api=self._api,
+                token=await self._token(),
+                repo_path=self._repo_path,
+                sender_id=notice.sender_id,
+                sender_login=notice.sender_login,
             )
         except FeedbackIgnored as exc:
             if exc.code == "sender_permission_refused":
@@ -1227,7 +1255,9 @@ class GitHubTracker:
         ):
             raise FactoryRefused("sender_mismatch")
         body = comment.get("body")
-        if not isinstance(body, str) or not mentions_login(body, self.mention):
+        if not isinstance(body, str) or not mentions_factory(
+            body, self.mention, await self.app_slug()
+        ):
             raise FactoryRefused("ordinary_comment")
 
     async def issue_state(self, number: int) -> IssueState:

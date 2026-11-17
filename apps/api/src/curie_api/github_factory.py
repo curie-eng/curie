@@ -44,6 +44,7 @@ from .forges.github.identity import delivery_uuid
 from .forges.github.tracker import GitHubTracker, IssueFacts, last_label_event
 from .forges.github.transport import parse_time
 from .forges.hosts import (
+    factory_app_slug,
     factory_code_host,
     factory_code_host_entry,
     factory_credentials,
@@ -892,6 +893,7 @@ async def handle_factory_delivery(
             delivery_id,
             labels=labels,
             mention=intake.mention,
+            app_slug=await factory_app_slug(registry),
         )
         await lock_issue(session, notice_issue(notice, registry))
         if notice.disposition == "admit":

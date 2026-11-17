@@ -94,6 +94,27 @@ def mentions_login(body: str, login: str) -> bool:
     return re.search(pattern, body, flags=re.IGNORECASE) is not None
 
 
+def mentions_factory(body: str, mention: str, app_slug: str | None) -> bool:
+    """True when body names the configured mention or the App's own slug.
+
+    ``app_slug`` is the App login from ``GitHubCredentials.app_slug``. None
+    means that login could not be read, and only the configured mention matches.
+    ``[`` is a token boundary, so ``@slug[bot]`` matches the slug.
+
+    A factory status comment carries ``<!-- curie-execution-request:`` and the
+    ask line, which names the mention. That comment is the factory speaking,
+    not a new ask.
+    """
+
+    if "<!-- curie-execution-request:" in body:
+        return False
+    if mentions_login(body, mention):
+        return True
+    if app_slug is None or app_slug.casefold() == mention.casefold():
+        return False
+    return mentions_login(body, app_slug)
+
+
 def _delivery(delivery_id: str) -> uuid.UUID:
     try:
         delivery = uuid.UUID(delivery_id)
@@ -146,6 +167,7 @@ def parse_factory_event(
     *,
     labels: Collection[str],
     mention: str,
+    app_slug: str | None,
 ) -> FactoryNotice:
     """Keep an admission, cancellation, or explicit mention. Refuse everything else.
 
@@ -245,7 +267,7 @@ def parse_factory_event(
         raise FactoryRefused("invalid_comment")
     if len(body) > _MAX_COMMENT_LENGTH:
         raise FactoryRefused("comment_too_large")
-    if not body.strip() or not mentions_login(body, mention):
+    if not body.strip() or not mentions_factory(body, mention, app_slug):
         raise FactoryRefused("ordinary_comment")
     comment_id = positive_identifier(comment.get("id"), "invalid_comment")
     return FactoryNotice(

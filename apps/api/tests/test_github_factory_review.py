@@ -54,6 +54,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from forge_fakes.github import (  # noqa: E402
+    APP_SLUG,
     INSTALLATION_ID,
     LABEL,
     MENTION,
@@ -692,6 +693,25 @@ def _refused(
     assert _code(response) == code
     assert _all_requests() == before
     assert len(_requests(number)) == 1
+
+
+@pytest.mark.parametrize("handle", (APP_SLUG, f"{APP_SLUG}[bot]"))
+def test_app_slug_mention_on_a_factory_pr_is_admitted_once(
+    factory: tuple[TestClient, ReviewGitHubAPI], handle: str
+) -> None:
+    client, api = factory
+    number, pr, _first = _owned(client, api)
+    payload, _fid = _feedback_event(api, "issue_comment", pr, f"@{handle} please look")
+    delivery = str(uuid.uuid4())
+
+    first = _post(client, "issue_comment", payload, delivery=delivery)
+    same = _post(client, "issue_comment", payload, delivery=delivery)
+    fresh = _post(client, "issue_comment", payload, delivery=str(uuid.uuid4()))
+
+    assert first.json()["status"] == "factory_admitted", first.text
+    assert same.json()["status"] == "factory_duplicate", same.text
+    assert fresh.json()["status"] == "factory_duplicate", fresh.text
+    assert len(_requests(number)) == 2
 
 
 def test_ordinary_comment_without_the_mention_is_ignored(

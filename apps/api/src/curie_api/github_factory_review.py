@@ -28,12 +28,12 @@ from . import workitem_dispatch
 from .config import Settings
 from .factory_reply_target import feedback_url
 from .factory_review_context import pull_request_body_context
-from .forges.hosts import factory_code_host_entry, factory_tracker, github_host
+from .forges.hosts import factory_app_slug, factory_code_host_entry, factory_tracker, github_host
 from .forges.registry import forges_registry
 from .forges.trackers import reply_route
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget
 from .github_factory import lock_issue
-from .github_factory_events import mentions_login
+from .github_factory_events import mentions_factory
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import (
     FeedbackIgnored,
@@ -111,9 +111,7 @@ async def _owner(
     return row[0], row[1]
 
 
-async def factory_owns(
-    session: AsyncSession, settings: Settings, event: str, payload: Any
-) -> bool:
+async def factory_owns(session: AsyncSession, settings: Settings, event: str, payload: Any) -> bool:
     """True when a WorkItem owns the lineage for the payload's pull request."""
 
     claimed = _payload_pull_request(event, payload)
@@ -205,7 +203,11 @@ async def admit_parsed_feedback(
     """
 
     registry = forges_registry(settings)
-    if not mentions_login(feedback.body, factory_tracker(registry).config.mention):
+    if not mentions_factory(
+        feedback.body,
+        factory_tracker(registry).config.mention,
+        await factory_app_slug(registry),
+    ):
         raise FeedbackIgnored("ordinary_comment")
     if not repository_is_allowed(feedback.repo_full_name, settings.github_repo_allowlist):
         raise FeedbackIgnored("repository_not_allowed")

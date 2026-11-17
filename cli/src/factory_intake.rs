@@ -1100,6 +1100,21 @@ fn merge_api(values: &mut serde_json::Value, extra: &serde_json::Value) {
     }
 }
 
+/// GitHub mention stored when this run and the recorded tracker both leave it unset.
+const DEFAULT_MENTION: &str = "curie-factory";
+
+/// The mention [`plan_app`] stores: an explicit `--mention`, else the recorded
+/// tracker mention, else [`DEFAULT_MENTION`]. Only the default is inferred.
+fn choose_mention(explicit: Option<&str>, recorded: Option<&str>) -> (String, bool) {
+    if let Some(mention) = explicit {
+        return (mention.to_string(), false);
+    }
+    if let Some(mention) = recorded {
+        return (mention.to_string(), false);
+    }
+    (DEFAULT_MENTION.to_string(), true)
+}
+
 /// Every GitHub read and the Secret ownership check; mutates nothing.
 async fn plan_app(
     opts: &mut FactoryIntakeOpts,
@@ -1117,8 +1132,10 @@ async fn plan_app(
     let repos_inferred = opts.all_installed_repos;
     let repos = crate::factory_app::resolve_allowlist(&opts.repos, &app, opts.all_installed_repos)?;
     opts.repos = repos.clone();
-    let mention_inferred = opts.mention.is_none();
-    let mention = opts.mention.clone().unwrap_or_else(|| app.slug.clone());
+    let (mention, mention_inferred) = choose_mention(
+        opts.mention.as_deref(),
+        recorded_tracker_str(recorded, "mention").as_deref(),
+    );
     opts.mention = Some(mention.clone());
     let (label, label_inferred) = match opts.label.clone() {
         Some(label) => (label, false),
@@ -2010,6 +2027,25 @@ mod tests {
     use super::*;
     use crate::ops::{CommonOpts, OpsCommand};
     use std::path::Path;
+
+    #[test]
+    fn plan_app_stores_curie_factory_when_no_mention_is_given() {
+        // `plan_app` stores this choice and then reads the cluster, so the
+        // unit test locks the mention it writes.
+        assert!(valid_github_login(DEFAULT_MENTION));
+        assert_eq!(
+            choose_mention(None, None),
+            ("curie-factory".to_string(), true)
+        );
+        assert_eq!(
+            choose_mention(Some("acme-bot"), Some("recorded-bot")),
+            ("acme-bot".to_string(), false)
+        );
+        assert_eq!(
+            choose_mention(None, Some("recorded-bot")),
+            ("recorded-bot".to_string(), false)
+        );
+    }
 
     #[test]
     fn github_host_keeps_an_explicit_port_and_maps_the_public_api() {

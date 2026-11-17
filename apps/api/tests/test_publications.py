@@ -48,6 +48,7 @@ from curie_api.crud import (
 from curie_api.crud import (
     publications as crud_publications,
 )
+from curie_api.factory_comment_text import github_ask_line
 from curie_api.factory_rediscovery import issue_marker
 from curie_api.forges.types import TrackerIssueRef
 from curie_api.github_app import _RESOLVERS
@@ -670,9 +671,9 @@ def _publication_commit_http(
         else "ghp_publication_operator"
     )
     # Observed GitHubCodeHost._token contract: REST uses the Git Basic header.
-    adapter_authorization = (
-        "Basic " + base64.b64encode(f"x-access-token:{fixture_token}".encode()).decode("ascii")
-    )
+    adapter_authorization = "Basic " + base64.b64encode(
+        f"x-access-token:{fixture_token}".encode()
+    ).decode("ascii")
 
     async def handle(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -4781,9 +4782,7 @@ def test_readmit_creates_new_lineage_after_never_pushed_failure(
             base_sha=FIRST_REVISION_SHA,
         ),
     )
-    assert (
-        _resolve(client, auth_headers, terminal_second["approval_id"]).status_code == 200
-    )
+    assert _resolve(client, auth_headers, terminal_second["approval_id"]).status_code == 200
     terminal = _advance_lineage(
         client,
         terminal_second["id"],
@@ -8536,7 +8535,8 @@ def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
     # and the canonical issue marker (#4629).
     number = payload["reply_conversation_id"].removeprefix("issue-")
     assert created.json()["body"] == (
-        f"{payload['body']}\n\nCloses #{number}\n\n{_factory_issue_marker(request_id)}"
+        f"{payload['body']}\n\nCloses #{number}\n\n{_factory_issue_marker(request_id)}\n\n"
+        f"{github_ask_line('curie')}"
     )
 
 
@@ -8778,8 +8778,30 @@ def test_factory_non_python_publication_keeps_its_existing_body_without_python_c
     # body lacked (#4358 plan D7), and the canonical issue marker (#4629).
     issue_number = int(payload["reply_conversation_id"].removeprefix("issue-"))
     assert created.json()["body"] == (
-        f"{payload['body']}\n\nCloses #{issue_number}\n\n{_factory_issue_marker(request_id)}"
+        f"{payload['body']}\n\nCloses #{issue_number}\n\n{_factory_issue_marker(request_id)}\n\n"
+        f"{github_ask_line('curie')}"
     )
+
+
+def test_github_publication_puts_the_ask_line_immediately_before_requester_preferences(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    from test_requester_instruction_publication import ANNOTATION, DIGEST, _acknowledge, _pin
+
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id, outcome="passed")
+    assert recorded.status_code == 201, recorded.text
+    _pin(request_id)
+    acknowledged = _acknowledge(client, request_id, "applied", sha256=DIGEST)
+    assert acknowledged.status_code == 200, acknowledged.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    lines = created.json()["body"].splitlines()
+    assert lines[-1] == ANNOTATION
+    assert lines[-3] == github_ask_line("curie")
+    assert sum(line.startswith("Requester preferences:") for line in lines) == 1
 
 
 def test_later_non_python_publication_keeps_prior_python_proof_pending(
