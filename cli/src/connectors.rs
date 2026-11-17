@@ -17,8 +17,10 @@
 //!
 //! Apply success is not connector health (#2350). After apply+prune, each
 //! hosted Deployment is waited on until Ready or a terminal pod reason, bounded
-//! by [`CONNECTOR_ROLLOUT_DEADLINE`]. A failed wait is nonzero and does not
-//! roll the agent or version back.
+//! by [`CONNECTOR_ROLLOUT_DEADLINE`]. A CreateContainerConfigError whose message
+//! is the kubelet secret or configmap cache sync timeout stays in progress until
+//! that same deadline. A failed wait is nonzero and does not roll the agent or
+//! version back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -396,6 +398,85 @@ fn terminal_reason(value: &str) -> Option<&'static str> {
     }
 }
 
+/// Kubelet secret or configmap cache sync that timed out. The container stays
+/// in CreateContainerConfigError until the cache catches up, so the rollout is
+/// still progressing. A missing object or key uses a different message.
+fn config_error_is_cache_sync_timeout(message: &str) -> bool {
+    let cache = message.contains("failed to sync secret cache")
+        || message.contains("failed to sync configmap cache");
+    cache && message.contains("timed out waiting for the condition")
+}
+
+/// Events excuse an empty-message CreateContainerConfigError only when they
+/// show the cache sync timeout and not a missing object or key.
+fn events_excuse_config_error(events: &str) -> bool {
+    if !config_error_is_cache_sync_timeout(events) {
+        return false;
+    }
+    let lower = events.to_ascii_lowercase();
+    !(lower.contains("not found") || lower.contains("find key"))
+}
+
+/// Keep a CreateContainerConfigError in progress when its cause is the cache
+/// sync timeout. Any other message, including a missing key, stays failed.
+fn settle_config_error(
+    observation: RolloutObservation,
+    status_message: &str,
+    events: Option<&str>,
+) -> RolloutObservation {
+    let RolloutObservation::Failed {
+        reason: "CreateContainerConfigError",
+        ..
+    } = &observation
+    else {
+        return observation;
+    };
+    if config_error_is_cache_sync_timeout(status_message) {
+        return RolloutObservation::Pending;
+    }
+    if status_message.is_empty() && events.is_some_and(events_excuse_config_error) {
+        return RolloutObservation::Pending;
+    }
+    observation
+}
+
+fn container_state_message<'a>(container: &'a Value, state: &str) -> &'a str {
+    container
+        .pointer(&format!("/state/{state}/message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// Message on the named pod's CreateContainerConfigError, if that pod has one.
+fn config_error_message<'a>(
+    pods: &'a [Value],
+    current_hash: Option<&str>,
+    pod_name: &str,
+) -> &'a str {
+    for pod in pods.iter().filter(|pod| pod_is_current(pod, current_hash)) {
+        if pod.pointer("/metadata/name").and_then(Value::as_str) != Some(pod_name) {
+            continue;
+        }
+        for field in ["/status/containerStatuses", "/status/initContainerStatuses"] {
+            let Some(list) = pod.pointer(field).and_then(Value::as_array) else {
+                continue;
+            };
+            for container in list {
+                for state in ["waiting", "terminated"] {
+                    if container
+                        .pointer(&format!("/state/{state}/reason"))
+                        .and_then(Value::as_str)
+                        == Some("CreateContainerConfigError")
+                    {
+                        return container_state_message(container, state);
+                    }
+                }
+            }
+        }
+    }
+    ""
+}
+
 fn replicaset_revision(rs: &Value) -> u64 {
     rs.pointer("/metadata/annotations")
         .and_then(Value::as_object)
@@ -445,16 +526,28 @@ fn pod_terminal_failure(pod: &Value) -> Option<RolloutObservation> {
         };
         for container in list {
             for pointer in ["/state/waiting/reason", "/state/terminated/reason"] {
-                if let Some(reason) = container
+                let Some(reason) = container
                     .pointer(pointer)
                     .and_then(Value::as_str)
                     .and_then(terminal_reason)
-                {
-                    return Some(RolloutObservation::Failed {
-                        reason,
-                        pod: name.clone(),
-                    });
+                else {
+                    continue;
+                };
+                if reason == "CreateContainerConfigError" {
+                    let state = if pointer.contains("/waiting/") {
+                        "waiting"
+                    } else {
+                        "terminated"
+                    };
+                    if config_error_is_cache_sync_timeout(container_state_message(container, state))
+                    {
+                        continue;
+                    }
                 }
+                return Some(RolloutObservation::Failed {
+                    reason,
+                    pod: name.clone(),
+                });
             }
         }
     }
@@ -489,7 +582,10 @@ fn deployment_progress_deadline(deployment: &Value) -> Option<RolloutObservation
     None
 }
 
-/// Classify a Deployment plus its pods. Message fields are ignored.
+/// Classify a Deployment plus its pods. Message text is not copied into the
+/// observation. A CreateContainerConfigError whose message is the kubelet
+/// secret or configmap cache sync timeout is still progressing; every other
+/// terminal reason fails immediately.
 ///
 /// `current_hash` is the newest ReplicaSet `pod-template-hash`. Terminal pod
 /// reasons are taken only from that revision, so a crashlooping predecessor
@@ -750,6 +846,7 @@ async fn observe_one(
     target: &ClusterTarget,
     namespace: &str,
     workload: &ConnectorWorkload,
+    secret_values: &BTreeMap<String, String>,
     deadline: Instant,
 ) -> Result<RolloutObservation> {
     let Some(deployment) = kubectl_list(
@@ -784,7 +881,22 @@ async fn observe_one(
         )
         .await?,
     );
-    Ok(observe_rollout(&deployment, &pods, current_hash.as_deref()))
+    let observation = observe_rollout(&deployment, &pods, current_hash.as_deref());
+    let pod_name = match &observation {
+        RolloutObservation::Failed {
+            reason: "CreateContainerConfigError",
+            pod: Some(pod_name),
+        } => pod_name.clone(),
+        _ => return Ok(observation),
+    };
+    // A populated message was already classified. An empty message can still
+    // be the cache sync timeout, which shows up on the pod events.
+    let message = config_error_message(&pods, current_hash.as_deref(), &pod_name);
+    if !message.is_empty() {
+        return Ok(observation);
+    }
+    let events = pod_events_excerpt(target, namespace, &pod_name, secret_values, deadline).await;
+    Ok(settle_config_error(observation, message, events.as_deref()))
 }
 
 async fn last_log_excerpt(
@@ -878,7 +990,7 @@ pub async fn wait_for_connector_rollouts(
         }
         let mut still = Vec::new();
         for workload in pending {
-            match observe_one(target, namespace, &workload, deadline).await? {
+            match observe_one(target, namespace, &workload, secret_values, deadline).await? {
                 RolloutObservation::Ready => {
                     ui.note(&format!("connector {}: ready", workload.connector));
                 }
@@ -1569,6 +1681,129 @@ mod tests {
             ),
             RolloutObservation::Pending
         );
+    }
+
+    fn pod_waiting_message(name: &str, reason: &str, message: &str) -> Value {
+        json!({
+            "metadata": {"name": name},
+            "status": {
+                "containerStatuses": [{
+                    "name": "server",
+                    "state": {"waiting": {"reason": reason, "message": message}}
+                }]
+            }
+        })
+    }
+
+    const SECRET_CACHE_SYNC_TIMEOUT: &str =
+        "failed to sync secret cache: timed out waiting for the condition";
+    const CONFIGMAP_CACHE_SYNC_TIMEOUT: &str =
+        "failed to sync configmap cache: timed out waiting for the condition";
+
+    #[test]
+    fn connector_rollout_transient_config_error_then_ready() {
+        for message in [SECRET_CACHE_SYNC_TIMEOUT, CONFIGMAP_CACHE_SYNC_TIMEOUT] {
+            assert_eq!(
+                observe_rollout(
+                    &deploy_status(1, 0, 0),
+                    &[pod_waiting_message(
+                        "mcp-other-abc",
+                        "CreateContainerConfigError",
+                        message
+                    )],
+                    None,
+                ),
+                RolloutObservation::Pending,
+                "{message}"
+            );
+        }
+        let events = format!("Warning Failed: {SECRET_CACHE_SYNC_TIMEOUT}");
+        assert_eq!(
+            settle_config_error(
+                RolloutObservation::Failed {
+                    reason: "CreateContainerConfigError",
+                    pod: Some("mcp-other-abc".into()),
+                },
+                "",
+                Some(&events),
+            ),
+            RolloutObservation::Pending
+        );
+        assert_eq!(
+            observe_rollout(&deploy_status(1, 1, 1), &[], None),
+            RolloutObservation::Ready
+        );
+    }
+
+    #[test]
+    fn connector_rollout_persistent_config_error_fails() {
+        let missing_key = "couldn't find key TOKEN in Secret curie/curie-other";
+        let observation = observe_rollout(
+            &deploy_status(1, 0, 0),
+            &[pod_waiting_message(
+                "mcp-other-abc",
+                "CreateContainerConfigError",
+                missing_key,
+            )],
+            None,
+        );
+        assert_eq!(
+            observation,
+            RolloutObservation::Failed {
+                reason: "CreateContainerConfigError",
+                pod: Some("mcp-other-abc".into()),
+            }
+        );
+        assert_eq!(
+            settle_config_error(
+                observation.clone(),
+                missing_key,
+                Some("Warning Failed: couldn't find key TOKEN in Secret curie/curie-other"),
+            ),
+            observation
+        );
+        let mixed = format!("Warning Failed: {SECRET_CACHE_SYNC_TIMEOUT}\nWarning Failed: secret \"curie-other\" not found");
+        assert_eq!(
+            settle_config_error(
+                RolloutObservation::Failed {
+                    reason: "CreateContainerConfigError",
+                    pod: Some("mcp-other-abc".into()),
+                },
+                "",
+                Some(&mixed),
+            ),
+            RolloutObservation::Failed {
+                reason: "CreateContainerConfigError",
+                pod: Some("mcp-other-abc".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn connector_rollout_other_terminal_reasons_unchanged() {
+        for reason in [
+            "CrashLoopBackOff",
+            "CreateContainerError",
+            "ImagePullBackOff",
+            "OOMKilled",
+        ] {
+            assert_eq!(
+                observe_rollout(
+                    &deploy_status(1, 0, 0),
+                    &[pod_waiting_message(
+                        "mcp-other-abc",
+                        reason,
+                        SECRET_CACHE_SYNC_TIMEOUT
+                    )],
+                    None,
+                ),
+                RolloutObservation::Failed {
+                    reason,
+                    pod: Some("mcp-other-abc".into()),
+                },
+                "{reason}"
+            );
+        }
     }
 
     #[test]
