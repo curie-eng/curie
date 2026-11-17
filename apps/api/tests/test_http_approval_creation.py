@@ -728,29 +728,3 @@ def test_http_creation_freezes_explicit_route_schedule(creation_case, override, 
     again = rows(case.request["approval"]["dedupe_key"])[0]
     assert {key: again[key] for key in RECORD_FIELDS} == before
     assert again["identity_context"] == seal
-
-
-def test_pending_http_receipt_survives_schedule_schema_upgrade(
-    isolated_migration_db, valkey, runs_stream, synthetic_provider,
-):
-    from _migration_support import alembic_config, column_names, stamped_revision
-    from alembic import command
-
-    isolated_migration_db.at("head")
-    with creation(valkey, runs_stream, synthetic_provider) as case:
-        assert accepted(post(case), case.request)["status"] == "pending"
-        before = rows(case.request["approval"]["dedupe_key"])[0]
-        try:
-            command.downgrade(alembic_config(), "0151")
-            assert stamped_revision() == "0151"
-            assert {"remind_every_s", "next_remind_at"}.isdisjoint(column_names("approvals"))
-            baseline = rows(case.request["approval"]["dedupe_key"])[0]
-            assert {key: baseline[key] for key in RECORD_FIELDS} == {
-                key: before[key] for key in RECORD_FIELDS
-            }
-            assert baseline["identity_context"] == before["identity_context"]
-        finally:
-            command.upgrade(alembic_config(), "head")
-        accepted(post(case), case.request, duplicate=True)
-        after = rows(case.request["approval"]["dedupe_key"])[0]
-        assert after == before

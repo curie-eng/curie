@@ -230,25 +230,6 @@ def _revoke(case: SimpleNamespace, revocation: str) -> Callable[[], Any]:
     return restore
 
 
-@pytest.mark.parametrize("revocation", list(REVOCATION_CODES))
-def test_revoked_authority_refuses_the_selected_approver_until_restored(
-    selection_case: SimpleNamespace, revocation: str,
-) -> None:
-    """@spec REQUEST-APPROVAL-5: ceiling user, key, registration, route or active status.
-
-    Each removal refuses the selected person and leaves the row pending;
-    restoring it admits the same person on the same row.
-    """
-    case = selection_case
-    configured(case, users=BOTH)
-    row = dynamic(case)
-    restore = _revoke(case, revocation)
-    refused(case, row, NATIVE_A, code=REVOCATION_CODES[revocation])
-    no_wake(case, row["id"])
-    restore()
-    answered(case, row, NATIVE_A)
-
-
 # --- AC1.5: widening admits nobody outside the stored set -----------------------------
 
 

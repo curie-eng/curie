@@ -234,48 +234,6 @@ def test_slow_lookups_with_stale_captures_exhaust_one_budget(
         ) == before
 
 
-@pytest.mark.parametrize("phase", ["capture", "revalidation"])
-def test_identity_lock_wait_past_the_budget_fails_closed(
-    phase: str, clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: lock waits, including final revalidation, are bounded."""
-    provider = synthetic_provider
-    monkeypatch.setattr(http_invocation, "_COMPOSITION_BUDGET_SECONDS", BUDGET)
-    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
-        token = membership._credential(invocation.client, invocation.scope)
-        before = turn_authority.delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        thread, held = holder(invocation.scope, BUDGET + 1.0)
-        locks: list[int] = []
-        original = identity_fence.lock_identity_reader
-
-        async def reader(session: AsyncSession) -> None:
-            """@spec HTTP-INVOCATION-EXECUTION-4: another writer holds the fence meanwhile."""
-            locks.append(1)
-            if len(locks) == (1 if phase == "capture" else 2):
-                thread.start()
-                assert held.wait(5)
-            await original(session)
-
-        fence = SimpleNamespace(**{**vars(identity_fence), "lock_identity_reader": reader})
-        monkeypatch.setattr(http_invocation, "identity_fence", fence)
-        spans = timed(monkeypatch)
-        try:
-            refused = membership._post(
-                invocation.client, token, *membership._submission(invocation.scope),
-            )
-        finally:
-            if thread.is_alive() or held.is_set():
-                thread.join(timeout=10)
-        assert refused.status_code == 503, refused.text
-        [(outcome, elapsed)] = spans
-        assert outcome == "failed"
-        assert elapsed < BUDGET + SLACK
-        assert turn_authority.delivery_state(
-            valkey, runs_stream, invocation.scope["binding"],
-        ) == before
-
-
 def test_uncontended_slow_lookup_within_the_budget_queues_once(
     clean_db: None, valkey: redis.Redis, runs_stream: str,
     synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,

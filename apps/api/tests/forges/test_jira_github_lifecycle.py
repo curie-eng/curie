@@ -27,7 +27,7 @@ Then the real passes run, through `WorkItemReconciler.run_once` (whose
 
 Two test-level shortcuts, both outside the factory core: the publication's
 approval is recorded directly (the approval and publication Job path is not
-offline, as in `test_offline_lifecycle`), and the publication Job's lineage
+offline), and the publication Job's lineage
 advance is made through the same CRUD service its route calls. The GitHub
 App's installation token mint is answered by `fake_installation_tokens`.
 
