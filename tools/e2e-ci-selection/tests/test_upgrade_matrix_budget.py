@@ -410,6 +410,7 @@ def test_jobs_fetch_refuses_a_page_github_502s_and_joins_the_safe_pages(
     page2 = _payload(second_shard)
     page2["total_count"] = 3
     seen: list[str] = []
+    jobs_path = "/repos/curie-eng/curie/actions/runs/43927791819/jobs"
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -431,8 +432,9 @@ def test_jobs_fetch_refuses_a_page_github_502s_and_joins_the_safe_pages(
             else:
                 payload = page1
                 host, port = self.server.server_address
+                # The next link is built from fixed values, never the request.
                 link = (
-                    f"<http://{host}:{port}{parsed.path}"
+                    f"<http://{host}:{port}{jobs_path}"
                     f'?per_page={JOBS_PAGE_SIZE}&page=2>; rel="next"'
                 )
             body = json.dumps(payload).encode()
@@ -470,6 +472,7 @@ def test_jobs_fetch_refuses_a_page_github_502s_and_joins_the_safe_pages(
     assert completed.returncode == 0, output
     assert len(seen) == 2
     assert all(f"per_page={JOBS_PAGE_SIZE}" in path for path in seen)
+    assert all(path.startswith(jobs_path) for path in seen)
     assert "page=2" in seen[1]
     summary = _summary(tmp_path)
     assert "1095" in summary
