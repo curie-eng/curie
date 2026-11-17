@@ -1746,11 +1746,10 @@ class LiveRun:
         self.deadline_fired: set[str] = set()
         self.deadline_processes: list[subprocess.Popen[bytes]] = []
         # The claim-pod follower's thread. ``follow_lock`` guards ``pods``, ``processes``
-        # appends from stream threads, ``present_pods`` and ``terminations``.
+        # appends from stream threads and ``terminations``.
         self.follow_lock = threading.Lock()
         self.follow_stop = threading.Event()
         self.follow_thread: threading.Thread | None = None
-        self.present_pods: set[str] = set()
         self.terminations: dict[tuple[str, str, str], dict[str, Any]] = {}
         # Branch to this run's published head; an empty head means ownership is unproved.
         self.publication_branches: dict[str, str] = {}
@@ -3357,8 +3356,8 @@ class LiveRun:
         """Read one stream into a runner container, respawning it while it exits silently.
 
         A ``kubectl exec`` or ``logs -f`` started before the container runs exits
-        with nothing on stdout. While the pod still exists (in the follower's
-        latest listing) the command is respawned every STREAM_RETRY_SECONDS, for
+        with nothing on stdout. While a fresh API listing contains the same pod UID,
+        the command is respawned every STREAM_RETRY_SECONDS, for
         at most STREAM_RETRY_LIMIT, so an early stream still connects and a
         container that already terminated still returns its logs. A stream that
         produced output is not respawned, and none is once the follower stops.
@@ -3396,8 +3395,10 @@ class LiveRun:
             self.clock.wait(STREAM_RETRY_SECONDS)
 
     def pod_present(self, uid: str) -> bool:
-        with self.follow_lock:
-            return uid in self.present_pods
+        listing = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL, timeout=FOLLOW_GET_SECONDS)
+        return any(
+            (pod.get("metadata") or {}).get("uid") == uid for pod in listing.get("items") or []
+        )
 
     # -- the claim-pod follower ---------------------------------------------------------
 
@@ -3430,8 +3431,6 @@ class LiveRun:
 
         listing = self.kube.json("get", "pods", "-l", POD_CLAIM_LABEL, timeout=FOLLOW_GET_SECONDS)
         items = [pod for pod in (listing or {}).get("items") or [] if isinstance(pod, dict)]
-        with self.follow_lock:
-            self.present_pods = {str((pod.get("metadata") or {}).get("uid") or "") for pod in items}
         for pod in items:
             if self.follow_stop.is_set():
                 return

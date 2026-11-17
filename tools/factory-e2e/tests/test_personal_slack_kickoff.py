@@ -1992,6 +1992,72 @@ def _streams_of(run: psk.LiveRun, shell: StreamShell) -> None:
     run.shell, run.kube = shell, psk.Kube(shell, CONTEXT, NAMESPACE)
 
 
+def test_progress_card_main_discovery_retries_capture_before_the_follower_lists_the_pod(
+    tmp_path: Path,
+) -> None:
+    pending = _pod("acme-claim-1-runner", "uid-1", "Pending", running=False)
+    answer = _claim_answer("acme-claim-1", {"pod": pending})
+    live = _live_run(tmp_path, answer=answer)
+    run, ledger = live.run, live.ledger
+    files = _pod_files(_turns("msg_impl", IMPLEMENTER_MODEL, 1, 120, start=1))
+    records = [_file_record(name, 0, data) for name, data in files.items()]
+    records += [
+        {"kind": "sync", "sizes": {name: len(data) for name, data in files.items()}, "at": T0 + 2},
+        {"kind": "end"},
+    ]
+    output = [json.dumps(record).encode() + b"\n" for record in records]
+    shell = StreamShell(
+        run.runtime, ledger, answer, {"exec": [[], output], "logs": [[b"runner booting\n"]]}
+    )
+    _streams_of(run, shell)
+
+    run.discover_runner_pods()
+    observed = run.pods["uid-1"]
+    for thread in observed.threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    run.follow_pass()
+
+    assert observed.harvest.transcript_files() == files
+    assert observed.harvest.complete and observed.eof.is_set()
+    facts = run.attempt_facts()
+    assert facts is not None and len(facts.sessions) == 1
+    assert facts.sessions[0].output_tokens == 120
+    assert len([argv for argv in shell.spawned if "exec" in argv]) == 2
+    ledger.close()
+
+
+@pytest.mark.parametrize("present_uid", [None, "uid-replacement"])
+def test_progress_card_capture_stops_when_the_original_pod_is_gone(
+    tmp_path: Path, present_uid: str | None
+) -> None:
+    original = _pod("acme-claim-1-runner", "uid-1", "Pending", running=False)
+    remaining = (
+        []
+        if present_uid is None
+        else [dict(original, metadata=dict(original["metadata"], uid=present_uid))]
+    )
+
+    def answer(_argv: list[str]) -> psk.Completed:
+        return psk.Completed(0, json.dumps({"items": remaining}).encode(), b"")
+
+    live = _live_run(tmp_path, answer=answer)
+    run, ledger = live.run, live.ledger
+    shell = StreamShell(
+        run.runtime, ledger, answer, {"exec": [[]], "logs": [[b"runner stopped\n"]]}
+    )
+    _streams_of(run, shell)
+    observed = run.attach_pod(original)
+    assert observed is not None
+    for thread in observed.threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert observed.eof.is_set() and observed.harvest.transcript_files() == {}
+    assert len([argv for argv in shell.spawned if "exec" in argv]) == 1
+    ledger.close()
+
+
 def test_runner_log_tail_keeps_the_last_lines_scrubbed(tmp_path: Path) -> None:
     """Behavior: an attached runner's log stream keeps only its last 80 lines, each scanned
     raw and kept scrubbed, and settlement records them under a sanitized pod reference."""
@@ -2247,7 +2313,7 @@ def test_follower_attaches_a_pending_claim_pod_and_audits_on_the_main_thread(
     assert streams[0][-5:] == ["logs", "-f", "acme-claim-1-runner", "-c", "runner"]
     assert observed.watch.ran and list(observed.log_tail) == ["runner booting"]
     listing = run.kube.argv("get", "pods", "-l", psk.POD_CLAIM_LABEL, "-o", "json")
-    assert [argv for argv, _gate in shell.calls] == [listing]  # one listing per pass
+    assert [argv for argv, _gate in shell.calls] == [listing] * 4
     assert audits == [] and not observed.audited
     assert "runner_pods_seen" not in ledger.observations("grant")
     # The main thread's discovery audits the attached pod once it runs.
