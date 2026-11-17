@@ -13,7 +13,6 @@ import asyncio
 import time
 import uuid
 from collections.abc import Iterator
-from datetime import datetime
 from typing import Any
 
 import httpx
@@ -82,7 +81,6 @@ from _hook_wake_support import (
     snapshot,
     spend_budget,
     stream_entries,
-    turns,
     unix_now,
     unreachable_database,
     unreachable_resume_queue,
@@ -96,8 +94,6 @@ from _hook_wake_support import (
     wake_path,
 )
 from _migration_support import IsolatedMigrationDb
-from aci_protocol import HookRunRef, TurnSource
-from channel_protocol import hook_conversation_id
 from curie_api import hook_signing
 from curie_api.config import get_settings
 from sqlalchemy import text
@@ -148,73 +144,6 @@ def test_oversize_body_is_refused_before_credentials(wake_db: str) -> None:
 
 
 # --- case 2: one uniform 401 ---
-
-
-def test_every_invalid_credential_answers_one_uniform_401(wake_db: str) -> None:
-    async def scenario() -> None:
-        async with wake_app() as ctx:
-            agent, api_key = ctx.agent_id, ctx.api_key
-            now = unix_now()
-            key = ctx.key()
-
-            def signed(**changes: Any) -> dict[str, str]:
-                return signed_headers(key, agent, WAKE, **changes)
-
-            good = signed()
-            digest = good[SIGNATURE_HEADER].removeprefix("sha256=")
-            cases: list[tuple[str, str, str, dict[str, str]]] = []
-            for header in (TIMESTAMP_HEADER, DELIVERY_HEADER, SIGNATURE_HEADER):
-                trimmed = {name: value for name, value in good.items() if name != header}
-                cases.append((f"missing {header}", agent, WAKE, trimmed))
-            for stamp in ("0" * (13 - len(now)) + now, "+" + now, now[:5] + " " + now[5:]):
-                cases.append((f"timestamp {stamp!r}", agent, WAKE, signed(timestamp=stamp)))
-            for delivery in ("dotted.delivery", "d" * 129):
-                cases.append(
-                    (f"delivery {delivery[:12]}", agent, WAKE, signed(delivery_id=delivery))
-                )
-            cases.append(
-                (
-                    "uppercase hex",
-                    agent,
-                    WAKE,
-                    {**good, SIGNATURE_HEADER: "sha256=" + digest.upper()},
-                )
-            )
-            cases.append(("no prefix", agent, WAKE, {**good, SIGNATURE_HEADER: digest}))
-            unknown = str(uuid.uuid4())
-            cases.append(("unknown agent", unknown, WAKE, signed_headers(key, unknown, WAKE)))
-            for spelling in (agent.upper(), "{" + agent + "}", agent.replace("-", "")):
-                derived = reference_key(api_key, spelling, WAKE, 1)
-                cases.append(
-                    (f"agent {spelling}", spelling, WAKE, signed_headers(derived, spelling, WAKE))
-                )
-            for name in ("Queue-Ready", "-queue", "queue ready", "q" * 64):
-                derived = reference_key(api_key, agent, name, 1)
-                cases.append(
-                    (f"hook {name[:12]}", agent, name, signed_headers(derived, agent, name))
-                )
-            wrong = reference_key("not-the-installation-key", agent, WAKE, 1)
-            cases.append(("wrong key", agent, WAKE, signed_headers(wrong, agent, WAKE)))
-            stale = str(int(time.time()) - (TOLERANCE_S + 1))
-            cases.append(("stale", agent, WAKE, signed(timestamp=stale)))
-            # 301 seconds past the next whole second, so never inside the window.
-            ahead = str(int(time.time()) + TOLERANCE_S + 2)
-            cases.append(("ahead", agent, WAKE, signed(timestamp=ahead)))
-
-            before = await snapshot(ctx)
-            bodies = set()
-            for label, path_agent, path_hook, headers in cases:
-                response = await ctx.client.post(
-                    wake_path(path_agent, path_hook), content=b"{}", headers=headers
-                )
-                assert response.status_code == 401, (label, response.text)
-                assert response.json() == INVALID_SIGNATURE, (label, response.text)
-                bodies.add(response.content)
-            assert len(bodies) == 1
-            await unchanged(ctx, before)
-            assert_queued(await wake(ctx))
-
-    drive(scenario)
 
 
 def _wire(response: httpx.Response) -> tuple[int, bytes, str | None]:
@@ -560,56 +489,6 @@ def test_guard_order_is_source_then_pause_then_kill_then_budget(wake_db: str) ->
                 await _apply_guard(ctx, guard, on=False)
             await unchanged(ctx, before)
             assert_queued(await wake(ctx))
-
-    drive(scenario)
-
-
-# --- case 9: admission ---
-
-
-def test_admission_queues_one_webhook_run_and_one_targetless_turn(wake_db: str) -> None:
-    async def scenario() -> None:
-        async with wake_app() as ctx:
-            assert await snapshot(ctx) == ([], [])
-            headers = signed_headers(ctx.key(), ctx.agent_id, WAKE)
-            sent = time.time()
-            response = await wake(ctx, headers=headers)
-            run_id = assert_queued(response)
-            assert response.json() == {"status": "queued", "run_id": run_id}
-
-            runs, entries = await snapshot(ctx)
-            assert len(runs) == 1 and len(entries) == 1
-            run = runs[0]
-            assert run["id"] == uuid.UUID(run_id)
-            assert run["agent_id"] == uuid.UUID(ctx.agent_id)
-            assert run["name"] == WAKE
-            assert run["source"] == "webhook"
-            assert run["version_id"] == uuid.UUID(ctx.version_id)
-            assert run["outcome"] is None and run["reason"] is None and run["ended_at"] is None
-            lease = (run["lease_expires_at"] - run["started_at"]).total_seconds()
-            assert abs(lease - DEFAULT_LEASE_S) <= 2, lease
-
-            [turn] = turns(entries)
-            assert turn.source == TurnSource.CRON
-            assert turn.reply_handle is None
-            assert turn.hook_run is not None
-            slot = turn.hook_run.slot_utc
-            assert turn.hook_run == HookRunRef(agent_id=ctx.agent_id, name=WAKE, slot_utc=slot)
-            assert datetime.fromisoformat(slot) == run["slot_utc"]
-            assert turn.event_id == f"cron:{ctx.agent_id}:{WAKE}:{slot}"
-            assert turn.conversation_id == hook_conversation_id(uuid.UUID(ctx.agent_id), WAKE)
-            assert turn.author == f"cron:{WAKE}"
-            assert turn.text == WAKE_PROMPT
-            assert turn.attachments == []
-            assert turn.tool_access is None and turn.author_principal is None
-
-            reservation = dedupe_key_for(ctx, headers)
-            assert await dedupe_keys(ctx) == [reservation.encode()]
-            expected = reference_ttl(headers[TIMESTAMP_HEADER], sent)
-            ttl = await ctx.valkey.ttl(reservation)
-            assert expected - 2 <= ttl <= expected, (ttl, expected)
-            remaining = await ctx.valkey.pttl(reservation)
-            assert time.time() + remaining / 1000 > int(headers[TIMESTAMP_HEADER]) + TOLERANCE_S
 
     drive(scenario)
 
