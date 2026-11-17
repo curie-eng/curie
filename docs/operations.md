@@ -3148,9 +3148,23 @@ Live Slack Socket Mode delivery and the runner's checkout of the revised branch 
 
 A person starts a personal factory run from Slack by mentioning the app with a link to one GitHub issue, either at a channel's root or in a thread no factory run owns: `@curie https://github.com/acme-corp/acme-fixture/issues/7`. Slack's `<URL>` and `<URL|label>` forms both count, and a label that names another issue reads as a second link. The channel must be a public or private channel where the agent has its Slack binding and a `github` surface that serves the issue's repository; a direct message stays ordinary chat.
 
-The sender must resolve through an operator-managed Slack identity link to an active principal in the binding's tenant, and that principal's [personal Claude enrollment](#personal-claude-enrollment) must be active. Trusted admission then records one personal WorkItem owned by the sender at the enrollment's current generation, with the issue link as its objective and no trigger label, under a request id derived from the Slack delivery, so a redelivered mention finds the run it already admitted. The mention's message becomes the run's thread, and the dispatcher's placeholder reply under it becomes the run's progress card: an admitted kickoff hands the placeholder to the progress lane, which edits it into the card and posts the needs a person and ready for review replies there, mentioning the sender (see [Factory Slack progress](#factory-slack-progress)). There is no separate admitted reply. The progress lane posts no root, because the mention already rooted the thread. This holds whether or not the agent has a `factory_slack_channel`.
+The sender must resolve through an active Slack identity link to an active principal in the binding's tenant, and that principal's [personal Claude enrollment](#personal-claude-enrollment) must be active. Trusted admission then records one personal WorkItem owned by the sender at the enrollment's current generation, with the issue link as its objective and no trigger label, under a request id derived from the Slack delivery, so a redelivered mention finds the run it already admitted. The mention's message becomes the run's thread, and the dispatcher's placeholder reply under it becomes the run's progress card: an admitted kickoff hands the placeholder to the progress lane, which edits it into the card and posts the needs a person and ready for review replies there, mentioning the sender (see [Factory Slack progress](#factory-slack-progress)). There is no separate admitted reply. The progress lane posts no root, because the mention already rooted the thread. This holds whether or not the agent has a `factory_slack_channel`.
 
-Exactly one link to an issue on the factory's GitHub code host is accepted. Every refusal is final for its delivery and is replied in the mention's thread, and each reply ends with `Outcome: <code>`:
+Exactly one link to an issue on the factory's GitHub code host is accepted.
+A `sender_unverified` or `enrollment_inactive` refusal is sent privately to the
+verified Slack sender, with `Code: <outcome>` and a **Connect your Claude plan**
+link button when a URL is available. The public placeholder becomes
+"Not started. I sent you a private message about what to do next."
+An unlinked account gets a sender-bound, single-use confirmation URL under
+`/api/identity/connect/<token>` when the Console uses HTTPS OIDC. The token
+expires after ten minutes, issuance is spaced one minute apart, and each
+account can hold at most five live tokens. The confirmation names the Slack
+account, warns that anyone using it can start runs on the confirming person's
+plan, and requires sign-in and an explicit CSRF-bound confirmation. In personal
+mode, confirmation redirects to `/settings/claude-plan`; a linked sender with
+an inactive enrollment gets that page directly. A refusal without a URL stays
+private, has no button, and names the operator. Other kickoff refusals keep
+their public thread replies ending with `Outcome: <code>`:
 
 1. The link: `link_missing` (no issue link), `link_multiple` (more than one), `link_malformed` (an issue-shaped link that is not exactly `/{owner}/{repo}/issues/{number}`), `link_host_unsupported` (another host) and `link_pull_request` (a pull request).
 2. The sender: `sender_unverified` when the Slack account does not resolve to an active principal, and `enrollment_inactive` when the principal has no active enrollment, including one disconnected or replaced while the mention was decided.

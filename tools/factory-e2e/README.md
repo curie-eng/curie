@@ -1581,9 +1581,28 @@ uv run python3 tools/factory-e2e/personal_slack_kickoff.py --live \
   --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION" \
   --grant-file "$GRANT_FILE" --grant-expires-at "$GRANT_EXPIRES_AT" --approve-live "$CEILING"
 
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py refusal-connect \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$CONNECT_ID" \
+  --context "$CTX" --docker-context "$DCTX" --registry-port "$PORT" \
+  --namespace "$NS" --release "$RELEASE" --app-dir "$APP_DIR" \
+  --curie-bot-token-file "$CURIE_BOT" --app-token-file "$APP_TOKEN" \
+  --sender-token-file "$SENDER_BOT" --channel-file "$CHANNEL" --isolation-file "$ISOLATION"
+
+uv run python3 tools/factory-e2e/personal_slack_kickoff.py judge \
+  --candidate "$SHA" --state-dir "$STATE" --run-id "$CONNECT_ID" --criterion refusal-connect
+
 uv run python3 tools/factory-e2e/personal_slack_kickoff.py judge \
   --candidate "$SHA" --state-dir "$STATE" --run-id "$RUN_ID" --criterion all
 ```
+
+`refusal-connect` takes the same installation and Slack inputs as `rehearse`,
+but takes no grant and never enrolls one. It mentions the app once with an
+unlinked sender and once with a linked sender without an enrollment, checks
+that each public thread has only the settled placeholder, and reads each
+private post acknowledgement from worker logs without recording its URL.
+It also counts the unlinked sender's live connect token and verifies that no
+WorkItem, request or runner started. `judge --criterion refusal-connect`
+requires both legs and complete cleanup, and prints anonymized thread dumps.
 
 `images` builds the api, worker, dispatcher and runner images and the
 dark-factory runner layer at the candidate through `git archive` with the OCI

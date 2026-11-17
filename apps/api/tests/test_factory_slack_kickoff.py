@@ -107,6 +107,63 @@ from apps.api.tests.test_factory_slack_runtime import (  # noqa: E402
 OTHER_CHANNEL = "C0EXAMPLE3"
 
 
+@pytest.mark.parametrize(
+    "oidc,scheme,offered", [(True, "https", True), (False, "https", False), (True, "http", False)]
+)
+def test_connect_plan_kickoff_unlinked_sender_and_spacing(
+    kickoff: SteeringStack, monkeypatch: pytest.MonkeyPatch, oidc: bool, scheme: str, offered: bool
+) -> None:
+    from urllib.parse import urlsplit
+
+    from apps.api.tests.test_factory_slack_runtime import TEAM
+    from apps.api.tests.test_identity_connect import connect_plan_settings
+
+    connect_plan_settings(monkeypatch, oidc=oidc, scheme=scheme)
+    user = f"U{kickoff.tag.upper()}9"
+    first = decide(kickoff, person_mention(kickoff, user, linking(next_issue())))
+    assert first["outcome"] == "sender_unverified"
+    assert bool(first.get("connect_url")) is offered
+    rows = _rows(
+        "SELECT * FROM curie.identity_connect_tokens WHERE provider_native_id = :user",
+        {"user": user},
+    )
+    assert len(rows) == int(offered)
+    if offered:
+        url = urlsplit(first["connect_url"])
+        assert url.netloc == "console.example.com" and url.path.startswith("/api/identity/connect/")
+        assert (
+            rows[0]["token_hash"] == hashlib.sha256(url.path.rsplit("/", 1)[1].encode()).hexdigest()
+        )
+        assert rows[0]["idp_issuer"] == "https://idp.example.com"
+        assert _rows(
+            "SELECT key FROM curie.identity_namespaces WHERE id = :id",
+            {"id": rows[0]["identity_namespace_id"]},
+        ) == [{"key": TEAM}]
+    second = decide(kickoff, person_mention(kickoff, user, linking(next_issue())))
+    assert second["outcome"] == "sender_unverified" and second.get("connect_url") is None
+    assert _rows(
+        "SELECT count(*) AS n FROM curie.identity_connect_tokens WHERE provider_native_id = :user",
+        {"user": user},
+    ) == [{"n": int(offered)}]
+
+
+def test_connect_plan_kickoff_inactive_enrollment(
+    kickoff: SteeringStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from apps.api.tests.test_identity_connect import connect_plan_settings
+
+    connect_plan_settings(monkeypatch)
+    person = kickoff.person()
+    answer = decide(kickoff, person_mention(kickoff, person.slack_user, linking(next_issue())))
+    assert answer["outcome"] == "enrollment_inactive"
+    assert answer["plan_url"] == "https://console.example.com/settings/claude-plan"
+    assert answer.get("connect_url") is None
+    assert _rows(
+        "SELECT count(*) AS n FROM curie.identity_connect_tokens WHERE provider_native_id = :user",
+        {"user": person.slack_user},
+    ) == [{"n": 0}]
+
+
 def _personal(principal_id: uuid.UUID) -> tuple[Any, ...]:
     return (DEFAULT_TENANT_ID, "personal", principal_id, GENERATION)
 

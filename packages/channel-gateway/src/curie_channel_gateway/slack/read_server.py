@@ -14,6 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ..read_transport import GatewayProviders, gateway_application
 from ..reply_delivery import ReplyDeliveryStore
 from ..request_replay import RequestReplayStore
+from .account_profiles import SlackAccountProfiles
 from .canvas import SlackCanvasReader
 from .files import SlackFileClient
 from .groups import SlackUserGroupClient
@@ -103,6 +104,9 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
                     tokens,
                     base_url=config.slack_api_base_url or None,
                     timeout_s=config.user_email_timeout_s,
+                ),
+                profiles=SlackAccountProfiles(
+                    http, tokens, base_url=config.slack_api_base_url or None
                 ),
             ),
             reply=sink,

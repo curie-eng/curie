@@ -13,12 +13,19 @@ import re
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 
+import httpx
+from curie_channel_gateway.read_models import AccountProfile
+from curie_channel_gateway.read_transport import GatewayError
+from pydantic import TypeAdapter
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import identity_audit, principal_authority
+from ..config import Settings, get_settings
 from ..crud.console import principal_is_active
+from ..identities import gateway_client
 from ..models import (
     IdentityConnectToken,
     IdentityLink,
@@ -43,6 +50,23 @@ class ConnectRefused(ValueError):
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def personal_console_origin(settings: Settings) -> str | None:
+    origin = urlsplit(settings.oidc_redirect_uri)
+    if (
+        settings.factory_model_auth_mode == "personal"
+        and settings.oidc_enabled
+        and origin.scheme == "https"
+        and origin.netloc
+    ):
+        return f"https://{origin.netloc}"
+    return None
+
+
+def plan_url(settings: Settings) -> str | None:
+    origin = personal_console_origin(settings)
+    return f"{origin}/settings/claude-plan" if origin else None
 
 
 async def configured_provider(
@@ -77,6 +101,24 @@ async def configured_provider(
     return config if synced is not None else None
 
 
+async def connect_issuer(session: AsyncSession, tenant_id: uuid.UUID) -> str | None:
+    try:
+        await principal_authority.lock_scope(session, tenant_id)
+    except principal_authority.PrincipalAuthorityRefusal:
+        return None
+    config = await configured_provider(session, tenant_id)
+    if config is not None:
+        return config.issuer
+    settings = get_settings()
+    if personal_console_origin(settings) is None:
+        return None
+    # A retained directory configuration must not acquire a different issuer
+    # when a snapshot becomes unavailable or its authority is disabled.
+    if await session.get(TenantIdentityProvider, tenant_id) is not None:
+        return None
+    return settings.oidc_issuer
+
+
 async def issue_for_sender(
     session: AsyncSession,
     *,
@@ -98,7 +140,7 @@ async def issue_for_sender(
     native_id = slack.user_id
     if native_id is None:
         return None
-    config = await configured_provider(session, tenant_id)
+    issuer = await connect_issuer(session, tenant_id)
     namespace = await session.scalar(
         select(IdentityNamespace)
         .where(
@@ -108,7 +150,7 @@ async def issue_for_sender(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if namespace is None or namespace.status != "active" or config is None:
+    if namespace is None or namespace.status != "active" or issuer is None:
         return None
     existing = await session.scalar(
         select(IdentityLink.id).where(
@@ -144,13 +186,47 @@ async def issue_for_sender(
             tenant_id=tenant_id,
             identity_namespace_id=namespace.id,
             provider_native_id=native_id,
-            idp_issuer=config.issuer,
+            idp_issuer=issuer,
             expires_at=now + TOKEN_TTL,
             created_at=now,
         )
     )
     await session.flush()
     return raw
+
+
+async def capture_slack_profile(
+    session: AsyncSession,
+    *,
+    token: str,
+    identity: str,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> None:
+    gateway = gateway_client(settings, client)
+    if gateway is None:
+        return
+    row = await session.get(IdentityConnectToken, hash_token(token))
+    assert row is not None
+    namespace = await session.get(IdentityNamespace, row.identity_namespace_id)
+    assert namespace is not None
+    try:
+        profile = await gateway.call(
+            identity,
+            "account_profile",
+            {"user_id": row.provider_native_id, "workspace": namespace.key},
+            TypeAdapter(AccountProfile),
+        )
+    except (GatewayError, httpx.HTTPError, TimeoutError):
+        return
+    for column, value in (
+        ("slack_display_name", profile.display_name),
+        ("slack_handle", profile.handle),
+        ("slack_workspace_name", profile.workspace_name),
+    ):
+        if isinstance(value, str) and value.strip():
+            setattr(row, column, value[:256])
+    await session.flush()
 
 
 async def live_token(
@@ -164,7 +240,7 @@ async def live_token(
     ))
     if tenant_id is None:
         raise ConnectRefused("invalid_connect")
-    config = await configured_provider(session, tenant_id)
+    issuer = await connect_issuer(session, tenant_id)
     query = select(IdentityConnectToken).where(IdentityConnectToken.token_hash == hash_token(token))
     if lock:
         query = query.with_for_update()
@@ -175,8 +251,8 @@ async def live_token(
         IdentityNamespace, row.identity_namespace_id, populate_existing=True
     )
     if (
-        config is None
-        or config.issuer != row.idp_issuer
+        issuer is None
+        or issuer != row.idp_issuer
         or namespace is None
         or namespace.tenant_id != row.tenant_id
         or namespace.status != "active"

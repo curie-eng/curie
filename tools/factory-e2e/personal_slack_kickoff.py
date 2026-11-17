@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live Slack kickoff acceptance driver for personal factory runs (#5380, ADR 0268 row 13).
 
-Six subcommands share one private SQLite ledger under ``--state-dir``:
+Seven subcommands share one private SQLite ledger under ``--state-dir``:
 
 1. ``images`` (unpaid) starts a loopback ``registry:2.8.3`` through the caller's
    Docker endpoint, builds the candidate's api, worker, dispatcher and runner
@@ -22,7 +22,8 @@ Six subcommands share one private SQLite ledger under ``--state-dir``:
    probe), so the paid path's diagnostics are captured with nothing to spend.
 5. ``run`` (also reachable as ``--live``) performs exactly one paid kickoff and
    the disconnected control, then finalizes every owned resource.
-6. ``judge --criterion X`` reads the ledger only and prints a verdict.
+6. ``refusal-connect`` (unpaid, no grant) proves the two private plan refusals.
+7. ``judge --criterion X`` reads the ledger only and prints a verdict.
 
 No held secret (the grant, the three Slack tokens, the App key and token, the
 API key, the worker token, the OIDC client secret or the console session) is
@@ -71,7 +72,7 @@ import personal_slack_kickoff_support as sks  # noqa: E402
 REPO_ROOT = HERE.parents[1]
 FIXTURE_ISSUE = HERE / "fixtures" / "personal-slack-kickoff-issue.md"
 OIDC_HARNESS = REPO_ROOT / "tools" / "oidc-e2e" / "oidc_e2e.py"
-SUBCOMMANDS = ("images", "slack-probe", "preflight", "rehearse", "run", "judge")
+SUBCOMMANDS = ("images", "slack-probe", "preflight", "rehearse", "refusal-connect", "run", "judge")
 DOCKERFILES = {
     "curie-api": "apps/api/Dockerfile",
     "curie-worker": "apps/worker/Dockerfile",
@@ -493,15 +494,15 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--candidate", default="")
         sub.add_argument("--state-dir", default="")
         sub.add_argument("--run-id", default="")
-        if name in {"images", "rehearse", "run"}:
+        if name in {"images", "rehearse", "refusal-connect", "run"}:
             for flag in ("--context", "--docker-context", "--registry-port", "--kubeconfig"):
                 sub.add_argument(flag, default="")
-        if name in {"rehearse", "run"}:
+        if name in {"rehearse", "refusal-connect", "run"}:
             for flag in ("--namespace", "--release", "--priority-classes"):
                 sub.add_argument(flag, default="")
-        if name in {"preflight", "rehearse", "run"}:
+        if name in {"preflight", "rehearse", "refusal-connect", "run"}:
             sub.add_argument("--app-dir", default="")
-        if name in {"slack-probe", "preflight", "rehearse", "run"}:
+        if name in {"slack-probe", "preflight", "rehearse", "refusal-connect", "run"}:
             for flag in (*SLACK_FLAGS.values(), "--channel-file", "--isolation-file"):
                 sub.add_argument(flag, default="")
         if name in {"preflight", "rehearse", "run"}:
@@ -521,7 +522,9 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--item-cap", type=int, required=True)
             sub.add_argument("--item-charged-before", type=int, required=True)
         if name == "judge":
-            sub.add_argument("--criterion", required=True, choices=[*sks.CRITERIA, "all"])
+            sub.add_argument(
+                "--criterion", required=True, choices=[*sks.CRITERIA, "refusal-connect", "all"]
+            )
     return parser
 
 
@@ -1555,6 +1558,18 @@ def cmd_judge(args: argparse.Namespace, runtime: Runtime) -> int:
 
 def live_inputs(inputs: Inputs, args: argparse.Namespace) -> Inputs:
     return with_slack(with_app(with_install(with_cluster(inputs, args), args), args), args)
+
+
+def cmd_refusal_connect(args: argparse.Namespace, runtime: Runtime) -> int:
+    inputs = live_inputs(base_inputs(args), args)
+    ledger = sks.Ledger.open(inputs.state_dir, inputs.run_id, scrubber=runtime.scrubber)
+    try:
+        ledger.ensure_run(inputs.candidate, phase="refusal-connect")
+        ledger.mark_live_kind("refusal-connect")
+    except sks.Refusal:
+        ledger.close()
+        raise
+    return RefusalConnectRun(inputs=inputs, runtime=runtime, ledger=ledger, ceiling=None).execute()
 
 
 def cmd_run(args: argparse.Namespace, runtime: Runtime) -> int:
@@ -2599,7 +2614,7 @@ class LiveRun:
         return sks.sql_uuid(found["id"])
 
     def seed_slack_link(self, namespace_id: str, sender_user: str, principal_id: str) -> None:
-        """Setup, not the proved path: no API creates a Slack link, so it is seeded by SQL.
+        """Seed the sender link for setup; account confirmation is proved separately.
 
         The sender bot user is mapped ``admin_mapped`` to the OIDC principal, the
         way #5375 seeds its principal; every value is validated before it is
@@ -3968,14 +3983,16 @@ class LiveRun:
             kit.channel, sks.kickoff_text(kit.curie_auth.user_id, self.issues["b"]["url"])
         )
         self.roots.append(ts)
-        self.observe_delivery("control", ts)
+        receipt = self.observe_delivery("control", ts)
         outcome: dict[str, str | None] = {"code": None}
 
         def replied() -> bool:
-            outcome["code"] = sks.reply_outcome(
-                kit.sender.replies(kit.channel, ts), author=kit.curie_auth.user_id
+            public = sks.connect_plan_public_reply(
+                kit.sender.replies(kit.channel, ts), root_ts=ts, author=kit.curie_auth.user_id
             )
-            return outcome["code"] is not None
+            ack = self.private_refusal_ack(receipt, sks.ENROLLMENT_INACTIVE)
+            outcome["code"] = sks.ENROLLMENT_INACTIVE if public and ack else None
+            return public and bool(ack)
 
         with contextlib.suppress(StepFailed):
             self.wait_until(replied, seconds=REPLY_SECONDS, what="the control reply", every=3)
@@ -3995,6 +4012,24 @@ class LiveRun:
             )
         self.ledger.record("refusal", "after", after)
         self.ledger.record("refusal", "control_native_sessions", new_pods)
+
+    def private_refusal_ack(
+        self, receipt: sks.SlackMentionReceipt | None, outcome: str
+    ) -> str | None:
+        if receipt is None:
+            return None
+        result = self.kube.ctl(
+            "logs",
+            "-l",
+            self.worker_selector,
+            "--tail=5000",
+            "--prefix=false",
+            "--all-containers=true",
+            timeout=60,
+        )
+        return sks.connect_plan_private_ack(
+            result.stdout, delivery_id=receipt.delivery_id, outcome=outcome
+        )
 
     def phase_fence_rehearsal(self) -> None:
         self.fence_paid_starts()
@@ -4243,6 +4278,95 @@ class LiveRun:
         return True
 
 
+class RefusalConnectRun(LiveRun):
+    """Both private refusal legs on a fresh install, without enrolling a grant."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.command = "refusal-connect"
+        self.origins = dataclasses.replace(
+            self.origins, redirect_uri=self.origins.redirect_uri.replace("http://", "https://", 1)
+        )
+
+    def phases(self) -> list[tuple[str, Callable[[], None]]]:
+        phases = super().phases()
+        return [
+            pair
+            for pair in phases
+            if pair[0]
+            in {
+                "refusals",
+                "registry",
+                "images",
+                "namespaces",
+                "dex",
+                "install",
+                "setup",
+                "fixtures",
+            }
+        ] + [("refusal-connect", self.phase_refusal_connect)]
+
+    def phase_refusal_connect(self) -> None:
+        kit = self.require_kit()
+        namespace_id = self.await_slack_namespace(kit.curie_auth.team_id)
+        user = sks.require_slack_id(kit.sender_auth.user_id, "user")
+        self.sql_write(
+            "UPDATE curie.identity_links SET revoked_at=now() "
+            f"WHERE identity_namespace_id='{namespace_id}' AND provider_native_id='{user}' "
+            "AND revoked_at IS NULL;"
+        )
+        dumps: list[dict[str, Any]] = []
+        for code, issue in (("sender_unverified", "a"), ("enrollment_inactive", "b")):
+            before = self.counts()
+            ts = kit.sender.post(
+                kit.channel, sks.kickoff_text(kit.curie_auth.user_id, self.issues[issue]["url"])
+            )
+            self.roots.append(ts)
+            receipt = self.observe_delivery(code, ts)
+            observed: dict[str, Any] = {}
+
+            def settled(
+                ts: str = ts,
+                receipt: sks.SlackMentionReceipt | None = receipt,
+                code: str = code,
+                observed: dict[str, Any] = observed,
+            ) -> bool:
+                messages = kit.sender.replies(kit.channel, ts)
+                ack = self.private_refusal_ack(receipt, code)
+                public = sks.connect_plan_public_reply(
+                    messages, root_ts=ts, author=kit.curie_auth.user_id
+                )
+                observed.update(message_ts=ack, public_placeholder_only=public)
+                return public and bool(ack)
+
+            self.wait_until(
+                settled, seconds=REPLY_SECONDS, what="the private plan refusal", every=3
+            )
+            observed.update(before=before, after=self.counts())
+            self.ledger.record("refusal-connect", code, observed)
+            dumps.append(
+                {
+                    "outcome": code,
+                    "messages": sks.anonymize_thread(
+                        kit.sender.replies(kit.channel, ts),
+                        root_ts=ts,
+                        roles={kit.sender_auth.user_id: "SENDER", kit.curie_auth.user_id: "CURIE"},
+                    ),
+                }
+            )
+            if code == "sender_unverified":
+                rows = self.sql(
+                    "SELECT count(*) AS n FROM curie.identity_connect_tokens "
+                    f"WHERE identity_namespace_id='{namespace_id}' AND provider_native_id='{user}' "
+                    "AND consumed_at IS NULL AND expires_at > now()"
+                )
+                self.ledger.record(
+                    "refusal-connect", "live_sender_tokens", rows[0].get("n") if rows else None
+                )
+                self.seed_slack_link(namespace_id, user, str(self.owner["principal_id"]))
+        self.ledger.record("refusal-connect", "thread_dump", dumps)
+
+
 # Sent into the runner container at a fence: SIGINT to each native CLI process,
 # the same interrupt a terminal gives it, before the pod is deleted.
 INTERRUPT_PROGRAM = r"""
@@ -4273,6 +4397,7 @@ COMMANDS: dict[str, Callable[[argparse.Namespace, Runtime], int]] = {
     "slack-probe": cmd_slack_probe,
     "preflight": cmd_preflight,
     "rehearse": cmd_rehearse,
+    "refusal-connect": cmd_refusal_connect,
     "run": cmd_run,
     "judge": cmd_judge,
 }

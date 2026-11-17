@@ -5,6 +5,14 @@ from typing import Literal, Protocol
 
 from channel_protocol import ChannelCapability
 
+from ..read_models import AccountProfile
+
+
+class AccountProfiles(Protocol):
+    async def profile_of(
+        self, *, identity: str, user_id: str, workspace: str
+    ) -> AccountProfile: ...
+
 
 class IdentitySelection[Route](Protocol):
     """Select a configured credential from authorized binding routes only."""

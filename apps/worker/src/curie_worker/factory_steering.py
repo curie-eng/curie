@@ -73,6 +73,14 @@ from typing import Any, Final
 import httpx
 from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.turn import route_identity
+from channel_protocol import (
+    MESSAGE_VERSION,
+    SCOPED_REPLY_WIRE_VERSION,
+    MessageLink,
+    OutboundMessage,
+    ReplyPost,
+    ReplyTarget,
+)
 from curie_internal.issue_links import find_issue_links
 from curie_internal.slack_mention_receipt import (
     MalformedMentionReceiptError,
@@ -89,6 +97,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from .binding import binding_adapter_for_handle
 from .kernel import constants as kernel_constants
 from .kernel.identity import CURRENT as HTTP_TURN_CARRY
+from .reply_sink import ReplySink, TargetRoute
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +347,7 @@ class FactorySteeringClient:
         worker_token: str | None,
         client: httpx.AsyncClient,
         intent_key: Callable[[str], str],
+        replies: ReplySink,
     ) -> None:
         """``intent_key`` names the worker's steering-sent marker of a delivery
         (``WorkerConfig.steering_sent_key``), the key ``record_intent`` writes
@@ -360,6 +370,7 @@ class FactorySteeringClient:
         self._headers = {"X-Curie-Worker-Token": worker_token} if worker_token else None
         self._client = client
         self._intent_key = intent_key
+        self._replies = replies
 
     async def _mapping(
         self, identity: str, channel: str, root_ts: str, kickoff_request: uuid.UUID
@@ -644,6 +655,62 @@ class FactorySteeringClient:
             # request) is now the run's progress card: no reply text.
             return SteeringReply(
                 outcome=outcome, text="", request_id=request_id, progress_card=True
+            )
+        if outcome in {"sender_unverified", "enrollment_inactive"}:
+            url = _optional_text(
+                body, "connect_url" if outcome == "sender_unverified" else "plan_url"
+            )
+            private = (
+                "Curie doesn't know your Slack account yet. Connect it to your Claude plan, "
+                "then mention me again."
+                if outcome == "sender_unverified"
+                else "You need to connect your Claude plan before Curie can start this run."
+            )
+            if url is None:
+                private = render_kickoff_reply(outcome, reason=reason)
+                private = (
+                    private.rsplit("\n", 1)[0] + " Ask the operator to help connect your account."
+                )
+            try:
+                async with asyncio.timeout_at(deadline):
+                    ack = await self._replies.emit(
+                        ReplyPost(
+                            version=SCOPED_REPLY_WIRE_VERSION,
+                            event="reply.post",
+                            target=ReplyTarget(
+                                kind=_SLACK_KIND,
+                                address=turn.handle.channel,
+                                conversation_id=turn.root_ts,
+                                reply_ref=None,
+                            ),
+                            audience_user=receipt.user_id,
+                            message=OutboundMessage(
+                                version=MESSAGE_VERSION,
+                                text=f"{private}\n\nCode: {outcome}",
+                                links=[MessageLink(label="Connect your Claude plan", url=url)]
+                                if url
+                                else [],
+                                footer=f"Code: {outcome}",
+                            ),
+                            requested_by="",
+                            delivery_id=str(
+                                uuid.uuid5(uuid.NAMESPACE_URL, f"curie-connect:{qevent.event_id}")
+                            ),
+                        ),
+                        route=TargetRoute(adapter=turn.identity),
+                        best_effort_unreachable=False,
+                    )
+            except Exception as exc:
+                raise SteeringUnavailable("private plan refusal could not be delivered") from exc
+            logger.info(
+                "factory kickoff private post delivery=%s outcome=%s message_ts=%s",
+                qevent.event_id,
+                outcome,
+                ack.ref,
+            )
+            return SteeringReply(
+                outcome=outcome,
+                text="Not started. I sent you a private message about what to do next.",
             )
         return SteeringReply(
             outcome=outcome,

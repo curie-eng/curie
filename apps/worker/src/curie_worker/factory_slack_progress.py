@@ -95,7 +95,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final
 
-from channel_protocol import MESSAGE_VERSION, OutboundMessage
+from channel_protocol import MESSAGE_VERSION, MessageLink, OutboundMessage
 from channel_protocol.reply import (
     PROGRESS_REPLY_WIRE_VERSION,
     SCOPED_REPLY_WIRE_VERSION,
@@ -1312,6 +1312,7 @@ class FactorySlackProgressLoop:
         channel: str,
         identity: str,
         conversation_id: str | None,
+        plan_url: str | None = None,
     ) -> str | None:
         ack = await self._replies.emit(
             ReplyPost(
@@ -1323,7 +1324,13 @@ class FactorySlackProgressLoop:
                     conversation_id=conversation_id,
                     reply_ref=None,
                 ),
-                message=OutboundMessage(version=MESSAGE_VERSION, text=text_value),
+                message=OutboundMessage(
+                    version=MESSAGE_VERSION,
+                    text=text_value,
+                    links=[MessageLink(label="Connect your Claude plan", url=plan_url)]
+                    if plan_url
+                    else [],
+                ),
                 requested_by="",
                 delivery_id=delivery_id,
             ),
@@ -1384,6 +1391,13 @@ class FactorySlackProgressLoop:
                 channel=work.channel,
                 identity=work.channel_identity,
                 conversation_id=None,
+                plan_url=(
+                    str(work.payload["plan_url"])
+                    if work.payload.get("plan_url")
+                    and work.payload.get("reason")
+                    in {"personal_owner_required", "enrollment_inactive"}
+                    else None
+                ),
             )
         except asyncio.CancelledError:
             raise
