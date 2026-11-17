@@ -348,22 +348,36 @@ def observer_database() -> Any:
     asyncio.run(administer(f'CREATE DATABASE "{name}"'))
     previous = os.environ.get("DATABASE_URL")
     url = base.set(database=name).render_as_string(hide_password=False)
-    try:
-        os.environ["DATABASE_URL"] = url
-        get_settings.cache_clear()
-        config = Config()
-        config.set_main_option(
-            "script_location", str(Path(__file__).resolve().parents[3] / "apps/api/alembic")
-        )
-        command.upgrade(config, "head")
-        yield url
-    finally:
+
+    def restore_process_settings() -> None:
         if previous is None:
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = previous
         get_settings.cache_clear()
+
+    try:
+        os.environ["DATABASE_URL"] = url
+        get_settings.cache_clear()
+        try:
+            config = Config()
+            config.set_main_option(
+                "script_location", str(Path(__file__).resolve().parents[3] / "apps/api/alembic")
+            )
+            command.upgrade(config, "head")
+        finally:
+            # Alembic reads DATABASE_URL. Later tests in this process must not.
+            restore_process_settings()
+        yield url
+    finally:
         asyncio.run(administer(f'DROP DATABASE "{name}" WITH (FORCE)'))
+
+
+def test_observer_database_does_not_leave_process_settings(observer_database: str) -> None:
+    from curie_api.config import get_settings
+
+    assert observer_database not in os.environ.get("DATABASE_URL", "")
+    assert get_settings().database_url != observer_database
 
 
 @pytest.fixture
