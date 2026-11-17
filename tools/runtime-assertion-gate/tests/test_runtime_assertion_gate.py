@@ -513,7 +513,7 @@ def test_chart_legs_upload_distinct_receipts_the_required_verdict_merges() -> No
         for leg in ("chart", "upgrade", "workload-1", "workload-2")
     }
     # Legs that share one artifact name would collide; each leg needs its own.
-    assert len(names) == 3
+    assert len(names) == 4
     for artifact in names:
         assert "${{" not in artifact
         assert fnmatch.fnmatchcase(artifact, download["pattern"]), artifact
