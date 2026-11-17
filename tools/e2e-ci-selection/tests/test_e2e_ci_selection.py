@@ -5831,6 +5831,7 @@ def test_setup_helper_changes_select_every_chart_leg_and_released_upgrade(
     assert completed.returncode == 0, completed.stderr
     selected = _outputs_of(output)
     assert selected["released_upgrade"] == "true"
+    assert selected["approval_resume"] == "true"
     assert json.loads(selected["chart_scenarios"]) == list(CHART_IDS)
     assert json.loads(selected["chart_legs"]) == list(CHART_LEGS)
 

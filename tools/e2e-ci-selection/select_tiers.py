@@ -67,10 +67,11 @@ FACTORY_PREFIXES = (
     "tools/model-script",
     "tools/github-stub",
 )
-# The kind approval resume scenario (#4016) runs only when a worker or approval
-# path changes. Prefixes without a .py suffix match by raw string prefix, so
+# The kind approval resume scenario (#4016) covers worker, approval and shared
+# setup paths. Prefixes without a .py suffix match by raw string prefix, so
 # "curie_api/approval" covers every approval*.py module.
 APPROVAL_RESUME_PREFIXES = (
+    ".github/scripts",
     "apps/worker/src/curie_worker",
     "apps/api/src/curie_api/resumequeue.py",
     "apps/api/src/curie_api/resumereconciler.py",

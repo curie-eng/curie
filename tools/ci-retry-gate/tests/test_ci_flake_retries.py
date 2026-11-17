@@ -109,13 +109,13 @@ def _setup_commands(tmp_path: Path, **controls: object) -> tuple[dict[str, str],
         status = 0
         if tool == "kind":
             if args[:2] == ["get", "clusters"] and data.get("existing"):
-                print("test-setup")
+                print("ci-fixture")
             if args[:2] == ["create", "cluster"]:
                 data["creates"] += 1
                 if data.get("create_failure"):
                     status = 1
         elif tool == "kubectl":
-            assert args[:2] == ["--context", "kind-test-setup"]
+            assert args[:2] == ["--context", "kind-ci-fixture"]
             if "rollout" in args:
                 mode = data.get("readiness")
                 if mode == "never" or mode == "second" and data["creates"] == 1:
@@ -156,17 +156,17 @@ def test_kind_setup_has_one_owned_recreate_and_preserves_foreign_clusters(
     config = tmp_path / "kind.yaml"
     config.write_text("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n")
     result = subprocess.run(
-        ["bash", str(REPO_ROOT / ".github/scripts/prepare-kind.sh"), "test-setup", str(config)],
+        ["bash", str(REPO_ROOT / ".github/scripts/prepare-kind.sh"), "ci-fixture", str(config)],
         env=env, capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == status, result.stdout + result.stderr
     assert (output.read_text() if output.exists() else "") == (
-        "owned_cluster=test-setup\n" if status == 0 else ""
+        "owned_cluster=ci-fixture\n" if status == 0 else ""
     )
     observed = json.loads(state.read_text())
     assert observed["creates"] == creates
     assert sum(call[:3] == ["kind", "delete", "cluster"] for call in observed["calls"]) == deletes
-    assert all("--name" in call and call[call.index("--name") + 1] == "test-setup"
+    assert all("--name" in call and call[call.index("--name") + 1] == "ci-fixture"
                for call in observed["calls"] if call[:3] == ["kind", "delete", "cluster"])
 
 
@@ -197,7 +197,7 @@ def test_kind_setup_refuses_a_corrupt_manifest_before_creating_a_cluster(tmp_pat
     config = tmp_path / "kind.yaml"
     config.write_text("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n")
     result = subprocess.run(
-        ["bash", str(REPO_ROOT / ".github/scripts/prepare-kind.sh"), "test-setup", str(config)],
+        ["bash", str(REPO_ROOT / ".github/scripts/prepare-kind.sh"), "ci-fixture", str(config)],
         env=env, capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 1, result.stdout + result.stderr
