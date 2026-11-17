@@ -39,7 +39,12 @@ test("github_link live browser proves account ownership and label admission owne
   expect(sessionResponse.status()).toBe(200);
   const session = await sessionResponse.json();
   const principal = session.principal.id;
+  const started = page.waitForResponse((response) =>
+    response.request().method() === "POST" &&
+    new URL(response.url()).pathname === "/api/identity/me/github-link",
+  );
   await page.getByRole("button", { name: "Link GitHub", exact: true }).click();
+  expect((await started).status()).toBe(200);
   await expect(page).toHaveURL(/\/login\/oauth\/authorize\?/);
   await page.getByRole("button", { name: "Authorize GitHub link", exact: true }).click();
   await expect(page.getByRole("status").filter({ hasText: "Your GitHub account is linked." })).toBeVisible();
