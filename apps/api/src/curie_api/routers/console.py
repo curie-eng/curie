@@ -227,7 +227,11 @@ async def current_session(
     dependencies=[Depends(limit_current_session)],
 )
 async def sign_in_methods(response: Response) -> ConsoleSignInMethodsOut:
-    """Report whether Console OIDC sign-in is enabled. No credential required."""
+    """Report whether Console OIDC sign-in is enabled. No credential required.
+
+    A presented X-API-Key is not a credential for this route. The login screen
+    reads it before a session exists, and the answer does not depend on the header.
+    """
 
     response.headers["Cache-Control"] = "no-store"
     return ConsoleSignInMethodsOut(oidc=bool(get_settings().oidc_enabled))

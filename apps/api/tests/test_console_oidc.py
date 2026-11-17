@@ -2152,6 +2152,11 @@ def test_principal_session_get_names_the_person(
     supplied_path = supplied[0] + supplied[1]
     assert console_router._accepted_return_to(supplied_path) == "/settings/claude-plan"
     assert console_router._accepted_return_to(supplied_path) is not supplied_path
+    # Sign-in methods stays readable with no credential. Reversing that
+    # statement makes the channel-token exclusion describe a route that
+    # consults the header again.
+    assert console_router.sign_in_methods.__doc__ is not None
+    assert "presented X-API-Key is not a credential" in console_router.sign_in_methods.__doc__
 
 
 def test_principal_session_disabled_principal_is_401(oidc_client: TestClient) -> None:
