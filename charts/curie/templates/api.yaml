@@ -405,13 +405,13 @@ spec:
             - name: FACTORY_ENABLED
               value: {{ get (.Values.factory | default dict) "enabled" | default false | quote }}
             - name: FACTORY_GITHUB_APP_CLIENT_ID
-              value: {{ .Values.factory.githubAppClientId | quote }}
-            {{- if .Values.factory.githubAppClientSecretExistingSecret }}
+              value: {{ get (.Values.factory | default dict) "githubAppClientId" | default "" | quote }}
+            {{- if get (.Values.factory | default dict) "githubAppClientSecretExistingSecret" }}
             - name: FACTORY_GITHUB_APP_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.factory.githubAppClientSecretExistingSecret | quote }}
-                  key: {{ .Values.factory.githubAppClientSecretExistingSecretKey | quote }}
+                  name: {{ get (.Values.factory | default dict) "githubAppClientSecretExistingSecret" | quote }}
+                  key: {{ get (.Values.factory | default dict) "githubAppClientSecretExistingSecretKey" | default "clientSecret" | quote }}
             {{- end }}
             - name: FACTORY_INTAKE
               value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}

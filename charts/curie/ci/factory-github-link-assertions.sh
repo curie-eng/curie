@@ -24,6 +24,11 @@ for doc in docs:
 }
 
 helm template rel "$CHART" -f "$CHART/values-dev.yaml" | check defaults
+helm template rel "$CHART" -f "$CHART/values-dev.yaml" --set factory=null | check defaults
+helm template rel "$CHART" -f "$CHART/values-dev.yaml" \
+  --set factory.githubAppClientId=null \
+  --set factory.githubAppClientSecretExistingSecret=null \
+  --set factory.githubAppClientSecretExistingSecretKey=null | check defaults
 helm template rel "$CHART" -f "$CHART/values-dev.yaml" \
   --set-string factory.githubAppClientId=Iv1.example \
   --set-string factory.githubAppClientSecretExistingSecret=acme-github-oauth \
