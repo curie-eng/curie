@@ -3,14 +3,14 @@
     "candidate/impl-advisory-progress": {
       "case": "impl-advisory-progress",
       "variant": "candidate",
-      "prompt_sha256": "1f03815afefcf0a9e89e6cc651834a1c25cae6a28f74276d25f66359568973ba",
-      "recorded": "2026-11-13"
+      "prompt_sha256": "1204a540000c59878f70e7a1dd6fe37b1c4db6e6872beb51b5f5455c2643d51f",
+      "recorded": "2026-11-17"
     },
     "candidate/impl-publication": {
       "case": "impl-publication",
       "variant": "candidate",
-      "prompt_sha256": "7d27a6c3f202b5d8d165d2eeccefd9b89ae8d2a172c85bf18a6aa4d68100a447",
-      "recorded": "2026-11-13"
+      "prompt_sha256": "d96f4ffe1665cedb10d137bb4e8595d9034d8116bb24f0f0baef7eb634b6cbd0",
+      "recorded": "2026-11-17"
     },
     "candidate/rev-missing-criterion": {
       "case": "rev-missing-criterion",
@@ -33,8 +33,8 @@
     "removed-final-approval-control/impl-publication": {
       "case": "impl-publication",
       "variant": "removed-final-approval-control",
-      "prompt_sha256": "a4f19666bbf414f45affbe63210bcfce5c06bf29b5dffde5f3374b29c7d48b48",
-      "recorded": "2026-11-13"
+      "prompt_sha256": "0f33b0fcff9b1a02af841656bf6fa03e1f7af4ffa1b8600e58fbb9758f77fef9",
+      "recorded": "2026-11-17"
     },
     "strict-plan-control/impl-advisory-progress": {
       "case": "impl-advisory-progress",
