@@ -8,8 +8,7 @@ fixture. The tracker is registered with monkeypatch in place of the
 whether or not the Jira adapter (#4358) has merged.
 
 The factory core still builds the install's GitHub adapter in a few seams
-(`curie_api.forges.hosts`), as the ``jira_cloud+github`` pair in
-``tests/forges/test_offline_lifecycle.py`` documents; they are replaced here.
+(`curie_api.forges.hosts`); those seams are replaced here.
 The WorkItem's own code host (`forges.trackers.code_host_for_repository`, #4358
 plan D14) is replaced by the adapter on the backend's client, in every module
 that imported it. The CI gate, reconciler and status replies otherwise run on
