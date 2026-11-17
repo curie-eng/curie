@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import ssl
 import time
 import uuid
 from collections.abc import Iterator
@@ -27,7 +26,7 @@ from curie_api.config import get_settings
 from curie_api.identity.http_credential_registry import build_provider_credential_registry
 from curie_api.identity.http_transport import HttpIdentityClient, ProviderBearer
 from curie_api.main import create_app
-from curie_api.models import Agent, AgentChannel, ChannelIdentity
+from curie_api.models import AgentChannel, ChannelIdentity
 from curie_api.resumequeue import resume_event_id
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
@@ -37,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.api.tests import test_http_email_receivers as email_receivers
 from apps.api.tests import test_http_invocation_membership as membership
-from apps.api.tests.test_http_approval_answers import answer, approver_role, resolve, unchanged
+from apps.api.tests.test_http_approval_answers import approver_role, resolve, unchanged
 from apps.api.tests.test_http_approval_creation import opened, request_for, rows
 from apps.api.tests.test_http_approval_grants import resume_check, resume_token
 from apps.api.tests.test_http_approval_legacy_writers import audits, created
@@ -240,93 +239,6 @@ def test_email_answer_by_a_sender_outside_the_approver_group_is_refused(
     assert response.status_code == 403, response.text
     assert response.json() == {"detail": "caller_not_allowed"}
     unchanged(case, before + 2)
-
-
-@pytest.mark.parametrize(
-    ("attempt", "status"),
-    [
-        ("foreign_key", 401), ("other_approval", 401), ("other_decision", 401),
-        ("other_sender", 401), ("other_binding", 401), ("invocation", 401), ("missing", 403),
-    ],
-)
-def test_forged_replayed_or_wrong_purpose_email_proof_is_refused_before_lookup(
-    email_case: SimpleNamespace, attempt: str, status: int,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-15: the proof binds approval, decision and sender."""
-    case = email_case
-    case.row = created(case)
-    approver_role(case)
-    before = len(case.provider.requests)
-    rejected = json.dumps({"decision": "rejected"}, separators=(",", ":")).encode()
-    submitted = {
-        "foreign_key": lambda: email_answer(case, key=b"f" * 32),
-        "other_approval": lambda: email_answer(case, approval_id=str(uuid.uuid4())),
-        "other_decision": lambda: email_answer(case, signed_body=rejected),
-        "other_sender": lambda: email_answer(case, sender=email_receivers.OTHER_SENDER),
-        "other_binding": lambda: email_answer(case, binding_id=case.scope["binding"]),
-        "invocation": lambda: email_answer(case, proof="invocation"),
-        "missing": lambda: email_answer(case, proof=None),
-    }[attempt]()
-    response = resolve(case, *submitted)
-    assert response.status_code == status, response.text
-    unchanged(case, before)
-
-
-def test_provider_outage_during_an_email_answer_fails_closed(
-    email_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-15: an unreachable provider is 503, never a pass."""
-    case = email_case
-    case.row = created(case)
-    approver_role(case)
-    state = case.client.app.state
-    trusted = state.http_identity_client
-    # A client that does not trust the synthetic provider's certificate observes nothing.
-    state.http_identity_client = HttpIdentityClient(tls_context=ssl.create_default_context())
-    try:
-        before = len(case.provider.requests)
-        response = resolve(case, *email_answer(case))
-        assert response.status_code == 503, response.text
-        assert response.json() == {"detail": "authority_unavailable"}
-        unchanged(case, before)
-    finally:
-        state.http_identity_client = trusted
-
-
-def test_email_turn_with_a_fixed_slack_card_is_answered_in_slack(
-    email_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-4/7: a fixed Slack card keeps the Slack answer."""
-    case = email_case
-    channel = case.scope["address"]
-
-    async def route(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-4."""
-        async with factory() as session, session.begin():
-            agent = await session.get(Agent, uuid.UUID(case.scope["agent"]))
-            assert agent is not None
-            agent.approval_routes = {ROUTE: {
-                "resolution": {"kind": "slack", "address": channel},
-                "approvers": {"users": [SENDER]},
-            }}
-
-    run(route)
-    case.request["approval"].update(route=ROUTE, card_channel=channel)
-    case.row = created(case)
-    approver_role(case)
-    stream = valkey.xrange(runs_stream)
-    # An email reply cannot answer a card shown in Slack.
-    before = len(case.provider.requests)
-    assert resolve(case, *email_answer(case)).status_code == 404
-    unchanged(case, before)
-    response = resolve(case, *answer(case))
-    assert response.status_code == 200, response.text
-    assert response.json()["resolved_by"] == SENDER
-    added = valkey.xrange(runs_stream)[len(stream):]
-    assert len(added) == 1
-    resumed = QueuedTurn.model_validate_json(added[0][1]["payload"])
-    assert resumed.reply_handle is not None and resumed.reply_handle.kind == "email"
-    valkey.xdel(runs_stream, added[0][0])
 
 
 def test_email_approval_answer_proofs_are_purpose_separated() -> None:

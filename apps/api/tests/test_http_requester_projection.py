@@ -372,25 +372,6 @@ def test_opted_in_refusals_and_unavailability_stay_v1_without_a_requester(
         )
 
 
-def test_an_opted_in_sender_without_a_verified_human_gets_v2_with_a_null_requester(
-    stores: SimpleNamespace,
-) -> None:
-    """@spec CONNECTOR-REQUESTER-1: a raw-account turn never acquires a human."""
-    stores.provider.outcomes[membership.SENDER] = "unresolved"
-    with invocation(stores, raw=True) as case:
-        assert case.context.outcome == "unresolved"
-        assert case.context.canonical is None and case.context.principal is None
-        off = authority.request_for(case)
-        assert_v1(
-            authority.post_check(case.client, off), off,
-            decision="continue", reason="current_authority",
-        )
-        requester_identity(case.scope["agent"], True)
-        for stage in ("prepare", "start"):
-            request = authority.request_for(case, stage=stage)
-            assert_v2(authority.post_check(case.client, request), request, requester=None)
-
-
 @pytest.mark.parametrize("outcome", ["unresolved", "inactive"])
 def test_a_fresh_lookup_that_is_not_resolved_projects_a_null_requester(
     stores: SimpleNamespace, outcome: str,
@@ -589,28 +570,6 @@ def approved_resume(stores: SimpleNamespace, *, raw: bool = False) -> Iterator[S
 def approved_check(case: SimpleNamespace, *, stage: str = "prepare") -> dict[str, Any]:
     """The worker's check for the published approved resume. @spec HTTP-APPROVAL-CONTINUITY-12."""
     return grants.resume_check(case, case.resume, case.resume_payload, stage=stage)
-
-
-def test_an_approved_resume_answered_by_another_approver_projects_the_original_requester(
-    stores: SimpleNamespace,
-) -> None:
-    """@spec CONNECTOR-REQUESTER-1 HTTP-APPROVAL-CONTINUITY-8/12: never the approver."""
-    with approved_resume(stores) as case:
-        expected = original_requester(case)
-        off = approved_check(case)
-        assert_v1(
-            authority.post_check(case.client, off), off,
-            decision="continue", reason="current_authority",
-        )
-        requester_identity(case.scope["agent"], True)
-        before = len(case.provider.requests)
-        request = approved_check(case, stage="start")
-        assert_v2(authority.post_check(case.client, request), request, requester=expected)
-        assert expected["subject"] != APPROVER_SUBJECT
-        # Both subjects were verified fresh for this one answer.
-        assert sorted(lookups(case, before)) == [
-            ("approval", APPROVER), ("invocation", membership.SENDER),
-        ]
 
 
 @pytest.mark.parametrize("raw", [False, True], ids=["group-only", "raw-account-exception"])

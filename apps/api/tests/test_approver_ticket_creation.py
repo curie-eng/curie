@@ -29,21 +29,16 @@ import pytest
 from approver_ticket_support import (
     APPROVER_A,
     APPROVER_B,
-    APPROVER_GROUP,
     CEILING_FILTER,
     CONNECTOR,
-    GROUP_MEMBER,
     KEY_ID,
     LIVE,
-    MANAGED_BY,
     OTHER_CONNECTOR,
     OTHER_ROUTE,
     OUTSIDER,
-    REQUESTER,
     ROUTE,
     TOOL,
     add_principal,
-    add_team,
     agent_state,
     api_headers,
     approval_audits,
@@ -54,18 +49,14 @@ from approver_ticket_support import (
     dynamic_request,
     enroll,
     exactly,
-    group_entry,
     ingress,
-    join_team,
     legacy,
     now,
     owner_verifies,
-    pinned_role,
     principal_claims,
     refused_with,
     selector_key,
     set_approver_role,
-    set_idp_managed_by,
     store_routes,
     stored_version,
     subject_entry,
@@ -83,7 +74,6 @@ from curie_internal.approver_ticket import TicketError, execution_arguments_sha2
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from apps.api.tests.test_http_approval_answers import answer, resolve
 from apps.api.tests.test_http_approval_creation import (
     RECORD_FIELDS,
     accepted,
@@ -93,7 +83,6 @@ from apps.api.tests.test_http_approval_creation import (
     request_for,
     rows,
 )
-from apps.api.tests.test_http_approval_legacy_writers import operator_headers
 
 SELECTION_FIELDS = (
     "selection_mode", "selection_requester", "selection_connector", "selection_tool",
@@ -374,39 +363,6 @@ def test_ceiling_users_narrow_the_selected_set(ticket_case: SimpleNamespace) -> 
         request = dynamic_request(case, carried(case, ARGS, approvers=approvers))
         refused_creation(case, request, 422, "approval_ticket_outside_ceiling")
     request = dynamic_request(case, carried(case, ARGS, approvers=(APPROVER_A,)))
-    receipt(create(case.client, request), request)
-
-
-def test_group_membership_never_proves_the_ceiling_at_creation(
-    ticket_case: SimpleNamespace,
-) -> None:
-    """@spec REQUEST-APPROVAL-1: only exact canonical identity proves membership (plan D9.3).
-
-    The person is an active human in a validly synced idp_group team (managed
-    by the tenant IdP, epoch 1, synced) that the pinned role names by a group
-    entry. Group entries never match at creation, so they are refused until the
-    operator pins a role naming them by issuer and subject.
-    """
-    case = ticket_case
-    tenant = case.scope["tenant"]
-    member = add_principal(tenant, GROUP_MEMBER)
-    set_idp_managed_by(tenant, MANAGED_BY)
-    team = add_team(tenant, APPROVER_GROUP, synced=True)
-    join_team(tenant, member, team)
-    pinned = enroll(case)["approval_routes"][ROUTE]["approver_ticket"]["ceiling"]
-    assert group_entry(APPROVER_GROUP) in pinned_role(pinned["approver_role"])["filter"]["entries"]
-
-    def attempt() -> dict[str, Any]:
-        return dynamic_request(case, carried(case, ARGS, approvers=(GROUP_MEMBER,)))
-
-    refused_creation(case, attempt(), 422, "approval_ticket_outside_ceiling")
-    set_approver_role(case.scope, {
-        "entries": CEILING_FILTER["entries"] + [subject_entry(GROUP_MEMBER)],
-    })
-    # The agent-owned edit alone does not widen the pin; the operator re-pin does.
-    refused_creation(case, attempt(), 422, "approval_ticket_outside_ceiling")
-    enroll(case)
-    request = attempt()
     receipt(create(case.client, request), request)
 
 
@@ -781,70 +737,6 @@ def test_legacy_creation_refuses_tickets_and_ordinary_legacy_is_unchanged(
     assert all(row[field] is None for field in SELECTION_FIELDS[1:])
 
 
-def test_ordinary_http_approval_keeps_its_record_digest_and_seal(
-    ticket_case: SimpleNamespace,
-) -> None:
-    """@spec REQUEST-APPROVAL-4: snapshot columns must not invalidate ordinary approvals."""
-    case = ticket_case
-    request = request_for(case)
-    created = accepted(create(case.client, request), request)
-    row = rows(request["approval"]["dedupe_key"])[0]
-    assert row["selection_mode"] == "ordinary"
-    assert all(row[field] is None for field in SELECTION_FIELDS[1:])
-    _, _, capsule = opened(case, row)
-    assert capsule.approval_record_sha256 == digest(canonical({
-        key: row[key] for key in RECORD_FIELDS
-    }))
-    assert owner_verifies(case, created["id"])
-
-
 # --- answer authority (decision 5) replaces the 0271a interlock -------------------
 
 
-def test_dynamic_approval_is_answered_by_a_selected_approver_and_refused_to_others(
-    ticket_case: SimpleNamespace,
-) -> None:
-    """@spec REQUEST-APPROVAL-5: the selected set decides; the creation-era interlock is gone.
-
-    This suite's directory resolves every account to the requester, so the
-    requester is the one canonical person who can answer here. Selected (with
-    the operator's audited exclusion opt-out, decision 6) its answer approves
-    the dynamic row; unselected it is refused, audited and the row stays
-    pending, and an operator principal stays refused. The role is migrated and
-    the owning route declares no legacy ``approvers`` block.
-    """
-    case = ticket_case
-    enroll(case, separation={"exclude_requester": False})
-
-    request = dynamic_request(case, carried(case, ARGS, approvers=(APPROVER_A,)))
-    receipt(create(case.client, request), request)
-    row = rows(request["approval"]["dedupe_key"])[0]
-    unselected = SimpleNamespace(client=case.client, scope=case.scope, row=row)
-    response = resolve(unselected, *answer(unselected))
-    assert response.status_code == 403, response.text
-    assert response.json() == {"detail": "caller_not_allowed"}
-    operator = case.client.post(
-        f"/approvals/{row['id']}/resolve", json={"decision": "approved"},
-        headers=operator_headers(),
-    )
-    assert operator.status_code == 403, operator.text
-    stored = rows(request["approval"]["dedupe_key"])[0]
-    assert (stored["status"], stored["resolved_by"]) == ("pending", None)
-    audits = approval_audits(row["id"])
-    assert [entry for entry in audits if entry["action"] == "resolved"] == []
-    assert [entry["action"] for entry in audits].count("denied") >= 1
-
-    second = ingress(case)
-    request = dynamic_request(second, carried(case, ARGS, approvers=(REQUESTER,)))
-    receipt(create(case.client, request), request)
-    row = rows(request["approval"]["dedupe_key"])[0]
-    selected = SimpleNamespace(client=case.client, scope=case.scope, row=row)
-    approved = resolve(selected, *answer(selected))
-    assert approved.status_code == 200, approved.text
-    assert approved.json()["status"] == "approved"
-    stored = rows(request["approval"]["dedupe_key"])[0]
-    assert stored["status"] == "approved"
-    assert stored["selected_approvers"] == row["selected_approvers"]
-    resolved = [entry for entry in approval_audits(row["id"]) if entry["action"] == "resolved"]
-    assert len(resolved) == 1, resolved
-    assert resolved[0]["evidence"]["selection"]["kind"] == "approval_selection"

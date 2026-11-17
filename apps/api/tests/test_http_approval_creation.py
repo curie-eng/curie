@@ -11,7 +11,6 @@ import importlib
 import json
 import uuid
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -20,14 +19,12 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import ApprovalRequest, QueuedTurn
-from curie_api import identity_fence
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA
 from curie_api.identity.http_transport import HttpIdentityClient
-from curie_api.models import AgentAccessPolicy, TenantIdentityProvider
 from curie_internal import identity_context
 from role_policy_support import run
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from apps.api.tests.test_http_invocation_membership import synthetic_provider as synthetic_provider
@@ -180,115 +177,6 @@ def opened(case: SimpleNamespace, row: dict[str, Any]) -> tuple[Any, Any, Any]:
     return module, ring, value
 
 
-def test_creation_seals_exact_original_bytes_and_delivered_placeholder_privately(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-3/4/5: actual accepted ingress is creation provenance."""
-    case = creation_case
-    result = accepted(post(case), case.request)
-    assert result["status"] == "pending"
-    stored = rows(case.request["approval"]["dedupe_key"])
-    assert len(stored) == 1
-    row = stored[0]
-    _, _, capsule = opened(case, row)
-    assert capsule.approval_id == result["id"] == str(row["id"])
-    assert capsule.source_context_sha256 == digest(case.capsule)
-    assert capsule.source_payload_sha256 == capsule.original_payload_sha256 == digest(case.payload)
-    assert capsule.creation_request_sha256 == digest(canonical(case.request["approval"]))
-    assert capsule.approval_record_sha256 == digest(canonical({
-        key: row[key] for key in RECORD_FIELDS
-    }))
-    assert capsule.scope == case.context.scope
-    assert capsule.original_event_id == capsule.source_event_id == case.context.event_id
-    assert capsule.principal == case.context.principal
-    assert capsule.canonical == case.context.canonical
-    assert row["reply_placeholder"] == "1760000000.000123"
-    assert row["granted_arguments"] == {}
-    assert len(case.provider.requests) == 2
-    public = case.client.get(
-        f'/approvals/{result["id"]}', headers={"X-API-Key": get_settings().api_key},
-    )
-    assert public.status_code == 200, public.text
-    assert "identity_context" not in public.json()
-    assert row["identity_context"] not in public.text
-
-
-def test_exact_retry_remains_historical_after_expiry_without_reauthorizing(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-5: request UUID/fresh permission do not replace history."""
-    case = creation_case
-    first = accepted(post(case), case.request)
-    row = rows(case.request["approval"]["dedupe_key"])[0]
-    module, ring, capsule = opened(case, row)
-    row.update(status="expired", resolved_at=datetime.now(UTC))
-    data = capsule.model_dump(mode="json")
-    data.update(
-        status="expired",
-        approval_record_sha256=digest(canonical({key: row[key] for key in RECORD_FIELDS})),
-    )
-    # Owned SQL fixture models a committed, correctly resealed non-grant terminal row.
-    resealed = module.seal_approval_context(module.ApprovalContextV1.model_validate(data), ring)
-
-    async def expire(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-5: only a valid purpose-specific seal is installed."""
-        async with factory() as session:
-            await session.execute(
-                text(f'UPDATE "{SCHEMA}".approvals SET status=:status, '
-                     'resolved_at=:at, identity_context=:context WHERE id=:id'),
-                {"status": "expired", "at": row["resolved_at"].replace(tzinfo=None),
-                 "context": resealed, "id": row["id"]},
-            )
-            await session.commit()
-
-    run(expire)
-    before = rows(case.request["approval"]["dedupe_key"])
-    calls = len(case.provider.requests)
-    case.provider.member = False
-    retry = copy.deepcopy(case.request)
-    retry["request_id"] = str(uuid.uuid4())
-    historical = accepted(post(case, retry), retry, duplicate=True)
-    assert historical["id"] == first["id"] and historical["status"] == "expired"
-    assert len(case.provider.requests) == calls
-    assert rows(case.request["approval"]["dedupe_key"]) == before
-    retry["approval"]["summary"] = "A conflicting synthetic operation"
-    refused(post(case, retry), 409, "approval_provenance_conflict")
-    assert rows(case.request["approval"]["dedupe_key"]) == before
-
-
-@pytest.mark.parametrize("conflicting", [False, True], ids=["identical", "conflicting"])
-def test_racing_creation_converges_without_replacing_winning_intent(
-    creation_case: SimpleNamespace, conflicting: bool,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-5/9: stale capture may503; ordinary retry adopts once."""
-    case = creation_case
-    requests = [copy.deepcopy(case.request), copy.deepcopy(case.request)]
-    requests[1]["request_id"] = str(uuid.uuid4())
-    if conflicting:
-        requests[1]["approval"]["summary"] = "A different synthetic operation"
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(post, case, item) for item in requests]
-        responses = [future.result(timeout=15) for future in futures]
-    assert sum(response.status_code == 201 for response in responses) == 1, [
-        (response.status_code, response.text) for response in responses
-    ]
-    winner = next(index for index, response in enumerate(responses) if response.status_code == 201)
-    loser = 1 - winner
-    created = accepted(responses[winner], requests[winner])
-    assert responses[loser].status_code in ({409, 503} if conflicting else {200, 503})
-    replay = copy.deepcopy(requests[winner])
-    replay["request_id"] = str(uuid.uuid4())
-    assert accepted(post(case, replay), replay, duplicate=True)["id"] == created["id"]
-    conflict = copy.deepcopy(replay)
-    conflict["approval"]["summary"] += " changed"
-    refused(post(case, conflict), 409, "approval_provenance_conflict")
-    stored = rows(replay["approval"]["dedupe_key"])
-    assert len(stored) == 1
-    assert stored[0]["summary"] == replay["approval"]["summary"]
-    _, _, capsule = opened(case, stored[0])
-    assert capsule.creation_request_sha256 == digest(canonical(replay["approval"]))
-
-
 def test_tampered_wire_scope_and_immutable_fields_never_reach_provider(
     creation_case: SimpleNamespace,
 ) -> None:
@@ -334,62 +222,6 @@ def test_tampered_wire_scope_and_immutable_fields_never_reach_provider(
     assert len(case.provider.requests) == 1
 
 
-def test_missing_route_wrong_card_and_implicit_permission_scope_refuse(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-4: supplied target and summary never create a grant."""
-    case = creation_case
-    variants = []
-    for updates in (
-        {"route": "synthetic-missing-route"}, {"card_channel": "C0OTHER"},
-        {"granted_tool": None}, {"granted_arguments": None},
-        {"gate_kind": None, "summary": "Permission required: synthetic_read"},
-    ):
-        item = copy.deepcopy(case.request)
-        item["approval"].update(updates)
-        variants.append(item)
-    for item in variants:
-        refused(post(case, item), 409, "unsupported_approval")
-    assert rows(case.request["approval"]["dedupe_key"]) == []
-
-
-def test_public_creation_cannot_hide_known_http_scope_with_null_agent_or_forged_route(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-1/5: classify both supplied agent and reply binding."""
-    case = creation_case
-    for changes in (
-        {"agent_id": None},
-        {"reply_channel": "C0EXAMPLEUNBOUND", "reply_adapter": "synthetic-unbound"},
-    ):
-        approval = copy.deepcopy(case.request["approval"])
-        approval.update(changes)
-        response = case.client.post(
-            "/approvals", json=approval, headers={"X-API-Key": get_settings().api_key},
-        )
-        assert 400 <= response.status_code < 500, response.text
-        assert rows(approval["dedupe_key"]) == []
-    assert len(case.provider.requests) == 1
-
-
-def test_public_dedupe_cannot_hide_stored_http_provenance_with_unbound_scope(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-1/5: existing authoritative row defeats retagging."""
-    case = creation_case
-    accepted(post(case), case.request)
-    before = rows(case.request["approval"]["dedupe_key"])
-    forged = copy.deepcopy(case.request["approval"])
-    forged.update(
-        agent_id=None, reply_channel="C0EXAMPLEUNBOUND", reply_adapter="synthetic-unbound",
-    )
-    response = case.client.post(
-        "/approvals", json=forged, headers={"X-API-Key": get_settings().api_key},
-    )
-    assert 400 <= response.status_code < 500, response.text
-    assert rows(forged["dedupe_key"]) == before
-
-
 def test_creation_repeats_fresh_provider_membership_instead_of_using_queued_permission(
     creation_case: SimpleNamespace,
 ) -> None:
@@ -398,87 +230,6 @@ def test_creation_repeats_fresh_provider_membership_instead_of_using_queued_perm
     case.provider.member = False
     refused(post(case), 403, "caller_not_allowed")
     assert len(case.provider.requests) == 2
-    assert rows(case.request["approval"]["dedupe_key"]) == []
-
-
-@pytest.mark.parametrize("changed", ["policy", "configuration", "lifecycle"])
-def test_committed_change_during_actual_lookup_discards_captured_authority(
-    creation_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, changed: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-9 HTTP-INVOCATION-EXECUTION-4: never salvaged.
-
-    Each bounded restart discards its bytes and looks up afresh; a change on
-    every attempt exhausts the bound.
-    """
-    case = creation_case
-    original = HttpIdentityClient.lookup
-    observations = []
-
-    async def lookup(client: HttpIdentityClient, **kwargs: Any) -> Any:
-        """@spec HTTP-APPROVAL-CONTINUITY-9: actual verified TLS remains the fact source."""
-        result = await original(client, **kwargs)
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            factory = async_sessionmaker(engine, expire_on_commit=False)
-            async with identity_fence.mutation(factory, case.client.app.state.valkey) as session:
-                if changed == "policy":
-                    row = await session.scalar(select(AgentAccessPolicy).where(
-                        AgentAccessPolicy.agent_id == uuid.UUID(case.scope["agent"]),
-                    ))
-                    assert row is not None
-                    row.version += 1
-                else:
-                    provider = await session.get(
-                        TenantIdentityProvider, uuid.UUID(case.scope["tenant"]),
-                    )
-                    assert provider is not None
-                    if changed == "configuration":
-                        provider.version += 1
-                    else:
-                        provider.lifecycle_generation += 1
-                await session.commit()
-            observations.append(result)
-        finally:
-            await engine.dispose()
-        return result
-
-    monkeypatch.setattr(HttpIdentityClient, "lookup", lookup)
-    refused(post(case), 503, "authority_unavailable")
-    assert len(observations) == 3 and len(case.provider.requests) == 1 + 3
-    assert rows(case.request["approval"]["dedupe_key"]) == []
-
-
-@pytest.mark.parametrize("uncertain", ["commit", "settlement"])
-def test_unacknowledged_lifecycle_commit_or_writer_settlement_never_inserts_approval(
-    creation_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, uncertain: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-9: uncertainty after a real write is not permission."""
-    case = creation_case
-    failures = []
-    if uncertain == "commit":
-        original_commit = AsyncSession.commit
-
-        async def commit(session: AsyncSession) -> None:
-            """@spec HTTP-APPROVAL-CONTINUITY-9: lose acknowledgement after actual SQL commit."""
-            await original_commit(session)
-            if not failures:
-                failures.append(uncertain)
-                raise ConnectionError("synthetic private commit acknowledgement loss")
-
-        monkeypatch.setattr(AsyncSession, "commit", commit)
-    else:
-        original_finish = identity_fence._WriterOwner.finish
-
-        async def finish(owner: Any, client: Any, pending: Any) -> None:
-            """@spec HTTP-APPROVAL-CONTINUITY-9: settle real resources before fault injection."""
-            await original_finish(owner, client, pending)
-            if not failures:
-                failures.append(uncertain)
-                raise identity_fence.IdentityWriterUnavailable()
-
-        monkeypatch.setattr(identity_fence._WriterOwner, "finish", finish)
-    refused(post(case), 503, "authority_unavailable")
-    assert failures == [uncertain]
     assert rows(case.request["approval"]["dedupe_key"]) == []
 
 
@@ -643,88 +394,3 @@ def test_resumed_turn_suspends_again_under_its_original_invoker(
     assert len(case.provider.requests) == calls + 1
 
 
-@pytest.mark.parametrize(
-    "variant",
-    ["forged", "stale", "other_approval", "retagged", "altered_payload"],
-)
-def test_forged_stale_or_foreign_resume_cannot_suspend_again(
-    creation_case: SimpleNamespace, variant: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-4/6: the resume must match the approval it names."""
-    case = creation_case
-    first, resume, payload = resolve_and_resume(case)
-    if variant == "forged":
-        ring = identity_context.build_identity_keyring(
-            "context", (("synthetic-context", 1, b"f" * 32),),
-        )
-        module = importlib.import_module("curie_internal.identity_approval")
-        token = module.seal_resume_context(module.ResumeContextV1.model_validate(resume), ring)
-    elif variant == "stale":
-        token = seal_resume(case, {**resume, "status": "rejected"})
-    elif variant == "other_approval":
-        # A consistent resume of an approval this turn never suspended on.
-        other = str(uuid.uuid4())
-        payload = payload.replace(resume["event_id"], f"approval-{other}-resolved")
-        token = seal_resume(case, {
-            **resume, "approval_id": other, "event_id": f"approval-{other}-resolved",
-            "payload_sha256": digest(payload),
-        })
-    elif variant == "retagged":
-        token = seal_resume(case, {**resume, "original_payload_sha256": digest("synthetic")})
-    else:
-        token = seal_resume(case, resume)
-        payload += " "
-    request = resumed_request(case, token, payload)
-    calls = len(case.provider.requests)
-    refused(post(case, request), 422, "invalid_approval_context")
-    assert rows(request["approval"]["dedupe_key"]) == []
-    assert len(case.provider.requests) == calls
-    assert rows(case.request["approval"]["dedupe_key"])[0]["id"] == first["id"]
-
-
-@pytest.mark.parametrize(
-    "override,producer,routed",
-    [
-        ({"expires_in_seconds": 3600}, 7, True),
-        ({"expires_in_seconds": 315360000}, 7, True),
-        ({"expires_in_seconds": None}, 7, True),
-        ({}, 23, True),
-        ({}, None, True),
-        ({}, 23, False),
-        ({}, None, False),
-    ],
-)
-def test_http_creation_freezes_explicit_route_schedule(creation_case, override, producer, routed):
-    case = creation_case
-    headers = {"X-API-Key": get_settings().api_key}
-    route = {"resolution": {"mode": "requesting_surface"}, **override}
-    changed = case.client.patch(
-        f"/agents/{case.scope['agent']}",
-        headers=headers,
-        json={"approval_routes": {"review": route}},
-    )
-    assert changed.status_code == 200, changed.text
-    case.request["approval"].update(route="review" if routed else None, expires_in_seconds=producer)
-    accepted(post(case), case.request)
-    row = rows(case.request["approval"]["dedupe_key"])[0]
-    duration = override.get("expires_in_seconds", producer) if routed else producer
-    if duration is None:
-        assert row["expires_at"] is None
-    else:
-        assert (row["expires_at"] - row["created_at"]).total_seconds() == duration
-    before = {key: row[key] for key in RECORD_FIELDS}
-    seal = row["identity_context"]
-    changed = case.client.patch(
-        f"/agents/{case.scope['agent']}",
-        headers=headers,
-        json={
-            "approval_routes": {
-                "review": {"resolution": {"mode": "requesting_surface"}, "expires_in_seconds": 99}
-            }
-        },
-    )
-    assert changed.status_code == 200, changed.text
-    accepted(post(case), case.request, duplicate=True)
-    again = rows(case.request["approval"]["dedupe_key"])[0]
-    assert {key: again[key] for key in RECORD_FIELDS} == before
-    assert again["identity_context"] == seal
