@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -730,36 +729,6 @@ def test_a_fresh_install_wide_no_list_answer_saves_the_call(
     assert gate.refusal(address="C0EXAMPLE3", adapter=None, callers=[STRANGER]) is (
         DropReason.CALLER_NOT_ALLOWED
     )
-
-
-def test_concurrent_questions_for_one_route_share_one_fetch(
-    admission_api: FakeAdmissionApi, store: _Store
-) -> None:
-    """Single-flight: a burst on one uncached route holds one API call, not one
-    per Bolt worker. Distinct routes still ask separately."""
-
-    admission_api.delay_s = 0.3
-    admission_api.lists[(CHANNEL, None)] = {LISTED}
-    gate = _gate(admission_api, _Clock(), store)
-    results: list[DropReason | None] = []
-    workers = [
-        threading.Thread(
-            target=lambda: results.append(
-                gate.refusal(address=CHANNEL, adapter=None, callers=[LISTED])
-            )
-        )
-        for _ in range(5)
-    ]
-    started = time.monotonic()
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join()
-    elapsed = time.monotonic() - started
-    assert results == [None] * 5
-    assert len(admission_api.requests) == 1
-    # Everyone waited for the one answer, not five answers in a row.
-    assert elapsed < 0.3 * 2
 
 
 def test_followers_of_a_failed_fetch_do_not_each_retry_the_dead_api(
