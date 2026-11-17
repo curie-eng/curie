@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import random
-import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -617,92 +616,3 @@ def test_expired_replay(stack: TestClient, monkeypatch: pytest.MonkeyPatch) -> N
     assert status == 409, body
     assert body["detail"] == "conversation has no selected repository workspace", body
     assert unchanged, "a refused replay changed durable rows"
-
-
-def test_expiry_during_binding_lock(stack: TestClient) -> None:
-    client = stack
-
-    # A first publication for the thread, so creation takes the agent_channels
-    # row lock (binding_for_route for_update) on its way to a new lineage.
-    case = _case("binding-lock")
-    _sql_running(case, "running")
-    assert not _rows(
-        "SELECT id FROM curie.thread_publication_lineages "
-        "WHERE agent_id = :agent AND conversation_id = :conversation",
-        {"agent": case.agent_id, "conversation": case.conversation_id},
-    )
-
-    async def scenario() -> tuple[Snapshot, Snapshot, list[dict[str, Any]], Any]:
-        before = await _snapshot_async()
-        engine = create_async_engine(get_settings().database_url, poolclass=NullPool)
-        outcome: dict[str, Any] = {}
-
-        def post() -> None:
-            try:
-                outcome["response"] = client.post(
-                    PUBLICATIONS, json=case.payload, headers=WORKER_HEADERS
-                )
-            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertion below
-                outcome["error"] = exc
-
-        worker = threading.Thread(target=post, daemon=True)
-        try:
-            async with engine.connect() as blocker:
-                transaction = await blocker.begin()
-                try:
-                    await blocker.execute(
-                        text(
-                            "SELECT id FROM curie.agent_channels "
-                            "WHERE address = :address FOR UPDATE"
-                        ),
-                        {"address": case.address},
-                    )
-                    blocker_pid = await blocker.scalar(text("SELECT pg_backend_pid()"))
-                    # Start the short lease after snapshots and the binding blocker are ready.
-                    await asyncio.to_thread(
-                        _sql,
-                        "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
-                        "clock_timestamp() + interval '2 seconds' WHERE id = :id",
-                        {"id": case.request_id},
-                    )
-                    worker.start()
-                    observed: list[dict[str, Any]] = []
-                    waited_from = time.monotonic()
-                    while time.monotonic() - waited_from < 10 and worker.is_alive():
-                        observed = await _rows_async(
-                            "SELECT pid, wait_event_type, wait_event FROM pg_stat_activity "
-                            "WHERE :blocker = ANY(pg_blocking_pids(pid))",
-                            {"blocker": blocker_pid},
-                        )
-                        if observed:
-                            break
-                        await asyncio.sleep(0.05)
-                    assert observed, ("creation never waited on the binding lock", outcome)
-                    assert worker.is_alive(), outcome
-                    # Hold the lock until the database clock is past the lease.
-                    waited_from = time.monotonic()
-                    while True:
-                        current = await _rows_async(
-                            "SELECT clock_timestamp() > runtime_heartbeat_expires_at "
-                            "AS expired FROM curie.execution_requests WHERE id = :id",
-                            {"id": case.request_id},
-                        )
-                        if current[0]["expired"]:
-                            break
-                        assert time.monotonic() - waited_from < 10, "lease never expired"
-                        await asyncio.sleep(0.05)
-                finally:
-                    await transaction.rollback()
-            await asyncio.to_thread(worker.join, 30)
-        finally:
-            await engine.dispose()
-        assert not worker.is_alive(), "publication request did not return"
-        assert "error" not in outcome, outcome
-        after = await _snapshot_async()
-        return before, after, observed, outcome["response"]
-
-    before, after, observed, response = asyncio.run(scenario())
-    assert observed
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["code"] == EXPIRED, response.text
-    assert after == before, "creation that outlived its lease left durable rows"

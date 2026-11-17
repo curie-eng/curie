@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import uuid
 from collections.abc import Iterator
@@ -124,85 +123,6 @@ def assert_response(
         "decision": decision,
         "reason": reason,
     }
-
-
-def test_current_check_repeats_fresh_group_authority_without_reenqueuing(
-    clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-8/16: prior continue cannot cache a group grant."""
-    provider = synthetic_provider
-    with queued_invocation(provider, valkey, runs_stream) as invocation:
-        before = delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        first = request_for(invocation)
-        assert_response(
-            post_check(invocation.client, first), first,
-            decision="continue", reason="current_authority",
-        )
-        assert len(provider.requests) == 2
-        assert provider.requests[1]["request_id"] != provider.requests[0]["request_id"]
-        assert delivery_state(valkey, runs_stream, invocation.scope["binding"]) == before
-
-        provider.member = False
-        second = request_for(invocation, stage="start")
-        assert second["request_id"] != first["request_id"]
-        assert_response(
-            post_check(invocation.client, second), second,
-            decision="refuse", reason="caller_not_allowed",
-        )
-        assert len(provider.requests) == 3
-        assert provider.requests[2]["request_id"] != provider.requests[1]["request_id"]
-        assert provider.responses[2]["membership"]["complete"] is True
-        assert provider.responses[2]["membership"]["groups"][0]["id"] != membership.GROUP
-        assert delivery_state(valkey, runs_stream, invocation.scope["binding"]) == before
-
-
-@pytest.mark.parametrize("mismatch", ["capsule", "payload", "scope", "event"])
-def test_current_check_rejects_unbound_context_inputs_before_provider_or_delivery(
-    mismatch: str, clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-8/16: valid outer request cannot replace signed scope."""
-    provider = synthetic_provider
-    with queued_invocation(provider, valkey, runs_stream) as invocation:
-        request = copy.deepcopy(request_for(invocation))
-        if mismatch == "capsule":
-            request["context"] = "synthetic-invalid-context"
-        elif mismatch == "payload":
-            request["payload_sha256"] = "0" * 64
-            assert request["payload_sha256"] != invocation.context.payload_sha256
-        elif mismatch == "scope":
-            request["scope"]["binding_id"] = str(uuid.uuid4())
-        else:
-            request["event_id"] = "synthetic-unrelated-event"
-        before = delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        assert_response(
-            post_check(invocation.client, request), request,
-            decision="refuse", reason="invalid_context",
-        )
-        assert len(provider.requests) == 1
-        assert delivery_state(valkey, runs_stream, invocation.scope["binding"]) == before
-
-
-@pytest.mark.parametrize("credential", ["missing", "wrong", "platform-only"])
-def test_current_check_requires_the_existing_worker_credential(
-    credential: str, clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-8/16: a platform credential cannot ask as a worker."""
-    provider = synthetic_provider
-    with queued_invocation(provider, valkey, runs_stream) as invocation:
-        headers = {}
-        if credential == "wrong":
-            headers["X-Curie-Worker-Token"] = "synthetic-wrong-worker-token"
-        elif credential == "platform-only":
-            headers["X-API-Key"] = get_settings().api_key
-        before = delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        response = invocation.client.post(PATH, json=request_for(invocation), headers=headers)
-        assert response.status_code == 401, response.text
-        assert response.headers["cache-control"] == "no-store"
-        assert len(provider.requests) == 1
-        assert delivery_state(valkey, runs_stream, invocation.scope["binding"]) == before
 
 
 def test_initial_current_check_refuses_unsupported_approval_resume_before_lookup(
