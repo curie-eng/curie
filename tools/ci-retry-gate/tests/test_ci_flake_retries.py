@@ -56,6 +56,7 @@ DIAGNOSTIC_UPLOADS = {
     "Upload the admitted agent failure digests",
     "Retain safe namespace cleanup evidence",
     "Upload upgrade matrix evidence",
+    "Upload scripted factory evidence",
 }
 
 

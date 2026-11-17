@@ -50,7 +50,7 @@ REQUIRED = frozenset(
         *(
             f"E2E scripted factory (kind, scripted model, {suite})"
             for suite in (
-                "initial-binding-1", "initial-binding-2", "initial-binding-3",
+                "scenario", "initial-binding-1", "initial-binding-2", "initial-binding-3",
                 "static-token-rotation", "fresh-install",
             )
         ),
@@ -246,7 +246,7 @@ def test_canonical_required_jobs_ignore_environment_override(
 ) -> None:
     monkeypatch.setenv("CURIE_E2E_SHARDS_OVERRIDE", "s01 nosetup fresh-n")
     assert kind_ci.required_job_names(ROOT, deadline=time.monotonic() + 8) == REQUIRED
-    assert len(REQUIRED) == 41
+    assert len(REQUIRED) == 42
     assert len(HISTORY["jobs"]) == 80
     assert len(CURRENT_JOBS) == 86
     assert reasons(kind_ci) == []

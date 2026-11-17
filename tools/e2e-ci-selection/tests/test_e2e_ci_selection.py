@@ -4871,9 +4871,7 @@ def test_approval_resume_job_runs_on_pull_requests_and_gates_e2e_required() -> N
         for step in job["steps"]
         if step.get("name") == "Tear down the disposable cluster release"
     )
-    assert teardown["if"] == (
-        "always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-matrix'"
-    )
+    assert teardown["if"] == "always()"
     assert "kubectl delete namespace curie" in teardown["run"]
     assert "--ignore-not-found" in teardown["run"]
     assert "kind delete cluster" not in teardown["run"]
@@ -5125,6 +5123,7 @@ def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, pat
 
 FRESH_INSTALL_TEST = "test_fresh_cluster_up_converges_without_rerun"
 SCRIPTED_FACTORY_LEGS = (
+    ("scenario", lambda run: run == "python3 tools/factory-e2e/factory_e2e.py scripted"),
     *(
         (f"initial-binding-{index}",
          lambda run, index=index: (
@@ -5143,6 +5142,7 @@ SCRIPTED_FACTORY_LEGS = (
         lambda run: run == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
     ),
 )
+SCRIPTED_FACTORY_EVIDENCE_STEP = "Upload scripted factory evidence"
 
 
 def _assert_scripted_factory_legs_map_one_to_one(job: dict[str, Any]) -> None:
@@ -5167,7 +5167,14 @@ def _assert_scripted_factory_legs_map_one_to_one(job: dict[str, Any]) -> None:
     for step in steps:
         if "matrix.suite" not in json.dumps(step) or any(step is owner for owner in claimed):
             continue
-        raise AssertionError(f"unexpected matrix.suite use in step {step.get('name')!r}")
+        if not (
+            step.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP
+            and step.get("if") == "always() && matrix.suite == 'scenario'"
+        ):
+            raise AssertionError(f"unexpected matrix.suite use in step {step.get('name')!r}")
+    evidence = [s for s in steps if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP]
+    if len(evidence) != 1 or evidence[0].get("if") != "always() && matrix.suite == 'scenario'":
+        raise AssertionError("evidence upload must run only in the scenario leg")
 
 
 def _scripted_factory_step(job: dict[str, Any], leg: str) -> dict[str, Any]:
@@ -5183,11 +5190,16 @@ def _drop_step_if(job: dict[str, Any]) -> None:
 
 
 def _misdirect_step_if(job: dict[str, Any]) -> None:
-    _scripted_factory_step(job, "initial-binding-1")["if"] = "matrix.suite == 'initial-binding'"
+    _scripted_factory_step(job, "scenario")["if"] = "matrix.suite == 'initial-binding'"
 
 
 def _enable_fail_fast(job: dict[str, Any]) -> None:
     job["strategy"]["fail-fast"] = True
+
+
+def _unguard_evidence(job: dict[str, Any]) -> None:
+    evidence = next(s for s in job["steps"] if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP)
+    evidence["if"] = "always()"
 
 
 def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
@@ -5197,7 +5209,7 @@ def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
 
 @pytest.mark.parametrize(
     "mutate",
-    (_drop_leg, _drop_step_if, _misdirect_step_if, _enable_fail_fast),
+    (_drop_leg, _drop_step_if, _misdirect_step_if, _enable_fail_fast, _unguard_evidence),
 )
 def test_scripted_factory_leg_mapping_rejects_skippable_shapes(
     mutate: Callable[[dict[str, Any]], None],
@@ -5219,6 +5231,18 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
     assert "pull_request" not in job["if"]
     assert job["needs"] == ["rust-build", "changes", "ci-images"]
     assert SCRIPTED_FACTORY_JOB in jobs["e2e-required"]["needs"]
+
+    scenario = [
+        step
+        for step in job["steps"]
+        if step.get("run") == "python3 tools/factory-e2e/factory_e2e.py scripted"
+    ]
+    assert len(scenario) == 1
+    assert scenario[0]["env"] == {
+        "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
+        "BUILDX_BUILDER": "default",
+    }
+    assert "continue-on-error" not in scenario[0]
 
     steps = job["steps"]
     registrations = [step for step in steps if INITIAL_BINDING_MODULE in step.get("run", "")]
