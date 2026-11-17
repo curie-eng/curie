@@ -45,6 +45,7 @@ import functools
 import itertools
 import json
 import logging
+import os
 import secrets
 import socket
 import sys
@@ -68,6 +69,7 @@ from aiohttp.test_utils import TestServer
 from curie_api import factory_progress
 from curie_api.config import get_settings
 from curie_api.factory_ci import RERUN_REQUESTED_NOTE
+from curie_api.forges.trackers import mention_objective
 from curie_api.forges.types import RepositoryRef, TrackerIssueRef
 from curie_api.main import create_app
 from curie_api.models import Approval, Publication
@@ -113,7 +115,9 @@ from forge_fakes.github import (  # noqa: E402
     _post,
     factory_env,
     fake_installation_tokens,
+    forges_env_json,
 )
+from forge_fakes.gitlab import forges_document as gitlab_forges_document  # noqa: E402
 
 from apps.worker.tests.kernel.conftest import make_config  # noqa: E402
 
@@ -501,6 +505,8 @@ class Stack:
         requester: str | None = None,
         owner: dict[str, Any] | None = None,
         objective: str | None = None,
+        tracker: dict[str, str] | None = None,
+        repository: dict[str, str] | None = None,
     ) -> tuple[uuid.UUID, uuid.UUID]:
         """A service WorkItem, or with ``owner`` a personal one bound to that owner.
 
@@ -519,13 +525,15 @@ class Stack:
                 "kind": "github",
                 "address": REPO,
                 "reply_conversation_id": f"issue-{number}",
-                "tracker": {
+                "tracker": tracker
+                or {
                     "kind": "github",
                     "host": "github.com",
                     "scope_id": str(REPO_ID),
                     "issue_id": str(number),
                 },
-                "repository": {
+                "repository": repository
+                or {
                     "code_host_kind": "github",
                     "host": "github.com",
                     "project_id": str(REPO_ID),
@@ -6445,6 +6453,71 @@ def test_progress_card_upgrade_cutoff_survives_a_worker_outage(
     else:
         assert _card_ts(item) is None
         assert "card" not in _post_kinds(item)
+
+
+@pytest.mark.parametrize("kind", ["gitlab", "jira_cloud"])
+def test_progress_card_configured_non_github_issue_link_and_needs_a_person_button(
+    stack: Stack,
+    kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    number = next(_ISSUES)
+    host = "gitlab.example.com" if kind == "gitlab" else "api.atlassian.example.com"
+    label = f"{REPO}#{number}" if kind == "gitlab" else f"ACME-{number}"
+    issue_url = (
+        f"https://{host}/{REPO}/-/issues/{number}"
+        if kind == "gitlab"
+        else f"https://tracker.example.com/browse/{label}"
+    )
+    tracker = {
+        "kind": kind,
+        "host": host,
+        "scope_id": str(REPO_ID) if kind == "gitlab" else "11111111-1111-4111-8111-111111111111",
+        "issue_id": str(number),
+        "display_key": label,
+    }
+    repository = (
+        {"code_host_kind": "gitlab", "host": host, "project_id": str(REPO_ID), "path": REPO}
+        if kind == "gitlab"
+        else None
+    )
+    if kind == "gitlab":
+        document = json.loads(os.environ["CURIE_FORGES"])
+        gitlab = gitlab_forges_document(
+            host=host, api_url=f"https://{host}/api/v4", project_id=REPO_ID, path=REPO
+        )
+        for section in ("code_hosts", "trackers", "bindings"):
+            document[section].extend(gitlab[section])
+        monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, tmp_path / "forge-links"))
+        get_settings.cache_clear()
+    assert stack.enable_destination().status_code == 200
+    request, item = stack.admit(
+        number,
+        tracker=tracker,
+        repository=repository,
+        objective=mention_objective(issue_url, kind, "42"),
+    )
+    stack.drain()
+    (root,) = [call for call in _channel_posts(stack, CHANNEL) if not call.params.get("thread_ts")]
+    assert root.text.splitlines()[-1] == issue_url
+    assert f"<{issue_url}|" in _last_card(stack, item)
+
+    _rows(
+        "UPDATE curie.execution_requests SET status = 'expired', "
+        "terminal_cause = 'capacity_wait_expired', terminal_at = now() WHERE id = :id",
+        {"id": request},
+    )
+    stack.drain(fresh=True)
+    edit = _card_edits(stack, item)[-1]
+    assert "Factory run: needs a person" in edit.haystack
+    blocks = edit.params["blocks"]
+    if isinstance(blocks, str):
+        blocks = json.loads(blocks)
+    buttons = [
+        element for block in blocks if block["type"] == "actions" for element in block["elements"]
+    ]
+    assert [button["url"] for button in buttons] == [issue_url]
 
 
 def test_progress_card_steering_revision_keeps_the_work_items_issue_link(

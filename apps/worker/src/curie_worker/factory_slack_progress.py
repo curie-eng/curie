@@ -184,16 +184,24 @@ assert _REFUSAL_REASON_SQL == ", ".join(repr(reason) for reason in _REFUSAL_REAS
 _ISSUE_URL_SQL = """
     CASE WHEN w.tracker_kind = 'github'
          THEN 'https://' || w.tracker_host || '/' || w.repository_path
-              || '/issues/' || w.tracker_issue_id END
+              || '/issues/' || w.tracker_issue_id
+         ELSE (
+             SELECT NULLIF(split_part(split_part(split_part(initial.objective,
+                        '?focusedCommentId=', 1), '#', 1), chr(10), 1), '')
+               FROM {requests} initial
+              WHERE initial.work_item_id = w.id
+              ORDER BY initial.sequence
+              LIMIT 1
+         ) END
 """
 # The root line's fields for an unposted root. Aliases are w and n.
-_ROOT_PAYLOAD_SQL = f"""
+_ROOT_PAYLOAD_SQL = """
     jsonb_strip_nulls(jsonb_build_object(
         'repository_path', w.repository_path,
         'issue_id', w.tracker_issue_id,
         'display_key', w.tracker_display_key,
         'title', n.subject_title,
-        'ticket_url', {_ISSUE_URL_SQL}
+        'ticket_url', {issue_url}
     ))
 """
 # The kinds this lane delivers. Rows of the pre-card kinds stay in the table
@@ -460,6 +468,8 @@ class PostgresFactorySlackStore:
         self._deliveries = f'"{schema}".factory_tracker_result_deliveries'
         self._receipts = f'"{schema}".factory_tracker_result_receipts'
         self._handoffs = f'"{schema}".factory_triage_handoffs'
+        self._issue_url = _ISSUE_URL_SQL.format(requests=self._requests)
+        self._root_payload = _ROOT_PAYLOAD_SQL.format(issue_url=self._issue_url)
         self._shown = _SHOWN_SQL.format(requests=self._requests)
         self._mention = _MENTION_SQL.format(
             requests=self._requests,
@@ -529,7 +539,7 @@ class PostgresFactorySlackStore:
             INSERT INTO {self._posts} AS p
                    (work_item_id, post_key, kind, sequence, rank, ordinal, payload)
             SELECT d.work_item_id, 'root', 'root', 0, 0, 0,
-                   {_ROOT_PAYLOAD_SQL}
+                   {self._root_payload}
               FROM discovered d
               JOIN {self._work_items} w ON w.id = d.work_item_id
               JOIN {self._requests} q
@@ -543,7 +553,7 @@ class PostgresFactorySlackStore:
         refresh_roots = text(
             f"""
             UPDATE {self._posts} AS p
-               SET payload = {_ROOT_PAYLOAD_SQL}
+               SET payload = {self._root_payload}
               FROM {self._threads} t
               JOIN {self._work_items} w ON w.id = t.work_item_id
               JOIN {self._requests} q
@@ -967,7 +977,7 @@ class PostgresFactorySlackStore:
                    CASE WHEN q.requester LIKE 'github:%'
                         THEN NULLIF(split_part(q.requester, ':', 3), '') END
                        AS requester_login,
-                   {_ISSUE_URL_SQL} AS ticket_url,
+                   {self._issue_url} AS ticket_url,
                    q.id AS request_id, q.sequence, q.status, q.terminal_cause,
                    COALESCE(q.started_at, q.created_at) AS started_at, q.terminal_at,
                    (
