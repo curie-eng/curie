@@ -45,6 +45,36 @@ Do not put a real token in a ticket, a document, or a shell history you share.
 
 ## Sign in and enroll
 
+There are two ways to enroll. The Console page is the first. The CLI is the
+second, for scripts and terminals.
+
+### In the Console
+
+Sign in to the Console with your organization, then open
+`<Console origin>/settings/claude-plan`. The same page is Settings, then Claude
+plan. A login-code session cannot use it; the page says so and links to
+organization sign-in.
+
+1. The page shows one status line: "Not connected", "Connected, generation N",
+   or "Disconnected". While a disconnect is still finishing, a second line
+   names the runs and stored tokens left to clean up, and the page refreshes
+   every 5 seconds until both are zero.
+2. Paste the token that `claude setup-token` printed into the box and choose
+   Connect (no plan yet), Replace (connected), or Reconnect (disconnected).
+   The page sends the version it last read, so a change made in another window
+   or the CLI answers "Your plan changed in another window" and the page
+   reloads the current state.
+3. Disconnect asks for confirmation. It stops your runs and deletes the stored
+   token. It does not revoke the token with Anthropic; revoke it in your Claude
+   account settings.
+
+The token is checked against the same rule as the CLI, sent once in the request
+body, and cleared from the page as soon as the request finishes. The page never
+shows it again and keeps it in no browser storage. Each button shows the
+matching `curie cluster subscription` command.
+
+### With the CLI
+
 The CLI uses your Console session cookie. It has no `--api-key`, and these
 commands do not read a platform key.
 

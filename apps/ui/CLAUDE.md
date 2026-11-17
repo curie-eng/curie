@@ -16,8 +16,8 @@ structure and wiring detail in `apps/ui/README.md`.
 - **Not everything is wired yet, but unwired surfaces are honest stubs, never
   demo data.** Create-agent + Deploy, Agents/Fleet, Runs/Traces, Metrics, Logs,
   Cost, Memory, Versions, and Evals call the real API (Evals reads
-  `GET /evals/matrix` in `src/views/wired/WiredEvals.tsx`). Usage and Settings
-  render a `ComingSoon` placeholder (`src/views/wired/WiredStubs.tsx`). Before
+  `GET /evals/matrix` in `src/views/wired/WiredEvals.tsx`). Usage and the Workspace
+  settings section render a `ComingSoon` placeholder (`src/views/wired/WiredStubs.tsx`). Before
   wiring one of these, check `apps/ui/README.md`'s "Not wired yet" list; when
   the endpoint does not exist yet, keep the honest stub rather than inventing
   data.

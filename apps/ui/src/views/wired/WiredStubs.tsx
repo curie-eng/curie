@@ -1,7 +1,10 @@
 import { C } from "../../tokens";
-import { Card, SectionTitle, Chip } from "../../primitives";
+import { Card, SectionTitle, Chip, Tabs } from "../../primitives";
 import { ConnectSlackPanel } from "../../components/ConnectSlackPanel";
 import { useWired } from "../../state/wired";
+import { useStore } from "../../state/store";
+import type { SettingsSection } from "../../state/route";
+import { WiredClaudePlan } from "./WiredClaudePlan";
 
 // Honest placeholders for the views not yet backend-driven, so wired mode never
 // leaks fixture data (no fictional deal-desk / eval cases / version rows). They
@@ -52,23 +55,40 @@ export function WiredUsage() {
   );
 }
 
+const SETTINGS_TABS = [
+  ["workspace", "Workspace"],
+  ["claude-plan", "Claude plan"],
+] as const satisfies readonly (readonly [SettingsSection, string])[];
+
 export function WiredSettings() {
   const { orgName } = useWired();
+  const { state, dispatch } = useStore();
   return (
     <div>
       <SectionTitle title="Settings" />
+      <Tabs
+        tabs={SETTINGS_TABS}
+        active={state.settingsSection}
+        onSelect={(section) => dispatch({ type: "settingsSection", section })}
+      />
       <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 720 }}>
-        <Card>
-          <div style={{ fontSize: 13, color: C.muted, marginBottom: 6 }}>Workspace name</div>
-          <div style={{ fontSize: 15, color: C.text }}>{orgName}</div>
-          <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>
-            Configured on the server. Read-only here for now.
-          </div>
-        </Card>
-        <ComingSoon
-          title="More project settings are not wired yet"
-          body="Default model and provider keys are managed outside the console for now. This view will bind to real settings in a later pass."
-        />
+        {state.settingsSection === "claude-plan" ? (
+          <WiredClaudePlan />
+        ) : (
+          <>
+            <Card>
+              <div style={{ fontSize: 13, color: C.muted, marginBottom: 6 }}>Workspace name</div>
+              <div style={{ fontSize: 15, color: C.text }}>{orgName}</div>
+              <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>
+                Configured on the server. Read-only here for now.
+              </div>
+            </Card>
+            <ComingSoon
+              title="More project settings are not wired yet"
+              body="Default model and provider keys are managed outside the console for now. This view will bind to real settings in a later pass."
+            />
+          </>
+        )}
       </div>
     </div>
   );

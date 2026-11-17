@@ -82,6 +82,13 @@ export const WIRED_ACTIONS = [
     mapping: { noCliEquivalent: "https://github.com/curie-eng/curie/issues/5559" },
   },
 
+  // WiredClaudePlan (#5716): each button maps to the CLI verb that does the same
+  // write with the same session. The CLI reads the token from a private file.
+  { id: "claude-plan-enroll", label: "Connect a personal Claude plan", mapping: { command: "cluster.subscription.enroll" } },
+  { id: "claude-plan-replace", label: "Replace the personal Claude plan token", mapping: { command: "cluster.subscription.replace" } },
+  { id: "claude-plan-reconnect", label: "Reconnect a personal Claude plan", mapping: { command: "cluster.subscription.reconnect" } },
+  { id: "claude-plan-disconnect", label: "Disconnect a personal Claude plan", mapping: { command: "cluster.subscription.disconnect" } },
+
   // Genuinely-unmapped actions: no dedicated CLI verb exists yet. These render
   // the honest amber glyph linking to the parity epic instead of a command.
   { id: "rollback", label: "Roll back to an earlier version", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },

@@ -24,10 +24,11 @@ RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 COPY apps/ui/package.json apps/ui/pnpm-lock.yaml ./apps/ui/
 WORKDIR /app/apps/ui
 RUN pnpm install --frozen-lockfile
-# The shared wording vector, then the UI sources. Both land at their
-# repo-relative paths so `../../tests/...` resolves from apps/ui.
+# The shared wording and enrollment token vectors, then the UI sources. All
+# land at their repo-relative paths so `../../tests/...` resolves from apps/ui.
 WORKDIR /app
 COPY tests/vectors/user-action-wording.json ./tests/vectors/user-action-wording.json
+COPY tests/vectors/personal-enrollment-token.json ./tests/vectors/personal-enrollment-token.json
 COPY apps/ui ./apps/ui
 WORKDIR /app/apps/ui
 RUN pnpm build
