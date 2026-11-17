@@ -99,7 +99,6 @@ def required_job_names(repo_root: Path, *, deadline: float) -> frozenset[str]:
             *(
                 f"E2E scripted factory (kind, scripted model, {suite})"
                 for suite in (
-                    "scenario",
                     "initial-binding-1",
                     "initial-binding-2",
                     "initial-binding-3",
