@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 
 from channel_protocol import (
+    SCOPED_REPLY_WIRE_VERSION,
     ConfirmIntent,
     ReplyAck,
     ReplyEvent,
@@ -216,6 +217,24 @@ class EgressHandler(BaseHTTPRequestHandler):
             return self._respond(
                 422,
                 {"detail": "reply wire 1.2 verbatim is not supported"},
+            )
+        if (
+            isinstance(event, ReplyUpdate)
+            and event.version == SCOPED_REPLY_WIRE_VERSION
+            and event.message_mode == "replace"
+        ):
+            return self._respond(
+                422,
+                {"detail": "reply wire 1.3 replace edit is not supported"},
+            )
+        if (
+            isinstance(event, ReplyPost)
+            and event.version == SCOPED_REPLY_WIRE_VERSION
+            and event.audience_user is not None
+        ):
+            return self._respond(
+                422,
+                {"detail": "reply wire 1.3 audience post is not supported"},
             )
         if isinstance(event, TurnCompleted) and not event.event_id:
             return self._respond(422, {"detail": "event_id must not be empty"})

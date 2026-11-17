@@ -104,7 +104,18 @@ def test_every_refusal_encodes_as_json(case: dict[str, Any]) -> None:
     json.dumps(caught.value.errors())
 
 
-@pytest.mark.parametrize("case", _cases("v1_0") + _cases("v1_1"))
+@pytest.mark.parametrize("case", _cases("v1_3"))
+def test_every_1_3_body_decodes_and_reserializes_to_the_same_bytes(
+    case: dict[str, Any],
+) -> None:
+    wire = _wire_bytes(case["body"])
+    event = _EVENTS.validate_json(wire)
+    assert event.version == "1.3"
+    assert event.event == case["body"]["event"]
+    assert event.model_dump_json() == wire
+
+
+@pytest.mark.parametrize("case", _cases("v1_0") + _cases("v1_1") + _cases("v1_3"))
 def test_every_accepted_body_also_decodes_from_python_objects(case: dict[str, Any]) -> None:
     # The mail adapter's egress parses the body with json.loads and then calls
     # validate_python, not validate_json, so the corpus is held to that path too.
@@ -133,3 +144,7 @@ def test_the_corpus_covers_every_event_and_every_progress_form() -> None:
         if case["body"].get("progress", {}).get("kind") == "milestone"
     }
     assert milestone_classes == {"evidence", "scope", "verification"}
+    v1_3 = _CORPUS["v1_3"]
+    assert {case["body"]["event"] for case in v1_3} == {"reply.update", "reply.post"}
+    assert any(case["body"].get("message_mode") == "replace" for case in v1_3)
+    assert any(case["body"].get("audience_user") for case in v1_3)
