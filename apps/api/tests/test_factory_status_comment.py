@@ -86,6 +86,7 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     REVISION_REPLY_VALUES,
     _attach_publication,
     _attach_revision_publication,
+    _finish_unpublished,
     _insert_revision,
     _notices,
     _patches,
@@ -3463,3 +3464,142 @@ def test_a_delegated_ticket_renders_its_handoff_once_the_outcome_is_recorded(
     assert comment["id"] == pending["id"]
     assert comment["body"].count("Implementation not started: output_changed.") == 1
     assert "Implementation admitted" not in comment["body"]
+
+
+# --- #5728: a question on a factory pull request -----------------------------
+
+_NINE_STEPS = (
+    "Read issue",
+    "Pin acceptance criteria",
+    "Plan",
+    "Plan review",
+    "Failing test",
+    "Implement",
+    "Review diff",
+    "Publish PR",
+    "Wait for CI",
+)
+_READING = "Reading the pull request and its Decisions"
+
+
+def _checklist_lines(body: str) -> list[str]:
+    return [line for line in body.splitlines() if line.startswith("- [")]
+
+
+def _running_revision(client: Any, github: Any, sink: Any, fragment: str) -> tuple[int, uuid.UUID]:
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    sink.requests.clear()
+    revision = _insert_revision(
+        first["work_item_id"],
+        number,
+        _revision_objective(pr, fragment),
+        _revision_reply(pr, fragment),
+    )
+    _start_running(client, revision)
+    _execute(
+        "INSERT INTO curie.factory_terminal_notices (execution_request_id, work_item_id) "
+        "VALUES (:request, :item)",
+        {"request": revision, "item": first["work_item_id"]},
+    )
+    return number, revision
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    ["issuecomment-5728", "discussion_r5728"],
+    ids=["pull_request", "review_thread"],
+)
+def test_a_running_pull_request_follow_up_hides_the_checklist_until_a_later_phase(
+    admitted: Any,  # noqa: F811
+    fragment: str,
+) -> None:
+    """#5728 AC2: the nine steps stay hidden through read_issue and preflight."""
+
+    client, github, sink = admitted
+    _number, revision = _running_revision(client, github, sink, fragment)
+
+    _reconcile()
+    (comment,) = _marked(sink, revision)
+    assert _READING in comment["body"]
+    assert "Status: RUNNING" in comment["body"]
+    assert _checklist_lines(comment["body"]) == []
+
+    assert report(client, revision, "read_issue").status_code == 201
+    _execute(
+        "INSERT INTO curie.execution_request_phase_reports (execution_request_id, phase) "
+        "VALUES (:id, 'verification_preflight')",
+        {"id": revision},
+    )
+    sink.requests.clear()
+    _reconcile()
+    (comment,) = _marked(sink, revision)
+    assert _READING in comment["body"]
+    assert "Status: RUNNING" in comment["body"]
+    assert _checklist_lines(comment["body"]) == []
+    for label in _NINE_STEPS:
+        assert label not in comment["body"]
+
+    assert report(client, revision, "plan", round=1).status_code == 201
+    sink.requests.clear()
+    _reconcile()
+    (comment,) = _marked(sink, revision)
+    assert _READING not in comment["body"]
+    assert "Status: RUNNING" in comment["body"]
+    checklist = _checklist_lines(comment["body"])
+    assert checklist
+    for label in _NINE_STEPS:
+        assert any(label in line for line in checklist)
+
+
+def test_an_issue_run_still_shows_the_checklist_at_read_issue(admitted: Any) -> None:  # noqa: F811
+    """A tracker-issue run is not a pull request follow-up, so its checklist stays."""
+
+    client, github, sink = admitted
+    number = 57281
+    request_id = _admit(client, github, sink, number)
+    _start_running(client, request_id)
+    assert report(client, request_id, "read_issue").status_code == 201
+    _reconcile()
+    (comment,) = _marked(sink, request_id)
+    assert _READING not in comment["body"]
+    assert "Status: RUNNING" in comment["body"]
+    checklist = _checklist_lines(comment["body"])
+    for label in _NINE_STEPS:
+        assert any(label in line for line in checklist)
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    ["issuecomment-5729", "discussion_r5729"],
+    ids=["pull_request", "review_thread"],
+)
+def test_an_unchanged_follow_up_is_answered_without_a_checklist(
+    admitted: Any,  # noqa: F811
+    fragment: str,
+) -> None:
+    """#5728 AC1: the final pill is ANSWERED and the request row stays completed."""
+
+    client, github, sink = admitted
+    _number, revision = _running_revision(client, github, sink, fragment)
+    assert report(client, revision, "plan", round=1).status_code == 201
+    detail = "No changes needed: Decisions entry 2 already records this approach."
+    finished = _finish_unpublished(client, revision, cause="no_pull_request", detail=detail)
+    assert finished.status_code == 200, finished.text
+    sink.requests.clear()
+    _reconcile()
+
+    (comment,) = _marked(sink, revision)
+    body = comment["body"]
+    assert "Status: ANSWERED" in body
+    assert "Status: SUCCEEDED" not in body
+    assert detail in body
+    assert "Agent's last message:" in body
+    assert _checklist_lines(body) == []
+    for label in _NINE_STEPS:
+        assert label not in body
+    row = _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": revision},
+    )[0]
+    assert row == {"status": "completed", "terminal_cause": "completed"}

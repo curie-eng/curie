@@ -43,6 +43,8 @@ from curie_runner.verification import (
     preflight_workspace_verification,
 )
 
+from examples.tests.test_pull_request_follow_up_detection import production_follow_up_objectives
+
 pytestmark = pytest.mark.xdist_independent
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -4157,3 +4159,58 @@ def test_task_notification_preserves_approval_until_a_later_edit(session: Sessio
     assert _saved_state(session) == before
     (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+
+
+_FOLLOW_UP_OBJECTIVES = production_follow_up_objectives()
+
+
+def _follow_up_session(tmp_path: Path, objective: str) -> Session:
+    """A run whose opening prompt is one production follow-up, inside the sender frame."""
+
+    session = Session(tmp_path)
+    session.fire(
+        "UserPromptSubmit",
+        prompt=frame_user_turn("message", "octocat", objective, "github"),
+    )
+    session.load_workflow()
+    return session
+
+
+@pytest.mark.parametrize(
+    "objective", list(_FOLLOW_UP_OBJECTIVES.values()), ids=list(_FOLLOW_UP_OBJECTIVES)
+)
+def test_a_pull_request_follow_up_refuses_an_empty_diff_review(
+    tmp_path: Path, objective: str
+) -> None:
+    """#5728 AC3: an empty candidate admits no diff review and does not stop the run."""
+
+    session = _follow_up_session(tmp_path, objective)
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    decision = session.pre("Agent", {"subagent_type": DIFF, "description": "diff", "prompt": "p"})
+    assert decision["permissionDecision"] == "deny"
+    assert "candidate patch is empty" in decision["permissionDecisionReason"]
+    refused = [
+        event
+        for event in session.gate_events()
+        if event.get("curie_gate") == "review_refused"
+        and event.get("cause") == "empty_candidate_patch"
+    ]
+    assert refused
+    assert _saved_state(session)["stopped"] is None
+    assert _saved_state(session)["pull_request_follow_up"] is True
+
+
+@pytest.mark.parametrize(
+    "objective", list(_FOLLOW_UP_OBJECTIVES.values()), ids=list(_FOLLOW_UP_OBJECTIVES)
+)
+def test_a_pull_request_follow_up_still_admits_a_nonempty_diff_review(
+    tmp_path: Path, objective: str
+) -> None:
+    """A follow-up that edited the checkout still gets a diff review."""
+
+    session = _follow_up_session(tmp_path, objective)
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    rework(session, 1)
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    assert not any(event.get("cause") == "empty_candidate_patch" for event in session.gate_events())
+    assert _saved_state(session)["stopped"] is None

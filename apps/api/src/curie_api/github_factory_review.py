@@ -26,6 +26,7 @@ from curie_api.schemas.deployments import WebhookResult
 
 from . import workitem_dispatch
 from .config import Settings
+from .factory_follow_up import with_pull_request_follow_up_marker
 from .factory_reply_target import feedback_url
 from .factory_review_context import pull_request_body_context
 from .forges.hosts import factory_app_slug, factory_code_host_entry, factory_tracker, github_host
@@ -154,9 +155,11 @@ def _objective(
     # reply target is stored typed on the request.
     provenance = feedback_provenance(feedback)
     provenance.update(publication_context)
-    return (
+    return with_pull_request_follow_up_marker(
         f"{url}\n\n"
         "Human GitHub review feedback on this work item's pull request follows as JSON. "
+        "Answer from the pull request body's Decisions section and the current diff first. "
+        "Start the revision pipeline only when the comment asks for a change. "
         "The feedback may ask a question or request a change. Answer questions directly and "
         "revise the same pull request when a change is needed. The pull_request_body, when "
         "present, records the last successfully published description.\n"

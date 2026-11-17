@@ -159,7 +159,16 @@ One script handles every hook event the bundle registers:
     checkout the diff reviewer already approved is refused (cause
     ``already_approved``): go to publish. An approval of another checkout is
     cleared. Then the timing check. A checkout identical to the last one that
-    got ``CHANGES`` is refused without a stop (cause ``no_progress``). With
+    got ``CHANGES`` is refused without a stop (cause ``no_progress``). A
+    pull-request follow-up, recognized because the first nonblank line after
+    the opening URL line of the user message is exactly ``Curie pull request
+    follow-up.`` (the same literal as
+    ``curie_api.factory_follow_up.PULL_REQUEST_FOLLOW_UP_MARKER``), refuses a
+    diff review whose candidate patch is empty (cause
+    ``empty_candidate_patch``) without stopping the run. Plan review of that
+    same empty checkout stays admitted,
+    and an issue run's empty diff review stays admitted, so a change request
+    can still pass plan review before it edits. With
     ``DIFF_ROUNDS`` rounds completed the run stops and writes ``curie_gate:
     review_refused`` with cause ``round_cap``, stage ``review_diff``, the
     completed ``round`` and the ``cap``. Each later diff review that the stop
@@ -573,6 +582,38 @@ def _bounded(text: str) -> str:
     return text if len(text) <= FINDINGS_LIMIT else f"{text[:FINDINGS_LIMIT]}\n[truncated]"
 
 
+# Same literal as curie_api.factory_follow_up.PULL_REQUEST_FOLLOW_UP_MARKER.
+# This hook cannot import the API. The builder regression keeps them equal.
+_PULL_REQUEST_FOLLOW_UP_MARKER = "Curie pull request follow-up."
+
+
+def _pull_request_follow_up(prompt: str) -> bool:
+    """Whether the opening prompt is a pull-request follow-up.
+
+    The marker has one reserved line, the same way a wait_ci round reserves
+    its second line: the first nonblank line after the opening URL line of
+    the user message, and that line must be exactly
+    ``_PULL_REQUEST_FOLLOW_UP_MARKER``. A copy further down, including inside
+    quoted issue or review text, does not count. The line is read inside the
+    sender frame, so a marker in the frame header or after the frame does not
+    count either. Old state files omit the flag; callers treat a missing key
+    as false.
+    """
+
+    lines = _message_lines(prompt)
+    if not lines:
+        return False
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        # The runner's frame closer is not part of the user message. Text
+        # after it is outside the frame and cannot supply the marker.
+        if line.startswith("[end-user-message "):
+            return False
+        return line == _PULL_REQUEST_FOLLOW_UP_MARKER
+    return False
+
+
 def _fresh(prompt: str = "") -> dict[str, Any]:
     """Fresh state for a new run, or for a CI fix round.
 
@@ -607,6 +648,9 @@ def _fresh(prompt: str = "") -> dict[str, Any]:
         "findings": None,
         # The fingerprint of the last diff candidate that got CHANGES.
         "rejected": None,
+        # Set from the opening prompt. An empty candidate refuses diff review
+        # only when this is true. Plan review stays admitted either way.
+        "pull_request_follow_up": _pull_request_follow_up(prompt),
     }
 
 
@@ -1537,6 +1581,16 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         # C is only built against a commit id, so the base is one here.
         if built is None or built.patch is None or not _is_commit(base):
             return _deny(UNVERIFIABLE)
+        # A question on a pull request has no diff. Refuse this review without
+        # stopping the run, so a later non-empty patch can still be reviewed.
+        # Plan review is not refused: it runs on the clean tree before edits.
+        if state.get("pull_request_follow_up") and (
+            not built.changed_paths or not built.patch.strip()
+        ):
+            emit_gate(state, "review_refused", cause="empty_candidate_patch", stage="review_diff")
+            return _deny(
+                "Diff review refused: the candidate patch is empty, so there is no diff to review."
+            )
         digest = candidate_digest(base, built.tree)
         try:
             patch_path = write_candidate_patch(built.tree, built.patch)

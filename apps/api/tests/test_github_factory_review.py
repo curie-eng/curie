@@ -513,7 +513,13 @@ def test_review_objective_carries_latest_succeeded_pull_request_body(
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "factory_admitted", response.text
     revision = _requests(number)[1]
-    provenance = json.loads(revision["objective"].splitlines()[-1])
+    prose, _separator, last_line = revision["objective"].rpartition("\n")
+    assert (
+        "Answer from the pull request body's Decisions section and the current diff first."
+        in prose
+    )
+    assert "Start the revision pipeline only when the comment asks for a change." in prose
+    provenance = json.loads(last_line)
     assert provenance["body"] == question
     assert provenance["sender"] == SENDER
     assert provenance["path"] == "src/acme/helper.py"

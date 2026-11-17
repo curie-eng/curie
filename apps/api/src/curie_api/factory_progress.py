@@ -816,14 +816,21 @@ _PILLS: dict[str, tuple[str, str, bool]] = {
 }
 _PUBLISHING = ("PUBLISHING", "#8250df", True)
 _RETRYING = ("RETRYING", "#2f81f7", False)
+# An unchanged follow-up answered a question. The comment pill only; the card
+# stays SUCCEEDED because its caller does not pass answered.
+_ANSWERED = ("ANSWERED", "#0969da", False)
 _UNKNOWN_COLOR = "#6e7781"
 
 
-def pill_for(status: str, publishing: bool, *, retrying: bool = False) -> tuple[str, str, bool]:
+def pill_for(
+    status: str, publishing: bool, *, retrying: bool = False, answered: bool = False
+) -> tuple[str, str, bool]:
     """The status pill: label, color, and whether its dot pulses."""
 
     if retrying:
         return _RETRYING
     if status == "running" and publishing:
         return _PUBLISHING
+    if answered and status == "completed":
+        return _ANSWERED
     return _PILLS.get(status, (status.upper(), _UNKNOWN_COLOR, False))

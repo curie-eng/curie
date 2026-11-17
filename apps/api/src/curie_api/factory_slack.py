@@ -62,6 +62,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import identity_fence, workitem_dispatch
 from .config import Settings
+from .factory_follow_up import with_pull_request_follow_up_marker
 from .forges import types
 from .forges.authority import feedback_allowlist, may_act_on_feedback
 from .forges.capabilities import Operation, supports
@@ -161,7 +162,7 @@ def objective(pr_url: str, branch: str, login: str, body: str) -> str:
         },
         ensure_ascii=False,
     )
-    return (
+    return with_pull_request_follow_up_marker(
         f"{pr_url}\n\nA person mentioned this factory run in its Slack thread. Revise this "
         f"same pull request on its existing branch {branch}; do not open a new pull "
         f"request. Their full reply follows as JSON.\n{reply}"
