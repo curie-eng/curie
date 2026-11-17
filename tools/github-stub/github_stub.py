@@ -761,7 +761,12 @@ class GithubStub:
             ):
                 self._json(handler, 400, {"error": "invalid_request"})
                 return
-            redirect = query["redirect_uri"][0]
+            redirect_value = re.fullmatch(r"[^\x00-\x1f\x7f-\x9f]+", query["redirect_uri"][0])
+            state = re.fullmatch(r"[^\x00-\x1f\x7f-\x9f]+", query["state"][0])
+            if redirect_value is None or state is None:
+                self._json(handler, 400, {"error": "invalid_request"})
+                return
+            redirect = redirect_value[0]
             if urlsplit(redirect).scheme != "https":
                 self._json(handler, 400, {"error": "invalid_redirect"})
                 return
@@ -775,7 +780,7 @@ class GithubStub:
                 handler.send_response(302)
                 handler.send_header(
                     "Location",
-                    redirect + "?" + urlencode({"code": code, "state": query["state"][0]}),
+                    redirect + "?" + urlencode({"code": code, "state": state[0]}),
                 )
                 handler.send_header("Cache-Control", "no-store")
                 handler.end_headers()

@@ -136,6 +136,30 @@ def _seconds(recording: dict[str, Any], instant: str) -> float:
     ).total_seconds()
 
 
+@pytest.mark.parametrize("field", ["redirect_uri", "state"])
+@pytest.mark.parametrize("approved", [False, True])
+def test_github_link_authorize_rejects_control_characters(
+    stub: Any, github: httpx.Client, field: str, approved: bool
+) -> None:
+    params = {
+        "client_id": stub.oauth_client_id,
+        "state": "EXAMPLE-state-sentinel",
+        "redirect_uri": "https://console.example.com/api/identity/me/github-link/callback",
+    }
+    if approved:
+        params["approved"] = "1"
+    for control in ("\r\nX-Injected: yes", "\x00", "\t", "\x1f", "\x7f", "\x85", "\x9f"):
+        response = github.get(
+            "/login/oauth/authorize", params={**params, field: params[field] + control}
+        )
+        assert response.status_code == 400
+        assert response.json() == {"error": "invalid_request"}
+        assert "location" not in response.headers
+        assert "x-injected" not in response.headers
+    with sqlite3.connect(stub._database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM oauth_codes").fetchone()[0] == 0
+
+
 def test_github_link_oauth_identity_revoke_and_label_actor(stub: Any, github: httpx.Client) -> None:
     params = {
         "client_id": stub.oauth_client_id,

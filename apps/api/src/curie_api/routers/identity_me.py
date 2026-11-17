@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta
@@ -144,6 +145,9 @@ async def start_github_link(
 ) -> GithubLinkStartOut:
     settings = get_settings()
     config = github_link.require_configuration(settings)
+    console_session = re.fullmatch(r"[A-Za-z0-9_-]{43}", request.cookies[CONSOLE_SESSION_COOKIE])
+    if console_session is None:
+        raise HTTPException(401, "missing, invalid, or expired principal session")
     state = secrets.token_urlsafe(32)
     now = await session.scalar(select(func.now()))
     assert now is not None
@@ -160,7 +164,7 @@ async def start_github_link(
     # Lax; the callback still verifies its live session against the one-use state.
     response.set_cookie(
         FLOW_COOKIE,
-        request.cookies[CONSOLE_SESSION_COOKIE],
+        console_session[0],
         secure=True,
         httponly=True,
         samesite="lax",

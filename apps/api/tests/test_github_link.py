@@ -190,6 +190,7 @@ def start(api: TestClient, owner: support.Owner) -> str:
     assert "SameSite=lax" in response.headers["set-cookie"]
     assert "Secure" in response.headers["set-cookie"]
     assert "Max-Age=600" in response.headers["set-cookie"]
+    assert response.cookies[FLOW_COOKIE] == owner.session
     state = query["state"][0]
     [stored] = sql_dicts(
         "SELECT * FROM curie.github_link_states WHERE principal_id = :id "
@@ -411,12 +412,44 @@ def test_github_link_taken_account_and_own_unlink(
     assert len(audits) == 1
 
 
-def test_github_link_cross_site_return_uses_same_live_session(
+def test_github_link_start_refuses_noncanonical_session_cookie(
     github_link_api: tuple[TestClient, GitHub], github_link_owners: list[support.Owner]
 ) -> None:
     api, _ = github_link_api
     owner = github_link_owners[0]
+    token = "EXAMPLE-noncanonical-session!"
+    sql_rows(
+        "UPDATE curie.console_sessions SET session_token_hash = :hash WHERE principal_id = :id",
+        {"hash": hashlib.sha256(token.encode()).hexdigest(), "id": owner.principal_id},
+    )
+    malformed = support.Owner(owner.tenant_id, owner.principal_id, token)
+    assert links(api, malformed)["links"] == []
+    response = api.post(START, headers=malformed.headers())
+    assert response.status_code == 401
+    assert "set-cookie" not in response.headers
+    assert (
+        sql_dicts(
+            "SELECT * FROM curie.github_link_states WHERE principal_id = :id",
+            {"id": owner.principal_id},
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("revoked", [False, True])
+def test_github_link_cross_site_return_uses_same_live_session(
+    github_link_api: tuple[TestClient, GitHub],
+    github_link_owners: list[support.Owner],
+    revoked: bool,
+) -> None:
+    api, github = github_link_api
+    owner = github_link_owners[0]
     state = start(api, owner)
+    if revoked:
+        sql_rows(
+            "UPDATE curie.console_sessions SET revoked_at = now() WHERE principal_id = :id",
+            {"id": owner.principal_id},
+        )
     api.cookies.clear()
     response = api.get(
         CALLBACK,
@@ -424,8 +457,9 @@ def test_github_link_cross_site_return_uses_same_live_session(
         headers={"Cookie": f"{FLOW_COOKIE}={owner.session}"},
         follow_redirects=False,
     )
-    assert response.headers["location"].endswith("github=linked")
+    assert response.headers["location"].endswith("github=failed" if revoked else "github=linked")
     assert "Max-Age=0" in response.headers["set-cookie"]
+    assert github.exchanges == (0 if revoked else 1)
 
 
 def test_github_link_unlink_stops_the_production_label_owner_resolver(
