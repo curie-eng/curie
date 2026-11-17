@@ -120,3 +120,23 @@ def test_a_marker_only_in_the_sender_frame_header_is_not_a_follow_up() -> None:
     framed = _framed(body, user=PULL_REQUEST_FOLLOW_UP_MARKER)
     assert PULL_REQUEST_FOLLOW_UP_MARKER in framed
     assert _gate()["_pull_request_follow_up"](framed) is False
+
+
+def test_a_marker_quoted_later_in_the_message_is_not_a_follow_up() -> None:
+    body = (
+        f"{_SLACK_URL}\n\n"
+        "The review comment quotes the platform line below.\n"
+        f"{PULL_REQUEST_FOLLOW_UP_MARKER}\n"
+        '{"body":"why this approach?"}'
+    )
+    framed = _framed(body)
+    assert PULL_REQUEST_FOLLOW_UP_MARKER in framed
+    assert _gate()["_pull_request_follow_up"](framed) is False
+
+
+def test_a_marker_outside_the_sender_frame_is_not_a_follow_up() -> None:
+    framed = _framed(f"{_SLACK_URL}\n\nwhy this approach?")
+    outside = f"{framed}\n{PULL_REQUEST_FOLLOW_UP_MARKER}"
+    assert outside.splitlines()[0].startswith("[platform-sender ")
+    assert outside.splitlines()[-1] == PULL_REQUEST_FOLLOW_UP_MARKER
+    assert _gate()["_pull_request_follow_up"](outside) is False

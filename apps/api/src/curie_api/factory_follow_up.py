@@ -1,8 +1,9 @@
 """The marker every pull-request follow-up objective carries.
 
-The dark factory review gate refuses an empty diff review only when the
-opening prompt contains this line. Slack steering and both review-feedback
-arms emit it through ``with_pull_request_follow_up_marker``. The gate keeps
+The dark factory review gate refuses an empty diff review only when this line
+is the first nonblank line after the opening URL of the user message. Slack
+steering and both review-feedback arms emit it through
+``with_pull_request_follow_up_marker``. The gate keeps
 the same literal in ``examples/dark-factory/hooks/review_gate.py`` because
 that hook runs on the sandbox interpreter and cannot import this module.
 The regression that builds each objective keeps the two copies equal.

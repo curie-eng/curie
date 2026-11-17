@@ -160,8 +160,9 @@ One script handles every hook event the bundle registers:
     ``already_approved``): go to publish. An approval of another checkout is
     cleared. Then the timing check. A checkout identical to the last one that
     got ``CHANGES`` is refused without a stop (cause ``no_progress``). A
-    pull-request follow-up, recognized because its opening prompt contains
-    the marker ``Curie pull request follow-up.`` (the same literal as
+    pull-request follow-up, recognized because the first nonblank line after
+    the opening URL line of the user message is exactly ``Curie pull request
+    follow-up.`` (the same literal as
     ``curie_api.factory_follow_up.PULL_REQUEST_FOLLOW_UP_MARKER``), refuses a
     diff review whose candidate patch is empty (cause
     ``empty_candidate_patch``) without stopping the run. Plan review of that
@@ -589,14 +590,28 @@ _PULL_REQUEST_FOLLOW_UP_MARKER = "Curie pull request follow-up."
 def _pull_request_follow_up(prompt: str) -> bool:
     """Whether the opening prompt is a pull-request follow-up.
 
-    Every pull-request follow-up objective carries
-    ``_PULL_REQUEST_FOLLOW_UP_MARKER``. The marker is read from the user
-    message inside a sender frame, so a frame header cannot hide it or supply
-    it. Old state files omit the flag; callers treat a missing key as false.
+    The marker has one reserved line, the same way a wait_ci round reserves
+    its second line: the first nonblank line after the opening URL line of
+    the user message, and that line must be exactly
+    ``_PULL_REQUEST_FOLLOW_UP_MARKER``. A copy further down, including inside
+    quoted issue or review text, does not count. The line is read inside the
+    sender frame, so a marker in the frame header or after the frame does not
+    count either. Old state files omit the flag; callers treat a missing key
+    as false.
     """
 
-    message = "\n".join(_message_lines(prompt))
-    return _PULL_REQUEST_FOLLOW_UP_MARKER in message
+    lines = _message_lines(prompt)
+    if not lines:
+        return False
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        # The runner's frame closer is not part of the user message. Text
+        # after it is outside the frame and cannot supply the marker.
+        if line.startswith("[end-user-message "):
+            return False
+        return line == _PULL_REQUEST_FOLLOW_UP_MARKER
+    return False
 
 
 def _fresh(prompt: str = "") -> dict[str, Any]:
