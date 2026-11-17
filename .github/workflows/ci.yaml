@@ -3258,6 +3258,7 @@ jobs:
       # The cluster has no CNI until this lands (disableDefaultCNI above), so
       # every node stays NotReady and nothing schedules until Calico is up.
       - name: Install Calico so NetworkPolicy is actually enforced
+        id: prepare_kind
         run: bash .github/scripts/prepare-kind.sh curie-e2e kind-config.yaml
       - name: Load images into the kind cluster
         run: |
@@ -3436,9 +3437,6 @@ jobs:
           kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
           kubectl describe pods -n curie -l app.kubernetes.io/component=runner-sandbox || true
           kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
-      # Delete only this job's namespaced release resources. Do not uninstall or
-      # delete the shared controller namespace: the pinned kind action owns final
-      # disposal of the whole single-use cluster. This still runs after failure.
       - name: Tear down the disposable cluster release
         if: always()
         run: |
@@ -3454,6 +3452,9 @@ jobs:
           name: runtime-assertion-receipts-${{ github.job }}
           path: ${{ runner.temp }}/runtime-assertion-receipts
           if-no-files-found: ignore
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-e2e'
+        run: kind delete cluster --name curie-e2e
 
   # The factory driver owns its kind cluster, registry, and local endpoints.
   # Replay drives the production factory from one labelled fixture issue to
@@ -3902,6 +3903,7 @@ jobs:
       # The cluster has no CNI until this lands (disableDefaultCNI above), so
       # every node stays NotReady and nothing schedules until Calico is up.
       - name: Install Calico so NetworkPolicy is actually enforced
+        id: prepare_kind
         run: bash .github/scripts/prepare-kind.sh curie-e2e kind-config.yaml
       - name: Install YAML parser for the installation identity proof
         run: python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
@@ -4158,7 +4160,7 @@ jobs:
           kubectl --context "$context" get pods -A -o wide || true
           kubectl --context "$context" get events -A --sort-by=.lastTimestamp | tail -50 || true
       - name: Delete the job-owned kind cluster
-        if: always()
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-e2e'
         run: |
           set -euo pipefail
           kind delete cluster --name curie-e2e
@@ -4292,6 +4294,7 @@ jobs:
       # The cluster has no CNI until this lands (disableDefaultCNI above), so
       # every node stays NotReady and nothing schedules until Calico is up.
       - name: Install Calico so NetworkPolicy is actually enforced
+        id: prepare_kind
         run: bash .github/scripts/prepare-kind.sh curie-e2e kind-config.yaml
       - name: Load images into the kind cluster
         run: |
@@ -4398,13 +4401,14 @@ jobs:
           kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
           kubectl describe pods -n curie -l app.kubernetes.io/component=runner-sandbox || true
           kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
-      # Delete only this job's namespaced release resources. Do not uninstall or
-      # delete the shared controller namespace: the pinned kind action owns final
-      # disposal of the whole single-use cluster. This still runs after failure.
       - name: Tear down the disposable cluster release
         if: always()
         run: |
           kubectl delete namespace curie \
+            --ignore-not-found --wait=false 2>/dev/null || true
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-e2e'
+        run: kind delete cluster --name curie-e2e
 
   # APPROVAL RESUME AFTER WORKER AND STORE RESTARTS (#4016). An approval
   # resolved while the resume store (Valkey) and the worker restart must still
@@ -4525,6 +4529,7 @@ jobs:
       # The cluster has no CNI until this lands (disableDefaultCNI above), so
       # every node stays NotReady and nothing schedules until Calico is up.
       - name: Install Calico so NetworkPolicy is actually enforced
+        id: prepare_kind
         run: bash .github/scripts/prepare-kind.sh curie-e2e kind-config.yaml
       - name: Load images into the kind cluster
         run: |
@@ -4627,14 +4632,14 @@ jobs:
           kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
           kubectl logs -n curie -l app.kubernetes.io/component=api --tail=200 || true
           kubectl logs -n curie -l app.kubernetes.io/component=runner-sandbox --all-containers --prefix --tail=200 || true
-      # Delete only this job's namespaced release resources. Do not uninstall or
-      # delete the shared controller namespace: the pinned kind action owns final
-      # disposal of the whole single-use cluster. This still runs after failure.
       - name: Tear down the disposable cluster release
         if: always()
         run: |
           kubectl delete namespace curie \
             --ignore-not-found --wait=false 2>/dev/null || true
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-e2e'
+        run: kind delete cluster --name curie-e2e
 
   # RELEASED CHART UPGRADE REGRESSION (issues #2097 and #2194). This is separate
   # from the fresh install cluster rung because it starts from published charts
@@ -4784,6 +4789,7 @@ jobs:
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Install Calico so NetworkPolicy is enforced
+        id: prepare_kind
         run: bash .github/scripts/prepare-kind.sh curie-upgrade kind-upgrade-config.yaml
       - name: Load candidate images into the kind cluster
         run: |
@@ -5124,6 +5130,9 @@ jobs:
         run: |
           kubectl delete namespace curie curie-negative \
             --ignore-not-found --wait=false 2>/dev/null || true
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade'
+        run: kind delete cluster --name curie-upgrade
 
   # Split from e2e-released-upgrade so the nil unsafe helper negative control
   # runs on its own runner and kind cluster, concurrently with the positive
@@ -5205,6 +5214,7 @@ jobs:
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Install Calico so NetworkPolicy is enforced
+        id: prepare_kind
         run: bash .github/scripts/prepare-kind.sh curie-upgrade-negative kind-upgrade-negative-config.yaml
       - name: Load the candidate worker image into the kind cluster
         run: kind load docker-image curie-worker:upgrade-candidate --name curie-upgrade-negative
@@ -5375,6 +5385,9 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
           kubectl delete namespace curie-profile \
             --ignore-not-found --wait=false 2>/dev/null || true
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-negative'
+        run: kind delete cluster --name curie-upgrade-negative
 
   # The upgrade matrix is sharded (issue #2733) and change-selected with
   # released-upgrade. Unrelated CLI, docs, and UI PRs must not occupy 12 kind
@@ -5517,6 +5530,7 @@ jobs:
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Install Calico so NetworkPolicy is enforced
+        id: prepare_kind
         run: bash .github/scripts/prepare-kind.sh curie-upgrade-matrix kind-upgrade-matrix-config.yaml
       - name: Run the cluster upgrade matrix
         env:
@@ -5552,9 +5566,10 @@ jobs:
           path: .projects/2590-evidence
           if-no-files-found: warn
       - name: Tear down the owned upgrade matrix cluster
-        if: always()
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-matrix'
         run: |
           kubectl delete namespace acme-2590 --ignore-not-found --wait=false 2>/dev/null || true
+          kind delete cluster --name curie-upgrade-matrix
 
   # Needs only `changes`, so an unregistered or untiered runtime assertion
   # fails within minutes instead of after the kind matrix. It is a separate job

@@ -3466,7 +3466,9 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     assert evidence["with"]["name"] == "upgrade-matrix-evidence-${{ matrix.shard }}"
     assert evidence["with"]["path"] == ".projects/2590-evidence"
     teardown = named_steps["Tear down the owned upgrade matrix cluster"]
-    assert teardown["if"] == "always()"
+    assert teardown["if"] == (
+        "always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-matrix'"
+    )
     assert "kind delete cluster --name curie-upgrade-matrix" in teardown["run"]
     assert "kind delete cluster --name curie-upgrade " not in teardown["run"]
 
@@ -3637,13 +3639,20 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     disk_name = "Free disk for the disposable released upgrade cluster"
     for shared in (
         "Install Helm",
-        "Install Calico so NetworkPolicy is enforced",
         "Download and verify the exact public v0.8.2 chart",
         "Write the legacy retained values fixture",
         "Write the managed attester verifier",
         disk_name,
     ):
         assert negative_steps[shared] == named_steps[shared], shared
+    setup_name = "Install Calico so NetworkPolicy is enforced"
+    for owner_steps, cluster in (
+        (named_steps, "curie-upgrade"),
+        (negative_steps, "curie-upgrade-negative"),
+    ):
+        assert owner_steps[setup_name]["run"] == (
+            f"bash .github/scripts/prepare-kind.sh {cluster} kind-{cluster.removeprefix('curie-')}-config.yaml"
+        )
     matrix_disk = next(
         step["run"]
         for step in jobs["e2e-cluster-upgrade-matrix"]["steps"]
@@ -4861,7 +4870,9 @@ def test_approval_resume_job_runs_on_pull_requests_and_gates_e2e_required() -> N
         for step in job["steps"]
         if step.get("name") == "Tear down the disposable cluster release"
     )
-    assert teardown["if"] == "always()"
+    assert teardown["if"] == (
+        "always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-matrix'"
+    )
     assert "kubectl delete namespace curie" in teardown["run"]
     assert "--ignore-not-found" in teardown["run"]
     assert "kind delete cluster" not in teardown["run"]

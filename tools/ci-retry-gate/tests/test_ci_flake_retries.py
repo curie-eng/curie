@@ -150,6 +150,8 @@ def test_kind_setup_has_one_owned_recreate_and_preserves_foreign_clusters(
     tmp_path: Path, controls: dict[str, object], status: int, creates: int, deletes: int
 ) -> None:
     env, state = _setup_commands(tmp_path, **controls)
+    output = tmp_path / "output"
+    env["GITHUB_OUTPUT"] = str(output)
     config = tmp_path / "kind.yaml"
     config.write_text("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n")
     result = subprocess.run(
@@ -157,6 +159,9 @@ def test_kind_setup_has_one_owned_recreate_and_preserves_foreign_clusters(
         env=env, capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == status, result.stdout + result.stderr
+    assert (output.read_text() if output.exists() else "") == (
+        "owned_cluster=test-setup\n" if status == 0 else ""
+    )
     observed = json.loads(state.read_text())
     assert observed["creates"] == creates
     assert sum(call[:3] == ["kind", "delete", "cluster"] for call in observed["calls"]) == deletes

@@ -469,9 +469,7 @@ def _is_failure_class_summary(step: dict[str, Any]) -> bool:
 def _carries_retry(step: dict[str, Any]) -> bool:
     if _is_failure_class_summary(step):
         return False
-    if _continue_on_error(step) and not str(step.get("uses", "")).startswith(
-        "actions/upload-artifact@"
-    ):
+    if _continue_on_error(step):
         return True
     condition = step.get("if")
     if isinstance(condition, str) and OUTCOME_REFERENCE.search(condition):
@@ -657,6 +655,58 @@ def test_failure_class_summaries_are_not_retries() -> None:
     assert _carries_retry(action)
 
 
+DIAGNOSTIC_UPLOADS = frozenset(
+    {
+        ("ci.yaml", "python-pytest", "Upload pytest durations"),
+        ("ci.yaml", "e2e-oidc", "Upload the OIDC evidence"),
+        ("ci.yaml", "factory-admitted-agent", "Upload the admitted agent failure digests"),
+        ("ci.yaml", "e2e-released-upgrade-negative", "Retain safe namespace cleanup evidence"),
+        ("ci.yaml", "e2e-cluster-upgrade-matrix", "Upload upgrade matrix evidence"),
+    }
+)
+
+
+def _is_diagnostic_upload(filename: str, job_id: str, step: dict[str, Any]) -> bool:
+    return (
+        (filename, job_id, _step_name(step)) in DIAGNOSTIC_UPLOADS
+        and str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        and "run" not in step
+        and not _carries_retry({**step, "continue-on-error": False})
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", [None, "workflow", "job", "name", "action", "run", "retry"]
+)
+def test_diagnostic_exception_is_limited_to_the_exact_upload(
+    monkeypatch: pytest.MonkeyPatch, mutation: str | None
+) -> None:
+    filename, job_id = "ci.yaml", "python-pytest"
+    step: dict[str, Any] = {
+        "name": "Upload pytest durations",
+        "uses": "actions/upload-artifact@v7",
+        "continue-on-error": True,
+    }
+    if mutation == "workflow":
+        filename = "other.yaml"
+    elif mutation == "job":
+        job_id = "other-job"
+    elif mutation == "name":
+        step["name"] = "Upload required receipt"
+    elif mutation == "action":
+        step["uses"] = "actions/download-artifact@v8"
+    elif mutation == "run":
+        step["run"] = "cargo test"
+    elif mutation == "retry":
+        step["if"] = "steps.producer.outcome == 'failure'"
+    monkeypatch.setitem(globals(), "_iter_steps", lambda: iter([(filename, job_id, 0, step)]))
+    if mutation is None:
+        test_rule_1_every_retry_carrying_step_is_allowlisted()
+    else:
+        with pytest.raises(AssertionError, match="RETRY_ALLOWLIST"):
+            test_rule_1_every_retry_carrying_step_is_allowlisted()
+
+
 def test_rule_1_every_retry_carrying_step_is_allowlisted() -> None:
     """Closed world: no step anywhere may carry a retry unless it is allowlisted.
 
@@ -666,6 +716,8 @@ def test_rule_1_every_retry_carrying_step_is_allowlisted() -> None:
     """
     unexpected: list[Identity] = []
     for filename, job_id, index, step in _iter_steps():
+        if _is_diagnostic_upload(filename, job_id, step):
+            continue
         if not _carries_retry(step):
             continue
         name = _step_name(step)

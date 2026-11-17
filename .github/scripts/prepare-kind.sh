@@ -41,6 +41,9 @@ ready() {
 for attempt in 1 2; do
   owned=1
   if ready; then
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+      printf 'owned_cluster=%s\n' "$cluster" >> "$GITHUB_OUTPUT"
+    fi
     exit 0
   fi
   kubectl --context "$context" get pods -A -o wide >&2 || true
