@@ -32,9 +32,8 @@ reply under the root. It always shows the shown request: the latest
 implementation request at or after ``first_sequence``, so a steering revision
 or an automatic retry changes the card and never adds a second one. A kickoff
 thread's card is the placeholder. Any other thread owes one ``card`` post, a
-plain line the first edit replaces; it is owed while the shown request is
-live or ended within ``_CARD_LATE`` of the pass, so a thread whose run ended
-before this lane existed gets no card.
+plain line the first edit replaces. It is owed when the shown request was
+live at or after the durable migration cutoff, even across a worker outage.
 
 Each pass re-renders every card whose shown request is live or ended after
 the card's last edit, under a per-thread lease, because a replace edit carries
@@ -90,7 +89,8 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Final
@@ -106,7 +106,7 @@ from channel_protocol.reply import (
 from curie_channel_gateway.reply_errors import InvalidReplyTargetError
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from .factory_slack_card import (
     CardRender,
@@ -180,22 +180,27 @@ _REFUSAL_REASON_SQL = (
     "'installation_changed'"
 )
 assert _REFUSAL_REASON_SQL == ", ".join(repr(reason) for reason in _REFUSAL_REASONS)
-# The root line's fields for an unposted root. Aliases are w, q and n.
-_ROOT_PAYLOAD_SQL = """
+# The WorkItem owns the issue identity; a revision objective contains instructions.
+_ISSUE_URL_SQL = """
+    CASE WHEN w.tracker_kind = 'github'
+         THEN 'https://' || w.tracker_host || '/' || w.repository_path
+              || '/issues/' || w.tracker_issue_id END
+"""
+# The root line's fields for an unposted root. Aliases are w and n.
+_ROOT_PAYLOAD_SQL = f"""
     jsonb_strip_nulls(jsonb_build_object(
         'repository_path', w.repository_path,
         'issue_id', w.tracker_issue_id,
         'display_key', w.tracker_display_key,
         'title', n.subject_title,
-        'ticket_url', NULLIF(split_part(q.objective, '#', 1), '')
+        'ticket_url', {_ISSUE_URL_SQL}
     ))
 """
 # The kinds this lane delivers. Rows of the pre-card kinds stay in the table
 # and neither deliver nor hold a later post back.
 _DELIVERED_KINDS_SQL = "'root', 'card', 'needs_person', 'ready', 'triage'"
 _LIVE_SQL = "'queued', 'waiting', 'running', 'cancellation_requested'"
-# A card post is owed for an ended run only this soon after it ended.
-_CARD_LATE: Final = timedelta(minutes=10)
+_CARD_SEND_TIMEOUT: Final = 30.0
 # The latest implementation request at or after the thread's first sequence,
 # the one the card shows. Alias t is the thread.
 _SHOWN_SQL = """
@@ -468,19 +473,15 @@ class PostgresFactorySlackStore:
         self._backoff_base = backoff_base_seconds
         self._backoff_max = backoff_max_seconds
         self._card_spacing = timedelta(seconds=card_edit_spacing_seconds)
-
-    def _bound(self, thread: str) -> str:
-        """True while ``thread``'s channel holds exactly its one bound identity."""
-
-        return f"""
+        self._bound_thread = f"""
             (
                 SELECT array_agg(CAST(c.adapter AS text))
                   FROM {self._channels} c
-                 WHERE c.agent_id = {thread}.agent_id
+                 WHERE c.agent_id = t.agent_id
                    AND c.kind = 'slack'
-                   AND c.address = {thread}.channel
+                   AND c.address = t.channel
                    AND c.adapter IS NOT NULL
-            ) = ARRAY[{thread}.channel_identity]
+            ) = ARRAY[t.channel_identity]
         """
 
     async def materialize(self) -> None:
@@ -557,7 +558,7 @@ class PostgresFactorySlackStore:
         # kickoff thread needs none.
         live_threads = f"""
             SELECT t.work_item_id, t.first_sequence, t.origin, t.channel_identity,
-                   t.requester_slack_user, t.card_ts, t.agent_id
+                   t.requester_slack_user, t.card_ts, t.agent_id, t.card_upgrade_cutoff
               FROM {self._threads} t
               JOIN {self._agents} a ON a.id = t.agent_id
              WHERE t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL
@@ -586,7 +587,7 @@ class PostgresFactorySlackStore:
               JOIN {self._work_items} w ON w.id = t.work_item_id
               CROSS JOIN LATERAL ({self._shown}) q
              WHERE t.card_ts IS NULL
-               AND (q.terminal_at IS NULL OR q.terminal_at >= now() - CAST(:late AS interval))
+               AND (q.terminal_at IS NULL OR q.terminal_at >= t.card_upgrade_cutoff)
             ON CONFLICT (work_item_id, post_key) DO NOTHING
             """
         )
@@ -617,6 +618,7 @@ class PostgresFactorySlackStore:
                      FROM {self._posts} x
                     WHERE x.work_item_id = t.work_item_id
                       AND x.post_key = 'terminal:' || q.id
+                      AND x.posted_at IS NOT NULL
                )
                AND (
                    q.completion_contract <> 'tracker_result'
@@ -665,6 +667,7 @@ class PostgresFactorySlackStore:
                      FROM {self._posts} x
                     WHERE x.work_item_id = t.work_item_id
                       AND x.kind = 'pull_request'
+                      AND x.posted_at IS NOT NULL
                       AND x.sequence >= q.sequence
                )
             ON CONFLICT (work_item_id, post_key) DO NOTHING
@@ -739,7 +742,7 @@ class PostgresFactorySlackStore:
         async with self._engine.begin() as connection:
             await connection.execute(discover)
             await connection.execute(refresh_roots)
-            await connection.execute(cards, {"late": _CARD_LATE})
+            await connection.execute(cards)
             await connection.execute(needs_person)
             await connection.execute(ready)
             await connection.execute(triages)
@@ -762,7 +765,7 @@ class PostgresFactorySlackStore:
                AND (p.not_before IS NULL OR p.not_before <= now())
                AND (p.kind = 'root' OR t.root_ts IS NOT NULL)
                AND p.kind IN ({_DELIVERED_KINDS_SQL})
-               AND {self._bound("t")}
+               AND {self._bound_thread}
                AND NOT EXISTS (
                    SELECT 1
                      FROM {self._posts} e
@@ -854,15 +857,12 @@ class PostgresFactorySlackStore:
                     {"ref": ref, "work_item_id": work.work_item_id},
                 )
 
-    async def claim_cards(self, limit: int) -> list[FactorySlackCard]:
-        """Lease up to ``limit`` cards that may need an edit.
-
-        A card is a candidate while its shown request is live or ended after
-        the card's last edit. The spacing filter skips a live card edited
-        recently unless its run reached a final state (ended, or its own
-        publication succeeded); ``render_due`` repeats the decision on the
-        render itself.
-        """
+    @asynccontextmanager
+    async def claim_card(
+        self,
+        excluded: Sequence[uuid.UUID],
+    ) -> AsyncIterator[tuple[FactorySlackCard, AsyncConnection] | None]:
+        """Claim one due card and hold its row lock through the send and acknowledgement."""
 
         due = text(
             f"""
@@ -872,6 +872,7 @@ class PostgresFactorySlackStore:
               JOIN {self._agents} a ON a.id = t.agent_id
               CROSS JOIN LATERAL ({self._shown}) q
              WHERE (t.origin = 'kickoff' OR a.factory_slack_channel IS NOT NULL)
+               AND NOT (t.work_item_id = ANY(:excluded))
                AND t.card_ts IS NOT NULL
                AND t.root_ts IS NOT NULL
                AND (t.card_lease_expires_at IS NULL OR t.card_lease_expires_at < now())
@@ -891,48 +892,64 @@ class PostgresFactorySlackStore:
                           AND b.status = 'succeeded'
                    )
                )
-               AND {self._bound("t")}
+               AND {self._bound_thread}
              ORDER BY t.card_edited_at NULLS FIRST, t.work_item_id
-             LIMIT :limit
-             FOR UPDATE OF t SKIP LOCKED
-            """
-        )
-        lease = text(
-            f"""
-            UPDATE {self._threads}
-               SET card_lease_owner = :owner,
-                   card_lease_expires_at = now() + :lease
-             WHERE work_item_id = ANY(:ids)
+             LIMIT 1
+             FOR NO KEY UPDATE OF t SKIP LOCKED
             """
         )
         async with self._engine.begin() as connection:
-            rows = (
-                (await connection.execute(due, {"spacing": self._card_spacing, "limit": limit}))
+            row = (
+                (
+                    await connection.execute(
+                        due, {"spacing": self._card_spacing, "excluded": list(excluded)}
+                    )
+                )
                 .mappings()
-                .all()
+                .first()
             )
-            if not rows:
-                return []
+            if row is None:
+                yield None
+                return
             await connection.execute(
-                lease,
+                text(f"""
+                UPDATE {self._threads}
+                   SET card_lease_owner = :owner,
+                       card_lease_expires_at = clock_timestamp() + :lease
+                 WHERE work_item_id = :id
+            """),
                 {
-                    "ids": [row["work_item_id"] for row in rows],
+                    "id": row["work_item_id"],
                     "owner": self._lease_owner,
                     "lease": timedelta(seconds=self._lease_seconds),
                 },
             )
-        return [
-            FactorySlackCard(
-                work_item_id=uuid.UUID(str(row["work_item_id"])),
-                channel_identity=str(row["channel_identity"]),
-                channel=str(row["channel"]),
-                root_ts=str(row["root_ts"]),
-                card_ts=str(row["card_ts"]),
-                digest=_str(row["card_digest"]),
-                edited_at=row["card_edited_at"],
+            yield (
+                FactorySlackCard(
+                    work_item_id=uuid.UUID(str(row["work_item_id"])),
+                    channel_identity=str(row["channel_identity"]),
+                    channel=str(row["channel"]),
+                    root_ts=str(row["root_ts"]),
+                    card_ts=str(row["card_ts"]),
+                    digest=_str(row["card_digest"]),
+                    edited_at=row["card_edited_at"],
+                ),
+                connection,
             )
-            for row in rows
-        ]
+
+    async def owns_card(self, connection: AsyncConnection, card: FactorySlackCard) -> bool:
+        return (
+            await connection.execute(
+                text(f"""
+            SELECT EXISTS (
+                SELECT 1 FROM {self._threads}
+                 WHERE work_item_id = :id AND card_lease_owner = :owner
+                   AND card_lease_expires_at > clock_timestamp()
+            )
+        """),
+                {"id": card.work_item_id, "owner": self._lease_owner},
+            )
+        ).scalar_one() is True
 
     async def render(self, card: FactorySlackCard) -> tuple[CardRender, datetime] | None:
         """The card's render from current records, and the database time it was read at."""
@@ -950,7 +967,7 @@ class PostgresFactorySlackStore:
                    CASE WHEN q.requester LIKE 'github:%'
                         THEN NULLIF(split_part(q.requester, ':', 3), '') END
                        AS requester_login,
-                   NULLIF(split_part(q.objective, '#', 1), '') AS ticket_url,
+                   {_ISSUE_URL_SQL} AS ticket_url,
                    q.id AS request_id, q.sequence, q.status, q.terminal_cause,
                    COALESCE(q.started_at, q.created_at) AS started_at, q.terminal_at,
                    (
@@ -1014,7 +1031,13 @@ class PostgresFactorySlackStore:
             )
         return _render(row, report_rows), row["now"]
 
-    async def ack_card(self, card: FactorySlackCard, render: CardRender, read_at: datetime) -> None:
+    async def ack_card(
+        self,
+        connection: AsyncConnection,
+        card: FactorySlackCard,
+        render: CardRender,
+        read_at: datetime,
+    ) -> None:
         """Record the edit Slack accepted and release the lease.
 
         The edit time stored is ``read_at``, when its records were read, so a
@@ -1022,34 +1045,34 @@ class PostgresFactorySlackStore:
         final render is owed on the next pass.
         """
 
-        async with self._engine.begin() as connection:
-            updated = (
-                await connection.execute(
-                    text(
-                        f"""
-                        UPDATE {self._threads}
-                           SET card_digest = :digest,
-                               card_edited_at = :read_at,
-                               card_lease_owner = NULL,
-                               card_lease_expires_at = NULL
-                         WHERE work_item_id = :work_item_id
-                           AND card_lease_owner = :owner
-                     RETURNING work_item_id
-                        """
-                    ),
-                    {
-                        "digest": render.digest,
-                        "read_at": read_at,
-                        "work_item_id": card.work_item_id,
-                        "owner": self._lease_owner,
-                    },
-                )
-            ).scalar_one_or_none()
-            if updated is None:
-                raise FactorySlackProgressError("factory Slack card acknowledgement was lost")
+        updated = (
+            await connection.execute(
+                text(
+                    f"""
+                    UPDATE {self._threads}
+                       SET card_digest = :digest,
+                           card_edited_at = :read_at,
+                           card_lease_owner = NULL,
+                           card_lease_expires_at = NULL
+                     WHERE work_item_id = :work_item_id
+                       AND card_lease_owner = :owner
+                 RETURNING work_item_id
+                    """
+                ),
+                {
+                    "digest": render.digest,
+                    "read_at": read_at,
+                    "work_item_id": card.work_item_id,
+                    "owner": self._lease_owner,
+                },
+            )
+        ).scalar_one_or_none()
+        if updated is None:
+            raise FactorySlackProgressError("factory Slack card acknowledgement was lost")
 
     async def release_card(
         self,
+        connection: AsyncConnection,
         card: FactorySlackCard,
         *,
         settled_at: datetime | None = None,
@@ -1063,27 +1086,26 @@ class PostgresFactorySlackStore:
         time a refused edit is tried again.
         """
 
-        async with self._engine.begin() as connection:
-            await connection.execute(
-                text(
-                    f"""
-                    UPDATE {self._threads}
-                       SET card_edited_at = COALESCE(:settled_at, card_edited_at),
-                           card_lease_owner = NULL,
-                           card_lease_expires_at = CASE WHEN CAST(:retry AS boolean)
-                                                        THEN now() + :backoff END
-                     WHERE work_item_id = :work_item_id
-                       AND card_lease_owner = :owner
-                    """
-                ),
-                {
-                    "settled_at": settled_at,
-                    "retry": retry,
-                    "backoff": timedelta(seconds=self._backoff_max / 10),
-                    "work_item_id": card.work_item_id,
-                    "owner": self._lease_owner,
-                },
-            )
+        await connection.execute(
+            text(
+                f"""
+                UPDATE {self._threads}
+                   SET card_edited_at = COALESCE(:settled_at, card_edited_at),
+                       card_lease_owner = NULL,
+                       card_lease_expires_at = CASE WHEN CAST(:retry AS boolean)
+                                                    THEN now() + :backoff END
+                 WHERE work_item_id = :work_item_id
+                   AND card_lease_owner = :owner
+                """
+            ),
+            {
+                "settled_at": settled_at,
+                "retry": retry,
+                "backoff": timedelta(seconds=self._backoff_max / 10),
+                "work_item_id": card.work_item_id,
+                "owner": self._lease_owner,
+            },
+        )
 
     def render_due(self, card: FactorySlackCard, render: CardRender, now: datetime) -> bool:
         """True when ``render`` should be sent now."""
@@ -1371,23 +1393,28 @@ class FactorySlackProgressLoop:
         logger.info("factory Slack refusal %s posted", work.notice_id)
         return True
 
-    async def _edit_card(self, card: FactorySlackCard) -> bool:
+    async def _edit_card(self, card: FactorySlackCard, connection: AsyncConnection) -> bool:
         """Render one leased card and send it when due; True when an edit went out."""
 
         try:
             rendered = await self._store.render(card)
         except BaseException:
-            await self._store.release_card(card)
+            await self._store.release_card(connection, card)
             raise
         if rendered is None:
-            await self._store.release_card(card)
+            await self._store.release_card(connection, card)
             return False
         render, now = rendered
         if not self._store.render_due(card, render, now):
             # An ended run whose card already shows its last render is settled.
             await self._store.release_card(
-                card, settled_at=now if render.final and render.digest == card.digest else None
+                connection,
+                card,
+                settled_at=now if render.final and render.digest == card.digest else None,
             )
+            return False
+        if not await self._store.owns_card(connection, card):
+            await self._store.release_card(connection, card)
             return False
         try:
             await self._replies.emit(
@@ -1407,17 +1434,17 @@ class FactorySlackProgressLoop:
                 best_effort_unreachable=False,
             )
         except asyncio.CancelledError:
-            await self._store.release_card(card)
+            await self._store.release_card(connection, card)
             raise
         except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
-            await self._store.release_card(card, retry=True)
+            await self._store.release_card(connection, card, retry=True)
             logger.warning(
                 "factory Slack card for work item %s refused (%s); retrying after backoff",
                 card.work_item_id,
                 type(exc).__name__,
             )
             return False
-        await self._store.ack_card(card, render, now)
+        await self._store.ack_card(connection, card, render, now)
         logger.info(
             "factory Slack card for work item %s edited (%s)", card.work_item_id, render.state
         )
@@ -1426,16 +1453,17 @@ class FactorySlackProgressLoop:
     async def edit_cards(self) -> int:
         """Send every due card edit, up to ``batch_limit``; returns edits sent."""
 
-        cards = await self._store.claim_cards(self._batch_limit)
+        seen: list[uuid.UUID] = []
         edited = 0
-        for index, card in enumerate(cards):
-            try:
-                if await self._edit_card(card):
-                    edited += 1
-            except BaseException:
-                for leased in cards[index + 1 :]:
-                    await self._store.release_card(leased)
-                raise
+        for _ in range(self._batch_limit):
+            async with self._store.claim_card(seen) as leased:
+                if leased is None:
+                    break
+                card, connection = leased
+                seen.append(card.work_item_id)
+                async with asyncio.timeout(_CARD_SEND_TIMEOUT):
+                    if await self._edit_card(card, connection):
+                        edited += 1
         return edited
 
     async def deliver_once(self) -> bool:

@@ -3207,6 +3207,7 @@ def _judge_progress(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
         and bool(card_ts)
         and replies[0].get("ts") == card_ts
         and replies[0].get("user") == bot,
+        "successful_pull_request": pull_request and bool(url_text),
         "card_finished": card_final,
         "one_ready_reply": notify_ok,
         "nothing_else_from_the_bot": card is not None and len(bot_replies) == 2,

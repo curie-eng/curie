@@ -2326,6 +2326,9 @@ class FactorySlackThread(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    card_upgrade_cutoff: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("'now'::timestamptz")
+    )
     # The progress card (#5715). A kickoff stores the dispatcher's placeholder
     # ts as ``card_ts`` at admission; any other thread stores its card post's.
     card_ts: Mapped[str | None] = mapped_column(Text, default=None)

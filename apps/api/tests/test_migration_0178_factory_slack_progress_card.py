@@ -68,9 +68,9 @@ def _thread(issue: int) -> uuid.UUID:
     sql_rows(
         "INSERT INTO curie.factory_slack_threads "
         "(work_item_id, agent_id, channel_identity, channel, root_ts, first_sequence, "
-        "origin) VALUES (:id, :agent, 'acme-factory', 'C0EXAMPLE1', '1800000000.000001', "
+        "origin) VALUES (:id, :agent, 'acme-factory', 'C0EXAMPLE1', :root, "
         "1, 'kickoff')",
-        {"id": item_id, "agent": agent_id},
+        {"id": item_id, "agent": agent_id, "root": f"1800000000.{issue:06d}"},
     )
     return item_id
 
@@ -105,8 +105,40 @@ def test_upgrade_adds_nullable_card_columns_and_leaves_rows_alone(
     assert COLUMNS <= column_names("factory_slack_threads")
     (thread,) = sql_dicts("SELECT * FROM curie.factory_slack_threads")
     assert {name: thread[name] for name in COLUMNS} == dict.fromkeys(COLUMNS)
-    assert {name: value for name, value in thread.items() if name not in COLUMNS} == threads[0]
+    assert {
+        name: value
+        for name, value in thread.items()
+        if name not in COLUMNS | {"card_upgrade_cutoff"}
+    } == threads[0]
     assert sql_dicts("SELECT * FROM curie.factory_slack_posts ORDER BY id") == posts
+
+
+def test_progress_card_migration_freezes_the_upgrade_cutoff_for_later_threads(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    isolated_migration_db.at(BELOW)
+    old = _thread(11)
+    (before,) = sql_rows("SELECT clock_timestamp()")
+    command.upgrade(alembic_config(), REVISION)
+    (after,) = sql_rows("SELECT clock_timestamp()")
+    (cutoff,) = sql_rows(
+        "SELECT card_upgrade_cutoff FROM curie.factory_slack_threads WHERE work_item_id = :id",
+        {"id": old},
+    )
+    assert before[0] <= cutoff[0] <= after[0]
+    new = _thread(12)
+    sql_rows(
+        "UPDATE curie.factory_slack_threads SET created_at = now() + interval '1 day' "
+        "WHERE work_item_id = :id",
+        {"id": new},
+    )
+    (later,) = sql_rows(
+        "SELECT card_upgrade_cutoff, created_at FROM curie.factory_slack_threads "
+        "WHERE work_item_id = :id",
+        {"id": new},
+    )
+    assert later[0] == cutoff[0]
+    assert later[1] > later[0]
 
 
 def test_the_kind_check_accepts_the_card_kinds_and_refuses_an_unknown_one(
@@ -153,6 +185,7 @@ def test_downgrade_deletes_only_card_kind_posts_and_drops_the_columns(
 
     assert stamped_revision() == BELOW
     assert not COLUMNS & column_names("factory_slack_threads")
+    assert "card_upgrade_cutoff" not in column_names("factory_slack_threads")
     assert sql_dicts("SELECT * FROM curie.factory_slack_posts ORDER BY id") == kept
     with pytest.raises(IntegrityError, match="factory_slack_posts_kind_ck"):
         _post(item_id, "ready")

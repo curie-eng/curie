@@ -40,18 +40,23 @@ regression guard for discovery and clearing.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import uuid
 from typing import Any
 
+import pytest
 from curie_api.config import get_settings
 from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 from curie_internal.factory_cause import cause_text
 from curie_worker.factory_slack_progress import (
+    FactorySlackProgressError,
     FactorySlackProgressLoop,
     PostgresFactorySlackStore,
     render_refusal,
 )
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from apps.api.tests.conftest import _disposable_db as _disposable_db
@@ -542,8 +547,7 @@ def test_label_enrollment_inactive_renders_the_disconnected_plan_sentence() -> N
         }
     )
     assert text == (
-        f"Refused: acme/widgets #17 · {sentence}\n"
-        "https://github.com/acme/widgets/issues/17"
+        f"Refused: acme/widgets #17 · {sentence}\nhttps://github.com/acme/widgets/issues/17"
     )
     missing = render_refusal(
         {
@@ -671,3 +675,177 @@ def test_progress_card_restarted_worker_resends_no_notify_card_post_or_unchanged
     assert len(_replies(stack, root_ts, NEEDS_YOU)) == 1
     assert [post["kind"] for post in _posts(work_item_id)] == ["card", "needs_person"]
     assert all(post["posted_at"] is not None for post in _posts(work_item_id))
+
+
+async def _edit_cards_as(stack: Stack, owner: str) -> int:
+    engine = create_async_engine(get_settings().database_url)
+    try:
+        loop = FactorySlackProgressLoop(
+            store=PostgresFactorySlackStore(
+                engine, schema=get_settings().db_schema, lease_owner=owner
+            ),
+            replies=SlackReplyAdapter(
+                DEFAULT_TOKEN,
+                identity_tokens={stack.identity: stack.factory_token},
+                base_url=stack.slack.base_url,
+            ),
+        )
+        return await loop.edit_cards()
+    finally:
+        await engine.dispose()
+
+
+def test_progress_card_delayed_send_does_not_lease_the_rest_of_the_batch(stack: Stack) -> None:
+    _number, first_request, first_item, _epoch, _root = _kickoff_run(stack)
+    _number, second_request, second_item, second_epoch, _root = _kickoff_run(stack)
+    stack.drain()
+    stack.report(first_request, "plan", "First card changed")
+    stack.report(second_request, "plan", "Second card changed")
+    _age_card(first_item)
+    _age_card(second_item)
+    _rows(
+        "UPDATE curie.factory_slack_threads SET card_edited_at = now() - interval '2 minutes' "
+        "WHERE work_item_id = :id",
+        {"id": first_item},
+    )
+    ts = _card_ts(first_item)
+    stack.slack.hold_next(lambda method, params: method == "chat.update" and params.get("ts") == ts)
+    first = stack.client.portal.start_task_soon(_edit_cards_as, stack, "first")
+    try:
+        assert stack.slack.hold_entered.wait(10), "first worker never sent the card edit"
+        stack.finish(second_request, second_epoch)
+        assert stack.client.portal.call(_edit_cards_as, stack, "peer") == 1
+        assert "Factory run: needs a person" in _last_card(stack, second_item)
+    finally:
+        stack.slack.hold_release.set()
+        first.result(timeout=10)
+
+
+async def _expire_card_lease(work_item_id: uuid.UUID) -> None:
+    engine = create_async_engine(get_settings().database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text("SET LOCAL statement_timeout = '100ms'"))
+            await connection.execute(
+                text(
+                    "UPDATE curie.factory_slack_threads SET card_lease_expires_at = now() "
+                    "- interval '1 second' WHERE work_item_id = :id"
+                ),
+                {"id": work_item_id},
+            )
+    except DBAPIError as exc:
+        assert getattr(exc.orig, "sqlstate", None) == "57014"
+    finally:
+        await engine.dispose()
+
+
+def test_progress_card_lost_owner_sends_nothing_and_the_peer_can_finish(stack: Stack) -> None:
+    _number, request_id, item, _epoch, _root = _kickoff_run(stack)
+    stack.drain()
+    stack.report(request_id, "plan", "Only the owner may send this edit")
+    _age_card(item)
+    since = len(stack.slack.calls)
+    _rows(
+        "CREATE FUNCTION curie.change_card_owner() RETURNS trigger LANGUAGE plpgsql AS $$ "
+        "BEGIN IF NEW.card_lease_owner = 'first' THEN NEW.card_lease_owner = 'peer'; "
+        "END IF; RETURN NEW; END $$"
+    )
+    _rows(
+        "CREATE TRIGGER change_card_owner BEFORE UPDATE ON curie.factory_slack_threads "
+        "FOR EACH ROW EXECUTE FUNCTION curie.change_card_owner()"
+    )
+    try:
+        with contextlib.suppress(FactorySlackProgressError):
+            stack.client.portal.call(_edit_cards_as, stack, "first")
+    finally:
+        _rows("DROP TRIGGER change_card_owner ON curie.factory_slack_threads")
+        _rows("DROP FUNCTION curie.change_card_owner()")
+    assert _updates_since(stack, since) == []
+    _rows(
+        "UPDATE curie.factory_slack_threads SET card_lease_owner = NULL, "
+        "card_lease_expires_at = NULL WHERE work_item_id = :id",
+        {"id": item},
+    )
+    assert stack.client.portal.call(_edit_cards_as, stack, "peer") == 1
+    assert "Only the owner may send this edit" in _last_card(stack, item)
+
+
+def test_progress_card_delayed_send_cannot_overwrite_a_peers_terminal_card(stack: Stack) -> None:
+    _number, request_id, item, epoch, _root = _kickoff_run(stack)
+    stack.drain()
+    stack.report(request_id, "plan", "A live update")
+    _age_card(item)
+    ts = _card_ts(item)
+    stack.slack.hold_next(lambda method, params: method == "chat.update" and params.get("ts") == ts)
+    first = stack.client.portal.start_task_soon(_edit_cards_as, stack, "first")
+    try:
+        assert stack.slack.hold_entered.wait(10)
+        stack.finish(request_id, epoch)
+        stack.client.portal.call(_expire_card_lease, item)
+        stack.client.portal.call(_edit_cards_as, stack, "peer")
+    finally:
+        stack.slack.hold_release.set()
+        with contextlib.suppress(FactorySlackProgressError):
+            first.result(timeout=10)
+    stack.client.portal.call(_edit_cards_as, stack, "peer")
+    terminal_seen = False
+    for edit in _card_edits(stack, item):
+        if "Factory run: needs a person" in edit.haystack:
+            terminal_seen = True
+        elif terminal_seen:
+            raise AssertionError("a stale live edit overwrote the terminal card")
+    assert terminal_seen
+
+
+def test_progress_card_rejected_edit_keeps_the_render_owed_until_delivery(stack: Stack) -> None:
+    _number, request_id, item, _epoch, _root = _kickoff_run(stack)
+    stack.report(request_id, "plan", "The edit must survive rejection")
+    stack.slack.fail_next("chat.update", token=stack.factory_token)
+    stack.slack.fail_next("chat.update", token=stack.factory_token)
+    stack.drain()
+    (state,) = _rows(
+        "SELECT card_digest FROM curie.factory_slack_threads WHERE work_item_id = :id", {"id": item}
+    )
+    assert state["card_digest"] is None
+    _rows(
+        "UPDATE curie.factory_slack_threads SET card_lease_expires_at = NULL "
+        "WHERE work_item_id = :id",
+        {"id": item},
+    )
+    stack.drain(fresh=True)
+    assert "The edit must survive rejection" in _last_card(stack, item)
+    (state,) = _rows(
+        "SELECT card_digest FROM curie.factory_slack_threads WHERE work_item_id = :id", {"id": item}
+    )
+    assert state["card_digest"] is not None
+
+
+def test_progress_card_lost_ack_replays_the_edit_without_another_card_post(stack: Stack) -> None:
+    _number, request_id, item, _epoch, root = _kickoff_run(stack)
+    stack.report(request_id, "plan", "The acknowledged content must survive")
+    _rows(
+        "CREATE FUNCTION curie.reject_card_ack() RETURNS trigger LANGUAGE plpgsql AS $$ "
+        "BEGIN IF NEW.card_digest IS NOT NULL THEN "
+        "RAISE EXCEPTION 'card acknowledgement unavailable'; END IF; RETURN NEW; END $$"
+    )
+    _rows(
+        "CREATE TRIGGER reject_card_ack BEFORE UPDATE ON curie.factory_slack_threads "
+        "FOR EACH ROW EXECUTE FUNCTION curie.reject_card_ack()"
+    )
+    try:
+        with pytest.raises(DBAPIError, match="card acknowledgement unavailable"):
+            stack.drain()
+        (state,) = _rows(
+            "SELECT card_digest FROM curie.factory_slack_threads WHERE work_item_id = :id",
+            {"id": item},
+        )
+        assert state["card_digest"] is None
+        assert len(_card_edits(stack, item)) == 1
+    finally:
+        _rows("DROP TRIGGER reject_card_ack ON curie.factory_slack_threads")
+        _rows("DROP FUNCTION curie.reject_card_ack()")
+    stack.drain(fresh=True)
+    edits = _card_edits(stack, item)
+    assert len(edits) == 2
+    assert edits[0].params["blocks"] == edits[1].params["blocks"]
+    assert len(_texts(stack, root)) == 1

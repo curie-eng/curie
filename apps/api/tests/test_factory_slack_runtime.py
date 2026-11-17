@@ -6152,10 +6152,13 @@ def test_label_enrollment_inactive_posts_one_channel_refusal(stack: Stack) -> No
     assert refused[0].params["client_msg_id"] == refusal_delivery_id(notice_id)
     assert not refused[0].params.get("thread_ts")
     assert refused[0].params["channel"] == CHANNEL
-    assert _rows(
-        "SELECT tracker_issue_id FROM curie.work_items WHERE tracker_issue_id = :issue",
-        {"issue": str(number)},
-    ) == []
+    assert (
+        _rows(
+            "SELECT tracker_issue_id FROM curie.work_items WHERE tracker_issue_id = :issue",
+            {"issue": str(number)},
+        )
+        == []
+    )
     assert _rows("SELECT count(*) AS n FROM curie.factory_slack_refusal_posts") == [{"n": 1}]
     stack.drain(fresh=True)
     assert len([call for call in _chat(stack) if call.text.startswith("Refused:")]) == 1
@@ -6337,15 +6340,20 @@ def test_progress_card_finished_shows_the_pull_request_and_replies_ready_once(
     assert _post_kinds(work_item_id) == ["root", "card", "ready"]
 
 
+@pytest.mark.parametrize("published", [False, True])
+@pytest.mark.parametrize("delivered", [False, True])
 def test_progress_card_leftover_pre_card_rows_never_block_the_card_or_a_notify_reply(
     stack: Stack,
+    published: bool,
+    delivered: bool,
 ) -> None:
     """AC5: unposted phase, pull request and terminal rows from before the card.
 
     The rows are fixture state in the shape the earlier lane wrote, ordered
     ahead of every post this lane owes. The card post, its edits and the ready
     reply still deliver, and the leftover rows stay unposted and unsent. Their
-    keys name no request of this run, so they announce nothing it owes.
+    keys and sequences belong to this request. Only delivered legacy rows
+    count as announcements and suppress the replacement notification.
     """
 
     number = next(_ISSUES)
@@ -6354,15 +6362,22 @@ def test_progress_card_leftover_pre_card_rows_never_block_the_card_or_a_notify_r
     root_ts = _kickoff_thread(stack, work_item_id, request_id)
     leftovers = {
         "phase:legacy": ("phase", {"phase": "implement", "note": "leftover phase line"}),
-        "pull_request:legacy": ("pull_request", {"url": "https://example.invalid/leftover"}),
-        f"terminal:{uuid.uuid4()}": ("terminal", {"status": "failed", "cause": "runner_failed"}),
+        f"pull_request:{request_id}": ("pull_request", {"url": "https://example.com/leftover"}),
+        f"terminal:{request_id}": ("terminal", {"status": "failed", "cause": "runner_failed"}),
     }
     for key, (kind, payload) in leftovers.items():
         _rows(
             "INSERT INTO curie.factory_slack_posts "
-            "(work_item_id, post_key, kind, sequence, rank, ordinal, payload) "
-            "VALUES (:item, :key, :kind, 0, 0, 0, CAST(:payload AS jsonb))",
-            {"item": work_item_id, "key": key, "kind": kind, "payload": json.dumps(payload)},
+            "(work_item_id, post_key, kind, sequence, rank, ordinal, payload, posted_at) "
+            "VALUES (:item, :key, :kind, 1, 0, 0, CAST(:payload AS jsonb), "
+            "CASE WHEN CAST(:delivered AS boolean) THEN now() END)",
+            {
+                "item": work_item_id,
+                "key": key,
+                "kind": kind,
+                "payload": json.dumps(payload),
+                "delivered": delivered,
+            },
         )
     stack.report(request_id, "plan", "Planned past the old rows")
     stack.drain()
@@ -6372,13 +6387,17 @@ def test_progress_card_leftover_pre_card_rows_never_block_the_card_or_a_notify_r
     assert "Planned past the old rows" in _last_card(stack, work_item_id)
 
     pr = next(_PULLS)
-    stack.own_pull_request(work_item_id, pr)
-    stack.finish(request_id, epoch, published=True)
+    if published:
+        stack.own_pull_request(work_item_id, pr)
+    stack.finish(request_id, epoch, published=published)
     stack.drain()
 
     pr_url = f"https://github.com/{REPO}/pull/{pr}"
-    assert _replies(stack, root_ts, READY) == [f"{READY}{pr_url}"]
-    assert "Factory run: finished" in _last_card(stack, work_item_id)
+    prefix = READY if published else NEEDS_YOU
+    expected = f"{READY}{pr_url}" if published else f"{NEEDS_YOU}{cause_text('runner_failed')}"
+    assert _replies(stack, root_ts, prefix) == ([] if delivered else [expected])
+    state = "finished" if published else "needs a person"
+    assert f"Factory run: {state}" in _last_card(stack, work_item_id)
     left = _rows(
         "SELECT post_key, posted_at, attempts, failed_at FROM curie.factory_slack_posts "
         "WHERE work_item_id = :id AND kind IN ('phase', 'pull_request', 'terminal')",
@@ -6386,11 +6405,78 @@ def test_progress_card_leftover_pre_card_rows_never_block_the_card_or_a_notify_r
     )
     assert {row["post_key"] for row in left} == set(leftovers)
     assert all(
-        row["posted_at"] is None and row["attempts"] == 0 and row["failed_at"] is None
+        (row["posted_at"] is not None) == delivered
+        and row["attempts"] == 0
+        and row["failed_at"] is None
         for row in left
     ), left
     for call in stack.slack.calls:
         assert "leftover" not in call.haystack
+
+
+@pytest.mark.parametrize(
+    ("ended_seconds_ago", "upgrade_seconds_ago", "eligible"), [(1, 0, False), (900, 1800, True)]
+)
+def test_progress_card_upgrade_cutoff_survives_a_worker_outage(
+    stack: Stack,
+    ended_seconds_ago: int,
+    upgrade_seconds_ago: int,
+    eligible: bool,
+) -> None:
+    number = next(_ISSUES)
+    request_id, item = stack.admit(number)
+    epoch = stack.start(request_id)
+    _kickoff_thread(stack, item, request_id)
+    stack.finish(request_id, epoch)
+    _rows(
+        "UPDATE curie.execution_requests SET "
+        "terminal_at = now() - make_interval(secs => :age) WHERE id = :id",
+        {"id": request_id, "age": ended_seconds_ago},
+    )
+    _rows(
+        "UPDATE curie.factory_slack_threads SET card_upgrade_cutoff = "
+        "now() - make_interval(secs => :age) WHERE work_item_id = :id",
+        {"id": item, "age": upgrade_seconds_ago},
+    )
+    stack.drain(fresh=True)
+    if eligible:
+        assert _card_ts(item) is not None
+        assert "Factory run: needs a person" in _last_card(stack, item)
+    else:
+        assert _card_ts(item) is None
+        assert "card" not in _post_kinds(item)
+
+
+def test_progress_card_steering_revision_keeps_the_work_items_issue_link(
+    steering: SteeringStack,
+) -> None:
+    stack = steering
+    writer = stack.person()
+    run = stack.open_steered_run()
+    stack.finish(run.request_id, run.epoch, published=True)
+    stack.drain()
+    admitted = stack.steer(writer.slack_user, "Please revise the helper.", thread_ts=run.root_ts)
+    _admitted(admitted)
+    (revision,) = admitted.new_requests
+    assert run.pr_url in revision["objective"]
+    assert "Their full reply follows as JSON" in revision["objective"]
+    epoch = stack.start(revision["id"])
+    _age_card(run.work_item_id)
+    stack.drain()
+    issue_url = f"https://github.com/{REPO}/issues/{run.number}"
+    assert f"<{issue_url}|#{run.number}" in _last_card(stack, run.work_item_id)
+
+    stack.finish(revision["id"], epoch)
+    stack.drain()
+    edit = _card_edits(stack, run.work_item_id)[-1]
+    blocks = edit.params["blocks"]
+    if isinstance(blocks, str):
+        blocks = json.loads(blocks)
+    buttons = [
+        element for block in blocks if block["type"] == "actions" for element in block["elements"]
+    ]
+    assert [button["url"] for button in buttons] == [issue_url]
+    assert "Their full reply" not in edit.haystack
 
 
 def _link_requester_to_slack(stack: Stack, work_item_id: uuid.UUID, slack_user: str) -> None:

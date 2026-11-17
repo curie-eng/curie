@@ -4159,6 +4159,7 @@ def test_progress_card_finished_thread_passes_every_check(tmp_path: Path) -> Non
                 "thread_is_kickoff_root",
                 "card_is_placeholder",
                 "card_is_first_reply",
+                "successful_pull_request",
                 "card_finished",
                 "one_ready_reply",
                 "nothing_else_from_the_bot",
@@ -4308,13 +4309,16 @@ def test_progress_card_failed_run_needs_a_person_and_one_notify_reply(tmp_path: 
         ]
         notify["text"] = f"<@{SENDER_USER}> this run needs you: The plan failed review."
 
-    assert _progress_judged(tmp_path, failed_run) == []
+    assert _progress_judged(tmp_path, failed_run) == ["successful_pull_request"]
 
     def wrong_notify(observed: dict[str, Any]) -> None:
         failed_run(observed)
         observed["thread_replies"][1]["text"] = f"<@{SENDER_USER}> your pull request is ready"
 
-    assert _progress_judged(tmp_path / "again", wrong_notify) == ["one_ready_reply"]
+    assert _progress_judged(tmp_path / "again", wrong_notify) == [
+        "successful_pull_request",
+        "one_ready_reply",
+    ]
 
 
 def test_progress_card_thread_dump_is_anonymized_and_printed_by_the_judge(tmp_path: Path) -> None:

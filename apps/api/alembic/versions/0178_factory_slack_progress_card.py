@@ -12,6 +12,8 @@
    at a time, because replace edits carry no revision and land last write wins.
 4. ``requester_slack_user``: the Slack user id that sent a kickoff mention,
    mentioned by the needs a person and ready replies.
+5. ``card_upgrade_cutoff``: the migration timestamp, frozen as the default
+   for both existing and future threads. Runs that ended before it owe no card.
 
 ``factory_slack_posts_kind_ck`` also accepts ``card`` (the card's first post
 when no placeholder exists), ``needs_person`` and ``ready`` (the two notify
@@ -54,6 +56,18 @@ _COLUMNS = (
 def upgrade() -> None:
     for name, type_ in _COLUMNS:
         op.add_column(THREADS, sa.Column(name, type_, nullable=True), schema=S)
+    # PostgreSQL resolves this timestamp literal once when the DDL is parsed,
+    # preserving the upgrade cutoff for existing threads and later inserts.
+    op.add_column(
+        THREADS,
+        sa.Column(
+            "card_upgrade_cutoff",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("'now'::timestamptz"),
+        ),
+        schema=S,
+    )
     op.drop_constraint(KIND_CK, POSTS, schema=S)
     op.create_check_constraint(KIND_CK, POSTS, f"kind IN ({_KINDS})", schema=S)
 
@@ -62,5 +76,6 @@ def downgrade() -> None:
     op.execute(f"DELETE FROM {S}.{POSTS} WHERE kind IN ('card', 'needs_person', 'ready')")
     op.drop_constraint(KIND_CK, POSTS, schema=S)
     op.create_check_constraint(KIND_CK, POSTS, f"kind IN ({_KINDS_0167})", schema=S)
+    op.drop_column(THREADS, "card_upgrade_cutoff", schema=S)
     for name, _type in reversed(_COLUMNS):
         op.drop_column(THREADS, name, schema=S)

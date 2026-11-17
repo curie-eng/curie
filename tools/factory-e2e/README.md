@@ -1430,8 +1430,9 @@ The judge has eight criteria, each computed from recorded observations only.
    marked done, and a `View pull request #N` button whose url is the observed
    pull request; exactly one other bot reply exists, and its text is
    `<@SENDER> your pull request is ready for review: <url>` with a delivered
-   `ready` outbox row. With no pull request the card shows a terminal state
-   and the one other reply is the `this run needs you:` notify. No bot message
+   `ready` outbox row. A failed run can show a terminal card and a
+   `this run needs you:` notify, but it fails the successful pull request
+   check and cannot satisfy this acceptance criterion. No bot message
    contains `Phase `, `Outcome: admitted`, `Run completed`, `PR open:` or a
    JSON object, and every outbox row was delivered into the thread. The
    anonymized thread dump (user ids, ts values, team ids, URLs and repository

@@ -3127,7 +3127,7 @@ The card's message text is the same content without the buttons. A kickoff's car
 
 Delivery is at least once and ordered per WorkItem: the root first, then the card, then each reply only after every earlier owed one. A rejected send, including one for an identity whose token this worker lacks, stays owed and retries with backoff; only an invalid target fails permanently. A refused card edit is retried on a later pass. A worker that stops mid-send posts that message again after a restart, and a worker restarted after a long outage posts everything owed since; an edit in flight is sent again with the same content.
 
-Upgrading to a release with the card: a thread whose run is live at upgrade time gets its card as its next reply, since it cannot be the first. A thread whose latest run ended more than ten minutes before the upgrade gets no card. Phase, PR open and run outcome lines left unposted by an older release are never posted and never hold back the card or a reply. The worker no longer reads a phase lines setting.
+Upgrading to a release with the card: a thread whose run is live at upgrade time gets its card as its next reply, since it cannot be the first. Threads that ended before the upgrade get no card. The migration records a durable cutoff, so a run live at upgrade time still gets its card after a worker outage. Phase, PR open and run outcome lines left unposted by an older release are never posted and never hold back the card or a reply. The worker no longer reads a phase lines setting.
 
 ### Factory Slack steering
 
