@@ -19,8 +19,9 @@
 //! hosted Deployment is waited on until Ready or a terminal pod reason, bounded
 //! by [`CONNECTOR_ROLLOUT_DEADLINE`]. A CreateContainerConfigError whose message
 //! is the kubelet secret or configmap cache sync timeout stays in progress until
-//! that same deadline. A failed wait is nonzero and does not roll the agent or
-//! version back.
+//! that same deadline. An empty status message stays in progress only when every
+//! failure event is that timeout. A failed wait is nonzero and does not roll the
+//! agent or version back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -407,14 +408,41 @@ fn config_error_is_cache_sync_timeout(message: &str) -> bool {
     cache && message.contains("timed out waiting for the condition")
 }
 
-/// Events excuse an empty-message CreateContainerConfigError only when they
-/// show the cache sync timeout and not a missing object or key.
-fn events_excuse_config_error(events: &str) -> bool {
-    if !config_error_is_cache_sync_timeout(events) {
-        return false;
+/// Message on a Failed or CreateContainerConfigError event.
+/// [`project_pod_events`] writes `Type Reason: message`.
+fn failure_event_message(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let (head, message) = line.split_once(": ")?;
+    if message.is_empty() {
+        return None;
     }
-    let lower = events.to_ascii_lowercase();
-    !(lower.contains("not found") || lower.contains("find key"))
+    let reason = head
+        .rsplit_once(' ')
+        .map(|(_, reason)| reason)
+        .unwrap_or(head);
+    if reason == "Failed" || reason == "CreateContainerConfigError" {
+        Some(message)
+    } else {
+        None
+    }
+}
+
+/// Events excuse an empty-message CreateContainerConfigError only when every
+/// failure event is the cache sync timeout. Any other failure, including a
+/// missing secret, configmap, or key beside an older timeout, stays terminal.
+fn events_excuse_config_error(events: &str) -> bool {
+    let mut saw_timeout = false;
+    for line in events.lines() {
+        let Some(message) = failure_event_message(line) else {
+            continue;
+        };
+        if config_error_is_cache_sync_timeout(message) {
+            saw_timeout = true;
+        } else {
+            return false;
+        }
+    }
+    saw_timeout
 }
 
 /// Keep a CreateContainerConfigError in progress when its cause is the cache
@@ -1733,6 +1761,48 @@ mod tests {
             observe_rollout(&deploy_status(1, 1, 1), &[], None),
             RolloutObservation::Ready
         );
+    }
+
+    #[test]
+    fn connector_rollout_mixed_events_surface_permanent_failure() {
+        let scheduled = "Normal Scheduled: Successfully assigned curie/mcp-other-abc to node";
+        let timeout_only = format!("{scheduled}\nWarning Failed: {SECRET_CACHE_SYNC_TIMEOUT}");
+        let failed = RolloutObservation::Failed {
+            reason: "CreateContainerConfigError",
+            pod: Some("mcp-other-abc".into()),
+        };
+        assert_eq!(
+            settle_config_error(failed.clone(), "", Some(&timeout_only)),
+            RolloutObservation::Pending
+        );
+        for permanent in [
+            "secret \"curie-other\" not found",
+            "configmap \"curie-other\" not found",
+            "couldn't find key TOKEN in Secret curie/curie-other",
+            "container has runAsNonRoot and image will run as root",
+        ] {
+            let events = format!(
+                "{scheduled}\nWarning Failed: {SECRET_CACHE_SYNC_TIMEOUT}\nWarning Failed: {permanent}"
+            );
+            assert_eq!(
+                settle_config_error(failed.clone(), "", Some(&events)),
+                failed,
+                "{permanent}"
+            );
+            let err = rollout_failure(
+                "other",
+                "curie",
+                "curie-mcp-other",
+                "CreateContainerConfigError",
+                None,
+                Some(&events),
+            );
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(permanent),
+                "permanent diagnostic missing from {text}"
+            );
+        }
     }
 
     #[test]
