@@ -1,7 +1,7 @@
 # Per-Dockerfile ignore (BuildKit honors <dockerfile>.dockerignore over the
 # context-root .dockerignore). The UI image builds from the REPO ROOT to reach
-# the shared wording vector, so this trims the root context to what the Vite
-# build needs -- the UI sources + lockfile and that one vector stay; everything
+# the shared vectors, so this trims the root context to what the Vite
+# build needs -- the UI sources + lockfile and those vectors stay; everything
 # else (the Python trees, the Rust CLI, the runner, docs, other packages,
 # installed deps and build output) is dropped.
 **/node_modules
@@ -29,6 +29,7 @@ tests/*
 !tests/vectors
 tests/vectors/*
 !tests/vectors/user-action-wording.json
+!tests/vectors/personal-enrollment-token.json
 packages
 *.md
 **/*.md
