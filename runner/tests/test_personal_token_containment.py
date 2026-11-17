@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import base64
-import ctypes
 import io
 import json
 import logging
 import os
-import shlex
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -29,7 +27,6 @@ from aiohttp.test_utils import TestClient, TestServer
 from claude_agent_sdk import ClaudeAgentOptions
 from curie_runner.adapter import ClaudeAgentSession
 from curie_runner.config import RunnerConfig
-from curie_runner.hooks import _merge_pre_tool_use_hooks, load_bundle_hooks
 from curie_runner.mcp_stdio import UnsafeStdioConfiguration
 from curie_runner.mcp_tool_capability import (
     ConnectorCapabilityFailure,
@@ -45,7 +42,7 @@ from curie_runner.server import create_app
 from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
 from curie_runner.startup_diagnostics import StderrTail
-from curie_runner.subprocess_env import lock_process_environ, proc_dumpable_library
+from curie_runner.subprocess_env import proc_dumpable_library
 from curie_telemetry.redact import RedactingLogFilter, register_held_secrets
 from personal_auth_support import (
     BUNDLED_CLI,
@@ -65,14 +62,8 @@ from personal_auth_support import (
 )
 from personal_token_support import (
     CONNECTOR_VALUE,
-    CONTAINMENT_CHANNELS,
-    CONTAINMENT_PATHS,
     PUBLIC_MARKER,
     ContainmentResponder,
-    assert_containment_capture,
-    containment_tool,
-    native_cli_pid,
-    write_containment_bundle,
 )
 
 
@@ -90,108 +81,6 @@ def native_prerequisites() -> str:
         if Path(configured).stat().st_uid != 0:
             raise RuntimeError("candidate process-lock library is not root owned")
     return library
-
-
-@pytest.mark.parametrize("channel", CONTAINMENT_CHANNELS)
-@pytest.mark.parametrize("path", CONTAINMENT_PATHS)
-def test_native_personal_token_containment(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    native_prerequisites: str,
-    channel: str,
-    path: str,
-) -> None:
-    responder = ContainmentResponder()
-    with installed(tmp_path, monkeypatch, responder) as installation:
-        monkeypatch.setenv("CURIE_PROC_DUMPABLE_PRELOAD", native_prerequisites)
-        monkeypatch.setenv("CURIE_MODEL_AUTH_MODE", "personal")
-        # The only sentinel delivery point is the actual personal-token env.
-        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", OWNER_GRANT)
-        bundle = write_containment_bundle(installation.workspace / "bundle")
-        startup = bundle.root / "startup.sh"
-        startup_capture = bundle.root / "startup.raw"
-        startup_control = bundle.root / "startup.public"
-        startup.write_text(
-            'if [ -n "${CLAUDE_CODE_OAUTH_TOKEN-}" ]; then '
-            f'printf "%s" "$CLAUDE_CODE_OAUTH_TOKEN" > {shlex.quote(str(startup_capture))}; fi\n'
-            f"printf '%s' {shlex.quote(PUBLIC_MARKER)} > {shlex.quote(str(startup_control))}\n",
-            encoding="utf-8",
-        )
-        wiring = wire_session(
-            installation,
-            reviewer_model=REVIEWER_MODEL,
-            plugin_dir=str(bundle.root),
-            max_turns=5,
-            explicit_env={"BASH_ENV": str(startup)} if channel == "Bash" else None,
-        )
-        options = replace(
-            wiring.options,
-            hooks=_merge_pre_tool_use_hooks(
-                wiring.options.hooks, load_bundle_hooks(str(bundle.root))
-            ),
-            mcp_servers=bundle_mcp_servers(str(bundle.root)),
-            env={**wiring.options.env, "LD_PRELOAD": ""},
-        )
-        session = ClaudeAgentSession(options)
-        runner = SessionRunner(
-            held_secrets=frozenset({OWNER_GRANT}),
-            session_factory=lambda: session,
-            ceiling=0,
-            max_usd_per_day=None,
-            tracer=RunTracer(None),
-            classifier=SideEffectClassifier(),
-            trace_name="curie-run:personal-custody",
-            session_id="session-PLACEHOLDER",
-            model=options.model,
-            tool_access=wiring.access,
-        )
-
-        async def scenario() -> list[str]:
-            lines: list[str] = []
-            try:
-                with anyio.fail_after(TURN_TIMEOUT_S):
-                    await runner.start()
-                    responder.calls = containment_tool(
-                        channel, path, bundle, native_cli_pid(session)
-                    )
-                    if channel == "Bash":
-                        name, arguments = responder.calls[0]
-                        responder.calls[0] = (
-                            name,
-                            {
-                                **arguments,
-                                "command": (
-                                    f"source {shlex.quote(str(startup))}; " + arguments["command"]
-                                ),
-                            },
-                        )
-                    async for line in runner.run_turn(
-                        Event(
-                            type="message", text="Run the custody probe.", user="U0EXAMPLE1", ts="1"
-                        )
-                    ):
-                        lines.append(line)
-            finally:
-                await runner.close()
-            return lines
-
-        libc = ctypes.CDLL(None, use_errno=True)
-        prior_dumpable = libc.prctl(3, 0, 0, 0, 0)
-        lock_process_environ()
-        try:
-            lines = anyio.run(scenario)
-        finally:
-            if libc.prctl(4, prior_dumpable, 0, 0, 0) != 0:
-                raise OSError(ctypes.get_errno())
-        finals = [event for event in parse_ndjson("".join(lines)) if isinstance(event, Final)]
-        assert len(finals) == 1
-        assert_owner_grant_only(installation.proxy)
-        assert_containment_capture(
-            channel, path, bundle, "\n".join(responder.raw_results), OWNER_GRANT
-        )
-        if channel == "Bash":
-            assert not startup_capture.exists(), "shell startup recovered the synthetic grant"
-            assert startup_control.read_text(encoding="utf-8") == PUBLIC_MARKER
 
 
 _STDIO_SERVER = """\

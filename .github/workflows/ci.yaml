@@ -2594,7 +2594,7 @@ jobs:
           set -euo pipefail
           set +e
           output=$(uv run pytest \
-            runner/tests/test_repo_toolchain_proof.py::test_dependency_install_succeeds_under_read_only_rootfs \
+            runner/tests/test_repo_toolchain_proof.py::test_seeded_defect_fails_then_fix_passes_then_revert_fails_again \
             -q --tb=line 2>&1)
           status=$?
           set -e
