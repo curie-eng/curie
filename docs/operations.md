@@ -2047,8 +2047,8 @@ retry, and they share the same two slots:
 2. An ordinary failure whose worker reported `retry_safety` `no_effects`: no
    side effect flag on the turn and an observed end of the turn. A `flagged`
    or `uncertain` run never earns another implementation attempt; a failed
-   publication is the one exception, item 3. The cause must also be one the
-   factory policy retries: `model_unreachable`, `model_rate_limited`,
+   `flagged` publication is the one exception, item 3. The cause must also be
+   one the factory policy retries: `model_unreachable`, `model_rate_limited`,
    `model_error` or `sandbox_node_disrupted`; `workspace_error`,
    `runner_error`, `runner_failed`, `runner_timeout` or `sandbox_terminated`
    only with a diagnosed `transient_service` condition; a provider credential,
@@ -2062,10 +2062,12 @@ retry, and they share the same two slots:
    `uncertain`, when a publication of the same request, lineage or
    conversation is still in flight, when a ready applied base move still owns
    the result, when the lineage is closed, when a newer revision is queued,
-   or when no exact complete candidate exists. A failed publication recovery
-   never buys a new implementation run. Loss of that recovery with its worker
-   admits the same candidate again inside the shared allowance. Any other
-   failure of it admits nothing.
+   or when no exact complete candidate exists. A recovery that fails again
+   with one of those three causes can admit another recovery of the same
+   candidate while retention and the allowance last. Loss of that recovery
+   with its worker admits the same candidate again inside the shared
+   allowance. Any other failure of it admits nothing, and none of them ever
+   starts an implementation run.
 
 Some failures settle needs-human at once and spend no retry, because nothing
 Curie runs today could release a wait on them (#5424). These are a
@@ -2159,13 +2161,14 @@ release, check for waiting retries. `curie cluster work-items <ID>` prints a
 cause of automatic retry blocked on a condition when `blocked_on` is set. The
 same read has no execution kind. While a publication recovery is waiting, the
 issue status comment says Recovering publication. An older dispatcher claims a
-waiting request once its dispatch time has passed and starts it as an ordinary
-implementation attempt. It does not read `blocked_on` or the request kind. A
-resource gated retry becomes due on its probe interval, and a publication
-recovery becomes due on the ordinary backoff. A provider gated retry stays
-undispatched until its waiting deadline, and that older dispatcher starts it
-then. Let those requests finish or expire first, or unlabel the issue to
-cancel them.
+waiting request only while its waiting deadline is still ahead and its
+dispatch time has passed. It does not read `blocked_on`. A provider gated
+retry sets its dispatch time to that deadline, so the claim never matches and
+the retry expires there. A resource gated retry becomes due on its probe
+interval, and a publication recovery becomes due on the ordinary backoff.
+Only those two can be claimed after a rollback, and that older dispatcher
+starts each as an ordinary implementation attempt. Let those requests finish
+or expire first, or unlabel the issue to cancel them.
 
 An operator can ask for the same admission again instead of relabelling the
 issue (#5431):
