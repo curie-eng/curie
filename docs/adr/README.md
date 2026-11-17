@@ -302,4 +302,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0279 | [A person acting through a GitHub App can select factory work, and refused trigger labels are answered on the issue](0279-a-person-acting-through-a-github-app-can-select-factory-work.md) | Accepted |
 | 0280 | [A repository writer can ask the factory for facts on the ticket, and facts are never admission](0280-a-repository-writer-can-ask-the-factory-for-facts-on-the-ticket.md) | Accepted |
 | 0281 | [Personal-mode refusals offer self-service account linking](0281-personal-mode-refusals-offer-self-service-account-linking.md) | Accepted |
+| 0282 | [Factory capability evidence composes the deployment record and base commit](0282-factory-capability-evidence-composes-deployment-and-base-commit.md) | Draft |
 <!-- END GENERATED: adr-index -->
