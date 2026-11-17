@@ -280,9 +280,9 @@ def test_uncontended_slow_lookup_within_the_budget_queues_once(
     clean_db: None, valkey: redis.Redis, runs_stream: str,
     synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: the budget does not refuse an in-time composition."""
+    """@spec HTTP-INVOCATION-EXECUTION-4: real IO completes within the production budget."""
     provider = synthetic_provider
-    monkeypatch.setattr(http_invocation, "_COMPOSITION_BUDGET_SECONDS", BUDGET)
+    budget = http_invocation._COMPOSITION_BUDGET_SECONDS
     with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
         token = membership._credential(invocation.client, invocation.scope)
         provider.during_lookup = slow()
@@ -293,7 +293,7 @@ def test_uncontended_slow_lookup_within_the_budget_queues_once(
         assert accepted.status_code == 200, accepted.text
         [(outcome, elapsed)] = spans
         assert outcome == "yielded"
-        assert SLOW <= elapsed < BUDGET
+        assert SLOW <= elapsed < budget
         assert len(provider.requests) == 2
         assert len(valkey.xrange(runs_stream)) == 2
 
