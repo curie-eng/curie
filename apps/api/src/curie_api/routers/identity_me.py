@@ -145,7 +145,7 @@ async def start_github_link(
 ) -> GithubLinkStartOut:
     settings = get_settings()
     config = github_link.require_configuration(settings)
-    console_session = re.fullmatch(r"[A-Za-z0-9_-]{43}", request.cookies[CONSOLE_SESSION_COOKIE])
+    console_session = re.fullmatch(r"[A-Za-z0-9_-]{43}", request.state.principal_session_token)
     if console_session is None:
         raise HTTPException(401, "missing, invalid, or expired principal session")
     state = secrets.token_urlsafe(32)
