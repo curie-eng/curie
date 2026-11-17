@@ -7,11 +7,18 @@ import {
   type Dispatch,
   type ReactNode,
 } from "react";
-import type { Action, AppState } from "./types";
+import type { Action, AppState, Nav } from "./types";
+
+// The console is not a router. The first paint opens Settings only for the
+// Claude plan path; every other URL, including /agents, stays on Overview.
+export function navForPath(pathname: string): Nav {
+  return pathname === "/settings/claude-plan" ? "settings" : "overview";
+}
 
 export function initialState(): AppState {
+  const pathname = typeof window === "undefined" ? "/" : window.location.pathname;
   return {
-    nav: "overview",
+    nav: navForPath(pathname),
     env: "prod",
     obsTab: "traces",
     modal: null,

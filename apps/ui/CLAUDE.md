@@ -104,6 +104,10 @@ schema applied):
 PW_INTEGRATION=1 CURIE_API_TARGET=http://localhost:8000 pnpm exec playwright test --project=integration
 ```
 
+`e2e/integration/console-principal-session.spec.ts` is not launched by a
+driver in this repo. The caller also sets `PW_BASE_URL` and the organization
+sign-in variables documented in `apps/ui/README.md` under Integration E2E.
+
 For the console credential proof, follow the isolated stack and harness setup in
 `apps/ui/README.md` under "Console credential proof". Leave `PW_BASE_URL` unset
 and choose an unused loopback `PW_PORT` so the assertions inspect a fresh

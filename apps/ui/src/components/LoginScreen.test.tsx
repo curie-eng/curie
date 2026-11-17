@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StoreProvider } from "../state/store";
 import { LoginScreen } from "./LoginScreen";
@@ -39,6 +39,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  window.history.pushState({}, "", "/");
   vi.unstubAllGlobals();
 });
 
@@ -50,6 +51,15 @@ function renderLogin(notice: string | null = null) {
     </StoreProvider>,
   );
   return { onSignedIn };
+}
+
+// Each call needs its own Response. The login screen also fetches sign-in
+// methods, and a Response body can be read once.
+function respond(make: () => Response) {
+  fetchMock.mockImplementation((input: string) => {
+    if (input === "/api/console/sign-in-methods") return Promise.resolve(json(200, { oidc: false }));
+    return Promise.resolve(make());
+  });
 }
 
 function postedCodes(): string[] {
@@ -96,21 +106,24 @@ describe("LoginScreen (#1047)", () => {
     expect(await screen.findByTestId("console-login-error")).toHaveTextContent(
       "Enter a login code minted by the Curie CLI.",
     );
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["/api/console/sign-in-methods"]);
     expect(onSignedIn).not.toHaveBeenCalled();
   });
 
   // Liveness for the refusal above: a real code with stray whitespace from a
   // terminal copy is sent, trimmed, as the exchange's only field.
   it("exchanges a pasted code, trimmed, and hands the session to onSignedIn", async () => {
-    fetchMock.mockResolvedValue(ok("U0EXCHANGED"));
+    respond(() => ok("U0EXCHANGED"));
     const { onSignedIn } = renderLogin();
     await userEvent.type(screen.getByLabelText("login code"), "  one-time-example-code ");
     await userEvent.click(screen.getByTestId("console-login-submit"));
 
     await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1));
     expect(onSignedIn).toHaveBeenCalledWith({ subject: "U0EXCHANGED", expires_at: EXPIRES_AT });
-    const [requestUrl, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const post = fetchMock.mock.calls.find(
+      ([url, init]) => url === "/api/console/session" && (init as RequestInit | undefined)?.method === "POST",
+    );
+    const [requestUrl, init] = post as [string, RequestInit];
     expect(requestUrl).toBe("/api/console/session");
     expect(init.method).toBe("POST");
     expect(init.credentials).toBe("same-origin");
@@ -120,7 +133,7 @@ describe("LoginScreen (#1047)", () => {
   });
 
   it("submits on Enter", async () => {
-    fetchMock.mockResolvedValue(ok());
+    respond(() => ok());
     const { onSignedIn } = renderLogin();
     await userEvent.type(screen.getByLabelText("login code"), "one-time-example-code{Enter}");
     await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1));
@@ -129,11 +142,12 @@ describe("LoginScreen (#1047)", () => {
 
   it("disables submit and shows progress while the exchange is in flight", async () => {
     let answer!: (r: Response) => void;
-    fetchMock.mockReturnValue(
-      new Promise<Response>((r) => {
-        answer = r;
-      }),
-    );
+    fetchMock.mockImplementation((input: string) => {
+      if (input === "/api/console/sign-in-methods") return Promise.resolve(json(200, { oidc: false }));
+      return new Promise<Response>((resolve) => {
+        answer = resolve;
+      });
+    });
     const { onSignedIn } = renderLogin();
     await submitCode("one-time-example-code");
 
@@ -155,7 +169,7 @@ describe("LoginScreen (#1047)", () => {
       "500: Internal Server Error",
     ],
   ])("shows the %s message and stays on the form", async (_label, refusal, message) => {
-    fetchMock.mockResolvedValue(refusal());
+    respond(refusal);
     const { onSignedIn } = renderLogin();
     await submitCode("one-time-example-code");
 
@@ -174,7 +188,7 @@ describe("LoginScreen (#1047)", () => {
   });
 
   it("treats a 200 with a blank subject as a failed sign-in", async () => {
-    fetchMock.mockResolvedValue(ok(null));
+    respond(() => ok(null));
     const { onSignedIn } = renderLogin();
     await submitCode("one-time-example-code");
     expect(await screen.findByTestId("console-login-error")).toHaveTextContent(
@@ -184,11 +198,11 @@ describe("LoginScreen (#1047)", () => {
   });
 
   it("recovers on the same form after a 401, a 429 and a 503", async () => {
-    fetchMock
-      .mockResolvedValueOnce(badCode())
-      .mockResolvedValueOnce(rateLimited())
-      .mockResolvedValueOnce(limiterDown())
-      .mockResolvedValueOnce(ok("U0RECOVERED"));
+    const replies = [badCode(), rateLimited(), limiterDown(), ok("U0RECOVERED")];
+    fetchMock.mockImplementation((input: string) => {
+      if (input === "/api/console/sign-in-methods") return Promise.resolve(json(200, { oidc: false }));
+      return Promise.resolve(replies.shift() ?? json(404, { detail: "Not Found" }));
+    });
     const { onSignedIn } = renderLogin();
 
     await submitCode("first-example-code");
@@ -213,5 +227,39 @@ describe("LoginScreen (#1047)", () => {
       "third-example-code",
       "fourth-example-code",
     ]);
+  });
+
+  it.each([
+    ["/", "/api/console/oidc/login?return_to=%2F"],
+    ["/settings/claude-plan", "/api/console/oidc/login?return_to=%2Fsettings%2Fclaude-plan"],
+    ["/agents", "/api/console/oidc/login"],
+  ])("links %s to organization sign-in when oidc is on", async (path, href) => {
+    window.history.pushState({}, "", path);
+    fetchMock.mockResolvedValue(json(200, { oidc: true }));
+    renderLogin();
+    expect(await screen.findByTestId("console-oidc-sign-in")).toHaveAttribute("href", href);
+    expect(screen.getByTestId("console-oidc-sign-in")).toHaveTextContent("Sign in with your organization");
+  });
+
+  it.each([
+    ["oidc false", () => json(200, { oidc: false })],
+    ["a failed methods call", () => json(404, { detail: "Not Found" })],
+  ])("hides organization sign-in on %s", async (_label, reply) => {
+    let answer!: (response: Response) => void;
+    fetchMock.mockImplementation((input: string) => {
+      if (input === "/api/console/sign-in-methods") {
+        return new Promise<Response>((resolve) => {
+          answer = resolve;
+        });
+      }
+      return Promise.resolve(json(404, { detail: "Not Found" }));
+    });
+    renderLogin();
+    await waitFor(() => expect(answer).toBeTypeOf("function"));
+    answer(reply());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId("console-oidc-sign-in")).not.toBeInTheDocument();
   });
 });

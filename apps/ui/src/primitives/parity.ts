@@ -73,6 +73,15 @@ export const WIRED_ACTIONS = [
   { id: "console-login-local", label: "Mint a console login code (dev)", mapping: { command: "local.console.login" } },
   { id: "console-login-cluster", label: "Mint a console login code (prod)", mapping: { command: "cluster.console.login" } },
 
+  // Organization sign-in (#5682) is a browser navigation to the API, not a
+  // CliHint. The CLI that drops the cookie copy is #5559, so the gap cites
+  // that issue rather than the parity epic.
+  {
+    id: "console-oidc-sign-in",
+    label: "Sign in with your organization",
+    mapping: { noCliEquivalent: "https://github.com/curie-eng/curie/issues/5559" },
+  },
+
   // Genuinely-unmapped actions: no dedicated CLI verb exists yet. These render
   // the honest amber glyph linking to the parity epic instead of a command.
   { id: "rollback", label: "Roll back to an earlier version", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },

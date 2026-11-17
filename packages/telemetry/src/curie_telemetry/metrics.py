@@ -432,6 +432,7 @@ _HTTP_OPERATIONS = [
     "/console/oidc/login",
     "/console/principal",
     "/console/session",
+    "/console/sign-in-methods",
     # Owner personal Claude enrollment (#5377).
     "/personal-claude/enrollment",
     "/coding-instructions",

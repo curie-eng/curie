@@ -1415,6 +1415,7 @@
           "/console/oidc/login",
           "/console/principal",
           "/console/session",
+          "/console/sign-in-methods",
           "/personal-claude/enrollment",
           "/coding-instructions",
           "/deploy-targets/list",
@@ -1587,7 +1588,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9760
+      "cardinality_bound": 9800
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1693,6 +1694,7 @@
           "/console/oidc/login",
           "/console/principal",
           "/console/session",
+          "/console/sign-in-methods",
           "/personal-claude/enrollment",
           "/coding-instructions",
           "/deploy-targets/list",
@@ -1865,7 +1867,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9760
+      "cardinality_bound": 9800
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -1971,6 +1973,7 @@
           "/console/oidc/login",
           "/console/principal",
           "/console/session",
+          "/console/sign-in-methods",
           "/personal-claude/enrollment",
           "/coding-instructions",
           "/deploy-targets/list",
@@ -2136,7 +2139,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1952
+      "cardinality_bound": 1960
     },
     "curie.background.loop": {
       "type": "counter",

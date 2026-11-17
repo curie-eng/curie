@@ -1,7 +1,14 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { C } from "../tokens";
 import { Button, Card, Notice } from "../primitives";
-import { ApiError, getConsoleSession, isUnauthorized, onUnauthorized, type ConsoleSession } from "../api/client";
+import {
+  ApiError,
+  getConsoleSession,
+  isUnauthorized,
+  logoutConsoleSession,
+  onUnauthorized,
+  type ConsoleSession,
+} from "../api/client";
 import { ConsoleGateFrame, LoginScreen } from "../components/LoginScreen";
 
 // The global console sign-in gate (#1047, ADR-0083). The console authenticates
@@ -18,6 +25,15 @@ import { ConsoleGateFrame, LoginScreen } from "../components/LoginScreen";
 // operator where they are and leaves the view to show its own error.
 
 const EXPIRED_NOTICE = "Your console session expired or was revoked. Mint a new login code and sign in again.";
+const PRINCIPAL_EXPIRED_NOTICE = "Your session expired. Sign in again.";
+
+// A login-code stub from before `kind` existed still counts as an operator
+// session. A principal session is live even when its subject is only the
+// principal id the API now returns.
+function acceptsSession(session: ConsoleSession): boolean {
+  if (session.kind === "principal") return true;
+  return Boolean(session.subject?.trim());
+}
 
 type GateState =
   | { kind: "checking" }
@@ -32,6 +48,7 @@ function unavailableMessage(e: unknown): string {
 }
 
 const Ctx = createContext<ConsoleSession | null>(null);
+const SignOutCtx = createContext<(() => Promise<void>) | null>(null);
 
 export function ConsoleSessionGate({ children }: { children: ReactNode }) {
   const [state, setState] = useState<GateState>({ kind: "checking" });
@@ -39,13 +56,27 @@ export function ConsoleSessionGate({ children }: { children: ReactNode }) {
   const [attempt, setAttempt] = useState(0);
   // The in-flight mid-session re-probe, so concurrent 401s share one request.
   const reprobe = useRef<Promise<void> | null>(null);
+  // The session the re-probe is judging, kept after sign-out so a late 401
+  // still knows whether the person or the operator was signed in.
+  const sessionRef = useRef<ConsoleSession | null>(null);
+  useEffect(() => {
+    if (state.kind === "signedIn") sessionRef.current = state.session;
+  }, [state]);
+
+  const signOut = async () => {
+    try {
+      if (await logoutConsoleSession()) setState({ kind: "signedOut", notice: null });
+    } catch {
+      // A failed logout leaves the console up. The cookie is still live.
+    }
+  };
 
   useEffect(() => {
     let live = true;
     getConsoleSession()
       .then((session) => {
         if (!live) return;
-        setState(session.subject?.trim() ? { kind: "signedIn", session } : { kind: "signedOut", notice: null });
+        setState(acceptsSession(session) ? { kind: "signedIn", session } : { kind: "signedOut", notice: null });
       })
       .catch((e: unknown) => {
         if (!live) return;
@@ -69,7 +100,11 @@ export function ConsoleSessionGate({ children }: { children: ReactNode }) {
         .then(
           () => {},
           (e: unknown) => {
-            if (live && isUnauthorized(e)) setState({ kind: "signedOut", notice: EXPIRED_NOTICE });
+            if (live && isUnauthorized(e)) {
+              const notice =
+                sessionRef.current?.kind === "principal" ? PRINCIPAL_EXPIRED_NOTICE : EXPIRED_NOTICE;
+              setState({ kind: "signedOut", notice });
+            }
           },
         )
         .finally(() => {
@@ -111,7 +146,11 @@ export function ConsoleSessionGate({ children }: { children: ReactNode }) {
         </ConsoleGateFrame>
       );
     case "signedIn":
-      return <Ctx.Provider value={state.session}>{children}</Ctx.Provider>;
+      return (
+        <SignOutCtx.Provider value={signOut}>
+          <Ctx.Provider value={state.session}>{children}</Ctx.Provider>
+        </SignOutCtx.Provider>
+      );
   }
 }
 
@@ -121,4 +160,14 @@ export function useConsoleSession(): ConsoleSession {
   const session = useContext(Ctx);
   if (!session) throw new Error("useConsoleSession must be used within ConsoleSessionGate");
   return session;
+}
+
+// Null outside the gate, so chrome rendered by unit tests without a provider
+// stays the operator shell.
+export function useOptionalConsoleSession(): ConsoleSession | null {
+  return useContext(Ctx);
+}
+
+export function useConsoleSignOut(): (() => Promise<void>) | null {
+  return useContext(SignOutCtx);
 }

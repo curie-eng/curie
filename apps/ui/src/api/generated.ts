@@ -2128,6 +2128,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/console/sign-in-methods": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Sign In Methods
+         * @description Report whether Console OIDC sign-in is enabled. No credential required.
+         *
+         *     A presented X-API-Key is not a credential for this route. The login screen
+         *     reads it before a session exists, and the answer does not depend on the header.
+         */
+        get: operations["sign_in_methods_console_sign_in_methods_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/deploy-targets/list": {
         parameters: {
             query?: never;
@@ -8010,11 +8033,16 @@ export interface components {
         };
         /**
          * ConsoleSessionOut
-         * @description The result of an exchange. Deliberately carries NO token.
+         * @description The result of an exchange or a session probe. Deliberately carries NO token.
          *
          *     The session token travels only as an `HttpOnly` cookie, so page script cannot
          *     read it -- putting it in the body would hand the credential straight back to
          *     the JavaScript this design exists to keep it away from.
+         *
+         *     ``kind`` is ``operator`` for a login-code session and ``principal`` for an
+         *     OIDC session. ``principal`` is populated only for the latter. A principal
+         *     session's ``subject`` is ``principal:<id>``, the same subject
+         *     ``authenticate_administrator`` already records.
          */
         ConsoleSessionOut: {
             /**
@@ -8022,8 +8050,37 @@ export interface components {
              * Format: date-time
              */
             expires_at: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "operator" | "principal";
+            principal: components["schemas"]["ConsoleSessionPrincipal"] | null;
             /** Subject */
             subject: string | null;
+        };
+        /**
+         * ConsoleSessionPrincipal
+         * @description The person a principal console session names. No token, no issuer.
+         */
+        ConsoleSessionPrincipal: {
+            /** Display Name */
+            display_name: string | null;
+            /** Email */
+            email: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+        };
+        /**
+         * ConsoleSignInMethodsOut
+         * @description Which unauthenticated sign-in paths this install offers.
+         */
+        ConsoleSignInMethodsOut: {
+            /** Oidc */
+            oidc: boolean;
         };
         /** Context */
         Context: {
@@ -18483,7 +18540,9 @@ export interface operations {
     };
     oidc_login_console_oidc_login_get: {
         parameters: {
-            query?: never;
+            query?: {
+                return_to?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -18496,6 +18555,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };
@@ -18590,6 +18658,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    sign_in_methods_console_sign_in_methods_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConsoleSignInMethodsOut"];
                 };
             };
         };
