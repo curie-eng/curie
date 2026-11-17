@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import yaml
 
@@ -36,6 +37,11 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 BUDGET_SECONDS = 20 * 60
 IMAGES_JOB = "Build CI images (no push)"
 RUN_STEP = "Run the cluster upgrade matrix"
+# GitHub documents 30 as the default page size for list jobs (maximum 100):
+# https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run
+# Run 43927791819 has 87 jobs and returns HTTP 502 at per_page=100, HTTP 200
+# at per_page=30 and per_page=50. The request stays at the documented default.
+JOBS_PAGE_SIZE = 30
 # Observed GitHub jobs API timestamps use a trailing Z (run 36420097006).
 ORIGIN = datetime(2026, 9, 18, 14, 0, 0, tzinfo=UTC)
 
@@ -383,9 +389,90 @@ def test_fetch_paginates_jobs_and_uses_documented_headers(tmp_path: Path) -> Non
     assert first["accept"] == "application/vnd.github+json"
     assert first["authorization"] == "Bearer example-token"
     assert first["api_version"] == "2022-11-28"
-    assert "per_page=100" in first["path"]
+    assert f"per_page={JOBS_PAGE_SIZE}" in first["path"]
     summary = _summary(tmp_path)
     assert "1100" in summary
+    assert "s02" in summary
+    assert "95" in summary
+
+
+def test_jobs_fetch_refuses_a_page_github_502s_and_joins_the_safe_pages(
+    tmp_path: Path,
+) -> None:
+    # Run 43927791819: the jobs listing 502s at per_page=100 because each job
+    # carries its step array, and returns 200 at the documented default of 30.
+    # The fake accepts only that page size, then joins two Link pages.
+    images = _images_job(95)
+    first_shard = _job("E2E cluster upgrade matrix (s01)", job_seconds=800, run_seconds=700)
+    second_shard = _job("E2E cluster upgrade matrix (s02)", job_seconds=1100, run_seconds=1000)
+    page1 = _payload(images, first_shard)
+    page1["total_count"] = 3
+    page2 = _payload(second_shard)
+    page2["total_count"] = 3
+    seen: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            seen.append(self.path)
+            parsed = urlsplit(self.path)
+            query = parse_qs(parsed.query)
+            requested = query.get("per_page", [""])[0]
+            if requested != str(JOBS_PAGE_SIZE):
+                body = b'{"message":"Server Error"}'
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if query.get("page", ["1"])[0] == "2":
+                payload = page2
+                link = ""
+            else:
+                payload = page1
+                host, port = self.server.server_address
+                link = (
+                    f"<http://{host}:{port}{parsed.path}"
+                    f'?per_page={JOBS_PAGE_SIZE}&page=2>; rel="next"'
+                )
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            if link:
+                self.send_header("Link", link)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        completed = _run(
+            tmp_path,
+            extra_args=["--api-url", f"http://{host}:{port}"],
+            env_updates={
+                "GITHUB_REPOSITORY": "curie-eng/curie",
+                "GITHUB_RUN_ID": "43927791819",
+                "GITHUB_TOKEN": "example-token",
+            },
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert len(seen) == 2
+    assert all(f"per_page={JOBS_PAGE_SIZE}" in path for path in seen)
+    assert "page=2" in seen[1]
+    summary = _summary(tmp_path)
+    assert "1095" in summary
     assert "s02" in summary
     assert "95" in summary
 
