@@ -1992,11 +1992,31 @@ def _streams_of(run: psk.LiveRun, shell: StreamShell) -> None:
     run.shell, run.kube = shell, psk.Kube(shell, CONTEXT, NAMESPACE)
 
 
+@pytest.mark.parametrize(
+    "listing_error",
+    [
+        pytest.param(None, id="available"),
+        pytest.param(psk.StepFailed("kubectl get exited 1"), id="api-error"),
+        pytest.param(OSError("API unavailable"), id="io-error"),
+        pytest.param(subprocess.TimeoutExpired("kubectl", 20), id="timeout"),
+    ],
+)
 def test_progress_card_main_discovery_retries_capture_before_the_follower_lists_the_pod(
     tmp_path: Path,
+    listing_error: Exception | None,
 ) -> None:
     pending = _pod("acme-claim-1-runner", "uid-1", "Pending", running=False)
-    answer = _claim_answer("acme-claim-1", {"pod": pending})
+    successful_answer = _claim_answer("acme-claim-1", {"pod": pending})
+    listings = 0
+
+    def answer(argv: list[str]) -> psk.Completed:
+        nonlocal listings
+        if "pods" in argv:
+            listings += 1
+            if listings == 2 and listing_error is not None:
+                raise listing_error
+        return successful_answer(argv)
+
     live = _live_run(tmp_path, answer=answer)
     run, ledger = live.run, live.ledger
     files = _pod_files(_turns("msg_impl", IMPLEMENTER_MODEL, 1, 120, start=1))
@@ -2007,7 +2027,7 @@ def test_progress_card_main_discovery_retries_capture_before_the_follower_lists_
     ]
     output = [json.dumps(record).encode() + b"\n" for record in records]
     shell = StreamShell(
-        run.runtime, ledger, answer, {"exec": [[], output], "logs": [[b"runner booting\n"]]}
+        run.runtime, ledger, answer, {"exec": [[], [], output], "logs": [[b"runner booting\n"]]}
     )
     _streams_of(run, shell)
 
@@ -2023,7 +2043,31 @@ def test_progress_card_main_discovery_retries_capture_before_the_follower_lists_
     facts = run.attempt_facts()
     assert facts is not None and len(facts.sessions) == 1
     assert facts.sessions[0].output_tokens == 120
-    assert len([argv for argv in shell.spawned if "exec" in argv]) == 2
+    assert len([argv for argv in shell.spawned if "exec" in argv]) == 3
+    ledger.close()
+
+
+@pytest.mark.parametrize("stop", ["deadline", "cancel"])
+def test_progress_card_capture_listing_errors_preserve_retry_bounds(
+    tmp_path: Path, stop: str
+) -> None:
+    live = _live_run(tmp_path)
+    run, ledger = live.run, live.ledger
+
+    def answer(_argv: list[str]) -> psk.Completed:
+        if stop == "cancel":
+            run.follow_stop.set()
+        else:
+            live.clock.wait(psk.STREAM_RETRY_LIMIT)
+        raise psk.StepFailed("kubectl could not complete")
+
+    shell = StreamShell(run.runtime, ledger, answer, {"exec": [[]]})
+    _streams_of(run, shell)
+    observed = _runner_pod(run, "uid-1")
+    run.follow_stream(observed, run.kube.argv("exec", observed.name), lambda _line: None)
+
+    assert len(shell.spawned) == 1
+    assert observed.harvest.transcript_files() == {}
     ledger.close()
 
 

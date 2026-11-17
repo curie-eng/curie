@@ -3365,7 +3365,7 @@ class LiveRun:
         """
 
         until = self.clock.monotonic() + STREAM_RETRY_LIMIT
-        while True:
+        while not self.follow_stop.is_set() and self.clock.monotonic() < until:
             try:
                 process = self.shell.spawn(argv)
             except Exception:  # noqa: BLE001 - the main-thread watchdog still bounds the attempt
@@ -3385,13 +3385,13 @@ class LiveRun:
             for line in process.stdout if process.stdout is not None else ():
                 produced = True
                 on_line(line)
-            if (
-                produced
-                or self.follow_stop.is_set()
-                or self.clock.monotonic() >= until
-                or not self.pod_present(observed.uid)
-            ):
+            if produced or self.follow_stop.is_set() or self.clock.monotonic() >= until:
                 return
+            try:
+                if not self.pod_present(observed.uid):
+                    return
+            except (StepFailed, OSError, subprocess.SubprocessError):
+                pass
             self.clock.wait(STREAM_RETRY_SECONDS)
 
     def pod_present(self, uid: str) -> bool:
