@@ -1119,6 +1119,24 @@ async def _lineage_closed_for(
     )
 
 
+def _has_no_change_marker(detail: str | None) -> bool:
+    """Whether any line starts with the no-change marker.
+
+    Leading whitespace on the line, then one leading run of blockquote (`>`)
+    and emphasis (`*` and `_`) markers, is ignored. A marker later in the
+    line does not count, and "No changes needed because" does not count.
+    """
+
+    if not detail:
+        return False
+    marker = "No changes needed:"
+    for line in detail.splitlines():
+        candidate = line.lstrip().lstrip(">*_").lstrip()
+        if candidate.startswith(marker):
+            return True
+    return False
+
+
 async def _unchanged_follow_up(
     session: AsyncSession,
     work_item: WorkItem,
@@ -1127,7 +1145,7 @@ async def _unchanged_follow_up(
 ) -> bool:
     """An explicit no-change reply can complete a follow-up on its open PR."""
 
-    if detail is None or not detail.strip().startswith("No changes needed:"):
+    if not _has_no_change_marker(detail):
         return False
     # The objective opens with the issue link admission wrote, so the
     # comparison reads the same link. An issue that cannot be linked (no
