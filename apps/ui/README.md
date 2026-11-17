@@ -68,10 +68,11 @@ proof specs pass before retaining the change.
 
 Build from the repository root with `docker build -f apps/ui/Dockerfile .`.
 The build stage retains the repository-relative paths of the generated ACI types
-and `tests/vectors/user-action-wording.json`. TypeScript checks the action wording
-tests against that shared vector during `pnpm build`, so the container context
-must include the same vector as a checkout build. Admit only that vector from the
-root tests directory; other test fixtures stay outside the UI build context.
+and the shared vectors `tests/vectors/user-action-wording.json` and
+`tests/vectors/personal-enrollment-token.json`. TypeScript checks the unit tests
+against those vectors during `pnpm build`, so the container context must include
+the same vectors as a checkout build. Admit only those vectors from the root tests
+directory; other test fixtures stay outside the UI build context.
 
 ## Structure
 
