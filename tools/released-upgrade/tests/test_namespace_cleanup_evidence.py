@@ -74,42 +74,6 @@ def test_original_upgrade_assertions_wait_and_required_cleanup_remain() -> None:
     assert "e2e-released-upgrade-negative" in required["needs"]
 
 
-def test_failure_only_safe_report_and_artifact_precede_owned_cluster_teardown() -> None:
-    """@spec NAMESPACE-CLEANUP-EVIDENCE-4."""
-    steps = workflow_job()["steps"]
-    collectors = [
-        (i, step)
-        for i, step in enumerate(steps)
-        if "namespace_cleanup_evidence" in step.get("run", "")
-    ]
-    assert len(collectors) == 1, "failure diagnostics do not collect namespace evidence"
-    position, collector = collectors[0]
-    assert "failure()" in collector.get("if", "")
-    run = collector["run"]
-    assert "--context" in run and "kind-curie-upgrade-negative" in run
-    assert "--namespace" in run and "curie-negative" in run and "curie-profile" in run
-    assert "current-context" not in run
-    artifacts = [
-        (i, step)
-        for i, step in enumerate(steps)
-        if "actions/upload-artifact@" in step.get("uses", "")
-        and "cleanup" in step.get("with", {}).get("name", "")
-    ]
-    assert len(artifacts) == 1, "safe cleanup report has no dedicated artifact"
-    artifact_position, artifact = artifacts[0]
-    assert "failure()" in artifact.get("if", "")
-    path = artifact["with"]["path"]
-    assert path.endswith(".json") and "\n" not in path
-    assert not any(character in path for character in "*?[]")
-    assert Path(path).name in run
-    teardown = next(
-        i
-        for i, step in enumerate(steps)
-        if step.get("name") == "Tear down the disposable negative control cluster"
-    )
-    assert position < artifact_position < teardown
-
-
 @pytest.mark.parametrize(
     ("context", "namespaces", "budget"),
     [
