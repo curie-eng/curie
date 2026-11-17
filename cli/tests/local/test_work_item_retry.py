@@ -106,12 +106,10 @@ def _default(name: str) -> Any:
     return Settings.model_fields[name].default
 
 
-def _unavailable(required_by: str, reason: str, exc: BaseException) -> None:
-    """Error under the matching CI requirement, otherwise skip with the reason."""
+def _unavailable(reason: str, exc: BaseException) -> None:
+    """Unavailable services are an error, in CI and outside it."""
 
-    if required_by in os.environ:
-        raise RuntimeError(f"{reason} ({required_by} is set)") from exc
-    pytest.skip(reason)
+    raise RuntimeError(reason) from exc
 
 
 def _base_url() -> URL:
@@ -187,7 +185,6 @@ def _probe_postgres(base: URL) -> None:
         asyncio.run(probe())
     except (OSError, asyncpg.PostgresError, TimeoutError) as exc:
         _unavailable(
-            "CI_REQUIRE_POSTGRES_TESTS",
             f"Postgres at {base.host}:{base.port} is unreachable: {type(exc).__name__}",
             exc,
         )
@@ -204,7 +201,6 @@ def _probe_valkey() -> Valkey:
         client.ping()
     except redis.exceptions.RedisError as exc:
         _unavailable(
-            "CI_REQUIRE_VALKEY_TESTS",
             f"Valkey at {valkey.host}:{valkey.port} is unreachable: {type(exc).__name__}",
             exc,
         )
@@ -223,10 +219,7 @@ def _probe_object_store() -> ObjectStore:
     try:
         store.client().list_buckets()
     except (BotoCoreError, ClientError) as exc:
-        # The API lifespan needs the object store, so the Postgres requirement
-        # covers it too.
         _unavailable(
-            "CI_REQUIRE_POSTGRES_TESTS",
             f"the object store at {store.endpoint} is unreachable: {type(exc).__name__}",
             exc,
         )

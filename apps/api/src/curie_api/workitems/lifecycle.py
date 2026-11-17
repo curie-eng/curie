@@ -3376,9 +3376,10 @@ async def admit_automatic_successor(
     ):
         return await _admit_publication_recovery(session, work_item, predecessor, owner_lost=False)
     if predecessor.execution_kind == "publication_recovery":
-        # A publication failure never buys an implementation run (#5429). A
-        # recovery lost with its worker recovers the same candidate again
-        # inside the shared allowance; its other failures admit nothing.
+        # Another publication failure is admitted above, as publication
+        # recovery, before this branch. Owner loss admits the same candidate
+        # again inside the shared allowance. Any other failure here admits
+        # nothing. None of these paths starts an implementation run (#5429).
         if origin == "owner_loss" and predecessor.terminal_cause == "owner_lost":
             return await _admit_publication_recovery(
                 session, work_item, predecessor, owner_lost=True

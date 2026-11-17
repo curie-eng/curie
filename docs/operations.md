@@ -2041,7 +2041,7 @@ Each WorkItem has two automatic retries for its whole lifetime
 ([ADR 0269](adr/0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md)),
 so an issue gets at most three full implementation attempts. A retry is a new
 execution request with its own identity, sequence, waiting deadline and
-execution deadline; the failed request is never changed. Two things spend a
+execution deadline; the failed request is never changed. Three things spend a
 retry, and they share the same two slots:
 
 1. A request lost with its worker. Curie admits the retry once the worker
@@ -2051,13 +2051,28 @@ retry, and they share the same two slots:
    nothing.
 2. An ordinary failure whose worker reported `retry_safety` `no_effects`: no
    side effect flag on the turn and an observed end of the turn. A `flagged`
-   or `uncertain` run never earns a retry. The cause must also be one the
-   factory policy retries: `model_unreachable`, `model_rate_limited`,
+   or `uncertain` run never earns another implementation attempt; a failed
+   `flagged` publication is the one exception, item 3. The cause must also be
+   one the factory policy retries: `model_unreachable`, `model_rate_limited`,
    `model_error` or `sandbox_node_disrupted`; `workspace_error`,
    `runner_error`, `runner_failed`, `runner_timeout` or `sandbox_terminated`
    only with a diagnosed `transient_service` condition; a provider credential,
    credit or usage refusal only as described below; or a limit exhaustion
    under a resource gate.
+3. A failed publication whose exact candidate Curie retained
+   (`publication_failed`, `approval_create_failed` or
+   `publication_unrecorded`, with publication candidates enabled, see below).
+   Curie admits a publication recovery request that publishes the retained
+   candidate and runs no model turn. It is refused when the worker reported
+   `uncertain`, when a publication of the same request, lineage or
+   conversation is still in flight, when a ready applied base move still owns
+   the result, when the lineage is closed, when a newer revision is queued,
+   or when no exact complete candidate exists. A recovery that fails again
+   with one of those three causes can admit another recovery of the same
+   candidate while retention and the allowance last. Loss of that recovery
+   with its worker admits the same candidate again inside the shared
+   allowance. Any other failure of it admits nothing, and none of them ever
+   starts an implementation run.
 
 Some failures settle needs-human at once and spend no retry, because nothing
 Curie runs today could release a wait on them (#5424). These are a
@@ -2134,10 +2149,31 @@ scratch volume, does not release it. A gated retry that is never released
 expires as `retry_condition_expired` naming its condition. A clean
 `sandbox_node_disrupted` failure is retried on the ordinary backoff.
 
+Publication recovery needs retained candidates, which are off by default. Set
+`worker.workspace.publicationCandidates.enabled` to true. That requires
+`agentSandbox.runner.workspace.enabled` and the internal worker token.
+`worker.workspace.publicationCandidates.maxBytes`, default 1073741824, caps
+all candidate bytes. Curie then keeps a private copy of each factory run's
+base and patch from before validation until 24 hours after the request's
+final disposition. With the switch off, a failed publication settles
+needs-human and nothing is recovered.
+
 Upgrade note: the finish route now requires `retry_safety`. A worker from an
 earlier release omits it, its finish is refused with 422, and its request ends
 `expired` with cause `execution_deadline` instead of the real cause. Roll the
-workers together with the API.
+workers together with the API. Before rolling the application back past this
+release, check for waiting retries. `curie cluster work-items <ID>` prints a
+cause of automatic retry blocked on a condition when `blocked_on` is set. The
+same read has no execution kind. While a publication recovery is waiting, the
+issue status comment says Recovering publication. An older dispatcher claims a
+waiting request only while its waiting deadline is still ahead and its
+dispatch time has passed. It does not read `blocked_on`. A provider gated
+retry sets its dispatch time to that deadline, so the claim never matches and
+the retry expires there. A resource gated retry becomes due on its probe
+interval, and a publication recovery becomes due on the ordinary backoff.
+Only those two can be claimed after a rollback, and that older dispatcher
+starts each as an ordinary implementation attempt. Let those requests finish
+or expire first, or unlabel the issue to cancel them.
 
 An operator can ask for the same admission again instead of relabelling the
 issue (#5431):
@@ -2180,9 +2216,10 @@ pending), `active_execution` (a request is waiting, queued, running or being can
 `teardown_unconfirmed` (a lost run's teardown is not observed yet),
 `allowance_exhausted` (it names the used count and the last cause; nothing here
 adds more), `not_retryable` (for example `no_pull_request`, a denial or
-`budget_exceeded`), `side_effects_unproven` (the failed run was `flagged`,
-`uncertain` or carries no safety fact) and `admission_refused` (a fence inside the automatic admission
-still holds).
+`budget_exceeded`), `side_effects_unproven` (for an implementation retry the
+failed run was `flagged`, `uncertain` or carries no safety fact; for a
+publication recovery only `uncertain`) and `admission_refused` (a fence inside
+the automatic admission still holds).
 
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it
