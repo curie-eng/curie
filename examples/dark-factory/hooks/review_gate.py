@@ -161,9 +161,11 @@ One script handles every hook event the bundle registers:
     cleared. Then the timing check. A checkout identical to the last one that
     got ``CHANGES`` is refused without a stop (cause ``no_progress``). A
     pull-request follow-up, recognized because its opening prompt contains
-    "review feedback on this work item's pull request", refuses a diff review
-    whose candidate patch is empty (cause ``empty_candidate_patch``) without
-    stopping the run. Plan review of that same empty checkout stays admitted,
+    the marker ``Curie pull request follow-up.`` (the same literal as
+    ``curie_api.factory_follow_up.PULL_REQUEST_FOLLOW_UP_MARKER``), refuses a
+    diff review whose candidate patch is empty (cause
+    ``empty_candidate_patch``) without stopping the run. Plan review of that
+    same empty checkout stays admitted,
     and an issue run's empty diff review stays admitted, so a change request
     can still pass plan review before it edits. With
     ``DIFF_ROUNDS`` rounds completed the run stops and writes ``curie_gate:
@@ -579,16 +581,22 @@ def _bounded(text: str) -> str:
     return text if len(text) <= FINDINGS_LIMIT else f"{text[:FINDINGS_LIMIT]}\n[truncated]"
 
 
-def _pull_request_follow_up(prompt: str) -> bool:
-    """Whether the opening prompt is review feedback on this work item's pull request.
+# Same literal as curie_api.factory_follow_up.PULL_REQUEST_FOLLOW_UP_MARKER.
+# This hook cannot import the API. The builder regression keeps them equal.
+_PULL_REQUEST_FOLLOW_UP_MARKER = "Curie pull request follow-up."
 
-    The phrase is the one both follow-up objectives write. It is read from the
-    user message inside a sender frame, so a frame header cannot hide it or
-    supply it. Old state files omit the flag; callers treat a missing key as false.
+
+def _pull_request_follow_up(prompt: str) -> bool:
+    """Whether the opening prompt is a pull-request follow-up.
+
+    Every pull-request follow-up objective carries
+    ``_PULL_REQUEST_FOLLOW_UP_MARKER``. The marker is read from the user
+    message inside a sender frame, so a frame header cannot hide it or supply
+    it. Old state files omit the flag; callers treat a missing key as false.
     """
 
     message = "\n".join(_message_lines(prompt))
-    return "review feedback on this work item's pull request" in message
+    return _PULL_REQUEST_FOLLOW_UP_MARKER in message
 
 
 def _fresh(prompt: str = "") -> dict[str, Any]:

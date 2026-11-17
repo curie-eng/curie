@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from . import workitem_dispatch
 from .config import Settings
+from .factory_follow_up import with_pull_request_follow_up_marker
 from .factory_review_context import pull_request_body_context
 from .factory_tracker_intake import take_due
 from .forges.authority import feedback_actionable, feedback_allowlist
@@ -178,7 +179,7 @@ def _objective(
         "head_sha": feedback.head_sha,
     }
     provenance.update(publication_context)
-    return (
+    return with_pull_request_follow_up_marker(
         f"{url}\n\n"
         f"Human {code_host.kind} review feedback on this work item's pull request follows as "
         "JSON. Answer from the pull request body's Decisions section and the current diff "

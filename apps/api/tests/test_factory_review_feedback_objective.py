@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+from curie_api.factory_follow_up import PULL_REQUEST_FOLLOW_UP_MARKER
 from curie_api.factory_review_feedback import _objective
 from curie_api.forges.types import (
     Actor,
@@ -27,13 +28,16 @@ def test_feedback_objective_answers_from_decisions_before_a_revision() -> None:
         head_sha="abc123",
         kind=FeedbackKind.COMMENT,
     )
+    url = "https://gitlab.example/acme/bot/-/merge_requests/4#note_1"
     objective = _objective(
         feedback,
-        "https://gitlab.example/acme/bot/-/merge_requests/4#note_1",
+        url,
         SimpleNamespace(kind="gitlab"),
         {"pull_request_body": "## Decisions\n1. Use the existing parser."},
     )
 
+    assert objective.splitlines()[0] == url
+    assert objective.splitlines()[2] == PULL_REQUEST_FOLLOW_UP_MARKER
     prose, _separator, last_line = objective.rpartition("\n")
     assert (
         "Answer from the pull request body's Decisions section and the current diff first." in prose
