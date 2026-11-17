@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getOwnedLinks, startGithubLink, unlinkOwnedAccount, type OwnedLink } from "../../api/client";
 import { Button, Card, CliHint, Modal } from "../../primitives";
-import { PARITY_TRACKING_ISSUE } from "../../primitives/parity";
+import { PARITY_TRACKING_ISSUE, WIRED_ACTIONS } from "../../primitives/parity";
 import { C } from "../../tokens";
 
 const LINKS_KEY = ["owned-account-links"] as const;
+const unlinkAction = WIRED_ACTIONS.find((action) => action.id === "account-unlink")!;
 const RESULTS: Record<string, string> = {
   linked: "Your GitHub account is linked.",
   taken: "That GitHub account is already linked; unlink it from its current account first.",
@@ -70,9 +71,11 @@ export function LinkedAccounts() {
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: 13, color: C.text }}>{link.provider === "github" ? "GitHub" : "Slack"}: {link.display_label}</div>
             <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>Linked {new Date(link.created_at).toLocaleDateString()}</div>
+            <div style={{ fontSize: 12, color: C.muted, marginTop: 4, overflowWrap: "anywhere" }}>
+              Operator route: <code>{unlinkAction.operatorRoute}</code>
+            </div>
           </div>
           <Button label="Unlink" variant="danger" disabled={busy} onClick={() => setConfirming(link)} />
-          <CliHint noCliEquivalent={PARITY_TRACKING_ISSUE} actionIds={["account-unlink"]} />
         </div>
       ))}
       {query.data?.github_link_available ? (

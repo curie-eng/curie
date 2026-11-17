@@ -34,7 +34,6 @@ const EXPECTED_COMMAND_IDS = [
   "local.work-items",
 ] as const;
 const EXPECTED_NO_CLI_ACTION_IDS = [
-  "account-unlink",
   "behavior-packs-edit",
   "eval-matrix",
   "github-account-link",

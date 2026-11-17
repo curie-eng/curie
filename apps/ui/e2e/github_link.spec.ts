@@ -38,6 +38,7 @@ test("github_link lists accounts and confirms each unlink", async ({ page }) => 
   await page.goto("/settings/claude-plan");
   await expect(page.getByTestId("linked-account")).toHaveCount(2);
   await expect(page.getByText("GitHub: acme-developer", { exact: true })).toBeVisible();
+  await expect(page.getByText("POST /identity/admin/{tenant_id}/links/{link_id}/revoke", { exact: true })).toHaveCount(2);
   await expect(page.getByRole("button", { name: "Link GitHub", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "Unlink", exact: true }).first().click();
   await page.getByRole("button", { name: "Cancel", exact: true }).click();

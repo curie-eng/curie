@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
-from .. import identity_audit
+from .. import identity_audit, identity_fence
 from ..auth import CONSOLE_SESSION_COOKIE, authorized_console_principal
 from ..config import get_settings
 from ..deps import SessionDep
@@ -231,42 +231,47 @@ async def github_link_callback(
         or not code
     ):
         return _result("failed")
+    tenant_id, principal_id = principal.tenant_id, principal.id
+    await session.rollback()
     try:
         native_id, login = await github_link.verified_account(settings, config, code)
     except github_link.ProviderRefused:
         return _result("failed")
-    namespace = await find_or_create_namespace(
-        session,
-        tenant_id=principal.tenant_id,
-        provider="github",
-        authority=config.host,
-        kind="github_host",
-        key=config.host,
-    )
-    if namespace.status != "active":
-        return _result("failed")
-    link = IdentityLink(
-        tenant_id=principal.tenant_id,
-        identity_namespace_id=namespace.id,
-        provider_native_id=native_id,
-        principal_id=principal.id,
-        created_by_principal_id=principal.id,
-        verification_source="provider_event_verified",
-        display_label=login,
-    )
-    session.add(link)
-    try:
-        await session.flush()
-    except IntegrityError:
-        await session.rollback()
-        return _result("taken")
-    identity_audit.record(
-        session,
-        tenant_id=principal.tenant_id,
-        principal_id=principal.id,
-        actor=f"principal:{principal.id}",
-        event_type="identity.code_host_link_created",
-        details={"link_id": str(link.id), "namespace_id": str(namespace.id)},
-    )
-    await session.commit()
+    async with identity_fence.mutation(
+        request.app.state.sessionmaker, request.app.state.valkey, request=request
+    ) as writer:
+        namespace = await find_or_create_namespace(
+            writer,
+            tenant_id=tenant_id,
+            provider="github",
+            authority=config.host,
+            kind="github_host",
+            key=config.host,
+        )
+        if namespace.status != "active":
+            return _result("failed")
+        link = IdentityLink(
+            tenant_id=tenant_id,
+            identity_namespace_id=namespace.id,
+            provider_native_id=native_id,
+            principal_id=principal_id,
+            created_by_principal_id=principal_id,
+            verification_source="provider_event_verified",
+            display_label=login,
+        )
+        writer.add(link)
+        try:
+            await writer.flush()
+        except IntegrityError:
+            await writer.rollback()
+            return _result("taken")
+        identity_audit.record(
+            writer,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            actor=f"principal:{principal_id}",
+            event_type="identity.code_host_link_created",
+            details={"link_id": str(link.id), "namespace_id": str(namespace.id)},
+        )
+        await writer.commit()
     return _result("linked")
