@@ -2138,6 +2138,9 @@ export interface paths {
         /**
          * Sign In Methods
          * @description Report whether Console OIDC sign-in is enabled. No credential required.
+         *
+         *     A presented X-API-Key is not a credential for this route. The login screen
+         *     reads it before a session exists, and the answer does not depend on the header.
          */
         get: operations["sign_in_methods_console_sign_in_methods_get"];
         put?: never;

@@ -2161,6 +2161,12 @@ def test_principal_session_get_names_the_person(
     # generated document drops it and this assertion fails.
     spec = (Path(__file__).resolve().parents[1] / "openapi.json").read_text(encoding="utf-8")
     assert "presented X-API-Key is not a credential" in spec
+    # The console's committed API types are generated from that spec.
+    # Reversing the generated module drops the sentence.
+    generated = (
+        Path(__file__).resolve().parents[3] / "apps/ui/src/api/generated.ts"
+    ).read_text(encoding="utf-8")
+    assert "presented X-API-Key is not a credential" in generated
 
 
 def test_principal_session_disabled_principal_is_401(oidc_client: TestClient) -> None:
