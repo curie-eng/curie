@@ -73,11 +73,26 @@ RETRY_ALLOWLIST = frozenset(
             "fix-pin",
             "Install kind and kubectl without creating a cluster",
         ),
-        ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
-        ("ci.yaml", "e2e-cluster-chart-regressions", "Create the kind cluster"),
-        ("ci.yaml", "e2e-cluster-rollout-recovery", "Create the kind cluster"),
-        ("ci.yaml", "e2e-cluster-approval-resume-restarts", "Create the kind cluster"),
-        ("ci.yaml", "e2e-cluster-upgrade-matrix", "Create the disposable kind cluster"),
+        (
+            "ci.yaml", "e2e-ladder-cluster",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        (
+            "ci.yaml", "e2e-cluster-chart-regressions",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        (
+            "ci.yaml", "e2e-cluster-rollout-recovery",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        (
+            "ci.yaml", "e2e-cluster-approval-resume-restarts",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        (
+            "ci.yaml", "e2e-cluster-upgrade-matrix",
+            "Install kind and kubectl without creating a cluster",
+        ),
         # Issue #3866: the same acquisition class as the #1106 wraps, on the
         # ci.yaml and helm-ci.yaml steps that were still a single attempt.
         ("ci.yaml", "action-pins", "Install uv"),
@@ -114,9 +129,15 @@ RETRY_ALLOWLIST = frozenset(
         # Issue #4628: the pinned setup action acquires uv before workspace sync.
         ("ci.yaml", "e2e-released-upgrade", "Install uv"),
         ("ci.yaml", "e2e-released-upgrade", "Install Helm"),
-        ("ci.yaml", "e2e-released-upgrade", "Create the disposable kind cluster"),
+        (
+            "ci.yaml", "e2e-released-upgrade",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "e2e-released-upgrade-negative", "Install Helm"),
-        ("ci.yaml", "e2e-released-upgrade-negative", "Create the disposable kind cluster"),
+        (
+            "ci.yaml", "e2e-released-upgrade-negative",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "e2e-cluster-upgrade-matrix", "Install Helm"),
         # Issue #4111: the scripted factory job acquires Helm, kind and kubectl
         # before the driver runs; the driver creates its own cluster.
@@ -448,7 +469,9 @@ def _is_failure_class_summary(step: dict[str, Any]) -> bool:
 def _carries_retry(step: dict[str, Any]) -> bool:
     if _is_failure_class_summary(step):
         return False
-    if _continue_on_error(step):
+    if _continue_on_error(step) and not str(step.get("uses", "")).startswith(
+        "actions/upload-artifact@"
+    ):
         return True
     condition = step.get("if")
     if isinstance(condition, str) and OUTCOME_REFERENCE.search(condition):

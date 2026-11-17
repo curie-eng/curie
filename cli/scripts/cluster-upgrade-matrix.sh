@@ -1565,7 +1565,7 @@ load_tag_images() {
             ref="${img}:${tag}"
         else
             log "pulling $ref"
-            docker pull "$ref"
+            bash "$REPO_ROOT/.github/scripts/pull-image.sh" "$ref"
         fi
         log "kind load $ref"
         load_kind_images "$ref"
@@ -1816,7 +1816,7 @@ helm_install_089() {
     for img in "${IMAGES[@]}"; do
         ref="$(image_for "$img" "0.8.9")"
         log "refreshing published image $ref"
-        docker pull "$ref"
+        bash "$REPO_ROOT/.github/scripts/pull-image.sh" "$ref"
     done
     load_tag_images "0.8.9"
     kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
