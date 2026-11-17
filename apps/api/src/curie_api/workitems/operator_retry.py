@@ -7,9 +7,10 @@ request, with the disposition ``factory_retry_policy.decide`` derives from that
 request's stored typed facts. So an operator can admit now exactly what
 automatic recovery would admit now, inside the same shared allowance, fences,
 backoff, publication only preference and candidate transfer. What it adds is a
-fresh evaluation once a transient fence cleared (or for a failure that settled
-before automatic recovery existed), a durable idempotency record, an audit
-row, and named refusals.
+fresh evaluation once a transient fence cleared, a durable idempotency record,
+an audit row, and named refusals. An ordinary failure that settled before
+automatic recovery existed carries no safety fact and is refused
+``side_effects_unproven``.
 
 The operator's request UUID is the idempotency key. An identical replay
 (same WorkItem, expected version, stripped reason and server derived actor)
