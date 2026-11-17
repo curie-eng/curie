@@ -3715,6 +3715,10 @@ _INVENTORY = (
 )
 
 
+def closed_unmerged_pull(pull: Any) -> bool:
+    return isinstance(pull, dict) and pull.get("state") == "closed" and pull.get("merged") is False
+
+
 def _judge_cleanup(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     rows = ledger.cleanup_rows()
     steps = [row for row in rows if row["kind"].startswith("step:")]
@@ -3725,9 +3729,27 @@ def _judge_cleanup(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     }
     observed = ledger.observations("cleanup")
     scan = observed.get("token_scan")
+    pull = observed.get("pull_request_state")
+    pull_url = ledger.observations("progress").get("pull_request_url")
+    close_rechecked = (
+        closed_unmerged_pull(pull)
+        and bool(pull_url)
+        and pull.get("html_url") == pull_url
+        and inventory.get("forge_prs") == "absent"
+    )
     checks = {
         "steps_recorded": bool(steps),
-        "every_step_ok": bool(steps) and all(row["status"] == "ok" for row in steps),
+        "every_step_ok": bool(steps)
+        and all(
+            row["status"] == "ok"
+            or (
+                row["kind"] == "step:close-run-pulls"
+                and row["status"] == "failed"
+                and row["detail"] == "forge PATCH returned 422"
+                and close_rechecked
+            )
+            for row in steps
+        ),
         "inventory_complete": all(kind in inventory for kind in _INVENTORY),
         "everything_absent": bool(inventory)
         and all(status == "absent" for status in inventory.values()),

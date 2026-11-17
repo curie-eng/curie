@@ -2466,7 +2466,12 @@ MOVED_HEAD = "b" * 40
 
 
 class FakeForge:
-    """The fixture repository's branches and pull requests, as the GitHub API shapes them."""
+    """GitHub shapes: https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    and https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request.
+
+    Branch deletion closing the PR and a later close returning 422 were observed
+    during a live fixture cleanup on 2026-11-17.
+    """
 
     repo = "acme/fixture"
 
@@ -2475,15 +2480,25 @@ class FakeForge:
         self.pulls: list[dict[str, Any]] = []
         self.deleted: list[str] = []
         self.closed: list[int] = []
+        self.calls: list[tuple[str, str]] = []
 
     def open_pull(self, number: int, branch: str) -> None:
         head = {"sha": self.branches[branch], "ref": branch}
-        self.pulls.append({"number": number, "state": "open", "head": head})
+        self.pulls.append(
+            {
+                "number": number,
+                "state": "open",
+                "merged": False,
+                "html_url": f"https://github.com/{self.repo}/pull/{number}",
+                "head": head,
+            }
+        )
 
     def repo_path(self, suffix: str) -> str:
         return f"/repos/{self.repo}{suffix}"
 
     def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        self.calls.append((method, path))
         prefix = f"/repos/{self.repo}"
         if method == "GET" and path.startswith(f"{prefix}/pulls?"):
             branch = urllib.parse.unquote(path.rsplit(":", 1)[1])
@@ -2492,10 +2507,15 @@ class FakeForge:
                 for pull in self.pulls
                 if pull["state"] == "open" and pull["head"]["ref"] == branch
             ]
+        if method == "GET" and path.startswith(f"{prefix}/pulls/"):
+            number = int(path.rsplit("/", 1)[1])
+            return 200, next(pull for pull in self.pulls if pull["number"] == number)
         if method == "PATCH" and path.startswith(f"{prefix}/pulls/"):
             number = int(path.rsplit("/", 1)[1])
             for pull in self.pulls:
                 if pull["number"] == number:
+                    if pull["state"] == "closed":
+                        return 422, {}
                     pull["state"] = "closed"
             self.closed.append(number)
             return 200, {}
@@ -2507,6 +2527,9 @@ class FakeForge:
         if method == "DELETE" and path.startswith(f"{prefix}/git/refs/heads/"):
             branch = path.removeprefix(f"{prefix}/git/refs/heads/")
             self.branches.pop(branch, None)
+            for pull in self.pulls:
+                if pull["head"]["ref"] == branch:
+                    pull["state"] = "closed"
             self.deleted.append(branch)
             return 204, None
         raise AssertionError((method, path))
@@ -2550,9 +2573,7 @@ def _recovering_run(
     run.sql = sql  # type: ignore[method-assign]
     run.forge = forge  # type: ignore[assignment]
     run.api = FakeApi(dict(zip(ids, publications, strict=True)))  # type: ignore[assignment]
-    run.finalizer.register("close-run-pulls", run.close_run_pulls)
-    run.finalizer.register("delete-run-branches", run.delete_run_branches)
-    run.finalizer.register("recover-publications", run.recover_publications)
+    run.register_publication_cleanup()
     run.queries = queries  # type: ignore[attr-defined]
     return live_run
 
@@ -2563,6 +2584,100 @@ def _inventory(live_run: Live) -> dict[str, str]:
         for row in live_run.ledger.cleanup_rows()
         if row["kind"].startswith("inventory:")
     }
+
+
+@pytest.mark.parametrize("branch_deleted_first", [False, True])
+def test_progress_card_cleanup_closes_pull_before_deleting_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, branch_deleted_first: bool
+) -> None:
+    forge = FakeForge()
+    branch = "curie/pub-1"
+    forge.branches[branch] = OWN_HEAD
+    forge.open_pull(7, branch)
+    request = forge.request
+
+    def racing_request(method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        status, payload = request(method, path, body)
+        if branch_deleted_first and method == "GET" and "/pulls?" in path and payload:
+            request("DELETE", forge.repo_path(f"/git/refs/heads/{branch}"))
+        return status, payload
+
+    monkeypatch.setattr(forge, "request", racing_request)
+    live_run = _recovering_run(
+        tmp_path,
+        forge,
+        live=True,
+        publications=[{"branch": branch, "lineage_head_sha": OWN_HEAD}],
+    )
+    try:
+        results = live_run.run.finalizer.run()
+        assert len(results) == 3 and all(ok for _, ok in results)
+        assert live_run.run.pulls_closed() and live_run.run.branches_absent()
+        assert forge.pulls[0]["state"] == "closed" and forge.pulls[0]["merged"] is False
+        assert forge.branches == {}
+        assert all(
+            row["status"] == "ok"
+            for row in live_run.ledger.cleanup_rows()
+            if row["kind"].startswith("step:")
+        )
+        patch = ("PATCH", forge.repo_path("/pulls/7"))
+        delete = ("DELETE", forge.repo_path(f"/git/refs/heads/{branch}"))
+        if branch_deleted_first:
+            assert ("GET", forge.repo_path("/pulls/7")) in forge.calls
+            assert forge.closed == []
+        else:
+            assert patch in forge.calls
+            assert forge.calls.index(patch) < forge.calls.index(delete)
+            assert forge.closed == [7]
+    finally:
+        live_run.ledger.close()
+
+
+@pytest.mark.parametrize(
+    ("patch_status", "get_status", "pull"),
+    [
+        (422, 200, {"state": "open", "merged": False}),
+        (422, 200, {"state": "closed", "merged": True}),
+        (422, 200, {"state": "closed"}),
+        (422, 200, None),
+        (422, 503, {"state": "closed", "merged": False}),
+        (403, 200, {"state": "closed", "merged": False}),
+    ],
+)
+def test_progress_card_cleanup_refuses_unproven_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_status: int,
+    get_status: int,
+    pull: Any,
+) -> None:
+    forge = FakeForge()
+    forge.branches["curie/pub-1"] = OWN_HEAD
+    forge.open_pull(7, "curie/pub-1")
+    request = forge.request
+
+    def failing_request(method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        if method == "PATCH":
+            return patch_status, {}
+        if method == "GET" and path == forge.repo_path("/pulls/7"):
+            return get_status, pull
+        return request(method, path, body)
+
+    monkeypatch.setattr(forge, "request", failing_request)
+    live_run = _recovering_run(
+        tmp_path,
+        forge,
+        live=True,
+        publications=[{"branch": "curie/pub-1", "lineage_head_sha": OWN_HEAD}],
+    )
+    try:
+        with pytest.raises(
+            psk.StepFailed,
+            match=f"forge (PATCH|GET) returned {get_status if get_status != 200 else patch_status}",
+        ):
+            live_run.run.close_run_pulls()
+    finally:
+        live_run.ledger.close()
 
 
 def test_finalize_cleans_a_publication_the_run_failed_before_reading_back(
@@ -4137,6 +4252,108 @@ def test_judge_reads_only_the_ledger_through_main(
     assert (code, payload["error"]) == (sks.EXIT_REFUSED, "candidate_mismatch")
     code, payload = judge(CANDIDATE, "acme-kickoff-9")
     assert (code, payload["error"]) == (sks.EXIT_REFUSED, "ledger_missing")
+
+
+def test_progress_card_cleanup_rejudges_recorded_close_422_offline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    argv = [
+        "judge",
+        "--candidate",
+        CANDIDATE,
+        "--state-dir",
+        str(state),
+        "--run-id",
+        RUN_ID,
+        "--criterion",
+        "all",
+    ]
+    try:
+        ledger.record_cleanup(
+            "step:close-run-pulls", "close-run-pulls", "failed", "forge PATCH returned 422"
+        )
+        assert psk.main(argv, environ={"PATH": ""}) == sks.EXIT_FAIL
+        before = _output(capsys)[0]
+        ledger.record(
+            "cleanup",
+            "pull_request_state",
+            {"html_url": PULL_URL, "state": "closed", "merged": False, "closed_at": _stamp(60)},
+        )
+        assert psk.main(argv, environ={"PATH": ""}) == sks.EXIT_PASS
+        after = _output(capsys)[0]
+        assert all(after["checks"].values())
+        assert after["counts"] == before["counts"]
+        assert after["ceiling"] == before["ceiling"]
+        assert ledger.cleanup_rows()[-1]["status"] == "failed"
+        assert ledger.candidate() == CANDIDATE
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "missing",
+        "open",
+        "merged",
+        "unknown-merged",
+        "wrong-pr",
+        "no-run-pr",
+        "inventory-present",
+        "other-status",
+        "other-step",
+    ],
+)
+def test_progress_card_cleanup_rejudge_requires_matching_closed_unmerged_pull(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], invalid: str
+) -> None:
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        pull = {"html_url": PULL_URL, "state": "closed", "merged": False}
+        if invalid == "open":
+            pull["state"] = "open"
+        elif invalid == "merged":
+            pull["merged"] = True
+        elif invalid == "unknown-merged":
+            del pull["merged"]
+        elif invalid == "wrong-pr":
+            pull["html_url"] = f"https://github.com/{REPO}/pull/9"
+        if invalid != "missing":
+            ledger.record("cleanup", "pull_request_state", pull)
+        if invalid == "no-run-pr":
+            ledger.record("progress", "pull_request_url", None)
+        if invalid == "inventory-present":
+            ledger.record_cleanup("inventory:forge_prs", "forge_prs", "present")
+        kind = "delete-run-branches" if invalid == "other-step" else "close-run-pulls"
+        detail = (
+            "forge PATCH returned 403" if invalid == "other-status" else "forge PATCH returned 422"
+        )
+        ledger.record_cleanup(f"step:{kind}", kind, "failed", detail)
+        assert (
+            psk.main(
+                [
+                    "judge",
+                    "--candidate",
+                    CANDIDATE,
+                    "--state-dir",
+                    str(state),
+                    "--run-id",
+                    RUN_ID,
+                    "--criterion",
+                    "cleanup",
+                ],
+                environ={"PATH": ""},
+            )
+            == sks.EXIT_FAIL
+        )
+        assert _output(capsys)[0]["checks"]["cleanup.every_step_ok"] is False
+    finally:
+        ledger.close()
 
 
 # --------------------------------------------------------------------------

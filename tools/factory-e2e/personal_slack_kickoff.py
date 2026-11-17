@@ -2467,10 +2467,7 @@ class LiveRun:
             timeout=900,
         )
         self.curie.run("surfaces", self.agent, "--add", f"github={repo}")
-        self.finalizer.register("close-run-pulls", self.close_run_pulls)
-        self.finalizer.register("delete-run-branches", self.delete_run_branches)
-        # Registered last so it runs first, while the api and database are still up.
-        self.finalizer.register("recover-publications", self.recover_publications)
+        self.register_publication_cleanup()
         self.policy_set = True
         self.configure_agent()
         agents = self.sql(f"SELECT id, tenant_id FROM curie.agents WHERE name = '{self.agent}'")
@@ -4049,6 +4046,11 @@ class LiveRun:
 
     # -- cleanup steps ------------------------------------------------------------------------
 
+    def register_publication_cleanup(self) -> None:
+        self.finalizer.register("delete-run-branches", self.delete_run_branches)
+        self.finalizer.register("close-run-pulls", self.close_run_pulls)
+        self.finalizer.register("recover-publications", self.recover_publications)
+
     def close_run_pulls(self) -> None:
         """Close an open pull request only while its head is this run's published commit."""
 
@@ -4072,9 +4074,14 @@ class LiveRun:
                 if str((pull.get("head") or {}).get("sha")) != head:
                     skipped += 1
                     continue
-                forge.call(
-                    "PATCH", forge.repo_path(f"/pulls/{pull.get('number')}"), {"state": "closed"}
-                )
+                path = forge.repo_path(f"/pulls/{pull.get('number')}")
+                status, _ = forge.request("PATCH", path, {"state": "closed"})
+                if status == 422:
+                    current = forge.call("GET", path)
+                    if sks.closed_unmerged_pull(current):
+                        continue
+                if status != 200:
+                    raise StepFailed(f"forge PATCH returned {status}")
         if skipped:
             raise StepFailed(
                 "an open run pull request is not provably at this run's commit; left open"
