@@ -30307,7 +30307,7 @@
     },
     "/console/sign-in-methods": {
       "get": {
-        "description": "Report whether Console OIDC sign-in is enabled. No credential required.",
+        "description": "Report whether Console OIDC sign-in is enabled. No credential required.\n\nA presented X-API-Key is not a credential for this route. The login screen\nreads it before a session exists, and the answer does not depend on the header.",
         "operationId": "sign_in_methods_console_sign_in_methods_get",
         "responses": {
           "200": {

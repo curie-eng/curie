@@ -2157,6 +2157,10 @@ def test_principal_session_get_names_the_person(
     # consults the header again.
     assert console_router.sign_in_methods.__doc__ is not None
     assert "presented X-API-Key is not a credential" in console_router.sign_in_methods.__doc__
+    # The committed spec must carry that same sentence. Reversing the
+    # generated document drops it and this assertion fails.
+    spec = (Path(__file__).resolve().parents[1] / "openapi.json").read_text(encoding="utf-8")
+    assert "presented X-API-Key is not a credential" in spec
 
 
 def test_principal_session_disabled_principal_is_401(oidc_client: TestClient) -> None:
