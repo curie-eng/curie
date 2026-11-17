@@ -187,10 +187,18 @@ a declared test driver on a test installation, are in
 
 ## Other ways in
 
-1. Adding the factory label, mentioning the app on the issue, or sending review
-   feedback does not start a personal run. With `FACTORY_MODEL_AUTH_MODE=personal`,
-   that intake is refused `personal_owner_required` before a WorkItem exists.
-   The current code does not post that refusal on the issue.
+1. Adding the factory label with `FACTORY_MODEL_AUTH_MODE=personal` admits a
+   WorkItem when the labeller is linked to a principal whose personal Claude
+   enrollment is active. The WorkItem owner is that principal at the
+   enrollment's generation. An unlinked labeller is refused
+   `personal_owner_required`. A linked labeller with no active enrollment is
+   refused `enrollment_inactive`. Each refusal is answered by an issue comment
+   and, when a factory Slack channel is configured, one channel post.
+   Mentioning the app on an issue that has no WorkItem is refused
+   `not_admitted`. Review feedback with no WorkItem is ignored. A WorkItem
+   admitted as service before the switch refuses its tracker mentions, review
+   feedback, and Slack steering with `personal_owner_required`. No owner is
+   invented for it.
 2. Ordinary Slack chat that is not a kickoff is refused before a claim or a
    model call: "This installation runs personal subscriptions, and this request
    has no owner to run it as (personal_owner_required). Nothing was started."

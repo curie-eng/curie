@@ -2383,6 +2383,7 @@ FACTORY_INTAKE_NOTICE_REASONS = (
     "actor_own_app",
     "actor_no_permission",
     "personal_owner_required",
+    "enrollment_inactive",
     "binding_ambiguous",
     "publication_completed",
     "installation_changed",

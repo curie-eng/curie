@@ -6054,6 +6054,35 @@ def test_key_events_refused_posts_once_per_notice(
     assert f"#{ambiguous_number}" not in haystack
 
 
+def test_label_enrollment_inactive_posts_one_channel_refusal(stack: Stack) -> None:
+    """A disconnected plan is one channel post, with the connect-it sentence."""
+
+    assert stack.enable_destination().status_code == 200
+    number = 92021
+    notice_id = _intake_notice(
+        number=number, reason="enrollment_inactive", agent_id=stack.agent_id, login="pat"
+    )
+    stack.drain_as(phase_lines=False)
+    refused = [call for call in _chat(stack) if call.text.startswith("Refused:")]
+    assert [call.text for call in refused] == [
+        _refused_line(
+            number,
+            "pat has no connected personal Claude plan. They connect it, "
+            "then apply the label again.",
+        )
+    ]
+    assert refused[0].params["client_msg_id"] == refusal_delivery_id(notice_id)
+    assert not refused[0].params.get("thread_ts")
+    assert refused[0].params["channel"] == CHANNEL
+    assert _rows(
+        "SELECT tracker_issue_id FROM curie.work_items WHERE tracker_issue_id = :issue",
+        {"issue": str(number)},
+    ) == []
+    assert _rows("SELECT count(*) AS n FROM curie.factory_slack_refusal_posts") == [{"n": 1}]
+    stack.drain_as(phase_lines=False, fresh=True)
+    assert len([call for call in _chat(stack) if call.text.startswith("Refused:")]) == 1
+
+
 def test_key_events_phase_lines_on_posts_phases_and_run_completed(stack: Stack) -> None:
     """The setting is off by default. On, phase lines and Run completed post, in order."""
 

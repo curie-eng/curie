@@ -161,6 +161,10 @@ def notice_body(row: FactoryIntakeNotice) -> str:
             f"This factory runs on personal model accounts and {login} is not linked to one.",
             f"The operator links {login}, or a linked person applies the label.",
         ),
+        "enrollment_inactive": (
+            f"{login} is linked, but their personal Claude plan is not connected.",
+            "They connect their plan, then apply the label again.",
+        ),
         "binding_ambiguous": (
             f"More than one factory agent serves the label {label} on {repo}, "
             "and Curie refuses to choose between them.",

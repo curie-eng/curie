@@ -41,6 +41,7 @@ from forge_fakes.github import (
     REPO,
     REPO_ID,
     SENDER,
+    SENDER_ID,
     _issue_event,
     _post,
     factory_env,
@@ -838,3 +839,182 @@ def test_webhook_delivery_attempts_one_and_periodic_pass_drains_the_rest(factory
     _pass(github, "delivery")
     rows = _rows("SELECT id FROM curie.factory_intake_notices WHERE posted_at IS NOT NULL")
     assert len(rows) == 3
+
+
+def _personal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", "personal")
+    get_settings.cache_clear()
+
+
+def _link_labeller(agent_id: str, *, active: bool | None, generation: int = 3) -> uuid.UUID:
+    """Map the fixture label actor to a principal on the agent's tenant."""
+
+    (agent,) = _sql(
+        "SELECT tenant_id FROM curie.agents WHERE id = :id", {"id": uuid.UUID(agent_id)}
+    )
+    tenant = agent["tenant_id"]
+    principal = uuid.uuid4()
+    _sql(
+        "INSERT INTO curie.principals (id, tenant_id, idp_subject, type, status, display_name) "
+        "VALUES (:id, :tenant, :subject, 'human', 'active', :name)",
+        {
+            "id": principal,
+            "tenant": tenant,
+            "subject": f"label-enrollment-{principal}",
+            "name": SENDER,
+        },
+    )
+    existing = _sql(
+        "SELECT id FROM curie.identity_namespaces "
+        "WHERE tenant_id = :tenant AND provider = 'github' AND kind = 'github_host' "
+        "AND authority = 'github.com' AND key = 'github.com'",
+        {"tenant": tenant},
+    )
+    if existing:
+        namespace = existing[0]["id"]
+        _sql(
+            "UPDATE curie.identity_namespaces SET status = 'active' WHERE id = :id",
+            {"id": namespace},
+        )
+    else:
+        namespace = uuid.uuid4()
+        _sql(
+            "INSERT INTO curie.identity_namespaces "
+            "(id, tenant_id, provider, kind, authority, key, status) "
+            "VALUES (:id, :tenant, 'github', 'github_host', 'github.com', 'github.com', 'active')",
+            {"id": namespace, "tenant": tenant},
+        )
+    _sql(
+        "INSERT INTO curie.identity_links "
+        "(id, tenant_id, identity_namespace_id, provider_native_id, principal_id, "
+        "verification_source, created_by_principal_id) "
+        "VALUES (:id, :tenant, :namespace, :account, :principal, 'admin_mapped', :principal)",
+        {
+            "id": uuid.uuid4(),
+            "tenant": tenant,
+            "namespace": namespace,
+            "account": str(SENDER_ID),
+            "principal": principal,
+        },
+    )
+    if active is not None:
+        _sql(
+            "INSERT INTO curie.personal_claude_enrollments "
+            "(id, tenant_id, principal_id, generation, active, version) "
+            "VALUES (:id, :tenant, :principal, :generation, :active, 1)",
+            {
+                "id": uuid.uuid4(),
+                "tenant": tenant,
+                "principal": principal,
+                "generation": generation,
+                "active": active,
+            },
+        )
+    return principal
+
+
+def _visible_notice(github: NoticeGitHub, number: int) -> str:
+    comments = [c for c in _comments(github, number) if "curie-factory-intake-" in c["body"]]
+    assert len(comments) == 1
+    return comments[0]["body"].split("<!--", 1)[0]
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_label_enrollment_inactive_refuses_a_disconnected_plan(
+    factory: Any, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A linked labeller with no active enrollment is told to connect a plan."""
+
+    guide = (
+        Path(__file__).resolve().parents[3] / "docs/guides/personal-subscription.md"
+    ).read_text()
+    assert "refused `personal_owner_required` before a" not in guide
+    assert "no WorkItem is refused" in guide
+    assert "`not_admitted`" in guide
+    assert "Review feedback with no WorkItem is ignored." in guide
+    assert "admitted as service before the switch" in guide
+
+    _client, github, agent = factory
+    _personal(monkeypatch)
+    _link_labeller(agent, active=False)
+    number = github.plant_issue(age=timedelta(minutes=5))
+    _observe(factory, path, number)
+
+    rows = _notices(number)
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "enrollment_inactive"
+    assert rows[0]["actor_login"] == SENDER
+    visible = _visible_notice(github, number)
+    assert f"`{SENDER}` is linked, but their personal Claude plan is not connected." in visible
+    assert "They connect their plan, then apply the label again." in visible
+    assert _work(number) == []
+    assert _requests(number) == []
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_label_enrollment_inactive_refuses_a_linked_labeller_with_no_enrollment(
+    factory: Any, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A linked labeller with no enrollment row is refused enrollment_inactive."""
+
+    _client, github, agent = factory
+    _personal(monkeypatch)
+    _link_labeller(agent, active=None)
+    number = github.plant_issue(age=timedelta(minutes=5))
+    _observe(factory, path, number)
+
+    rows = _notices(number)
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "enrollment_inactive"
+    assert rows[0]["actor_login"] == SENDER
+    visible = _visible_notice(github, number)
+    assert f"`{SENDER}` is linked, but their personal Claude plan is not connected." in visible
+    assert "They connect their plan, then apply the label again." in visible
+    assert _work(number) == []
+    assert _requests(number) == []
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_label_enrollment_inactive_keeps_an_unlinked_actor_on_personal_owner_required(
+    factory: Any, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """An actor with no principal still needs a link, not a plan connection."""
+
+    _client, github, _agent = factory
+    _personal(monkeypatch)
+    number = github.plant_issue(age=timedelta(minutes=5))
+    _observe(factory, path, number)
+
+    rows = _notices(number)
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "personal_owner_required"
+    visible = _visible_notice(github, number)
+    assert "is not linked" in visible
+    assert "enrollment_inactive" not in visible
+    assert _work(number) == []
+    assert _requests(number) == []
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_label_enrollment_inactive_admits_a_linked_actor_with_an_active_plan(
+    factory: Any, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """An active enrollment admits the labeller as owner at that generation."""
+
+    _client, github, agent = factory
+    _personal(monkeypatch)
+    principal = _link_labeller(agent, active=True, generation=3)
+    number = github.plant_issue(age=timedelta(minutes=5))
+    _observe(factory, path, number)
+
+    assert _notices(number) == []
+    items = _work(number)
+    assert len(items) == 1
+    assert items[0]["model_auth_mode"] == "personal"
+    assert items[0]["owner_principal_id"] == principal
+    assert items[0]["enrollment_generation"] == 3
+    requests = _requests(number)
+    assert len(requests) == 1
+    assert requests[0]["model_auth_mode"] == "personal"
+    assert requests[0]["owner_principal_id"] == principal
+    assert requests[0]["enrollment_generation"] == 3

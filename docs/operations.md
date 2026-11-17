@@ -1505,11 +1505,16 @@ is `poll` or `webhook`, and `poll` is the default. The API setting
 `FACTORY_MODEL_AUTH_MODE` (default `service`) selects the mode that GitHub and
 tracker intake, pull request review feedback, and
 [Slack steering](#factory-slack-steering) of a service WorkItem admit under.
-Intake never names an owner, so `personal` makes every new intake admission
-refuse with `personal_owner_required`, and a WorkItem admitted as service before
-the switch refuses its tracker mentions, review feedback and Slack steering with
-the same code; no owner is invented for it. A personal WorkItem keeps its owner
-on every revision, whoever asked for it. It is an environment setting only,
+A labelled issue in `personal` mode names an owner when the labeller is linked
+to a principal with an active personal Claude enrollment. The WorkItem owner
+is that principal at the enrollment's generation. An unlinked labeller is
+refused `personal_owner_required`. A linked labeller with no active enrollment
+is refused `enrollment_inactive`. Each refusal is answered by an issue comment
+and, when a factory Slack channel is configured, one channel post. A WorkItem
+admitted as service before the switch refuses its tracker mentions, review
+feedback and Slack steering with `personal_owner_required`. No owner is
+invented for it. A personal WorkItem keeps its owner on every revision,
+whoever asked for it. It is an environment setting only,
 with no chart value, and the worker reads it too
 ([Personal Claude enrollment](#personal-claude-enrollment)). The `factory:`
 block replaces the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
