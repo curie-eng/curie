@@ -54,6 +54,7 @@ from .factory_comment_text import (
     status_marker,
 )
 from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, pill_for
+from .factory_questions import QUESTIONS_ASKED, QUESTIONS_LABEL, ROUND_LIMIT, asked_round
 from .factory_reply_target import stored_reply_target
 from .factory_retry_policy import condition_text
 from .factory_triage_status import (
@@ -277,15 +278,16 @@ async def mark_lineage_status_comment_stale(session: AsyncSession, lineage_id: u
         await mark_status_comment_stale(session, work_item_id)
 
 
-# The state labels the pass owns (#3077, #3221; triaged since #5586). A closed
-# set, never a prefix match: human labels, including other ``curie:`` labels,
-# are never touched.
+# The state labels the pass owns (#3077, #3221; triaged since #5586; questions
+# since #5785). A closed set, never a prefix match: human labels, including
+# other ``curie:`` labels, are never touched.
 STATE_LABELS = (
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
     TRIAGED_LABEL,
+    QUESTIONS_LABEL,
 )
 LEGACY_STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
 _DESIRED_LABEL = {
@@ -301,6 +303,11 @@ _DESIRED_LABEL = {
 }
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
 _WAITING_FOR_PROGRESS = "_Waiting for the agent to report progress._"
+# The first line of a live implementation run's status comment on its ticket
+# (#5785 decision 13): posted at admission, before any model progress.
+INVESTIGATING_LINE = (
+    "Investigating this ticket. The factory will open a pull request or post its questions here."
+)
 _READING_PULL_REQUEST = "Reading the pull request and its Decisions"
 # A running pull request follow-up hides its checklist until a phase other than
 # these is reported. verification_preflight is the platform's own check, not
@@ -317,6 +324,7 @@ _PAUSED_FOR_UPGRADE_LINE = (
 def desired_label(
     status: str,
     *,
+    cause: str | None = None,
     pr_state: str | None = None,
     tracker_result: bool = False,
     result_delivered: bool = False,
@@ -325,8 +333,10 @@ def desired_label(
     """The state label for a request status; '' means none of the state labels.
 
     A tracker-result request shows triaged once its result is delivered and
-    never pr-open (``factory_triage_status.triage_label``); an implementation
-    request's mapping is unchanged.
+    never pr-open (``factory_triage_status.triage_label``). An implementation
+    request that ended with the question ending (completed, cause
+    ``questions_asked``, #5785) shows questions; every other mapping is
+    unchanged.
     """
 
     if tracker_result:
@@ -337,6 +347,8 @@ def desired_label(
             return label
     if status in {"failed", "expired"} and pr_state == "merged":
         return ""
+    if status == "completed" and cause == QUESTIONS_ASKED:
+        return QUESTIONS_LABEL
     return _DESIRED_LABEL.get(status, "")
 
 
@@ -352,6 +364,7 @@ def result_section(
     retries_used: int = 0,
     blocked_on: str | None = None,
     run_cost_usd: Decimal | None = None,
+    question_round: int | None = None,
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
@@ -362,6 +375,7 @@ def result_section(
     a failed or expired request with no successor. ``blocked_on`` is the
     condition a ``retry_condition_expired`` request was still blocked on.
     ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
+    ``question_round`` is the round a ``questions_asked`` request posted.
     """
 
     if successor is not None:
@@ -391,6 +405,12 @@ def result_section(
                 text += f"Note: {detail.strip()}\n"
         else:
             raise ValueError("a completed issue notice requires its pull request URL")
+    elif cause == QUESTIONS_ASKED:
+        # The question ending (#5785): its own outcome, never a failure line.
+        of_rounds = (
+            f" (round {question_round} of {ROUND_LIMIT})" if question_round is not None else ""
+        )
+        text = f"Questions asked{of_rounds}. Answer in a plain comment on this ticket.\n"
     elif cause == "issue_cancelled" and superseded:
         text = (
             f"Stopped: the label was added again, so a new run replaced this one.\nCause: {cause}\n"
@@ -674,6 +694,7 @@ def status_body(
     waiting_line: str | None = None,
     base_line: str | None = None,
     progress_line: str | None = None,
+    lead_line: str | None = None,
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
@@ -682,11 +703,15 @@ def status_body(
     agent's last message as a neutralized Markdown quote. With a card, the checklist
     and waiting placeholder are left out; without one the checklist is the
     fallback (#3125). A ``progress_line`` replaces both the card and the checklist.
+    A ``lead_line`` opens a non-final body, before the card, checklist or
+    waiting placeholder; a final body carries none.
     """
 
     parts: list[str] = []
     if result is not None:
         parts.append(result.rstrip("\n"))
+    elif lead_line:
+        parts.append(lead_line)
     if progress_line:
         parts.append(progress_line)
     elif card_url:
@@ -740,6 +765,13 @@ def _desired_label_sql() -> Any:
                 ThreadPublicationLineage.pr_url.is_not(None),
             ),
             literal(""),
+        ),
+        (
+            and_(
+                ExecutionRequest.status == "completed",
+                ExecutionRequest.terminal_cause == QUESTIONS_ASKED,
+            ),
+            literal(QUESTIONS_LABEL),
         ),
         (completed_proof(), literal("curie-factory:pr-open")),
         *[
@@ -846,6 +878,7 @@ class _StatusClaim:
     tracker_result: bool = False
     result_delivered: bool = False
     work_item_cancelled: bool = False
+    cause: str | None = None
 
 
 async def _claim_next(
@@ -985,6 +1018,7 @@ async def _claim_next(
         tracker_result=is_tracker_result(request),
         result_delivered=bool(result_delivered),
         work_item_cancelled=work_item.cancelled_at is not None,
+        cause=request.terminal_cause,
     )
     session.expunge(row)
     return claim
@@ -1388,6 +1422,11 @@ async def _render(
                 retries_used=retries_used,
                 blocked_on=request.blocked_on,
                 run_cost_usd=run_cost_usd,
+                question_round=(
+                    await asked_round(session, work_item.id, request.id)
+                    if cause == QUESTIONS_ASKED
+                    else None
+                ),
             )
             if (
                 request.status in {"failed", "expired", "cancelled"}
@@ -1507,6 +1546,14 @@ async def _render(
         waiting_line=waiting_line,
         base_line=render_base_line(work_item, transition),
         progress_line=progress_line,
+        lead_line=(
+            INVESTIGATING_LINE
+            if request.terminal_at is None
+            and target.kind == "issue"
+            and not is_tracker_result(request)
+            and request.execution_kind != "publication_recovery"
+            else None
+        ),
     )
     if (
         request.status in {"queued", "waiting", "running", "cancellation_requested"}
@@ -1616,6 +1663,7 @@ async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
         return 0
     desired = desired_label(
         claim.status,
+        cause=claim.cause,
         pr_state=claim.pr_state,
         tracker_result=claim.tracker_result,
         result_delivered=claim.result_delivered,

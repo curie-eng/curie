@@ -1,11 +1,12 @@
 """The single issue read authorized by a factory issue read capability (ADR 0187),
-and its two tracker result siblings (ADR 0277, #5586).
+its two tracker result siblings (ADR 0277, #5586) and the question route (#5785).
 
 The same ``wir`` capability authorizes ``/work-items/completion-contract`` (the
 runner asks which contract its execution runs under; a tracker result request
 reserves its one model session there) and ``/work-items/tracker-result`` (the
-runner's ``submit_tracker_result`` tool). Each re-checks that the capability
-names the durable WorkItem's issue before and after any tracker call.
+runner's ``submit_tracker_result`` tool), and ``/work-items/questions`` (the
+runner's ``ask_questions`` tool). Each re-checks that the capability names the
+durable WorkItem's issue before and after any tracker call.
 """
 
 import asyncio
@@ -24,10 +25,13 @@ from curie_api.schemas.workitems import (
     IssueReadContext,
     IssueReadContextMint,
     IssueReadResult,
+    QuestionsOut,
+    QuestionsSubmission,
     TrackerResultOut,
     TrackerResultSubmission,
 )
 
+from .. import factory_questions as questions_core
 from .. import factory_tracker_result_runtime as runtime
 from .. import requester_instruction_context
 from ..auth import require_internal_worker_token
@@ -449,3 +453,79 @@ async def submit_tracker_result(
             "ticket_url": answer.ticket_url,
         }
     )
+
+
+# The question route (#5785) ----------------------------------------------------------
+
+_QUESTION_REFUSALS = {
+    questions_core.INVALID_CONTEXT: "the execution no longer grants this call",
+    questions_core.INVALID_QUESTIONS: "the questions are outside the tool's bounds",
+    questions_core.NOT_IMPLEMENTATION_CONTRACT: "this execution does not run the "
+    "implementation contract",
+    questions_core.REQUEST_NOT_RUNNING: "this execution is not running",
+    questions_core.WORK_ITEM_CANCELLED: "this work item is cancelled",
+    questions_core.PULL_REQUEST_OPEN: "this work item already has an open pull request",
+    questions_core.ALREADY_PUBLISHED: "this execution already published",
+    questions_core.ALREADY_ASKED: "this execution already posted different questions",
+    questions_core.QUESTION_ROUNDS_EXHAUSTED: "this ticket's question rounds are used",
+}
+
+
+def _question_refused(code: str) -> HTTPException:
+    return issue_read_error(409, code, _QUESTION_REFUSALS.get(code, "the questions were refused"))
+
+
+@router.post("/questions", response_model=QuestionsOut)
+async def post_questions(
+    data: QuestionsSubmission,
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    claims: Annotated[IssueReadClaims, Depends(require_issue_read)],
+) -> QuestionsOut:
+    """Post this execution's numbered questions on its own ticket (#5785).
+
+    The platform composes the comment and writes it as one marked comment per
+    asking request through the tracker's marked-comment write. The round is
+    recorded ``posting`` and committed before the tracker write, and
+    ``outstanding`` after it, with the answer fence read from the database
+    clock then. A replay of the same body by the same request answers the
+    first result with no second write. Refusals are 409 with a fixed code and
+    nothing echoed; a tracker failure is 503 ``tracker_unavailable`` and
+    leaves the round ``posting``, which settlement treats as not asked.
+    """
+
+    response.headers["Cache-Control"] = "no-store"
+    if not questions_core.input_valid(data.summary, data.questions):
+        raise _question_refused(questions_core.INVALID_QUESTIONS)
+    try:
+        await _named_pair(session, claims)
+    except runtime.RuntimeRefused as refused:
+        raise _question_refused(refused.code) from None
+    try:
+        begun = await questions_core.begin_round(
+            session,
+            request_id=claims.execution_request_id,
+            summary=data.summary,
+            questions=data.questions,
+        )
+        if isinstance(begun, questions_core.Posting):
+            try:
+                comment_id = await questions_core.post_round(
+                    get_settings(),
+                    request.app.state.http_client,
+                    request_id=claims.execution_request_id,
+                    posting=begun,
+                )
+            except questions_core.TrackerUnavailable:
+                raise _tracker_unavailable() from None
+            begun = await questions_core.finish_round(
+                session,
+                work_item_id=begun.work_item.id,
+                request_id=claims.execution_request_id,
+                digest=begun.digest,
+                comment_id=comment_id,
+            )
+    except questions_core.QuestionsRefused as refused:
+        raise _question_refused(refused.code) from None
+    return QuestionsOut(round=begun.round, rounds_limit=questions_core.ROUND_LIMIT)

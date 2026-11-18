@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
-from .. import factory_retry_policy, transcripts
+from .. import factory_questions, factory_retry_policy, transcripts
 from ..config import get_settings
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
 from ..factory_retry_policy import Disposition, DispositionKind, RetryFacts, RetrySafety
@@ -589,6 +589,7 @@ async def settle_terminal(
 
     if request.terminal_at is None:
         return
+    await factory_questions.settle_round(session, work_item, request)
     await _queue_notice(session, work_item, request, detail=detail)
     continuing = await session.scalar(
         select(ExecutionRequest.id)
@@ -2105,6 +2106,18 @@ async def terminalize_execution(
         if await _unchanged_follow_up(session, work_item, request, detail):
             status = "completed"
             cause = "completed"
+        else:
+            # The question ending (#5785): a request whose posted questions
+            # are this WorkItem's current round settles completed, so it never
+            # spends an automatic failure successor and is never needs-human.
+            # A request refused past the round cap fails with its own cause,
+            # which admits no successor.
+            ending = await factory_questions.question_ending(session, work_item.id, request.id)
+            if ending == factory_questions.QUESTIONS_ASKED:
+                status = "completed"
+                cause = ending
+            elif ending is not None:
+                cause = ending
     if status == "failed" and cause.strip() == "approval_create_failed":
         pending = await session.scalar(
             select(Publication.id)
@@ -2543,6 +2556,9 @@ async def request_cancellation(
 
     await _cancel_queued_requests(session, work_item_id, now, cause)
     await _expire_unused_grants(session, work_item_id)
+    # An outstanding question ends with the WorkItem (#5785): after this no
+    # comment is an answer.
+    await factory_questions.delete_for_cancellation(session, work_item_id)
     await _revoke_triage_delegations(session, work_item_id, now)
 
     active = await lock_active_request(session, work_item_id)
