@@ -152,9 +152,9 @@ def _cause(
                     "and expiry is pending the reconciler"
                 )
             return f"{text}; waiting deadline {_iso(deadline)}"
-        if req.retry_of_request_id is not None and now < req.dispatch_not_before:
+        if req.retry_of_request_id is not None and now < req.dispatch_due:
             return (
-                f"automatic retry scheduled for {_iso(req.dispatch_not_before)}; "
+                f"automatic retry scheduled for {_iso(req.dispatch_due)}; "
                 f"waiting deadline {_iso(deadline)}"
             )
         text = "waiting for sandbox capacity"
@@ -494,7 +494,7 @@ def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
             if req.retry_of_request_id is not None
             else None
         ),
-        dispatch_not_before=req.dispatch_not_before,
+        dispatch_not_before=req.dispatch_due,
         blocked_on=req.blocked_on,
         resource_gate=(
             None

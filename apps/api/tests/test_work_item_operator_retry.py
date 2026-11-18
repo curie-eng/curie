@@ -45,6 +45,7 @@ from test_factory_retry import (
     _configure,
     _db,
     _dispatch,
+    _due,
     _execute,
     _expire_wait,
     _fail,
@@ -301,7 +302,7 @@ def test_failure_settled_before_automatic_recovery_admits_one_request(
     successor = _successor(item.request_id)
     assert successor is not None
     # The automatic backoff of slot 1, not an immediate start.
-    due = successor["dispatch_not_before"] - _request(item.request_id)["terminal_at"]
+    due = _due(successor) - _request(item.request_id)["terminal_at"]
     assert due >= timedelta(seconds=24)
     assert body["successor_dispatch_not_before"] is not None
     assert len(_requests(item.work_item_id)) == 2

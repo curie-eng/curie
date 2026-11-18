@@ -215,7 +215,8 @@ class WorkItemRequestOut(BaseModel):
     # The raised limit a resource gated retry waits for; null when ungated.
     resource_gate: ResourceGateOut | None
     # The worker's side effect fact from this request's finish; null when the
-    # request did not end through a worker finish.
+    # request did not end through a worker finish or its worker sent no fact,
+    # as a worker from an earlier release does.
     retry_safety: RetrySafety | None
 
 

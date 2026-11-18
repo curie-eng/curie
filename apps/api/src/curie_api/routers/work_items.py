@@ -184,9 +184,11 @@ class FinishBody(BaseModel):
     # The CI fix round whose turn ended unpublished (#4330). Required for
     # ``ci_fix_unpublished`` and refused for every other cause.
     ci_fix_round: int | None = Field(default=None, ge=CI_FIRST_FIX_ROUND, le=CI_MAX_ROUNDS)
-    # The worker's typed safety fact for this turn (ADR 0269). Required with
-    # no default: a missing fact is refused, never read as clean.
-    retry_safety: Literal["no_effects", "flagged", "uncertain"]
+    # The worker's typed safety fact for this turn (ADR 0269). A worker from
+    # an earlier release sends none; the body carries no protocol version to
+    # tell it from a current worker, so a missing fact is accepted as unknown:
+    # stored as NULL, which admits no implementation retry, never as clean.
+    retry_safety: Literal["no_effects", "flagged", "uncertain"] | None = None
     # The provider retry condition the worker received, decoded tolerantly.
     retry_condition: RetryConditionBody | None = None
     # The scratch volume a scratch exhaustion filled (#5427). Required for
@@ -200,6 +202,13 @@ class FinishBody(BaseModel):
             raise ValueError("ci_fix_unpublished requires ci_fix_round")
         if not unpublished and self.ci_fix_round is not None:
             raise ValueError("ci_fix_round is only valid with cause ci_fix_unpublished")
+        return self
+
+    @model_validator(mode="after")
+    def _safety_absent_not_null(self) -> Self:
+        # Only an omitted fact reads as unknown; an explicit null is no fact.
+        if "retry_safety" in self.model_fields_set and self.retry_safety is None:
+            raise ValueError("retry_safety must be a safety fact when present")
         return self
 
     @model_validator(mode="after")
