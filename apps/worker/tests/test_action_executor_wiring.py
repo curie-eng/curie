@@ -57,7 +57,7 @@ def test_the_loop_is_not_built_with_the_executor_off() -> None:
 def test_the_loop_is_not_built_without_a_worker_token() -> None:
     """Pins existing behaviour."""
 
-    assert _build(_config(internal_worker_token="")) is None
+    assert _build(_config(internal_worker_token="", publication_candidates_enabled=False)) is None
 
 
 def test_the_local_tier_loop_reads_no_deployment() -> None:
