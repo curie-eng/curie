@@ -94,11 +94,12 @@ def required_job_names(repo_root: Path, *, deadline: float) -> frozenset[str]:
             "E2E required",
             *(
                 f"E2E chart runtime regressions (kind, Calico, {leg})"
-                for leg in ("chart", "upgrade", "workload")
+                for leg in ("chart", "upgrade", "workload-1", "workload-2")
             ),
             *(
                 f"E2E scripted factory (kind, scripted model, {suite})"
                 for suite in (
+                    "scenario",
                     "initial-binding-1",
                     "initial-binding-2",
                     "initial-binding-3",
