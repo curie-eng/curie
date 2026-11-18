@@ -218,6 +218,7 @@ chart_scenarios:
     - .github/workflows/ci.yaml
     - .github/e2e-selection.yaml
     - .github/actions/load-ci-images
+    - .github/scripts
     - tools/runtime-assertion-gate/run.sh
     - cli/scripts/configure-docker-hub-mirror.sh
     - cli/scripts/ensure-kind-registry.sh
@@ -283,7 +284,7 @@ chart_scenarios:
         - examples/sre-bot/observability/prometheus-values.yaml
     connector-apply-race:
       step: Connector apply survives a concurrent reconciler create
-      leg: workload
+      leg: workload-2
       inputs:
         - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/connector-apply-race-runtime.sh
@@ -295,7 +296,7 @@ chart_scenarios:
         - uv.lock
     connector-secret-rotation:
       step: Hosted connector credential rotation rolls only that connector
-      leg: workload
+      leg: workload-2
       inputs:
         - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/connector-secret-rotation-runtime.sh
@@ -324,7 +325,7 @@ chart_scenarios:
         - uv.lock
     quota-progress:
       step: Quota progress regression
-      leg: workload
+      leg: workload-1
       inputs:
         - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
@@ -340,7 +341,7 @@ chart_scenarios:
     # still runs if shared_inputs is ever narrowed.
     factory-resource-profile:
       step: Factory resource profile runtime (#4889)
-      leg: workload
+      leg: workload-1
       inputs:
         - charts/curie/ci/scenarios/workload-install.sh
         - charts/curie/ci/runtime/factory-resource-profile-runtime.sh
@@ -417,6 +418,7 @@ rules:
     apps/worker/src/curie_worker/consumer_liveness.py: [local, local-release, cluster, released-upgrade]
     apps/worker/src/curie_worker/workspace.py: [local, local-release, cluster, released-upgrade]
   prefixes:
+    .github/scripts: [cluster, released-upgrade]
     charts: [cluster]
     # Everything `helm package charts/curie` ships. charts/curie/ci is
     # helmignored, so its test scripts cannot change an upgrade and stay on

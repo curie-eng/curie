@@ -495,6 +495,7 @@ jobs:
       # Per test durations for shard planning. The name stays outside the
       # required job's `python-pytest-shard-*` download.
       - name: Upload pytest durations
+        continue-on-error: true
         if: always() && steps.python-runtime.outputs.pytest == 'true' && steps.python-runtime.outputs.active == 'true'
         uses: actions/upload-artifact@v7
         with:
@@ -2928,6 +2929,7 @@ jobs:
           CURIE_OIDC_E2E_IMAGE_TAG: oidc-e2e
         run: bash cli/scripts/oidc-e2e.sh --evidence "$RUNNER_TEMP/oidc-e2e-evidence.json"
       - name: Upload the OIDC evidence
+        continue-on-error: true
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
@@ -3240,49 +3242,32 @@ jobs:
         run: bash cli/scripts/ensure-kind-registry.sh
       - name: Restore kind and kubectl from the Actions cache
         uses: ./.github/actions/kind-tool-cache
-      - name: Create the kind cluster
-        id: create_kind_cluster
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
         continue-on-error: true
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-e2e
-          config: kind-config.yaml
-      # A first attempt that died partway can leave nodes behind, and
-      # `kind create cluster` refuses to run against a cluster name that
-      # already has any. Tear the partial cluster down so the retry starts
-      # clean. `kind` is absent from PATH when attempt 1 died before the
-      # action installed it, which is what the `|| true` covers.
-      - name: Back off before retrying Create the kind cluster
-        if: steps.create_kind_cluster.outcome == 'failure'
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
         run: |
-          echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
-          kind delete cluster --name curie-e2e 2>/dev/null || true
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
           bash cli/scripts/ensure-kind-registry.sh
           sleep 15
-      - name: Create the kind cluster (retry)
-        if: steps.create_kind_cluster.outcome == 'failure'
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-e2e
-          config: kind-config.yaml
+          install_only: true
       # The cluster has no CNI until this lands (disableDefaultCNI above), so
       # every node stays NotReady and nothing schedules until Calico is up.
       - name: Install Calico so NetworkPolicy is actually enforced
-        run: |
-          set -euo pipefail
-          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
-            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
-          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
-            | sha256sum --check --strict
-          kubectl apply -f "$calico_manifest"
-          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
-          kubectl wait --for=condition=Ready node --all --timeout=300s
-      # Load the product images into the node store with no registry round trip.
+        id: prepare_kind
+        run: bash .github/scripts/prepare-kind.sh curie-e2e kind-config.yaml
       - name: Load images into the kind cluster
         run: |
           set -euo pipefail
@@ -3460,9 +3445,6 @@ jobs:
           kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
           kubectl describe pods -n curie -l app.kubernetes.io/component=runner-sandbox || true
           kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
-      # Delete only this job's namespaced release resources. Do not uninstall or
-      # delete the shared controller namespace: the pinned kind action owns final
-      # disposal of the whole single-use cluster. This still runs after failure.
       - name: Tear down the disposable cluster release
         if: always()
         run: |
@@ -3478,6 +3460,9 @@ jobs:
           name: runtime-assertion-receipts-${{ github.job }}
           path: ${{ runner.temp }}/runtime-assertion-receipts
           if-no-files-found: ignore
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-e2e'
+        run: kind delete cluster --name curie-e2e
 
   # The factory driver owns its kind cluster, registry, and local endpoints.
   # Replay drives the production factory from one labelled fixture issue to
@@ -3494,7 +3479,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [initial-binding-1, initial-binding-2, initial-binding-3, static-token-rotation, fresh-install]
+        suite: [scenario, initial-binding-1, initial-binding-2, initial-binding-3, static-token-rotation, fresh-install]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -3587,6 +3572,12 @@ jobs:
           docker tag curie-ci/worker:candidate curie-worker:local
           docker tag curie-ci/ui:candidate curie-ui:local
           docker tag curie-ci/runner:candidate curie-runner:latest
+      - name: Run the scripted factory scenario
+        if: matrix.suite == 'scenario'
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          BUILDX_BUILDER: default
+        run: python3 tools/factory-e2e/factory_e2e.py scripted
       - name: Run the initial tracker binding regressions (shard 1/3)
         if: matrix.suite == 'initial-binding-1'
         run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_initial_binding.py --case-shard 1/3
@@ -3602,6 +3593,14 @@ jobs:
       - name: Run the fresh cluster install regression
         if: matrix.suite == 'fresh-install'
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_cluster_up.py::test_fresh_cluster_up_converges_without_rerun
+      - name: Upload scripted factory evidence
+        continue-on-error: true
+        if: always() && matrix.suite == 'scenario'
+        uses: actions/upload-artifact@v7
+        with:
+          name: scripted-factory-evidence-${{ github.sha }}
+          path: target/factory-e2e/scripted-*.json
+          if-no-files-found: warn
 
   # The admitted agent runtime module (#4619) loads the candidate CLI built by
   # rust-build and the api, worker, ui and runner images built by ci-images,
@@ -3726,6 +3725,7 @@ jobs:
           CURIE_C4_CANDIDATE_IMAGES: curie-ci/{component}:candidate
         run: uv run pytest -q -n 0 --durations=0 tools/factory-e2e/tests/test_c4_admitted_agent.py tools/factory-e2e/tests/test_c4_dynamic_base.py --case-shard "$CASE_SHARD"
       - name: Upload the admitted agent failure digests
+        continue-on-error: true
         if: failure()
         uses: actions/upload-artifact@v7
         with:
@@ -3841,7 +3841,7 @@ jobs:
   # assertion and the connector readiness probe are registered runtime
   # assertions (#3391), and a failure here reddens the required verdict exactly
   # as the rung does. Proofs using this job's cluster each own their namespace.
-  # The job runs as three legs, `chart`, `upgrade`, and `workload`, each on
+  # Chart, upgrade, and two workload legs each run on
   # its own runner and its own kind cluster; the selector's `chart_legs`
   # output picks them.
   e2e-cluster-chart-regressions:
@@ -3909,48 +3909,32 @@ jobs:
         run: bash cli/scripts/ensure-kind-registry.sh
       - name: Restore kind and kubectl from the Actions cache
         uses: ./.github/actions/kind-tool-cache
-      - name: Create the kind cluster
-        id: create_kind_cluster
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
         continue-on-error: true
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-e2e
-          config: kind-config.yaml
-      # A first attempt that died partway can leave nodes behind, and
-      # `kind create cluster` refuses to run against a cluster name that
-      # already has any. Tear the partial cluster down so the retry starts
-      # clean. `kind` is absent from PATH when attempt 1 died before the
-      # action installed it, which is what the `|| true` covers.
-      - name: Back off before retrying Create the kind cluster
-        if: steps.create_kind_cluster.outcome == 'failure'
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
         run: |
-          echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
-          kind delete cluster --name curie-e2e 2>/dev/null || true
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
           bash cli/scripts/ensure-kind-registry.sh
           sleep 15
-      - name: Create the kind cluster (retry)
-        if: steps.create_kind_cluster.outcome == 'failure'
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-e2e
-          config: kind-config.yaml
+          install_only: true
       # The cluster has no CNI until this lands (disableDefaultCNI above), so
       # every node stays NotReady and nothing schedules until Calico is up.
       - name: Install Calico so NetworkPolicy is actually enforced
-        run: |
-          set -euo pipefail
-          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
-            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
-          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
-            | sha256sum --check --strict
-          kubectl apply -f "$calico_manifest"
-          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
-          kubectl wait --for=condition=Ready node --all --timeout=300s
+        id: prepare_kind
+        run: bash .github/scripts/prepare-kind.sh curie-e2e kind-config.yaml
       - name: Install YAML parser for the installation identity proof
         run: python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
       - name: Prepare the installation identity proof kubeconfig
@@ -4066,18 +4050,18 @@ jobs:
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
       - name: Download the candidate chart runtime CLI
-        if: ${{ (matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) || (matrix.leg == 'upgrade' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}
+        if: ${{ (startsWith(matrix.leg, 'workload-') && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) || (matrix.leg == 'upgrade' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: curie-x86_64-linux-${{ github.sha }}
           path: cli/target/release
       - name: Load the candidate chart runtime images
-        if: ${{ (matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) || (matrix.leg == 'upgrade' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}
+        if: ${{ (startsWith(matrix.leg, 'workload-') && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) || (matrix.leg == 'upgrade' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}
         uses: ./.github/actions/load-ci-images
         with:
           images: "{api,worker,runner}"
       - name: Stage the candidate chart runtime images in kind
-        if: ${{ (matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) || (matrix.leg == 'upgrade' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}
+        if: ${{ (startsWith(matrix.leg, 'workload-') && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile'))) || (matrix.leg == 'upgrade' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'platform-runner-upgrade'))) }}
         run: |
           set -euo pipefail
           chmod +x cli/target/release/curie
@@ -4101,7 +4085,7 @@ jobs:
         run: bash tools/runtime-assertion-gate/run.sh charts/curie/ci/runtime/platform-runner-upgrade-runtime.sh
       - name: Install the shared workload platform
         id: workload_install
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress')) }}
+        if: ${{ (matrix.leg == 'workload-1' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress'))) || (matrix.leg == 'workload-2' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation'))) }}
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
@@ -4111,7 +4095,7 @@ jobs:
           CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:chart-runtime-${{ github.sha }}
         run: bash tools/runtime-assertion-gate/run.sh charts/curie/ci/scenarios/workload-install.sh up
       - name: Quota progress regression
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        if: ${{ matrix.leg == 'workload-1' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
         timeout-minutes: 30
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
@@ -4126,7 +4110,7 @@ jobs:
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
       - name: Hosted connector credential rotation rolls only that connector
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') }}
+        if: ${{ matrix.leg == 'workload-2' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') }}
         timeout-minutes: 45
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
@@ -4140,7 +4124,7 @@ jobs:
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/connector-secret-rotation-runtime.sh
       - name: Connector apply survives a concurrent reconciler create
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') }}
+        if: ${{ matrix.leg == 'workload-2' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') }}
         timeout-minutes: 45
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
@@ -4156,7 +4140,7 @@ jobs:
       # #4889: a factory agent's real sandbox holds a 1280Mi workspace write for
       # at least 90 seconds, and the standard envelope evicts the same write.
       - name: Factory resource profile runtime (#4889)
-        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') }}
+        if: ${{ matrix.leg == 'workload-1' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') }}
         timeout-minutes: 30
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
@@ -4175,7 +4159,7 @@ jobs:
           kubectl get pods -A -o wide || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
       - name: Remove the shared workload platform
-        if: ${{ always() && matrix.leg == 'workload' }}
+        if: ${{ always() && startsWith(matrix.leg, 'workload-') }}
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           CURIE_SCENARIO_CONTEXT: kind-curie-e2e
@@ -4206,7 +4190,7 @@ jobs:
           kubectl --context "$context" get pods -A -o wide || true
           kubectl --context "$context" get events -A --sort-by=.lastTimestamp | tail -50 || true
       - name: Delete the job-owned kind cluster
-        if: always()
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-e2e'
         run: |
           set -euo pipefail
           kind delete cluster --name curie-e2e
@@ -4318,49 +4302,32 @@ jobs:
         run: bash cli/scripts/ensure-kind-registry.sh
       - name: Restore kind and kubectl from the Actions cache
         uses: ./.github/actions/kind-tool-cache
-      - name: Create the kind cluster
-        id: create_kind_cluster
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
         continue-on-error: true
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-e2e
-          config: kind-config.yaml
-      # A first attempt that died partway can leave nodes behind, and
-      # `kind create cluster` refuses to run against a cluster name that
-      # already has any. Tear the partial cluster down so the retry starts
-      # clean. `kind` is absent from PATH when attempt 1 died before the
-      # action installed it, which is what the `|| true` covers.
-      - name: Back off before retrying Create the kind cluster
-        if: steps.create_kind_cluster.outcome == 'failure'
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
         run: |
-          echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
-          kind delete cluster --name curie-e2e 2>/dev/null || true
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
           bash cli/scripts/ensure-kind-registry.sh
           sleep 15
-      - name: Create the kind cluster (retry)
-        if: steps.create_kind_cluster.outcome == 'failure'
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-e2e
-          config: kind-config.yaml
+          install_only: true
       # The cluster has no CNI until this lands (disableDefaultCNI above), so
       # every node stays NotReady and nothing schedules until Calico is up.
       - name: Install Calico so NetworkPolicy is actually enforced
-        run: |
-          set -euo pipefail
-          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
-            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
-          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
-            | sha256sum --check --strict
-          kubectl apply -f "$calico_manifest"
-          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
-          kubectl wait --for=condition=Ready node --all --timeout=300s
-      # Load the product images into the node store with no registry round trip.
+        id: prepare_kind
+        run: bash .github/scripts/prepare-kind.sh curie-e2e kind-config.yaml
       - name: Load images into the kind cluster
         run: |
           set -euo pipefail
@@ -4466,13 +4433,14 @@ jobs:
           kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
           kubectl describe pods -n curie -l app.kubernetes.io/component=runner-sandbox || true
           kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
-      # Delete only this job's namespaced release resources. Do not uninstall or
-      # delete the shared controller namespace: the pinned kind action owns final
-      # disposal of the whole single-use cluster. This still runs after failure.
       - name: Tear down the disposable cluster release
         if: always()
         run: |
           kubectl delete namespace curie \
+            --ignore-not-found --wait=false 2>/dev/null || true
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-e2e'
+        run: kind delete cluster --name curie-e2e
 
   # APPROVAL RESUME AFTER WORKER AND STORE RESTARTS (#4016). An approval
   # resolved while the resume store (Valkey) and the worker restart must still
@@ -4571,49 +4539,32 @@ jobs:
         run: bash cli/scripts/ensure-kind-registry.sh
       - name: Restore kind and kubectl from the Actions cache
         uses: ./.github/actions/kind-tool-cache
-      - name: Create the kind cluster
-        id: create_kind_cluster
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
         continue-on-error: true
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-e2e
-          config: kind-config.yaml
-      # A first attempt that died partway can leave nodes behind, and
-      # `kind create cluster` refuses to run against a cluster name that
-      # already has any. Tear the partial cluster down so the retry starts
-      # clean. `kind` is absent from PATH when attempt 1 died before the
-      # action installed it, which is what the `|| true` covers.
-      - name: Back off before retrying Create the kind cluster
-        if: steps.create_kind_cluster.outcome == 'failure'
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
         run: |
-          echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
-          kind delete cluster --name curie-e2e 2>/dev/null || true
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
           bash cli/scripts/ensure-kind-registry.sh
           sleep 15
-      - name: Create the kind cluster (retry)
-        if: steps.create_kind_cluster.outcome == 'failure'
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-e2e
-          config: kind-config.yaml
+          install_only: true
       # The cluster has no CNI until this lands (disableDefaultCNI above), so
       # every node stays NotReady and nothing schedules until Calico is up.
       - name: Install Calico so NetworkPolicy is actually enforced
-        run: |
-          set -euo pipefail
-          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
-            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
-          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
-            | sha256sum --check --strict
-          kubectl apply -f "$calico_manifest"
-          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
-          kubectl wait --for=condition=Ready node --all --timeout=300s
-      # Load the product images into the node store with no registry round trip.
+        id: prepare_kind
+        run: bash .github/scripts/prepare-kind.sh curie-e2e kind-config.yaml
       - name: Load images into the kind cluster
         run: |
           set -euo pipefail
@@ -4715,14 +4666,14 @@ jobs:
           kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
           kubectl logs -n curie -l app.kubernetes.io/component=api --tail=200 || true
           kubectl logs -n curie -l app.kubernetes.io/component=runner-sandbox --all-containers --prefix --tail=200 || true
-      # Delete only this job's namespaced release resources. Do not uninstall or
-      # delete the shared controller namespace: the pinned kind action owns final
-      # disposal of the whole single-use cluster. This still runs after failure.
       - name: Tear down the disposable cluster release
         if: always()
         run: |
           kubectl delete namespace curie \
             --ignore-not-found --wait=false 2>/dev/null || true
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-e2e'
+        run: kind delete cluster --name curie-e2e
 
   # RELEASED CHART UPGRADE REGRESSION (issues #2097 and #2194). This is separate
   # from the fresh install cluster rung because it starts from published charts
@@ -4852,41 +4803,30 @@ jobs:
         run: bash cli/scripts/ensure-kind-registry.sh
       - name: Restore kind and kubectl from the Actions cache
         uses: ./.github/actions/kind-tool-cache
-      - name: Create the disposable kind cluster
-        id: create_the_disposable_kind_cluster
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
         continue-on-error: true
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-upgrade
-          config: kind-upgrade-config.yaml
-      - name: Back off before retrying Create the disposable kind cluster
-        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
         run: |
-          echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
           bash cli/scripts/ensure-kind-registry.sh
-          kind delete cluster --name curie-upgrade 2>/dev/null || true
           sleep 15
-      - name: Create the disposable kind cluster (retry)
-        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-upgrade
-          config: kind-upgrade-config.yaml
+          install_only: true
       - name: Install Calico so NetworkPolicy is enforced
-        run: |
-          set -euo pipefail
-          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
-            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
-          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
-            | sha256sum --check --strict
-          kubectl apply -f "$calico_manifest"
-          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
-          kubectl wait --for=condition=Ready node --all --timeout=300s
+        id: prepare_kind
+        run: bash .github/scripts/prepare-kind.sh curie-upgrade kind-upgrade-config.yaml
       - name: Load candidate images into the kind cluster
         run: |
           set -euo pipefail
@@ -5226,7 +5166,9 @@ jobs:
         run: |
           kubectl delete namespace curie curie-negative \
             --ignore-not-found --wait=false 2>/dev/null || true
-          kind delete cluster --name curie-upgrade 2>/dev/null || true
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade'
+        run: kind delete cluster --name curie-upgrade
 
   # Split from e2e-released-upgrade so the nil unsafe helper negative control
   # runs on its own runner and kind cluster, concurrently with the positive
@@ -5288,41 +5230,30 @@ jobs:
         run: bash cli/scripts/ensure-kind-registry.sh
       - name: Restore kind and kubectl from the Actions cache
         uses: ./.github/actions/kind-tool-cache
-      - name: Create the disposable kind cluster
-        id: create_the_disposable_kind_cluster
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
         continue-on-error: true
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-upgrade-negative
-          config: kind-upgrade-negative-config.yaml
-      - name: Back off before retrying Create the disposable kind cluster
-        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
         run: |
-          echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
           bash cli/scripts/ensure-kind-registry.sh
-          kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
           sleep 15
-      - name: Create the disposable kind cluster (retry)
-        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-upgrade-negative
-          config: kind-upgrade-negative-config.yaml
+          install_only: true
       - name: Install Calico so NetworkPolicy is enforced
-        run: |
-          set -euo pipefail
-          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
-            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
-          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
-            | sha256sum --check --strict
-          kubectl apply -f "$calico_manifest"
-          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
-          kubectl wait --for=condition=Ready node --all --timeout=300s
+        id: prepare_kind
+        run: bash .github/scripts/prepare-kind.sh curie-upgrade-negative kind-upgrade-negative-config.yaml
       - name: Load the candidate worker image into the kind cluster
         run: kind load docker-image curie-worker:upgrade-candidate --name curie-upgrade-negative
       - name: Download and verify the exact public v0.8.2 chart
@@ -5478,6 +5409,7 @@ jobs:
             > namespace-cleanup-evidence.json || true
           cat namespace-cleanup-evidence.json
       - name: Retain safe namespace cleanup evidence
+        continue-on-error: true
         if: failure()
         uses: actions/upload-artifact@v7
         with:
@@ -5491,7 +5423,9 @@ jobs:
             --ignore-not-found --wait=false 2>/dev/null || true
           kubectl delete namespace curie-profile \
             --ignore-not-found --wait=false 2>/dev/null || true
-          kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
+      - name: Delete the job-owned kind cluster
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-negative'
+        run: kind delete cluster --name curie-upgrade-negative
 
   # The upgrade matrix is sharded (issue #2733) and change-selected with
   # released-upgrade. Unrelated CLI, docs, and UI PRs must not occupy 12 kind
@@ -5614,43 +5548,30 @@ jobs:
         run: bash cli/scripts/ensure-kind-registry.sh
       - name: Restore kind and kubectl from the Actions cache
         uses: ./.github/actions/kind-tool-cache
-      - name: Create the disposable kind cluster
-        id: create_kind_cluster
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
         continue-on-error: true
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-upgrade-matrix
-          config: kind-upgrade-matrix-config.yaml
-      - name: Back off before retrying Create the disposable kind cluster
-        if: steps.create_kind_cluster.outcome == 'failure'
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
         run: |
-          echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
-          kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
           bash cli/scripts/ensure-kind-registry.sh
           sleep 15
-      - name: Create the disposable kind cluster (retry)
-        if: steps.create_kind_cluster.outcome == 'failure'
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
-          cluster_name: curie-upgrade-matrix
-          config: kind-upgrade-matrix-config.yaml
+          install_only: true
       - name: Install Calico so NetworkPolicy is enforced
-        run: |
-          set -euo pipefail
-          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
-            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
-          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
-            | sha256sum --check --strict
-          kubectl apply -f "$calico_manifest"
-          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
-          kubectl wait --for=condition=Ready node --all --timeout=300s
-      # No workflow-level kind load: the script retags matrix-candidate to
-      # 0.9.0/0.9.1 from local docker and kind-loads exclusive tags itself.
+        id: prepare_kind
+        run: bash .github/scripts/prepare-kind.sh curie-upgrade-matrix kind-upgrade-matrix-config.yaml
       - name: Run the cluster upgrade matrix
         env:
           CURIE_BIN: cli/target/release/curie
@@ -5677,6 +5598,7 @@ jobs:
           tail -c 2000 .projects/2590-evidence/rollback-088.json 2>/dev/null || true
           tail -c 1000 .projects/2590-evidence/rollback-088.err 2>/dev/null || true
       - name: Upload upgrade matrix evidence
+        continue-on-error: true
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -5684,10 +5606,10 @@ jobs:
           path: .projects/2590-evidence
           if-no-files-found: warn
       - name: Tear down the owned upgrade matrix cluster
-        if: always()
+        if: always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-matrix'
         run: |
           kubectl delete namespace acme-2590 --ignore-not-found --wait=false 2>/dev/null || true
-          kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
+          kind delete cluster --name curie-upgrade-matrix
 
   # Needs only `changes`, so an unregistered or untiered runtime assertion
   # fails within minutes instead of after the kind matrix. It is a separate job
