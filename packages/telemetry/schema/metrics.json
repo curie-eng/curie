@@ -101,6 +101,43 @@
       "type": "counter",
       "unit": "{turn}"
     },
+    "curie.agent.turn.duration": {
+      "attributes": {
+        "agent": {
+          "ceiling": 32,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$",
+          "reserved": [
+            "other",
+            "unbound"
+          ]
+        },
+        "outcome": [
+          "done",
+          "awaiting_approval",
+          "budget_halted",
+          "classified_failure",
+          "side_effect_halted",
+          "idle",
+          "interrupted",
+          "deadline_halted",
+          "capacity_wait_expired",
+          "stale_owner"
+        ],
+        "service.name": [
+          "curie-worker"
+        ],
+        "source": [
+          "worker"
+        ]
+      },
+      "cardinality_bound": 340,
+      "description": "End to end turn duration for one agent. The agent label follows curie.agent.turn.completed: at most 32 slugs per process, the rest other, a turn with no resolved agent unbound.",
+      "monotonic": false,
+      "type": "histogram",
+      "unit": "s"
+    },
     "curie.approval.lifecycle": {
       "attributes": {
         "operation": [

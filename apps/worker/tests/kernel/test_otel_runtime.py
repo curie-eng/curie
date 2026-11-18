@@ -271,6 +271,8 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
 
     No binding leaves ``unbound``. A binding's agent name is the label. The
     fleet ``curie.turn.completed`` point never gains an agent attribute.
+    #5814: ``curie.agent.turn.duration`` carries the fleet duration's value
+    under the same agent and outcome, and the fleet duration stays unlabeled.
     """
 
     class _Resolved:
@@ -325,6 +327,10 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
             agent_points = _metrics(probe, "curie.agent.turn.completed")
             assert agent_points[-1].attributes["agent"] == "unbound"
             assert agent_points[-1].attributes["outcome"] == "done"
+            durations = _metrics(probe, "curie.agent.turn.duration")
+            assert len(durations) == 1
+            assert durations[-1].attributes["agent"] == "unbound"
+            assert "agent" not in _metrics(probe, "curie.turn.duration")[-1].attributes
 
         probe.metrics.clear()
         async with make_harness(binding=_Binding()) as named:
@@ -342,6 +348,18 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
             validate_record_metric(
                 "curie.turn.completed",
                 attributes=fleet[-1].attributes,
+            )
+            # #5814: the same seconds as the fleet histogram, under the agent.
+            fleet_duration = _metrics(probe, "curie.turn.duration")
+            agent_duration = _metrics(probe, "curie.agent.turn.duration")
+            assert len(fleet_duration) == len(agent_duration) == 1
+            assert "agent" not in fleet_duration[-1].attributes
+            assert agent_duration[-1].value == fleet_duration[-1].value
+            assert agent_duration[-1].attributes == named_points[-1].attributes
+            validate_record_metric(
+                "curie.agent.turn.duration",
+                agent_duration[-1].value,
+                attributes=agent_duration[-1].attributes,
             )
             token = kernel_constants._TURN_AGENT.set("unbound")
             try:
