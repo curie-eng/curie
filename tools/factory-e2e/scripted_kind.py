@@ -78,10 +78,14 @@ def validate_configuration(args: argparse.Namespace) -> None:
             raise fe.ConfigError("the facts scenario never records or calls a model")
         return
     if args.record:
+        if args.scenario != "publication":
+            raise fe.ConfigError("only the publication scenario supports recording")
         if not os.environ.get("CURIE_FACTORY_RECORD_KEY"):
             raise fe.ConfigError("recording requires CURIE_FACTORY_RECORD_KEY")
     elif not Path(args.transcript).is_file():
-        raise fe.ConfigError(f"transcript {args.transcript} is missing; use scripted --record")
+        raise fe.ConfigError(
+            f"transcript {args.transcript} is missing; use scripted --scenario publication --record"
+        )
     else:
         loader = Path(__file__).resolve().parents[2] / "tools/model-script/model_script.py"
         try:
@@ -340,9 +344,6 @@ def registry_bind_rejected(detail: str) -> bool:
 class ScriptedRun:
     """One private cluster, registry, fixture server and model endpoint."""
 
-    # The triage-to-pr scenario and the channel gateway it posts through. A
-    # subclass that drives its own scenario on this install turns both off.
-    TRIAGE_TO_PR = True
     tracker_poll_seconds = TRACKER_POLL_SECONDS
 
     def __init__(self, args: argparse.Namespace) -> None:
@@ -410,13 +411,7 @@ class ScriptedRun:
         self.recording_closed = False
 
     def gateway_enabled(self) -> bool:
-        """Whether this run deploys the channel gateway for the triage scenario.
-
-        Recording captures only the issue-to-pull-request transcript, and the
-        facts scenario posts nothing to Slack, so neither runs the gateway.
-        """
-
-        return self.TRIAGE_TO_PR and self.args.scenario != "facts" and not self.args.record
+        return self.args.scenario == "triage-to-pr"
 
     def check_disk(self, stage: str, *, required_bytes: int = 30 * 1024**3) -> None:
         free = shutil.disk_usage("/").free

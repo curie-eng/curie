@@ -278,7 +278,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_guarded_rollback() {
         .map(|offset| remote_refresh + offset)
         .expect("published image refresh must use the canonical ghcr.io image helper");
     let pull = install_089[image_ref..]
-        .find("docker pull \"$ref\"")
+        .find("bash \"$REPO_ROOT/.github/scripts/pull-image.sh\" \"$ref\"")
         .map(|offset| image_ref + offset)
         .expect("published image refresh must fail closed when a remote pull fails");
     let load = install_089
@@ -292,7 +292,7 @@ fn published_v089_rollback_scenario_is_strict_and_keeps_guarded_rollback() {
         "every ghcr.io 0.8.9 image must be refreshed before kind load and Helm install"
     );
     assert!(
-        !install_089.contains("docker pull \"$ref\" ||"),
+        !install_089.contains("bash \"$REPO_ROOT/.github/scripts/pull-image.sh\" \"$ref\" ||"),
         "published image refresh must not suppress a pull failure"
     );
 

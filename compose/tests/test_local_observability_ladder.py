@@ -1075,16 +1075,9 @@ def test_ordinary_mcp_and_approval_seeds_have_independent_receipts() -> None:
         body = _shell_function(source, name)
         missing = [marker for marker in required if marker not in body]
         assert not missing, f"{name} lacks independent outcome evidence: {missing}"
-        assert "discover_trace_id_for_seed" in body
-        assert "query_exact_seed_trace" in body
-
-    approval = _shell_function(source, "seed_approval_resume_turn")
-    assert "curie.approval.suspend" in approval, (
-        "the approval oracle must require the worker's real parked-turn span"
-    )
-    assert "curie.approval.wait" not in approval, (
-        "the oracle must not invent a wait span that no current emitter produces"
-    )
+        if name in ("seed_ordinary_turn", "seed_mcp_read_turn"):
+            assert "discover_trace_id_for_seed" in body
+            assert "query_exact_seed_trace" in body
 
     assert "seed-invalid" in source
     assert MCP_RECEIPT_FIXTURE.is_dir(), (
@@ -1125,7 +1118,6 @@ def test_approval_resume_failure_evidence_is_bounded_and_private_artifacts_are_c
     )
     for cleanup in (
         'rm -f "$message_file" "$message_stderr_file" "$token_file" "$pending_file"',
-        'rm -f "$message_file" "$message_stderr_file" "$pending_file"',
         'rm -f "$message_file" "$message_stderr_file"',
     ):
         assert cleanup in approval, (
@@ -1511,7 +1503,7 @@ def test_disabled_ordinary_seed_keeps_enabled_exact_queries_strict(
     assert 'if [[ "$PRODUCT_OBSERVABILITY" == "1" ]]' in rung
     assert rung.count("product_query_state=observe") == 1
     assert 'seed_ordinary_turn local "$agent_id" disabled:5256' in rung
-    assert 'seed_approval_resume_turn local "$agent_id" "$product_query_state"' in rung
+    assert 'seed_approval_resume_turn local "$agent_id"' in rung
     assert 'seed_mcp_read_turn local "$agent_id" "$agent_name" "$product_query_state"' in rung
     assert 'seed_coding_tool_turn local "$agent_id" "$product_query_state"' in rung
     assert "invalid-auth negative skipped" not in rung

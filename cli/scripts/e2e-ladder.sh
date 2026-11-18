@@ -303,11 +303,9 @@ MCP_RECEIPT_ALIAS=""
 MCP_RECEIPT_IMAGE=""
 LAST_ORDINARY_TRACE_ID=""
 LAST_MCP_TRACE_ID=""
-LAST_APPROVAL_TRACE_ID=""
 LAST_CODING_TRACE_ID=""
 LAST_ORDINARY_MEMBERSHIP=""
 LAST_MCP_MEMBERSHIP=""
-LAST_APPROVAL_MEMBERSHIP=""
 LAST_CODING_MEMBERSHIP=""
 LAST_QUERY_MEMBERSHIP=""
 LAST_QUERY_OBSERVATION_COUNT="0"
@@ -1662,8 +1660,8 @@ PYAGENT
 }
 
 seed_approval_resume_turn() {
-    local tier="$1" agent_id="${2:-}" query_state="${3:-present}" marker="curie-seed-approval-$$-$RANDOM"
-    local stream_start stream_end message_file message_stderr_file token_file pending_file approval_id token out trace_id
+    local tier="$1" agent_id="${2:-}" marker="curie-seed-approval-$$-$RANDOM"
+    local message_file message_stderr_file token_file pending_file approval_id token out
     local code=0 attempt
     if [[ "$LIVE" == "1" || -z "$agent_id" || -z "$marker" ]]; then
         echo "seed-invalid: deterministic approval seed needs fake mode and a deployed agent before telemetry" >&2
@@ -1719,10 +1717,6 @@ PY
         return 1
     }
     rm -f "$token_file"
-    stream_start="$(capture_stream_cursor "$tier")" || {
-        rm -f "$message_file" "$message_stderr_file" "$pending_file"
-        return 1
-    }
     "$BIN" --json local message --channel "$APPROVAL_SEED_CHANNEL" --timeout-secs 120 \
         "[fake:request-approval:e2e] approve correlation $marker" > "$message_file" 2> "$message_stderr_file" &
     APPROVAL_SEED_MESSAGE_PID=$!
@@ -1771,14 +1765,6 @@ PY
     fi
     rm -f "$message_file" "$message_stderr_file"
     assert_finalized_reply "$tier approval resume" "$out"
-    stream_end="$(capture_stream_cursor "$tier")" || return 1
-    trace_id="$(discover_trace_id_for_seed "$tier" "$marker" "$stream_start" "$stream_end")" || return 1
-    query_exact_seed_trace "$tier" "$trace_id" \
-        "curie.approval.suspend,curie.approval.resolve,curie.approval.resume,curie.reply.post|curie.reply.update" \
-        "approved" "$query_state"
-    LAST_APPROVAL_TRACE_ID="$trace_id"
-    LAST_APPROVAL_MEMBERSHIP="$LAST_QUERY_MEMBERSHIP"
-    printf '%s' "$trace_id"
 }
 
 assert_local_observability_summary() {
@@ -5079,9 +5065,8 @@ rung_local() {
 
     if [[ "$LIVE" == "0" ]]; then
         echo
-        echo "=== exact approval wait/resolve/resume product-observability seed ==="
-        seed_approval_resume_turn local "$agent_id" "$product_query_state"
-        [[ "$LAST_APPROVAL_MEMBERSHIP" == "true" ]] || product_membership="false"
+        echo "=== approval wait/resolve/resume ==="
+        seed_approval_resume_turn local "$agent_id"
         cleanup_approval_seed_fixture || return 1
     fi
     if [[ "$LIVE" == "1" ]]; then

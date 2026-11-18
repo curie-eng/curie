@@ -2395,9 +2395,12 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
    got HTTP 200 and `factory_admitted`, and
    `GET /v1/internal/work-items/requests/{id}` returns the admitted WorkItem.
 
-`curie dev factory-e2e scripted` runs the factory on its own disposable kind
-cluster with a GitHub stub and recorded model responses. Scripted mode honors
-`CURIE_BIN`, including when `--build-images` builds the runner with that CLI.
+`curie dev factory-e2e scripted --scenario publication` runs issue-to-PR on a
+disposable kind cluster with a GitHub stub and recorded model responses.
+Select `--scenario triage-to-pr` to run the triage handoff on the same install
+after publication passes, or `--scenario facts` to check admission facts.
+Scripted mode honors `CURIE_BIN`, including when `--build-images` builds the
+runner with that CLI.
 Every factory mode defaults to `curie` on PATH when `CURIE_BIN` is unset,
 resolves the executable to an absolute path before any cluster or GitHub
 action, and prints that path with the first line of its `--version` output.

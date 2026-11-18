@@ -6668,7 +6668,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "scripted",
         help="kind-rung factory scenario with the GitHub stub and a scripted model",
     )
-    scripted.add_argument("--scenario", choices=("publication", "facts"), default="publication")
+    scripted.add_argument(
+        "--scenario",
+        choices=("publication", "facts", "triage-to-pr"),
+        required=True,
+        help="run issue-to-PR, admission facts, or issue-to-PR followed by triage on one install",
+    )
     scripted.add_argument(
         "--transcript",
         type=Path,

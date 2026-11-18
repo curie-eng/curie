@@ -68,8 +68,15 @@ def test_original_upgrade_assertions_wait_and_required_cleanup_remain() -> None:
         if step.get("name") == "Tear down the disposable negative control cluster"
     )
     assert teardown["if"] == "always()"
-    assert "kind delete cluster --name curie-upgrade-negative" in teardown["run"]
     assert "--ignore-not-found --wait=false" in teardown["run"]
+    cluster_teardown = next(
+        step for step in steps if step.get("name") == "Delete the job-owned kind cluster"
+    )
+    assert cluster_teardown["if"] == (
+        "always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-negative'"
+    )
+    assert "kind delete cluster --name curie-upgrade-negative" in cluster_teardown["run"]
+    assert steps.index(teardown) < steps.index(cluster_teardown)
     required = yaml.safe_load(WORKFLOW.read_text())["jobs"]["e2e-required"]
     assert "e2e-released-upgrade-negative" in required["needs"]
 
