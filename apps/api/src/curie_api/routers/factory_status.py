@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from curie_internal import sandbox_token
+from curie_internal.factory_phase_view import phase_view
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
@@ -32,7 +33,6 @@ from ..factory_progress import (
     PROGRESS_SCOPE,
     ProgressReport,
     VerificationObservation,
-    phase_view,
     record_report,
     record_verification,
 )

@@ -77,7 +77,8 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # Publication recovery requests require 0175, which stays below this floor.
     # Operator retry records require 0176.
     # Enrollment inactive intake notices require 0177.
-    candidate = {"schema_min": "0177", "schema_head": "0177"}
+    # The factory Slack progress card requires 0178.
+    candidate = {"schema_min": "0178", "schema_head": "0178"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -85,7 +86,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-58:] == [
+    assert catalog["revisions"][-59:] == [
         "0095",
         "0096",
         "0097",
@@ -144,6 +145,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
         "0175",
         "0176",
         "0177",
+        "0178",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

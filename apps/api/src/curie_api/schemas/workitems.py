@@ -286,7 +286,7 @@ class WorkItemStageOut(BaseModel):
 
 
 class WorkItemProgressOut(BaseModel):
-    """The latest execution's progress, derived by ``factory_progress.phase_view``."""
+    """The latest execution's progress, derived by ``factory_phase_view.phase_view``."""
 
     current: str | None
     note: str | None
@@ -465,6 +465,9 @@ class FactorySlackKickoffIn(BaseModel):
     malformed one is a refusal, not a retry. ``root_ts`` is the thread's ts, or
     the message's own at root. ``author`` is the turn's Slack user id; the
     receipt must name the same delivery, route and sender.
+    ``placeholder_ts`` is the ts of the dispatcher's placeholder reply under
+    the mention, None when it posted none; an admission stores it as the
+    run's progress card.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -475,6 +478,7 @@ class FactorySlackKickoffIn(BaseModel):
     root_ts: str = Field(min_length=1, max_length=64)
     author: str = Field(min_length=1, max_length=64)
     receipt: dict[str, Any]
+    placeholder_ts: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class FactorySlackKickoffOut(BaseModel):

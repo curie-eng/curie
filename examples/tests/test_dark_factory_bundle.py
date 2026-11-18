@@ -109,11 +109,17 @@ def test_progress_declaration_defines_ordered_phases_labels_loops_and_stages() -
         {"start": "implement", "review": "wait_ci", "cap": 3},
     ]
     assert declared["stages"] == [
-        {"id": "plan", "label": "Plan", "phases": ["read_issue", "pin_criteria", "plan"]},
-        {"id": "plan_review", "label": "Plan review", "phases": ["plan_review"]},
-        {"id": "implement", "label": "Implement", "phases": ["failing_test", "implement"]},
-        {"id": "review_diff", "label": "Review diff", "phases": ["review_diff", "publish"]},
-        {"id": "wait_ci", "label": "Wait for CI", "phases": ["wait_ci"]},
+        {
+            "id": "read_issue",
+            "label": "Reading the issue",
+            "phases": ["read_issue", "pin_criteria"],
+        },
+        {"id": "plan", "label": "Planning the change", "phases": ["plan"]},
+        {"id": "plan_review", "label": "Reviewing the plan", "phases": ["plan_review"]},
+        {"id": "implement", "label": "Writing the change", "phases": ["failing_test", "implement"]},
+        {"id": "review_diff", "label": "Reviewing the diff", "phases": ["review_diff"]},
+        {"id": "publish", "label": "Opening the pull request", "phases": ["publish"]},
+        {"id": "wait_ci", "label": "Waiting for CI", "phases": ["wait_ci"]},
     ]
 
 

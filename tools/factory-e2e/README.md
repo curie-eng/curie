@@ -1419,11 +1419,26 @@ The judge has eight criteria, each computed from recorded observations only.
    synthetic record. Provider errors from the CLI's debug stderr must agree with
    the terminal frame. Each role's observed model is recorded
    (`grant.role_models`) and printed in the judge output.
-4. `progress`: every `factory_slack_posts` row for the WorkItem was delivered
-   into the kickoff thread, read back with `conversations.replies`. The thread
-   row is origin `kickoff` at the kickoff message, no root post exists, the
-   admitted reply and the terminal post are there, and the pull request post is
-   there whenever a pull request exists.
+4. `progress`: the kickoff thread holds the progress card and one notify
+   reply, read back with `conversations.replies`, and nothing else from the
+   bot. The thread row is origin `kickoff` at the kickoff message, its
+   `card_ts` equals the dispatcher placeholder's ts (observed right after
+   admission, so the card is the placeholder edited in place) and is the first
+   reply, and no root post or retired post kind (`phase`, `pull_request`,
+   `terminal`, `card`) exists. When a pull request exists the card's final
+   message has the header `Factory run: finished`, the seven checklist steps
+   marked done, and a `View pull request #N` button whose url is the observed
+   pull request; exactly one other bot reply exists, and its text is
+   `<@SENDER> your pull request is ready for review: <url>` with a delivered
+   `ready` outbox row. A failed run can show a terminal card and a
+   `this run needs you:` notify, but it fails the successful pull request
+   check and cannot satisfy this acceptance criterion. No bot message
+   contains `Phase `, `Outcome: admitted`, `Run completed`, `PR open:` or a
+   JSON object, and every outbox row was delivered into the thread. The
+   anonymized thread dump (user ids, ts values, team ids, URLs and repository
+   names replaced by stable placeholders, block structure kept) is recorded as
+   `progress.thread_dump` and printed in the `observations` of
+   `judge --criterion progress` (and `all`), for the pull request body.
 5. `refusal`: the enrollment is disconnected through
    `curie cluster subscription disconnect`, the run waits for teardown to
    settle, and the same sender kicks off a second fixture issue. The reply in

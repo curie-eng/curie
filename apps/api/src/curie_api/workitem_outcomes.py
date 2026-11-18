@@ -6,8 +6,8 @@ console render those strings verbatim. The module reads canonical WorkItem,
 ExecutionRequest, publication-lineage, Publication, Approval, factory status
 comment and execution phase report rows; it writes nothing and adds no store.
 The title and progress strip come from the status comment rows and the phase
-reports through ``factory_progress.phase_view``, the same derivation the
-GitHub status card uses (#4102).
+reports through ``curie_internal.factory_phase_view.phase_view``, the same
+derivation the GitHub status card uses (#4102).
 
 Output is an allowlist: every view is built from explicit fields below, never
 from an ORM row, so a runtime-owner token, a reply transport address, a patch,
@@ -27,6 +27,7 @@ from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Literal, cast
 
+from curie_internal.factory_phase_view import phase_view
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,7 +54,6 @@ from curie_api.schemas.workitems import (
 
 from .config import Settings
 from .factory_notices import start_failed_sentence
-from .factory_progress import phase_view
 from .factory_retry_policy import RetrySafety, condition_text
 from .models import (
     Approval,

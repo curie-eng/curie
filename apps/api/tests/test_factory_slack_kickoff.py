@@ -99,6 +99,7 @@ from apps.api.tests.test_factory_slack_runtime import (  # noqa: E402
     _disable,
     _rows,
     _seed_principal,
+    _settled_completion,
     owner_tuples,
     runnable_requests,
 )
@@ -135,7 +136,10 @@ def test_an_enrolled_sender_at_root_admits_one_personal_work_item_and_request(
     """A person's top-level mention linking an issue admits one personal run they own.
 
     Native path: the dispatcher writes the receipt, the worker asks the route
-    before any sandbox, and the reply names the outcome and the issue.
+    before any sandbox with the placeholder's ts, and the turn settles
+    delivered without editing the placeholder or posting a reply: the thread
+    stores the placeholder as the run's progress card and the sender as its
+    requester (#5715).
     """
 
     stack = kickoff
@@ -181,15 +185,19 @@ def test_an_enrolled_sender_at_root_admits_one_personal_work_item_and_request(
         "root_ts": attempt.delivery.message_ts,
         "first_sequence": request["sequence"],
         "origin": "kickoff",
+        "card_ts": attempt.delivery.placeholder,
+        "requester_slack_user": person.slack_user,
     }
+    assert attempt.delivery.placeholder is not None
     assert counts() == {
         "work_items": before["work_items"] + 1,
         "requests": before["requests"] + 1,
         "threads": before["threads"] + 1,
     }
-    assert attempt.edits, "the placeholder was not edited with the answer"
-    assert "Outcome: admitted" in attempt.edits[-1].text
-    assert issue_url(number) in attempt.edits[-1].text
+    assert attempt.edits == [], [call.text for call in attempt.edits]
+    assert attempt.posts == [], [call.text for call in attempt.posts]
+    assert _settled_completion(stack, attempt.delivery) == "delivered"
+    assert stack.is_terminal(attempt.delivery.delivery_id)
     _assert_no_sandbox(stack)
 
 
@@ -268,6 +276,9 @@ def test_an_unmapped_thread_reply_admits_under_its_thread_root(kickoff: Steering
     work_item_id, _request_id = _assert_admitted(attempt.answer, number)
     (thread,) = threads_at(thread_ts)
     assert (thread["work_item_id"], thread["origin"]) == (work_item_id, "kickoff")
+    assert attempt.delivery.placeholder is not None
+    assert thread["card_ts"] == attempt.delivery.placeholder, thread
+    assert (attempt.edits, attempt.posts) == ([], [])
     assert threads_at(attempt.delivery.message_ts) == []
     _assert_no_sandbox(stack)
 
@@ -305,6 +316,55 @@ def test_a_redelivery_answers_the_same_admission_once(kickoff: SteeringStack) ->
     refused = decide(stack, person_mention(stack, person.slack_user, linking(later)))
     assert refused["outcome"] == "enrollment_inactive", refused
     assert counts() == after_first
+
+
+def test_progress_card_kickoff_with_no_placeholder_stores_no_card_and_a_replay_changes_nothing(
+    kickoff: SteeringStack,
+) -> None:
+    """A kickoff the dispatcher posted no placeholder for stores a NULL card ts.
+
+    The progress lane then posts the card as the thread's first reply. The
+    sender is stored either way. A replayed admission, even one now naming a
+    placeholder, writes nothing (#5715).
+    """
+
+    stack = kickoff
+    person = enrolled(stack)
+    number = next_issue()
+    plant_issue(stack, number)
+    mention = person_mention(stack, person.slack_user, linking(number))
+
+    first = decide(stack, mention)
+    work_item_id, _request_id = _assert_admitted(first, number)
+    (thread,) = threads_at(mention.root_ts)
+    assert thread["work_item_id"] == work_item_id
+    assert (thread["card_ts"], thread["requester_slack_user"]) == (None, person.slack_user)
+    after_first = counts()
+
+    again = decide(stack, mention, placeholder_ts="1800000999.000001")
+    assert again["outcome"] == "admitted" and again["replayed"] is True, again
+    assert threads_at(mention.root_ts) == [thread]
+    assert counts() == after_first
+
+
+@pytest.mark.parametrize("placeholder_ts", ["", "1" * 65])
+def test_progress_card_placeholder_ts_out_of_bounds_is_refused(
+    kickoff: SteeringStack, placeholder_ts: str
+) -> None:
+    """A placeholder ts outside 1 to 64 characters is a 422 that admits nothing."""
+
+    stack = kickoff
+    person = enrolled(stack)
+    number = next_issue()
+    plant_issue(stack, number)
+    mention = person_mention(stack, person.slack_user, linking(number))
+    before = counts()
+
+    refused = ask(stack, mention, placeholder_ts=placeholder_ts)
+    assert refused.status_code == 422, refused.text
+    assert counts() == before
+    assert threads_at(mention.root_ts) == []
+    _assert_admitted(decide(stack, mention), number)
 
 
 def test_later_steering_never_transfers_ownership(kickoff: SteeringStack) -> None:
@@ -835,8 +895,9 @@ def test_a_code_host_outage_answers_503_and_admits_once_after(
 
 
 def test_progress_reaches_the_originating_root_end_to_end(kickoff: SteeringStack) -> None:
-    """With no factory destination configured, the run's phase, pull request and
-    terminal posts land in the kickoff's own root, and no root is posted."""
+    """With no factory destination configured, the run's progress card is the
+    kickoff's placeholder, edited in place, the finished notify reply lands in
+    the kickoff's own root mentioning the sender, and no root is posted (#5715)."""
 
     stack = kickoff
     person = enrolled(stack)
@@ -853,14 +914,14 @@ def test_progress_reaches_the_originating_root_end_to_end(kickoff: SteeringStack
     stack.finish(request_id, epoch, published=True)
     stack.drain()
 
-    posts = [
-        call.haystack
-        for call in stack.slack.thread_posts(stack.factory_token, root)
-        if "Outcome:" not in call.haystack
-    ]
-    assert len(posts) == 3, posts
-    assert "Drafting the plan" in posts[0]
-    assert f"https://github.com/{REPO}/pull/{pull}" in posts[1]
+    posts = [call.haystack for call in stack.slack.thread_posts(stack.factory_token, root)]
+    assert len(posts) == 1, posts
+    assert f"<@{person.slack_user}>" in posts[0], posts
+    assert f"https://github.com/{REPO}/pull/{pull}" in posts[0], posts
+    assert attempt.delivery.placeholder is not None
+    cards = [call.haystack for call in stack.slack.edits_of(attempt.delivery.placeholder)]
+    assert cards and "Drafting the plan" in cards[-1], cards
+    assert f"https://github.com/{REPO}/pull/{pull}" in cards[-1], cards
     assert stack.slack.roots(stack.factory_token) == []
     (thread,) = threads_at(root)
     assert (thread["work_item_id"], thread["origin"]) == (work_item_id, "kickoff")

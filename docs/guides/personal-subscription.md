@@ -189,17 +189,17 @@ Any earlier attempt of this message is unconfirmed here; this thread shows the r
 Outcome: enrollment_inactive
 ```
 
-If the run is admitted, the same thread answers:
+If the run is admitted, the app's first reply in that thread becomes the run's
+progress card. It names the issue and that you started it, lists the run's
+steps as they are done, and is edited in place until the run finishes or stops.
+When the pull request is open, or when the run needs you, the thread also gets
+one short reply that mentions you:
 
 ```text
-Factory run started for this issue.
-Issue: https://github.com/acme-corp/acme-fixture/issues/7
-Progress for this run is posted in this thread.
-Outcome: admitted
+@you your pull request is ready for review: https://github.com/acme-corp/acme-fixture/pull/12
 ```
 
-Later posts in that thread are phase reports, the pull request link, and the
-final outcome. The thread does not need `factory_slack_channel`. See
+The thread does not need `factory_slack_channel`. See
 [Factory Slack progress](../operations.md#factory-slack-progress).
 
 To ask for a change after the run has started, mention the app in that run's

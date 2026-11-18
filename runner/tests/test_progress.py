@@ -96,10 +96,12 @@ def test_the_dark_factory_bundle_declares_nine_phases_and_three_loops() -> None:
         ("implement", "wait_ci", 3),
     ]
     assert [(stage["id"], stage["phases"]) for stage in declared["stages"]] == [
-        ("plan", ["read_issue", "pin_criteria", "plan"]),
+        ("read_issue", ["read_issue", "pin_criteria"]),
+        ("plan", ["plan"]),
         ("plan_review", ["plan_review"]),
         ("implement", ["failing_test", "implement"]),
-        ("review_diff", ["review_diff", "publish"]),
+        ("review_diff", ["review_diff"]),
+        ("publish", ["publish"]),
         ("wait_ci", ["wait_ci"]),
     ]
 
