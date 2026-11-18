@@ -655,18 +655,29 @@ def test_a_revision_is_verified_only_for_this_publication_and_its_marker(
 
 
 def test_a_code_host_outage_is_a_payload_free_503(
-    seeded: Seeded,
+    seeded: Seeded, caplog: pytest.LogCaptureFixture
 ) -> None:
     client, publication, code_host = seeded
     code_host.fail = Unavailable("github_rate_limited")
 
-    response = client.get(_url(publication["id"], "branch-head"), headers=WORKER_HEADERS)
+    with caplog.at_level(logging.WARNING, logger=publication_code_host.__name__):
+        response = client.get(_url(publication["id"], "branch-head"), headers=WORKER_HEADERS)
 
     assert response.status_code == 503
     assert response.json()["detail"] == {
         "code": "publication.code_host_unavailable",
         "message": "the code host answered github_rate_limited",
     }
+    warnings = [
+        record for record in caplog.records if record.name == publication_code_host.__name__
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert warnings[0].getMessage() == (
+        f"Publication branch lookup failed publication_id={publication['id']} "
+        "error=Unavailable reason=github_rate_limited"
+    )
+    assert warnings[0].exc_info is None
 
 
 def test_recovery_opens_the_stored_contract_once_and_adopts_it(
