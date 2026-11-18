@@ -4,6 +4,8 @@ Date: 2026-08-22
 
 Status: Accepted
 
+**Partially amended by [ADR 0287](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md)** (back-link added under ADR 0045): an execution prefix additionally contains the learned rules section, stable for one work item or session and absent from reviewer context.
+
 **Partially amended by [ADR 0278](0278-requester-coding-instructions.md)** in decisions
 1 and 2: an execution prefix additionally contains a requester scoped instruction
 section, stable for its WorkItem and absent from reviewer context.

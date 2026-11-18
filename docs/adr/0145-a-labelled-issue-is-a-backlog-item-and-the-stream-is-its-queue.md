@@ -9,6 +9,8 @@ Status: Accepted
 Selected work may produce a tracker result; one human selection may authorize
 its explicitly bounded implementation handoff.
 
+The amendment by ADR 0277 recorded above is withdrawn by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md), which supersedes ADR 0277 in full; the withdrawal takes effect in code when its triage removal tickets land. Also partially amended by [ADR 0287](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md) (back-link added under ADR 0045): a platform-held learned rule is memory, not a task record or a copy of the ticket, so the notes on reading the ticket and on having no task table are unchanged in substance.
+
 Partially amended by
 [ADR 0162](0162-work-items-own-durable-execution-identity.md). The tracker
 remains the backlog and Curie still does not copy tracker content. The stream no

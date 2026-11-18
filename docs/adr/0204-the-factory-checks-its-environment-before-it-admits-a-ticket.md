@@ -9,6 +9,8 @@ Status: Accepted
 Its pre-allocation requirements are explicitly deferred for this launch surface
 until the named shared checks ship.
 
+The amendment by ADR 0277 recorded above is withdrawn by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md), which supersedes ADR 0277 in full; the withdrawal takes effect in code when its triage removal tickets land (back-link added under ADR 0045).
+
 Accepted 2026-10-06 with explicit maintainer approval from Brian Conn
 (TheConnMan), given after the Draft merged in
 [#4106](https://github.com/curie-eng/curie/pull/4106).

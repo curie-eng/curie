@@ -4,6 +4,8 @@ Date: 2026-09-18
 
 Status: Accepted
 
+**Partially amended by [ADR 0287](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md)** (back-link added under ADR 0045): a work item may carry a pin and a child snapshot of person accepted rule text, which is product memory and not issue content.
+
 **Partially amended by [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 in Decision, the WorkItem identity is no longer a GitHub repository id and

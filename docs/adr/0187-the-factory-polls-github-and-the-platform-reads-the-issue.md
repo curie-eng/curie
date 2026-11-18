@@ -9,6 +9,8 @@ Status: Accepted
 Adds the delegated-selection provenance path alongside tracker observations;
 scoped reads and credential custody are preserved.
 
+The amendment by ADR 0277 recorded above is withdrawn by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md), which supersedes ADR 0277 in full; the withdrawal takes effect in code when its triage removal tickets land. Also partially amended by [ADR 0287](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md) (back-link added under ADR 0045): the execution scoped issue read capability also authorizes one sibling write, `/work-items/rule-proposal`, which stores a rule candidate and never tracker content.
+
 Partially amended by [ADR 0279](0279-a-person-acting-through-a-github-app-can-select-factory-work.md)
 under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md),
 only where this record ignores every App-related label event.
