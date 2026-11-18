@@ -20,35 +20,47 @@ class SlackAccountProfiles:
         if not token:
             raise ValueError("account profile unavailable")
         headers = {"Authorization": f"Bearer {token}"}
-        user_response = await self._http.get(
-            f"{self._base}/users.info", params={"user": user_id}, headers=headers, timeout=5
+        user = await self._read(
+            "users.info", params={"user": user_id}, headers=headers, field="user", expected=user_id
         )
-        team_response = await self._http.get(
-            f"{self._base}/team.info", params={"team": workspace}, headers=headers, timeout=5
+        team = await self._read(
+            "team.info",
+            params={"team": workspace},
+            headers=headers,
+            field="team",
+            expected=workspace,
         )
-        user_response.raise_for_status()
-        team_response.raise_for_status()
-        user_body, team_body = user_response.json(), team_response.json()
-        if not isinstance(user_body, dict) or not isinstance(team_body, dict):
-            raise ValueError("account profile unavailable")
-        user, team = user_body.get("user"), team_body.get("team")
-        if (
-            user_body.get("ok") is not True
-            or team_body.get("ok") is not True
-            or not isinstance(user, dict)
-            or not isinstance(team, dict)
-            or user.get("id") != user_id
-            or team.get("id") != workspace
-        ):
-            raise ValueError("account profile unavailable")
-        profile = user.get("profile")
-        if not isinstance(profile, dict):
-            raise ValueError("account profile unavailable")
+        profile = user.get("profile") if user else None
         return AccountProfile(
-            display_name=_label(profile.get("display_name")) or _label(user.get("real_name")),
-            handle=_label(user.get("name")),
-            workspace_name=_label(team.get("name")),
+            display_name=(
+                _label(profile.get("display_name")) if isinstance(profile, dict) else None
+            )
+            or (_label(user.get("real_name")) if user else None),
+            handle=_label(user.get("name")) if user else None,
+            workspace_name=_label(team.get("name")) if team else None,
         )
+
+    async def _read(
+        self,
+        method: str,
+        *,
+        params: dict[str, str],
+        headers: dict[str, str],
+        field: str,
+        expected: str,
+    ) -> dict[str, object] | None:
+        try:
+            response = await self._http.get(
+                f"{self._base}/{method}", params=params, headers=headers, timeout=5
+            )
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            return None
+        value = body.get(field)
+        return value if isinstance(value, dict) and value.get("id") == expected else None
 
 
 def _label(value: object) -> str | None:

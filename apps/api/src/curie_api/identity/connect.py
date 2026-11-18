@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import re
 import secrets
+import unicodedata
 import uuid
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
@@ -200,32 +201,34 @@ async def capture_slack_profile(
     *,
     token: str,
     identity: str,
+    user_id: str,
+    workspace: str,
     settings: Settings,
     client: httpx.AsyncClient,
 ) -> None:
     gateway = gateway_client(settings, client)
     if gateway is None:
         return
-    row = await session.get(IdentityConnectToken, hash_token(token))
-    assert row is not None
-    namespace = await session.get(IdentityNamespace, row.identity_namespace_id)
-    assert namespace is not None
     try:
         profile = await gateway.call(
             identity,
             "account_profile",
-            {"user_id": row.provider_native_id, "workspace": namespace.key},
+            {"user_id": user_id, "workspace": workspace},
             TypeAdapter(AccountProfile),
         )
     except (GatewayError, httpx.HTTPError, TimeoutError):
         return
+    row = await session.get(IdentityConnectToken, hash_token(token))
+    assert row is not None
     for column, value in (
         ("slack_display_name", profile.display_name),
         ("slack_handle", profile.handle),
         ("slack_workspace_name", profile.workspace_name),
     ):
         if isinstance(value, str) and value.strip():
-            setattr(row, column, value[:256])
+            label = "".join(c for c in value if unicodedata.category(c) not in {"Cc", "Cf"})[:256]
+            if label.strip():
+                setattr(row, column, label)
     await session.flush()
 
 

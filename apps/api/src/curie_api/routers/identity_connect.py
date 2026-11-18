@@ -99,21 +99,31 @@ async def connect_page(token: str, request: Request, session: SessionDep) -> HTM
     namespace = await session.get(IdentityNamespace, row.identity_namespace_id)
     assert namespace is not None  # live_token checked it
     account = f"{namespace.provider} user {row.provider_native_id} in workspace {namespace.key}"
+    account_html = f"<p>{escape(account)}</p>"
     personal = get_settings().factory_model_auth_mode == "personal"
     warning = ""
     if personal and namespace.provider == "slack":
-        details = ", ".join(
-            x
-            for x in (f"@{row.slack_handle}" if row.slack_handle else None, row.provider_native_id)
-            if x
+        labels = " ".join(
+            f"<bdi>{escape(label)}</bdi>"
+            for label in (
+                row.slack_display_name,
+                f"@{row.slack_handle}" if row.slack_handle else None,
+            )
+            if label
         )
-        who = f"{row.slack_display_name} ({details})" if row.slack_display_name else details
         workspace = (
-            f"{row.slack_workspace_name} ({namespace.key})"
+            f"<bdi>{escape(row.slack_workspace_name)}</bdi>"
             if row.slack_workspace_name
-            else namespace.key
+            else "Name unavailable"
         )
-        account = f"Slack user {who} in workspace {workspace}"
+        account_html = (
+            "<dl>"
+            f"<dt>Slack user</dt><dd>{labels or 'Name unavailable'}</dd>"
+            f'<dt>User ID</dt><dd><code dir="ltr">{escape(row.provider_native_id)}</code></dd>'
+            f"<dt>Workspace</dt><dd>{workspace}</dd>"
+            f'<dt>Workspace ID</dt><dd><code dir="ltr">{escape(namespace.key)}</code></dd>'
+            "</dl>"
+        )
         warning = (
             "<p>Confirm only if this is your own Slack account. "
             "Anyone using it will start runs on your Claude plan.</p>"
@@ -140,7 +150,7 @@ async def connect_page(token: str, request: Request, session: SessionDep) -> HTM
         )
     response = HTMLResponse(
         '<!doctype html><html lang="en"><meta charset="utf-8"><title>Connect account</title>'
-        f"<h1>Connect account</h1><p>{escape(account)}</p>{warning}{action}"
+        f"<h1>Connect account</h1>{account_html}{warning}{action}"
         "<p>Your original request will not run. After connecting, send it again.</p></html>",
         headers=PRIVATE_HEADERS,
     )

@@ -4356,12 +4356,18 @@ class RefusalConnectRun(LiveRun):
             )
             if code == "sender_unverified":
                 rows = self.sql(
-                    "SELECT count(*) AS n FROM curie.identity_connect_tokens "
+                    "SELECT count(*) AS n, count(slack_display_name) AS named "
+                    "FROM curie.identity_connect_tokens "
                     f"WHERE identity_namespace_id='{namespace_id}' AND provider_native_id='{user}' "
                     "AND consumed_at IS NULL AND expires_at > now()"
                 )
                 self.ledger.record(
                     "refusal-connect", "live_sender_tokens", rows[0].get("n") if rows else None
+                )
+                self.ledger.record(
+                    "refusal-connect",
+                    "live_sender_tokens_with_display_name",
+                    rows[0].get("named") if rows else None,
                 )
                 self.seed_slack_link(namespace_id, user, str(self.owner["principal_id"]))
         self.ledger.record("refusal-connect", "thread_dump", dumps)

@@ -2852,6 +2852,9 @@ def _judge_refusal_connect(ledger: Ledger) -> tuple[dict[str, bool], dict[str, i
             and all(leg["before"].get(key) == 0 for key in _COUNT_KEYS)
         )
     checks["one_sender_bound_live_token"] = observed.get("live_sender_tokens") == 1
+    checks["sender_display_name_captured"] = (
+        observed.get("live_sender_tokens_with_display_name") == 1
+    )
     checks["unpaid"] = ledger.run_row()["live_starts"] == 0
     cleanup, counts = _judge_cleanup(ledger)
     checks.update({f"cleanup.{key}": value for key, value in cleanup.items()})

@@ -3150,6 +3150,13 @@ A person starts a personal factory run from Slack by mentioning the app with a l
 
 The sender must resolve through an active Slack identity link to an active principal in the binding's tenant, and that principal's [personal Claude enrollment](#personal-claude-enrollment) must be active. Trusted admission then records one personal WorkItem owned by the sender at the enrollment's current generation, with the issue link as its objective and no trigger label, under a request id derived from the Slack delivery, so a redelivered mention finds the run it already admitted. The mention's message becomes the run's thread, and the dispatcher's placeholder reply under it becomes the run's progress card: an admitted kickoff hands the placeholder to the progress lane, which edits it into the card and posts the needs a person and ready for review replies there, mentioning the sender (see [Factory Slack progress](#factory-slack-progress)). There is no separate admitted reply. The progress lane posts no root, because the mention already rooted the thread. This holds whether or not the agent has a `factory_slack_channel`.
 
+The bot needs `users:read` for account labels (`users.info`) and `team:read`
+for the workspace name (`team.info`). After adding these scopes to the app
+manifest, reinstall the app in the workspace to refresh its bot-token grant.
+Each successful lookup supplies its own labels; a failed lookup leaves only
+its labels unavailable. The confirmation shows native user and workspace ids
+in separate fields and isolates display labels from their direction.
+
 Exactly one link to an issue on the factory's GitHub code host is accepted.
 A `sender_unverified` or `enrollment_inactive` refusal is sent privately to the
 verified Slack sender, with `Code: <outcome>` and a **Connect your Claude plan**

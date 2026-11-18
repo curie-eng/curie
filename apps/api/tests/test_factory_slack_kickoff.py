@@ -164,6 +164,95 @@ def test_connect_plan_kickoff_inactive_enrollment(
     ) == [{"n": 0}]
 
 
+def test_connect_plan_kickoff_commits_before_slack_profile_reads(
+    kickoff: SteeringStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextlib import asynccontextmanager
+
+    import httpx
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from apps.api.tests.test_factory_slack_runtime import TEAM, _factory_gateway
+    from apps.api.tests.test_identity_connect import connect_plan_settings
+
+    connect_plan_settings(monkeypatch)
+    user = f"U{kickoff.tag.upper()}9"
+    observations = []
+
+    @asynccontextmanager
+    async def gateway():
+        engine = create_async_engine(get_settings().database_url)
+
+        async def slack(request):
+            visible, available = False, False
+            try:
+                async with engine.begin() as conn:
+                    visible = (
+                        await conn.scalar(
+                            text(
+                                "SELECT count(*) FROM curie.identity_connect_tokens "
+                                "WHERE provider_native_id = :user"
+                            ),
+                            {"user": user},
+                        )
+                        == 1
+                    )
+                    await conn.execute(
+                        text("SELECT id FROM curie.tenants WHERE id = :id FOR UPDATE NOWAIT"),
+                        {"id": DEFAULT_TENANT_ID},
+                    )
+                    available = True
+            except DBAPIError:
+                pass
+            observations.append((visible, available))
+            # Slack users.info and team.info response shapes:
+            # https://docs.slack.dev/reference/methods/users.info/
+            # https://docs.slack.dev/reference/methods/team.info/.
+            if request.path.endswith("users.info"):
+                return web.json_response(
+                    {
+                        "ok": True,
+                        "user": {"id": user, "name": "alice", "profile": {"display_name": "Alice"}},
+                    }
+                )
+            return web.json_response({"ok": True, "team": {"id": TEAM, "name": "Example"}})
+
+        app = web.Application()
+        app.router.add_get("/api/{method}", slack)
+        try:
+            async with TestServer(app) as provider:
+                async with (
+                    _factory_gateway(
+                        str(provider.make_url("/api/")), kickoff.identity, kickoff.factory_token
+                    ) as endpoint,
+                    httpx.AsyncClient() as client,
+                ):
+                    yield endpoint, client
+        finally:
+            await engine.dispose()
+
+    with kickoff.client.portal.wrap_async_context_manager(gateway()) as (endpoint, client):
+        with monkeypatch.context() as runtime:
+            runtime.setenv("CURIE_CHANNEL_GATEWAY_URL", endpoint)
+            runtime.setenv("CURIE_CHANNEL_GATEWAY_TOKEN", "test-api-credential")
+            runtime.setenv("CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE", "true")
+            runtime.setattr(kickoff.client.app.state, "http_client", client)
+            get_settings.cache_clear()
+            answer = decide(kickoff, person_mention(kickoff, user, linking(next_issue())))
+        get_settings.cache_clear()
+    assert answer["outcome"] == "sender_unverified"
+    assert observations == [(True, True), (True, True)]
+    assert _rows(
+        "SELECT slack_display_name FROM curie.identity_connect_tokens "
+        "WHERE provider_native_id = :user",
+        {"user": user},
+    ) == [{"slack_display_name": "Alice"}]
+
+
 def _personal(principal_id: uuid.UUID) -> tuple[Any, ...]:
     return (DEFAULT_TENANT_ID, "personal", principal_id, GENERATION)
 

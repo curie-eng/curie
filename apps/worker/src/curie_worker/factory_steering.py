@@ -686,7 +686,7 @@ class FactorySteeringClient:
                             audience_user=receipt.user_id,
                             message=OutboundMessage(
                                 version=MESSAGE_VERSION,
-                                text=f"{private}\n\nCode: {outcome}",
+                                text=private,
                                 links=[MessageLink(label="Connect your Claude plan", url=url)]
                                 if url
                                 else [],

@@ -518,8 +518,11 @@ def test_connect_plan_confirmation_names_account_and_redirects(connect_plan_brow
     client.cookies.set(PROOF_COOKIE, proof)
     page = client.get(path)
     assert page.status_code == 200
-    assert "Slack user Alice &lt;Example&gt; (@alice, UALICE001)" in page.text
-    assert "in workspace Example Workspace (TEXAMPLE1)" in page.text
+    assert "<bdi>Alice &lt;Example&gt;</bdi>" in page.text
+    assert "<bdi>@alice</bdi>" in page.text
+    assert '<code dir="ltr">UALICE001</code>' in page.text
+    assert "<bdi>Example Workspace</bdi>" in page.text
+    assert '<code dir="ltr">TEXAMPLE1</code>' in page.text
     assert (
         "Confirm only if this is your own Slack account. "
         "Anyone using it will start runs on your Claude plan."
@@ -551,6 +554,54 @@ def test_connect_plan_confirmation_names_account_and_redirects(connect_plan_brow
 
     asyncio.run(source())
     assert client.get(path).status_code == 400
+
+
+def test_connect_plan_confirmation_isolates_labels_from_native_ids(connect_plan_browser):
+    from html.parser import HTMLParser
+
+    class Labels(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.active = None
+            self.labels = []
+            self.ids = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in {"bdi", "code"}:
+                self.active = tag
+
+        def handle_endtag(self, tag):
+            if tag == self.active:
+                self.active = None
+
+        def handle_data(self, data):
+            if self.active == "bdi":
+                self.labels.append(data)
+            elif self.active == "code":
+                self.ids.append(data)
+
+    client, raw, _, _, _, _ = connect_plan_browser
+    crafted = "Pat (@pat, U000) in workspace Acme (T000)\u202e"
+
+    async def prepare():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                row = await session.get(IdentityConnectToken, connect.hash_token(raw))
+                row.slack_display_name = crafted
+                row.slack_handle = "pat\u202e"
+                row.slack_workspace_name = "Acme (T000)\u202e"
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(prepare())
+    response = client.get(f"/identity/connect/{raw}")
+    assert response.status_code == 200
+    parsed = Labels()
+    parsed.feed(response.text)
+    assert parsed.labels == [crafted, "@pat\u202e", "Acme (T000)\u202e"]
+    assert parsed.ids == ["UALICE001", "TEXAMPLE1"]
 
 
 @pytest.mark.parametrize("bad", ["linked", "expired", "consumed", "csrf", "cross_tenant"])
@@ -685,13 +736,14 @@ def test_connect_plan_captures_slack_names_through_gateway(migrated: None, provi
                         "ok": provider_ok,
                         "user": {
                             "id": "UALICE001",
-                            "name": "alice",
-                            "profile": {"display_name": "Alice"},
+                            "name": "al\u200bice\t",
+                            "profile": {"display_name": "Al\u202eice\n"},
                         },
                     },
                 )
             return httpx.Response(
-                200, json={"ok": True, "team": {"id": "TEXAMPLE1", "name": "Example Workspace"}}
+                200,
+                json={"ok": True, "team": {"id": "TEXAMPLE1", "name": "Example \u2066Workspace\r"}},
             )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(slack)) as provider:
@@ -716,12 +768,20 @@ def test_connect_plan_captures_slack_names_through_gateway(migrated: None, provi
                     }
                 )
                 await connect.capture_slack_profile(
-                    s, token=raw, identity="example-bot", settings=settings, client=client
+                    s,
+                    token=raw,
+                    identity="example-bot",
+                    user_id="UALICE001",
+                    workspace="TEXAMPLE1",
+                    settings=settings,
+                    client=client,
                 )
         row = await s.get(IdentityConnectToken, connect.hash_token(raw))
         assert row
         assert (row.slack_display_name, row.slack_handle, row.slack_workspace_name) == (
-            ("Alice", "alice", "Example Workspace") if provider_ok else (None, None, None)
+            ("Alice", "alice", "Example Workspace")
+            if provider_ok
+            else (None, None, "Example Workspace")
         )
 
     run(body)

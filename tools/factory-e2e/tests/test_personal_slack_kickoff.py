@@ -4415,6 +4415,7 @@ def test_connect_plan_judge_rejects_missing_proof_through_cli(
             },
         )
     ledger.record("refusal-connect", "live_sender_tokens", 1)
+    ledger.record("refusal-connect", "live_sender_tokens_with_display_name", 1)
     argv = [
         "judge",
         "--candidate",
@@ -4431,6 +4432,10 @@ def test_connect_plan_judge_rejects_missing_proof_through_cli(
     ledger.record("refusal-connect", "live_sender_tokens", 0)
     assert psk.main(argv, environ={"PATH": ""}) == sks.EXIT_FAIL
     assert _output(capsys)[0]["checks"]["refusal-connect.one_sender_bound_live_token"] is False
+    ledger.record("refusal-connect", "live_sender_tokens", 1)
+    ledger.record("refusal-connect", "live_sender_tokens_with_display_name", 0)
+    assert psk.main(argv, environ={"PATH": ""}) == sks.EXIT_FAIL
+    assert _output(capsys)[0]["checks"]["refusal-connect.sender_display_name_captured"] is False
     ledger.close()
 
 
@@ -5389,10 +5394,7 @@ def test_ceiling_is_the_exact_approval_and_the_gate_holds_parallel_starts(tmp_pa
     codes = [code for code, _stdout, _stderr in reported]
     slot_names = sorted(os.listdir(slots)) if slots.is_dir() else None
     assert sorted(codes[:4]) == [0, 0, 2, 2] and sorted(codes[4:]) == [0, 2], (
-        [
-            {"code": code, "stdout": stdout, "stderr": stderr}
-            for code, stdout, stderr in reported
-        ],
+        [{"code": code, "stdout": stdout, "stderr": stderr} for code, stdout, stderr in reported],
         slot_names,
     )
     assert sorted(os.listdir(slots)) == ["diff-0", "diff-1", "plan-0"]

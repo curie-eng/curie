@@ -17,7 +17,9 @@ from curie_channel_gateway.slack.account_profiles import SlackAccountProfiles
 from pydantic import TypeAdapter
 
 
-@pytest.mark.parametrize("failure", [None, "user", "team", "mismatch"])
+@pytest.mark.parametrize(
+    "failure", [None, "user", "team", "user_mismatch", "team_mismatch", "user_timeout", "team_http"]
+)
 def test_connect_plan_profile_reads_names_with_receiving_identity(failure):
     async def scenario():
         calls = []
@@ -27,23 +29,25 @@ def test_connect_plan_profile_reads_names_with_receiving_identity(failure):
             # and https://docs.slack.dev/reference/methods/team.info/.
             calls.append(request)
             if request.url.path.endswith("users.info"):
+                if failure == "user_timeout":
+                    raise httpx.ReadTimeout("provider unavailable", request=request)
                 return httpx.Response(
                     200,
                     json={
                         "ok": failure != "user",
                         "user": {
-                            "id": "U0EXAMPLE1",
+                            "id": "U0EXAMPLE2" if failure == "user_mismatch" else "U0EXAMPLE1",
                             "name": "alice",
                             "profile": {"display_name": "Alice"},
                         },
                     },
                 )
             return httpx.Response(
-                200,
+                503 if failure == "team_http" else 200,
                 json={
                     "ok": failure != "team",
                     "team": {
-                        "id": "T0EXAMPLE2" if failure == "mismatch" else "T0EXAMPLE1",
+                        "id": "T0EXAMPLE2" if failure == "team_mismatch" else "T0EXAMPLE1",
                         "name": "Example",
                     },
                 },
@@ -83,11 +87,13 @@ def test_connect_plan_profile_reads_names_with_receiving_identity(failure):
                         TypeAdapter(AccountProfile),
                     )
 
-                if failure:
-                    with pytest.raises(GatewayError):
-                        await read()
-                else:
-                    assert await read() == AccountProfile("Alice", "alice", "Example")
+                user_ok = failure not in {"user", "user_mismatch", "user_timeout"}
+                team_ok = failure not in {"team", "team_mismatch", "team_http"}
+                assert await read() == AccountProfile(
+                    "Alice" if user_ok else None,
+                    "alice" if user_ok else None,
+                    "Example" if team_ok else None,
+                )
                 assert len(calls) == 2
                 assert all(r.headers["authorization"] == "Bearer xoxb-example" for r in calls)
                 assert calls[0].url.params["user"] == "U0EXAMPLE1"

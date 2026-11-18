@@ -109,6 +109,8 @@ from .models import (
     AgentChannel,
     ExecutionRequest,
     FactorySlackThread,
+    IdentityConnectToken,
+    IdentityNamespace,
     PersonalClaudeEnrollment,
 )
 from .personal_execution import OwnerContext
@@ -592,10 +594,18 @@ async def _decide(
                 slack=evidence,
             )
             if token is not None:
+                row = await session.get(IdentityConnectToken, connect.hash_token(token))
+                assert row is not None
+                namespace = await session.get(IdentityNamespace, row.identity_namespace_id)
+                assert namespace is not None
+                user_id, workspace = row.provider_native_id, namespace.key
+                await session.commit()
                 await connect.capture_slack_profile(
                     session,
                     token=token,
                     identity=data.channel_identity,
+                    user_id=user_id,
+                    workspace=workspace,
                     settings=settings,
                     client=client,
                 )

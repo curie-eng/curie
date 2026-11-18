@@ -139,11 +139,17 @@ def test_connect_plan_private_kickoff_settles_placeholder(
     post = private[0]
     assert post.params["user"] == user and post.token == stack.factory_token
     assert post.params["thread_ts"] == attempt.delivery.message_ts
-    assert f"Code: {code}" in post.text
+    assert f"Code: {code}" not in post.text
     assert "Connect your Claude plan" in post.haystack if oidc else "operator" in post.text
     blocks = post.params.get("blocks", [])
     if isinstance(blocks, str):
         blocks = json.loads(blocks)
+    assert [
+        element["text"]
+        for block in blocks
+        if block.get("type") == "context"
+        for element in block.get("elements", [])
+    ].count(f"Code: {code}") == 1
     buttons = [
         element
         for block in blocks
