@@ -86,6 +86,8 @@ jobs:
 
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl without creating a cluster
         id: install_kind
         continue-on-error: true
@@ -1217,11 +1219,14 @@ jobs:
           version: v3.17.3
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the kind cluster
         id: create_the_kind_cluster
         continue-on-error: true
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
+          version: v0.24.0
           cluster_name: curie-reserved-env
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
       - name: Back off before retrying Create the kind cluster
@@ -1235,6 +1240,7 @@ jobs:
         if: steps.create_the_kind_cluster.outcome == 'failure'
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
+          version: v0.24.0
           cluster_name: curie-reserved-env
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
       - name: Install YAML parser

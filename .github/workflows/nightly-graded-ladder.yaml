@@ -474,6 +474,8 @@ jobs:
       # versions. The `kind` Docker network (created here) is the bridge every
       # node container sits on; its gateway is the host address the in-cluster
       # worker reaches the reply stub through, resolved below.
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the kind cluster
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
