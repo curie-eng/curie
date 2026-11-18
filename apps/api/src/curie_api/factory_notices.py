@@ -270,11 +270,58 @@ async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UU
 
 
 async def mark_lineage_status_comment_stale(session: AsyncSession, lineage_id: uuid.UUID) -> None:
-    work_item_id = await session.scalar(
-        select(WorkItem.id).where(WorkItem.publication_lineage_id == lineage_id)
+    found = (
+        await session.execute(
+            select(WorkItem.id, ThreadPublicationLineage.status)
+            .join(ThreadPublicationLineage, ThreadPublicationLineage.id == lineage_id)
+            .where(WorkItem.publication_lineage_id == lineage_id)
+        )
+    ).one_or_none()
+    if found is None:
+        return
+    work_item_id, lineage_status = found
+    await mark_status_comment_stale(session, work_item_id)
+    if lineage_status == "merged":
+        await _mark_ticket_status_comment_stale(session, work_item_id)
+
+
+async def _mark_ticket_status_comment_stale(session: AsyncSession, work_item_id: uuid.UUID) -> None:
+    """Reopen the ticket's own status comment once its pull request merged.
+
+    A pull request revision is the newest request but answers on the pull
+    request, so the stale mark on the newest request never reaches the comment
+    on the ticket. The ticket's comment is the newest request that replies on
+    the issue; it gains the merge notice only when it completed.
+    """
+
+    ticket_request = (
+        await session.execute(
+            select(ExecutionRequest.id, ExecutionRequest.status)
+            .where(
+                ExecutionRequest.work_item_id == work_item_id,
+                ExecutionRequest.reply_target_kind == "issue",
+            )
+            .order_by(ExecutionRequest.sequence.desc())
+            .limit(1)
+        )
+    ).one_or_none()
+    if ticket_request is None or ticket_request.status != "completed":
+        return
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(
+            FactoryStatusComment.execution_request_id == ticket_request.id,
+            or_(
+                FactoryStatusComment.finalized_at.is_not(None),
+                FactoryStatusComment.sync_owner.is_not(None),
+            ),
+            FactoryStatusComment.refused_at.is_(None),
+        )
+        .values(
+            finalized_at=None,
+            sync_invalidated=FactoryStatusComment.sync_owner.is_not(None),
+        )
     )
-    if work_item_id is not None:
-        await mark_status_comment_stale(session, work_item_id)
 
 
 # The state labels the pass owns (#3077, #3221; triaged since #5586). A closed
@@ -335,7 +382,9 @@ def desired_label(
         )
         if label is not None:
             return label
-    if status in {"failed", "expired"} and pr_state == "merged":
+    # A merged pull request ends the ticket's time with the factory, whatever
+    # the run's own status: the label is removed (ADR decision 15).
+    if status in {"completed", "failed", "expired"} and pr_state == "merged":
         return ""
     return _DESIRED_LABEL.get(status, "")
 
@@ -734,7 +783,7 @@ def _desired_label_sql() -> Any:
         *triage_label_sql(),
         (
             and_(
-                ExecutionRequest.status.in_(("failed", "expired")),
+                ExecutionRequest.status.in_(("completed", "failed", "expired")),
                 ThreadPublicationLineage.status == "merged",
                 ThreadPublicationLineage.pr_number.is_not(None),
                 ThreadPublicationLineage.pr_url.is_not(None),
@@ -925,7 +974,7 @@ async def _claim_next(
     row, work_item, request, pr_url, pr_number, pr_state, latest, result_delivered, label = selected
     if pr_number is None or not pr_url:
         pr_state = None
-    if pr_state == "merged" and request.status in {"failed", "expired"}:
+    if pr_state == "merged" and request.status in {"completed", "failed", "expired"}:
         row.finalized_at = None
     now = await _clock(session)
     await session.execute(
@@ -1402,6 +1451,11 @@ async def _render(
             if line is not None:
                 separator = "\n\n" if result.endswith("\n\n") else "\n"
                 result = result.rstrip("\n") + separator + line + "\n"
+            if request.status == "completed" and pr_url and pr_state == "merged":
+                # The factory sends no workflow status transition; this last
+                # line is how a Jira or GitLab ticket learns the pull request
+                # merged.
+                result += f"Pull request merged: {pr_url}\n"
     publishing = (
         await session.scalar(
             select(Publication.id)
