@@ -1207,13 +1207,14 @@ class WorkerConfig(BaseSettings):
     workspace_recovery_collect_interval_s: float = Field(
         default=30.0, gt=0, validation_alias="CURIE_WORKSPACE_RECOVERY_COLLECT_INTERVAL_S"
     )
-    # Publication candidate retention (#5428). Off by default; when on (which
+    # Publication candidate retention (#5428). On by default; when on (which
     # requires the internal worker token and managed workspaces), a started
     # WorkItem run's publication snapshot and trusted base are retained as a
     # private, non-authorizing candidate before validation, and the worker
     # supervises the candidate object collector. Separate from recovery.
+    # Set false when this process has no token or no managed workspaces.
     publication_candidates_enabled: bool = Field(
-        default=False, validation_alias="CURIE_PUBLICATION_CANDIDATES_ENABLED"
+        default=True, validation_alias="CURIE_PUBLICATION_CANDIDATES_ENABLED"
     )
     publication_candidates_collect_interval_s: float = Field(
         default=30.0, gt=0, validation_alias="CURIE_PUBLICATION_CANDIDATES_COLLECT_INTERVAL_S"

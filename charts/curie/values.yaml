@@ -2246,11 +2246,11 @@ worker:
     recovery:
       enabled: false
       maxBytes: null
-    # Publication candidates (#5428): keep a private copy of each factory run's
-    # snapshot until 24 h after its final disposition. maxBytes caps all
-    # candidate bytes. Needs agentSandbox.runner.workspace.enabled.
+    # Publication candidates (#5428). On by default. The render turns this off
+    # when agentSandbox.runner.workspace.enabled is false. maxBytes caps all
+    # candidate bytes. Set enabled to false to turn retention off.
     publicationCandidates:
-      enabled: false
+      enabled: true
       maxBytes: 1073741824
   # Inbound channel attachments (#2567). The worker downloads a referenced file
   # with the channel bot token (Slack) or from the adapter that sent it, with

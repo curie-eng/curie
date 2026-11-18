@@ -638,7 +638,11 @@ def _probes(sent: list[httpx.Request]) -> list[httpx.Request]:
     [
         pytest.param({"action_executor_enabled": False}, id="executor off"),
         pytest.param(
-            {"action_executor_enabled": True, "internal_worker_token": ""},
+            {
+                "action_executor_enabled": True,
+                "internal_worker_token": "",
+                "publication_candidates_enabled": False,
+            },
             id="executor on without a worker token",
         ),
     ],
