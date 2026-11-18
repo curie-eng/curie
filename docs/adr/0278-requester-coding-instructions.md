@@ -4,6 +4,8 @@ Date: 2026-11-10
 
 Status: Accepted
 
+**Partially amended by [ADR 0287](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md)** (back-link added under ADR 0045): accepted learned rules rank between repository guidance and requester preferences, and the platform writes a second line, `Learned rules:`, before the `Requester preferences:` line.
+
 **Maintainer approval:** The repository owner approved acceptance alongside
 implementation on 2026-11-12, recorded in the implementing issue #5590, under [ADR
 0102](0102-accepted-alongside-implementation-with-explicit-approval.md). The decision is
