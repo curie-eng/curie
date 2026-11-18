@@ -127,6 +127,9 @@ jobs:
       - name: Ensure kind-registry exists
         if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_kind == 'true') }}
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_kind == 'true') }}
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl without creating a cluster
         if: ${{ github.event_name != 'merge_group' && (steps.fix-pin-curie.outputs.needs_kind == 'true') }}
         id: install_kind

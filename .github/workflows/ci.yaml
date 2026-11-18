@@ -555,6 +555,8 @@ jobs:
           version: v3.16.4
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl without creating a cluster
         id: install_kind
         continue-on-error: true
@@ -676,6 +678,8 @@ jobs:
           version: v3.16.4
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl without creating a cluster
         id: install_kind
         continue-on-error: true
@@ -1331,6 +1335,8 @@ jobs:
       # container must exist.
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl without creating a cluster
         id: install_kind
         continue-on-error: true
@@ -3232,6 +3238,8 @@ jobs:
       # worker reaches the reply stub through, resolved below.
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -3537,6 +3545,8 @@ jobs:
       # container must exist.
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl without creating a cluster
         id: install_kind
         continue-on-error: true
@@ -3653,6 +3663,8 @@ jobs:
       # container must exist.
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl without creating a cluster
         id: install_kind
         continue-on-error: true
@@ -3784,6 +3796,8 @@ jobs:
       # container must exist.
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl without creating a cluster
         id: install_kind
         continue-on-error: true
@@ -3893,6 +3907,8 @@ jobs:
       # moved to containerd 2.x, which this kind version cannot load.
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -4300,6 +4316,8 @@ jobs:
       # worker reaches the reply stub through, resolved below.
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -4551,6 +4569,8 @@ jobs:
       # worker reaches the reply stub through, resolved below.
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
@@ -4830,6 +4850,8 @@ jobs:
           EOF
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the disposable kind cluster
         id: create_the_disposable_kind_cluster
         continue-on-error: true
@@ -5264,6 +5286,8 @@ jobs:
           EOF
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the disposable kind cluster
         id: create_the_disposable_kind_cluster
         continue-on-error: true
@@ -5588,6 +5612,8 @@ jobs:
           EOF
       - name: Ensure kind-registry exists
         run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Create the disposable kind cluster
         id: create_kind_cluster
         continue-on-error: true
