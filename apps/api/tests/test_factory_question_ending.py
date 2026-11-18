@@ -43,6 +43,7 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
 )
 from sqlalchemy import text
 from test_factory_publication_recovery import api  # noqa: F401  (fixture)
+from test_factory_status_comment import _live_revision
 from test_factory_terminus import _reconcile
 
 QUESTIONS_URL = "/work-items/questions"
@@ -360,6 +361,16 @@ def test_investigating_line_is_absent_for_a_tracker_result_request(
     tr._begin(triage)
     _reconcile()
     assert INVESTIGATING not in _status_body(sink, triage.request_id)
+
+
+@pytest.mark.parametrize("fragment", ["discussion_r88301", "issuecomment-88302"])
+def test_investigating_line_is_absent_for_pull_request_feedback(
+    admitted: Any, fragment: str
+) -> None:
+    client, github, sink = admitted
+    sink.by_path = True
+    _number, _pr, revision, _work_item_id = _live_revision(client, github, sink, fragment)
+    assert INVESTIGATING not in _status_body(sink, revision)
 
 
 # Criterion 11: three rounds, then the cap ----------------------------------------------
