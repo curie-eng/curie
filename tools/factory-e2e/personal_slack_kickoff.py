@@ -1690,6 +1690,10 @@ class RunnerPod:
 class LiveRun:
     """Explicit phases; a LIFO finalizer registered before each resource is created."""
 
+    # object.__new__ skips __init__, and the unpaid refusal run is built that way.
+    # The default keeps phases() defined and leaves that leg off the grant path.
+    grant_notice = False
+
     def __init__(
         self,
         *,
