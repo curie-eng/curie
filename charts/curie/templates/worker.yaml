@@ -424,7 +424,7 @@ spec:
             - name: CURIE_PERSONAL_GRANT_NAMESPACE
               value: {{ $personalGrantNamespace | quote }}
             {{- end }}
-            {{- $consoleOrigin := dig "console" "origin" "" .Values }}
+            {{- $consoleOrigin := dig "console" "origin" "" (.Values | toYaml | fromYaml) }}
             {{- if $consoleOrigin }}
             # Rejected Claude plan direct message (#5720). Rendered only when
             # the console origin is set, so the reconnect button has a URL.
