@@ -405,7 +405,7 @@ def test_controls_apply_to_the_implementer_only() -> None:
 def test_the_removed_approval_control_raises_when_an_anchor_is_missing() -> None:
     skill = PROMPTS["implementer"].read_bytes().decode("utf-8")
     assert removed_final_approval_control(skill) != skill
-    without_diff_heading = skill.replace("## 7. Diff review", "## 7. Something else")
+    without_diff_heading = skill.replace("## 8. Diff review", "## 8. Something else")
     with pytest.raises(ValueError):
         removed_final_approval_control(without_diff_heading)
     spec = json.loads(REMOVED_APPROVAL.read_text(encoding="utf-8"))

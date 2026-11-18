@@ -935,8 +935,20 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/hooks/review_gate.py"),
     ),
     (
+        "hooks/reproduction_gate.py",
+        include_bytes!("../../examples/dark-factory/hooks/reproduction_gate.py"),
+    ),
+    (
         "evals/cases.json",
         include_bytes!("../../examples/dark-factory/evals/cases.json"),
+    ),
+    (
+        "evals/investigation-cases.json",
+        include_bytes!("../../examples/dark-factory/evals/investigation-cases.json"),
+    ),
+    (
+        "evals/question-format.md",
+        include_bytes!("../../examples/dark-factory/evals/question-format.md"),
     ),
     (
         "skills/implement-issue/SKILL.md",
@@ -997,7 +1009,8 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
 ];
 
 /// Files rendered with the executable bit, matching their tracked mode.
-const DARK_FACTORY_EXECUTABLE_FILES: &[&str] = &["hooks/review_gate.py"];
+const DARK_FACTORY_EXECUTABLE_FILES: &[&str] =
+    &["hooks/review_gate.py", "hooks/reproduction_gate.py"];
 
 pub struct DarkFactoryRenderOpts {
     pub out: PathBuf,
@@ -1021,24 +1034,8 @@ pub const FACTORY_TRIAGE_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/factory-triage/progress/phases.json"),
     ),
     (
-        "hooks/hooks.json",
-        include_bytes!("../../examples/factory-triage/hooks/hooks.json"),
-    ),
-    (
-        "hooks/reproduction_gate.py",
-        include_bytes!("../../examples/factory-triage/hooks/reproduction_gate.py"),
-    ),
-    (
         "skills/investigate-report/SKILL.md",
         include_bytes!("../../examples/factory-triage/skills/investigate-report/SKILL.md"),
-    ),
-    (
-        "evals/triage-cases.json",
-        include_bytes!("../../examples/factory-triage/evals/triage-cases.json"),
-    ),
-    (
-        "evals/reply-format.md",
-        include_bytes!("../../examples/factory-triage/evals/reply-format.md"),
     ),
 ];
 
@@ -1091,11 +1088,6 @@ pub fn render_factory_triage(
             )?;
         } else {
             std::fs::write(&path, bytes)?;
-        }
-        #[cfg(unix)]
-        if *name == "hooks/reproduction_gate.py" {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         }
     }
     Ok(FactoryTriageRenderOutput {
@@ -5092,15 +5084,17 @@ mod dark_factory_render_tests {
                 .unwrap_or_else(|e| panic!("{name} was not written: {e}"));
             assert_eq!(written.as_slice(), *bytes, "{name} bytes differ");
         }
-        let mode = std::fs::metadata(out.join("hooks/review_gate.py"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o111,
-            0o111,
-            "review_gate.py mode {mode:o} is not executable"
-        );
+        for hook in ["hooks/review_gate.py", "hooks/reproduction_gate.py"] {
+            let mode = std::fs::metadata(out.join(hook))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o111,
+                0o111,
+                "{hook} mode {mode:o} is not executable"
+            );
+        }
         let readme_mode = std::fs::metadata(out.join("README.md"))
             .unwrap()
             .permissions()

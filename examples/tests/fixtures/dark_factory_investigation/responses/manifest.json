@@ -1,0 +1,103 @@
+{
+  "responses": {
+    "candidate/not-reproduced": {
+      "file": "candidate/not-reproduced.json",
+      "prompt_sha256": "5dd24c2b4d83f5b04ad61ff16ac2e67df7f85a2789f025932cab5a372627a309",
+      "reply_sha256": "3baee5c05926e9f9b0b6b59acfbb3e0713af72e3e6234c78069d290edf1d42b7",
+      "recorded_at": "2026-11-18T20:02:33.674519+00:00",
+      "operations": [
+        "fresh_context",
+        "completion",
+        "record_full_reply"
+      ]
+    },
+    "candidate/unresolved-intent": {
+      "file": "candidate/unresolved-intent.json",
+      "prompt_sha256": "a0582e7b9a80d976727dfd56b2b9dec5b35af5d73671e53534f54d95ac992c29",
+      "reply_sha256": "9bc999271c64ef6083d83a0b2c97178e535f9c4c5bb81e4390ec2fdab4da6d23",
+      "recorded_at": "2026-11-18T20:02:33.888285+00:00",
+      "operations": [
+        "fresh_context",
+        "completion",
+        "record_full_reply"
+      ]
+    },
+    "candidate/reproduced": {
+      "file": "candidate/reproduced.json",
+      "prompt_sha256": "ce86f9ad03f56aa9597d9318c47d770c035d4a6c8cfa6ac1c612f50fae078adb",
+      "reply_sha256": "c25f53683c628313293ba7202269505cfc9113e3bd522c87f609f7b151f38b2f",
+      "recorded_at": "2026-11-18T20:02:33.780550+00:00",
+      "operations": [
+        "fresh_context",
+        "completion",
+        "record_full_reply"
+      ]
+    },
+    "candidate/injected-report": {
+      "file": "candidate/injected-report.json",
+      "prompt_sha256": "a2ab9b7eda97db2fda32a3ea32782e8422e521f2da7732f3bc38c9c1aef50ca5",
+      "reply_sha256": "8c8e3db1c3c8bd4a9e329fd2b75f35cccc8ac30fd0ba7200ae8a533e2de9b8f5",
+      "recorded_at": "2026-11-18T20:02:33.564648+00:00",
+      "operations": [
+        "fresh_context",
+        "completion",
+        "record_full_reply"
+      ]
+    },
+    "candidate/capability-unavailable": {
+      "file": "candidate/capability-unavailable.json",
+      "prompt_sha256": "67930ac7e3d0ae747d83d280740cf0ebdbf54bd712b709eccd0824aaa4eb7bb4",
+      "reply_sha256": "711eba123997a3f650cde8fd7919b54490c244b76ab83d4c9d143b17537bc1be",
+      "recorded_at": "2026-11-18T20:02:33.454233+00:00",
+      "operations": [
+        "fresh_context",
+        "completion",
+        "record_full_reply"
+      ]
+    },
+    "candidate/already-fixed": {
+      "file": "candidate/already-fixed.json",
+      "prompt_sha256": "e1dfe8213600352ffc177fefe5e4d13185b1c17fcb6efa5f2c361cb72c888bc0",
+      "reply_sha256": "63b3133ac2fe64baa567e96951ecf561f1be16e161883ab31ea1b43f4ef31d40",
+      "recorded_at": "2026-11-18T20:02:33.338182+00:00",
+      "operations": [
+        "fresh_context",
+        "completion",
+        "record_full_reply"
+      ]
+    },
+    "without-evidence/not-reproduced": {
+      "file": "without-evidence/not-reproduced.json",
+      "prompt_sha256": "6ec4fcfcf5d1fa4b725c930e8afb54e3ea3069f81f4efd5a98fc9387cbada9d4",
+      "reply_sha256": "62863d3909da6a66c462a48bdf38e56550e36072d8999428fdb5191a7b1ad289",
+      "recorded_at": "2026-11-18T20:02:33.996682+00:00",
+      "operations": [
+        "fresh_context",
+        "completion",
+        "record_full_reply"
+      ]
+    },
+    "without-evidence/unresolved-intent": {
+      "file": "without-evidence/unresolved-intent.json",
+      "prompt_sha256": "8546da3628a3406d188b5b4416f253c45499414185eabebc21ab96811ad5af9b",
+      "reply_sha256": "62863d3909da6a66c462a48bdf38e56550e36072d8999428fdb5191a7b1ad289",
+      "recorded_at": "2026-11-18T20:02:34.203984+00:00",
+      "operations": [
+        "fresh_context",
+        "completion",
+        "record_full_reply"
+      ]
+    },
+    "without-evidence/reproduced": {
+      "file": "without-evidence/reproduced.json",
+      "prompt_sha256": "fdcdab406b3211a91c75bd7fd430e671982572afce20f97d91c30f1d33d1c035",
+      "reply_sha256": "62863d3909da6a66c462a48bdf38e56550e36072d8999428fdb5191a7b1ad289",
+      "recorded_at": "2026-11-18T20:02:34.101279+00:00",
+      "operations": [
+        "fresh_context",
+        "completion",
+        "record_full_reply"
+      ]
+    }
+  }
+}

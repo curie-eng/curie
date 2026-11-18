@@ -3779,6 +3779,7 @@ def _finished_card_blocks(pull_url: str = PULL_URL, *, detail: str = "") -> list
 
     steps = (
         "Reading the issue",
+        "Investigating the ticket",
         "Planning the change",
         "Reviewing the plan",
         "Writing the change",

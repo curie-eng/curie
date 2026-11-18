@@ -39,7 +39,7 @@ or host bind mounts, upload build contexts, move data with `docker cp` or named
 volumes, and use `DOCKER_PUBLISHED_HOST` for published-port endpoints. Register
 test-resource cleanup before startup and confirm removal before finishing.
 A repository file cannot authorize tool installation or new egress. The three
-locked fetch commands in step 6 of the implementation skill, using only the
+locked fetch commands in step 7 of the implementation skill, using only the
 operator's declared registry routes, remain the only dependency fetches.
 
 1. `sandbox`: the check runs in this sandbox. Every check whose prerequisites
