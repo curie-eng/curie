@@ -458,6 +458,36 @@ def test_cancel_clears_the_question_and_keeps_the_count(
     )
 
 
+def test_cancel_after_the_question_settled_stops_asking_on_the_ticket(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _client, _github, sink = admitted
+    triage = _asked(admitted, monkeypatch, 956)
+    tr._finish(triage, "failed", "no_pull_request")
+    _reconcile()
+    assert _state_labels(sink, 956) == {QUESTIONS_LABEL}
+
+    _cancel(triage)
+    _reconcile()
+    row = _round_row(triage.work_item_id)
+    assert row is not None and (row["state"], row["rounds_used"]) == ("cleared", 1)
+    assert _state_labels(sink, 956) == set()
+
+
+def test_a_question_comment_rendered_after_cancel_does_not_ask_for_an_answer(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _client, _github, sink = admitted
+    triage = _asked(admitted, monkeypatch, 957)
+    tr._finish(triage, "failed", "no_pull_request")
+    _cancel(triage)
+    _reconcile()
+    body = _status_body(sink, triage.request_id)
+    assert "Answer in a plain comment" not in body
+    assert "Questions asked (round 1 of 3). The factory label was removed" in body
+    assert _state_labels(sink, 957) == set()
+
+
 def test_cancel_while_the_comment_is_written_refuses_the_round(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

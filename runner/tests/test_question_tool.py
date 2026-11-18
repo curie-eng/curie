@@ -7,6 +7,8 @@ aiohttp server that records what it received; nothing of ours is mocked.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from pathlib import Path
 from typing import Any
@@ -80,6 +82,38 @@ def _ask(api: _QuestionsApi, args: dict[str, Any]) -> dict[str, Any]:
             return await handler(args)
 
     return anyio.run(go)
+
+
+def test_parallel_calls_reach_the_route_one_at_a_time() -> None:
+    # The route lets a retry of a round still posting write again, so two
+    # parallel calls from one turn must not both be in flight.
+    in_flight = 0
+    most = 0
+    overlapped = asyncio.Event()
+
+    async def slow(request: web.Request) -> web.Response:
+        nonlocal in_flight, most
+        in_flight += 1
+        most = max(most, in_flight)
+        if in_flight > 1:
+            overlapped.set()
+        # Hold the first call open long enough for an unserialized second call
+        # to arrive; serialized, nothing arrives and the wait times out.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(overlapped.wait(), timeout=0.5)
+        in_flight -= 1
+        return web.json_response({"round": 1, "rounds_limit": 3})
+
+    async def go() -> list[dict[str, Any]]:
+        app = web.Application()
+        app.router.add_post(QUESTIONS_PATH, slow)
+        async with TestServer(app) as server:
+            handler = questions_handler(str(server.make_url(QUESTIONS_PATH)), CAPABILITY)
+            return list(await asyncio.gather(handler(_valid()), handler(_valid())))
+
+    results = anyio.run(go)
+    assert most == 1
+    assert all(not result.get("is_error") for result in results)
 
 
 def _valid() -> dict[str, Any]:

@@ -109,13 +109,16 @@ class TrackerResultOut(BaseModel):
 class QuestionsSubmission(BaseModel):
     """The runner question tool's call (#5785): what the investigation found and
     the numbered questions. The API checks the bounds and composes the comment;
-    input outside them is refused 409 ``invalid_questions``."""
+    input outside them, a missing field included, is refused 409
+    ``invalid_questions``."""
 
     summary: Any = Field(
+        default=None,
         description="What the investigation found, 1 to 4,000 characters, including a "
         "reproduction result when there is one."
     )
     questions: Any = Field(
+        default=None,
         description="1 to 10 questions, each 1 to 1,000 characters with no blank line."
     )
 

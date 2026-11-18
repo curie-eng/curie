@@ -147,6 +147,27 @@ def test_model_text_cannot_open_an_html_comment(
     assert "<!--" not in head
 
 
+def test_model_text_is_redacted_mention_free_and_cannot_hold_the_frame_in_a_fence(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "ghp_" + "A1b2C3d4E5" * 3 + "F6g7H8"
+    triage = _running(admitted, monkeypatch, 804)
+    response = _ask(
+        triage,
+        summary=f"Ran it with {secret} and saw:\n```\ntraceback, never closed",
+        questions=["Should @someone own this?"],
+    )
+    assert response.status_code == 200, response.text
+    (body,) = _marked(triage)
+    assert secret not in body
+    assert "[REDACTED" in body
+    assert "@someone" not in body and "@\u200bsomeone" in body
+    # No line of the composed comment opens a fence, so the numbered questions
+    # and the answer line render as the frame, not as code.
+    assert not any(line.lstrip().startswith(("```", "~~~")) for line in body.splitlines())
+    assert "\n1. Should @\u200bsomeone own this?\n" in body
+
+
 # Criterion 2: GitHub and Jira Cloud ------------------------------------------------
 
 
@@ -257,6 +278,29 @@ def test_refused_input_outside_the_bounds_is_invalid_questions(
     }
     assert triage.tracker.ledger.writes == 0
     assert _round_row(triage.work_item_id) is None
+
+
+@pytest.mark.parametrize("body", [{"questions": ["Which branch?"]}, {"summary": "Found it."}, {}])
+def test_refused_a_missing_field_is_invalid_questions_not_a_422(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
+) -> None:
+    triage = _running(admitted, monkeypatch, 826)
+    refused = triage.client.post(
+        QUESTIONS_URL, headers={"X-Curie-Issue-Read": triage.capability}, json=body
+    )
+    assert refused.status_code == 409
+    assert _code(refused) == "invalid_questions"
+    assert triage.tracker.ledger.writes == 0
+
+
+def test_a_question_with_one_crlf_line_break_is_accepted(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The runner accepts a single CRLF; the route must not read it as a blank line.
+    triage = _running(admitted, monkeypatch, 827)
+    asked = _ask(triage, questions=["first line\r\nsecond line?"])
+    assert asked.status_code == 200
+    assert asked.json() == {"round": 1, "rounds_limit": 3}
 
 
 def test_refused_a_tracker_result_request_is_not_implementation_contract(

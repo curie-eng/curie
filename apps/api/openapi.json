@@ -14515,7 +14515,7 @@
         "type": "object"
       },
       "QuestionsSubmission": {
-        "description": "The runner question tool's call (#5785): what the investigation found and\nthe numbered questions. The API checks the bounds and composes the comment;\ninput outside them is refused 409 ``invalid_questions``.",
+        "description": "The runner question tool's call (#5785): what the investigation found and\nthe numbered questions. The API checks the bounds and composes the comment;\ninput outside them, a missing field included, is refused 409\n``invalid_questions``.",
         "properties": {
           "questions": {
             "description": "1 to 10 questions, each 1 to 1,000 characters with no blank line.",
@@ -14526,10 +14526,6 @@
             "title": "Summary"
           }
         },
-        "required": [
-          "summary",
-          "questions"
-        ],
         "title": "QuestionsSubmission",
         "type": "object"
       },

@@ -348,7 +348,8 @@ def desired_label(
     if status in {"failed", "expired"} and pr_state == "merged":
         return ""
     if status == "completed" and cause == QUESTIONS_ASKED:
-        return QUESTIONS_LABEL
+        # A cancelled WorkItem takes no answer, so the ticket stops asking.
+        return "" if work_item_cancelled else QUESTIONS_LABEL
     return _DESIRED_LABEL.get(status, "")
 
 
@@ -365,6 +366,7 @@ def result_section(
     blocked_on: str | None = None,
     run_cost_usd: Decimal | None = None,
     question_round: int | None = None,
+    work_item_cancelled: bool = False,
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
@@ -375,7 +377,9 @@ def result_section(
     a failed or expired request with no successor. ``blocked_on`` is the
     condition a ``retry_condition_expired`` request was still blocked on.
     ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
-    ``question_round`` is the round a ``questions_asked`` request posted.
+    ``question_round`` is the round a ``questions_asked`` request posted, and
+    ``work_item_cancelled`` replaces its answer instruction once the WorkItem
+    is cancelled, since an answer then starts nothing.
     """
 
     if successor is not None:
@@ -410,7 +414,13 @@ def result_section(
         of_rounds = (
             f" (round {question_round} of {ROUND_LIMIT})" if question_round is not None else ""
         )
-        text = f"Questions asked{of_rounds}. Answer in a plain comment on this ticket.\n"
+        if work_item_cancelled:
+            text = (
+                f"Questions asked{of_rounds}. The factory label was removed, "
+                "so an answer starts nothing.\n"
+            )
+        else:
+            text = f"Questions asked{of_rounds}. Answer in a plain comment on this ticket.\n"
     elif cause == "issue_cancelled" and superseded:
         text = (
             f"Stopped: the label was added again, so a new run replaced this one.\nCause: {cause}\n"
@@ -763,6 +773,14 @@ def _desired_label_sql() -> Any:
                 ThreadPublicationLineage.status == "merged",
                 ThreadPublicationLineage.pr_number.is_not(None),
                 ThreadPublicationLineage.pr_url.is_not(None),
+            ),
+            literal(""),
+        ),
+        (
+            and_(
+                ExecutionRequest.status == "completed",
+                ExecutionRequest.terminal_cause == QUESTIONS_ASKED,
+                WorkItem.cancelled_at.is_not(None),
             ),
             literal(""),
         ),
@@ -1427,6 +1445,7 @@ async def _render(
                     if cause == QUESTIONS_ASKED
                     else None
                 ),
+                work_item_cancelled=work_item.cancelled_at is not None,
             )
             if (
                 request.status in {"failed", "expired", "cancelled"}
@@ -1536,26 +1555,9 @@ async def _render(
     card_url = (
         None if progress_line or not base else f"{base}/v1/factory/cards/{row.card_token}.svg"
     )
-    body = status_body(
-        request_id=row.execution_request_id,
-        card_url=card_url,
-        pill_label=pill_label,
-        phase_view=None if progress_line else view,
-        result=result,
-        paused_for_upgrade=paused_for_upgrade,
-        waiting_line=waiting_line,
-        base_line=render_base_line(work_item, transition),
-        progress_line=progress_line,
-        lead_line=(
-            INVESTIGATING_LINE
-            if request.terminal_at is None
-            and target.kind == "issue"
-            and not is_tracker_result(request)
-            and request.execution_kind != "publication_recovery"
-            else None
-        ),
-    )
-    if (
+    # A follow-up on an existing pull request cannot ask (pull_request_open),
+    # so it carries the continuing line instead of the investigating line.
+    continuing = bool(
         request.status in {"queued", "waiting", "running", "cancellation_requested"}
         and work_item.publication_lineage_id is not None
         and pr_url
@@ -1570,7 +1572,28 @@ async def _render(
             .limit(1)
         )
         is not None
-    ):
+    )
+    body = status_body(
+        request_id=row.execution_request_id,
+        card_url=card_url,
+        pill_label=pill_label,
+        phase_view=None if progress_line else view,
+        result=result,
+        paused_for_upgrade=paused_for_upgrade,
+        waiting_line=waiting_line,
+        base_line=render_base_line(work_item, transition),
+        progress_line=progress_line,
+        lead_line=(
+            INVESTIGATING_LINE
+            if request.terminal_at is None
+            and not continuing
+            and target.kind == "issue"
+            and not is_tracker_result(request)
+            and request.execution_kind != "publication_recovery"
+            else None
+        ),
+    )
+    if continuing:
         body = redact_factory_comment(
             f"Continuing on the existing pull request: {pr_url}\n\n{body}"
         )

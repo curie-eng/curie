@@ -62,7 +62,7 @@ from .provider_retry import (
     rate_limited_condition,
     usage_limited_condition,
 )
-from .side_effects import SideEffectClassifier
+from .side_effects import ARGUMENTS_WITHHELD_TOOLS, SideEffectClassifier
 
 # Longest raw tool reply this will parse into a recordable ``result``. The reply
 # travels the wire and lands in a durable record, so an unbounded connector
@@ -579,7 +579,12 @@ def _translate_assistant(
                         tool=block.name,
                         detail="non-idempotent tool executed",
                         call_id=block.id,
-                        arguments=block.input if isinstance(block.input, dict) else None,
+                        arguments=(
+                            block.input
+                            if isinstance(block.input, dict)
+                            and block.name not in ARGUMENTS_WITHHELD_TOOLS
+                            else None
+                        ),
                     )
                 )
                 state.side_effect_emitted = True

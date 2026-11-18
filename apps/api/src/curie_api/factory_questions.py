@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import factory_tracker_result_runtime as runtime
 from .config import Settings
+from .factory_comment_text import publishable_model_text
 from .forges.errors import ForgeError
 from .forges.ports import MarkedComments
 from .forges.types import ReplyTarget, TrackerIssueRef
@@ -62,7 +63,8 @@ ANSWER_LINE: Final = (
 SUMMARY_MAX_CHARS: Final = 4_000
 QUESTION_MAX_CHARS: Final = 1_000
 QUESTIONS_MAX: Final = 10
-_BLANK_LINE = re.compile(r"(?:\r\n|\r|\n)[ \t]*(?:\r\n|\r|\n)")
+# A CRLF is one line break: the lone ``\r`` alternative may not split it.
+_BLANK_LINE = re.compile(r"(?:\r\n|\r(?!\n)|\n)[ \t]*(?:\r\n|\r(?!\n)|\n)")
 
 # Refusal codes, each answered 409 with the code only (decision 10).
 NOT_IMPLEMENTATION_CONTRACT: Final = "not_implementation_contract"
@@ -115,10 +117,21 @@ def input_valid(summary: object, questions: object) -> bool:
     )
 
 
+_FENCE_RUN = re.compile(r"`{3,}|~{3,}")
+
+
 def _inert(text: str) -> str:
-    # Model text may not open an HTML comment: that would hide what follows
-    # from a reader, or imitate a platform marker.
-    return text.replace("<!--", "<​!--")
+    """Model text made safe for the fixed comment frame.
+
+    It is redacted, stripped of controls, and cannot open an HTML comment
+    (hiding what follows or imitating a platform marker) or mention anyone,
+    exactly like the tracker result (``publishable_model_text``). A run of
+    three or more backticks or tildes gets a U+200B between its characters, so
+    an unclosed code fence in the summary cannot swallow the numbered
+    questions or the answer line below it.
+    """
+
+    return _FENCE_RUN.sub(lambda run: "\u200b".join(run.group(0)), publishable_model_text(text))
 
 
 def compose_body(round_number: int, summary: str, questions: list[str]) -> str:

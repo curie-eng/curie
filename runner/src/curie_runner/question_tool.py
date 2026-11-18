@@ -17,6 +17,7 @@ round and reaches no endpoint.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
@@ -138,9 +139,21 @@ def _render_posted(payload: Any) -> dict[str, Any]:
 
 
 def questions_handler(url: str, token: str) -> ResultHandler:
-    """The handler of ``ask_questions``, closed over the route and capability."""
+    """The handler of ``ask_questions``, closed over the route and capability.
+
+    Calls run one at a time. The route lets a retry of a round still
+    ``posting`` write again (the lost-response path), so two parallel calls
+    from one turn could both reach the tracker; serialized, the second sees
+    the posted round and replays it.
+    """
+
+    single_flight = asyncio.Lock()
 
     async def ask_questions(args: dict[str, Any]) -> dict[str, Any]:
+        async with single_flight:
+            return await _ask(args)
+
+    async def _ask(args: dict[str, Any]) -> dict[str, Any]:
         issues = question_input_issues(args)
         if issues:
             return _error(

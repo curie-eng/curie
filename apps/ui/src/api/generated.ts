@@ -11154,19 +11154,20 @@ export interface components {
          * QuestionsSubmission
          * @description The runner question tool's call (#5785): what the investigation found and
          *     the numbered questions. The API checks the bounds and composes the comment;
-         *     input outside them is refused 409 ``invalid_questions``.
+         *     input outside them, a missing field included, is refused 409
+         *     ``invalid_questions``.
          */
         QuestionsSubmission: {
             /**
              * Questions
              * @description 1 to 10 questions, each 1 to 1,000 characters with no blank line.
              */
-            questions: unknown;
+            questions?: unknown;
             /**
              * Summary
              * @description What the investigation found, 1 to 4,000 characters, including a reproduction result when there is one.
              */
-            summary: unknown;
+            summary?: unknown;
         };
         /**
          * QueuedTurn
