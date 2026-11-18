@@ -4,14 +4,15 @@ The upgrade creates ``factory_question_rounds`` and ``factory_answer_receipts``
 and lets ``factory_terminal_notices.applied_label`` hold
 ``curie-factory:questions``. A round whose comment was never posted may have
 zero rounds used only while it is ``posting`` or after it settled ``cleared``.
-The downgrade refuses while a status comment row records the new label, then
-restores the earlier CHECK and drops both tables.
+A started request may complete with cause ``questions_asked``. The downgrade
+refuses while a status comment row records the new label or a request records
+the new cause, then restores the earlier CHECKs and drops both tables.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from _migration_support import (
@@ -107,14 +108,35 @@ def _notice(item_id: uuid.UUID, request_id: uuid.UUID, label: str) -> None:
     )
 
 
+def _completed(item_id: uuid.UUID, cause: str) -> uuid.UUID:
+    """A started request on ``item_id`` that completed with ``cause``."""
+
+    request_id = uuid.uuid4()
+    sql_rows(
+        "INSERT INTO curie.execution_requests (id, work_item_id, sequence, status, "
+        "wait_deadline, started_at, execution_deadline, terminal_at, terminal_cause, "
+        "execution_attempts) "
+        "VALUES (:id, :item, 2, 'completed', :deadline, :stamp, :deadline, :stamp, :cause, 1)",
+        {
+            "id": request_id,
+            "item": item_id,
+            "stamp": STAMP,
+            "deadline": STAMP + timedelta(minutes=30),
+            "cause": cause,
+        },
+    )
+    return request_id
+
+
 def test_upgrade_creates_both_tables_and_widens_the_label_check(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     isolated_migration_db.at(BELOW)
     assert _tables() == set()
-    assert QUESTIONS_LABEL not in _checks("factory_terminal_notices")[
-        "factory_terminal_notices_applied_label_ck"
-    ]
+    assert (
+        QUESTIONS_LABEL
+        not in _checks("factory_terminal_notices")["factory_terminal_notices_applied_label_ck"]
+    )
 
     command.upgrade(alembic_config(), REVISION)
 
@@ -189,9 +211,10 @@ def test_downgrade_restores_the_earlier_schema(
 
     assert stamped_revision() == BELOW
     assert _tables() == set()
-    assert QUESTIONS_LABEL not in _checks("factory_terminal_notices")[
-        "factory_terminal_notices_applied_label_ck"
-    ]
+    assert (
+        QUESTIONS_LABEL
+        not in _checks("factory_terminal_notices")["factory_terminal_notices_applied_label_ck"]
+    )
     other, request = _work_item(51)
     with pytest.raises(IntegrityError, match="factory_terminal_notices_applied_label_ck"):
         _notice(other, request, QUESTIONS_LABEL)
@@ -209,3 +232,33 @@ def test_downgrade_refuses_while_a_notice_carries_the_questions_label(
 
     assert stamped_revision() == REVISION
     assert _tables() == {"factory_question_rounds", "factory_answer_receipts"}
+
+
+def test_a_started_request_completes_with_questions_asked_only_after_the_upgrade(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    isolated_migration_db.at(BELOW)
+    item_id, _request = _work_item(70)
+    with pytest.raises(IntegrityError, match="execution_requests_state_shape_ck"):
+        _completed(item_id, "questions_asked")
+
+    command.upgrade(alembic_config(), REVISION)
+
+    _completed(item_id, "questions_asked")
+    other, _request = _work_item(71)
+    _completed(other, "completed")
+    with pytest.raises(IntegrityError, match="execution_requests_state_shape_ck"):
+        _completed(other, "question_rounds_exhausted")
+
+
+def test_downgrade_refuses_while_a_request_completed_with_questions_asked(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    isolated_migration_db.at(REVISION)
+    item_id, _request = _work_item(80)
+    _completed(item_id, "questions_asked")
+
+    with pytest.raises(RuntimeError, match="factory_question_ending_present"):
+        command.downgrade(alembic_config(), BELOW)
+
+    assert stamped_revision() == REVISION

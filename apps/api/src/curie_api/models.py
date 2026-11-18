@@ -1291,7 +1291,10 @@ class ExecutionRequest(Base):
         # which like ``owner_lost`` ends failed with an observation, and a
         # started completed or failed request may carry a confirmed teardown
         # observation) with one branch changed: an unstarted expired request
-        # may also end ``retry_condition_expired`` when it was blocked.
+        # may also end ``retry_condition_expired`` when it was blocked. Then
+        # migration 0180 (#5785): a started completed request may also end
+        # ``questions_asked``, a request that posted questions and opened no
+        # pull request.
         CheckConstraint(
             "((status = 'failed' AND started_at IS NULL AND execution_deadline IS NULL "
             "AND terminal_at IS NOT NULL AND terminal_cause = 'start_failed' "
@@ -1317,7 +1320,8 @@ class ExecutionRequest(Base):
             "AND termination_observation IS NULL) "
             "OR (status = 'completed' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
-            "AND terminal_cause IS NOT NULL AND terminal_cause = 'completed') "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause IN ('completed', 'questions_asked')) "
             "OR (status = 'failed' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
             "AND terminal_cause IS NOT NULL "
