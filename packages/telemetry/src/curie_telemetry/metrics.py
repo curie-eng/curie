@@ -793,6 +793,17 @@ _METRICS: dict[str, dict[str, Any]] = {
         True,
         _AGENT_TURN_ATTRIBUTES,
     ),
+    # #5814: per-agent time to complete. Same value as curie.turn.duration and
+    # the same bounded agent label as curie.agent.turn.completed.
+    "curie.agent.turn.duration": _definition(
+        "histogram",
+        "s",
+        "End to end turn duration for one agent. The agent label follows "
+        "curie.agent.turn.completed: at most 32 slugs per process, the rest other, "
+        "a turn with no resolved agent unbound.",
+        False,
+        _AGENT_TURN_ATTRIBUTES,
+    ),
     "curie.schedule.fire": _definition(
         "counter", "{fire}", "Durably settled hook fires.", True, _SCHEDULE_FIRE_ATTRIBUTES
     ),
