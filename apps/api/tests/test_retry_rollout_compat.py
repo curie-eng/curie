@@ -188,8 +188,7 @@ _SHIFT = (
 
 def _remaining(request_id: uuid.UUID, column: str) -> timedelta:
     (row,) = _rows(
-        f"SELECT {column} - clock_timestamp() AS left FROM curie.execution_requests "
-        "WHERE id = :id",
+        f"SELECT {column} - clock_timestamp() AS left FROM curie.execution_requests WHERE id = :id",
         {"id": request_id},
     )
     value = row["left"]
