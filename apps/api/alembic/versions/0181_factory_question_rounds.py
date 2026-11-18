@@ -21,8 +21,8 @@ comment row records the new label or a request records the new cause, either
 of which the restored checks would reject, then restores both checks and drops
 both tables.
 
-Revision ID: 0180
-Revises: 0179
+Revision ID: 0181
+Revises: 0180
 """
 
 from collections.abc import Sequence
@@ -31,8 +31,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0180"
-down_revision: str = "0179"
+revision: str = "0181"
+down_revision: str = "0180"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -114,7 +114,7 @@ _COMPLETED = (
     "AND terminal_cause IS NOT NULL AND terminal_cause IN ('completed', 'questions_asked')) "
 )
 assert _SHAPE_0172.count(_COMPLETED_0172) == 1
-# The 0180 definition, copied in ``models.ExecutionRequest``: only the
+# The 0181 definition, copied in ``models.ExecutionRequest``: only the
 # started completed branch differs from 0172.
 STATE_SHAPE = _SHAPE_0172.replace(_COMPLETED_0172, _COMPLETED)
 
@@ -142,24 +142,24 @@ def _printed(bodies: Sequence[str]) -> list[str]:
 
     bind = op.get_bind()
     bind.exec_driver_sql(
-        f"CREATE TEMPORARY TABLE curie_0180_shape_probe (LIKE {S}.execution_requests)"
+        f"CREATE TEMPORARY TABLE curie_0181_shape_probe (LIKE {S}.execution_requests)"
     )
     try:
         printed = []
         for index, body in enumerate(bodies):
             bind.exec_driver_sql(
-                f"ALTER TABLE curie_0180_shape_probe ADD CONSTRAINT probe_{index} CHECK ({body})"
+                f"ALTER TABLE curie_0181_shape_probe ADD CONSTRAINT probe_{index} CHECK ({body})"
             )
             printed.append(
                 bind.exec_driver_sql(
                     "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                    "WHERE conrelid = 'curie_0180_shape_probe'::regclass "
+                    "WHERE conrelid = 'curie_0181_shape_probe'::regclass "
                     f"AND conname = 'probe_{index}'"
                 ).scalar_one()
             )
         return printed
     finally:
-        bind.exec_driver_sql("DROP TABLE curie_0180_shape_probe")
+        bind.exec_driver_sql("DROP TABLE curie_0181_shape_probe")
 
 
 def _canonical(body: str) -> str:

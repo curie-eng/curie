@@ -1292,7 +1292,7 @@ class ExecutionRequest(Base):
         # started completed or failed request may carry a confirmed teardown
         # observation) with one branch changed: an unstarted expired request
         # may also end ``retry_condition_expired`` when it was blocked. Then
-        # migration 0180 (#5785): a started completed request may also end
+        # migration 0181 (#5785): a started completed request may also end
         # ``questions_asked``, a request that posted questions and opened no
         # pull request.
         CheckConstraint(
