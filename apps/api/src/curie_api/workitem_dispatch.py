@@ -770,7 +770,14 @@ async def claim_due(
             ExecutionRequest.wait_deadline > func.clock_timestamp(),
             # A guarded request's own dispatch time; its dispatch_not_before
             # holds the waiting deadline so an older claim never matches it.
-            ExecutionRequest.dispatch_due <= func.clock_timestamp(),
+            # Spelled per column so each partial due index serves its rows.
+            or_(
+                and_(
+                    ExecutionRequest.guarded_dispatch_not_before.is_(None),
+                    ExecutionRequest.dispatch_not_before <= func.clock_timestamp(),
+                ),
+                ExecutionRequest.guarded_dispatch_not_before <= func.clock_timestamp(),
+            ),
             # A successor blocked on a typed condition is never dispatched
             # (ADR 0269), except a resource gate, which is offered every probe
             # so the worker can check the current limit (#5427).
