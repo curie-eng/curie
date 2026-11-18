@@ -56,6 +56,8 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl
         uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:

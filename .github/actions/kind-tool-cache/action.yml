@@ -1,0 +1,35 @@
+name: Restore kind and kubectl from the Actions cache
+description: >-
+  Put the kind and kubectl binaries helm/kind-action installs into the runner
+  tool cache before kind-action runs. kind-action skips a download when the
+  binary is already at its tool-cache path, so a cache hit removes the job's
+  fetches from github.com releases and dl.k8s.io. A restored binary must match
+  the pinned SHA-256 below or it is deleted and kind-action downloads and
+  verifies it as before. On a miss, the cache post step saves what kind-action
+  installed. The versions here must match every helm/kind-action step;
+  tools/ci-retry-gate/tests/test_kind_tool_cache.py enforces that.
+runs:
+  using: composite
+  steps:
+    - name: Restore the kind tool directory
+      id: restore
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.tool_cache }}/kind/v0.24.0/amd64
+        key: kind-tools-v0.24.0-kubectl-v1.37.1-linux-amd64
+    - name: Verify the restored kind and kubectl binaries
+      if: steps.restore.outputs.cache-hit == 'true'
+      shell: bash
+      env:
+        TOOL_DIR: ${{ runner.tool_cache }}/kind/v0.24.0/amd64
+      run: |
+        set -euo pipefail
+        if ! sha256sum --check --status - <<EOF
+        b89aada5a39d620da3fcd16435b7f28d858927dd53f92cbac77686b0588b600d  ${TOOL_DIR}/kind/bin/kind
+        65691ff77eb6fa44c908b77a1082c9f092c3b9733b5cefabec0d1104890e21a8  ${TOOL_DIR}/kubectl/bin/kubectl
+        EOF
+        then
+          echo "::warning::cached kind or kubectl does not match its pinned SHA-256; kind-action will download it"
+          rm -rf -- "${TOOL_DIR:?}"
+        fi
