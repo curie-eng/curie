@@ -197,6 +197,8 @@ api:
   ENVIRONMENT: api.environment
   FACTORY_CI_WAIT_S: factory.ciWaitSeconds
   FACTORY_ENABLED: factory.enabled
+  FACTORY_GITHUB_APP_CLIENT_ID: factory.githubAppClientId
+  FACTORY_GITHUB_APP_CLIENT_SECRET: factory.githubAppClientSecretExistingSecret
   FACTORY_INTAKE: factory.intake
   FACTORY_BASE_LABEL_SETTLE_S: factory.baseLabelSettleSeconds
   CURIE_REQUESTER_CODING_INSTRUCTIONS_APPLY: factory.requesterCodingInstructions.apply

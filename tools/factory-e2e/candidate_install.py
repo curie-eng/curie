@@ -51,11 +51,14 @@ STUB_DATABASE = tch.STUB_DATABASE
 TERMINAL = frozenset({"completed", "failed", "expired", "cancelled"})
 HELM_RELEASE_NAME = "meta.helm.sh/release-name"
 HELM_RELEASE_NAMESPACE = "meta.helm.sh/release-namespace"
+# Match the chart's platform priority so a sandbox runner cannot preempt the forge.
+FIXTURE_PRIORITY = 1_000_000
+PRIORITY_CLASS_RESOURCE = "priorityclasses.scheduling.k8s.io"
 # Cluster-scoped kinds the chart can render from a release, swept by Helm annotation.
 CLUSTER_SWEEP = (
     "clusterroles.rbac.authorization.k8s.io",
     "clusterrolebindings.rbac.authorization.k8s.io",
-    "priorityclasses.scheduling.k8s.io",
+    PRIORITY_CLASS_RESOURCE,
     "validatingadmissionpolicies.admissionregistration.k8s.io",
     "validatingadmissionpolicybindings.admissionregistration.k8s.io",
     "namespaces",
@@ -269,6 +272,7 @@ class CandidateInstall:
     digests: dict[str, frozenset[str]] = field(default_factory=dict)
     rendered: list[tuple[str, str]] = field(default_factory=list)
     cluster_resources: dict[tuple[str, str], str] = field(default_factory=dict)
+    _fixture_priority_class: str | None = field(default=None, init=False)
     api_url: str = ""
     api_key: str = field(default="", repr=False)
     forward: subprocess.Popen[Any] | None = None
@@ -453,7 +457,7 @@ class CandidateInstall:
                     f"{resource}/{name} already exists; another release owns that name. "
                     "Pass another release name."
                 )
-        self.log(f"release renders {len(self.rendered)} cluster-scoped objects")
+        self.log(f"tracking {len(self.rendered)} cluster-scoped objects for teardown")
 
     # --- teardown ---------------------------------------------------------
 
@@ -462,6 +466,7 @@ class CandidateInstall:
         return (
             annotations.get(HELM_RELEASE_NAME) == self.inputs.release
             and annotations.get(HELM_RELEASE_NAMESPACE) == self.inputs.namespace
+            and annotations.get(fe.RUN_ANNOTATION, self.run_id) == self.run_id
         )
 
     def remove_install(self) -> dict[str, Any]:
@@ -557,7 +562,43 @@ class CandidateInstall:
         self.kubectl("create", "-f", "-", input_text=json.dumps(manifest))
         self.log(f"namespace {self.inputs.namespace} created")
 
-    def start_stub(self, seed_files: Mapping[str, str], seed_issue: str) -> None:
+    def _create_fixture_priority_class(self) -> str:
+        name = f"{self.inputs.namespace}-fixture"
+        if self.kubectl(
+            "get", PRIORITY_CLASS_RESOURCE, name, "--ignore-not-found", "-o", "name"
+        ).strip():
+            raise Refused(f"PriorityClass {name} already exists; left in place")
+        self.rendered.append((PRIORITY_CLASS_RESOURCE, name))
+        manifest = {
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": {
+                "name": name,
+                "annotations": {
+                    HELM_RELEASE_NAME: self.inputs.release,
+                    HELM_RELEASE_NAMESPACE: self.inputs.namespace,
+                    fe.RUN_ANNOTATION: self.run_id,
+                },
+            },
+            "value": FIXTURE_PRIORITY,
+            "globalDefault": False,
+            "preemptionPolicy": "Never",
+        }
+        self.kubectl("create", "-f", "-", input_text=json.dumps(manifest))
+        return name
+
+    def create_fixture_manifests(self, manifests: list[dict[str, Any]]) -> None:
+        if self._fixture_priority_class is None:
+            self._fixture_priority_class = self._create_fixture_priority_class()
+        for manifest in manifests:
+            if manifest["kind"] == "Pod":
+                manifest["spec"]["priorityClassName"] = self._fixture_priority_class
+        listing = {"apiVersion": "v1", "kind": "List", "items": manifests}
+        self.kubectl("create", "-f", "-", input_text=json.dumps(listing))
+
+    def stub_manifests(
+        self, seed_files: Mapping[str, str], seed_issue: str
+    ) -> list[dict[str, Any]]:
         image = self.inputs.images["worker"]
         manifests = poe.code_host_manifests(
             tch.stub_manifests(self.inputs.namespace, image, STUB_PORT),
@@ -571,8 +612,10 @@ class CandidateInstall:
         for manifest in manifests:
             if manifest["kind"] == "Pod":
                 manifest["spec"]["containers"][0]["imagePullPolicy"] = self.inputs.pull_policy
-        listing = {"apiVersion": "v1", "kind": "List", "items": manifests}
-        self.kubectl("create", "-f", "-", input_text=json.dumps(listing))
+        return manifests
+
+    def start_stub(self, seed_files: Mapping[str, str], seed_issue: str) -> None:
+        self.create_fixture_manifests(self.stub_manifests(seed_files, seed_issue))
         self.kubectl(
             "-n",
             self.inputs.namespace,

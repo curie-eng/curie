@@ -572,7 +572,10 @@ factory against a disposable install.
 the start of each phase the skill calls `mcp__curie__report_progress`, and the
 platform edits one status comment on the issue with a live card showing the
 current phase, the loop rounds and the run's activity. A failed report never
-stops the run.
+stops the run. The card and the Slack progress card group the phases into
+seven plain-English steps declared under `stages`: reading the issue, planning
+the change, reviewing the plan, writing the change, reviewing the diff, opening
+the pull request, and waiting for CI.
 
 ## Evals
 

@@ -404,6 +404,15 @@ spec:
               value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
             - name: FACTORY_ENABLED
               value: {{ get (.Values.factory | default dict) "enabled" | default false | quote }}
+            - name: FACTORY_GITHUB_APP_CLIENT_ID
+              value: {{ get (.Values.factory | default dict) "githubAppClientId" | default "" | quote }}
+            {{- if get (.Values.factory | default dict) "githubAppClientSecretExistingSecret" }}
+            - name: FACTORY_GITHUB_APP_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ get (.Values.factory | default dict) "githubAppClientSecretExistingSecret" | quote }}
+                  key: {{ get (.Values.factory | default dict) "githubAppClientSecretExistingSecretKey" | default "clientSecret" | quote }}
+            {{- end }}
             - name: FACTORY_INTAKE
               value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
             - name: FACTORY_BASE_LABEL_SETTLE_S

@@ -200,8 +200,7 @@ class Recovery(ci.CandidateInstall):
             self.inputs.pull_policy,
             owner={owner_key: owner_value},
         )
-        listing = {"apiVersion": "v1", "kind": "List", "items": manifests}
-        self.kubectl("create", "-f", "-", input_text=json.dumps(listing))
+        self.create_fixture_manifests(manifests)
         self.kubectl(
             "-n", ns, "wait", "--for=condition=Ready", f"pod/{prl.PROXY_NAME}", "--timeout=600s"
         )

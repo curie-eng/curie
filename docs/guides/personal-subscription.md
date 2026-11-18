@@ -189,17 +189,17 @@ Any earlier attempt of this message is unconfirmed here; this thread shows the r
 Outcome: enrollment_inactive
 ```
 
-If the run is admitted, the same thread answers:
+If the run is admitted, the app's first reply in that thread becomes the run's
+progress card. It names the issue and that you started it, lists the run's
+steps as they are done, and is edited in place until the run finishes or stops.
+When the pull request is open, or when the run needs you, the thread also gets
+one short reply that mentions you:
 
 ```text
-Factory run started for this issue.
-Issue: https://github.com/acme-corp/acme-fixture/issues/7
-Progress for this run is posted in this thread.
-Outcome: admitted
+@you your pull request is ready for review: https://github.com/acme-corp/acme-fixture/pull/12
 ```
 
-Later posts in that thread are phase reports, the pull request link, and the
-final outcome. The thread does not need `factory_slack_channel`. See
+The thread does not need `factory_slack_channel`. See
 [Factory Slack progress](../operations.md#factory-slack-progress).
 
 To ask for a change after the run has started, mention the app in that run's
@@ -315,3 +315,15 @@ substrate is Kubernetes. That error is
    enrolled subscription.
    [Issue 5640](https://github.com/curie-eng/curie/issues/5640) tracks that
    limit.
+
+## Link your GitHub account
+
+Open **Settings > Claude plan > Linked accounts** in the Console and choose
+**Link GitHub**. Authorize the factory GitHub App with the account you use to
+apply factory labels. If the button is absent, ask the operator to configure
+the GitHub App OAuth client. An account already linked to someone else must be
+unlinked there before it can be linked to you.
+
+The same section lists your Slack and GitHub accounts. Choose **Unlink** and
+confirm to stop new runs through an account. Runs already admitted keep their
+owner; disconnect your Claude plan when those runs must also stop.

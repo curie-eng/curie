@@ -312,6 +312,9 @@
       "type": "object",
       "description": "Rendered as CURIE_FORGES (#4397); the api validates the entries. appId stays untyped like api.githubAppId.",
       "properties": {
+        "githubAppClientId": {"type": "string"},
+        "githubAppClientSecretExistingSecret": {"type": "string"},
+        "githubAppClientSecretExistingSecretKey": {"type": "string"},
         "enabled": {"type": "boolean"},
         "intake": {"type": "string", "enum": ["poll", "webhook"]},
         "baseLabelSettleSeconds": {"type": "integer", "minimum": 0},

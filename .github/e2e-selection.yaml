@@ -10,6 +10,8 @@ ci_policy_tests:
   tools/ci-retry-gate/tests/test_gitleaks_scope.py:
     [.github, tools/ci-retry-gate, conftest.py, pyproject.toml, uv.lock,
      .gitleaks.toml, apps/ui/pnpm-lock.yaml, cli/Cargo.lock]
+  tools/ci-retry-gate/tests/test_kind_tool_cache.py:
+    [.github, tools/ci-retry-gate, conftest.py, pyproject.toml, uv.lock]
   tools/ci-retry-gate/tests/test_pr_body.py:
     [.github, tools/ci-retry-gate, conftest.py, pyproject.toml, uv.lock,
      scripts/check-pr-body.sh]
