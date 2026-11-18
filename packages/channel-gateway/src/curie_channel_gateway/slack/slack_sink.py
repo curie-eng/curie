@@ -1002,7 +1002,6 @@ class SlackReplyAdapter:
         # into the approval card's Approve/Reject buttons. A message with no
         # interaction degrades to a plain text post (the mandatory text fallback).
         intent = message.interaction
-        blocks: list[dict[str, Any]] | None
         # A reply wire 1.1 delivery_id keys any other create (ADR-0130 d4).
         client_msg_id: str | None = delivery_id
         # Approval cards always have blocks. A plain post has them only when
