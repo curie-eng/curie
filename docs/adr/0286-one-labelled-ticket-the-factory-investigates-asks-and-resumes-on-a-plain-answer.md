@@ -8,7 +8,9 @@ Accepted before implementation under the normal path of
 [`docs/adr/AGENTS.md`](AGENTS.md), not the coordinated exception of
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
 The repository owner approved this decision for acceptance on 2026-11-18,
-recorded in the issue #5784. It supersedes
+recorded in the issue #5784. The realizing issues are #5785 to #5794 and
+#5808, and the triage removal issues #5802 to #5807, as mapped under
+"Realizing code paths". It supersedes
 [ADR 0277](0277-factory-triage-publishes-tickets-before-implementation-admission.md)
 in full and partially amends ADRs 0161, 0197, 0199 and 0234, precisely as listed
 under "Supersedes" and "Amends" below, under the back-link rule in

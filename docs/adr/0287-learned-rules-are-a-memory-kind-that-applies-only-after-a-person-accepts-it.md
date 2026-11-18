@@ -8,7 +8,8 @@ Accepted before implementation under the normal path of
 [`docs/adr/AGENTS.md`](AGENTS.md), not the coordinated exception of
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
 The repository owner approved this decision for acceptance on 2026-11-18,
-recorded in the issue #5784. It partially amends ADRs 0167, 0188, 0278, 0119,
+recorded in the issue #5784. The realizing issues are #5795 to #5801 and
+#5808, as mapped under "Realizing code paths". It partially amends ADRs 0167, 0188, 0278, 0119,
 0162, 0187 and 0145, precisely as listed under "Accepted ADRs amended", under
 the back-link rule in
 [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md).
