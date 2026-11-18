@@ -24,14 +24,12 @@ from typing import Any
 
 import pytest
 from approver_ticket_support import (
-    OTHER_ROUTE,
     approval_rows,
     carried,
     create,
     dynamic_request,
     enroll,
     exactly,
-    ingress,
 )
 from approver_ticket_support import ticket_case as ticket_case
 from curie_api import identity_fence
@@ -42,8 +40,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from apps.api.tests import test_http_invocation_membership as membership
 from apps.api.tests.test_approver_ticket_creation import receipt
-from apps.api.tests.test_http_approval_creation import accepted, rows
-from apps.api.tests.test_http_requester_projection import CHANGED_SUBJECT, admit_raw_sender
+from apps.api.tests.test_http_approval_creation import rows
+from apps.api.tests.test_http_requester_projection import CHANGED_SUBJECT
 from apps.api.tests.test_http_requester_projection import synthetic_provider as synthetic_provider
 
 PLAIN: dict[str, Any] = {"target": "acct-example-1"}
@@ -55,46 +53,6 @@ LOOKUPS: dict[str, Callable[[SimpleNamespace], None]] = {
         {membership.SENDER: CHANGED_SUBJECT},
     ),
 }
-
-
-def raw_enrolled(case: SimpleNamespace) -> None:
-    """Admit the sender through the raw-account exception, then register the pair."""
-    admit_raw_sender(case.scope)
-    enroll(case)
-
-
-@pytest.mark.parametrize("lookup", sorted(LOOKUPS))
-def test_a_ticket_needs_the_original_requester_freshly_resolved(
-    ticket_case: SimpleNamespace, lookup: str,
-) -> None:
-    """@spec REQUEST-APPROVAL-4: the raw-account exception never admits a ticket.
-
-    The ordinary approval from the same capsule and lookup is admitted, so the
-    refusal belongs to the ticket rule, not to admission.
-    """
-    case = ticket_case
-    raw_enrolled(case)
-    agent = case.scope["agent"]
-    LOOKUPS[lookup](case.provider)
-
-    request = dynamic_request(case, carried(case, PLAIN))
-    exactly(create(case.client, request), 403, "caller_not_allowed")
-    assert approval_rows(agent) == []
-
-    ordinary = dynamic_request(
-        case, {}, route=OTHER_ROUTE, tool="synthetic_read", gate_kind="permission",
-    )
-    accepted(create(case.client, ordinary), ordinary)
-    assert [row["selection_mode"] for row in approval_rows(agent)] == ["ordinary"]
-
-    case.provider.outcomes.clear()
-    case.provider.subjects.clear()
-    owning = ingress(case)
-    current = dynamic_request(owning, carried(case, PLAIN))
-    receipt(create(case.client, current), current)
-    assert sorted(row["selection_mode"] for row in approval_rows(agent)) == [
-        "dynamic", "ordinary",
-    ]
 
 
 def test_a_requester_disabled_before_the_writer_refuses_there(

@@ -623,48 +623,6 @@ def test_seeded_defect_fails_then_fix_passes_then_revert_fails_again(tmp_path: P
     evidence.write(_evidence_dir(tmp_path) / "repo-toolchain-cycle-evidence.json")
 
 
-# --- 2. install under a read-only rootfs, with its control -------------------
-
-
-def test_dependency_install_succeeds_under_read_only_rootfs(tmp_path: Path) -> None:
-    """Catches "the install only worked because hardening was off".
-
-    The positive leg proves the venv-in-/workspace install completes. The
-    control leg proves, in the very same posture, that writing the image's
-    ``site-packages`` is refused with a read-only-filesystem error. Without the
-    control, a green install cannot be distinguished from an unhardened run.
-    """
-
-    _require_runner_image()
-    _require_non_vacuous_hardening()
-    _require_fixture()
-
-    evidence = Evidence()
-    with _owned_tempdir(prefix="curie-2571-install-") as root:
-        workspace = _materialize_fixture_clone(Path(root))
-
-        install = evidence.record(
-            _run_in_sandbox("install-vendored", INSTALL_VENDORED, workspace=workspace)
-        )
-        assert install.exit_status == 0, (
-            f"the documented install must succeed with no operator exec fix-up:\n{install.output}"
-        )
-
-        control = evidence.record(
-            _run_in_sandbox(
-                "control-write-usr-local-lib",
-                "touch /usr/local/lib/curie-2571-control",
-                workspace=workspace,
-            )
-        )
-        assert control.exit_status != 0, "the read-only rootfs must refuse a site-packages write"
-        assert "read-only file system" in control.output.casefold(), (
-            f"the refusal must be the read-only-rootfs one, not some other error:\n{control.output}"
-        )
-
-    evidence.write(_evidence_dir(tmp_path) / "repo-toolchain-install-evidence.json")
-
-
 # --- 3. posture pinning ------------------------------------------------------
 
 

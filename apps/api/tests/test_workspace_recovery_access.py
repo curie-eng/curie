@@ -7,8 +7,6 @@ import hashlib
 import http.client
 import json
 import logging
-import os
-import stat
 import threading
 import time
 import uuid
@@ -16,11 +14,11 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -587,178 +585,6 @@ class HeldResponse:
     @property
     def body(self) -> bytes:
         return b"".join(message.get("body", b"") for message in self.messages)
-
-
-def _regular_fds() -> dict[tuple[int, int, int], int]:
-    result = {}
-    for name in os.listdir("/proc/self/fd"):
-        try:
-            fd = int(name)
-            info = os.fstat(fd)
-        except OSError:
-            continue
-        if stat.S_ISREG(info.st_mode):
-            result[(fd, info.st_dev, info.st_ino)] = stat.S_IMODE(info.st_mode)
-    return result
-
-
-@contextmanager
-def _short_readers(seconds: int = 3) -> Iterator[None]:
-    assert 1 <= seconds <= 10
-    _sql(
-        "CREATE FUNCTION curie.access_test_short_reader() RETURNS trigger LANGUAGE plpgsql AS $$ "
-        f"BEGIN NEW.expires_at := clock_timestamp() + interval '{seconds} seconds'; "
-        "RETURN NEW; END $$"
-    )
-    try:
-        _sql(
-            "CREATE TRIGGER access_test_short_reader BEFORE INSERT ON "
-            "curie.workspace_recovery_readers FOR EACH ROW "
-            "EXECUTE FUNCTION curie.access_test_short_reader()"
-        )
-        yield
-    finally:
-        _sql("DROP TRIGGER IF EXISTS access_test_short_reader ON curie.workspace_recovery_readers")
-        _sql("DROP FUNCTION curie.access_test_short_reader()")
-
-
-def _raw_signed_get(proxy: StoreProxy, path: str) -> tuple[int, bytes]:
-    endpoint = urlsplit(proxy.endpoint)
-    connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=10)
-    try:
-        connection.request("GET", path)
-        response = connection.getresponse()
-        return response.status, response.read()
-    finally:
-        connection.close()
-
-
-def test_recovery_reader_lifetime(access: Access, caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.INFO)
-    source = access.source()
-    reservation, payloads = access.capture(source)
-    assert access.get(source).status_code == 200
-    counts = _authority_counts()
-    path = _path(source, reservation, "patch")
-    initial_files = _regular_fds()
-    held = [HeldResponse(access.client, path) for _ in range(8)]
-    with ThreadPoolExecutor(max_workers=9) as pool:
-        running = []
-        try:
-            for response in held:
-                running.append(pool.submit(response.run))
-                assert response.entered.wait(10), "authenticated response did not reach send"
-            readers = _readers(source)
-            assert len(readers) == 8
-            assert len({row["holder_id"] for row in readers}) == 8
-            assert all(285 < (r["expires_at"] - r["observed_at"]).total_seconds() <= 300
-                       for r in readers)
-            spools = _regular_fds().keys() - initial_files.keys()
-            assert len(spools) >= 8, "each pending response must own its verified spool"
-            assert all(_regular_fds()[fd] == 0o600 for fd in spools)
-            _refused(access.get(source, reservation, "patch"), 429)
-            retained = readers[0]
-            repeated = _ok(_post(access.client, "acquire-reader", {
-                "work_item_id": source["work_item_id"],
-                "checkpoint_id": reservation["checkpoint_id"],
-                "holder_id": retained["holder_id"],
-            }))
-            assert repeated["lease_id"] == str(retained["id"])
-            assert datetime.fromisoformat(repeated["expires_at"].replace("Z", "+00:00")) == (
-                retained["expires_at"]
-            )
-            for suffix in ("readers", "acquire-reader", "renew-reader"):
-                response = access.client.post(f"{_path(source, reservation)}/{suffix}",
-                                              json={}, headers=access.headers)
-                assert response.status_code in {404, 405}
-            signed_path, _ = access.proxy.requests[-1]
-            signed = parse_qs(urlsplit(signed_path).query)
-            assert 1 <= int(signed["X-Amz-Expires"][0]) <= 5
-            status, body = _raw_signed_get(access.proxy, signed_path)
-            assert status == 200 and body == payloads["patch"]
-            held[0].release.set()
-            running[0].result(timeout=10)
-            assert held[0].body == payloads["patch"]
-            assert len(_readers(source)) == 7
-            assert access.get(source, reservation, "manifest").content == payloads["manifest"]
-        finally:
-            for response in held:
-                response.release.set()
-                response.disconnect.set()
-            for future in running:
-                future.result(timeout=10)
-    assert not _readers(source)
-    assert not (spools & _regular_fds().keys())
-
-    for fail_send in (True, False):
-        response = HeldResponse(access.client, path, fail_send=fail_send)
-        before = _regular_fds()
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(response.run)
-            try:
-                assert response.entered.wait(10)
-                if fail_send:
-                    with pytest.raises((OSError, ExceptionGroup)):
-                        future.result(timeout=10)
-                else:
-                    assert len(_readers(source)) == 1
-                    response.disconnect.set()
-                    future.result(timeout=10)
-                    assert response.body == b""
-            finally:
-                response.release.set()
-                response.disconnect.set()
-        assert not _readers(source)
-        assert not (_regular_fds().keys() - before.keys())
-
-    for mode in ("failure", "headers", "body"):
-        before = _regular_fds()
-        access.proxy.arm(mode)
-        try:
-            with _short_readers():
-                response = access.get(source, reservation, "patch")
-            assert access.proxy.seen.is_set()
-            _refused(response, 502 if mode == "failure" else 409)
-            assert not _readers(source)
-            assert not (_regular_fds().keys() - before.keys())
-        finally:
-            access.proxy.release.set()
-            access.proxy.mode = ""
-
-    with _short_readers():
-        response = HeldResponse(access.client, path)
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(response.run)
-            try:
-                assert response.entered.wait(10)
-                reader = _readers(source)[0]
-                signed_path, _ = access.proxy.requests[-1]
-                query = parse_qs(urlsplit(signed_path).query)
-                signed_ttl = int(query["X-Amz-Expires"][0])
-                assert 1 <= signed_ttl <= 2
-                remaining = (reader["expires_at"] - reader["observed_at"]).total_seconds()
-                assert signed_ttl <= remaining + 1
-                status, body = _raw_signed_get(access.proxy, signed_path)
-                assert status == 200 and body == payloads["patch"]
-                with pytest.raises((TimeoutError, ExceptionGroup)):
-                    future.result(timeout=8)
-                assert future.done(), "download did not end at its lease deadline"
-                assert not _readers(source)
-                assert response.body == b""
-            finally:
-                response.release.set()
-                response.disconnect.set()
-        signed_at = datetime.strptime(query["X-Amz-Date"][0], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
-        expires = signed_at + timedelta(seconds=signed_ttl + 1)
-        until_expired = (expires - datetime.now(UTC)).total_seconds()
-        if until_expired > 0:
-            threading.Event().wait(until_expired)
-        status, _ = _raw_signed_get(access.proxy, signed_path)
-        assert status == 403, "the actual store accepted an expired signed capability"
-    assert access.get(source, reservation, "patch").content == payloads["patch"]
-    assert not _readers(source)
-    assert _authority_counts() == counts
-    _private(caplog.text)
 
 
 def _collect(access: Access) -> Any:

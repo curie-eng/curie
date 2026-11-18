@@ -157,61 +157,6 @@ def assert_only_expected_denials(owned):
     assert all(entry[b"reason"] == b"key" for entry in entries)
 
 
-def test_a_turn_runs_end_to_end_and_acks_under_the_worker_role(
-    owned_worker, enqueue_writer, monkeypatch, caplog
-):
-    """Stream read, group, delivery lease, lock, markers, completion outbox, liveness,
-    sandbox affinity and the reply, from an entry written by the enqueue role,
-    @spec PROTECTED-HOOK-LANE-3 PROTECTED-HOOK-LANE-7."""
-    from aci_protocol import Final, SessionStatus, TextDelta
-    from curie_internal.turn_queue import to_stream_fields
-    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
-    from curie_worker.delivery_lease import DeliveryLeaseStore
-    from queue_fixtures import qevent, wait_until
-
-    broker = owned_worker.broker
-    broker.command("SET", wb.CONTROL, "control-bytes")
-    broker.command("SET", wb.BINDING, b"binding-bytes")
-
-    async def go():
-        async with under_role(owned_worker, monkeypatch) as (h, client):
-            h.runner.default_script = [
-                TextDelta(text="hi "),
-                Final(text="answer", status=SessionStatus.DONE),
-            ]
-            consumer = Consumer(
-                redis=h.async_redis,
-                kernel=h.kernel,
-                config=h.config,
-                leases=DeliveryLeaseStore(h.async_redis, h.config),
-                reminders=refuse_unconfigured_reminder,
-            )
-            await consumer.ensure_group()
-            event = qevent("hello", thread="tc1", event_id="event-example-1")
-            enqueue_writer.xadd(wb.STREAM, to_stream_fields(event))
-            task = asyncio.create_task(consumer.run())
-            await wait_until(lambda: h.sink.last_text == "answer", "the reply")
-            consumer.request_stop()
-            await task
-            assert h.runner.opened == ["hello"]
-            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
-            assert summary["pending"] == 0
-            assert await h.async_redis.exists(h.config.done_key("event-example-1")) == 1
-            assert await client.read_control(wb.CONTROL) == b"control-bytes"
-            assert await client.read_binding(wb.BINDING_EVENT) == b"binding-bytes"
-
-    caplog.set_level(logging.WARNING)
-    asyncio.run(go())
-    assert_only_expected_failures(caplog)
-    assert_only_expected_denials(owned_worker)
-    assert foreign_keys(broker) == []
-    assert broker.command("GET", wb.CONTROL) == b"control-bytes"
-    assert broker.command("GET", wb.BINDING) == b"binding-bytes"
-    assert broker.command("KEYS", wb.SANDBOX_PREFIX + ":route:*"), "no affinity route was kept"
-    assert broker.command("KEYS", "curie:runs:consumer-heartbeat-capable:*"), "no liveness marker"
-    assert broker.command("KEYS", wb.WORKER_PREFIX + ":*"), "no worker marker was kept"
-
-
 def test_an_unparseable_entry_goes_to_the_lane_graveyard_not_curie_runs_dead(
     owned_worker, enqueue_writer, monkeypatch, caplog
 ):

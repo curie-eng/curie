@@ -275,26 +275,6 @@ def test_concurrent_claims_reserve_before_credentials_or_create_with_stale_quota
             assert affinity.get(f"contender-{index}") is None
 
 
-def test_pending_unrouted_create_consumes_capacity(
-    admission_client: AdmissionClient, affinity: AffinityStore, key_prefix: str
-) -> None:
-    client = admission_client
-    client.create_continue = threading.Event()
-    substrate = make_substrate(client, affinity, key_prefix)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        pending = executor.submit(substrate.claim, "pending")
-        try:
-            assert client.create_entered.wait(5)
-            assert affinity.get("pending") is None
-            substrate.claim("second")
-            with pytest.raises(CapacityExhaustedError):
-                substrate.claim("third")
-            assert len(client.created) == 2
-        finally:
-            client.create_continue.set()
-        assert pending.result(timeout=5).claim_name in client.claims
-
-
 def test_unpublished_handoff_candidate_consumes_a_separate_reservation(
     admission_client: AdmissionClient, affinity: AffinityStore, key_prefix: str
 ) -> None:

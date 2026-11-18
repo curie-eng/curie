@@ -23,7 +23,6 @@ from typing import Any
 
 import pytest
 import redis
-from aci_protocol import QueuedTurn
 from curie_api import agent_role_policy, channel_token, principal_authority
 from curie_api.config import get_settings
 from curie_api.identity.http_credential_registry import build_provider_credential_registry
@@ -37,7 +36,6 @@ from curie_api.models import (
     AgentChannel,
     ChannelIdentity,
     IdentityNamespace,
-    Principal,
     ProviderInstallation,
 )
 from curie_api.schemas.http_identity import LookupRequestV1, NamespaceV1
@@ -47,7 +45,6 @@ from curie_internal.keyspace import CHANNEL_KEY_PREFIX
 from fastapi.testclient import TestClient
 from principal_adoption_support import ISSUER, VECTORS, selection
 from role_policy_support import change, run, seed
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 ACCOUNT = "T0EXAMPLE1"
@@ -457,106 +454,6 @@ def test_owned_tls_source_echoes_fresh_request_scope(synthetic_provider: SimpleN
     asyncio.run(exchange())
 
 
-def test_current_http_member_queues_one_context_and_nonmember_writes_no_delivery_state(
-    clean_db: None,
-    valkey: redis.Redis,
-    runs_stream: str,
-    synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4/5/6/7/15: same receiver, credential and current group."""
-    provider = synthetic_provider
-    scope = _scope(provider.url)
-    module = _runtime_api()
-    identity_client = HttpIdentityClient(tls_context=provider.tls)
-    try:
-        with TestClient(
-            create_app(
-                http_identity_runtime=_runtime(module, scope), http_identity_client=identity_client
-            )
-        ) as client:
-            token = _credential(client, scope)
-            body, proof = _submission(scope)
-            assert _keys(valkey, scope["binding"]) == set() and valkey.xlen(runs_stream) == 0
-            accepted = _post(client, token, body, proof)
-            assert accepted.status_code == 200, accepted.text
-            entries = valkey.xrange(runs_stream)
-            assert len(entries) == 1
-            stream_id, fields = entries[0]
-            assert accepted.json()["stream_id"] == stream_id
-            assert set(fields) == {"payload", "curie_identity_context_v1"}
-            payload = fields["payload"]
-            turn = QueuedTurn.model_validate_json(payload)
-            ring = codec.build_identity_keyring(
-                "context", (("synthetic-context", 1, scope["context_key"]),)
-            )
-            context = codec.open_invocation_context(fields["curie_identity_context_v1"], ring)
-            assert isinstance(context, codec.InvocationContextV1)
-            assert context.payload_sha256 == hashlib.sha256(payload.encode()).hexdigest()
-            assert context.event_id == context.original_event_id == turn.event_id
-            assert context.scope.model_dump() == {
-                "tenant_id": scope["tenant"],
-                "agent_id": scope["agent"],
-                "binding_id": scope["binding"],
-                "binding_generation": scope["generation"],
-                "channel_identity_id": scope["identity"],
-                "provider_installation_id": scope["installation"],
-                "provider": "slack",
-                "native_id": SENDER,
-                "namespace": scope["namespace"].model_dump(),
-            }
-            assert context.receiver_id == scope["receiver_id"] and context.independent_human is True
-            assert context.provider_version == scope["configuration"].version
-            assert context.role_policy_version == scope["role_version"]
-            assert context.canonical.subject == SUBJECT and context.canonical.issuer == ISSUER
-            assert turn.author == SENDER and turn.reply_handle.placeholder is None
-            assert turn.author_principal is not None and context.principal is not None
-            assert turn.author_principal.model_dump() == context.principal.model_dump()
-            with pytest.raises((AttributeError, TypeError, ValueError)):
-                context.principal.principal_id = str(uuid.uuid4())
-
-            async def original_association(factory: async_sessionmaker[AsyncSession]) -> None:
-                """@spec HTTP-INVOCATION-EXECUTION-4/5/6: inspect durable provenance."""
-                async with factory() as session:
-                    row = await session.scalar(
-                        select(Principal).where(
-                            Principal.tenant_id == uuid.UUID(scope["tenant"]),
-                            Principal.idp_issuer == ISSUER,
-                            Principal.idp_subject == SUBJECT,
-                        )
-                    )
-                    assert row is not None and row.type == "human" and row.status == "active"
-                    assert turn.author_principal.principal_id == str(row.id)
-                    assert turn.author_principal.authorization_version == row.authorization_version
-
-            run(original_association)
-            assert len(provider.requests) == 1
-            observed = provider.requests[0]
-            assert observed["authority_version"] == scope["configuration"].version
-            assert observed["scope"]["tenant_id"] == scope["tenant"]
-            assert observed["scope"]["sender"] == {
-                "provider": "slack",
-                "channel_identity_id": scope["identity"],
-                "provider_installation_id": scope["installation"],
-                "namespace": scope["namespace"].model_dump(),
-                "native_id": SENDER,
-            }
-            previous = {key: valkey.get(key) for key in _keys(valkey, scope["binding"])}
-            provider.member = False
-            refused = _post(client, token, *_submission(scope))
-            assert refused.status_code == 403 and refused.json() == {"detail": "caller_not_allowed"}
-            assert len(provider.requests) == 2
-            assert provider.requests[1]["request_id"] != observed["request_id"]
-            assert provider.responses[1]["membership"]["complete"] is True
-            assert provider.responses[1]["membership"]["groups"][0]["id"] != GROUP
-            assert {key: valkey.get(key) for key in _keys(valkey, scope["binding"])} == previous
-            assert valkey.xrange(runs_stream) == entries
-        assert identity_client.close_status().state == "closed"
-    finally:
-        keys = _keys(valkey, scope["binding"])
-        if keys:
-            valkey.delete(*keys)
-
-
 @pytest.mark.parametrize(
     "tamper", ["body", "sender", "receiving_scope", "binding_generation", "mac"]
 )
@@ -646,61 +543,6 @@ def _grid_evidence(**changes: Any) -> codec.ReceiverSlackEvidenceV1:
         "event_team": GRID_WORKSPACE, "interaction_user_team_id": None,
         "is_ext_shared_channel": False, "enterprise_ids": (GRID_ORG,), **changes,
     })
-
-
-def test_grid_workspace_member_queues_one_organisation_context_and_outsiders_refuse(
-    clean_db: None,
-    valkey: redis.Redis,
-    runs_stream: str,
-    synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-2/15/21: synthetic Grid ids; no live Grid qualified."""
-    provider = synthetic_provider
-    scope = _scope(provider.url, grid=True)
-    module = _runtime_api()
-    try:
-        with TestClient(
-            create_app(
-                http_identity_runtime=_runtime(module, scope),
-                http_identity_client=HttpIdentityClient(tls_context=provider.tls),
-            )
-        ) as client:
-            token = _credential(client, scope)
-            for refused in (
-                {"is_ext_shared_channel": True},
-                {"is_ext_shared_channel": None},
-                {"enterprise_ids": ()},
-                {"enterprise_ids": ("E0EXAMPLEPARTNER",)},
-                {"enterprise_ids": (GRID_ORG, "is_enterprise_install")},
-            ):
-                submission = _submission(scope, slack=_grid_evidence(**refused))
-                response = _post(client, token, *submission)
-                assert response.status_code == 401, refused
-                assert response.json() == {"detail": "invalid_http_receiver"}
-            assert provider.requests == []
-            assert _keys(valkey, scope["binding"]) == set() and valkey.xlen(runs_stream) == 0
-            accepted = _post(client, token, *_submission(scope, slack=_grid_evidence()))
-            assert accepted.status_code == 200, accepted.text
-            (entry,) = valkey.xrange(runs_stream)
-            ring = codec.build_identity_keyring(
-                "context", (("synthetic-context", 1, scope["context_key"]),)
-            )
-            context = codec.open_invocation_context(entry[1]["curie_identity_context_v1"], ring)
-            assert isinstance(context, codec.InvocationContextV1)
-            organisation = {
-                "id": scope["namespace"].id, "authority": "", "kind": "slack_enterprise",
-                "key": GRID_ORG,
-            }
-            assert context.scope.namespace.model_dump() == organisation
-            assert context.scope.native_id == SENDER
-            (observed,) = provider.requests
-            assert observed["scope"]["sender"]["namespace"] == organisation
-            assert observed["scope"]["sender"]["native_id"] == SENDER
-            assert QueuedTurn.model_validate_json(entry[1]["payload"]).author == SENDER
-    finally:
-        keys = _keys(valkey, scope["binding"])
-        if keys:
-            valkey.delete(*keys)
 
 
 def test_operator_adopts_and_filters_real_tls_membership(

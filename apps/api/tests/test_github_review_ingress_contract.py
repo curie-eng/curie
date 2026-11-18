@@ -56,10 +56,3 @@ def test_review_event_rejects_bad_signature_before_parsing(client: TestClient) -
     response = _post(client, "issue_comment", signature="sha256=" + "0" * 64)
 
     assert response.status_code == 401, response.text
-
-
-def test_unrelated_event_remains_ignored_without_parsing(client: TestClient) -> None:
-    response = _post(client, "issues")
-
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "ignored"

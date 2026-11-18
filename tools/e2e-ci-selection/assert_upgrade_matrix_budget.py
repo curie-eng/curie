@@ -35,6 +35,13 @@ RUN_STEP = "Run the cluster upgrade matrix"
 DEFAULT_API_URL = "https://api.github.com"
 API_VERSION = "2022-11-28"
 USER_AGENT = "curie-upgrade-matrix-budget/2823"
+# Documented default for list-jobs-for-a-workflow-run (maximum is 100).
+# per_page=100 returns HTTP 502 for a full nightly run whose jobs include
+# step arrays (run 43927791819, 87 jobs). per_page=30 and per_page=50 both
+# returned HTTP 200 for that run. Stay on the documented default: fetch_jobs
+# already follows Link rel=next and checks total_count.
+# https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run
+JOBS_PAGE_SIZE = 30
 
 
 class BudgetError(Exception):
@@ -255,7 +262,10 @@ def fetch_json(url: str, token: str) -> tuple[Any, Mapping[str, str]]:
 
 
 def fetch_jobs(api_url: str, repository: str, run_id: str, token: str) -> list[dict[str, Any]]:
-    url = f"{api_url.rstrip('/')}/repos/{repository}/actions/runs/{run_id}/jobs?per_page=100"
+    url = (
+        f"{api_url.rstrip('/')}/repos/{repository}/actions/runs/{run_id}/jobs"
+        f"?per_page={JOBS_PAGE_SIZE}"
+    )
     collected: list[dict[str, Any]] = []
     total: int | None = None
     while url:

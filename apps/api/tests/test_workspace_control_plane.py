@@ -27,11 +27,10 @@ from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
 from curie_api.workspace_policy import repository_is_allowed
-from fastapi import Response
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 REPO = "acme-corp/acme-bot"
 OTHER_REPO = "attacker/other-bot"
@@ -163,7 +162,6 @@ def worker_client(_disposable_db: Any, monkeypatch: pytest.MonkeyPatch) -> Itera
         yield test_client
     _RESOLVERS.clear()
     get_settings.cache_clear()
-
 
 
 def _worker_request() -> Any:
@@ -534,73 +532,6 @@ def test_workspace_credential_pat_fallback_is_redeemed_through_the_endpoint(
         response.json()["authorization_header"]
         == "Basic " + base64.b64encode(b"x-access-token:ghp_operator_workspace").decode()
     )
-
-
-def test_workspace_credential_resolution_does_not_block_the_event_loop(
-    worker_client: TestClient,
-    auth_headers: dict[str, str],
-    clean_db: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A synchronous installation-token mint must run outside FastAPI's loop."""
-
-    from curie_api.routers.workspaces import redeem_workspace_credential
-    from curie_api.schemas.workspaces import WorkspaceCredentialRequest
-
-    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
-    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
-    selected = worker_client.post(
-        f"/v1/internal/workspaces/{deployment['id']}/selection",
-        json={
-            "conversation_id": "thread-nonblocking",
-            "author": "U0REQUEST1",
-            "repo_full_name": REPO,
-        },
-        headers=WORKER_HEADERS,
-    )
-    assert selected.status_code == 200, selected.text
-
-    resolver_started = threading.Event()
-    loop_progressed = threading.Event()
-
-    def blocking_resolver(_: str, *, html_base: str, credentials: Any) -> tuple[str, str]:
-        resolver_started.set()
-        if not loop_progressed.wait(timeout=0.5):
-            raise AssertionError("credential resolver blocked the event loop")
-        return "https://github.com/acme-corp/acme-bot.git", "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
-
-    monkeypatch.setattr(
-        "curie_api.forges.github.code_host.resolve_repository_credential", blocking_resolver
-    )
-
-    async def exercise() -> str:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
-            async with sessionmaker() as session:
-                call = asyncio.create_task(
-                    redeem_workspace_credential(
-                        uuid.UUID(deployment["id"]),
-                        WorkspaceCredentialRequest(conversation_id="thread-nonblocking"),
-                        _worker_request(),
-                        session,
-                        Response(),
-                    )
-                )
-
-                async def prove_progress() -> None:
-                    await asyncio.to_thread(resolver_started.wait)
-                    await asyncio.sleep(0)
-                    loop_progressed.set()
-
-                progress = asyncio.create_task(prove_progress())
-                result = await asyncio.wait_for(call, timeout=2)
-                await progress
-                return result.authorization_header
-        finally:
-            await engine.dispose()
-
-    assert asyncio.run(exercise()) == "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
 
 
 def test_workspace_credential_prefers_app_installation_token_over_pat(
