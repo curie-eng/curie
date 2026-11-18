@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Form, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.routing import APIRoute
 
 from ..approval_auth import enforce_console_cookie_origin
@@ -99,6 +99,35 @@ async def connect_page(token: str, request: Request, session: SessionDep) -> HTM
     namespace = await session.get(IdentityNamespace, row.identity_namespace_id)
     assert namespace is not None  # live_token checked it
     account = f"{namespace.provider} user {row.provider_native_id} in workspace {namespace.key}"
+    account_html = f"<p>{escape(account)}</p>"
+    personal = get_settings().factory_model_auth_mode == "personal"
+    warning = ""
+    if personal and namespace.provider == "slack":
+        labels = " ".join(
+            f"<bdi>{escape(label)}</bdi>"
+            for label in (
+                row.slack_display_name,
+                f"@{row.slack_handle}" if row.slack_handle else None,
+            )
+            if label
+        )
+        workspace = (
+            f"<bdi>{escape(row.slack_workspace_name)}</bdi>"
+            if row.slack_workspace_name
+            else "Name unavailable"
+        )
+        account_html = (
+            "<dl>"
+            f"<dt>Slack user</dt><dd>{labels or 'Name unavailable'}</dd>"
+            f'<dt>User ID</dt><dd><code dir="ltr">{escape(row.provider_native_id)}</code></dd>'
+            f"<dt>Workspace</dt><dd>{workspace}</dd>"
+            f'<dt>Workspace ID</dt><dd><code dir="ltr">{escape(namespace.key)}</code></dd>'
+            "</dl>"
+        )
+        warning = (
+            "<p>Confirm only if this is your own Slack account. "
+            "Anyone using it will start runs on your Claude plan.</p>"
+        )
     principal = await connect.browser_principal(
         session, token=token, proof=request.cookies.get(PROOF_COOKIE, "")
     )
@@ -121,7 +150,7 @@ async def connect_page(token: str, request: Request, session: SessionDep) -> HTM
         )
     response = HTMLResponse(
         '<!doctype html><html lang="en"><meta charset="utf-8"><title>Connect account</title>'
-        f"<h1>Connect account</h1><p>{escape(account)}</p>{action}"
+        f"<h1>Connect account</h1>{account_html}{warning}{action}"
         "<p>Your original request will not run. After connecting, send it again.</p></html>",
         headers=PRIVATE_HEADERS,
     )
@@ -138,7 +167,7 @@ async def confirm_connection(
     request: Request,
     session: SessionDep,
     csrf: Annotated[str, Form(min_length=43, max_length=43)],
-) -> HTMLResponse:
+) -> Response:
     enforce_console_cookie_origin(request)
     bound = request.cookies.get(CONNECT_COOKIE, "")
     expected = request.cookies.get(CSRF_COOKIE, "")
@@ -160,10 +189,17 @@ async def confirm_connection(
     except connect.ConnectRefused:
         await session.rollback()
         raise refused() from None
-    response = HTMLResponse(
-        '<!doctype html><html lang="en"><meta charset="utf-8"><title>Account connected</title>'
-        "<h1>Account connected</h1><p>Return to your chat and send your request again.</p></html>",
-        headers=PRIVATE_HEADERS,
-    )
+    response: Response
+    if get_settings().factory_model_auth_mode == "personal":
+        response = RedirectResponse(
+            "/settings/claude-plan", status_code=303, headers=PRIVATE_HEADERS
+        )
+    else:
+        response = HTMLResponse(
+            '<!doctype html><html lang="en"><meta charset="utf-8"><title>Account connected</title>'
+            "<h1>Account connected</h1><p>Return to your chat and send your request again.</p>"
+            "</html>",
+            headers=PRIVATE_HEADERS,
+        )
     clear_connect_cookies(response)
     return response

@@ -1114,7 +1114,9 @@ def build(
         bundles=BundleStore(config),
         # Factory run steering (#5414): always built, so a factory run's Slack
         # root never starts ordinary chat on any worker.
-        factory_steering=_build_factory_steering(config, engine, async_redis, client=eval_http),
+        factory_steering=_build_factory_steering(
+            config, engine, async_redis, client=eval_http, sink=sink
+        ),
         # #5378: a WorkItem request runs only as the owner its snapshot names.
         personal_execution=build_personal_execution(
             config,
@@ -1775,6 +1777,7 @@ def _build_factory_steering(
     redis_client: AsyncRedis,
     *,
     client: httpx.AsyncClient,
+    sink: ReplySinkRouter,
 ) -> FactorySteeringClient:
     """The kernel's factory run steering client (#5414), always built.
 
@@ -1792,6 +1795,7 @@ def _build_factory_steering(
         worker_token=config.internal_worker_token or None,
         client=client,
         intent_key=config.steering_sent_key,
+        replies=ObservedReplySink(sink),
     )
 
 

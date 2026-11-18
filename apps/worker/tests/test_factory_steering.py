@@ -10,6 +10,9 @@ in that root still reaches the steer route. The progress-card tests hand an
 admitted kickoff's placeholder to the card and send no reply text, omit the
 placeholder on a steer request, keep the reply when kickoff is refused, and
 do not render admitted kickoff text.
+``test_connect_plan_private_kickoff_settles_placeholder`` sends a private
+connect-plan notice for a linked or unlinked sender, with and without OIDC,
+and settles the public placeholder without the outcome code.
 
 The boundary is ``test_factory_slack_runtime``'s steering stack: the real API
 (``create_app()`` on uvicorn over a disposable migrated Postgres, real Valkey
@@ -88,6 +91,64 @@ GENERATION = 2
 DRIVER_BOT_ID = "B0EXAMPLE5"
 DRIVER_BOT_USER = "U0EXAMPLE5"
 DRIVER_APP_ID = "A0EXAMPLE5"
+OTHER_USER = "U0EXAMPLE6"
+
+
+@pytest.mark.parametrize(
+    "linked,oidc", [(False, True), (True, True), (False, False), (True, False)]
+)
+def test_connect_plan_private_kickoff_settles_placeholder(
+    steering: SteeringStack, monkeypatch: pytest.MonkeyPatch, linked: bool, oidc: bool
+) -> None:
+    from apps.api.tests.factory_slack_kickoff_harness import (
+        kick,
+        linking,
+        next_issue,
+        report_auth_test,
+    )
+    from apps.api.tests.test_identity_connect import connect_plan_settings
+
+    stack = steering
+    report_auth_test(stack)
+    connect_plan_settings(monkeypatch, oidc=oidc)
+    user = stack.person().slack_user if linked else OTHER_USER
+    start = len(stack.slack.calls)
+    attempt = kick(stack, user, linking(next_issue()))
+    code = "enrollment_inactive" if linked else "sender_unverified"
+    assert attempt.answer["outcome"] == code
+    private = [c for c in stack.slack.calls[start:] if c.method == "chat.postEphemeral" and c.ok]
+    assert len(private) == 1
+    post = private[0]
+    assert post.params["user"] == user and post.token == stack.factory_token
+    assert post.params["thread_ts"] == attempt.delivery.message_ts
+    assert f"Code: {code}" not in post.text
+    assert "Connect your Claude plan" in post.haystack if oidc else "operator" in post.text
+    blocks = post.params.get("blocks", [])
+    if isinstance(blocks, str):
+        blocks = json.loads(blocks)
+    assert [
+        element["text"]
+        for block in blocks
+        if block.get("type") == "context"
+        for element in block.get("elements", [])
+    ].count(f"Code: {code}") == 1
+    buttons = [
+        element
+        for block in blocks
+        for element in block.get("elements", [])
+        if element.get("type") == "button"
+    ]
+    assert len(buttons) == int(oidc)
+    if oidc:
+        assert buttons[0]["text"]["text"] == "Connect your Claude plan"
+        assert buttons[0]["url"] == attempt.answer["plan_url" if linked else "connect_url"]
+    public = "Not started. I sent you a private message about what to do next."
+    assert [c.text for c in attempt.edits] == [public]
+    assert attempt.posts == []
+    assert all(code not in c.haystack for c in attempt.edits)
+    assert all("/identity/connect/" not in c.haystack for c in attempt.edits)
+    _assert_no_sandbox(stack)
+
 
 _ISSUES = itertools.count(6401)
 _TS = itertools.count(1)
@@ -524,6 +585,9 @@ def _card_client(
         worker_token="example-worker-token",
         client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
         intent_key=lambda event_id: f"intent:{event_id}",
+        replies=runtime.SlackReplyAdapter(
+            "example-token", base_url="https://slack.example.com/api/"
+        ),
     )
 
 

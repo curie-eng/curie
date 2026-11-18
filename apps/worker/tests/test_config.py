@@ -1909,9 +1909,14 @@ def test_recovery_capture_starts_with_its_token_and_workspaces(
 def test_disabled_recovery_keeps_every_existing_configuration_valid(
     monkeypatch: pytest.MonkeyPatch, token: str, workspace: str
 ) -> None:
-    """The refusals bind only when recovery is on; off, nothing new is required."""
+    """The refusals bind only when recovery is on; off, nothing new is required.
+
+    Candidate retention defaults on and has the same token and workspace
+    requirements, so this case turns that switch off to isolate recovery.
+    """
 
     _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_CANDIDATES_ENABLED", "false")
     monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "false")
     monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", token)
     monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", workspace)
@@ -1968,6 +1973,20 @@ def test_candidate_capture_starts_with_its_token_and_workspaces(
     assert config.workspace_recovery_enabled is False
 
 
+def test_publication_candidates_default_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A process with the built-in token and managed workspaces retains candidates."""
+
+    _clear_all_config_env(monkeypatch)
+    config = WorkerConfig()
+    assert config.publication_candidates_enabled is True
+    repo_root = Path(__file__).resolve().parents[3]
+    values = yaml.safe_load((repo_root / "charts" / "curie" / "values.yaml").read_text())
+    chart = values["worker"]["workspace"]["publicationCandidates"]
+    assert chart["enabled"] is True
+    assert chart["enabled"] == WorkerConfig.model_fields["publication_candidates_enabled"].default
+    assert chart["maxBytes"] == 1073741824
+
+
 @pytest.mark.parametrize(
     ("token", "workspace"),
     [("", "false"), ("", "true"), ("candidate-worker-token", "false")],
@@ -1976,9 +1995,10 @@ def test_candidate_capture_starts_with_its_token_and_workspaces(
 def test_disabled_candidates_keep_every_existing_configuration_valid(
     monkeypatch: pytest.MonkeyPatch, token: str, workspace: str
 ) -> None:
-    """The refusals bind only when candidates are on; off (the default), nothing is required."""
+    """The refusals bind only when candidates are on. Explicit off needs nothing."""
 
     _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_CANDIDATES_ENABLED", "false")
     monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", token)
     monkeypatch.setenv("CURIE_WORKSPACE_ENABLED", workspace)
     config = WorkerConfig()

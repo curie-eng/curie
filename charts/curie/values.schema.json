@@ -578,7 +578,7 @@
             "publicationCandidates": {
               "type": "object",
               "properties": {
-                "enabled": {"type": "boolean"},
+                "enabled": {"type": "boolean", "default": true},
                 "maxBytes": {"type": "integer", "minimum": 1}
               }
             }

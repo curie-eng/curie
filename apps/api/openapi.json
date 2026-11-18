@@ -10051,6 +10051,17 @@
       "FactorySlackKickoffOut": {
         "description": "The kickoff decision. ``reason`` is the resolver's reason for\n``sender_unverified``, the base refusal code for ``base_refused`` and the\nadmission refusal code for ``admission_refused``.",
         "properties": {
+          "connect_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connect Url"
+          },
           "issue_url": {
             "anyOf": [
               {
@@ -10087,6 +10098,17 @@
             ],
             "title": "Outcome",
             "type": "string"
+          },
+          "plan_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Url"
           },
           "reason": {
             "anyOf": [

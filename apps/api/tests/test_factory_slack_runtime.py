@@ -1871,6 +1871,7 @@ async def _run_production_worker(
             read_block_ms=100,
             internal_worker_token="",
             workspace_enabled=False,
+            publication_candidates_enabled=False,
             publication_enabled=False,
             channel_gateway_url=gateway_url,
             channel_gateway_token="test-worker-credential",
@@ -2751,6 +2752,7 @@ async def _steering_worker(
             internal_worker_token=WORKER_TOKEN if token else "",
             api_base_url=stack.api_hop.url,
             workspace_enabled=False,
+            publication_candidates_enabled=False,
             publication_enabled=False,
             channel_gateway_url=gateway_url,
             channel_gateway_token="test-worker-credential",
@@ -5184,6 +5186,65 @@ def test_label_enrollment_inactive_posts_one_channel_refusal(stack: Stack) -> No
         == []
     )
     assert _rows("SELECT count(*) AS n FROM curie.factory_slack_refusal_posts") == [{"n": 1}]
+    stack.drain(fresh=True)
+    assert len([call for call in _chat(stack) if call.text.startswith("Refused:")]) == 1
+
+
+@pytest.mark.parametrize("reason", ["personal_owner_required", "enrollment_inactive"])
+def test_connect_plan_label_notice_posts_tokenless_button(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    from curie_api.factory_intake_notices import record_notice
+    from curie_api.github_factory_events import FactoryNotice
+
+    from apps.api.tests.test_identity_connect import connect_plan_settings
+
+    connect_plan_settings(monkeypatch)
+    assert stack.enable_destination().status_code == 200
+
+    async def observe():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with async_sessionmaker(engine)() as s:
+                notice = FactoryNotice(
+                    delivery_id=uuid.uuid4(),
+                    event="issues",
+                    action="labeled",
+                    disposition="admit",
+                    installation_id=1,
+                    repository_id=REPO_ID,
+                    repo_full_name=REPO,
+                    issue_number=95001,
+                    sender_id=9,
+                    sender_login="alice",
+                    label_event_at=datetime.now(UTC),
+                    label="factory",
+                    label_event_id=95001,
+                )
+                await record_notice(
+                    s,
+                    notice,
+                    TrackerIssueRef("github", "github.com", str(REPO_ID), "95001"),
+                    settings=get_settings(),
+                    reason=reason,
+                    agent_id=uuid.UUID(stack.agent_id),
+                )
+                await s.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(observe())
+    payloads = _rows("SELECT payload FROM curie.factory_slack_refusal_posts")
+    assert payloads and payloads[0]["payload"].get("plan_url") == (
+        "https://console.example.com/settings/claude-plan"
+    ), payloads
+    stack.drain()
+    posts = [call for call in _chat(stack) if call.text.startswith("Refused:")]
+    assert len(posts) == 1
+    assert "Connect your Claude plan" in posts[0].haystack
+    assert "https://console.example.com/settings/claude-plan" in posts[0].haystack
+    assert "/identity/connect/" not in posts[0].haystack
+    assert not posts[0].params.get("thread_ts")
     stack.drain(fresh=True)
     assert len([call for call in _chat(stack) if call.text.startswith("Refused:")]) == 1
 
