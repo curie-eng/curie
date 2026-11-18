@@ -3982,16 +3982,18 @@ class LiveRun:
         kit = self.require_kit()
         first = self.issues["a"]
         second = self._open_grant_issue("grant-same")
+        first_key = self._grant_issue_key(first)
+        second_key = self._grant_issue_key(second)
         self._post_grant_kickoff(kit, first)
         self._wait_rejected_grant(int(first["number"]))
-        opened = self._wait_grant_dms(kit, 1)
+        opened = self._wait_grant_dms(kit, 1, [first_key])
         self.ledger.record("grant-notice", "dm_count_after_first", opened["count"])
         self.ledger.record("grant-notice", "first_text_ok", opened["text_ok"])
         self.ledger.record("grant-notice", "first_button_ok", opened["button_url_ok"])
 
         self._post_grant_kickoff(kit, second)
         self._wait_rejected_grant(int(second["number"]))
-        held = self._hold_grant_dm_count(kit, int(opened["count"]))
+        held = self._hold_grant_dm_count(kit, int(opened["count"]), [first_key, second_key])
         self.ledger.record("grant-notice", "dm_count_after_second", held["count"])
         self.ledger.record("grant-notice", "second_settled", held["count"] == opened["count"])
 
@@ -4003,9 +4005,10 @@ class LiveRun:
         if code != 0 or type(replaced) is not int or replaced == generation:
             raise StepFailed("subscription replace did not move the generation")
         third = self._open_grant_issue("grant-replaced")
+        third_key = self._grant_issue_key(third)
         self._post_grant_kickoff(kit, third)
         self._wait_rejected_grant(int(third["number"]))
-        again = self._wait_grant_dms(kit, int(opened["count"]) + 1)
+        again = self._wait_grant_dms(kit, int(opened["count"]) + 1, [first_key, third_key])
         self.ledger.record("grant-notice", "dm_count_after_replace", again["count"])
         self.ledger.record("grant-notice", "replace_text_ok", again["text_ok"])
         self.ledger.record("grant-notice", "replace_button_ok", again["button_url_ok"])
@@ -4059,16 +4062,36 @@ class LiveRun:
             every=5,
         )
 
-    def _grant_dm_facts(self, kit: SlackKit) -> dict[str, Any]:
-        messages = kit.curie.direct_history(kit.sender_auth.user_id)
-        return sks.grant_notice_facts(messages)
+    def _grant_issue_key(self, issue: Mapping[str, Any]) -> str:
+        number = issue.get("number")
+        if not isinstance(number, int):
+            raise StepFailed("a grant-notice issue has no number")
+        return f"#{number}"
 
-    def _wait_grant_dms(self, kit: SlackKit, minimum: int) -> dict[str, Any]:
+    def _grant_issue_keys(self) -> list[str]:
+        keys: list[str] = []
+        for issue in self.issues.values():
+            number = issue.get("number") if isinstance(issue, dict) else None
+            if isinstance(number, int):
+                keys.append(f"#{number}")
+        return keys
+
+    def _grant_dm_facts(self, kit: SlackKit, expected: Sequence[str]) -> dict[str, Any]:
+        messages = kit.curie.direct_history(kit.sender_auth.user_id)
+        return sks.grant_notice_facts(messages, expected=expected)
+
+    def _wait_grant_dms(
+        self, kit: SlackKit, minimum: int, expected: Sequence[str]
+    ) -> dict[str, Any]:
         found: dict[str, Any] = {}
 
         def ready() -> bool:
-            found.update(self._grant_dm_facts(kit))
-            return int(found.get("count") or 0) >= minimum
+            found.update(self._grant_dm_facts(kit, expected))
+            return (
+                int(found.get("count") or 0) >= minimum
+                and found.get("text_ok") is True
+                and found.get("button_url_ok") is True
+            )
 
         self.wait_until(
             ready,
@@ -4078,12 +4101,14 @@ class LiveRun:
         )
         return found
 
-    def _hold_grant_dm_count(self, kit: SlackKit, expected: int) -> dict[str, Any]:
+    def _hold_grant_dm_count(
+        self, kit: SlackKit, expected_count: int, expected: Sequence[str]
+    ) -> dict[str, Any]:
         deadline = self.clock.monotonic() + GRANT_NOTICE_QUIET_SECONDS
         last: dict[str, Any] = {}
         while True:
-            last = self._grant_dm_facts(kit)
-            if int(last.get("count") or 0) != expected:
+            last = self._grant_dm_facts(kit, expected)
+            if int(last.get("count") or 0) != expected_count:
                 raise StepFailed("a same-generation kickoff posted another grant notice")
             if self.clock.monotonic() >= deadline:
                 return last
@@ -4318,10 +4343,35 @@ class LiveRun:
                 else:
                     foreign += 1
             kit.sender.delete(kit.channel, root)
+        self._delete_grant_dms(kit)
         if foreign:
             raise StepFailed("a thread holds a message the run did not post; left in place")
         if not self.slack_messages_absent():
             raise StepFailed("a run message is still present")
+
+    def _delete_grant_dms(self, kit: SlackKit) -> None:
+        """Delete the rejected-plan DMs this run posted. The bot can delete its own."""
+
+        keys = self._grant_issue_keys()
+        if not keys:
+            return
+        channel_id, messages = kit.curie.direct_conversation(kit.sender_auth.user_id)
+        if not channel_id:
+            return
+        for stamp in sks.grant_dm_timestamps(
+            messages, author=kit.curie_auth.user_id, issue_keys=keys
+        ):
+            kit.curie.delete(channel_id, stamp)
+
+    def _grant_dms_absent(self) -> bool:
+        kit = self.kit
+        if kit is None:
+            return True
+        keys = self._grant_issue_keys()
+        if not keys:
+            return True
+        _channel, messages = kit.curie.direct_conversation(kit.sender_auth.user_id)
+        return not sks.grant_dm_timestamps(messages, author=kit.curie_auth.user_id, issue_keys=keys)
 
     def slack_messages_absent(self) -> bool:
         kit = self.require_kit()
@@ -4336,7 +4386,7 @@ class LiveRun:
                 raise
             if any(message.get("ts") != root for message in messages):
                 return False
-        return True
+        return self._grant_dms_absent()
 
     # -- finalizer inventory ------------------------------------------------------------------
 

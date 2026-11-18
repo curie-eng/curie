@@ -76,9 +76,12 @@ WorkItem, so it is one channel post and never a thread reply.
 generation (#5720). A personal request that ends ``failed`` with
 ``authentication_required`` owes it only while the owner's enrollment is still
 active at the WorkItem's generation. The first such failure's issue is the
-one named. Delivery is ``chat.postMessage`` to the owner's Slack user id.
-No link, or no single Slack binding, records the row and logs
-``grant_notice_no_recipient`` once, with no post.
+one named. Delivery is ``chat.postMessage`` to the owner's Slack user id, resolved
+again at send from the one active link in the serving workspace. A revoked,
+reassigned, disabled or disconnected link sends nothing and logs
+``grant_notice_no_recipient`` once. The issue title is read at send. While it
+is still empty the notice waits, then sends the sentence without a title so
+the line stays grammatical.
 
 Delivery of a WorkItem is ordered by (sequence, rank, ordinal): the root first,
 then the card, every other post only once the root has a ts, and never a post
@@ -366,6 +369,10 @@ def refusal_delivery_id(notice_id: int) -> str:
 
 GRANT_NOTICE_BUTTON: Final = "Reconnect your Claude plan"
 GRANT_NOTICE_NO_RECIPIENT: Final = "grant_notice_no_recipient"
+GRANT_NOTICE_TITLE_PENDING: Final = "grant_notice_title_pending"
+# Sends without a title after this many waits, so a run whose tracker never
+# records one still gets a grammatical sentence.
+_GRANT_TITLE_WAITS: Final = 5
 _GRANT_RECONNECT_PATH: Final = "/settings/claude-plan"
 
 
@@ -448,9 +455,14 @@ class FactorySlackRefusal:
 
 @dataclass(frozen=True)
 class FactoryGrantNotice:
-    """One leased grant notice: who to tell and which generation it names."""
+    """One leased grant notice: who to tell and which generation it names.
+
+    ``recipient`` is the link captured when the row was inserted. Delivery
+    does not post to it; it resolves the owner's active link again.
+    """
 
     post_id: int
+    tenant_id: uuid.UUID
     principal_id: uuid.UUID
     generation: int
     payload: dict[str, Any]
@@ -486,6 +498,8 @@ def _render(row: RowMapping, reports: Sequence[RowMapping]) -> CardRender:
         pr_number=int(row["pr_number"]) if published and row["pr_number"] is not None else None,
         pr_url=_str(row["pr_url"]) if published else None,
         pr_title=_str(row["pr_title"]) if published else None,
+        plan_still_connected=row["plan_still_connected"] is True,
+        personal=row["personal"] is True,
     )
     return render_card(subject, request, now=row["now"])
 
@@ -1143,6 +1157,15 @@ class PostgresFactorySlackStore:
                        AS requester_login,
                    {self._issue_url} AS ticket_url,
                    q.id AS request_id, q.sequence, q.status, q.terminal_cause,
+                   (w.model_auth_mode = 'personal') AS personal,
+                   EXISTS (
+                       SELECT 1
+                         FROM {self._enrollments} e
+                        WHERE e.tenant_id = w.tenant_id
+                          AND e.principal_id = w.owner_principal_id
+                          AND e.active
+                          AND e.generation = w.enrollment_generation
+                   ) AS plan_still_connected,
                    COALESCE(q.started_at, q.created_at) AS started_at, q.terminal_at,
                    (
                        SELECT n.subject_title
@@ -1449,12 +1472,98 @@ class PostgresFactorySlackStore:
                 },
             )
 
+    async def resolve_grant_recipient(self, work: FactoryGrantNotice) -> str | None:
+        """The owner's one active Slack user in the serving workspace, read now.
+
+        A revoked link, a disabled identity, a disconnected installation, or
+        anything other than one active link answers nothing. A link replaced
+        since the row was inserted answers the new user.
+        """
+
+        if work.channel_identity is None:
+            return None
+        query = text(
+            f"""
+            SELECT min(l.provider_native_id) AS recipient
+              FROM {self._identities} ci
+              JOIN {self._installations} pi
+                ON pi.id = ci.provider_installation_id
+              JOIN {self._namespaces} ns
+                ON ns.tenant_id = ci.tenant_id
+               AND ns.provider = 'slack'
+               AND ns.kind = 'slack_workspace'
+               AND ns.authority = pi.authority
+               AND ns.key = pi.external_account_id
+               AND ns.status = 'active'
+              JOIN {self._links} l
+                ON l.identity_namespace_id = ns.id
+               AND l.tenant_id = ns.tenant_id
+               AND l.revoked_at IS NULL
+             WHERE ci.tenant_id = :tenant_id
+               AND ci.provider = 'slack'
+               AND ci.name = :identity
+               AND ci.status = 'active'
+               AND NOT ci.installation_mismatch
+               AND pi.provider = 'slack'
+               AND pi.status = 'connected'
+               AND l.principal_id = :principal_id
+            HAVING count(*) = 1
+            """
+        )
+        async with self._engine.connect() as connection:
+            recipient = (
+                await connection.execute(
+                    query,
+                    {
+                        "tenant_id": work.tenant_id,
+                        "identity": work.channel_identity,
+                        "principal_id": work.principal_id,
+                    },
+                )
+            ).scalar_one_or_none()
+        return None if recipient is None else str(recipient)
+
+    async def grant_notice_title(self, work: FactoryGrantNotice) -> str | None:
+        """The first rejected request's issue title, read when the notice is sent."""
+
+        query = text(
+            f"""
+            SELECT n.subject_title
+              FROM {self._requests} q
+              JOIN {self._work_items} w ON w.id = q.work_item_id
+              LEFT JOIN {self._notices} n ON n.execution_request_id = q.id
+             WHERE w.tenant_id = :tenant_id
+               AND w.owner_principal_id = :principal_id
+               AND w.enrollment_generation = :generation
+               AND w.model_auth_mode = 'personal'
+               AND q.status = 'failed'
+               AND q.terminal_cause = 'authentication_required'
+             ORDER BY q.terminal_at NULLS LAST, q.id
+             LIMIT 1
+            """
+        )
+        async with self._engine.connect() as connection:
+            title = (
+                await connection.execute(
+                    query,
+                    {
+                        "tenant_id": work.tenant_id,
+                        "principal_id": work.principal_id,
+                        "generation": work.generation,
+                    },
+                )
+            ).scalar_one_or_none()
+        if not isinstance(title, str):
+            return None
+        stripped = title.strip()
+        return stripped or None
+
     async def claim_grant_notice(self) -> FactoryGrantNotice | None:
         """Lease the next due grant notice, or None when none is due."""
 
         owed = text(
             f"""
-            SELECT g.id, g.principal_id, g.generation, g.payload, g.attempts,
+            SELECT g.id, g.tenant_id, g.principal_id, g.generation, g.payload, g.attempts,
                    g.channel_identity, g.recipient
               FROM {self._grants} g
              WHERE g.posted_at IS NULL
@@ -1489,10 +1598,12 @@ class PostgresFactorySlackStore:
         payload = row["payload"]
         if isinstance(payload, str):
             payload = json.loads(payload)
+        tenant = row["tenant_id"]
         principal = row["principal_id"]
         identity = row["channel_identity"]
         return FactoryGrantNotice(
             post_id=int(row["id"]),
+            tenant_id=tenant if isinstance(tenant, uuid.UUID) else uuid.UUID(str(tenant)),
             principal_id=(
                 principal if isinstance(principal, uuid.UUID) else uuid.UUID(str(principal))
             ),
@@ -1699,16 +1810,31 @@ class FactorySlackProgressLoop:
         return True
 
     async def _deliver_grant(self, work: FactoryGrantNotice) -> bool:
-        if not work.recipient or not work.channel_identity:
+        if not work.channel_identity:
             await self._store.fail_grant_notice(work, error=GRANT_NOTICE_NO_RECIPIENT)
             logger.info(GRANT_NOTICE_NO_RECIPIENT)
             return False
-        text_value, links = render_grant_notice(work.payload)
+        recipient = await self._store.resolve_grant_recipient(work)
+        if not recipient:
+            await self._store.fail_grant_notice(work, error=GRANT_NOTICE_NO_RECIPIENT)
+            logger.info(GRANT_NOTICE_NO_RECIPIENT)
+            return False
+        payload = dict(work.payload)
+        title = await self._store.grant_notice_title(work)
+        if title:
+            payload["title"] = title
+        elif not payload.get("title") and work.attempts < _GRANT_TITLE_WAITS:
+            await self._store.retry_grant_notice(
+                work, error=GRANT_NOTICE_TITLE_PENDING, permanent=False
+            )
+            logger.info(GRANT_NOTICE_TITLE_PENDING)
+            return False
+        text_value, links = render_grant_notice(payload)
         try:
             ref = await self._emit(
                 text_value=text_value,
                 delivery_id=grant_notice_delivery_id(work.principal_id, work.generation),
-                channel=work.recipient,
+                channel=recipient,
                 identity=work.channel_identity,
                 conversation_id=None,
                 links=links,
@@ -1884,6 +2010,7 @@ __all__ = [
     "FactorySlackWork",
     "GRANT_NOTICE_BUTTON",
     "GRANT_NOTICE_NO_RECIPIENT",
+    "GRANT_NOTICE_TITLE_PENDING",
     "PostgresFactorySlackStore",
     "delivery_id_for",
     "grant_notice_delivery_id",

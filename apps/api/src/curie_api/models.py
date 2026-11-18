@@ -2550,8 +2550,9 @@ class FactoryGrantNotice(Base):
 
     One row per tenant principal and enrollment generation, inserted while that
     enrollment is still active at the WorkItem's generation. ``recipient`` is
-    the owner's Slack user id, null when no single link or binding can be
-    resolved. The lease, attempt and acknowledgement columns match
+    the owner's Slack user id at insert, null when no single link or binding
+    could be resolved then. Delivery reads the active link again and does not
+    post to this snapshot. The lease, attempt and acknowledgement columns match
     ``factory_slack_posts``. The payload holds the issue key, title, issue URL
     and reconnect URL, and never a token, generation or Secret name.
     """

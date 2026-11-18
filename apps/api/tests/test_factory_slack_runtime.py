@@ -5937,3 +5937,45 @@ def test_grant_notice_card_names_the_claude_plan_page(stack: Stack) -> None:
     assert _replies(stack, root, NEEDS_YOU) == [
         f"{NEEDS_YOU}{cause_text('authentication_required')}"
     ]
+
+
+def test_grant_notice_card_does_not_call_a_disconnect_a_rejection(stack: Stack) -> None:
+    """Disconnect and replace are not a provider rejection.
+
+    A started personal run that loses its grant still ends
+    ``authentication_required``. The card says the enrollment was replaced or
+    disconnected. The notify reply keeps the shared cause sentence.
+    """
+
+    raw = cause_text("enrollment_fenced")
+    fence = raw[:1].upper() + raw[1:]
+    _seed_receiving_identity(stack.identity)
+
+    def ended_card(owner: uuid.UUID, *, active: bool, generation: int) -> tuple[str, str]:
+        number = next(_ISSUES)
+        request_id, work_item_id = stack.admit(number, owner=_owner(owner))
+        _stamp_title(request_id, "Fix the greeting")
+        stack.start(request_id)
+        root = _kickoff_thread(stack, work_item_id, request_id)
+        _end_plain(request_id, "failed", "authentication_required")
+        _set_enrollment(owner, generation=generation, active=active)
+        stack.drain()
+        return _last_card(stack, work_item_id), root
+
+    disconnected, _link = _seed_principal(f"U0{stack.tag.upper()}CD")
+    _enroll(disconnected)
+    card, root = ended_card(disconnected, active=False, generation=1)
+    assert "was rejected" not in card
+    assert fence in card
+    assert _replies(stack, root, NEEDS_YOU) == [
+        f"{NEEDS_YOU}{cause_text('authentication_required')}"
+    ]
+
+    replaced, _other = _seed_principal(f"U0{stack.tag.upper()}CR")
+    _enroll(replaced)
+    card, root = ended_card(replaced, active=True, generation=2)
+    assert "was rejected" not in card
+    assert fence in card
+    assert _replies(stack, root, NEEDS_YOU) == [
+        f"{NEEDS_YOU}{cause_text('authentication_required')}"
+    ]

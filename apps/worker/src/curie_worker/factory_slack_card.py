@@ -119,6 +119,11 @@ class CardRequest:
     pr_number: int | None
     pr_url: str | None
     pr_title: str | None
+    # A personal run whose enrollment is still active at its generation. The
+    # rejected-plan sentence is true only then. A disconnect or replace keeps
+    # ``authentication_required`` on a started request, and that sentence is not.
+    plan_still_connected: bool = False
+    personal: bool = False
 
 
 def _view(request: CardRequest) -> PhaseView | None:
@@ -256,10 +261,13 @@ def render_card(subject: CardSubject, request: CardRequest, *, now: datetime) ->
             label = f"View pull request {number}".rstrip()
             links.append(MessageLink(label=label[:_LINK_LABEL_MAX], url=url))
     elif state == "needs a person":
-        # A rejected personal grant names the Claude plan page. Other causes
-        # keep the shared sentence, and the notify reply does too (#5720).
-        if request.terminal_cause == "authentication_required":
+        # The rejected-plan sentence is only true while that enrollment is still
+        # active. A disconnect or replace uses the enrollment fence sentence.
+        # The notify reply keeps the shared cause sentence (#5720).
+        if request.terminal_cause == "authentication_required" and request.plan_still_connected:
             sentence = "Your Claude plan was rejected. Reconnect it on the Claude plan page."
+        elif request.terminal_cause == "authentication_required" and request.personal:
+            sentence = _sentence(cause_text("enrollment_fenced"))
         else:
             sentence = _sentence(cause_text(str(request.terminal_cause or "")))
         body.extend(["", f":raising_hand: *Needs a person.* {escaped(sentence)}"])

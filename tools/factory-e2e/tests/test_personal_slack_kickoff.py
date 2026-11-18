@@ -4230,33 +4230,81 @@ def test_judge_checks_observed_models_and_rehearsal_ledgers(tmp_path: Path) -> N
         rehearsal.close()
 
 
+def _grant_dm(key: str, *, button: str | None = None, extra_button: str | None = None) -> dict:
+    url = button if button is not None else f"{sks.CONSOLE_ORIGIN}{sks.GRANT_NOTICE_BUTTON_SUFFIX}"
+    elements = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Reconnect your Claude plan"},
+            "url": url,
+        }
+    ]
+    if extra_button is not None:
+        elements.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Again"},
+                "url": extra_button,
+            }
+        )
+    if button == "":
+        elements = []
+    return {
+        "text": (
+            "Your Claude plan was rejected when Curie tried to use it, so your factory "
+            f"run for {key} Fix the greeting stopped. The work is kept."
+        ),
+        "blocks": [{"type": "actions", "elements": elements}],
+        "user": "UBOT",
+        "ts": key,
+    }
+
+
 def test_grant_notice_judge_counts_one_message_per_generation(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A rehearsal ledger passes grant-notice from the recorded DM counts, and a second
-    message at the same generation fails it. The judge reads no Slack token."""
+    """Each expected issue key matches one DM, and that DM's own button.
 
-    message = {
-        "text": (
-            "Your Claude plan was rejected when Curie tried to use it, so your factory "
-            "run for #7 Fix the greeting stopped. The work is kept."
-        ),
-        "blocks": [
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Reconnect your Claude plan"},
-                        "url": f"{sks.CONSOLE_ORIGIN}{sks.GRANT_NOTICE_BUTTON_SUFFIX}",
-                    }
-                ],
-            }
-        ],
+    A URL that is not on the button, two URLs on one message, or a second
+    message for the same key does not pass. A notice for another issue is
+    ignored. A second message at the same generation fails the ledger judge.
+    The judge reads no Slack token.
+    """
+
+    button = f"{sks.CONSOLE_ORIGIN}{sks.GRANT_NOTICE_BUTTON_SUFFIX}"
+    first = _grant_dm("#7")
+    second = _grant_dm("#8")
+    assert sks.grant_notice_facts([first, second], expected=["#7", "#8"]) == {
+        "count": 2,
+        "text_ok": True,
+        "button_url_ok": True,
     }
-    facts = sks.grant_notice_facts([message, dict(message)])
-    assert facts == {"count": 2, "text_ok": True, "button_url_ok": True}
-    assert sks.grant_notice_facts([{"text": "ping"}])["count"] == 0
+    assert sks.grant_notice_facts([{"text": "ping"}], expected=["#7"])["count"] == 0
+    unrelated = _grant_dm("#99")
+    assert sks.grant_notice_facts([first, unrelated], expected=["#7"]) == {
+        "count": 1,
+        "text_ok": True,
+        "button_url_ok": True,
+    }
+    pooled = _grant_dm("#7", extra_button=button)
+    bare = _grant_dm("#8", button="")
+    bare["blocks"] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": button},
+        }
+    ]
+    missed = sks.grant_notice_facts([pooled, bare], expected=["#7", "#8"])
+    assert missed["button_url_ok"] is False
+    duplicate = sks.grant_notice_facts([first, dict(first)], expected=["#7"])
+    assert duplicate["count"] == 2
+    assert duplicate["text_ok"] is False
+    assert duplicate["button_url_ok"] is False
+    assert sks.grant_dm_timestamps(
+        [first, {**second, "user": "UHUMAN"}, unrelated],
+        author="UBOT",
+        issue_keys=["#7", "#8"],
+    ) == ["#7"]
 
     state = _private(tmp_path / "state")
     ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())

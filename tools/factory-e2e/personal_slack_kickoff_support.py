@@ -815,8 +815,8 @@ class SlackWeb:
             if error.code != "message_not_found":
                 raise
 
-    def direct_history(self, user_id: str) -> list[dict[str, Any]]:
-        """``conversations.history`` of the direct message with ``user_id``, or none."""
+    def direct_conversation(self, user_id: str) -> tuple[str, list[dict[str, Any]]]:
+        """The IM channel id with ``user_id`` and its history, or an empty channel."""
 
         cursor = ""
         channel_id = ""
@@ -834,11 +834,17 @@ class SlackWeb:
             meta = listed.get("response_metadata")
             cursor = str(meta.get("next_cursor") or "") if isinstance(meta, dict) else ""
             if not cursor:
-                return []
+                return "", []
         if not channel_id:
-            return []
+            return "", []
         history = self.call("conversations.history", {"channel": channel_id, "limit": "200"})
-        return [item for item in history.get("messages") or [] if isinstance(item, dict)]
+        messages = [item for item in history.get("messages") or [] if isinstance(item, dict)]
+        return channel_id, messages
+
+    def direct_history(self, user_id: str) -> list[dict[str, Any]]:
+        """``conversations.history`` of the direct message with ``user_id``, or none."""
+
+        return self.direct_conversation(user_id)[1]
 
 
 def kickoff_text(curie_user: str, issue_url: str) -> str:
@@ -873,36 +879,104 @@ def message_text(message: Mapping[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _nested_urls(value: Any) -> list[str]:
-    found: list[str] = []
-    if isinstance(value, dict):
-        url = value.get("url")
-        if isinstance(url, str):
-            found.append(url)
-        for item in value.values():
-            found.extend(_nested_urls(item))
-    elif isinstance(value, list):
-        for item in value:
-            found.extend(_nested_urls(item))
-    return found
+def _names_issue_key(text: str, key: str) -> bool:
+    """Whether ``key`` stands alone in ``text`` (``#7`` does not match ``#70``)."""
+
+    if not key:
+        return False
+    return re.search(rf"(?<!\S){re.escape(key)}(?!\S)", text) is not None
 
 
-def grant_notice_facts(messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """How many rejected-plan DMs ``messages`` holds, and whether each carries the button."""
+def _button_blocks(message: Mapping[str, Any]) -> list[Any]:
+    blocks = message.get("blocks")
+    if isinstance(blocks, str):
+        try:
+            blocks = json.loads(blocks)
+        except json.JSONDecodeError:
+            return []
+    return blocks if isinstance(blocks, list) else []
 
-    notices = [message for message in messages if GRANT_NOTICE_MARK in message_text(message)]
-    button_urls = [
-        url
-        for message in notices
-        for url in _nested_urls(message.get("blocks"))
-        if url.endswith(GRANT_NOTICE_BUTTON_SUFFIX)
-    ]
+
+def grant_notice_button_url(message: Mapping[str, Any]) -> str | None:
+    """The one reconnect URL on this message's own button, or none.
+
+    A URL in the text or in another block does not count. Two button URLs do
+    not count as one.
+    """
+
+    urls: list[str] = []
+    for block in _button_blocks(message):
+        if not isinstance(block, dict) or block.get("type") != "actions":
+            continue
+        elements = block.get("elements")
+        if not isinstance(elements, list):
+            continue
+        for element in elements:
+            if not isinstance(element, dict) or element.get("type") != "button":
+                continue
+            url = element.get("url")
+            if isinstance(url, str):
+                urls.append(url)
+    if len(urls) != 1 or not urls[0].endswith(GRANT_NOTICE_BUTTON_SUFFIX):
+        return None
+    return urls[0]
+
+
+def grant_notice_facts(
+    messages: Sequence[Mapping[str, Any]], *, expected: Sequence[str]
+) -> dict[str, Any]:
+    """Match each expected issue key to exactly one rejected-plan DM.
+
+    A notice that names none of ``expected`` is ignored. Each expected key
+    must be the only expected key in its message, and that message's own
+    button must carry the Claude plan URL. Two URLs on one message do not
+    cover a second key.
+    """
+
+    if not expected or any(not key for key in expected):
+        raise ValueError("expected issue keys are required")
+    buckets: dict[str, list[Mapping[str, Any]]] = {key: [] for key in expected}
+    for message in messages:
+        text = message_text(message)
+        if GRANT_NOTICE_MARK not in text:
+            continue
+        hits = [key for key in expected if _names_issue_key(text, key)]
+        if len(hits) != 1:
+            continue
+        buckets[hits[0]].append(message)
     kept = "stopped. The work is kept."
+    text_ok = all(
+        len(buckets[key]) == 1 and kept in message_text(buckets[key][0]) for key in expected
+    )
+    button_url_ok = all(
+        len(buckets[key]) == 1 and grant_notice_button_url(buckets[key][0]) is not None
+        for key in expected
+    )
     return {
-        "count": len(notices),
-        "text_ok": bool(notices) and all(kept in message_text(message) for message in notices),
-        "button_url_ok": bool(notices) and len(button_urls) >= len(notices),
+        "count": sum(len(rows) for rows in buckets.values()),
+        "text_ok": text_ok,
+        "button_url_ok": button_url_ok,
     }
+
+
+def grant_dm_timestamps(
+    messages: Sequence[Mapping[str, Any]], *, author: str, issue_keys: Sequence[str]
+) -> list[str]:
+    """Timestamps of rejected-plan DMs ``author`` posted that name one issue key."""
+
+    found: list[str] = []
+    for message in messages:
+        if message.get("user") != author:
+            continue
+        text = message_text(message)
+        if GRANT_NOTICE_MARK not in text:
+            continue
+        if not any(_names_issue_key(text, key) for key in issue_keys):
+            continue
+        stamp = message.get("ts")
+        if isinstance(stamp, str):
+            found.append(stamp)
+    return found
 
 
 def reply_outcome(messages: Iterable[Mapping[str, Any]], *, author: str) -> str | None:
