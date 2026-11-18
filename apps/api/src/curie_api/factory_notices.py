@@ -335,7 +335,9 @@ def desired_label(
         )
         if label is not None:
             return label
-    if status in {"failed", "expired"} and pr_state == "merged":
+    # A merged pull request ends the ticket's time with the factory, whatever
+    # the run's own status: the label is removed (ADR decision 15).
+    if status in {"completed", "failed", "expired"} and pr_state == "merged":
         return ""
     return _DESIRED_LABEL.get(status, "")
 
@@ -734,7 +736,7 @@ def _desired_label_sql() -> Any:
         *triage_label_sql(),
         (
             and_(
-                ExecutionRequest.status.in_(("failed", "expired")),
+                ExecutionRequest.status.in_(("completed", "failed", "expired")),
                 ThreadPublicationLineage.status == "merged",
                 ThreadPublicationLineage.pr_number.is_not(None),
                 ThreadPublicationLineage.pr_url.is_not(None),
@@ -925,7 +927,7 @@ async def _claim_next(
     row, work_item, request, pr_url, pr_number, pr_state, latest, result_delivered, label = selected
     if pr_number is None or not pr_url:
         pr_state = None
-    if pr_state == "merged" and request.status in {"failed", "expired"}:
+    if pr_state == "merged" and request.status in {"completed", "failed", "expired"}:
         row.finalized_at = None
     now = await _clock(session)
     await session.execute(
@@ -1396,6 +1398,10 @@ async def _render(
             ):
                 state = "closed without merging" if pr_state == "closed" else pr_state
                 result += f"Pull request: {pr_url} ({state})\n"
+            elif request.status == "completed" and pr_url and pr_state == "merged":
+                # The factory never moves a ticket's workflow status; this line
+                # is how a Jira or GitLab ticket learns the pull request merged.
+                result += f"Pull request merged: {pr_url}\n"
             # Tokens and estimated cost over every round of the work item
             # (#3223), after the Cause line so its parse is unchanged.
             line = usage_line(usage)

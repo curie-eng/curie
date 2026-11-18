@@ -2593,18 +2593,23 @@ def test_port_lineage_state_refinalizes_unchanged_completed_comments_idempotentl
 
     after = _notices(request_id)[0]
     assert after["finalized_at"] is not None
-    assert (
-        _rows(
-            "SELECT rendered_digest FROM curie.factory_terminal_notices "
-            "WHERE execution_request_id = :id",
-            {"id": request_id},
-        )[0]["rendered_digest"]
-        == digest
-    )
+    redigest = _rows(
+        "SELECT rendered_digest FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]["rendered_digest"]
+    assert (redigest != digest) == (state == "merged")
     assert after["comment_id"] == before["comment_id"]
-    assert jira.writes == writes
     assert len(jira.issue(ticket.id).remote_links) == 1
-    assert "curie-factory:pr-open" in jira.issue(ticket.id).labels
+    if state == "merged":
+        # A merged pull request ends the factory's label; the body gained its
+        # merge line, so the edit is a real write (one-ticket ADR decision 15).
+        assert "curie-factory:pr-open" not in jira.issue(ticket.id).labels
+        assert jira.writes > writes
+        writes = jira.writes
+    else:
+        assert jira.writes == writes
+        assert "curie-factory:pr-open" in jira.issue(ticket.id).labels
     _reconcile()
     repeated = _notices(request_id)[0]
     assert repeated["attempts"] == after["attempts"]

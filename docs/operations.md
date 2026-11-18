@@ -2322,8 +2322,10 @@ row, stops further edits, and does not change the execution row.
 
 The same pass keeps one state label on the originating issue, for revisions
 too: `curie-factory:queued` while waiting, `curie-factory:running` while running
-or stopping, `curie-factory:pr-open` after a completed run, and
-`curie-factory:needs-human` after a failed or expired one. A cancelled run
+or stopping, `curie-factory:pr-open` after a completed run until its pull request merges, and
+`curie-factory:needs-human` after a failed or expired one. A merged pull request
+removes the label and ends the status comment with `Pull request merged: <url>`;
+Curie never transitions a ticket's workflow status. A cancelled run
 removes all four. The same pass removes a legacy `curie:queued`,
 `curie:running`, `curie:pr-open`, or `curie:needs-human` label by exact name
 whenever it sets or clears the state label, including after an upgrade.
