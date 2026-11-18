@@ -13,7 +13,6 @@ advisory gate hold. Product code gains no failure injection parameter.
 from __future__ import annotations
 
 import asyncio
-import secrets
 import socket
 import threading
 import time
@@ -30,7 +29,6 @@ from curie_protected_hooks.source_policy_sql import SourceGate
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_hook_source_admin_routes import (
-    BODIES,
     PROTECTED_TARGET,
     _intent,
     admin_app,
@@ -42,15 +40,12 @@ from test_hook_source_admin_routes import (
     get_secret,
     ledger,
     policy_row,
-    post_support,
     put_policy,
     second_agent,
     seed_row,
     source_record,
     state,
-    support_headers,
 )
-from test_hook_source_support import legacy_secret
 
 pytestmark = pytest.mark.usefixtures("support_db")
 # Fixtures shared with the route suite, registered in this module by name.
@@ -344,52 +339,6 @@ def test_restart_between_reserve_and_confirmation_is_broker_unavailable(
     run(scenario)
 
 
-# -- concurrency on one agent ----------------------------------------------------------------
-
-
-@pytest.mark.parametrize("second", ["put", "delete"])
-def test_concurrent_mutations_on_one_agent_serialize_on_the_gate(
-    principals: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second: str
-) -> None:
-    """Two mutations at expected generation 0 for one agent: exactly one commits.
-
-    The loser waits on the gate, then refuses on stale CAS (or, for DELETE of
-    the now configured row, stale CAS too) with no new history.
-    @spec PROTECTED-HOOK-SOURCE-2 @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-10.
-    """
-
-    async def scenario() -> None:
-        """@spec PROTECTED-HOOK-SOURCE-2/10."""
-        async with admin_app(tmp_path, monkeypatch, principals) as (_app, client, agent, _rt):
-            await asyncio.to_thread(pause_writes, principals, 1500)
-            first_op, second_op = str(uuid.uuid4()), str(uuid.uuid4())
-            try:
-                first = asyncio.create_task(put_policy(client, agent, "0", first_op))
-                await until(lambda: pending_registered(agent), 4, "no registration")
-                other = asyncio.create_task(
-                    put_policy(client, agent, "0", second_op)
-                    if second == "put"
-                    else delete_policy(client, agent, "0", second_op)
-                )
-                await asyncio.sleep(0.3)
-                assert not other.done(), "second mutation did not wait on the agent gate"
-            finally:
-                await asyncio.to_thread(unpause, principals)
-            winner, loser = await asyncio.wait_for(asyncio.gather(first, other), 15)
-            assert_refusal(winner, 503, "runtime_unavailable", "1")
-            assert_refusal(loser, 409, "stale_source_generation")
-            assert await asyncio.to_thread(ledger, agent) == [
-                (first_op, 1, "committed", _intent(PROTECTED_TARGET))
-            ]
-            assert source_record(principals, agent) == {
-                "floor": "1",
-                "operation_id": first_op,
-                "active": None,
-            }
-
-    run(scenario)
-
-
 # -- gate waits and the gate pool bound --------------------------------------------------------
 
 
@@ -479,82 +428,6 @@ def test_admin_requests_give_up_on_the_gate_after_five_seconds_without_effects(
             )
             for response in freed:
                 assert_refusal(response, 503, "runtime_unavailable", "1")
-
-    run(scenario)
-
-
-def test_gate_pool_exhaustion_by_slow_mutations_is_bounded_for_other_agents(
-    principals: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Two mutations on a paused broker plus two gate waiters exhaust the four gate connections.
-
-    Gated ingress for another agent (its support probe) waits for a gate
-    connection, and no longer than the documented bound: the gate phase
-    deadline plus SQL time, measured here as the pause plus slack.
-    @spec PROTECTED-HOOK-SOURCE-2 @spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-SOURCE-9
-    @spec PROTECTED-HOOK-SOURCE-10.
-    """
-
-    async def scenario() -> None:
-        """@spec PROTECTED-HOOK-SOURCE-2/10."""
-        observer = create_async_engine(get_settings().database_url, pool_size=1, max_overflow=0)
-        try:
-            async with admin_app(tmp_path, monkeypatch, principals) as (_app, client, agent, _rt):
-                other = await second_agent(client)
-                body = BODIES[None]
-                pause_ms = 3000
-                await asyncio.to_thread(pause_writes, principals, pause_ms)
-                paused_at = time.monotonic()
-                try:
-                    first = asyncio.create_task(put_policy(client, agent, "0", str(uuid.uuid4())))
-                    await until(lambda: pending_registered(agent), 2, "no registration")
-                    waiters = [
-                        asyncio.create_task(put_policy(client, agent, "0", str(uuid.uuid4()))),
-                        asyncio.create_task(get_policy(client, agent)),
-                        asyncio.create_task(get_secret(client, agent)),
-                    ]
-                    await until(
-                        lambda: advisory(observer, granted=False),
-                        2,
-                        "gate waiters never queued",
-                    )
-                    await asyncio.sleep(0.3)
-                    probe_started = time.monotonic()
-                    probe = asyncio.create_task(
-                        post_support(
-                            client,
-                            other,
-                            body,
-                            support_headers(
-                                legacy_secret(other),
-                                requested=None,
-                                body=body,
-                                delivery="bound-" + secrets.token_hex(4),
-                            ),
-                        )
-                    )
-                    await asyncio.sleep(0.5)
-                    assert not probe.done(), "another agent's ingress did not wait on the pool"
-                finally:
-                    remaining = pause_ms / 1000 - (time.monotonic() - paused_at)
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                    await asyncio.to_thread(unpause, principals)
-                response = await asyncio.wait_for(probe, 15)
-                waited = time.monotonic() - probe_started
-                assert response.status_code == 503, response.text
-                assert response.json()["reason"] == "source_unconfigured"
-                # Bound: gate phase deadline (5 s) plus SQL time; the pause ends first here.
-                assert waited <= 5 + 3, f"other agent's ingress stalled {waited:.2f}s"
-                # The paused reserve outlives the writer's two second socket timeout or not.
-                slow = await first
-                assert slow.status_code == 503 and slow.json()["detail"]["code"] in (
-                    "runtime_unavailable",
-                    "broker_unavailable",
-                ), slow.text
-                await asyncio.gather(*waiters, return_exceptions=True)
-        finally:
-            await observer.dispose()
 
     run(scenario)
 

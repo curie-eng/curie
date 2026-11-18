@@ -52,7 +52,7 @@ def test_missing_replay_transcript_refuses_before_resource_mutation(
     missing = tmp_path / "missing-transcript.json"
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
-    args = fe.parse_args(["scripted", "--transcript", str(missing)])
+    args = fe.parse_args(["scripted", "--scenario", "publication", "--transcript", str(missing)])
 
     assert sk.main(args) == fe.EXIT_CONFIG
     assert "transcript" in capsys.readouterr().err.lower()
@@ -73,6 +73,15 @@ def test_facts_recording_refuses_before_resource_mutation(
     args = fe.parse_args(["scripted", "--scenario", "facts", "--record"])
     assert sk.main(args) == fe.EXIT_CONFIG
     assert "never records" in capsys.readouterr().err
+
+
+def test_triage_recording_refuses_before_resource_mutation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    args = fe.parse_args(["scripted", "--scenario", "triage-to-pr", "--record"])
+    assert sk.main(args) == fe.EXIT_CONFIG
+    assert "only the publication scenario supports recording" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("violation", [None, "admission", "request", "tool", "route"])
@@ -147,7 +156,10 @@ def test_record_without_upstream_key_refuses_before_resource_mutation(
     monkeypatch.delenv("CURIE_FACTORY_RECORD_KEY", raising=False)
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
-    args = fe.parse_args(["scripted", "--record", "--transcript", str(tmp_path / "record.json")])
+    args = fe.parse_args(
+        ["scripted", "--scenario", "publication", "--record",
+         "--transcript", str(tmp_path / "record.json")]
+    )
 
     assert sk.main(args) == fe.EXIT_CONFIG
     assert "CURIE_FACTORY_RECORD_KEY" in capsys.readouterr().err
@@ -171,7 +183,7 @@ def test_malformed_replay_transcript_refuses_before_resource_mutation(
     malformed.write_text(content)
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
-    args = fe.parse_args(["scripted", "--transcript", str(malformed)])
+    args = fe.parse_args(["scripted", "--scenario", "publication", "--transcript", str(malformed)])
 
     assert sk.main(args) == fe.EXIT_CONFIG
     assert "transcript" in capsys.readouterr().err.lower()
@@ -193,15 +205,15 @@ def test_well_formed_replay_transcript_passes_configuration(tmp_path: Path) -> N
             }
         )
     )
-    args = fe.parse_args(["scripted", "--transcript", str(transcript)])
+    args = fe.parse_args(["scripted", "--scenario", "publication", "--transcript", str(transcript)])
 
     sk.validate_configuration(args)
 
 
-def _replay_args(tmp_path: Path) -> Any:
+def _replay_args(tmp_path: Path, *, scenario: str = "publication") -> Any:
     transcript = tmp_path / "transcript.json"
     transcript.write_text(json.dumps({"version": 1, "exchanges": []}))
-    return fe.parse_args(["scripted", "--transcript", str(transcript)])
+    return fe.parse_args(["scripted", "--scenario", scenario, "--transcript", str(transcript)])
 
 
 def _evidence(tmp_path: Path) -> dict[str, Any]:
@@ -777,7 +789,10 @@ def _recording_run(
     monkeypatch.setenv("FACTORY_RUN_ID", run_id)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.delenv("CURIE_FACTORY_RECORD_BASELINE_REMAINING", raising=False)
-    args = fe.parse_args(["scripted", "--record", "--transcript", str(tmp_path / "record.json")])
+    args = fe.parse_args(
+        ["scripted", "--scenario", "publication", "--record",
+         "--transcript", str(tmp_path / "record.json")]
+    )
     run = sk.ScriptedRun(args)
     monkeypatch.setattr(run, "provider_remaining", lambda: remaining)
     monkeypatch.setattr(run, "command", lambda *_args, **_kwargs: str(tmp_path / "repo/.git"))
@@ -1677,11 +1692,11 @@ def _image_check_commands(
     return calls, mutating
 
 
-# A replay run enables the channel gateway, so it also needs the dispatcher image.
-REPLAY_IMAGES = (*sk.IMAGES, sk.GATEWAY_IMAGE)
+# Triage replay needs the dispatcher image for the channel gateway.
+TRIAGE_IMAGES = (*sk.IMAGES, sk.GATEWAY_IMAGE)
 
 
-@pytest.mark.parametrize("missing", REPLAY_IMAGES)
+@pytest.mark.parametrize("missing", TRIAGE_IMAGES)
 def test_missing_local_image_refuses_as_configuration_before_resource_creation(
     missing: str,
     tmp_path: Path,
@@ -1691,7 +1706,7 @@ def test_missing_local_image_refuses_as_configuration_before_resource_creation(
 
     calls, mutating = _image_check_commands(tmp_path, monkeypatch, missing)
 
-    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_CONFIG
+    assert sk.main(_replay_args(tmp_path, scenario="triage-to-pr")) == fe.EXIT_CONFIG
     assert ("docker", "image", "inspect", missing) in calls
     assert mutating == [], "no cluster, registry or build command may run"
     evidence = _evidence(tmp_path)
@@ -1706,18 +1721,18 @@ def test_present_local_images_pass_the_check_and_reach_resource_creation(
 ) -> None:
     calls, mutating = _image_check_commands(tmp_path, monkeypatch, None)
 
-    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
+    assert sk.main(_replay_args(tmp_path, scenario="triage-to-pr")) == fe.EXIT_FAILED
     inspected = {
         image for argv in calls if argv[:3] == ("docker", "image", "inspect")
         for image in argv[3:]
     }
-    assert sorted(inspected) == sorted(REPLAY_IMAGES)
+    assert sorted(inspected) == sorted(TRIAGE_IMAGES)
     assert mutating, "the run must proceed past the image check"
     assert mutating[0][:2] in {("docker", "run"), ("kind", "create")}
     first_mutation = calls.index(mutating[0])
     assert all(
         calls.index(("docker", "image", "inspect", image)) < first_mutation
-        for image in REPLAY_IMAGES
+        for image in TRIAGE_IMAGES
     )
     assert "stop at first resource command" in _evidence(tmp_path)["error"]
 
@@ -1777,7 +1792,7 @@ def test_admitted_candidate_map_keeps_image_refs_through_budget_and_import(
 def test_failed_publication_evidence_survives_verdict_without_transport_or_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
     request_id = "00000000-0000-0000-0000-000000000001"
     run.evidence["execution_request_id"] = request_id
     run.evidence["final_comment"] = {"body": f"<!-- curie-execution-request:{request_id} -->"}
@@ -1814,7 +1829,7 @@ def test_failed_publication_evidence_survives_verdict_without_transport_or_crede
 def test_publication_trust_uses_actual_worker_namespace_or_refuses(
     publication_namespace: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
     ca_file = tmp_path / "ca.pem"
     run.stub = type("StubCa", (), {"ca_file": ca_file})()
     calls: list[tuple[str, ...]] = []
@@ -1844,7 +1859,7 @@ def test_publication_trust_uses_actual_worker_namespace_or_refuses(
 def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
     run.secrets = ["example-sensitive-token"]
     calls: list[tuple[str, ...]] = []
     remaining = True
@@ -2082,7 +2097,7 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 def test_triage_setup_requests_unattended_publication_before_deploy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    driver = sk.ScriptedRun(_replay_args(tmp_path))
+    driver = sk.ScriptedRun(_replay_args(tmp_path, scenario="triage-to-pr"))
     driver.workdir = tmp_path / "work"
     driver.workdir.mkdir()
     driver.env.update(CURIE_API_URL="http://api.example.com", CURIE_API_KEY="example-key")
@@ -2632,7 +2647,7 @@ def test_enabled_gateway_builds_and_imports_the_dispatcher_image_the_chart_names
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    args = _replay_args(tmp_path)
+    args = _replay_args(tmp_path, scenario="triage-to-pr")
     args.build_images = True
     run = sk.ScriptedRun(args)
     assert run.gateway_enabled()
@@ -2687,16 +2702,16 @@ def test_enabled_gateway_builds_and_imports_the_dispatcher_image_the_chart_names
 
 
 def test_runs_without_the_gateway_leave_the_dispatcher_image_out(tmp_path: Path) -> None:
-    recording = fe.parse_args(["scripted", "--record"])
+    from c4_admitted_kind import AdmittedKind
+
+    recording = fe.parse_args(["scripted", "--scenario", "publication", "--record"])
     facts = fe.parse_args(["scripted", "--scenario", "facts"])
 
-    class OwnScenario(sk.ScriptedRun):
-        TRIAGE_TO_PR = False
-
     for run in (
+        sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"])),
         sk.ScriptedRun(recording),
         sk.ScriptedRun(facts),
-        OwnScenario(_replay_args(tmp_path)),
+        AdmittedKind(tmp_path, Path("curie")),
     ):
         assert not run.gateway_enabled()
         assert sk.GATEWAY_IMAGE not in run.image_refs

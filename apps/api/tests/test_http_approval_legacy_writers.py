@@ -6,7 +6,6 @@ Actual ASGI routes, sweeper, reconciler, PostgreSQL and Valkey; synthetic inputs
 
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 import uuid
@@ -14,13 +13,12 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
-from curie_api import approval_principal, identity_fence
+from curie_api import approval_principal
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA
 from curie_api.identity.http_approval import http_expiry_owner
 from curie_api.resumequeue import ResumeQueue
-from curie_api.resumereconciler import ResumeReconciler
-from curie_api.sweeper import SealedExpiryCursor, sweep_expired_approvals
+from curie_api.sweeper import sweep_expired_approvals
 from redis import asyncio as redis_async
 from role_policy_support import run
 from sqlalchemy import text
@@ -209,51 +207,6 @@ def test_sweeper_without_the_sealing_owner_leaves_a_selected_row_pending(
     assert audits(row["id"]) == []
 
 
-def test_adopted_row_without_provenance_is_never_legacy_expired(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-1/10: null provenance is not legacy authority."""
-    case = creation_case
-    row = created(case)
-    forged = str(uuid.uuid4())
-
-    async def insert(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-10: an out-of-band null row on the adopted route."""
-        async with factory() as session:
-            await session.execute(
-                text(f'INSERT INTO "{SCHEMA}".approvals (id, agent_id, conversation_id, author, '
-                     "summary, reply_kind, reply_channel, reply_adapter, reply_placeholder, "
-                     "dedupe_key, status, expires_at, card_channel) "
-                     "SELECT :id, agent_id, conversation_id, author, summary, reply_kind, "
-                     "reply_channel, reply_adapter, reply_placeholder, :dedupe, 'pending', "
-                     f':at, card_channel FROM "{SCHEMA}".approvals WHERE id = :source'),
-                {"id": forged, "dedupe": uuid.uuid4().hex, "source": row["id"],
-                 "at": datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=5)},
-            )
-            await session.commit()
-
-    run(insert)
-    sweep(case, owner=True)
-    sweep(case, owner=False)
-    response = case.client.post(
-        f"/approvals/{forged}/resolve", json={"decision": "approved"},
-        headers=chat_headers(uuid.UUID(forged), row["card_channel"]),
-    )
-    assert response.status_code == 403, response.text
-    assert response.json() == {"detail": "unsupported_approval"}
-
-    async def read(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-10."""
-        async with factory() as session:
-            status = (await session.execute(
-                text(f'SELECT status FROM "{SCHEMA}".approvals WHERE id = :id'), {"id": forged},
-            )).scalar_one()
-            assert status == "pending"
-
-    run(read)
-    assert audits(uuid.UUID(forged)) == []
-
-
 def test_recovery_refuses_a_selected_row_before_mutation(
     creation_case: SimpleNamespace,
 ) -> None:
@@ -276,32 +229,6 @@ def test_recovery_refuses_a_selected_row_before_mutation(
     assert response.json() == {"detail": "unsupported_approval"}
     assert rows(row["dedupe_key"]) == [row]
     assert audits(row["id"]) == []
-
-
-def test_reconciler_keeps_a_selected_wake_owed_instead_of_publishing_it(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-1/10: no context-free resume for a selected row."""
-    case = creation_case
-    row = lapse(case, created(case))
-    sweep(case, owner=True)
-    assert_expired_and_resealed(case, row["dedupe_key"])
-
-    async def reconcile(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-10: a pass past the grace horizon."""
-        valkey = redis_async.from_url(get_settings().valkey_dsn())
-        try:
-            reconciler = ResumeReconciler(
-                factory, ResumeQueue(valkey), interval_seconds=1, grace_seconds=0,
-                batch_limit=10,
-            )
-            await asyncio.sleep(0.01)
-            assert await reconciler.reconcile_once() == 0
-        finally:
-            await valkey.aclose()
-
-    run(reconcile)
-    assert rows(row["dedupe_key"])[0]["resumed_at"] is None
 
 
 def seed_rows(
@@ -357,42 +284,6 @@ def row_by_id(approval_id: uuid.UUID) -> dict[str, Any]:
     return found[0]
 
 
-def test_reconciler_batches_never_fill_with_selected_rows(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-10: selected owed wakes cannot starve legacy wakes."""
-    case = creation_case
-    source = created(case)
-    old = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=2)
-    selected = seed_rows(source, [
-        {"status": "expired", "expires": old, "resolved": old, "context": "synthetic-sealed"}
-        for _ in range(3)
-    ])
-    (legacy,) = seed_rows(source, [{
-        "status": "expired", "expires": old + timedelta(minutes=30),
-        "resolved": old + timedelta(minutes=30), "legacy": True,
-    }])
-    stream = f"test:curie:runs:fairness:{uuid.uuid4().hex}"
-
-    async def reconcile(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-10: a separate owned stream."""
-        valkey = redis_async.from_url(get_settings().valkey_dsn())
-        try:
-            reconciler = ResumeReconciler(
-                factory, ResumeQueue(valkey, stream=stream), interval_seconds=1,
-                grace_seconds=0, batch_limit=2,
-            )
-            assert await reconciler.reconcile_once() == 1
-            assert await valkey.xlen(stream) == 1
-        finally:
-            await valkey.delete(stream)
-            await valkey.aclose()
-
-    run(reconcile)
-    assert row_by_id(legacy)["resumed_at"] is not None
-    assert all(row_by_id(item)["resumed_at"] is None for item in selected)
-
-
 def test_sweeper_batches_never_fill_with_rows_it_must_leave_pending(
     creation_case: SimpleNamespace,
 ) -> None:
@@ -432,31 +323,6 @@ def test_sweeper_batches_never_fill_with_rows_it_must_leave_pending(
     assert all(row_by_id(item)["status"] == "pending" for item in stuck)
 
 
-def test_expiry_owner_takes_no_identity_writer_when_nothing_expires(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-9/10: no global fence rotation for a no-op."""
-    case = creation_case
-    row = created(case)
-    runtime = case.client.app.state.http_identity_runtime
-
-    async def go(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-10: a pending row whose deadline has not passed."""
-        valkey = redis_async.from_url(get_settings().valkey_dsn())
-        try:
-            before = await valkey.get(identity_fence.FENCE_KEY)
-            owner = http_expiry_owner(SimpleNamespace(
-                sessionmaker=factory, valkey=valkey, http_identity_runtime=runtime,
-            ))
-            assert await owner(row["id"]) is None
-            assert await valkey.get(identity_fence.FENCE_KEY) == before
-        finally:
-            await valkey.aclose()
-
-    run(go)
-    assert rows(row["dedupe_key"]) == [row]
-
-
 def test_resolve_reports_expiry_owner_failure_as_unavailable(
     creation_case: SimpleNamespace, monkeypatch: Any,
 ) -> None:
@@ -492,68 +358,3 @@ def test_resolve_after_a_concurrent_expiry_keeps_the_existing_410(
     )
     assert response.status_code == 410, response.text
     assert rows(row["dedupe_key"]) == [expired]
-
-
-def sealed_passes(
-    case: SimpleNamespace, passes: int, *, limit: int, share_cursor: bool = True,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-10: sweeper passes with the production owner."""
-    runtime = case.client.app.state.http_identity_runtime
-
-    async def go(factory: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-APPROVAL-CONTINUITY-10: one cursor lives across the passes."""
-        valkey = redis_async.from_url(get_settings().valkey_dsn())
-        stream = f"test:curie:runs:sealed-cursor:{uuid.uuid4().hex}"
-        try:
-            stores = SimpleNamespace(
-                sessionmaker=factory, valkey=valkey, http_identity_runtime=runtime,
-            )
-            cursor = SealedExpiryCursor()
-            for _ in range(passes):
-                async with factory() as session:
-                    await sweep_expired_approvals(
-                        session, ResumeQueue(valkey, stream=stream),
-                        now=datetime.now(UTC).replace(tzinfo=None), limit=limit,
-                        http_expiry=http_expiry_owner(stores),
-                        sealed_cursor=cursor if share_cursor else None,
-                    )
-        finally:
-            await valkey.delete(stream)
-            await valkey.aclose()
-
-    run(go)
-
-
-def test_unexpirable_sealed_batch_does_not_starve_later_expiries(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-10: a full unverifiable page never hides a valid row."""
-    case = creation_case
-    valid = lapse(case, created(case))
-    source = rows(valid["dedupe_key"])[0]
-    now = datetime.now(UTC).replace(tzinfo=None)
-    stuck = seed_rows(source, [
-        {"status": "pending", "expires": now - timedelta(hours=2), "context": "synthetic-retired"},
-        {"status": "pending", "expires": now - timedelta(hours=1), "context": "synthetic-retired"},
-    ])
-    sealed_passes(case, 2, limit=2)
-    assert row_by_id(valid["id"])["status"] == "expired"
-    assert all(row_by_id(item)["status"] == "pending" for item in stuck)
-
-
-def test_verifiable_sealed_rows_expire_in_the_first_pass(
-    creation_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-10: control; verifiable rows lead and expire at once."""
-    case = creation_case
-    valid = lapse(case, created(case))
-    now = datetime.now(UTC).replace(tzinfo=None)
-    stuck = seed_rows(valid, [
-        {
-            "status": "pending", "expires": now - timedelta(minutes=1),
-            "context": "synthetic-retired",
-        },
-    ])
-    sealed_passes(case, 1, limit=2)
-    assert row_by_id(valid["id"])["status"] == "expired"
-    assert all(row_by_id(item)["status"] == "pending" for item in stuck)

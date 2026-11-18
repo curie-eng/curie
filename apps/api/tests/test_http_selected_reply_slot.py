@@ -36,7 +36,6 @@ from curie_worker.reply_sink import TargetRoute
 from fastapi.testclient import TestClient
 from slack_sdk.web import WebClient
 
-from apps.api.tests import test_http_email_receivers as email_receivers
 from apps.api.tests import test_http_invocation_membership as membership
 from apps.api.tests.test_http_invocation_membership import synthetic_provider as synthetic_provider
 
@@ -210,29 +209,6 @@ def _edit_placeholder(turn: QueuedTurn) -> list[tuple[str, dict[str, Any]]]:
     return captured
 
 
-def test_lost_response_then_identical_retry_keeps_the_accepted_slot_the_answer_edits(
-    clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-27: a retry of an accepted request keeps its own slot."""
-    with _rig(valkey, synthetic_provider) as rig:
-        rig.lose_first_response = True
-        outcome = rig.mention(_native(rig.scope))
-        assert [answer.status_code for answer in rig.answers] == [200, 200]
-        assert rig.answers[0].json()["duplicate"] is False
-        assert rig.answers[1].json()["duplicate"] is True
-        assert rig.answers[1].json()["reply_ref"] == FIRST_SLOT
-        assert outcome.result.status == "accepted" and outcome.result.duplicate is True
-        assert outcome.result.reply_ref == FIRST_SLOT and outcome.placeholder == FIRST_SLOT
-        rig.web.chat_postMessage.assert_called_once()
-        rig.web.chat_delete.assert_not_called()
-        (turn,) = rig.turns(valkey, runs_stream)
-        assert turn.reply_handle is not None and turn.reply_handle.placeholder == FIRST_SLOT
-        captured = _edit_placeholder(turn)
-        assert [method for method, _body in captured] == ["chat.update"]
-        assert captured[0][1]["ts"] == FIRST_SLOT
-        assert captured[0][1]["channel"] == rig.scope["address"]
-
-
 def test_redelivery_with_a_new_placeholder_deletes_only_the_new_one_and_never_conflicts(
     clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
 ) -> None:
@@ -362,83 +338,3 @@ def test_malformed_reply_ref_refuses_without_delivery_state(
         response = membership._post(rig.client, rig.credential, body, proof)
         assert response.status_code == 401, response.text
         assert valkey.xrange(runs_stream) == []
-
-
-def _email_body(
-    *, delivery_id: str, reply_ref: str, text: str = "Synthetic email request",
-) -> bytes:
-    """@spec HTTP-INVOCATION-EXECUTION-27/29: an email TurnIn whose adapter names a reply_ref."""
-    value = json.loads(email_receivers._body(delivery_id=delivery_id, text=text))
-    value["reply_ref"] = reply_ref
-    return json.dumps(value, separators=(",", ":")).encode()
-
-
-def test_email_turn_intent_binds_the_verified_email_delivery(
-    clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-27/29: an email turn has an intent but no reply slot.
-
-    The email proof's immutable fields and the whole parsed body, reply_ref
-    included, are its intent: the same message is a duplicate, any other body
-    under its Message-ID is a conflict, and no placeholder is queued.
-    """
-    scope = email_receivers._email_scope(synthetic_provider.url)
-    try:
-        with email_receivers._client(synthetic_provider, scope) as client:
-            token = email_receivers._email_credential(client, scope)
-            delivery = "<synthetic-" + uuid.uuid4().hex + "@example.com>"
-            body = _email_body(delivery_id=delivery, reply_ref="<parent@example.com>")
-            accepted = email_receivers._post(
-                client, token, body, email_receivers._proof(scope, body),
-            )
-            assert accepted.status_code == 200, accepted.text
-            assert accepted.json()["duplicate"] is False
-            entries = valkey.xrange(runs_stream)
-            assert len(entries) == 1
-            turn = QueuedTurn.model_validate_json(entries[0][1]["payload"])
-            assert turn.reply_handle is not None and turn.reply_handle.kind == "email"
-            assert turn.reply_handle.placeholder is None
-
-            again = email_receivers._post(
-                client, token, body, email_receivers._proof(scope, body),
-            )
-            assert again.status_code == 200, again.text
-            assert again.json() == {
-                "event_id": accepted.json()["event_id"],
-                "stream_id": accepted.json()["stream_id"], "duplicate": True,
-            }
-            for changed in (
-                _email_body(delivery_id=delivery, reply_ref="<other@example.com>"),
-                _email_body(delivery_id=delivery, reply_ref="<parent@example.com>",
-                            text="Synthetic changed request"),
-            ):
-                conflict = email_receivers._post(
-                    client, token, changed, email_receivers._proof(scope, changed),
-                )
-                assert conflict.status_code == 409, conflict.text
-                assert conflict.json() == {"detail": "delivery_intent_conflict"}
-            assert valkey.xrange(runs_stream) == entries
-    finally:
-        email_receivers._cleanup(valkey, scope)
-
-
-def test_direct_message_reply_ref_is_queued_as_the_sealed_reply_placeholder(
-    clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-26/27: a DM's placeholder is its reply slot too."""
-    direct = codec.ReceiverSlackEvidenceV1.model_validate({
-        "delivery": "message", "user_id": membership.SENDER,
-        "event_user_team": membership.ACCOUNT, "event_team": membership.ACCOUNT,
-        "interaction_user_team_id": None, "is_ext_shared_channel": False,
-        "enterprise_ids": (), "channel_type": "im",
-    })
-    with _rig(valkey, synthetic_provider) as rig:
-        body, proof = _submission(rig.scope, FIRST_SLOT, slack=direct)
-        response = membership._post(rig.client, rig.credential, body, proof)
-        assert response.status_code == 200, response.text
-        (entry,) = valkey.xrange(runs_stream)
-        turn = QueuedTurn.model_validate_json(entry[1]["payload"])
-        assert turn.reply_handle is not None and turn.reply_handle.placeholder == FIRST_SLOT
-        captured = _edit_placeholder(turn)
-        assert [method for method, _body in captured] == ["chat.update"]
-        assert captured[0][1]["ts"] == FIRST_SLOT

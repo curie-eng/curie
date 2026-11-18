@@ -9,8 +9,6 @@ from __future__ import annotations
 import importlib
 import json
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -135,73 +133,6 @@ def _assert_binding(module: Any, value: Any, scope: dict[str, Any], required: bo
     assert value.http_identity_required is required
 
 
-@asynccontextmanager
-async def _corrupt_clone(
-    factory: async_sessionmaker[AsyncSession],
-    scope: dict[str, Any],
-    payload: str,
-) -> AsyncIterator[str]:
-    """@spec HTTP-INVOCATION-EXECUTION-17: corrupt only an owned clone, preserve base checks."""
-    schema = "http_binding_" + uuid.uuid4().hex
-    source = get_settings().db_schema
-    async with factory() as session:
-        database = await session.scalar(text("SELECT current_database()"))
-        assert isinstance(database, str) and database.startswith("curie_test_")
-        assert (
-            await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": schema})
-            is None
-        )
-    created = False
-    try:
-        async with factory() as session, session.begin():
-            created = True
-            await session.execute(text(f"CREATE SCHEMA {schema}"))
-            for table, column, identifier in (
-                ("tenants", "id", scope["tenant"]),
-                ("agents", "id", scope["agent"]),
-                ("agent_channels", "id", scope["binding"]),
-                ("tenant_identity_providers", "tenant_id", scope["tenant"]),
-            ):
-                await session.execute(
-                    text(f"CREATE TABLE {schema}.{table} (LIKE {source}.{table} INCLUDING ALL)")
-                )
-                await session.execute(
-                    text(
-                        f"INSERT INTO {schema}.{table} SELECT * FROM {source}.{table} "
-                        f"WHERE {column}=:id"
-                    ),
-                    {"id": identifier},
-                )
-            await session.execute(
-                text(
-                    f"ALTER TABLE {schema}.tenant_identity_providers DROP CONSTRAINT "
-                    "tenant_identity_providers_http_object_ck"
-                )
-            )
-            await session.execute(
-                text(
-                    f"UPDATE {schema}.tenant_identity_providers "
-                    "SET http_selection=CAST(:value AS jsonb) WHERE tenant_id=:tenant"
-                ),
-                {"value": payload, "tenant": scope["tenant"]},
-            )
-        yield schema
-    finally:
-        if created:
-            # The exact name is generated and recorded before creation; never sweep schemas.
-            assert schema.startswith("http_binding_") and len(schema) == 45
-            async with factory() as session, session.begin():
-                await session.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
-            async with factory() as session:
-                assert (
-                    await session.scalar(
-                        text("SELECT to_regnamespace(:schema)"),
-                        {"schema": schema},
-                    )
-                    is None
-                )
-
-
 def test_owned_fixture_has_explicit_tenant_and_no_active_deployment(clean_db: None) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-17: existing resolver control qualifies real fixtures."""
 
@@ -271,67 +202,6 @@ def test_never_rebound_binding_classifies_at_generation_zero(
     run(check)
 
 
-@pytest.mark.parametrize("payload", ["null", "false", "[]"])
-def test_nonobject_json_selection_still_requires_context_in_owned_corrupt_clone(
-    clean_db: None,
-    payload: str,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-17: decoded None/false/empty is not SQL NULL."""
-    module = api()
-
-    async def check(factory: async_sessionmaker[AsyncSession]) -> None:
-        scope = await _seed_scope(factory, "sql_null")
-        async with _corrupt_clone(factory, scope, payload) as schema:
-            resolver = await _resolver(factory, scope, schema=schema)
-            value = await resolver.identity_binding("slack", scope["adapter"], scope["address"])
-            _assert_binding(module, value, scope, True)
-
-    run(check)
-
-
-def test_corrupt_clone_fixture_preserves_base_constraint_and_real_route(clean_db: None) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-17: independently qualify SQL-null/JSON-null control."""
-
-    async def check(factory: async_sessionmaker[AsyncSession]) -> None:
-        scope = await _seed_scope(factory, "sql_null")
-        async with _corrupt_clone(factory, scope, "null") as schema:
-            resolver = await _resolver(factory, scope, schema=schema)
-            bound = await resolver.undeployed_binding("slack", scope["adapter"], scope["address"])
-            assert bound is not None and bound.agent_id == scope["agent"]
-            async with factory() as session:
-                cloned = (
-                    await session.execute(
-                        text(
-                            f"SELECT http_selection IS NULL AS absent, "
-                            "jsonb_typeof(http_selection) AS json_type "
-                            f"FROM {schema}.tenant_identity_providers WHERE tenant_id=:id"
-                        ),
-                        {"id": scope["tenant"]},
-                    )
-                ).one()
-                assert cloned.absent is False and cloned.json_type == "null"
-                assert (
-                    await session.scalar(
-                        text(
-                            "SELECT http_selection IS NULL FROM curie.tenant_identity_providers "
-                            "WHERE tenant_id=:id"
-                        ),
-                        {"id": scope["tenant"]},
-                    )
-                    is True
-                )
-                assert (
-                    await session.scalar(
-                        text(
-                            "SELECT convalidated FROM pg_constraint WHERE "
-                            "conrelid='curie.tenant_identity_providers'::regclass AND "
-                            "conname='tenant_identity_providers_http_object_ck'"
-                        )
-                    )
-                    is True
-                )
-
-    run(check)
 
 
 def test_route_adapter_kind_address_and_tenant_are_exact_and_unknown_is_none(

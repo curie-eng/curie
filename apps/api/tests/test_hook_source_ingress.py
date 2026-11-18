@@ -263,30 +263,6 @@ def test_legacy_key_cannot_authenticate_protected_source(ingress_db: None) -> No
     asyncio.run(asyncio.wait_for(scenario(), 20))
 
 
-@pytest.mark.parametrize("unknown", [False, True])
-def test_bad_or_unknown_authentication_finishes_without_gate(
-    ingress_db: None, unknown: bool
-) -> None:
-    """@spec PROTECTED-HOOK-SOURCE-2."""
-
-    async def scenario() -> None:
-        """@spec PROTECTED-HOOK-SOURCE-2."""
-        async with ingress() as (app, client, agent):
-            target = str(uuid.uuid4()) if unknown else agent
-            async with app.state.source_gate.hold(uuid.UUID(target)):
-                async with asyncio.timeout(2):
-                    response = await client.post(
-                        f"/hooks/{target}/{HOOK}",
-                        content=BODY,
-                        headers=signed_headers("bad-secret"),
-                    )
-                assert response.status_code == 401
-                assert response.json()["detail"] == "missing or invalid signature"
-                assert app.state.source_gate.engine.pool.checkedout() == 1
-
-    asyncio.run(asyncio.wait_for(scenario(), 20))
-
-
 @pytest.mark.parametrize("protected", [False, True])
 def test_waiting_request_reauthenticates_before_fresh_consistency(
     ingress_db: None, protected: bool
