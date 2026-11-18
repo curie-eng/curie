@@ -592,6 +592,7 @@ _HTTP_OPERATIONS = [
     "/work-items",
     "/work-items/completion-contract",
     "/work-items/issue-read",
+    "/work-items/questions",
     "/work-items/tracker-result",
     "/work-items/{work_item_id}",
     "/work-items/{work_item_id}/usage",

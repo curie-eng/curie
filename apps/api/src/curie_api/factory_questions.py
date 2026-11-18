@@ -353,6 +353,8 @@ async def finish_round(
             await session.commit()
             return Posted(round=row.rounds_used)
         if row.state == POSTING:
+            # Read before the UPDATE: the session synchronizes ``row`` with it.
+            posted = row.rounds_used + 1
             await session.execute(
                 update(FactoryQuestionRound)
                 .where(FactoryQuestionRound.work_item_id == work_item_id)
@@ -366,7 +368,7 @@ async def finish_round(
                 )
             )
             await session.commit()
-            return Posted(round=row.rounds_used + 1)
+            return Posted(round=posted)
     # The request settled (the row was cleared) or another body replaced
     # this one while the tracker write ran.
     status = await session.scalar(
