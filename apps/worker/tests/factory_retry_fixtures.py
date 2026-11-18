@@ -488,9 +488,14 @@ class FactoryRetryCase(StartWaitCase):
         return int(found["automatic_retries_used"])
 
     async def make_due(self, request_id: uuid.UUID) -> None:
+        # A guarded row (migration 0182) is due by its guarded time and keeps
+        # its waiting deadline where an older dispatcher's claim reads.
         await self.execute(
-            "UPDATE curie.execution_requests "
-            "SET dispatch_not_before = clock_timestamp() - interval '1 second' "
+            "UPDATE curie.execution_requests SET "
+            "guarded_dispatch_not_before = CASE WHEN guarded_dispatch_not_before IS NULL "
+            "THEN NULL ELSE clock_timestamp() - interval '1 second' END, "
+            "dispatch_not_before = CASE WHEN guarded_dispatch_not_before IS NULL "
+            "THEN clock_timestamp() - interval '1 second' ELSE wait_deadline END "
             "WHERE id = :id AND status = 'waiting'",
             {"id": request_id},
             guarded=True,

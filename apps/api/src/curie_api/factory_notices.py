@@ -546,7 +546,7 @@ def retry_state_time(row: ExecutionRequest) -> datetime:
 
     if row.blocked_on is not None and row.wait_deadline is not None:
         return row.wait_deadline
-    return row.dispatch_not_before
+    return row.dispatch_due
 
 
 def _retrying_section(cause: str, successor: RetrySuccessor, *, feedback_url: str | None) -> str:

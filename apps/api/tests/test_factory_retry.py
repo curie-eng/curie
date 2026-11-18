@@ -299,10 +299,35 @@ def _successor(request_id: uuid.UUID) -> dict[str, Any] | None:
     return found[0] if found else None
 
 
+def _due(row: dict[str, Any]) -> datetime:
+    """The time the current dispatcher claims a stored row (migration 0182).
+
+    A row older dispatchers must never claim keeps its own time in
+    ``guarded_dispatch_not_before`` and its waiting deadline in
+    ``dispatch_not_before``.
+    """
+
+    guarded = row["guarded_dispatch_not_before"]
+    value = row["dispatch_not_before"] if guarded is None else guarded
+    assert isinstance(value, datetime)
+    return value
+
+
+# Moves a row's dispatch time to :due, in whichever column the current
+# dispatcher reads; a guarded row keeps its waiting deadline in the other.
+_SET_DUE = (
+    "guarded_dispatch_not_before = CASE WHEN guarded_dispatch_not_before IS NULL "
+    "THEN NULL ELSE {due} END, "
+    "dispatch_not_before = CASE WHEN guarded_dispatch_not_before IS NULL "
+    "THEN {due} ELSE {deadline} END"
+)
+
+
 def _make_due(request_id: uuid.UUID) -> None:
+    due = "clock_timestamp() - interval '1 second'"
     _execute(
         "UPDATE curie.execution_requests "
-        "SET dispatch_not_before = clock_timestamp() - interval '1 second' "
+        f"SET {_SET_DUE.format(due=due, deadline='wait_deadline')} "
         "WHERE id = :id AND status = 'waiting'",
         {"id": request_id},
         guarded=True,
@@ -310,10 +335,11 @@ def _make_due(request_id: uuid.UUID) -> None:
 
 
 def _expire_wait(request_id: uuid.UUID) -> None:
+    deadline = "clock_timestamp() - interval '1 second'"
+    due = "clock_timestamp() - interval '2 seconds'"
     _execute(
         "UPDATE curie.execution_requests "
-        "SET wait_deadline = clock_timestamp() - interval '1 second', "
-        "dispatch_not_before = clock_timestamp() - interval '2 seconds' "
+        f"SET wait_deadline = {deadline}, {_SET_DUE.format(due=due, deadline=deadline)} "
         "WHERE id = :id AND status = 'waiting'",
         {"id": request_id},
         guarded=True,
@@ -504,7 +530,7 @@ def _assert_timing(
     wait = successor["wait_deadline"]
     terminal_at = predecessor["terminal_at"]
     assert terminal_at <= wait - budget <= terminal_at + timedelta(seconds=5)
-    due = successor["dispatch_not_before"]
+    due = _due(successor)
     if case_timing == "blocked":
         assert due == wait
     elif case_timing == "gated":

@@ -3808,14 +3808,6 @@
   ],
   "refused_finish_bodies": [
     {
-      "id": "missing_safety",
-      "body": {
-        "outcome": "failed",
-        "cause": "model_unreachable"
-      },
-      "why": "retry_safety is required and has no default"
-    },
-    {
       "id": "null_safety",
       "body": {
         "outcome": "failed",

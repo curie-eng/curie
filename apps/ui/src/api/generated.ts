@@ -9362,11 +9362,8 @@ export interface components {
              */
             outcome: "completed" | "failed";
             retry_condition?: components["schemas"]["RetryCondition"] | null;
-            /**
-             * Retry Safety
-             * @enum {string}
-             */
-            retry_safety: "no_effects" | "flagged" | "uncertain";
+            /** Retry Safety */
+            retry_safety?: ("no_effects" | "flagged" | "uncertain") | null;
             /** Runtime Epoch */
             runtime_epoch: number;
         };

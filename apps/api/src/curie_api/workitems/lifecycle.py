@@ -3419,6 +3419,8 @@ async def admit_automatic_successor(
     wait_deadline = now + timedelta(seconds=get_settings().work_item_wait_budget_seconds)
     slot = work_item.automatic_retries_used + 1
     dispatch_not_before = now
+    # Set only for a successor an older dispatcher must never claim.
+    guarded_dispatch_not_before: datetime | None = None
     blocked_on: str | None = None
     gate: dict[str, Any] | None = None
     if origin == "ordinary":
@@ -3444,11 +3446,14 @@ async def admit_automatic_successor(
             )
             if gate is None:
                 return False
-            # A gated wait is probed, not slept until its deadline.
+            # A gated wait is probed, not slept until its deadline. Only this
+            # release reads the gate, so the probe time is guarded: an older
+            # dispatcher would start the retry without checking it.
             blocked_on = disposition.condition
-            dispatch_not_before = now + timedelta(
+            guarded_dispatch_not_before = now + timedelta(
                 seconds=get_settings().work_item_resource_gate_probe_seconds
             )
+            dispatch_not_before = wait_deadline
         elif blocked:
             # Only a provider probe releases any other block, and only for a
             # probed scope with no reset time; otherwise nothing would wait.
@@ -3486,6 +3491,7 @@ async def admit_automatic_successor(
             "retry_of_request_id": predecessor.id,
             "retry_origin_request_id": predecessor.retry_origin_request_id or predecessor.id,
             "dispatch_not_before": dispatch_not_before,
+            "guarded_dispatch_not_before": guarded_dispatch_not_before,
             "blocked_on": blocked_on,
             "resource_gate": gate,
         },
@@ -3580,7 +3586,11 @@ async def _admit_publication_recovery(
                     "retry_origin_request_id": (
                         predecessor.retry_origin_request_id or predecessor.id
                     ),
-                    "dispatch_not_before": due,
+                    # An older dispatcher reads no execution kind and would
+                    # start this as an implementation run, so only the
+                    # guarded time makes it due (migration 0182).
+                    "dispatch_not_before": wait_deadline,
+                    "guarded_dispatch_not_before": due,
                     "blocked_on": None,
                     "execution_kind": "publication_recovery",
                     "recovery_candidate_id": candidate.id,
