@@ -2470,7 +2470,7 @@ def test_lineage_state_stale_version_and_another_work_item_do_not_invalidate(
     assert _curie_labels(sink, 55830) == {"curie-factory:needs-human"}
 
 
-@pytest.mark.parametrize("terminal", ["failed", "expired"])
+@pytest.mark.parametrize("terminal", ["failed", "expired", "completed"])
 def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotently(
     admitted: Any, terminal: str, monkeypatch: pytest.MonkeyPatch  # noqa: F811
 ) -> None:
@@ -2486,6 +2486,8 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
     _attach_publication(work_item_id, status="succeeded", pr=77)
     if terminal == "failed":
         _finish_failed(client, request_id, epoch, "runner_escalated")
+    elif terminal == "completed":
+        pass  # the succeeded publication above completes it on the next pass
     else:
         original = lifecycle.database_now
 
@@ -2504,8 +2506,11 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
     before = _notices(request_id)[0]
     assert before["finalized_at"] is not None
     (comment,) = _marked(sink, request_id)
+    # The stored comment is the pre-merge text: no pull request state line.
     comment["body"] = "\n".join(
-        line for line in comment["body"].split("\n") if not line.startswith("Pull request:")
+        line
+        for line in comment["body"].split("\n")
+        if not line.startswith(("Pull request:", "Pull request merged:"))
     )
     _execute(
         "UPDATE curie.factory_terminal_notices SET rendered_digest = :digest "
@@ -2517,15 +2522,23 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
         "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)",
         {"id": work_item_id},
     )
-    assert _curie_labels(sink, 55835) == {"curie-factory:needs-human"}
+    # No stale mark ran: only the fallback selection can reopen this notice.
+    assert _curie_labels(sink, 55835) == {
+        "curie-factory:pr-open" if terminal == "completed" else "curie-factory:needs-human"
+    }
     sink.requests.clear()
 
     _reconcile()
 
     (updated,) = _marked(sink, request_id)
     assert updated["id"] == comment["id"]
-    assert f"Cause: {request['terminal_cause']}" in updated["body"]
-    assert f"Pull request: https://github.com/{REPO}/pull/77 (merged)" in updated["body"]
+    if terminal == "completed":
+        assert updated["body"].split("\n\n")[0].rstrip("\n").splitlines()[-1] == (
+            f"Pull request merged: https://github.com/{REPO}/pull/77"
+        )
+    else:
+        assert f"Cause: {request['terminal_cause']}" in updated["body"]
+        assert f"Pull request: https://github.com/{REPO}/pull/77 (merged)" in updated["body"]
     assert len(_patches(sink)) == 1
     assert _posts(sink) == []
     assert _curie_labels(sink, 55835) == set()

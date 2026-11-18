@@ -12,6 +12,7 @@ and none may touch a transitions path.
 
 from __future__ import annotations
 
+import re
 import sys
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -25,9 +26,15 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api import factory_notices
+from curie_api.factory_comment_text import marker_for
 from curie_api.forges.memory import InMemoryTracker
 from curie_api.forges.types import PullRequest, PullRequestRef, PullRequestState, ReplyTarget
-from forge_fakes.github_comments import HEAD_A, admitted, comments  # noqa: F401  (fixtures)
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
+    HEAD_A,
+    _rows,
+    admitted,
+    comments,
+)
 from forge_fakes.jira import JiraFake, flatten, jira_tracker
 from forge_fakes.jira import fake_client as jira_client
 from test_factory_status_comment import (
@@ -42,6 +49,7 @@ from test_factory_status_comment import (
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     REPO,
     _attach_publication,
+    _complete_revision,
     _notices,
     _published_issue,
     _reconcile,
@@ -221,6 +229,18 @@ def _completed(name: str, fixture: Any, monkeypatch: pytest.MonkeyPatch, number:
 _NUMBERS = {"github": 0, "memory": 56901, "jira": 56902}
 
 
+def _assert_ends_result(body: str, leg: _Leg) -> None:
+    """The merge line closes the result section: after the completion text and
+    directly after the usage line, with nothing of the result following it."""
+
+    assert body.count(leg.merged_line) == 1
+    assert f"Completed: {leg.url}" in body.split(leg.merged_line)[0]
+    assert re.search(r"Usage: [^\n]*?run\n?" + re.escape(leg.merged_line), body)
+    if "\n\n" in body:
+        (part,) = [part for part in body.split("\n\n") if leg.merged_line in part]
+        assert part.rstrip("\n").splitlines()[-1] == leg.merged_line
+
+
 @pytest.mark.parametrize("name", LEGS)
 def test_merged_completed_request_gets_merge_notice_and_no_state_label(
     admitted: Any,  # noqa: F811
@@ -237,9 +257,7 @@ def test_merged_completed_request_gets_merge_notice_and_no_state_label(
     leg.merge()
 
     after = leg.body()
-    result = after.split(f"Completed: {leg.url}", 1)[1]
-    assert leg.merged_line in result
-    assert after.count(leg.merged_line) == 1
+    _assert_ends_result(after, leg)
     assert leg.labels() == set()
     assert _notices(leg.request_id)[0]["finalized_at"] is not None
 
@@ -326,11 +344,55 @@ def test_merged_failed_request_unchanged_from_base(
 
 
 def _request_status(leg: _Leg) -> str:
-    from test_factory_terminus import _rows
-
     return str(
         _rows(
             "SELECT status FROM curie.execution_requests WHERE id = :id",
             {"id": leg.request_id},
         )[0]["status"]
     )
+
+
+def test_merged_pull_request_after_a_revision_reaches_the_tickets_own_comment(
+    admitted: Any,  # noqa: F811
+) -> None:
+    """The newest request is a completed pull request revision, whose comment
+    is on the pull request; the ticket's own comment still gains the notice."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, pr, revision = _complete_revision(client, github, sink, "issuecomment-88401")
+    work_item_id = _rows(
+        "SELECT work_item_id FROM curie.execution_requests WHERE id = :id", {"id": revision}
+    )[0]["work_item_id"]
+    first = _rows(
+        "SELECT id FROM curie.execution_requests WHERE work_item_id = :id AND sequence = 1",
+        {"id": work_item_id},
+    )[0]["id"]
+    assert first != revision
+    ticket_path = f"/repos/{REPO}/issues/{number}/comments"
+    pull_path = f"/repos/{REPO}/issues/{pr}/comments"
+    assert _curie_labels(sink, number) == {PR_OPEN}
+    ticket_before = sink.lists[ticket_path][0]["body"]
+    assert marker_for(first) in ticket_before
+    assert "Pull request merged" not in ticket_before
+    url = f"https://github.com/{REPO}/pull/{pr}"
+
+    _observe_lineage_state(client, work_item_id, "merged")
+    _reconcile()
+
+    ticket_after = next(
+        c["body"] for c in sink.lists[ticket_path] if marker_for(first) in c["body"]
+    )
+    merged = f"Pull request merged: {url}"
+    (result,) = [part for part in ticket_after.split("\n\n") if merged in part]
+    assert result.rstrip("\n").splitlines()[-1] == merged
+    revision_comment = next(
+        c["body"] for c in sink.lists[pull_path] if marker_for(revision) in c["body"]
+    )
+    assert merged in revision_comment
+    assert _curie_labels(sink, number) == set()
+    assert _notices(first)[0]["finalized_at"] is not None
+    assert _notices(revision)[0]["finalized_at"] is not None
+    sink.requests.clear()
+    _reconcile()
+    assert _writes(sink) == []

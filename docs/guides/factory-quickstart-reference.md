@@ -994,11 +994,11 @@ State labels Curie manages, one at a time:
 |---|---|
 | `curie-factory:queued` | Admitted, waiting for a sandbox |
 | `curie-factory:running` | Running or stopping |
-| `curie-factory:pr-open` | Finished with a pull request that is still open |
+| `curie-factory:pr-open` | Finished with a pull request; removed when that pull request merges (it stays if the pull request closes without merging) |
 | `curie-factory:needs-human` | Failed or expired; the status comment says why |
 | `curie-factory:triaged` | A triage run delivered its result (a published ticket or findings); it does not mean the defect is fixed |
 
-A cancelled run removes all five. When the pull request merges, the label is removed and the status comment ends with `Pull request merged: <url>`; Curie never moves a ticket's workflow status on any tracker, so Jira and GitLab status stays with your own automation. Curie never changes your `curie-factory` label.
+A cancelled run removes all five. When the pull request merges, the label is removed and the status comment ends with `Pull request merged: <url>`. The factory itself sends no status transition on any tracker, so Jira and GitLab status stays with your own automation; a closing keyword in the pull request (`Closes #<id>`) is the code host's own automation and may still close the issue. Curie never changes your `curie-factory` label.
 
 ## Local kind capacity and recovery
 
