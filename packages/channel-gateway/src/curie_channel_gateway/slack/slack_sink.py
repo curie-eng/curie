@@ -1005,6 +1005,10 @@ class SlackReplyAdapter:
         blocks: list[dict[str, Any]] | None
         # A reply wire 1.1 delivery_id keys any other create (ADR-0130 d4).
         client_msg_id: str | None = delivery_id
+        # Approval cards always have blocks. A plain post has them only when
+        # the message carries links, so the type stays optional (#5720).
+        text: str
+        blocks: list[dict[str, Any]] | None
         if isinstance(intent, ConfirmIntent):
             # A 1.0 approval has no delivery_id, so it keeps its historical
             # approval UUID key. On 1.1, ADR-0130 d4 makes delivery_id the
