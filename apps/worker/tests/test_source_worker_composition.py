@@ -51,6 +51,7 @@ def config(url: str) -> WorkerConfig:
         valkey_password=VALKEY_PW,
         internal_worker_token="",
         workspace_enabled=False,
+        publication_candidates_enabled=False,
         publication_enabled=False,
         stream="test:source-composition:runs:" + token,
         eval_stream="test:source-composition:evals:" + token,

@@ -787,8 +787,9 @@ print(json.dumps(graph))
         // which stays below this floor. Operator retry records require 0176.
         // Enrollment inactive intake notices require 0177, which stays below this
         // floor. The factory Slack progress card requires 0178.
-        // GitHub account link states and display labels require 0179, which stays
-        // below this floor. Guarded dispatch times for retries an older dispatcher must never claim require 0182.
+        // GitHub account link states and display labels require 0179.
+        // Slack account display labels require 0180.
+        // Guarded automatic retry dispatch times require 0182.
         assert_eq!(candidate.schema_min, "0182");
         assert_eq!(candidate.schema_head, "0182");
         assert_eq!(
@@ -857,6 +858,7 @@ print(json.dumps(graph))
         assert!(!live_in_window("0177", &current));
         assert!(!live_in_window("0178", &current));
         assert!(!live_in_window("0179", &current));
+        assert!(!live_in_window("0180", &current));
         assert!(live_in_window("0182", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));

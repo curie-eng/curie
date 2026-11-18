@@ -122,6 +122,7 @@ def graph_payload() -> dict[str, Any]:
         ("0177", False),
         ("0178", False),
         ("0179", False),
+        ("0180", False),
         ("0182", True),
         ("0000", True),
         ("future-expand", True),
@@ -169,8 +170,9 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     this floor. Operator retry records require 0176.
     Enrollment inactive intake notices require 0177.
     The factory Slack progress card requires 0178.
-    GitHub account link states and display labels require 0179, which stays below this floor.
-    Guarded dispatch times for retries an older dispatcher must never claim require 0182.
+    GitHub account link states and display labels require 0179.
+    Slack account display labels require 0180.
+    Guarded automatic retry dispatch times require 0182.
     """
     window = shared().load_metadata().window
     assert window.schema_min == "0182"

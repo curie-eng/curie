@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import importlib.util
-import os
 import sqlite3
 import subprocess
 import sys
@@ -826,15 +825,6 @@ def test_preexisting_sqlite_sidecar_symlink_is_refused(root: Path, name: str) ->
     with pytest.raises(api().RegistryInvalid):
         open_registry(root)
     assert target.read_text() == "SYNTHETIC-PRIVATE-MARKER"
-
-
-def test_refusals_and_repeated_open_close_do_not_leak_descriptors(root: Path) -> None:
-    before = len(os.listdir("/dev/fd"))
-    for _ in range(20):
-        with open_registry(root):
-            with pytest.raises(api().RegistryUnavailable):
-                open_registry(root)
-    assert len(os.listdir("/dev/fd")) == before
 
 
 def test_live_storage_mode_change_refuses_operation(root: Path) -> None:

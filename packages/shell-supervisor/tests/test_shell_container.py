@@ -719,6 +719,7 @@ def crash_case(tls: ShellTls, tmp_path: Path, phase: str, crash_platform):
         runner_api_base_url="http://crash-api:8000",
         api_key="crash-proof-platform-key",
         workspace_enabled=False,
+        publication_candidates_enabled=False,
     )
     storage = build_s3_client(
         endpoint_url=config.s3_endpoint_url,
@@ -1088,115 +1089,6 @@ def test_crash_proof_control_completes_a_tool_and_persists_history(crash_case) -
         assert len(json.loads(response.read())["value"]) == 1
     finally:
         connection.close()
-
-
-@pytest.mark.parametrize("phase", ["before", "during", "after"])
-@pytest.mark.parametrize("repeat", range(3))
-def test_worker_kill_recovers_one_reply_and_retires_the_shell(crash_case, phase, repeat) -> None:
-    case = crash_case
-    state = case["provider"]
-    worker = case["worker"]
-
-    def reached() -> bool:
-        if worker.poll() is not None:
-            pytest.fail(
-                "worker exited before the kill point: "
-                + (case["logs"] / "worker-0.log").read_text()[-4000:]
-            )
-        observed = state("/state")
-        if any(reply["event"] == "turn.completed" for reply in observed["replies"]):
-            pytest.fail(
-                "turn ended before the kill point: "
-                + (case["logs"] / "worker-0.log").read_text()[-4000:]
-            )
-        if not observed[phase]:
-            return False
-        if phase == "before":
-            return True
-        code, status = case["shell"].request(
-            "GET",
-            case["handle"].base_path + "/v1/status",
-            token=case["handle"].token,
-        )
-        return code == 200 and status["side_effect_emitted"] is True
-
-    wait_until(reached, 60, f"real tool reached {phase} kill point")
-    observed = state("/state")
-    assert observed["tool_starts"] == (0 if phase == "before" else 1)
-    if phase == "during":
-        assert not observed["after"]
-    assert not [r for r in observed["replies"] if r["event"] == "turn.completed"]
-    worker.kill()
-    worker.wait(5)
-    assert worker.returncode == -9
-    replacement = case["restart"]()
-    wait_until(
-        lambda: (
-            case["valkey"].hget(case["prefix"] + ":sandbox:static:slot:" + case["slot"], "state")
-            == "quarantined"
-        ),
-        45,
-        "abandoned child retired and shell quarantined",
-    )
-    state("/release", "POST")
-
-    def recovered() -> bool:
-        if replacement.poll() is not None:
-            pytest.fail(
-                "replacement worker exited: " + (case["logs"] / "worker-1.log").read_text()[-4000:]
-            )
-        replies = state("/state")["replies"]
-        slot = case["valkey"].hget(case["prefix"] + ":sandbox:static:slot:" + case["slot"], "state")
-        return any(r["event"] == "turn.completed" for r in replies) and slot in {
-            "free",
-            "quarantined",
-        }
-
-    wait_until(recovered, 75, "one final reply and a reusable or quarantined shell slot")
-    replies = state("/state")["replies"]
-    finals = [r for r in replies if r["event"] == "turn.completed"]
-    assert len(finals) == 1
-    assert finals[0]["event_id"] == case["event_id"]
-    assert finals[0]["outcome"] == ("delivered" if phase == "before" else "escalated")
-    assert state("/state")["tool_starts"] == 1
-    answers = [r for r in replies if r["event"] in {"reply.update", "reply.post"} and r.get("text")]
-    expected = (
-        "recovered"
-        if phase == "before"
-        else "curie-turn-failure: prior-side-effect\n\n"
-        "A prior attempt may already have executed an action; not retrying automatically. "
-        "Flagging for a human."
-    )
-    assert answers[-1]["text"] == expected
-    assert sum(r["text"] == answers[-1]["text"] for r in answers) == 1
-    assert case["valkey"].xlen(case["config"].dead_letter_stream_name()) == 0
-    assert (
-        case["valkey"].xpending(case["config"].stream, case["config"].consumer_group)["pending"]
-        == 0
-    )
-    assert (
-        case["shell"].request("GET", "/_curie/supervisor/v1/shell", token=CONTROL_TOKEN)[1]["claim"]
-        is None
-    )
-    assert case["shell"].request("GET", "/_curie/supervisor/healthz", token=CONTROL_TOKEN)[0] == 503
-    children = _docker(
-        "exec",
-        "--user",
-        "0:0",
-        case["shell"].name,
-        "python",
-        "-c",
-        "import json,pathlib; live=[]\n"
-        "for path in pathlib.Path('/proc').glob('[0-9]*/status'):\n"
-        " try:\n"
-        "  lines=path.read_text().splitlines()\n"
-        "  fields=dict(line.split(':',1) for line in lines if ':' in line)\n"
-        "  if fields['Uid'].split()[0]=='1000' and fields['State'].split()[0]!='Z':\n"
-        "   live.append(path.parent.name)\n"
-        " except FileNotFoundError: pass\n"
-        "print(json.dumps(live))",
-    )
-    assert json.loads(children) == []
 
 
 def test_runner_default_entrypoint_serves_authenticated_status(

@@ -1881,13 +1881,14 @@ true
 {{- $cap | int64 -}}
 {{- end -}}
 
-{{/* Publication candidates (#5428): the API and worker share these checks. */}}
+{{/* Publication candidates (#5428). On when the value is true and workspaces are on.
+     Workspaces off renders the switch off instead of failing: other dependent
+     switches fail an explicit true, but a default of true would then refuse
+     every install that turns workspaces off. */}}
 {{- define "curie.publicationCandidatesEnabled" -}}
 {{- $candidates := dig "workspace" "publicationCandidates" dict (.Values.worker | default dict) -}}
-{{- if get $candidates "enabled" -}}
-{{- if not (dig "runner" "workspace" "enabled" false (.Values.agentSandbox | default dict)) -}}
-{{- fail "worker.workspace.publicationCandidates.enabled needs agentSandbox.runner.workspace.enabled (#5428)" -}}
-{{- end -}}
+{{- $workspaces := dig "runner" "workspace" "enabled" false (.Values.agentSandbox | default dict) -}}
+{{- if and (get $candidates "enabled") $workspaces -}}
 {{- $_ := include "curie.publicationCandidateMaxBytes" . -}}
 true
 {{- else -}}false{{- end -}}

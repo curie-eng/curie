@@ -67,8 +67,9 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # Operator retry records require 0176.
     # Enrollment inactive intake notices require 0177.
     # The factory Slack progress card requires 0178.
-    # GitHub account link states and display labels require 0179, which stays below this floor.
-    # Guarded dispatch times for retries an older dispatcher must never claim require 0182.
+    # GitHub account link states and display labels require 0179.
+    # Slack account display labels require 0180.
+    # Guarded automatic retry dispatch times require 0182.
     assert window == {"schema_min": "0182", "schema_head": "0182"}
 
 
@@ -100,7 +101,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.3") == {"schema_min": "0140", "schema_head": "0140"}
     assert data["windows"].get("0.14.4") == {"schema_min": "0140", "schema_head": "0140"}
-    assert data["revisions"][-61:] == [
+    assert data["revisions"][-62:] == [
         "0095",
         "0096",
         "0097",
@@ -161,6 +162,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0177",
         "0178",
         "0179",
+        "0180",
         "0182",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
@@ -218,6 +220,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0177"] == "expand"
     assert kinds["0178"] == "expand"
     assert kinds["0179"] == "expand"
+    assert kinds["0180"] == "expand"
     assert kinds["0182"] == "expand"
 
 

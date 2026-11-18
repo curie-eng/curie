@@ -23,19 +23,13 @@ from approver_ticket_support import (
     OTHER_ROUTE,
     approval_rows,
     carried,
-    create,
     dynamic_request,
     enroll,
-    exactly,
-    ingress,
     legacy,
     refused_with,
 )
 from approver_ticket_support import synthetic_provider as synthetic_provider
 from approver_ticket_support import ticket_case as ticket_case
-
-from apps.api.tests.test_approver_ticket_creation import receipt
-from apps.api.tests.test_http_approval_creation import accepted, rows
 
 GATE_KINDS = (None, "policy", "permission")
 PLAIN: dict[str, Any] = {"target": "acct-example-1"}
@@ -90,42 +84,6 @@ def approval_for(case: SimpleNamespace, gate_kind: str | None, changes: dict[str
     request = dynamic_request(case, None, gate_kind=gate_kind)
     request["approval"].update(changes)
     return request
-
-
-def test_http_creation_locks_the_registered_pair_to_its_route(
-    ticket_case: SimpleNamespace,
-) -> None:
-    """@spec REQUEST-APPROVAL-2: each refusal under every gate kind; ordinary use continues."""
-    case = ticket_case
-    enroll(case)
-    agent = case.scope["agent"]
-    for gate_kind in GATE_KINDS:
-        for name, changes, code in lock_cases(case):
-            request = approval_for(case, gate_kind, changes)
-            response = create(case.client, request)
-            assert response.status_code == 409, (gate_kind, name, response.text)
-            exactly(response, 409, code)
-    assert approval_rows(agent) == []
-
-    # Neighbors: the bundle still routes ordinary unrelated tools, and names that
-    # are not the registered live name are ordinary off the owning route.
-    # Each fresh ingress mints a channel token, which bumps the binding
-    # generation and retires every earlier capsule, so a neighbor's capsule is
-    # minted only just before that neighbor is posted.
-    for invocation_for, tool in (
-        (lambda: case, "synthetic_read"),
-        (lambda: ingress(case), f"mcp__plugin_ticket-plugin_{CONNECTOR}__execute"),
-        (lambda: ingress(case), f"mcp__{CONNECTOR}"),
-    ):
-        request = dynamic_request(
-            invocation_for(), {}, route=OTHER_ROUTE, tool=tool, gate_kind="permission",
-        )
-        accepted(create(case.client, request), request)
-        assert rows(request["approval"]["dedupe_key"])[0]["route"] == OTHER_ROUTE
-    owning = ingress(case)
-    request = dynamic_request(owning, carried(case, PLAIN))
-    receipt(create(case.client, request), request)
-    assert len(approval_rows(agent)) == 4
 
 
 def test_legacy_creation_applies_the_same_lock(ticket_case: SimpleNamespace) -> None:

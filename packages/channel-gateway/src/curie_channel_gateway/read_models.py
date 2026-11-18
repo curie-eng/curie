@@ -5,6 +5,13 @@ from datetime import UTC, datetime, timedelta
 
 
 @dataclass(frozen=True)
+class AccountProfile:
+    display_name: str | None = None
+    handle: str | None = None
+    workspace_name: str | None = None
+
+
+@dataclass(frozen=True)
 class ChannelMessage:
     id: str
     thread_id: str | None

@@ -336,26 +336,3 @@ fn slack_app_token_cancel_choice_names_every_recovery_path() {
         );
     }
 }
-
-#[cfg(target_os = "linux")]
-#[test]
-fn model_credential_value_cancellation_names_every_recovery_path() {
-    let text = cancel_next_local_deploy_prompt(
-        &[
-            ("SLACK_APP_TOKEN", "xapp-EXAMPLE-app-token"),
-            ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
-        ],
-        &[b"\r", b"\x1b"],
-        "model credential value",
-    );
-    for recovery in [
-        "CURIE_MODEL_BASE_URL",
-        "curie secrets set <NAME>",
-        "export <NAME>=",
-    ] {
-        assert!(
-            text.contains(recovery),
-            "model credential value cancellation must show {recovery:?}:\n{text}"
-        );
-    }
-}

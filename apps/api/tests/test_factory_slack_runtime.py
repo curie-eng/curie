@@ -1871,6 +1871,7 @@ async def _run_production_worker(
             read_block_ms=100,
             internal_worker_token="",
             workspace_enabled=False,
+            publication_candidates_enabled=False,
             publication_enabled=False,
             channel_gateway_url=gateway_url,
             channel_gateway_token="test-worker-credential",
@@ -2027,19 +2028,14 @@ FACTORY_BOT_USER = "U0EXAMPLEBOT"
 SIBLING_BOT_ID = "B0EXAMPLE2"
 SIBLING_BOT_USER = "U0EXAMPLE8"
 APP_TOKEN = "xapp-EXAMPLE"
-GHES_HOST = "github.example.com"
-REPLACED_REPO_ID = 4499
 ROLE_PASSWORD = secrets.token_hex(8)
 UNMAPPED_THREAD = "1800000999.000001"
 # The chart's generic warm pool and the template it references.
 CHART_POOL = "curie-runner-pool"
 CHART_TEMPLATE = "curie-runner-template"
-# The label the substrate puts on each claim naming the agent it serves.
-AGENT_LABEL = "curietech.ai/agent"
 # Worker-local outcome codes, named in the reply text (``Outcome: <code>``).
 EVIDENCE_MISSING = "steering_evidence_missing"
 UNCONFIGURED = "steering_unconfigured"
-BUDGET_EXPIRED = "steering_budget_expired"
 # A reply on a path an earlier attempt of the same delivery may have admitted
 # on never claims nothing was queued (plan addendum R1-1).
 FALSE_NOTHING_QUEUED = ("could not be queued", "nothing was queued", "was not queued")
@@ -2057,15 +2053,6 @@ def _receipt_key(delivery_id: str) -> str:
     from curie_internal.slack_mention_receipt import receipt_key
 
     return str(receipt_key(delivery_id))
-
-
-def _slack_escaped(body: str) -> str:
-    """``body`` as a Slack event's ``text`` carries it.
-
-    https://docs.slack.dev/messaging/formatting-message-text#escaping-text
-    """
-
-    return body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # --- GitHub REST stand-in ----------------------------------------------------------
@@ -2765,6 +2752,7 @@ async def _steering_worker(
             internal_worker_token=WORKER_TOKEN if token else "",
             api_base_url=stack.api_hop.url,
             workspace_enabled=False,
+            publication_candidates_enabled=False,
             publication_enabled=False,
             channel_gateway_url=gateway_url,
             channel_gateway_token="test-worker-credential",
@@ -3568,6 +3556,50 @@ def _disable(person: Person) -> None:
     )
 
 
+def _carry_http_identity(stack: SteeringStack) -> None:
+    """Re-deliver the just-enqueued mention as an HTTP-selected turn arrives.
+
+    The stream entry gains the ``curie_identity_context_v1`` field the HTTP
+    receiver lane carries (#5444), while the native receipt for it still exists.
+    """
+
+    stream = stack.names["stream"]
+    entry_id, fields = stack.valkey.xrange(stream)[-1]
+    stack.valkey.xdel(stream, entry_id)
+    stack.valkey.xadd(stream, {**fields, "curie_identity_context_v1": "ZXhhbXBsZS1jb250ZXh0"})
+
+
+def _receipt_from_another_app(stack: SteeringStack, delivery: Delivery) -> None:
+    """The stored receipt now names another receiving app than the turn's."""
+
+    key = _receipt_key(delivery.delivery_id)
+    stored = stack.valkey.get(key)
+    assert stored is not None, "the dispatcher wrote no receipt"
+    receipt = json.loads(stored)
+    receipt["channel_identity"] = f"acme-other-app-{stack.tag}"
+    stack.valkey.set(key, json.dumps(receipt), keepttl=True)
+
+
+def _spend_budget(stack: SteeringStack, remaining_ms: int) -> None:
+    """Fixture state of a redelivered entry that already spent most of its budget.
+
+    The delivery state hash's ``deadline_ms`` is create-if-absent on acquire
+    (``delivery_lease._ACQUIRE_LUA``), so the consumer's lease inherits this
+    deadline exactly as a reclaimed delivery inherits its predecessor's.
+    """
+
+    config = stack.steerer.config
+    stream, group = config.stream, config.consumer_group
+    entry_id, _fields = stack.valkey.xrange(stream)[-1]
+    seconds, micros = stack.valkey.time()
+    now_ms = int(seconds) * 1000 + int(micros) // 1000
+    stack.valkey.hset(
+        config.delivery_state_key(stream, group, entry_id),
+        "deadline_ms",
+        str(now_ms + remaining_ms),
+    )
+
+
 # A WorkItem's or request's owner facts (#5376): ``(tenant_id, model_auth_mode,
 # owner_principal_id, enrollment_generation)``.
 OwnerTuple = tuple[uuid.UUID | None, str, uuid.UUID | None, int | None]
@@ -3610,380 +3642,6 @@ def installation_mode(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
 
     monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", mode)
     get_settings.cache_clear()
-
-
-# --- AC2: an authorized mention revises the same pull request -----------------------
-
-
-def test_an_authorized_mention_admits_a_revision_of_the_same_pull_request(
-    steering: SteeringStack,
-) -> None:
-    """AC2, AC6: the complete quoted multiline body, same PR and branch, original route.
-
-    The reply mentions the factory bot again inside its quote and its code
-    block and keeps boundary whitespace, so the objective must carry the event
-    text exactly, not the self-mention-stripped turn text. Liveness: the same
-    text in an unmapped thread is ordinary chat, which still gets the
-    normalized text.
-
-    Falsifiable: without the kernel diversion the mention claims a sandbox and
-    no revision exists; an objective that drops or rewrites the body (the
-    stripped turn text included), or a revision whose reply route is the Slack
-    thread, fails the field checks.
-    """
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-    (original,) = stack.requests()
-    (lineage_before,) = _rows(
-        "SELECT branch, pr_number, pr_url, status, head_sha, version "
-        "FROM curie.thread_publication_lineages"
-    )
-    body = (
-        'Please keep the "acme_helper" name.\n'
-        "Also:\n"
-        "> a quoted line naming {bot} again\n"
-        "> and a second one\n"
-        "```\n"
-        "def acme_helper() -> None: ...  # {bot}\n"
-        "```\n"
-        "Thanks & regards, naïve café ✓"
-    )
-    mention_token = f"<@{FACTORY_BOT_USER}>"
-    sent = f"  {mention_token}  " + _slack_escaped(body).replace("{bot}", mention_token) + " \n  "
-
-    attempt = stack.steer(writer.slack_user, sent, thread_ts=run.root_ts, raw=True)
-
-    reply = attempt.reply
-    assert reply is not None and reply["outcome"] == "admitted", attempt.replies
-    assert reply["pull_request_url"] == run.pr_url
-    expected_id = stack.expected_request_id(attempt.delivery)
-    (admitted,) = attempt.new_requests
-    assert admitted["id"] == expected_id
-    assert reply["request_id"] == str(expected_id)
-    assert admitted["work_item_id"] == run.work_item_id
-    assert admitted["status"] == "queued"
-    objective = admitted["objective"]
-    # The person's complete message, exactly the event text Slack delivered:
-    # every mention and boundary whitespace kept, and nothing of the bot-rooted
-    # root the dispatcher quotes into the turn text.
-    assert attempt.delivery.text == sent
-    carried = _objective_reply(objective)
-    assert carried["body"] == attempt.delivery.text, carried
-    assert json.dumps(sent, ensure_ascii=False) in objective
-    assert ROOT_TEXT not in objective
-    assert run.pr_url in objective and run.branch in objective
-    assert "same" in objective.lower(), objective
-    assert admitted["requester"] == writer.requester
-    assert (admitted["reply_target_kind"], admitted["reply_target_pr_number"]) == (
-        "pull_request",
-        str(run.pr),
-    )
-    assert admitted["reply_target_url"] == run.pr_url
-    # The original tracker binding and conversation; Slack is never its identity.
-    assert (
-        admitted["reply_kind"],
-        admitted["reply_address"],
-        admitted["reply_conversation_id"],
-    ) == (original["reply_kind"], original["reply_address"], original["reply_conversation_id"])
-    assert original["reply_kind"] == "github"
-    assert _rows("SELECT id FROM curie.work_items") == [{"id": run.work_item_id}]
-    assert _rows(
-        "SELECT branch, pr_number, pr_url, status, head_sha, version "
-        "FROM curie.thread_publication_lineages"
-    ) == [lineage_before]
-    # Automatic publication adds no approval.
-    assert _rows("SELECT id FROM curie.approvals") == []
-    assert attempt.edits, "the placeholder was not edited with the outcome"
-    assert all(call.token == stack.factory_token for call in attempt.edits)
-    assert "admitted" in attempt.edits[-1].text and run.pr_url in attempt.edits[-1].text
-    assert stack.pending() == 0
-    assert stack.is_terminal(attempt.delivery.delivery_id)
-    _assert_no_sandbox(stack)
-
-    # Liveness: the same text in an unmapped thread is ordinary chat, and the
-    # sandbox gets the normalized text (every self-mention stripped, trimmed).
-    answers = len(stack.api_hop.steer_answers())
-    before = len(stack.requests())
-    stack.k8s.accept(pool=CHART_POOL, template=CHART_TEMPLATE, service_fqdn="127.0.0.1")
-    stack.mention(writer.slack_user, sent, thread_ts=UNMAPPED_THREAD, raw=True)
-    assert stack.consume() is not None
-    delivered = [
-        str(request.get("text"))
-        for method, path, request in stack.k8s.sandbox_address.requests
-        if method == "POST" and path in ("/v1/steer", "/v1/event")
-    ]
-    assert delivered, stack.k8s.sandbox_address.requests
-    for text_ in delivered:
-        assert mention_token not in text_, text_
-        assert text_ == text_.strip(), text_
-        assert "&gt; a quoted line naming again\n" in text_, text_
-    assert stack.api_hop.steer_answers()[answers:] == []
-    assert len(stack.requests()) == before
-
-
-# --- AC3: every refusal beside a valid liveness admission ----------------------------
-
-REFUSALS = [
-    "unlinked_channel_member",
-    "revoked_github_link",
-    "revoked_slack_link",
-    "wrong_workspace",
-    "inactive_principal",
-    "disabled_after_enqueue",
-    "read_permission",
-    "wrong_host_link",
-    "two_github_links",
-    "tagger_without_write",
-    "cancelled_work_item",
-    "closed_lineage",
-    "provider_pull_request_closed",
-    "provider_head_branch_differs",
-    "revoked_while_permission_paused",
-    "receipt_deleted",
-    "wrong_app_receipt",
-    "http_identity_context",
-    "bot_mention",
-]
-
-
-def _carry_http_identity(stack: SteeringStack) -> None:
-    """Re-deliver the just-enqueued mention as an HTTP-selected turn arrives.
-
-    The stream entry gains the ``curie_identity_context_v1`` field the HTTP
-    receiver lane carries (#5444), while the native receipt for it still exists.
-    """
-
-    stream = stack.names["stream"]
-    entry_id, fields = stack.valkey.xrange(stream)[-1]
-    stack.valkey.xdel(stream, entry_id)
-    stack.valkey.xadd(stream, {**fields, "curie_identity_context_v1": "ZXhhbXBsZS1jb250ZXh0"})
-
-
-def _receipt_from_another_app(stack: SteeringStack, delivery: Delivery) -> None:
-    """The stored receipt now names another receiving app than the turn's."""
-
-    key = _receipt_key(delivery.delivery_id)
-    stored = stack.valkey.get(key)
-    assert stored is not None, "the dispatcher wrote no receipt"
-    receipt = json.loads(stored)
-    receipt["channel_identity"] = f"acme-other-app-{stack.tag}"
-    stack.valkey.set(key, json.dumps(receipt), keepttl=True)
-
-
-@pytest.mark.parametrize("case", REFUSALS)
-def test_each_refusal_fails_closed_beside_a_valid_liveness_admission(
-    steering: SteeringStack, case: str
-) -> None:
-    """AC3, AC4, AC6: no request, a named outcome, no sandbox; a valid mention admits."""
-
-    stack = steering
-    writer = stack.person()
-    tagger: Person | None = None
-    if case == "tagger_without_write":
-        tagger = stack.person(permission="read")
-    run = stack.open_steered_run(requester=tagger.requester if tagger is not None else None)
-    root = run.root_ts
-    own_requests = {run.request_id}
-
-    def live(body: str = "Please also update the changelog.") -> None:
-        _admitted(stack.steer(writer.slack_user, body, thread_ts=root))
-
-    if case == "unlinked_channel_member":
-        # A member of the channel with no link: membership confers nothing.
-        member = stack.person(slack=False, github=False)
-        _api_refused(
-            stack.steer(member.slack_user, "Rename it.", thread_ts=root),
-            "sender_unverified",
-            "no_link",
-        )
-        live()
-    elif case == "revoked_github_link":
-        live()
-        stack.revoke(writer.github_link_ids[0])
-        _api_refused(
-            stack.steer(writer.slack_user, "Rename it.", thread_ts=root),
-            "code_host_identity_missing",
-        )
-    elif case == "revoked_slack_link":
-        live()
-        assert writer.slack_link_id is not None
-        stack.revoke(writer.slack_link_id)
-        _api_refused(
-            stack.steer(writer.slack_user, "Rename it.", thread_ts=root),
-            "sender_unverified",
-            "no_link",
-        )
-    elif case == "wrong_workspace":
-        _api_refused(
-            stack.steer(writer.slack_user, "Rename it.", thread_ts=root, team=OTHER_TEAM),
-            "sender_unverified",
-            "namespace_unknown",
-        )
-        live()
-    elif case == "inactive_principal":
-        inactive = stack.person()
-        _disable(inactive)
-        _api_refused(
-            stack.steer(inactive.slack_user, "Rename it.", thread_ts=root),
-            "sender_unverified",
-            "principal_inactive",
-        )
-        live()
-    elif case == "disabled_after_enqueue":
-        # Authority is revalidated when the worker consumes the delivery.
-        later = stack.person()
-        _api_refused(
-            stack.steer(
-                later.slack_user,
-                "Rename it.",
-                thread_ts=root,
-                before_consume=lambda _delivery: _disable(later),
-            ),
-            "sender_unverified",
-            "principal_inactive",
-        )
-        live()
-    elif case == "read_permission":
-        reader = stack.person(permission="read")
-        _api_refused(stack.steer(reader.slack_user, "Rename it.", thread_ts=root), "not_authorized")
-        live()
-    elif case == "wrong_host_link":
-        elsewhere = stack.person(host=GHES_HOST)
-        _api_refused(
-            stack.steer(elsewhere.slack_user, "Rename it.", thread_ts=root),
-            "code_host_identity_missing",
-        )
-        live()
-    elif case == "two_github_links":
-        twice = stack.person()
-        second = int(f"8{secrets.randbelow(10**8):08d}")
-        stack.github.add_account(Account(second, f"acme-alt-{stack.tag}", "write"))
-        twice.github_link_ids.append(stack.link_github(twice, second))
-        _api_refused(
-            stack.steer(twice.slack_user, "Rename it.", thread_ts=root),
-            "code_host_identity_ambiguous",
-        )
-        live()
-    elif case == "tagger_without_write":
-        # The person who started the run is linked, but tagging it conferred
-        # nothing: current write permission decides.
-        assert tagger is not None
-        _api_refused(stack.steer(tagger.slack_user, "Rename it.", thread_ts=root), "not_authorized")
-        live()
-    elif case == "cancelled_work_item":
-        live()
-        (item,) = _rows(
-            "SELECT version FROM curie.work_items WHERE id = :id", {"id": run.work_item_id}
-        )
-        cancelled = stack.client.post(
-            f"/v1/internal/work-items/{run.work_item_id}/cancel",
-            headers=stack.internal,
-            json={"expected_version": item["version"]},
-        )
-        assert cancelled.status_code == 200, cancelled.text
-        _api_refused(
-            stack.steer(writer.slack_user, "Rename it.", thread_ts=root), "work_item_cancelled"
-        )
-    elif case == "closed_lineage":
-        live()
-        _rows(
-            "UPDATE curie.thread_publication_lineages SET status = 'closed' WHERE id = :id",
-            {"id": run.lineage_id},
-        )
-        _api_refused(stack.steer(writer.slack_user, "Rename it.", thread_ts=root), "lineage_closed")
-    elif case == "provider_pull_request_closed":
-        live()
-        stack.github.pulls[run.pr]["state"] = "closed"
-        _api_refused(
-            stack.steer(writer.slack_user, "Rename it.", thread_ts=root), "pull_request_not_open"
-        )
-    elif case == "provider_head_branch_differs":
-        live()
-        stack.github.pulls[run.pr]["head"]["ref"] = "curie/another-branch"
-        _api_refused(
-            stack.steer(writer.slack_user, "Rename it.", thread_ts=root),
-            "pull_request_branch_mismatch",
-        )
-    elif case == "revoked_while_permission_paused":
-        _admitted(
-            stack.steer_paused(
-                writer.slack_user, "Paused, then released.", thread_ts=root, during=lambda: None
-            )
-        )
-        _api_refused(
-            stack.steer_paused(
-                writer.slack_user,
-                "Paused, then revoked.",
-                thread_ts=root,
-                during=lambda: stack.revoke(writer.github_link_ids[0]),
-            ),
-            "authority_changed",
-        )
-    elif case == "receipt_deleted":
-        _worker_refused(
-            stack.steer(
-                writer.slack_user,
-                "Rename it.",
-                thread_ts=root,
-                before_consume=lambda d: stack.valkey.delete(_receipt_key(d.delivery_id)),
-            )
-        )
-        assert stack.pending() == 0
-        live()
-    elif case == "wrong_app_receipt":
-        # The receiving app is what establishes the trusted sender: a receipt
-        # naming another app is refused, locally or by the API.
-        attempt = stack.steer(
-            writer.slack_user,
-            "Rename it.",
-            thread_ts=root,
-            before_consume=lambda d: _receipt_from_another_app(stack, d),
-        )
-        assert attempt.new_requests == [], attempt.new_requests
-        assert attempt.reply is None or attempt.reply["outcome"] == "receipt_mismatch"
-        assert attempt.edits, "the placeholder was not edited with the refusal"
-        last = attempt.edits[-1].text
-        assert "receipt_mismatch" in last or EVIDENCE_MISSING in last, last
-        assert stack.pending() == 0
-        live()
-    elif case == "http_identity_context":
-        # An HTTP-selected turn stays outside native steering (#5444): whichever
-        # layer refuses it, it asks no steering decision and claims no sandbox.
-        # The carried context cannot be checked here, so the #5444 identity
-        # layer keeps the delivery for redelivery (TurnAuthorityUnavailable);
-        # it is never settled as steering. That pending entry parks later
-        # turns of this thread behind it, so liveness uses another run root.
-        attempt = stack.steer(
-            writer.slack_user,
-            "Rename it.",
-            thread_ts=root,
-            before_consume=lambda _d: _carry_http_identity(stack),
-        )
-        assert attempt.replies == [], attempt.replies
-        assert attempt.new_requests == []
-        assert not stack.is_terminal(attempt.delivery.delivery_id)
-        assert stack.pending() == 1
-        other = stack.open_steered_run()
-        own_requests.add(other.request_id)
-        _admitted(
-            stack.steer(
-                writer.slack_user, "Please also update the changelog.", thread_ts=other.root_ts
-            )
-        )
-    elif case == "bot_mention":
-        _worker_refused(stack.steer(None, "Rename it.", thread_ts=root, bot_id=SIBLING_BOT_ID))
-        assert stack.pending() == 0
-        live()
-    else:  # pragma: no cover - the parameter list is closed
-        raise AssertionError(case)
-
-    # Exactly the one liveness revision was admitted, by the authorized writer.
-    admitted = [row for row in stack.requests() if row["id"] not in own_requests]
-    assert len(admitted) == 1, admitted
-    assert all(row["requester"] == writer.requester for row in admitted)
-    _assert_no_sandbox(stack)
 
 
 # --- #5378 Decision 8: Slack steering admits under the installation's mode ------------
@@ -4050,111 +3708,6 @@ def test_a_personal_installation_refuses_a_legacy_service_work_item_on_tracker_a
     assert owner_tuples(run.work_item_id) == {**legacy, revision["id"]: service}
     assert runnable_requests() == {revision["id"]}
     _assert_no_sandbox(stack)
-
-
-# --- AC4: idempotency, queueing, promotion, ordinary paths ----------------------------
-
-
-def test_steering_is_idempotent_queues_successors_and_leaves_ordinary_paths_intact(
-    steering: SteeringStack,
-) -> None:
-    """AC4, AC6: once per delivery, queued behind the live run, no approval.
-
-    A plain reply in the mapped root is never a turn, and a mention in an
-    unmapped thread of the same channel takes the ordinary path to a sandbox.
-    """
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-
-    first = stack.steer(writer.slack_user, "First revision request.", thread_ts=run.root_ts)
-    _admitted(first)
-    (queued_first,) = first.new_requests
-    assert queued_first["status"] == "queued"
-
-    # Slack redelivers the same event: the dispatcher claims it once.
-    length = stack.valkey.xlen(stack.names["stream"])
-    stack.mention(
-        writer.slack_user,
-        "First revision request.",
-        thread_ts=run.root_ts,
-        event_id=first.delivery.event_id,
-        message_ts=first.delivery.message_ts,
-    )
-    assert stack.valkey.xlen(stack.names["stream"]) == length
-    assert stack.consume() is None
-    # A redelivered stream copy of the same turn admits nothing new either.
-    copies = [
-        fields
-        for _entry, fields in stack.valkey.xrange(stack.names["stream"])
-        if first.delivery.delivery_id in json.dumps(fields)
-    ]
-    assert len(copies) == 1, copies
-    stack.valkey.xadd(stack.names["stream"], copies[0])
-    known = len(stack.requests())
-    answers = len(stack.api_hop.steer_answers())
-    assert stack.consume() is not None
-    assert len(stack.requests()) == known
-    assert all(
-        body.get("request_id") == str(queued_first["id"])
-        for _status, body in stack.api_hop.steer_answers()[answers:]
-    )
-
-    second = stack.steer(writer.slack_user, "Second revision request.", thread_ts=run.root_ts)
-    _admitted(second)
-    (queued_second,) = second.new_requests
-    assert queued_second["status"] == "queued"
-    assert queued_second["sequence"] > queued_first["sequence"]
-
-    # The predecessor ends; promotion takes the oldest queued revision only.
-    stack.finish(run.request_id, run.epoch)
-    _promote(run.work_item_id)
-    statuses = {row["id"]: row for row in stack.requests()}
-    assert statuses[queued_first["id"]]["status"] == "waiting"
-    assert statuses[queued_first["id"]]["wait_deadline"] is not None
-    assert statuses[queued_second["id"]]["status"] == "queued"
-    assert _rows("SELECT id FROM curie.approvals") == []
-    assert stack.pending() == 0
-    _assert_no_sandbox(stack)
-
-    # A plain reply in the mapped root is never delivered as a turn.
-    length = stack.valkey.xlen(stack.names["stream"])
-    stack.plain_reply(writer.slack_user, "Just chatting in the thread.", thread_ts=run.root_ts)
-    assert stack.valkey.xlen(stack.names["stream"]) == length
-
-    # A mention in an unmapped thread of the same channel is an ordinary turn.
-    before = len(stack.requests())
-    answers = len(stack.api_hop.steer_answers())
-    # Here the cluster accepts sandbox claims, so the ordinary start is observed
-    # succeeding: the claim is created and bound, and the kernel sends this
-    # message to the sandbox it claimed. No runner listens there; the kernel's
-    # bounded retry then ends the turn as a runner failure.
-    stack.k8s.accept(pool=CHART_POOL, template=CHART_TEMPLATE, service_fqdn="127.0.0.1")
-    question = "What does this service do?"
-    ordinary = stack.mention(writer.slack_user, question, thread_ts=UNMAPPED_THREAD)
-    assert stack.consume() is not None
-    claims = stack.k8s.created("sandboxclaims")
-    assert [status for status, _claim in claims] == [201], claims
-    labels = claims[0][1]["metadata"]["labels"]
-    assert labels[AGENT_LABEL] == f"acme-factory-{stack.tag}", labels
-    # The kernel hands the message to the runner of the sandbox it claimed:
-    # first as a runner steer (a live turn would take it), then as a new turn.
-    # A runner steer is the kernel's own, not the factory steering route.
-    delivered = [
-        body
-        for method, path, body in stack.k8s.sandbox_address.requests
-        if method == "POST" and path in ("/v1/steer", "/v1/event")
-    ]
-    assert delivered, stack.k8s.sandbox_address.requests
-    assert all(question in str(body.get("text")) for body in delivered), delivered
-    texts = stack.placeholder_texts(ordinary.placeholder)
-    assert texts[0] == stack.steerer.config.booting_text, texts
-    assert stack.not_started() not in texts, texts
-    assert "runner-error" in texts[-1], texts
-    assert stack.api_hop.steer_answers()[answers:] == []
-    assert len(stack.requests()) == before
-
 
 # --- production wiring: the worker as ``run.build`` composes it --------------------------
 
@@ -4287,336 +3840,6 @@ def _settled_completion(stack: SteeringStack, delivery: Delivery) -> str:
     return str(event["outcome"])
 
 
-def test_an_admitted_steering_completes_delivered_and_releases_the_thread(
-    steering: SteeringStack,
-) -> None:
-    """Control 12: an admission settles as the kernel's ``delivered`` completion.
-
-    The admitted delivery's one fenced settle writes the done marker and a
-    ``turn.completed`` record whose outcome is ``delivered``, which is emitted and
-    cleared, and the entry is acked. The thread's order is released: the next
-    mention in the same root is handled at once and settles the same way.
-
-    Falsifiable: an admission completed as ``dropped`` reads ``dropped`` here,
-    and one that writes a bare done marker without a completion record shows
-    no fenced settle at all.
-    """
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-
-    first = stack.steer(writer.slack_user, "Please rename it.", thread_ts=run.root_ts)
-    _admitted(first)
-    assert _settled_completion(stack, first.delivery) == "delivered"
-    assert stack.is_terminal(first.delivery.delivery_id)
-    assert stack.pending() == 0
-    assert stack.placeholder_texts(first.delivery.placeholder)[-1] == _steering().render_reply(
-        "admitted", pull_request_url=run.pr_url
-    )
-
-    following = stack.steer(writer.slack_user, "And add a test.", thread_ts=run.root_ts)
-    _admitted(following)
-    assert _settled_completion(stack, following.delivery) == "delivered"
-    assert stack.is_terminal(following.delivery.delivery_id)
-    assert stack.pending() == 0
-    assert stack.revisions(run) == [
-        stack.expected_request_id(first.delivery),
-        stack.expected_request_id(following.delivery),
-    ]
-    assert stack.resend_invitations() == []
-    _assert_no_sandbox(stack)
-
-
-async def _peer_takes_lease(stack: SteeringStack, entry_id: str, peer: str) -> None:
-    """A peer worker takes the delivery as a lease-expiry reclaim would.
-
-    The PEL row moves to the peer (``XCLAIM``), the stale owner's lease key is
-    gone (its expiry), and the peer acquires through the production
-    ``DeliveryLeaseStore``, which bumps the fencing generation.
-    """
-
-    from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
-    from curie_worker.delivery_lease import DeliveryLeaseStore
-    from redis.asyncio import Redis as AsyncValkey
-
-    config = stack.steerer.config
-    stream, group = config.stream, config.consumer_group
-    client = AsyncValkey(
-        host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None, decode_responses=True
-    )
-    try:
-        claimed = await client.xclaim(stream, group, peer, 0, [entry_id], justid=True)
-        assert [str(row) for row in claimed] == [entry_id], claimed
-        await client.delete(config.delivery_lease_key(stream, group, entry_id))
-        lease = await DeliveryLeaseStore(client, config).acquire(
-            stream, group, entry_id, consumer=peer
-        )
-        assert lease.generation >= 2, lease.generation
-    finally:
-        await client.aclose()
-
-
-def test_a_stale_owner_of_a_diverted_turn_settles_nothing_after_a_peer_took_the_lease(
-    steering: SteeringStack,
-) -> None:
-    """ADR-0131 on the diversion: a fenced-out owner marks, completes and acks nothing.
-
-    The refusal's placeholder edit is held open while a peer takes the
-    delivery lease in real Valkey. Once the edit returns, the stale owner's
-    settle is refused by the fence: no done marker, and the entry is still
-    pending, now under the peer. Liveness: an unheld refusal settles.
-    """
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-    stream, group = stack.names["stream"], stack.names["group"]
-    peer = f"peer-{stack.tag}"
-
-    delivery = stack.mention(writer.slack_user, "Rename it.", thread_ts=run.root_ts)
-    assert delivery.placeholder is not None
-    stack.valkey.delete(_receipt_key(delivery.delivery_id))
-    stack.slack.hold_next(
-        lambda method, params: method == "chat.update" and params.get("ts") == delivery.placeholder
-    )
-    future = stack.client.portal.start_task_soon(_consume_one, stack.steerer)
-    entry_id: str | None = None
-    try:
-        assert stack.slack.hold_entered.wait(20), "the refusal edit never started"
-        (pending,) = stack.valkey.xpending_range(stream, group, "-", "+", 10)
-        entry_id = str(pending["message_id"])
-        stack.client.portal.call(_peer_takes_lease, stack, entry_id, peer)
-    finally:
-        stack.slack.hold_release.set()
-    assert future.result(timeout=25) == entry_id
-
-    # The edit itself went out: it was in flight before the transfer.
-    assert any(EVIDENCE_MISSING in text_ for text_ in stack.placeholder_texts(delivery.placeholder))
-    assert not stack.is_terminal(delivery.delivery_id), "the stale owner wrote the done marker"
-    (still,) = stack.valkey.xpending_range(stream, group, "-", "+", 10)
-    assert (str(still["message_id"]), still["consumer"]) == (entry_id, peer), still
-    assert [row["id"] for row in stack.requests()] == [run.request_id]
-
-    # Liveness: the same refusal without a transfer settles. The first entry is
-    # still pending under the peer, and same-thread ordering parks any later
-    # turn of that root behind it, so the liveness refusal uses another root.
-    other = stack.open_steered_run()
-    settled = stack.steer(
-        writer.slack_user,
-        "Rename it again.",
-        thread_ts=other.root_ts,
-        before_consume=lambda d: stack.valkey.delete(_receipt_key(d.delivery_id)),
-    )
-    _worker_refused(settled)
-    assert stack.is_terminal(settled.delivery.delivery_id)
-    _assert_no_sandbox(stack)
-
-
-# --- control 2: a delivery with too little budget left to steer -------------------------
-
-
-def _spend_budget(stack: SteeringStack, remaining_ms: int) -> None:
-    """Fixture state of a redelivered entry that already spent most of its budget.
-
-    The delivery state hash's ``deadline_ms`` is create-if-absent on acquire
-    (``delivery_lease._ACQUIRE_LUA``), so the consumer's lease inherits this
-    deadline exactly as a reclaimed delivery inherits its predecessor's.
-    """
-
-    config = stack.steerer.config
-    stream, group = config.stream, config.consumer_group
-    entry_id, _fields = stack.valkey.xrange(stream)[-1]
-    seconds, micros = stack.valkey.time()
-    now_ms = int(seconds) * 1000 + int(micros) // 1000
-    stack.valkey.hset(
-        config.delivery_state_key(stream, group, entry_id),
-        "deadline_ms",
-        str(now_ms + remaining_ms),
-    )
-
-
-def test_a_mention_with_no_steering_budget_left_is_refused_before_any_api_call(
-    steering: SteeringStack,
-) -> None:
-    """A delivery with at most the minimum attempt budget left never steers.
-
-    Refused locally with ``steering_budget_expired``: no steering request, no
-    GitHub read, no admission, and no claim that nothing was queued (an earlier
-    attempt may have). Liveness: the same mention with the full budget admits.
-    """
-
-    from curie_worker.kernel import constants as kernel_constants
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-    remaining_ms = int(kernel_constants._MIN_ATTEMPT_BUDGET_S * 1000) - 2000
-    assert remaining_ms > 0
-    github_reads = len(stack.github.paths)
-
-    attempt = stack.steer(
-        writer.slack_user,
-        "Please rename the helper.",
-        thread_ts=run.root_ts,
-        before_consume=lambda _d: _spend_budget(stack, remaining_ms),
-    )
-
-    assert attempt.replies == [], "a delivery without budget reached the steering route"
-    assert attempt.new_requests == [], attempt.new_requests
-    assert stack.github.paths[github_reads:] == []
-    assert attempt.edits, "the placeholder was not edited with the refusal"
-    assert BUDGET_EXPIRED in attempt.edits[-1].text, attempt.edits[-1].text
-    _no_false_nothing_queued([call.text for call in attempt.edits])
-    assert stack.pending() == 0
-
-    _admitted(stack.steer(writer.slack_user, "Please rename the helper.", thread_ts=run.root_ts))
-    assert len(stack.revisions(run)) == 1
-    _assert_no_sandbox(stack)
-
-
-# --- control 1: the code host, repository and pull request are the lineage's -----------
-
-
-def test_steering_refuses_a_lineage_on_another_code_host_than_the_configured_one(
-    steering: SteeringStack,
-) -> None:
-    """The configured GitHub code host must be the host the lineage's repository is on.
-
-    The lineage records its repository on a GitHub Enterprise placeholder host
-    while the configured GitHub code host is github.com; the person holds a
-    link and write permission on the lineage's host. Refused
-    ``code_host_mismatch``. Liveness: on the matching host the same person admits.
-    """
-
-    stack = steering
-    run = stack.open_steered_run()
-    elsewhere = stack.person(host=GHES_HOST)
-    _rows(
-        "UPDATE curie.thread_publication_lineages SET code_host_host = :host WHERE id = :id",
-        {"host": GHES_HOST, "id": run.lineage_id},
-    )
-
-    _api_refused(
-        stack.steer(elsewhere.slack_user, "Rename it.", thread_ts=run.root_ts),
-        "code_host_mismatch",
-    )
-    assert stack.revisions(run) == []
-
-    _rows(
-        "UPDATE curie.thread_publication_lineages SET code_host_host = 'github.com' WHERE id = :id",
-        {"id": run.lineage_id},
-    )
-    assert elsewhere.account_id is not None
-    stack.revoke(elsewhere.github_link_ids[0])
-    elsewhere.github_link_ids.append(stack.link_github(elsewhere, elsewhere.account_id))
-    _admitted(stack.steer(elsewhere.slack_user, "Rename it.", thread_ts=run.root_ts))
-    _assert_no_sandbox(stack)
-
-
-def _replace_repository(stack: SteeringStack, pr: int, repository_id: int) -> None:
-    """GitHub answers the stored path with another repository (a move, then a new one).
-
-    https://docs.github.com/en/rest/repos/repos#get-a-repository (``id``) and
-    https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
-    (``base.repo.id``, ``head.repo.id``).
-    """
-
-    stack.github.repository_id = repository_id
-    pull = stack.github.pulls[pr]
-    pull["head"]["repo"]["id"] = repository_id
-    pull["base"]["repo"]["id"] = repository_id
-
-
-def test_steering_refuses_a_repository_replaced_at_the_lineages_path(
-    steering: SteeringStack,
-) -> None:
-    """The repository at the lineage's path must still be the stored repository id."""
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-    _replace_repository(stack, run.pr, REPLACED_REPO_ID)
-
-    _api_refused(
-        stack.steer(writer.slack_user, "Rename it.", thread_ts=run.root_ts),
-        "repository_mismatch",
-    )
-    assert stack.revisions(run) == []
-
-    _replace_repository(stack, run.pr, REPO_ID)
-    _admitted(stack.steer(writer.slack_user, "Rename it.", thread_ts=run.root_ts))
-    _assert_no_sandbox(stack)
-
-
-_ABSENT = object()
-_NULL_REPO = object()
-
-# (sides, reported): what the pull request read reports in place of the
-# repository's integer id. https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
-REPOSITORY_ID_DEFECTS: list[tuple[tuple[str, ...], object]] = [
-    (("head", "base"), REPLACED_REPO_ID),
-    (("head", "base"), _ABSENT),
-    (("head", "base"), str(REPO_ID)),
-    (("head", "base"), True),
-    (("head", "base"), float(REPO_ID)),
-    (("head",), _ABSENT),
-    (("base",), _ABSENT),
-    (("head", "base"), _NULL_REPO),
-]
-
-
-@pytest.mark.parametrize(
-    ("sides", "reported"),
-    REPOSITORY_ID_DEFECTS,
-    ids=[
-        "other_repository",
-        "absent",
-        "string",
-        "bool",
-        "float",
-        "head_only_missing",
-        "base_only_missing",
-        "repo_object_null",
-    ],
-)
-def test_steering_refuses_a_pull_request_whose_repository_id_is_not_the_lineages(
-    steering: SteeringStack, sides: tuple[str, ...], reported: object
-) -> None:
-    """The pull request read must report the stored repository id on both sides.
-
-    The repository read still answers the stored id, so only the pull request
-    payload's ``head.repo`` / ``base.repo`` is wrong: another repository's id,
-    absent, a string, a bool, a float, or no repository object at all. A null
-    id is refused by the adapter's own pull request read tests.
-    Each is refused ``repository_mismatch``. Liveness: with the integer ids
-    restored, the mention admits.
-    """
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-    pull = stack.github.pulls[run.pr]
-    for side in sides:
-        if reported is _NULL_REPO:
-            pull[side]["repo"] = None
-        elif reported is _ABSENT:
-            pull[side]["repo"].pop("id")
-        else:
-            pull[side]["repo"]["id"] = reported
-
-    _api_refused(
-        stack.steer(writer.slack_user, "Rename it.", thread_ts=run.root_ts),
-        "repository_mismatch",
-    )
-    assert stack.revisions(run) == []
-
-    for side in ("head", "base"):
-        pull[side]["repo"] = {"id": REPO_ID, "full_name": REPO}
-    _admitted(stack.steer(writer.slack_user, "Rename it.", thread_ts=run.root_ts))
-    _assert_no_sandbox(stack)
-
-
 # --- controls 5, 7: an admission whose answer the worker never read --------------------
 
 
@@ -4670,28 +3893,6 @@ def _replay_completes_once(
     _assert_no_sandbox(stack)
 
 
-def test_a_lost_admission_answer_never_invites_a_resend_and_admits_once(
-    steering: SteeringStack,
-) -> None:
-    """A steering answer lost after the admission committed is not a resend invitation.
-
-    The worker cannot tell an admitted request from an unsent one, so the
-    placeholder says the request is not confirmed and the delivery stays
-    pending; the consumer's generic not-started notice (a resend is a new
-    delivery id, so a second revision) is never posted. The consumer's reclaim
-    pass redelivers it, the route replays the admission, and the WorkItem holds
-    exactly one revision.
-    """
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-    assert "send it again" in stack.not_started()
-
-    delivery = _lose_one_admission(stack, writer, run)
-    _replay_completes_once(stack, stack.steerer, run, delivery)
-
-
 def test_a_lost_answer_replay_after_a_login_rename_reports_the_committed_revision(
     steering: SteeringStack,
 ) -> None:
@@ -4719,125 +3920,7 @@ def test_a_lost_answer_replay_after_a_login_rename_reports_the_committed_revisio
     assert revision["requester"] == writer.requester
 
 
-def test_a_refused_redelivery_after_a_lost_answer_never_claims_nothing_was_queued(
-    steering: SteeringStack,
-) -> None:
-    """Plan addendum R1-1: a refusal reachable on a redelivery stays neutral.
-
-    Attempt 1 committed the admission with its answer lost; before the
-    redelivery the person's code host link is revoked, so the redelivery is
-    refused. Its reply names the refusal and never claims nothing was queued,
-    because a revision was. Liveness: the committed revision is still the
-    WorkItem's one revision.
-    """
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-    delivery = _lose_one_admission(stack, writer, run)
-    expected_id = stack.expected_request_id(delivery)
-    stack.revoke(writer.github_link_ids[0])
-
-    answers = len(stack.api_hop.steer_answers())
-    assert stack.reclaim() == 1
-    ((status, refused),) = stack.api_hop.steer_answers()[answers:]
-    assert status == 200 and refused["outcome"] == "code_host_identity_missing", refused
-    texts = stack.placeholder_texts(delivery.placeholder)
-    assert "code_host_identity_missing" in texts[-1], texts
-    _no_false_nothing_queued(texts)
-    assert stack.resend_invitations() == []
-    assert stack.revisions(run) == [expected_id]
-    assert stack.pending() == 0
-    _assert_no_sandbox(stack)
-
-
 # --- controls 5, 6: a redelivery whose steering prerequisite fails ----------------------
-
-
-@contextlib.contextmanager
-def _prerequisite_fails(
-    stack: SteeringStack, prerequisite: str, delivery: Delivery
-) -> Iterator[Callable[[], bool]]:
-    """One real failure of a steering prerequisite, for the attempt inside the block.
-
-    Yields a check that the failure was actually met. ``receipt_read`` drops
-    the worker's Valkey connection on each try of the receipt read;
-    ``mapping_lookup`` revokes the worker role's SELECT on the factory run
-    mapping; ``mapping_connection_refused`` closes the worker's Postgres
-    endpoint, so the mapped root read gets the driver's own
-    ``ConnectionRefusedError``.
-    """
-
-    if prerequisite == "receipt_read":
-        key = _receipt_key(delivery.delivery_id)
-        rule = stack.valkey_hop.drop(
-            lambda command: command[0].upper() == "GET" and command[1:] == [key],
-            times=_drops_for_one_failed_call(),
-        )
-        yield lambda: rule.remaining == 0
-        rule.remaining = 0
-    elif prerequisite == "mapping_lookup":
-        _set_mapping_readable(stack, False)
-        try:
-            yield lambda: True
-        finally:
-            _set_mapping_readable(stack, True)
-    else:
-        stack.client.portal.call(stack.postgres_hop.close)
-        try:
-            yield lambda: True
-        finally:
-            stack.client.portal.call(stack.postgres_hop.start)
-
-
-@pytest.mark.parametrize("redelivery", ["same_worker", "replacement_worker"])
-@pytest.mark.parametrize(
-    "prerequisite", ["receipt_read", "mapping_lookup", "mapping_connection_refused"]
-)
-def test_a_redelivery_whose_steering_prerequisite_fails_keeps_the_unconfirmed_reply(
-    steering: SteeringStack, prerequisite: str, redelivery: str
-) -> None:
-    """A lost admission answer keeps its no-resend reply across a failed redelivery.
-
-    Attempt 2, the consumer's reclaim (in the same process or a replacement
-    that never saw attempt 1), cannot read a steering prerequisite, so it
-    never asks the API and the delivery stays pending; the generic
-    not-started notice never replaces the unconfirmed reply. Attempt 3,
-    healthy, replays the admission once. Liveness: an ordinary turn in an
-    unmapped thread that fails for an unrelated reason (the cluster refuses
-    its sandbox) still gets the generic notice.
-    """
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-    delivery = _lose_one_admission(stack, writer, run)
-    expected_id = stack.expected_request_id(delivery)
-    worker = stack.steerer if redelivery == "same_worker" else stack.worker_process()
-
-    answers = len(stack.api_hop.steer_answers())
-    with _prerequisite_fails(stack, prerequisite, delivery) as failed:
-        assert stack.reclaim(worker) == 1
-        assert failed(), "attempt 2 never read the prerequisite"
-    assert stack.api_hop.steer_answers()[answers:] == [], "attempt 2 reached the steering route"
-    assert stack.resend_invitations() == [], "the generic notice invited a resend"
-    texts = stack.placeholder_texts(delivery.placeholder)
-    assert texts[-1] == _steering().UNCONFIRMED_TEXT, texts
-    _no_false_nothing_queued(texts)
-    assert stack.pending() == 1
-    assert not stack.is_terminal(delivery.delivery_id)
-    assert stack.revisions(run) == [expected_id]
-
-    _replay_completes_once(stack, worker, run, delivery)
-
-    ordinary = stack.mention(
-        writer.slack_user, "What does this service do?", thread_ts=UNMAPPED_THREAD
-    )
-    since = len(stack.k8s.requests)
-    assert stack.consume(worker) is not None
-    assert _reached_sandbox(stack, since), stack.k8s.requests
-    assert stack.placeholder_texts(ordinary.placeholder)[-1] == stack.not_started()
-    assert stack.revisions(run) == [expected_id]
 
 
 def test_a_first_attempt_whose_mapping_connection_is_refused_stays_pending_without_a_notice(
@@ -4896,46 +3979,6 @@ def test_a_first_attempt_whose_mapping_connection_is_refused_stays_pending_witho
     assert stack.pending() == 0
     assert stack.resend_invitations() == []
     _assert_no_sandbox(stack)
-
-
-@pytest.mark.parametrize("redelivery", ["same_worker", "replacement_worker"])
-def test_a_redelivery_whose_done_check_fails_after_a_lost_answer_never_invites_a_resend(
-    steering: SteeringStack, redelivery: str
-) -> None:
-    """The durable steering-sent marker alone keeps the resend invitation off.
-
-    Attempt 2, in the same process or a replacement that never saw attempt 1, fails its
-    initial done-check (its Valkey connection drops on each try of that read),
-    so it raises before steering is consulted. The consumer's notice-path
-    terminality read then succeeds and answers "not terminal", which alone
-    would post the generic not-started notice. The marker written before
-    attempt 1's request keeps it off. Attempt 3 replays once.
-
-    Falsifiable: without the marker check in ``notify_turn_not_started`` the
-    generic notice replaces the unconfirmed reply here.
-    """
-
-    stack = steering
-    writer = stack.person()
-    run = stack.open_steered_run()
-    delivery = _lose_one_admission(stack, writer, run)
-    worker = stack.steerer if redelivery == "same_worker" else stack.worker_process()
-    done_key = worker.config.done_key(delivery.delivery_id)
-
-    answers = len(stack.api_hop.steer_answers())
-    rule = stack.valkey_hop.drop(
-        lambda command: command[0].upper() == "EXISTS" and command[1:] == [done_key],
-        times=_drops_for_one_failed_call(read=False),
-    )
-    assert stack.reclaim(worker) == 1
-    assert rule.remaining == 0, "attempt 2 never read the done-check"
-    assert stack.api_hop.steer_answers()[answers:] == [], "attempt 2 reached the steering route"
-    assert stack.resend_invitations() == [], "the generic notice invited a resend"
-    assert stack.placeholder_texts(delivery.placeholder)[-1] == _steering().UNCONFIRMED_TEXT
-    assert stack.pending() == 1
-    assert not stack.is_terminal(delivery.delivery_id)
-
-    _replay_completes_once(stack, worker, run, delivery)
 
 
 # --- control 4: no steering request leaves before its intent is durable ----------------
@@ -5004,31 +4047,6 @@ def test_a_queued_steering_turn_whose_intent_cannot_be_recorded_sends_nothing(
     assert sent_ttl > 0 and done_ttl > 0, (sent_ttl, done_ttl)
     assert sent_ttl >= done_ttl - 60, (sent_ttl, done_ttl)
     _assert_no_sandbox(stack)
-
-
-def test_an_ordinary_turn_in_an_unmapped_thread_still_gets_the_generic_notice(
-    steering: SteeringStack,
-) -> None:
-    """The steering intent marker never reaches ordinary chat.
-
-    An ordinary turn in a thread no factory run maps fails before it starts
-    (the cluster refuses its sandbox). No steering request was sent and no
-    steering-sent marker exists; the generic not-started notice is posted, as
-    for every other failed turn.
-    """
-
-    stack = steering
-    writer = stack.person()
-    stack.open_steered_run()
-    ordinary = stack.mention(
-        writer.slack_user, "What does this service do?", thread_ts=UNMAPPED_THREAD
-    )
-    assert stack.consume() is not None
-    assert _reached_sandbox(stack, 0), stack.k8s.requests
-    assert stack.api_hop.steer_answers() == []
-    assert stack.placeholder_texts(ordinary.placeholder)[-1] == stack.not_started()
-    assert stack.pending() == 1
-    assert stack.valkey.exists(stack.steering_sent_key(ordinary.delivery_id)) == 0
 
 
 # --- a persistence failure at admission never leaks the Slack body ---------------------
@@ -6168,6 +5186,65 @@ def test_label_enrollment_inactive_posts_one_channel_refusal(stack: Stack) -> No
         == []
     )
     assert _rows("SELECT count(*) AS n FROM curie.factory_slack_refusal_posts") == [{"n": 1}]
+    stack.drain(fresh=True)
+    assert len([call for call in _chat(stack) if call.text.startswith("Refused:")]) == 1
+
+
+@pytest.mark.parametrize("reason", ["personal_owner_required", "enrollment_inactive"])
+def test_connect_plan_label_notice_posts_tokenless_button(
+    stack: Stack, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    from curie_api.factory_intake_notices import record_notice
+    from curie_api.github_factory_events import FactoryNotice
+
+    from apps.api.tests.test_identity_connect import connect_plan_settings
+
+    connect_plan_settings(monkeypatch)
+    assert stack.enable_destination().status_code == 200
+
+    async def observe():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with async_sessionmaker(engine)() as s:
+                notice = FactoryNotice(
+                    delivery_id=uuid.uuid4(),
+                    event="issues",
+                    action="labeled",
+                    disposition="admit",
+                    installation_id=1,
+                    repository_id=REPO_ID,
+                    repo_full_name=REPO,
+                    issue_number=95001,
+                    sender_id=9,
+                    sender_login="alice",
+                    label_event_at=datetime.now(UTC),
+                    label="factory",
+                    label_event_id=95001,
+                )
+                await record_notice(
+                    s,
+                    notice,
+                    TrackerIssueRef("github", "github.com", str(REPO_ID), "95001"),
+                    settings=get_settings(),
+                    reason=reason,
+                    agent_id=uuid.UUID(stack.agent_id),
+                )
+                await s.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(observe())
+    payloads = _rows("SELECT payload FROM curie.factory_slack_refusal_posts")
+    assert payloads and payloads[0]["payload"].get("plan_url") == (
+        "https://console.example.com/settings/claude-plan"
+    ), payloads
+    stack.drain()
+    posts = [call for call in _chat(stack) if call.text.startswith("Refused:")]
+    assert len(posts) == 1
+    assert "Connect your Claude plan" in posts[0].haystack
+    assert "https://console.example.com/settings/claude-plan" in posts[0].haystack
+    assert "/identity/connect/" not in posts[0].haystack
+    assert not posts[0].params.get("thread_ts")
     stack.drain(fresh=True)
     assert len([call for call in _chat(stack) if call.text.startswith("Refused:")]) == 1
 

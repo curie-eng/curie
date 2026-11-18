@@ -22,7 +22,7 @@ CHECK, index and column; a guarded row then keeps its deadline as its dispatch
 time and expires there unclaimed, the safe direction.
 
 Revision ID: 0182
-Revises: 0179
+Revises: 0180
 """
 
 from collections.abc import Sequence
@@ -30,7 +30,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "0182"
-down_revision: str = "0179"
+down_revision: str = "0180"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 S = "curie"

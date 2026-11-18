@@ -9239,6 +9239,8 @@ export interface components {
          *     admission refusal code for ``admission_refused``.
          */
         FactorySlackKickoffOut: {
+            /** Connect Url */
+            connect_url?: string | null;
             /** Issue Url */
             issue_url?: string | null;
             /**
@@ -9246,6 +9248,8 @@ export interface components {
              * @enum {string}
              */
             outcome: "admitted" | "not_factory" | "receipt_mismatch" | "test_driver_refused" | "binding_missing" | "binding_ambiguous" | "link_missing" | "link_multiple" | "link_malformed" | "link_host_unsupported" | "link_pull_request" | "sender_unverified" | "enrollment_inactive" | "issue_inaccessible" | "issue_closed" | "publication_exists" | "base_refused" | "thread_conflict" | "authority_changed" | "admission_refused";
+            /** Plan Url */
+            plan_url?: string | null;
             /** Reason */
             reason?: string | null;
             /**

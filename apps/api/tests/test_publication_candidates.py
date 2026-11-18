@@ -441,7 +441,7 @@ def test_candidate_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CURIE_PUBLICATION_CANDIDATES_ENABLED", raising=False)
     monkeypatch.delenv("CURIE_PUBLICATION_CANDIDATE_MAX_BYTES", raising=False)
     defaults = Settings(_env_file=None)
-    assert defaults.publication_candidates_enabled is False
+    assert defaults.publication_candidates_enabled is True
     assert defaults.publication_candidate_max_bytes == 1073741824
     for value in ("0", "-1", "not-a-number"):
         monkeypatch.setenv("CURIE_PUBLICATION_CANDIDATE_MAX_BYTES", value)

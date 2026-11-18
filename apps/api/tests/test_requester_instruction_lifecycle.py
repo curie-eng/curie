@@ -12,7 +12,7 @@ import pytest
 import test_personal_execution_lifecycle as scenarios
 from curie_api.config import get_settings
 from curie_api.requester_coding_profiles import write_profile
-from test_personal_execution_lifecycle import api, world
+from test_personal_execution_lifecycle import WORKER_HEADERS, api, world
 
 TEXT = "EXAMPLE_PINNED_CODING_SELECTION_5591\n"
 
@@ -21,6 +21,28 @@ TEXT = "EXAMPLE_PINNED_CODING_SELECTION_5591\n"
 def reset_settings_cache() -> Iterator[None]:
     yield
     get_settings.cache_clear()
+
+
+def test_operator_read_exposes_default_coding_instruction_absence(api, world, auth_headers):
+    agent = support.api_agent(api, auth_headers, tenant_id=world.tenant_id)
+    agent_id = agent["agent_id"]
+    personal = support.admit_personal(api, WORKER_HEADERS, world, agent_id, issue_number=53781)
+    service = support.admit_service(
+        api, WORKER_HEADERS, agent_id, issue_number=53782, conversation="1700000000.000200"
+    )
+
+    for admitted, principal, absence_reason in (
+        (personal, str(world.owner_id), "no_profile"),
+        (service, None, "no_verified_requester"),
+    ):
+        response = api.get(f"/work-items/{admitted.work_item_id}", headers=auth_headers)
+        assert response.status_code == 200, response.text
+        detail = response.json()
+        assert detail["requester_principal_id"] == principal
+        assert detail["coding_instructions"]["absence_reason"] == absence_reason
+        [request] = detail["requests"]
+        assert request["coding_instructions_selection_id"] == detail["id"]
+        assert request["coding_instructions_evidence"] == "none"
 
 
 def _write(world, *, value, expected_revision):

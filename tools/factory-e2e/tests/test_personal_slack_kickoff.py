@@ -4356,6 +4356,110 @@ def test_progress_card_cleanup_rejudge_requires_matching_closed_unmerged_pull(
         ledger.close()
 
 
+def test_connect_plan_private_ack_and_public_thread_are_specific() -> None:
+    line = (
+        f'{{"message":"factory kickoff private post delivery={DELIVERY} '
+        'outcome=sender_unverified message_ts=1800000000.000123"}'
+    )
+    assert (
+        sks.connect_plan_private_ack(
+            line.encode(), delivery_id=DELIVERY, outcome="sender_unverified"
+        )
+        == "1800000000.000123"
+    )
+    assert (
+        sks.connect_plan_private_ack(
+            line.encode(), delivery_id=DELIVERY, outcome="enrollment_inactive"
+        )
+        is None
+    )
+    assert (
+        sks.connect_plan_private_ack(
+            line.encode(), delivery_id="other", outcome="sender_unverified"
+        )
+        is None
+    )
+    messages = [
+        {"ts": KICKOFF_TS, "user": SENDER_USER, "text": "mention"},
+        {"ts": REPLY_TS[0], "user": CURIE_USER, "text": sks.CONNECT_REFUSAL_PUBLIC},
+    ]
+    assert sks.connect_plan_public_reply(messages, root_ts=KICKOFF_TS, author=CURIE_USER)
+    assert not sks.connect_plan_public_reply(
+        messages + [messages[1]], root_ts=KICKOFF_TS, author=CURIE_USER
+    )
+    assert not sks.connect_plan_public_reply(messages, root_ts=KICKOFF_TS, author=SENDER_USER)
+
+
+def test_connect_plan_judge_rejects_missing_proof_through_cli(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = _private(tmp_path / "state")
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    ledger.ensure_run(CANDIDATE, phase="refusal-connect")
+    ledger.mark_live_kind("refusal-connect")
+    ledger.record_cleanup("step:delete-install", "install", "ok")
+    for kind in sks._INVENTORY:
+        ledger.record_cleanup(f"inventory:{kind}", kind, "absent")
+    ledger.record("cleanup", "registry_tags_absent", True)
+    ledger.record("cleanup", "token_scan", {"stdout": {"token_bytes_found": False}})
+    counts = dict.fromkeys(sks._COUNT_KEYS, 0)
+    for code in ("sender_unverified", "enrollment_inactive"):
+        ledger.record(
+            "refusal-connect",
+            code,
+            {
+                "message_ts": "1800000000.000123",
+                "public_placeholder_only": True,
+                "before": counts,
+                "after": counts,
+            },
+        )
+    ledger.record("refusal-connect", "live_sender_tokens", 1)
+    ledger.record("refusal-connect", "live_sender_tokens_with_display_name", 1)
+    argv = [
+        "judge",
+        "--candidate",
+        CANDIDATE,
+        "--run-id",
+        RUN_ID,
+        "--state-dir",
+        str(state),
+        "--criterion",
+        "refusal-connect",
+    ]
+    assert psk.main(argv, environ={"PATH": ""}) == sks.EXIT_PASS
+    assert _output(capsys)[0]["verdict"] == "pass"
+    ledger.record("refusal-connect", "live_sender_tokens", 0)
+    assert psk.main(argv, environ={"PATH": ""}) == sks.EXIT_FAIL
+    assert _output(capsys)[0]["checks"]["refusal-connect.one_sender_bound_live_token"] is False
+    ledger.record("refusal-connect", "live_sender_tokens", 1)
+    ledger.record("refusal-connect", "live_sender_tokens_with_display_name", 0)
+    assert psk.main(argv, environ={"PATH": ""}) == sks.EXIT_FAIL
+    assert _output(capsys)[0]["checks"]["refusal-connect.sender_display_name_captured"] is False
+    ledger.close()
+
+
+def test_connect_plan_unpaid_leg_never_enrolls_or_starts_models(tmp_path: Path) -> None:
+    # The production phase list determines what a real invocation executes.
+    run = object.__new__(psk.RefusalConnectRun)
+    run.rehearsal, run.kickoff_diagnostic = True, False
+    names = [name for name, _ in run.phases()]
+    assert names == [
+        "refusals",
+        "registry",
+        "images",
+        "namespaces",
+        "dex",
+        "install",
+        "setup",
+        "fixtures",
+        "refusal-connect",
+    ]
+    with pytest.raises(SystemExit) as refused:
+        psk.build_parser().parse_args(["refusal-connect", "--grant-file", str(tmp_path / "grant")])
+    assert refused.value.code == 2
+
+
 # --------------------------------------------------------------------------
 # 7. Read-back: every post in the kickoff's own thread
 # --------------------------------------------------------------------------
@@ -5290,10 +5394,7 @@ def test_ceiling_is_the_exact_approval_and_the_gate_holds_parallel_starts(tmp_pa
     codes = [code for code, _stdout, _stderr in reported]
     slot_names = sorted(os.listdir(slots)) if slots.is_dir() else None
     assert sorted(codes[:4]) == [0, 0, 2, 2] and sorted(codes[4:]) == [0, 2], (
-        [
-            {"code": code, "stdout": stdout, "stderr": stderr}
-            for code, stdout, stderr in reported
-        ],
+        [{"code": code, "stdout": stdout, "stderr": stderr} for code, stdout, stderr in reported],
         slot_names,
     )
     assert sorted(os.listdir(slots)) == ["diff-0", "diff-1", "plan-0"]

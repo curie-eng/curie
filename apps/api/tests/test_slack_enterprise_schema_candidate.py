@@ -62,7 +62,7 @@ def test_every_coupled_candidate_consumer_requires_0169(relative: str, extract: 
 def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-21: exact graph parent and file digest."""
     revisions = load("cli/src/application_schema_windows.json")["revisions"]
-    assert revisions[-39:] == [
+    assert revisions[-40:] == [
         "0138",
         "0139",
         "0140",
@@ -101,6 +101,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
         "0177",
         "0178",
         "0179",
+        "0180",
         "0182",
     ]
     kinds = load("apps/api/src/curie_api/revision_kinds.json")
@@ -139,6 +140,7 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
     assert kinds["0177"] == "expand"
     assert kinds["0178"] == "expand"
     assert kinds["0179"] == "expand"
+    assert kinds["0180"] == "expand"
     assert kinds["0182"] == "expand"
     serving = load("packages/protected-hooks/src/curie_protected_hooks/schema_serving.json")
     assert serving["revision_parents"]["0139"] == ["0138"]
@@ -176,7 +178,8 @@ def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None
     assert serving["revision_parents"]["0177"] == ["0176"]
     assert serving["revision_parents"]["0178"] == ["0177"]
     assert serving["revision_parents"]["0179"] == ["0178"]
-    assert serving["revision_parents"]["0182"] == ["0179"]
+    assert serving["revision_parents"]["0180"] == ["0179"]
+    assert serving["revision_parents"]["0182"] == ["0180"]
     chart_rows = load("charts/curie/files/schema-compat.json")["revisions"]
     chart = {row["revision"]: row for row in chart_rows}
     assert chart["0139"] == {

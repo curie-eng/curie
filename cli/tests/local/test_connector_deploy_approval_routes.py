@@ -687,16 +687,13 @@ APPROVAL_SEED_MESSAGE_PID=''
 APPROVAL_SEED_AGENT_ID=''
 APPROVAL_SEED_CHANNEL=''
 {functions}
-capture_stream_cursor() {{ printf 'stream-cursor'; }}
-discover_trace_id_for_seed() {{ printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; }}
-query_exact_seed_trace() {{ LAST_QUERY_MEMBERSHIP=true; return 0; }}
 cleanup_seed() {{
     local code=$?
     cleanup_approval_seed_fixture || code=$?
     exit "$code"
 }}
 trap cleanup_seed EXIT
-seed_approval_resume_turn local {shlex.quote(parity_agent_id)} stub
+seed_approval_resume_turn local {shlex.quote(parity_agent_id)}
 python3 - "$CURIE_API_URL" "$APPROVAL_SEED_AGENT_ID" "$APPROVAL_SEED_CHANNEL" <<'PY'
 import json
 import os

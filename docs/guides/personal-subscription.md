@@ -181,13 +181,22 @@ Your Slack identity selects your principal. That principal's active enrollment
 selects the grant and the generation the run is bound to. The installation's
 GitHub App reads the issue. A linked GitHub account is not required to start.
 
-If you have no active enrollment, the thread answers before any model work:
+If your Slack account is unlinked or your enrollment is inactive, Curie sends
+you a private message with a **Connect your Claude plan** button before any
+model work. The public placeholder becomes:
 
 ```text
-You have no active personal subscription enrolled.
-Any earlier attempt of this message is unconfirmed here; this thread shows the run if one started.
-Outcome: enrollment_inactive
+Not started. I sent you a private message about what to do next.
 ```
+
+For an unlinked account, the button opens the existing account confirmation
+page. It shows your Slack display name, @handle, user id and workspace name
+and id when Slack supplied the names. Confirm only your own account: anyone
+using it can start runs on your Claude plan. Sign in, confirm, then connect
+your plan on the Console's `/settings/claude-plan` page and mention the app
+again. An already linked account opens that plan page directly. When secure
+Console OIDC is unavailable or the token issuance limit is reached, the private
+message has no button and directs you to the operator.
 
 If the run is admitted, the app's first reply in that thread becomes the run's
 progress card. It names the issue and that you started it, lists the run's
@@ -227,7 +236,10 @@ a declared test driver on a test installation, are in
    enrollment's generation. An unlinked labeller is refused
    `personal_owner_required`. A linked labeller with no active enrollment is
    refused `enrollment_inactive`. Each refusal is answered by an issue comment
-   and, when a factory Slack channel is configured, one channel post.
+   and, when a factory Slack channel is configured, one channel post. When
+   the secure Console origin is configured, the comment links to the Claude
+   plan page and the channel post has a **Connect your Claude plan** button.
+   These public links contain no account-connect token.
    Mentioning the app on an issue that has no WorkItem is refused
    `not_admitted`. Review feedback with no WorkItem is ignored. A WorkItem
    admitted as service before the switch refuses its tracker mentions, review
