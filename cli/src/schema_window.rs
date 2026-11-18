@@ -786,9 +786,11 @@ print(json.dumps(graph))
         // which stays below this floor. Publication recovery requests require 0175,
         // which stays below this floor. Operator retry records require 0176.
         // Enrollment inactive intake notices require 0177, which stays below this
-        // floor. The factory Slack progress card requires 0178.
-        assert_eq!(candidate.schema_min, "0178");
-        assert_eq!(candidate.schema_head, "0178");
+        // floor. The factory Slack progress card requires 0178, which stays below
+        // this floor. Guarded dispatch times for retries an older dispatcher must
+        // never claim require 0182.
+        assert_eq!(candidate.schema_min, "0182");
+        assert_eq!(candidate.schema_head, "0182");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -853,7 +855,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0175", &current));
         assert!(!live_in_window("0176", &current));
         assert!(!live_in_window("0177", &current));
-        assert!(live_in_window("0178", &current));
+        assert!(!live_in_window("0178", &current));
+        assert!(live_in_window("0182", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

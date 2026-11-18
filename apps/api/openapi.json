@@ -10467,13 +10467,20 @@
             ]
           },
           "retry_safety": {
-            "enum": [
-              "no_effects",
-              "flagged",
-              "uncertain"
+            "anyOf": [
+              {
+                "enum": [
+                  "no_effects",
+                  "flagged",
+                  "uncertain"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Retry Safety",
-            "type": "string"
+            "title": "Retry Safety"
           },
           "runtime_epoch": {
             "minimum": 1.0,
@@ -10484,8 +10491,7 @@
         "required": [
           "runtime_epoch",
           "outcome",
-          "cause",
-          "retry_safety"
+          "cause"
         ],
         "title": "FinishBody",
         "type": "object"

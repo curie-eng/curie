@@ -2158,23 +2158,6 @@ base and patch from before validation until 24 hours after the request's
 final disposition. With the switch off, a failed publication settles
 needs-human and nothing is recovered.
 
-Upgrade note: the finish route now requires `retry_safety`. A worker from an
-earlier release omits it, its finish is refused with 422, and its request ends
-`expired` with cause `execution_deadline` instead of the real cause. Roll the
-workers together with the API. Before rolling the application back past this
-release, check for waiting retries. `curie cluster work-items <ID>` prints a
-cause of automatic retry blocked on a condition when `blocked_on` is set. The
-same read has no execution kind. While a publication recovery is waiting, the
-issue status comment says Recovering publication. An older dispatcher claims a
-waiting request only while its waiting deadline is still ahead and its
-dispatch time has passed. It does not read `blocked_on`. A provider gated
-retry sets its dispatch time to that deadline, so the claim never matches and
-the retry expires there. A resource gated retry becomes due on its probe
-interval, and a publication recovery becomes due on the ordinary backoff.
-Only those two can be claimed after a rollback, and that older dispatcher
-starts each as an ordinary implementation attempt. Let those requests finish
-or expire first, or unlabel the issue to cancel them.
-
 An operator can ask for the same admission again instead of relabelling the
 issue (#5431):
 `curie cluster work-items <ID> --rerun --request-id <UUID> --expected-version <N> --reason <TEXT> --yes`,
@@ -2680,7 +2663,9 @@ Each item also reports its automatic retry allowance:
 dispatch time; a blocked retry stores its waiting deadline here),
 `blocked_on` (the named condition, or null) and `retry_safety` (the worker's
 `no_effects`, `flagged` or `uncertain` fact from its finish, or null when the
-request did not end through a worker finish). A request retried after owner
+request did not end through a worker finish or its worker sent no fact, as a
+worker from an earlier release does; null never admits an implementation
+retry). A request retried after owner
 loss before this release reports `owner_loss`
 with a null `retry_of_request_id`. Its predecessor's status card shows
 `NEEDS HUMAN` rather than `RETRYING`; the issue label still follows the newest
