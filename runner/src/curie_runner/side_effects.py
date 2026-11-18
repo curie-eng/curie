@@ -69,6 +69,17 @@ PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
     | STATE_READ_TOOL_NAMES
 )
 
+# Platform tools that always write outside the sandbox. ``ask_questions``
+# (#5785, decision 16) posts a comment on the ticket, an external write, so a
+# turn that asked is not replayed blind. The classifier treats every name here
+# as side-effecting even if a harness declaration lists it as read-only, and
+# the import time check below keeps the two sets from overlapping.
+PLATFORM_SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({"mcp__curie__ask_questions"})
+
+assert not (PLATFORM_SIDE_EFFECTING_TOOLS & PLATFORM_IDEMPOTENT_TOOLS), (
+    "a platform side-effecting tool must not be in the idempotent set"
+)
+
 # The Claude Code harness adapter's declared read-only tool set. Names match the
 # claude-agent-sdk tool identifiers (PascalCase). Per ADR-0060 each harness
 # declares its own read-only set; this is the Claude adapter's declaration and
@@ -108,7 +119,7 @@ class SideEffectClassifier:
             if readonly_tools is not None
             else CLAUDE_READONLY_TOOLS
         )
-        self._idempotent = declared | PLATFORM_IDEMPOTENT_TOOLS
+        self._idempotent = (declared | PLATFORM_IDEMPOTENT_TOOLS) - PLATFORM_SIDE_EFFECTING_TOOLS
 
     def is_side_effecting(self, tool_name: str) -> bool:
         """True if executing ``tool_name`` may cause a non-idempotent side effect."""

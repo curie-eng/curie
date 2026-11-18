@@ -73,7 +73,13 @@ from .approval_wording import describe_approval, presentation_text
 from .caller_feedback import action_label
 from .memory_facts import MEMORY_TOOL_NAMES
 from .publication_precheck import PublicationPrecheck
-from .tool_names import PROGRESS_TOOL, STATE_TOOL_NAMES, TRACKER_RESULT_TOOL, TURN_PROGRESS_TOOL
+from .tool_names import (
+    PROGRESS_TOOL,
+    QUESTION_TOOL,
+    STATE_TOOL_NAMES,
+    TRACKER_RESULT_TOOL,
+    TURN_PROGRESS_TOOL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +248,11 @@ ISSUE_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__get_issue"
 # only for an execution whose API contract is tracker_result. It writes, so it
 # is never in ``side_effects.PLATFORM_IDEMPOTENT_TOOLS``.
 TRACKER_RESULT_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TRACKER_RESULT_TOOL}"
+# The factory question tool (#5785), mounted on the same server only for an
+# execution whose API contract is implementation and that holds the issue read
+# capability. It writes a ticket comment, so it is never idempotent (see
+# ``side_effects.PLATFORM_SIDE_EFFECTING_TOOLS``).
+QUESTION_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{QUESTION_TOOL}"
 
 # The existing platform MCP servers ``curie`` and ``curie-state`` retain their
 # exemption under #2286 and ADR 0139. Only their exact published platform tool
@@ -274,6 +285,9 @@ TRACKER_RESULT_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TRACKER_RESULT_TOOL}"
 # ``submit_tracker_result`` (ADR 0277) is the run's one platform result: the
 # API, not toolPolicy, decides whether it is accepted, from the request bound
 # capability, and only the platform's own ``curie`` server publishes the name.
+# ``ask_questions`` (#5785) is exempt for the same reason: the API, not
+# toolPolicy, decides from the request bound capability whether the questions
+# are accepted, and only the platform's own ``curie`` server publishes the name.
 _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
     {
         APPROVAL_TOOL_NAME,
@@ -282,6 +296,7 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
         TURN_PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
         TRACKER_RESULT_TOOL_NAME,
+        QUESTION_TOOL_NAME,
     }
 )
 

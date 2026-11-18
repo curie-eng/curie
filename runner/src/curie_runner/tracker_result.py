@@ -61,6 +61,7 @@ ISSUE_READ_SEGMENT = "issue-read"
 _ISSUE_READ_SUFFIX = "/work-items/" + ISSUE_READ_SEGMENT
 _CONTRACT_SEGMENT = "completion-contract"
 _RESULT_SEGMENT = "tracker-result"
+_QUESTIONS_SEGMENT = "questions"
 
 # ``ContractUnavailable.reason`` codes. Fixed strings only.
 REASON_ROUTE_INVALID = "route_invalid"
@@ -160,6 +161,8 @@ PUBLICATION_RECOVERY = CompletionContract(CONTRACT_PUBLICATION_RECOVERY)
 class SiblingUrls:
     completion_contract: str
     tracker_result: str
+    # The ``ask_questions`` route (#5785), beside the issue read route.
+    questions: str
 
 
 @dataclass(frozen=True)
@@ -182,6 +185,10 @@ class BoundContract:
     # wraps it as an SDK tool (harness.claude.tracker_result_tool), so this
     # module stays free of the SDK (ADR 0140).
     result_handler: ResultHandler | None = None
+    # The plain async handler of ``ask_questions`` (#5785), set only for an
+    # implementation contract the API answered. Never for a tracker result or
+    # a publication recovery.
+    question_handler: ResultHandler | None = None
 
 
 def sibling_urls(issue_read_url: str) -> SiblingUrls:
@@ -212,7 +219,7 @@ def sibling_urls(issue_read_url: str) -> SiblingUrls:
     def at(segment: str) -> str:
         return urlunsplit((parts.scheme, parts.netloc, base + segment, "", ""))
 
-    return SiblingUrls(at(_CONTRACT_SEGMENT), at(_RESULT_SEGMENT))
+    return SiblingUrls(at(_CONTRACT_SEGMENT), at(_RESULT_SEGMENT), at(_QUESTIONS_SEGMENT))
 
 
 def session_limits(
@@ -454,7 +461,8 @@ async def bind_completion_contract(
 
     No capability means an implementation session and no call at all. With
     one, the contract route is called once; a tracker result contract comes
-    back with its ``submit_tracker_result`` tool, and a publication recovery
+    back with its ``submit_tracker_result`` tool, an implementation contract
+    with the ``ask_questions`` tool (#5785), and a publication recovery
     contract with nothing (the process then constructs no model session).
     """
 
@@ -465,6 +473,12 @@ async def bind_completion_contract(
     contract = await fetch_completion_contract(
         urls.completion_contract, token, delay=delay, deadline_s=deadline_s
     )
+    if contract.kind == CONTRACT_IMPLEMENTATION:
+        # Imported here because ``question_tool`` builds on this module's
+        # shared post and refusal helpers.
+        from .question_tool import questions_handler
+
+        return BoundContract(contract, question_handler=questions_handler(urls.questions, token))
     if not contract.tracker_result:
         return BoundContract(contract)
     return BoundContract(contract, tracker_result_handler(urls.tracker_result, token))
