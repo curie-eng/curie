@@ -87,8 +87,9 @@ CONTRACT = "0041"
 # Operator retry records require 0176.
 # Enrollment inactive intake notices require 0177.
 # The factory Slack progress card requires 0178.
-# GitHub account link states and display labels require 0179.
-APP_SCHEMA_MIN = "0179"
+# GitHub account link states and display labels require 0179, which stays below this floor.
+# Guarded dispatch times for retries an older dispatcher must never claim require 0182.
+APP_SCHEMA_MIN = "0182"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -121,7 +122,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     window = load_window()
     assert window.schema_min == APP_SCHEMA_MIN
     assert window.schema_head == HEAD
-    assert HEAD == "0179"
+    assert HEAD == "0182"
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
     # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
@@ -147,6 +148,7 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0177"] == KIND_EXPAND
     assert kinds["0178"] == KIND_EXPAND
     assert kinds["0179"] == KIND_EXPAND
+    assert kinds["0182"] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
@@ -240,6 +242,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0177",
             "0178",
             "0179",
+            "0182",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -304,8 +307,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0177",
             "0178",
             "0179",
+            "0182",
         }
-    assert current_revision() == "0179"
+    assert current_revision() == "0182"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -426,8 +430,9 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # floor. Operator retry records require 0176.
     # Enrollment inactive intake notices require 0177.
     # The factory Slack progress card requires 0178.
-    # GitHub account link states and display labels require 0179.
-    for revision in sorted(known - {"0179"}):
+    # GitHub account link states and display labels require 0179, which stays below this floor.
+    # Guarded dispatch times for retries an older dispatcher must never claim require 0182.
+    for revision in sorted(known - {"0182"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0140", window, known) is False
     assert can_serve("0141", window, known) is False
@@ -464,7 +469,8 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     assert can_serve("0176", window, known) is False
     assert can_serve("0177", window, known) is False
     assert can_serve("0178", window, known) is False
-    assert can_serve("0179", window, known) is True
+    assert can_serve("0179", window, known) is False
+    assert can_serve("0182", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
