@@ -920,6 +920,30 @@ def _visible_notice(github: NoticeGitHub, number: int) -> str:
 
 
 @pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize("linked", [False, True])
+def test_connect_plan_notice_links_tokenless_console_page(
+    factory: Any, monkeypatch: pytest.MonkeyPatch, path: str, linked: bool
+) -> None:
+    from apps.api.tests.test_identity_connect import connect_plan_settings
+
+    _, github, agent = factory
+    connect_plan_settings(monkeypatch)
+    if linked:
+        _link_labeller(agent, active=None)
+    number = github.plant_issue(age=timedelta(minutes=5))
+    _observe(factory, path, number)
+    visible = _visible_notice(github, number)
+    assert visible.rstrip().endswith(
+        "Connect your Claude plan: https://console.example.com/settings/claude-plan"
+    )
+    assert "/identity/connect/" not in visible
+    assert _notices(number)[0]["reason"] == (
+        "enrollment_inactive" if linked else "personal_owner_required"
+    )
+    assert _work(number) == [] and _requests(number) == []
+
+
+@pytest.mark.parametrize("path", PATHS)
 def test_label_enrollment_inactive_refuses_a_disconnected_plan(
     factory: Any, monkeypatch: pytest.MonkeyPatch, path: str
 ) -> None:

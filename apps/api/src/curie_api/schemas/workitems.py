@@ -493,6 +493,8 @@ class FactorySlackKickoffOut(BaseModel):
     issue_url: str | None = None
     replayed: bool = False
     reason: str | None = None
+    connect_url: str | None = None
+    plan_url: str | None = None
 
 
 # The operator's reason for a retry, stripped before validation, hashing and storage.

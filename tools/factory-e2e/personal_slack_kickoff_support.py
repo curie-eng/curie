@@ -2479,7 +2479,10 @@ def route_url(
     path = urllib.parse.urlunsplit(("", "", parts.path, parts.query, ""))
     if parts.scheme == "http" and parts.netloc == origins.issuer_netloc:
         return f"http://127.0.0.1:{dex_local}{path}", {"Host": origins.issuer_netloc}
-    if parts.scheme == "http" and parts.netloc == origins.redirect_netloc:
+    if (
+        parts.scheme == urllib.parse.urlsplit(origins.redirect_uri).scheme
+        and parts.netloc == origins.redirect_netloc
+    ):
         return f"http://127.0.0.1:{api_local}{path}", {}
     if parts.scheme == "http" and parts.netloc == f"127.0.0.1:{api_local}":
         return url, {}
@@ -2811,6 +2814,51 @@ def generated_secrets_ok(data: Mapping[str, str]) -> bool:
 
 CRITERIA = ("slack", "admission", "owner", "grant", "progress", "refusal", "budget", "cleanup")
 REHEARSAL_CRITERIA = ("slack", "refusal", "cleanup")
+CONNECT_REFUSAL_PUBLIC = "Not started. I sent you a private message about what to do next."
+
+
+def connect_plan_private_ack(logs: bytes, *, delivery_id: str, outcome: str) -> str | None:
+    pattern = re.compile(
+        rf"factory kickoff private post delivery={re.escape(delivery_id)} "
+        rf'outcome={re.escape(outcome)} message_ts=(\d+\.\d+)(?=["\s]|$)'
+    )
+    match = pattern.search(logs.decode("utf-8", "replace"))
+    return match[1] if match else None
+
+
+def connect_plan_public_reply(
+    messages: Sequence[Mapping[str, Any]], *, root_ts: str, author: str
+) -> bool:
+    replies = [m for m in messages if m.get("ts") != root_ts]
+    return (
+        len(replies) == 1
+        and replies[0].get("user") == author
+        and (replies[0].get("text") == CONNECT_REFUSAL_PUBLIC)
+    )
+
+
+def _judge_refusal_connect(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
+    observed = ledger.observations("refusal-connect")
+    checks: dict[str, bool] = {}
+    for code in ("sender_unverified", "enrollment_inactive"):
+        leg = observed.get(code)
+        leg = leg if isinstance(leg, dict) else {}
+        checks[f"{code}.private_post_accepted"] = bool(
+            isinstance(leg.get("message_ts"), str) and re.fullmatch(r"\d+\.\d+", leg["message_ts"])
+        )
+        checks[f"{code}.public_placeholder_only"] = leg.get("public_placeholder_only") is True
+        checks[f"{code}.nothing_started"] = leg.get("before") == leg.get("after") and (
+            isinstance(leg.get("before"), dict)
+            and all(leg["before"].get(key) == 0 for key in _COUNT_KEYS)
+        )
+    checks["one_sender_bound_live_token"] = observed.get("live_sender_tokens") == 1
+    checks["sender_display_name_captured"] = (
+        observed.get("live_sender_tokens_with_display_name") == 1
+    )
+    checks["unpaid"] = ledger.run_row()["live_starts"] == 0
+    cleanup, counts = _judge_cleanup(ledger)
+    checks.update({f"cleanup.{key}": value for key, value in cleanup.items()})
+    return checks, counts
 
 
 def _true(observed: Mapping[str, Any], key: str) -> bool:
@@ -3762,6 +3810,7 @@ def _judge_cleanup(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
 
 
 _JUDGES: dict[str, Callable[[Ledger], tuple[dict[str, bool], dict[str, int]]]] = {
+    "refusal-connect": _judge_refusal_connect,
     "slack": _judge_slack,
     "admission": _judge_admission,
     "owner": _judge_owner,
@@ -3778,7 +3827,11 @@ def judge(ledger: Ledger, criterion: str) -> dict[str, Any]:
 
     rehearsal = ledger.live_kind() == "rehearse"
     if criterion == "all":
-        names = list(REHEARSAL_CRITERIA if rehearsal else CRITERIA)
+        names = (
+            ["refusal-connect"]
+            if ledger.live_kind() == "refusal-connect"
+            else list(REHEARSAL_CRITERIA if rehearsal else CRITERIA)
+        )
     elif criterion in _JUDGES:
         if rehearsal and criterion not in REHEARSAL_CRITERIA:
             raise Refusal("rehearsal_ledger", "--criterion")
@@ -3801,6 +3854,10 @@ def judge(ledger: Ledger, criterion: str) -> dict[str, Any]:
         dump = ledger.observations("progress").get("thread_dump")
         if isinstance(dump, list):
             observations["progress.thread_dump"] = dump
+    if "refusal-connect" in names:
+        dump = ledger.observations("refusal-connect").get("thread_dump")
+        if isinstance(dump, list):
+            observations["refusal-connect.thread_dump"] = dump
     return {
         "criterion": criterion,
         "verdict": "pass" if checks and all(checks.values()) else "fail",
