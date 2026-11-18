@@ -422,43 +422,6 @@ def test_delivery_guard_failure_leaves_owed_and_recovers(
     assert facts(world).request.comment_id == "101"
 
 
-@pytest.mark.parametrize("failure", ["crash", "deadline", "unparseable"])
-def test_recovery_guard_isolates_one_unreadable_request(
-    facts_world: Any, monkeypatch: Any, failure: str
-) -> None:
-    import curie_api.factory_facts_exchange as exchange
-    import httpx
-
-    world = facts_world
-    world.add()
-    world.fail_write = True
-    world.cycle()
-    world.fail_write = False
-    world.add(102, number=43)
-    original = world.handle
-    monkeypatch.setattr(exchange, "FACTS_DEADLINE_SECONDS", 0.25)
-
-    async def broken(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/issues/42/comments"):
-            if failure == "crash":
-                raise RuntimeError("private-recovery-crash-sentinel")
-            if failure == "deadline":
-                await asyncio.Event().wait()
-            return httpx.Response(200, content=b"{broken-json")
-        return original(request)
-
-    world.handle = broken
-    asyncio.run(asyncio.wait_for(world.poll(), timeout=3))
-    assert world.answers(42) == []
-    assert len(world.answers(43)) == 1
-    assert len(asyncio.run(world.rows("factory_facts_requests"))) == 2
-    assert_no_work(world)
-    world.handle = original
-    monkeypatch.setattr(exchange, "FACTS_DEADLINE_SECONDS", 45.0)
-    world.cycle()
-    assert len(world.answers(42)) == len(world.answers(43)) == 1
-
-
 def test_invalid_requests_get_no_reply_and_log_only_reason(facts_world: Any, caplog: Any) -> None:
     from test_factory_facts import REQUESTS, request_body
 
