@@ -297,9 +297,11 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0274 | [A declared webhook wake skips overlap until the next poll](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md) | Accepted |
 | 0275 | [A channel gateway owns provider authentication and I/O](0275-channel-gateway-provider-boundary.md) | Accepted |
 | 0276 | [Static shells share capacity and receive agent inputs per claim](0276-static-shells-share-capacity-and-receive-agent-inputs-per-claim.md) | Accepted |
-| 0277 | [Factory triage publishes tickets before implementation admission](0277-factory-triage-publishes-tickets-before-implementation-admission.md) | Accepted |
+| 0277 | [Factory triage publishes tickets before implementation admission](0277-factory-triage-publishes-tickets-before-implementation-admission.md) | Superseded by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md) |
 | 0278 | [Requester coding instructions are pinned preferences below repository rules](0278-requester-coding-instructions.md) | Accepted |
 | 0279 | [A person acting through a GitHub App can select factory work, and refused trigger labels are answered on the issue](0279-a-person-acting-through-a-github-app-can-select-factory-work.md) | Accepted |
 | 0280 | [A repository writer can ask the factory for facts on the ticket, and facts are never admission](0280-a-repository-writer-can-ask-the-factory-for-facts-on-the-ticket.md) | Accepted |
 | 0281 | [Personal-mode refusals offer self-service account linking](0281-personal-mode-refusals-offer-self-service-account-linking.md) | Accepted |
+| 0286 | [One labelled ticket: the factory investigates, asks on the ticket, and resumes on a plain answer](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md) | Accepted |
+| 0287 | [Learned rules are a memory kind that applies only after a person accepts it](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md) | Accepted |
 <!-- END GENERATED: adr-index -->

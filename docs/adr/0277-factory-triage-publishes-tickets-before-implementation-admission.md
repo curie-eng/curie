@@ -2,8 +2,9 @@
 
 Date: 2026-11-10
 
-Status: Accepted
+Status: Superseded by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md)
 
+**Superseded in full by [ADR 0286](0286-one-labelled-ticket-the-factory-investigates-asks-and-resumes-on-a-plain-answer.md)** (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)): one labelled ticket replaces the separate triage path, and the partial amendments recorded below are withdrawn with it.
 Accepted alongside implementation under
 [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
 The repository owner approved acceptance alongside implementation on

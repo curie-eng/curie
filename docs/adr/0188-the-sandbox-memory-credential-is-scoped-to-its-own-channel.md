@@ -4,6 +4,8 @@ Date: 2026-10-01
 
 Status: Accepted
 
+**Partially amended by [ADR 0287](0287-learned-rules-are-a-memory-kind-that-applies-only-after-a-person-accepts-it.md)** (back-link added under ADR 0045): the per turn write credential may propose one rule per turn in its own scope but never accept, reject, remove or read pending rules, and the read only boot credential reads only accepted rules.
+
 Accepted by Brian on 2026-10-02 for v0.12.0. The implementation was
 already present in `apps/api/src/curie_api/routers/state.py`.
 
