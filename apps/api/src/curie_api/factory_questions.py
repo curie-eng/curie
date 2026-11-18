@@ -10,7 +10,7 @@ marked-comment write, and the request ends with the question ending:
 This module owns the round record (`FactoryQuestionRound`, one row per
 WorkItem), the comment the platform composes, the route's refusals and its two
 transactions around the tracker write, the question ending the finish path
-applies, the row rules at settlement, and the delete at cancellation. The
+applies, the row rules at settlement, and the clear at cancellation. The
 round record stores identities, a count, a digest and a fence, never question
 or answer text (ADR 0187, ADR 0199).
 
@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Final
 
 import httpx
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import factory_tracker_result_runtime as runtime
@@ -421,7 +421,7 @@ async def settle_round(
     3. Otherwise any terminal outcome makes it ``cleared``, a ``posting`` row
        included (its round never counted).
 
-    A cancelled WorkItem's row was deleted with the cancellation.
+    A cancelled WorkItem's row was cleared with the cancellation.
     """
 
     if work_item.cancelled_at is not None:
@@ -453,14 +453,24 @@ async def settle_round(
     )
 
 
-async def delete_for_cancellation(session: AsyncSession, work_item_id: uuid.UUID) -> None:
-    """Drop the WorkItem's round record in its cancellation transaction.
+async def clear_for_cancellation(session: AsyncSession, work_item_id: uuid.UUID) -> None:
+    """Clear the WorkItem's question in its cancellation transaction.
 
-    Cancellation is sticky (ADR 0161): after it no comment is an answer.
+    Cancellation is sticky (ADR 0161): after it no comment is an answer, so
+    the row is ``cleared`` and names no pending request. ``rounds_used`` is
+    kept: the cap counts rounds for the WorkItem's lifetime and a relabel,
+    which reuses the WorkItem, does not reset it (ADR 0286 decision 8).
     """
 
     await session.execute(
-        delete(FactoryQuestionRound).where(FactoryQuestionRound.work_item_id == work_item_id)
+        update(FactoryQuestionRound)
+        .where(FactoryQuestionRound.work_item_id == work_item_id)
+        .values(
+            state=CLEARED,
+            pending_request_id=None,
+            version=FactoryQuestionRound.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
     )
 
 

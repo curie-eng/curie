@@ -5,7 +5,8 @@ completes with ``questions_asked``, admits no retry, and its status comment
 names the round and carries ``curie-factory:questions``. An answer queued
 before the asking request settles keeps its revision request. A fourth ask is
 refused, and the request that was refused fails ``question_rounds_exhausted``,
-which needs a human. Cancelling the WorkItem drops its round record.
+which needs a human. Cancelling the WorkItem clears its question and keeps
+the round count, so a relabel does not reset the cap (ADR 0286 decision 8).
 
 Each case admits a labelled issue through a signed webhook, acquires and
 starts its request as the worker does, asks through the route over HTTP with
@@ -438,11 +439,18 @@ def _cancel(triage: tr._Triage) -> None:
     assert isinstance(triage.client.portal.call(go), lifecycle.WorkItemOutcome)
 
 
-def test_cancel_drops_the_round_record(admitted: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cancel_clears_the_question_and_keeps_the_count(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
     triage = _asked(admitted, monkeypatch, 951)
-    assert _round_row(triage.work_item_id) is not None
+    revision = _queue_revision(triage)
+    _answer(triage.work_item_id, revision)
     _cancel(triage)
-    assert _round_row(triage.work_item_id) is None
+    row = _round_row(triage.work_item_id)
+    assert row is not None
+    assert (row["state"], row["rounds_used"], row["pending_request_id"]) == ("cleared", 1, None)
+    # The cancellation's own sweep cancels the queued answer follow-up.
+    assert _request(revision)["status"] == "cancelled"
     refused = _ask(triage)
     assert (refused.status_code, refused.json()["detail"]["code"]) == (
         409,
@@ -476,4 +484,52 @@ def test_cancel_while_the_comment_is_written_refuses_the_round(
         409,
         "work_item_cancelled",
     )
-    assert _round_row(triage.work_item_id) is None
+    row = _round_row(triage.work_item_id)
+    assert row is not None and (row["state"], row["rounds_used"]) == ("cleared", 0)
+
+
+def test_cancel_then_relabel_keeps_the_round_cap(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _client, github, _sink = admitted
+    triage = _asked(admitted, monkeypatch, 953)
+    # Two more rounds were posted by earlier attempts on this WorkItem.
+    tr._exec(
+        "UPDATE curie.factory_question_rounds SET rounds_used = 3 WHERE work_item_id = :id",
+        {"id": triage.work_item_id},
+    )
+    tr._finish(triage, "failed", "no_pull_request")
+    _cancel(triage)
+    tr._label(triage.client, github, 953)
+    relabelled = _requests(triage.work_item_id)[-1]["id"]
+    assert relabelled != triage.request_id
+    current = _take_over(triage, relabelled)
+    refused = _ask(current)
+    assert (refused.status_code, refused.json()["detail"]["code"]) == (
+        409,
+        "question_rounds_exhausted",
+    )
+
+
+def test_a_relabel_that_supersedes_the_waiting_answer_clears_the_round(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge_fakes.github import _issue_event, _post
+
+    client, github, _sink = admitted
+    triage = _asked(admitted, monkeypatch, 954)
+    revision = _queue_revision(triage)
+    _answer(triage.work_item_id, revision)
+    tr._finish(triage, "failed", "no_pull_request")
+    _promote(triage)
+    assert _request(revision)["status"] == "waiting"
+
+    github.advance_label_event(954)
+    relabelled = _post(client, "issues", _issue_event("labeled", 954, label={"name": LABEL}))
+    assert relabelled.status_code == 200, relabelled.text
+    _reconcile()
+
+    assert _request(revision)["status"] == "cancelled"
+    row = _round_row(triage.work_item_id)
+    assert row is not None
+    assert (row["state"], row["rounds_used"]) == ("cleared", 1)

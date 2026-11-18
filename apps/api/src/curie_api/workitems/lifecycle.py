@@ -2558,7 +2558,7 @@ async def request_cancellation(
     await _expire_unused_grants(session, work_item_id)
     # An outstanding question ends with the WorkItem (#5785): after this no
     # comment is an answer.
-    await factory_questions.delete_for_cancellation(session, work_item_id)
+    await factory_questions.clear_for_cancellation(session, work_item_id)
     await _revoke_triage_delegations(session, work_item_id, now)
 
     active = await lock_active_request(session, work_item_id)
@@ -2785,6 +2785,7 @@ async def readmit(
         )
         superseded = await reload_request(session, active.id)
         await _queue_notice(session, work_item, superseded, detail=None)
+        await factory_questions.settle_round(session, work_item, superseded)
     version: int | None = await session.scalar(
         update(WorkItem)
         .where(WorkItem.id == work_item_id)
@@ -2892,6 +2893,7 @@ async def admit_pending_readmit(
         active.version += 1
         await session.flush()
         await _queue_notice(session, work_item, active, detail=None)
+        await factory_questions.settle_round(session, work_item, active)
     version: int | None = await session.scalar(
         update(WorkItem)
         .where(WorkItem.id == work_item_id)
