@@ -490,6 +490,10 @@ _HTTP_OPERATIONS = [
     "/directory/people",
     "/directory/people/status",
     "/directory/namespaces",
+    "/identity/me/links",
+    "/identity/me/links/{link_id}",
+    "/identity/me/github-link",
+    "/identity/me/github-link/callback",
     "/identity/connect/{token}",
     "/identity/connect/{token}/confirm",
     # Team directory sync status (#4584, ADR 0220).

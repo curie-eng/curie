@@ -36,6 +36,7 @@ const EXPECTED_COMMAND_IDS = [
 const EXPECTED_NO_CLI_ACTION_IDS = [
   "behavior-packs-edit",
   "eval-matrix",
+  "github-account-link",
   "memory-delete",
   "memory-edit",
 ] as const satisfies readonly WiredActionId[];

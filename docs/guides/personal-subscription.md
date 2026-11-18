@@ -315,3 +315,15 @@ substrate is Kubernetes. That error is
    enrolled subscription.
    [Issue 5640](https://github.com/curie-eng/curie/issues/5640) tracks that
    limit.
+
+## Link your GitHub account
+
+Open **Settings > Claude plan > Linked accounts** in the Console and choose
+**Link GitHub**. Authorize the factory GitHub App with the account you use to
+apply factory labels. If the button is absent, ask the operator to configure
+the GitHub App OAuth client. An account already linked to someone else must be
+unlinked there before it can be linked to you.
+
+The same section lists your Slack and GitHub accounts. Choose **Unlink** and
+confirm to stop new runs through an account. Runs already admitted keep their
+owner; disconnect your Claude plan when those runs must also stop.

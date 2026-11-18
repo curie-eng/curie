@@ -1,7 +1,7 @@
 {
   "candidate": {
-    "schema_head": "0182",
-    "schema_min": "0182"
+    "schema_head": "0179",
+    "schema_min": "0179"
   },
   "revisions": [
     "0001",
@@ -158,7 +158,7 @@
     "0176",
     "0177",
     "0178",
-    "0182"
+    "0179"
   ],
   "windows": {
     "0.10.0": {

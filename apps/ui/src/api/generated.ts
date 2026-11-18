@@ -2861,6 +2861,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/identity/me/github-link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Start Github Link */
+        post: operations["start_github_link_identity_me_github_link_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/github-link/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Github Link Callback */
+        get: operations["github_link_callback_identity_me_github_link_callback_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Links */
+        get: operations["list_links_identity_me_links_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/me/links/{link_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Unlink */
+        delete: operations["unlink_identity_me_links__link_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/identity/resolve": {
         parameters: {
             query?: never;
@@ -9349,6 +9417,11 @@ export interface components {
          * @enum {string}
          */
         GateKind: "permission" | "policy";
+        /** GithubLinkStartOut */
+        GithubLinkStartOut: {
+            /** Authorize Url */
+            authorize_url: string;
+        };
         /**
          * GraderOut
          * @description A deterministic grader, mirroring the frozen eval-case Grader shape
@@ -10214,6 +10287,30 @@ export interface components {
              * Format: uuid
              */
             request_id: string;
+        };
+        /** OwnedLinkOut */
+        OwnedLinkOut: {
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Display Label */
+            display_label: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Provider */
+            provider: string;
+        };
+        /** OwnedLinksOut */
+        OwnedLinksOut: {
+            /** Github Link Available */
+            github_link_available: boolean;
+            /** Links */
+            links: components["schemas"]["OwnedLinkOut"][];
         };
         /** Owner */
         Owner: {
@@ -20156,6 +20253,131 @@ export interface operations {
                 };
                 content: {
                     "text/html": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    start_github_link_identity_me_github_link_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubLinkStartOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    github_link_callback_identity_me_github_link_callback_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+                "__Host-curie_github_link_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            307: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_links_identity_me_links_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OwnedLinksOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    unlink_identity_me_links__link_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                link_id: string;
+            };
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityLinkRevokedOut"];
                 };
             };
             /** @description Validation Error */

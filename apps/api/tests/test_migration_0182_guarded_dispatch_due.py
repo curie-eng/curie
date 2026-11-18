@@ -28,7 +28,7 @@ from alembic import command
 from sqlalchemy.exc import IntegrityError
 
 REVISION = "0182"
-BELOW = "0178"
+BELOW = "0179"
 COLUMN = "guarded_dispatch_not_before"
 CHECK = "execution_requests_guarded_dispatch_ck"
 STAMP = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)

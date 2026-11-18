@@ -40,7 +40,7 @@ from curie_internal.driver_declaration import (
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT, WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
 from plugin_format.connector_render import ConnectorProxy, GrantStore
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .e2e_connector import E2EInstall
@@ -355,6 +355,8 @@ class Settings(BaseSettings):
     factory_intake: Literal["poll", "webhook"] = "poll"
     # Personal GitHub labels use the linked requester and normal owner validation.
     factory_model_auth_mode: Literal["service", "personal"] = "service"
+    factory_github_app_client_id: str = ""
+    factory_github_app_client_secret: SecretStr = SecretStr("")
     # ADR 0278 (#5592): the worker and runner deliver, validate and acknowledge
     # the pinned document, so admission selects it by default.
     requester_coding_instructions_apply: bool = Field(

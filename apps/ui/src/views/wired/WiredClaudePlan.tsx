@@ -16,6 +16,7 @@ import {
   type PersonalEnrollment,
 } from "../../api/client";
 import { checkEnrollmentToken, type EnrollmentTokenCheck } from "../../lib/enrollmentToken";
+import { LinkedAccounts } from "./LinkedAccounts";
 
 // The Claude plan section of Settings (#5716): self-service enrollment for the
 // person's own Claude subscription, the same owner API `curie cluster
@@ -306,7 +307,7 @@ export function WiredClaudePlan() {
   const principal = session === null || session.kind === "principal";
   return (
     <div data-testid="claude-plan-section" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      {principal ? <ClaudePlanBody /> : <SignInPrompt />}
+      {principal ? <><ClaudePlanBody /><LinkedAccounts /></> : <SignInPrompt />}
     </div>
   );
 }
