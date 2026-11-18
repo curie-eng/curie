@@ -1,7 +1,7 @@
 """Add self-service GitHub link state and identity display labels (#5719).
 
-Revision ID: 0178
-Revises: 0177
+Revision ID: 0179
+Revises: 0178
 """
 
 from collections.abc import Sequence
@@ -10,8 +10,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0178"
-down_revision: str = "0177"
+revision: str = "0179"
+down_revision: str = "0178"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
