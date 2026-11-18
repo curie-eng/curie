@@ -60,8 +60,8 @@ CONTRACT = "0041"
 # The 0108 join requires both stable reply selectors (0106) and identity links (0107).
 # The join requires both start diagnostics (0123) and attachment catalogs (0130),
 # and above it the Agent ORM reads agents.learned_skills (selfimp_skills_0001,
-# ADR 0247), the agent schedule columns (selfimp_sched_0001, ADR 0248) and the
-# twin memory toggle of selfimp_memory_0001 (ADR 0249), so twin memory is the floor.
+# ADR 0283), the agent schedule columns (selfimp_sched_0001, ADR 0248) and the
+# twin memory toggle of selfimp_memory_0001 (ADR 0284), so twin memory is the floor.
 APP_SCHEMA_MIN = "selfimp_memory_0001"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"

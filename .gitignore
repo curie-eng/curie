@@ -66,6 +66,7 @@ target/
 
 # Node
 node_modules/
+.pnpm-store/
 dist/
 build/
 

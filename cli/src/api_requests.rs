@@ -229,7 +229,7 @@ pub struct MemoryGuidanceIn {
 }
 
 /// `POST /agents/{id}/state/_memory/archive` and `.../restore`
-/// (`MemoryLifecycleIn`, ADR 0249). `expected_version` is the version the CLI
+/// (`MemoryLifecycleIn`, ADR 0284). `expected_version` is the version the CLI
 /// just read; the channel pair is sent only for channel scope.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryLifecycleIn {
@@ -242,7 +242,7 @@ pub struct MemoryLifecycleIn {
     pub scope: String,
 }
 
-/// `POST /agents/{id}/state/_memory/revert` (`MemoryRevertIn`, ADR 0249).
+/// `POST /agents/{id}/state/_memory/revert` (`MemoryRevertIn`, ADR 0284).
 /// `to_version` 0 means the entry's absence before it was created.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryRevertIn {
@@ -325,7 +325,7 @@ pub struct AgentScheduleRevert {
 }
 
 /// `POST /agents/{id}/learned-skills/{ref}/revert` (`LearnedSkillRevert`,
-/// ADR 0247). No `to_revision` undoes the last change.
+/// ADR 0283). No `to_revision` undoes the last change.
 #[derive(Debug, Clone, Serialize)]
 pub struct LearnedSkillRevert {
     pub expected_revision: u32,

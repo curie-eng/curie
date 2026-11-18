@@ -362,7 +362,7 @@ pub struct Agent {
     /// as off, which is what it does.
     #[serde(default)]
     pub memory_writes: bool,
-    /// Whether this agent opted in to agent-wide learning (ADR 0249): the
+    /// Whether this agent opted in to agent-wide learning (ADR 0284): the
     /// learning default guidance and standing instructions. Independent of
     /// `memory_writes`. Absent deserializes as `None`: the platform did not
     /// report it, and consumers refuse rather than assume it is off.
@@ -382,7 +382,7 @@ pub struct Agent {
     #[serde(default = "default_schedule_min_interval_minutes")]
     pub schedule_min_interval_minutes: u32,
     /// Whether the runner loads and may edit this agent's learned skills
-    /// (ADR 0247). Defaulted so an older platform reads as off.
+    /// (ADR 0283). Defaulted so an older platform reads as off.
     #[serde(default)]
     pub learned_skills: bool,
     /// Who resolves publication approval. Missing responses stay on human approval.
@@ -912,7 +912,7 @@ pub struct MemoryEntry {
     pub provenance: MemoryProvenance,
 }
 
-/// One learned skill (`LearnedSkillOut`, ADR 0247). `author` and
+/// One learned skill (`LearnedSkillOut`, ADR 0283). `author` and
 /// `conversation` come from the head's latest revision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedSkill {
@@ -974,7 +974,7 @@ pub struct StateEntry {
 }
 
 /// One canonical memory head as the typed memory routes return it
-/// (`MemoryRecordOut`, ADR 0249). Serialized back verbatim as the archive and
+/// (`MemoryRecordOut`, ADR 0284). Serialized back verbatim as the archive and
 /// restore result, so the CLI cannot drop a field by hand-picking one.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemoryRecord {
@@ -1056,7 +1056,7 @@ impl<'a> MemoryScope<'a> {
 /// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
 /// text the runner shows beside its memory tools, and whether it is the
 /// platform `default`, the `learning_default` for an agent that opted in to
-/// agent-wide learning (ADR 0249), or `operator`-set.
+/// agent-wide learning (ADR 0284), or `operator`-set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryGuidance {
     pub text: String,
@@ -2479,7 +2479,7 @@ pub(crate) fn memory_state_url(
     Ok(url)
 }
 
-/// Build the typed memory detail route (ADR 0249):
+/// Build the typed memory detail route (ADR 0284):
 /// `/agents/{id}/state/_memory/entries/{fact_id}?scope=agent|channel` plus the
 /// exact `channel_kind` and `channel_address` for channel scope. Identities
 /// travel as path segments and query values, never interpolated.
@@ -4313,7 +4313,7 @@ impl ApiClient {
         Ok(())
     }
 
-    /// A typed memory route's refusal (ADR 0249). A 409 means the head moved
+    /// A typed memory route's refusal (ADR 0284). A 409 means the head moved
     /// after the CLI read it: that is reported as a stale version and never
     /// retried, because a retry would overwrite a change nobody reviewed.
     async fn expect_memory_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {

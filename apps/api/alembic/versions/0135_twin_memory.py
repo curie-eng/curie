@@ -1,6 +1,6 @@
 """Twin memory: the agent-wide learning toggle and immutable memory revisions.
 
-ADR 0249. Adds ``agents.agent_wide_learning`` (default false) and the
+ADR 0284. Adds ``agents.agent_wide_learning`` (default false) and the
 ``memory_revisions`` table, then enriches every valid canonical fact already
 stored (``memory`` / ``fact-<32 hex>`` whose value is an object with a string
 statement) to the typed shape: ``kind="fact"``, ``archived=false``, a title from

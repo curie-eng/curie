@@ -1624,7 +1624,7 @@ def test_live_publish_without_gate_layers_still_pauses_via_the_stream(
 
 
 class _InProcessFactsStore:
-    """A fake memory with the ``MemoryFactsStore`` surface the tools use (ADR 0249).
+    """A fake memory with the ``MemoryFactsStore`` surface the tools use (ADR 0284).
 
     Only the memory tools call ``create``/``update``, so ``writes`` is the record
     of every successful ``remember``/``update`` call this turn. Versions are

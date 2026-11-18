@@ -52,10 +52,10 @@ from .tool_names import (
 # through the platform, so a retry after one repeats no real-world action. The
 # canvas list and read tools (ADR 0200) only read too; ``edit_canvas_cell``
 # writes to the provider and is deliberately absent, so it stays a side effect.
-# ``read_memory`` (ADR 0249) only reads the agent's own memory records. The six
+# ``read_memory`` (ADR 0284) only reads the agent's own memory records. The six
 # memory mutators (remember, update, forget, archive_memory, restore_memory,
 # revert_memory) write durable state and stay side effects.
-# The learned-skills list and read tools (ADR 0247) only read the agent's own
+# The learned-skills list and read tools (ADR 0283) only read the agent's own
 # skills; the four tools that change them stay side effects.
 # The ``curie-state`` ``get`` and ``list`` tools only read the durable store; its
 # ``set``, ``append`` and ``delete`` change it and stay side effects.

@@ -47,8 +47,8 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # join while the candidate advances to team sync state (0120), agent access
     # policies (0121), directory authority (0122), and attachment catalogs (0130),
     # then the self-improving revisions. The Agent ORM reads
-    # agents.learned_skills (ADR 0247), the agent schedule columns (ADR 0248)
-    # and agents.agent_wide_learning (ADR 0249), so twin memory, which follows
+    # agents.learned_skills (ADR 0283), the agent schedule columns (ADR 0248)
+    # and agents.agent_wide_learning (ADR 0284), so twin memory, which follows
     # agent schedules, is the floor.
     released_0130 = {"schema_min": "0108", "schema_head": "0108"}
     candidate = {"schema_min": "selfimp_memory_0001", "schema_head": "selfimp_memory_0001"}

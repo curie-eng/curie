@@ -1,4 +1,4 @@
-# 249. Twin memory: standing instructions and a bounded index
+# 284. Twin memory: standing instructions and a bounded index
 
 Date: 2026-10-19
 

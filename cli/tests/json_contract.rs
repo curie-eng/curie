@@ -2516,7 +2516,7 @@ fn memory_output_validates_all_variants() {
         assert_valid("memory.schema.json", &deleted.to_json());
     }
     let schema = load_schema("memory.schema.json");
-    // ADR 0249 adds required typed fact fields and lifecycle results to a
+    // ADR 0284 adds required typed fact fields and lifecycle results to a
     // closed schema, which ADR 0101 makes a major bump.
     let id = schema["$id"].as_str().expect("memory schema $id");
     assert!(
@@ -2558,7 +2558,7 @@ fn memory_output_validates_all_variants() {
     };
     assert_valid("memory.schema.json", &added.to_json());
 
-    // ADR 0249 lifecycle results: an archived or restored entry, and an entry
+    // ADR 0284 lifecycle results: an archived or restored entry, and an entry
     // with its revisions (live and deleted).
     let record = memory_record_sample();
     assert_valid(

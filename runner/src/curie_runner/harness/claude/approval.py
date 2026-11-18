@@ -170,7 +170,7 @@ def build_approval_server(
     ``turn_progress_tool`` is the deliberate progress tool (ADR 0130), appended
     only when ``progress_tool`` is not: a factory execution keeps its own.
 
-    ``memory_tools`` (#1461, ADR 0249) are what ``build_memory_tools`` returned:
+    ``memory_tools`` (#1461, ADR 0284) are what ``build_memory_tools`` returned:
     ``read_memory`` whenever memory is readable, plus the six mutators only with
     memory writes on and a memory credential.
 
@@ -220,7 +220,7 @@ def build_approval_server(
     )
 
 
-# --- The memory tools (#1461, ADR-0167, ADR 0249) -----------------------------
+# --- The memory tools (#1461, ADR-0167, ADR 0284) -----------------------------
 
 _MEMORY_PROPERTY = {
     "type": "string",
@@ -335,7 +335,7 @@ def build_memory_tools(
     session_id: str,
     mutators: bool,
 ) -> list[SdkMcpTool[Any]]:
-    """The memory tools for the ``curie`` server (ADR 0249).
+    """The memory tools for the ``curie`` server (ADR 0284).
 
     ``read_memory`` always; the six tools that change memory (``remember``,
     ``update``, ``forget``, ``archive_memory``, ``restore_memory``,

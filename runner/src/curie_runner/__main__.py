@@ -715,7 +715,7 @@ def _compose_system_prompt(
     Image tools (ADR 0216) and the remote Docker contract (ADR 0217) sit beside
     the workspace verification block, before bundle instructions.
 
-    The learned-skills guidance (ADR 0247) follows the memory guidance it is
+    The learned-skills guidance (ADR 0283) follows the memory guidance it is
     contrasted with, present only when learned skills loaded.
     """
 
@@ -833,10 +833,10 @@ def build_runner(
     ``memory_facts_preamble`` is the rendered standing-instruction and fact
     index blocks and ``memory_guidance`` the selected guidance text (None falls
     back to ``DEFAULT_GUIDANCE``), both from the boot memory context (#1461,
-    ADR 0249).
+    ADR 0284).
 
     ``learned_skills`` is the session's materialized ``curie-learned`` plugin
-    (ADR 0247), None when the toggle is off or the store was unreachable.
+    (ADR 0283), None when the toggle is off or the store was unreachable.
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -911,7 +911,7 @@ def build_runner(
         )
         else None
     )
-    # The memory tools (#1461, ADR-0167, ADR 0249) mount only on the real-model
+    # The memory tools (#1461, ADR-0167, ADR 0284) mount only on the real-model
     # path, which is the only path that mounts platform MCP servers at all, and
     # only with a memory token and the typed memory routes the worker's refs
     # locate. ``read_memory`` mounts whenever memory is readable, writes on or
@@ -940,7 +940,7 @@ def build_runner(
     memory_mutators_mounted = (
         memory_readable and config.memory_writes_on and channel_facts_store is not None
     )
-    # Agent schedules (ADR 0248) and learned skills (ADR 0247) mount on the
+    # Agent schedules (ADR 0248) and learned skills (ADR 0283) mount on the
     # real-model path only. Their tools read the author and the write
     # credential from the same per-turn holder, so it exists whenever memory is
     # readable or either of these sets of tools is mounted.
@@ -1479,7 +1479,7 @@ def build_runner(
                 hooks=session_hooks,
                 # Only the bundle's own skills are listed to the model (#3766,
                 # ADR-0189); the CLI's built-in skills stay hidden.
-                # Learned skills (ADR 0247) are the one generated plugin admitted beside it.
+                # Learned skills (ADR 0283) are the one generated plugin admitted beside it.
                 skills=[
                     *bundle_skill_names(config.session.plugin_dir),
                     *(learned.qualified_names if learned else []),
@@ -1702,7 +1702,7 @@ def _memory_context_failure(exc: Exception) -> str:
 
 
 async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | None]:
-    """Load the typed memory context at boot (#1461, ADR 0249).
+    """Load the typed memory context at boot (#1461, ADR 0284).
 
     One ``GET .../state/_memory/context`` with the session's read token returns
     the agent-wide learning switch, the selected guidance, the standing
@@ -1887,7 +1887,7 @@ class _BootFetches:
     mcp_capability: McpToolCapabilityProbe | None
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
     history_capacity_exceeded: bool = False
-    # Memory blocks and guidance from the boot context (#1461, ADR 0249); field names match the
+    # Memory blocks and guidance from the boot context (#1461, ADR 0284); field names match the
     # build_runner parameters they feed.
     memory_facts_preamble: str | None = None
     memory_guidance: str | None = None

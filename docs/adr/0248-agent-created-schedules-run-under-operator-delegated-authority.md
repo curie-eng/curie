@@ -216,7 +216,7 @@ revert when the claim is set, and when the sender is `<no person>` or starts
 with `cron:`. List and cancel stay allowed. No conversation-prefix detection is
 used. The runner tool also refuses by author, as defense in depth only.
 
-Learned skills (ADR 0247) already refuse writes from a `<no person>` or `cron:`
+Learned skills (ADR 0283) already refuse writes from a `<no person>` or `cron:`
 sender. An approval continuation of a scheduled run names the approver as its
 sender, so the learned-skills API also refuses when the claim is `true`, and the
 worker reads the approval's origin whenever learned skills are on, not only

@@ -1,4 +1,4 @@
-"""Learned skills (ADR 0247): an agent's own Markdown skills, with history.
+"""Learned skills (ADR 0283): an agent's own Markdown skills, with history.
 
 The runner reads them at boot with its broad ``state`` credential and changes
 them with the per-turn credential the worker mints (``skills: "write"``); the

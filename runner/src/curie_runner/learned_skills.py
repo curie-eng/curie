@@ -1,4 +1,4 @@
-"""Learned skills: an agent's own Markdown skills, loaded per session (ADR 0247).
+"""Learned skills: an agent's own Markdown skills, loaded per session (ADR 0283).
 
 The runner reads the agent's active learned skills at boot from the dedicated
 ``/agents/<id>/learned-skills`` router, reached from the agent prefix of

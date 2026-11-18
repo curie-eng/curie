@@ -1,4 +1,4 @@
-"""Learned skills (ADR 0247, epic #4780).
+"""Learned skills (ADR 0283, epic #4780).
 
 Adds ``agents.learned_skills BOOLEAN NOT NULL DEFAULT false`` (every existing
 agent comes out of the upgrade with it off), the ``learned_skills`` head table

@@ -26,7 +26,7 @@ eighteen state routes. Twelve cover six operations, the verbs this doc once said
 each doubled by `agents.memory` (#1525 follow-up) into its original path plus a
 binding-scoped `.../state/bindings/{kind}/{address}/...` sibling, both implemented by
 the same shared function. The other six are the typed memory routes under
-`/state/_memory` (context, entries, search, archive, restore, revert; ADR 0249).
+`/state/_memory` (context, entries, search, archive, restore, revert; ADR 0284).
 The swap
 axis here is the state backend, and it is a SOFT seam: the store is reached over the HTTP
 state API, not a typed in-process port, so a second backend is a persistence change behind

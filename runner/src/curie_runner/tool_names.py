@@ -84,7 +84,7 @@ AGENT_SCHEDULE_READ_ONLY_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     {f"mcp__{AGENT_SCHEDULES_SERVER_NAME}__list_schedules"}
 )
 
-# The learned-skills tools (ADR 0247) on their own in-process server, mounted
+# The learned-skills tools (ADR 0283) on their own in-process server, mounted
 # only when the agent's learned skills toggle is on. Only list and read read.
 LEARNED_SKILLS_SERVER_NAME: Final = "learned_skills"
 LEARNED_SKILL_TOOL_SHORT_NAMES: Final = ("list", "read", "create", "patch", "delete", "revert")

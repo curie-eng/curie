@@ -6,10 +6,10 @@ Two credentials, both ``scope="state"`` so an old API still accepts them:
   carries ``{binding, memory: "read"}``;
 * the per-turn token from ``BindingResolver.turn_memory_token`` carries
   ``{binding, memory, sender, turn, conversation, skills}`` and a short expiry;
-  ``conversation`` is the turn's thread key (ADR 0249), the signed source
+  ``conversation`` is the turn's thread key (ADR 0284), the signed source
   conversation the API stamps on a memory write and on a learned-skill change.
   It is only minted when the agent has memory writes or learned skills on
-  (ADR 0247), the turn names a binding, and the thread is not eval-isolated.
+  (ADR 0283), the turn names a binding, and the thread is not eval-isolated.
   ``memory`` is ``"write"`` only with memory writes on; ``skills`` is
   ``"write"`` only with learned skills on.
 
@@ -239,7 +239,7 @@ def test_eval_isolated_turn_gets_no_turn_token() -> None:
 
 
 def test_turn_token_signs_the_thread_key_as_conversation() -> None:
-    # ADR 0249: the API stamps a memory write's source conversation from this
+    # ADR 0284: the API stamps a memory write's source conversation from this
     # signed claim, never from the request body, so the worker must sign the
     # exact thread key the turn runs in. Two threads on one binding get two
     # different conversations.
@@ -258,7 +258,7 @@ def test_turn_token_signs_the_thread_key_as_conversation() -> None:
     assert "conversation" not in _claims(env["CURIE_MEMORY_TOKEN"])
 
 
-# --- learned skills (ADR 0247) -------------------------------------------------------
+# --- learned skills (ADR 0283) -------------------------------------------------------
 
 
 def test_learned_skills_alone_mints_a_skills_writer_that_reads_memory() -> None:

@@ -90,7 +90,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `RemediationQualificationOutput` (the `local`/`cluster remediation-qualification` verbs: a qualification record or a verifier run),
   `SkillOutput`, `SkillListOutput`, `SkillHistoryOutput`, `SkillDiffOutput`, and
   `SkillExportOutput` (`cli/src/commands/learned_skills.rs`, the `local`/`cluster skills`
-  verbs for learned skills, ADR 0247; schema `cli/schema/skills.schema.json`),
+  verbs for learned skills, ADR 0283; schema `cli/schema/skills.schema.json`),
   `ConnectorBuildOutput`. The last is
   the `curie build --plugin-dir` receipt for connector source builds (ADR-0113):
   it emits one object even when the bundle declares nothing to build, because

@@ -847,7 +847,7 @@ async def _process_event(
                 else None
             )
             from_cron = False
-            # Learned skills read the same claim (ADR 0247 refuses scheduled
+            # Learned skills read the same claim (ADR 0283 refuses scheduled
             # writes), so the origin is read when they are on too.
             learned_skills = bool(getattr(resolved, "learned_skills", False))
             if is_resume and (agent_schedules or learned_skills or schedule_id is not None):

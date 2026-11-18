@@ -593,7 +593,7 @@ def _facts(response: httpx.Response, harness: _Recovery) -> None:
     assert response.status_code == 200, response.text
     entries = response.json()
     assert len(entries) == len(harness.facts)
-    # Memory facts are canonical typed records (ADR 0249): the server adds
+    # Memory facts are canonical typed records (ADR 0284): the server adds
     # author, stated_at and the like, so compare only the fields the seed wrote.
     assert {
         entry["key"]: {name: entry["value"].get(name) for name in harness.facts[entry["key"]]}

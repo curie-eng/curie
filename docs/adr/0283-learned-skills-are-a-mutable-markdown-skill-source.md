@@ -1,4 +1,4 @@
-# 247. Learned skills are a mutable, Markdown-only skill source
+# 283. Learned skills are a mutable, Markdown-only skill source
 
 Date: 2026-10-20
 

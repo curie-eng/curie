@@ -248,7 +248,7 @@ fn operators_cannot_supply_an_expected_version_flag() {
     }
 }
 
-// --- Typed memory metadata and the reversible lifecycle (ADR 0249) ----------
+// --- Typed memory metadata and the reversible lifecycle (ADR 0284) ----------
 //
 // The binary runs against a wire-level stub of the platform API that holds the
 // canonical heads and their revision history the way Contract r4 defines them,

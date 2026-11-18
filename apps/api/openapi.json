@@ -9212,7 +9212,7 @@
         "type": "object"
       },
       "MemoryGuidanceOut": {
-        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent; else\n``learning_default`` when the agent is opted in to agent-wide learning and\n``text`` is the learning default (ADR 0249); else ``default`` and ``text``\nis the platform default.",
+        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent; else\n``learning_default`` when the agent is opted in to agent-wide learning and\n``text`` is the learning default (ADR 0284); else ``default`` and ``text``\nis the platform default.",
         "properties": {
           "source": {
             "enum": [
@@ -14314,7 +14314,7 @@
         "type": "object"
       },
       "StateEntryPut": {
-        "description": "Write a durable state entry (#23). ``expected_version`` opts into\ncompare-and-set: the write is rejected with 409 unless it matches the stored\nversion (omit it for a blind upsert). ``value`` is any JSON value (object,\narray, or scalar); an array value is what ``append`` grows.\n\nOn a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0249) the\nvalue must be the typed entry shape, a create sends no ``expected_version``\n(or 0), and an update must send the head's version (428 when omitted).",
+        "description": "Write a durable state entry (#23). ``expected_version`` opts into\ncompare-and-set: the write is rejected with 409 unless it matches the stored\nversion (omit it for a blind upsert). ``value`` is any JSON value (object,\narray, or scalar); an array value is what ``append`` grows.\n\nOn a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0284) the\nvalue must be the typed entry shape, a create sends no ``expected_version``\n(or 0), and an update must send the head's version (428 when omitted).",
         "properties": {
           "expected_version": {
             "anyOf": [
@@ -20941,7 +20941,7 @@
         ]
       },
       "get": {
-        "description": "The agent's effective memory guidance and its source (#1461, ADR 0249).",
+        "description": "The agent's effective memory guidance and its source (#1461, ADR 0284).",
         "operationId": "get_memory_guidance_agents__agent_id__memory_guidance_get",
         "parameters": [
           {
@@ -22329,7 +22329,7 @@
     },
     "/agents/{agent_id}/state/_memory/context": {
       "get": {
-        "description": "The bounded boot memory (ADR 0249): the learning toggle, the effective\nguidance, at most 20 active standing instructions and the titles of at most\n50 active facts from agent memory plus the caller's own channel, with\ntotals and omitted counts. No fact statement is ever in it.\n\nA sandbox credential sees its own binding (none when it names none). The\nplatform key sees agent memory, plus one binding when it names both\n``channel_kind`` and ``channel_address``.",
+        "description": "The bounded boot memory (ADR 0284): the learning toggle, the effective\nguidance, at most 20 active standing instructions and the titles of at most\n50 active facts from agent memory plus the caller's own channel, with\ntotals and omitted counts. No fact statement is ever in it.\n\nA sandbox credential sees its own binding (none when it names none). The\nplatform key sees agent memory, plus one binding when it names both\n``channel_kind`` and ``channel_address``.",
         "operationId": "memory_context_agents__agent_id__state__memory_context_get",
         "parameters": [
           {

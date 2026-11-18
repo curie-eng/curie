@@ -16,7 +16,7 @@ Names this file pins that the build spec did not spell out: the store class
 ``MemoryFactsStore(url, token)`` and the ``platform_tool_names`` keyword
 ``memory_tool_names`` (the exact mounted memory tool-name set, Contract r4).
 
-Contract r4 (ADR 0249) moved boot to one ``GET .../state/_memory/context`` read and
+Contract r4 (ADR 0284) moved boot to one ``GET .../state/_memory/context`` read and
 gave the tools kinds, titles and caller-observed versions. The fake below serves
 that context route when a test sets ``context``, the typed entry read, and the raw
 canonical routes with compare-and-set. Boot composition, the injection record and

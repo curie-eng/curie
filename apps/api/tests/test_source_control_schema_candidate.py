@@ -37,9 +37,9 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the newest schema the app reads (#2911's tenant scope);
     # the join requires both start diagnostics (0123) and attachment catalogs
-    # (0130), and above it the Agent ORM reads agents.learned_skills (ADR 0247),
+    # (0130), and above it the Agent ORM reads agents.learned_skills (ADR 0283),
     # the agent schedule columns (ADR 0248), then agents.agent_wide_learning
-    # (ADR 0249).
+    # (ADR 0284).
     assert window == {"schema_min": "selfimp_memory_0001", "schema_head": "selfimp_memory_0001"}
 
 

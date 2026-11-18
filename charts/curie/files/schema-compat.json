@@ -911,7 +911,7 @@
         "selfimp_sched_0001"
       ],
       "revision": "selfimp_memory_0001",
-      "sha256": "7bb16633878d44de9510649dbc0d805a6f5dbe5434a3500011ce38175ceeaa4a"
+      "sha256": "c351b224ab3857d25aa99401e30a217a7bf6595e3a4c8beccd6d9a80a8b6e8aa"
     },
     {
       "kind": "expand",
@@ -935,7 +935,7 @@
         "selfimp_safety_0001"
       ],
       "revision": "selfimp_skills_0001",
-      "sha256": "e7d62c25a418c914e22ba3da288edf8b4a35e0113fa01eb53f5ed7c1b60966d6"
+      "sha256": "97b75995505034353db741601af265bb6a4023715af9f238f24159f99978dd38"
     }
   ],
   "schema_head": "selfimp_memory_0001",

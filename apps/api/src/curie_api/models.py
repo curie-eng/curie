@@ -323,7 +323,7 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
-    # Whether this agent is opted in to agent-wide learning (ADR 0249). Operator
+    # Whether this agent is opted in to agent-wide learning (ADR 0284). Operator
     # owned and off by default, independent of ``memory_writes``: it authorizes
     # standing instructions (kind ``instruction``) and selects the learning
     # default guidance. It never turns memory writes on.
@@ -334,7 +334,7 @@ class Agent(Base):
     schedule_timezone: Mapped[str] = mapped_column(Text, default="UTC", server_default="UTC")
     schedule_max_active: Mapped[int] = mapped_column(default=20, server_default="20")
     schedule_min_interval_minutes: Mapped[int] = mapped_column(default=15, server_default="15")
-    # Whether the agent loads and may edit its learned skills (ADR 0247).
+    # Whether the agent loads and may edit its learned skills (ADR 0283).
     # Operator-owned; off by default, like ``memory_writes``.
     learned_skills: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -2332,7 +2332,7 @@ class WorkflowStateEntry(Base):
 
 
 class MemoryRevision(Base):
-    """One immutable revision of a canonical memory entry (ADR 0249).
+    """One immutable revision of a canonical memory entry (ADR 0284).
 
     Every successful create, update, delete, archive, restore and revert of a
     ``memory`` / ``fact-<hex>`` head appends exactly one row here in the same
@@ -4061,7 +4061,7 @@ class AgentScheduleRun(Base):
 
 
 class LearnedSkill(Base):
-    """One learned skill's head (ADR 0247): its current content and the revision
+    """One learned skill's head (ADR 0283): its current content and the revision
     number every change compare-and-sets. History is ``LearnedSkillRevision``."""
 
     __tablename__ = "learned_skills"
@@ -4093,7 +4093,7 @@ class LearnedSkill(Base):
 
 
 class LearnedSkillRevision(Base):
-    """One immutable, insert-only change to a learned skill (ADR 0247). ``deleted``
+    """One immutable, insert-only change to a learned skill (ADR 0283). ``deleted``
     is the skill's state after this revision, so a revert restores it too."""
 
     __tablename__ = "learned_skill_revisions"

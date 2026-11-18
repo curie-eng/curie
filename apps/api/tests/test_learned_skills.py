@@ -1,4 +1,4 @@
-"""Learned skills (ADR 0247, epic #4780 slice 1): the store, its revisions and who may touch it.
+"""Learned skills (ADR 0283, epic #4780 slice 1): the store, its revisions and who may touch it.
 
 Everything here goes through the real HTTP app against the disposable Postgres
 and the compose Valkey the conftest provisions; nothing is mocked. Sandbox

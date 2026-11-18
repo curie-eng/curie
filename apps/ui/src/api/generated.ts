@@ -969,7 +969,7 @@ export interface paths {
         };
         /**
          * Get Memory Guidance
-         * @description The agent's effective memory guidance and its source (#1461, ADR 0249).
+         * @description The agent's effective memory guidance and its source (#1461, ADR 0284).
          */
         get: operations["get_memory_guidance_agents__agent_id__memory_guidance_get"];
         /**
@@ -1286,7 +1286,7 @@ export interface paths {
         };
         /**
          * Memory Context
-         * @description The bounded boot memory (ADR 0249): the learning toggle, the effective
+         * @description The bounded boot memory (ADR 0284): the learning toggle, the effective
          *     guidance, at most 20 active standing instructions and the titles of at most
          *     50 active facts from agent memory plus the caller's own channel, with
          *     totals and omitted counts. No fact statement is ever in it.
@@ -8054,7 +8054,7 @@ export interface components {
          *
          *     ``source`` is ``operator`` when guidance is stored for the agent; else
          *     ``learning_default`` when the agent is opted in to agent-wide learning and
-         *     ``text`` is the learning default (ADR 0249); else ``default`` and ``text``
+         *     ``text`` is the learning default (ADR 0284); else ``default`` and ``text``
          *     is the platform default.
          */
         MemoryGuidanceOut: {
@@ -10254,7 +10254,7 @@ export interface components {
          *     version (omit it for a blind upsert). ``value`` is any JSON value (object,
          *     array, or scalar); an array value is what ``append`` grows.
          *
-         *     On a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0249) the
+         *     On a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0284) the
          *     value must be the typed entry shape, a create sends no ``expected_version``
          *     (or 0), and an update must send the head's version (428 when omitted).
          */

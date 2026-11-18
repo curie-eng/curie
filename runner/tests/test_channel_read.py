@@ -55,7 +55,7 @@ HISTORY_TOOL = "mcp__curie-slack__read_channel_history"
 THREAD_TOOL = "mcp__curie-slack__read_thread_replies"
 MESSAGE_TOOL = "mcp__curie-slack__read_channel_message"
 LIVE_NAMES = frozenset({HISTORY_TOOL, THREAD_TOOL, MESSAGE_TOOL})
-# Every memory tool a writes-on boot mounts (ADR 0249): the widest exact set the
+# Every memory tool a writes-on boot mounts (ADR 0284): the widest exact set the
 # platform exemption can be handed.
 MEMORY_LIVE_NAMES = frozenset(
     f"mcp__curie__{name}"

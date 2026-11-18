@@ -1,4 +1,4 @@
-"""Learned skills on the runner (epic #4780, ADR 0247).
+"""Learned skills on the runner (epic #4780, ADR 0283).
 
 The runner reads an agent's active learned skills at boot from the dedicated
 learned-skills API, materializes them as a generated local plugin named

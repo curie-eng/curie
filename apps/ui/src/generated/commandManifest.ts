@@ -1960,7 +1960,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0249); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0284); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -2256,7 +2256,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "An agent's learned skills (ADR 0247): list, show, diff, history, revert, delete and export",
+          "about": "An agent's learned skills (ADR 0283): list, show, diff, history, revert, delete and export",
           "args": [
             {
               "global": false,
@@ -3620,7 +3620,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0249). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
+              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0284). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
               "id": "agent_wide_learning",
               "long": "agent-wide-learning",
               "positional": false,
@@ -3644,7 +3644,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Turn the agent's learned skills on or off (ADR 0247). Off stops loading and editing them; stored skills and history stay",
+              "help": "Turn the agent's learned skills on or off (ADR 0283). Off stops loading and editing them; stored skills and history stay",
               "id": "learned_skills",
               "long": "learned-skills",
               "positional": false,
@@ -6764,7 +6764,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0249). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
+              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0284). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
               "id": "agent_wide_learning",
               "long": "agent-wide-learning",
               "positional": false,
@@ -6788,7 +6788,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Turn the agent's learned skills on or off (ADR 0247). Off stops loading and editing them; stored skills and history stay",
+              "help": "Turn the agent's learned skills on or off (ADR 0283). Off stops loading and editing them; stored skills and history stay",
               "id": "learned_skills",
               "long": "learned-skills",
               "positional": false,
@@ -8436,7 +8436,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0249); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0284); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -8834,7 +8834,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "An agent's learned skills (ADR 0247): list, show, diff, history, revert, delete and export",
+          "about": "An agent's learned skills (ADR 0283): list, show, diff, history, revert, delete and export",
           "args": [
             {
               "global": false,

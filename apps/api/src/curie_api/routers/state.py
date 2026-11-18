@@ -91,7 +91,7 @@ STATE_APP_SCOPE = "state.app"
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
 # tool, not raw state. A future fixed namespace must be added here too.
-# ``agent_schedules`` (ADR 0248) and ``learned_skills`` (ADR 0247) are never
+# ``agent_schedules`` (ADR 0248) and ``learned_skills`` (ADR 0283) are never
 # stored in raw state at all: each has its own router as the only door, so every
 # sandbox credential is refused on them.
 MEMORY_NAMESPACE = "memory"
@@ -100,7 +100,7 @@ LEARNED_SKILLS_NAMESPACE = "learned_skills"
 RESERVED_NAMESPACES = frozenset(
     {MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE, AGENT_SCHEDULES_NAMESPACE, LEARNED_SKILLS_NAMESPACE}
 )
-# The path segment of the typed memory routes (ADR 0249). Those routes are
+# The path segment of the typed memory routes (ADR 0284). Those routes are
 # registered before the generic ``{namespace}/{key}`` ones, and the generic
 # routes refuse it as a namespace, so it can never also be a state namespace.
 TYPED_MEMORY_SEGMENT = "_memory"
@@ -147,8 +147,8 @@ class StatePrincipal:
     ``schedules``, ``conversation`` and ``scheduled`` are the per-turn agent
     schedule claims (ADR 0248); ``scheduled`` is None unless the claim is an
     exact JSON boolean. ``skills`` and ``conversation`` are the per-turn
-    learned-skill claims (ADR 0247), and ``conversation`` is also stamped as a
-    memory write's source conversation (ADR 0249). A STATE token with no ``memory`` claim was
+    learned-skill claims (ADR 0283), and ``conversation`` is also stamped as a
+    memory write's source conversation (ADR 0284). A STATE token with no ``memory`` claim was
     minted by a pre-ADR-0188 worker: ``legacy``, which fails closed on memory
     (read-only, agent memory only)."""
 
@@ -485,7 +485,7 @@ async def require_turn_open(
 ) -> None:
     """Refuse a STATE credential whose ``turn`` the worker has reported ended
     (#3776), for memory facts, agent schedules (ADR 0248) and learned skills
-    (ADR 0247) alike. The caller
+    (ADR 0283) alike. The caller
     decides which writes are turn-bound. A Valkey failure is a 503, never a
     silently accepted write. A credential with no turn claim is not turn-bound."""
 
@@ -506,7 +506,7 @@ async def require_turn_open(
 def _memory_actor(
     principal: StatePrincipal, agent_id: uuid.UUID, path: str
 ) -> memory_records.Actor:
-    """Who a canonical memory mutation is attributed to (ADR-0188, ADR 0249).
+    """Who a canonical memory mutation is attributed to (ADR-0188, ADR 0284).
 
     A sandbox write's author is the per-turn credential's signed ``sender`` and
     its source conversation the signed ``conversation`` claim, whatever the body
@@ -603,7 +603,7 @@ async def forbid_reserved_namespace(
 router = APIRouter(prefix="/agents", tags=["state"], dependencies=[Depends(require_state_access)])
 
 
-# --- Typed memory routes (ADR 0249) --------------------------------------------
+# --- Typed memory routes (ADR 0284) --------------------------------------------
 #
 # Registered here, BEFORE every generic ``/{agent_id}/state/{namespace}/...``
 # route, so ``_memory/context`` is never parsed as namespace ``_memory`` and key
@@ -696,7 +696,7 @@ async def memory_context(
     channel_kind: str | None = None,
     channel_address: str | None = None,
 ) -> MemoryContextOut:
-    """The bounded boot memory (ADR 0249): the learning toggle, the effective
+    """The bounded boot memory (ADR 0284): the learning toggle, the effective
     guidance, at most 20 active standing instructions and the titles of at most
     50 active facts from agent memory plus the caller's own channel, with
     totals and omitted counts. No fact statement is ever in it.
@@ -1129,7 +1129,7 @@ async def _put_state(
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     if memory_records.is_canonical_key(namespace, key):
-        # ADR 0249: a canonical memory entry is typed, versioned, counted and
+        # ADR 0284: a canonical memory entry is typed, versioned, counted and
         # audited, all in the one memory transaction.
         assert actor is not None, "canonical memory writes are attributed by the route"
         try:
@@ -1283,7 +1283,7 @@ async def _append_state(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     if namespace == MEMORY_NAMESPACE:
         # The legacy log shares the namespace byte budget with the canonical
-        # entries (ADR 0249): the same scope lock, before the row lock.
+        # entries (ADR 0284): the same scope lock, before the row lock.
         await memory_records.lock_scope(session, agent_id, scope)
     if namespace == TRANSCRIPT_NAMESPACE:
         row = await transcripts.append(session, agent_id, scope, key, data.item, data.reserve_bytes)
@@ -1695,7 +1695,7 @@ async def _delete_state(
     if namespace == TRANSCRIPT_NAMESPACE:
         return recorded(await transcripts.remove(session, agent_id, scope, key, expected_version))
     if memory_records.is_canonical_key(namespace, key):
-        # ADR 0249: compare-and-delete is required, and the deletion is a
+        # ADR 0284: compare-and-delete is required, and the deletion is a
         # revision written in the same transaction as the head's removal.
         assert actor is not None, "canonical memory deletes are attributed by the route"
         agent = await crud_agents.get_agent(session, agent_id)

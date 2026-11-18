@@ -561,7 +561,7 @@ class ResolvedDeployment(BaseModel):
     # from the resolver statements for the same schema reason
     # (``agent_schedules_for``) and copied on by the kernel, degrading to off.
     agent_schedules: bool = False
-    # Whether the operator turned learned skills on (ADR 0247): with it on the
+    # Whether the operator turned learned skills on (ADR 0283): with it on the
     # per-turn credential carries ``skills: "write"``. Read apart from the
     # resolver statements for the same schema reason (``learned_skills_for``),
     # but copied on here by every resolve path, degrading to off.
@@ -1225,7 +1225,7 @@ class BindingResolver:
         return bool(row is not None and row[0])
 
     async def learned_skills_for(self, agent_id: uuid.UUID) -> bool:
-        """Whether the operator turned learned skills on for the agent (ADR 0247).
+        """Whether the operator turned learned skills on for the agent (ADR 0283).
 
         The same separate read as ``memory_writes_for`` (migration selfimp_skills_0001 adds
         the column). A missing agent row or a null value reads as off.
@@ -1646,7 +1646,7 @@ class BindingResolver:
         ttl_s: float,
         scheduled: bool = False,
     ) -> str | None:
-        """The per-turn state write credential (ADR-0188, ADR 0247, ADR 0248), or None.
+        """The per-turn state write credential (ADR-0188, ADR 0283, ADR 0248), or None.
 
         Sent as the turn's ``Event.memory_token`` (MEMORY-TOKEN-2), never in the
         boot env: the boot-env token outlives the turn and so cannot name its
@@ -1656,11 +1656,11 @@ class BindingResolver:
         writes); the API writes only fact keys with it, only on the channel
         ``binding`` names, and stamps ``sender`` as the fact's author and
         ``conversation`` (this turn's ``thread_key``) as its source
-        conversation (ADR 0249). ``schedules`` is ``"write"`` only with agent
+        conversation (ADR 0284). ``schedules`` is ``"write"`` only with agent
         schedules on, and ``scheduled`` marks a scheduled run or its approval
         continuation, which may not create or change schedules (ADR 0248).
         ``skills`` is ``"write"`` only with learned skills on, and the API
-        stamps ``sender`` and ``conversation`` on each skill change (ADR 0247).
+        stamps ``sender`` and ``conversation`` on each skill change (ADR 0283).
 
         None unless there is a key to sign with, the agent has memory writes,
         agent schedules or learned skills on, the turn names a binding, and the

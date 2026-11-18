@@ -585,9 +585,9 @@ print(json.dumps(graph))
         ] {
             assert!(!live_in_window(below, &current), "{below}");
         }
-        // learned skills adds agents.learned_skills, which the Agent ORM reads (ADR 0247),
+        // learned skills adds agents.learned_skills, which the Agent ORM reads (ADR 0283),
         // agent schedules add agents columns it reads (ADR 0248), and twin memory adds
-        // the learning toggle it also reads (ADR 0249). Agent access policies (0121, #4585)
+        // the learning toggle it also reads (ADR 0284). Agent access policies (0121, #4585)
         // and the later next revisions chain below them.
         assert!(!live_in_window("0108", &current));
         assert!(!live_in_window("0120", &current));

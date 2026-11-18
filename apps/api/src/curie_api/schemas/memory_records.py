@@ -1,4 +1,4 @@
-"""Wire shapes of the typed twin memory routes (ADR 0249, Contract r4).
+"""Wire shapes of the typed twin memory routes (ADR 0284, Contract r4).
 
 The routes live under ``/agents/{agent_id}/state/_memory`` on the state router.
 ``tests/vectors/twin-memory.json`` holds an example of every response object

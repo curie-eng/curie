@@ -680,7 +680,7 @@ class Settings(BaseSettings):
     # namespace are both bounded. Sizes are the serialized-JSON byte length.
     state_max_value_bytes: int = 64 * 1024  # 64 KiB per value
     state_max_namespace_bytes: int = 1024 * 1024  # 1 MiB per (agent, namespace)
-    # Canonical memory heads (facts and standing instructions, ADR 0249) one
+    # Canonical memory heads (facts and standing instructions, ADR 0284) one
     # (agent, memory scope) may retain, active and archived alike. A delete
     # frees a slot; an archive does not.
     memory_max_entries_per_scope: int = 1000

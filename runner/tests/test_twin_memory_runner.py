@@ -1,4 +1,4 @@
-"""Twin memory in the runner (ADR 0249, Contract r4): boot composition and tools.
+"""Twin memory in the runner (ADR 0284, Contract r4): boot composition and tools.
 
 Every case drives the process entrypoint ``__main__._serve`` with the real
 ``build_runner``: ``web.run_app`` is captured instead of serving, the capability

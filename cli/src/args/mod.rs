@@ -559,7 +559,7 @@ impl<C: clap::Args> ActionsCommand<C> {
     }
 }
 
-/// `<tier> skills <agent> <verb>`: an agent's learned skills (ADR 0247),
+/// `<tier> skills <agent> <verb>`: an agent's learned skills (ADR 0283),
 /// shared by `local` and `cluster`. `C` is the tier's connection flags; they
 /// are global, so they parse after the verb's own arguments too.
 #[derive(Args, Debug, Clone)]
@@ -1902,7 +1902,7 @@ impl EvalSamplingArgs {
 }
 
 /// The reversible memory lifecycle flags shared by `local memory` and
-/// `cluster memory` (ADR 0249). Each acts on one canonical entry, in agent
+/// `cluster memory` (ADR 0284). Each acts on one canonical entry, in agent
 /// memory or the `--channel` selected binding, and none combines with add,
 /// delete, a guidance flag, or another lifecycle flag. None takes an expected
 /// version from argv: every mutation reads the current one first.
