@@ -4703,3 +4703,22 @@ retried row leaves the reference time unchanged. Outside the envelope, the age
 and `curie.factory.intake.notice.oldest_owed_age_seconds` show delayed intake
 and delayed refusal delivery respectively. Repository labels are bounded to
 20 values, with additional repositories sharing `other`.
+
+## GitHub account linking
+
+For a personal-mode installation with Console organization sign-in, register
+`https://console.example.com/api/identity/me/github-link/callback` as a callback
+URL in the factory GitHub App settings. Use your Console origin in place of
+`https://console.example.com`. Set `factory.githubAppClientId` to the App OAuth
+client id, `factory.githubAppClientSecretExistingSecret` to an existing Secret
+in the release namespace, and `factory.githubAppClientSecretExistingSecretKey`
+to its client-secret key. These become `FACTORY_GITHUB_APP_CLIENT_ID` and
+`FACTORY_GITHUB_APP_CLIENT_SECRET` in the API. Keep the client secret in that
+Secret, outside Helm values and release history.
+
+People can then use **Settings > Claude plan > Link GitHub** to prove ownership
+of their GitHub account. Curie reads the numeric account id, revokes the
+short-lived user token, and retains only the account link and display login.
+Without both client settings, the linking action is hidden and its routes
+answer 404. GitHub Enterprise Server uses the factory code host web and API
+bases. The callback requires HTTPS on the Console origin.

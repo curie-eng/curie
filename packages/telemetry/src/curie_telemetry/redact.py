@@ -22,6 +22,11 @@ def _placeholder(name: str) -> str:
 
 REDACTION_RULES: tuple[RedactionRule, ...] = (
     RedactionRule(
+        "github_link_callback_query",
+        re.compile(r"(/identity/me/github-link/callback/?)\?(?!\[REDACTED:)[^\s\"\']+"),
+        r"\1?[REDACTED:github_link_callback_query]",
+    ),
+    RedactionRule(
         "oidc_callback_query",
         re.compile(r"(/console/oidc/callback)\?(?!\[REDACTED:)[^\s\"\']+"),
         r"\1?[REDACTED:oidc_callback_query]",

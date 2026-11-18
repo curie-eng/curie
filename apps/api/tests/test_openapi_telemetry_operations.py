@@ -9,6 +9,7 @@ declared domain of each HTTP server metric, with no database and no server.
 """
 
 import json
+import math
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -62,3 +63,18 @@ def test_a_missing_route_is_named() -> None:
     assert missing_operations(openapi_paths(), manifest) == {
         name: ["/agents/{agent_id}/memory/guidance"] for name in HTTP_SERVER_METRICS
     }
+
+
+def test_github_link_operations_keep_http_cardinality_bounded() -> None:
+    manifest = declared_metric_manifest()
+    for name in HTTP_SERVER_METRICS:
+        metric = manifest["metrics"][name]
+        assert {
+            "/identity/me/links",
+            "/identity/me/links/{link_id}",
+            "/identity/me/github-link",
+            "/identity/me/github-link/callback",
+        } <= set(metric["attributes"]["operation"])
+        assert metric["cardinality_bound"] == math.prod(
+            len(domain) for domain in metric["attributes"].values()
+        )

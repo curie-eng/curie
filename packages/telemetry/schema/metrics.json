@@ -1469,6 +1469,10 @@
           "/directory/people",
           "/directory/people/status",
           "/directory/namespaces",
+          "/identity/me/links",
+          "/identity/me/links/{link_id}",
+          "/identity/me/github-link",
+          "/identity/me/github-link/callback",
           "/identity/connect/{token}",
           "/identity/connect/{token}/confirm",
           "/teams",
@@ -1588,7 +1592,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9800
+      "cardinality_bound": 9960
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1748,6 +1752,10 @@
           "/directory/people",
           "/directory/people/status",
           "/directory/namespaces",
+          "/identity/me/links",
+          "/identity/me/links/{link_id}",
+          "/identity/me/github-link",
+          "/identity/me/github-link/callback",
           "/identity/connect/{token}",
           "/identity/connect/{token}/confirm",
           "/teams",
@@ -1867,7 +1875,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 9800
+      "cardinality_bound": 9960
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -2027,6 +2035,10 @@
           "/directory/people",
           "/directory/people/status",
           "/directory/namespaces",
+          "/identity/me/links",
+          "/identity/me/links/{link_id}",
+          "/identity/me/github-link",
+          "/identity/me/github-link/callback",
           "/identity/connect/{token}",
           "/identity/connect/{token}/confirm",
           "/teams",
@@ -2139,7 +2151,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1960
+      "cardinality_bound": 1992
     },
     "curie.background.loop": {
       "type": "counter",

@@ -1311,6 +1311,9 @@ personalClaude:
 # A credential names its Secret: existingSecret, existingSecretKey.
 factory:
   enabled: false
+  githubAppClientId: ""
+  githubAppClientSecretExistingSecret: ""
+  githubAppClientSecretExistingSecretKey: clientSecret
   intake: poll  # or webhook
   baseLabelSettleSeconds: 60
   # Requester coding instructions (ADR 0278): admission pins each requester's
