@@ -18,6 +18,7 @@ from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -135,6 +136,91 @@ def _seconds(recording: dict[str, Any], instant: str) -> float:
     ).total_seconds()
 
 
+@pytest.mark.parametrize("field", ["redirect_uri", "state"])
+@pytest.mark.parametrize("approved", [False, True])
+def test_github_link_authorize_rejects_control_characters(
+    stub: Any, github: httpx.Client, field: str, approved: bool
+) -> None:
+    params = {
+        "client_id": stub.oauth_client_id,
+        "state": "EXAMPLE-state-sentinel",
+        "redirect_uri": "https://console.example.com/api/identity/me/github-link/callback",
+    }
+    if approved:
+        params["approved"] = "1"
+    for control in ("\r\nX-Injected: yes", "\x00", "\t", "\x1f", "\x7f", "\x85", "\x9f"):
+        response = github.get(
+            "/login/oauth/authorize", params={**params, field: params[field] + control}
+        )
+        assert response.status_code == 400
+        assert response.json() == {"error": "invalid_request"}
+        assert "location" not in response.headers
+        assert "x-injected" not in response.headers
+    with sqlite3.connect(stub._database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM oauth_codes").fetchone()[0] == 0
+
+
+def test_github_link_oauth_identity_revoke_and_label_actor(stub: Any, github: httpx.Client) -> None:
+    params = {
+        "client_id": stub.oauth_client_id,
+        "state": "EXAMPLE-state-sentinel",
+        "redirect_uri": "https://console.example.com/api/identity/me/github-link/callback",
+    }
+    page = github.get("/login/oauth/authorize", params=params)
+    assert page.status_code == 200
+    assert "Authorize GitHub link" in page.text
+    authorized = github.get("/login/oauth/authorize", params={**params, "approved": "1"})
+    assert authorized.status_code == 302
+    returned = parse_qs(urlsplit(authorized.headers["location"]).query)
+    assert returned["state"] == [params["state"]]
+    form = {
+        "client_id": stub.oauth_client_id,
+        "client_secret": stub.oauth_client_secret,
+        "redirect_uri": params["redirect_uri"],
+        "code": returned["code"][0],
+    }
+    refused = github.post("/login/oauth/access_token", data={**form, "client_secret": "wrong"})
+    assert refused.status_code == 401
+    exchanged = github.post("/login/oauth/access_token", data=form)
+    assert exchanged.status_code == 200
+    token = exchanged.json()["access_token"]
+    assert (
+        github.post("/login/oauth/access_token", data=form).json()["error"]
+        == "bad_verification_code"
+    )
+    headers = {"Authorization": "Bearer " + token}
+    assert github.get("/api/v3/user", headers=headers).json()["id"] == 6601
+    revoke_path = f"/api/v3/applications/{stub.oauth_client_id}/token"
+    assert github.request("DELETE", revoke_path, json={"access_token": token}).status_code == 401
+    assert (
+        github.request(
+            "DELETE",
+            revoke_path,
+            auth=(stub.oauth_client_id, stub.oauth_client_secret),
+            json={"access_token": token},
+        ).status_code
+        == 204
+    )
+    assert github.get("/api/v3/user", headers=headers).status_code == 401
+    labelled = github.post(
+        f"/repos/{REPO}/issues/3815/labels",
+        json={"labels": ["github-link-fixture"]},
+        headers={"Authorization": "Bearer example-human-token"},
+    )
+    assert labelled.status_code == 200
+    events = github.get(f"/repos/{REPO}/issues/3815/events").json()
+    event = next(
+        item for item in events if item.get("label", {}).get("name") == "github-link-fixture"
+    )
+    assert event["actor"]["id"] == 6601
+    with sqlite3.connect(stub._database) as connection:
+        rows = str(connection.execute("SELECT * FROM oauth_codes").fetchall()) + str(
+            connection.execute("SELECT * FROM oauth_tokens").fetchall()
+        )
+    for sentinel in (token, returned["code"][0], params["state"], stub.oauth_client_secret):
+        assert sentinel not in rows + str(stub.request_log)
+
+
 def test_tls_requires_the_generated_ca(stub: Any) -> None:
     assert stub.base_url.startswith("https://")
     with httpx.Client(trust_env=False) as untrusted, pytest.raises(httpx.ConnectError):
@@ -227,6 +313,83 @@ def test_seeded_issue_uses_the_required_input_and_a_human_label_event(
     assert events[0]["label"]["name"] == "factory"
     assert events[0]["actor"]["type"] == "User"
     assert stub.unknown_requests == []
+
+
+@pytest.mark.parametrize("extension", ["admitted", "dynamic", "upgrade"])
+def test_factory_subclasses_preserve_github_label_intake_http(
+    tmp_path: Path,
+    recording: dict[str, Any],
+    issue_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extension: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(STUB_ROOT.parent / "factory-e2e"))
+    monkeypatch.syspath_prepend(str(STUB_ROOT.parent / "factory-e2e" / "tests"))
+    github_module = sys.modules[_stub_type().__module__]
+    if extension == "admitted":
+        from c4_admitted_http import tracker_stub_type
+
+        server_type = tracker_stub_type(github_module, redact=lambda value: value)
+    elif extension == "dynamic":
+        from c4_admitted_http import tracker_stub_type
+        from c4_dynamic_base import dynamic_stub_type
+
+        monkeypatch.setattr(
+            github_module,
+            "GithubStub",
+            tracker_stub_type(github_module, redact=lambda value: value),
+        )
+        server_type = dynamic_stub_type(github_module, redact=lambda value: value)
+    else:
+        from test_c4_upgrade_migration import _github_fixture
+
+        server_type = _github_fixture(github_module)
+    server = server_type(tmp_path, recording, seed_tree=SEED_TREE, issue_file=issue_file)
+    try:
+        server.start()
+        with httpx.Client(
+            base_url=server.base_url,
+            verify=ssl.create_default_context(cafile=str(server.ca_file)),
+            trust_env=False,
+        ) as client:
+            try:
+                repository = client.get(f"/repos/{REPO}")
+            except httpx.RemoteProtocolError:
+                pytest.fail("factory subclass closed the GitHub intake connection")
+            assert repository.status_code == 200
+            assert repository.json()["full_name"] == REPO
+            assert client.get(f"/repos/{REPO}/installation").json()["id"] == 5501
+            issue = _ok(
+                client.post(
+                    f"/repos/{REPO}/issues",
+                    json={"title": "Exercise label intake", "body": ISSUE_BODY, "labels": []},
+                ),
+                201,
+            )
+            number = issue["number"]
+            labelled = client.post(
+                f"/repos/{REPO}/issues/{number}/labels",
+                json={"labels": ["acme-intake"]},
+                headers={"Authorization": "Bearer example-human-token"},
+            )
+            assert labelled.status_code == 200
+            found = _ok(client.get(f"/repos/{REPO}/issues", params={"labels": "acme-intake"}))
+            assert [row["number"] for row in found] == [number]
+            events = _ok(client.get(f"/repos/{REPO}/issues/{number}/events"))
+            assert events[-1]["event"] == "labeled"
+            assert events[-1]["actor"] == github_module.HUMAN
+            assert (
+                client.post(
+                    f"/repos/{REPO}/issues/{number}/labels",
+                    json={"labels": ["acme-bot-label"]},
+                ).status_code
+                == 200
+            )
+            events = _ok(client.get(f"/repos/{REPO}/issues/{number}/events"))
+            assert events[-1]["actor"] == github_module.BOT
+            assert server.unknown_requests == []
+    finally:
+        server.close()
 
 
 def test_app_discovery_and_token_scope_use_real_credentials(

@@ -219,6 +219,9 @@ jobs:
       - name: helm render assertions (factory forges)
         run: bash charts/curie/ci/factory-forges-assertions.sh
 
+      - name: helm render assertions (GitHub account linking)
+        run: bash charts/curie/ci/factory-github-link-assertions.sh
+
       # Prove worker.streamRetention.minAgeSeconds reaches the worker, is
       # bounded by the schema, and defaults on a release with no such block.
       - name: helm render assertions (stream retention window)

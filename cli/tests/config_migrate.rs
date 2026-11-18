@@ -2714,6 +2714,9 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     // The factory settings arrived with #4397 as chart values, never extraEnv.
     "FACTORY_CI_WAIT_S",
     "FACTORY_ENABLED",
+    // OAuth linking settings are first-class values from introduction (#5719).
+    "FACTORY_GITHUB_APP_CLIENT_ID",
+    "FACTORY_GITHUB_APP_CLIENT_SECRET",
     "FACTORY_INTAKE",
     "GITHUB_API_URL",
     "GITHUB_APP_ID",

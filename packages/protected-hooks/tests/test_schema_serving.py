@@ -120,7 +120,8 @@ def graph_payload() -> dict[str, Any]:
         ("0175", False),
         ("0176", False),
         ("0177", False),
-        ("0178", True),
+        ("0178", False),
+        ("0179", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -167,10 +168,11 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     this floor. Operator retry records require 0176.
     Enrollment inactive intake notices require 0177.
     The factory Slack progress card requires 0178.
+    GitHub account link states and display labels require 0179.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0178"
-    assert window.schema_head == "0178"
+    assert window.schema_min == "0179"
+    assert window.schema_head == "0179"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])

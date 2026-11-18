@@ -107,6 +107,7 @@ from .routers import (
     identity_approvals,
     identity_authority,
     identity_connect,
+    identity_me,
     identity_operator,
     memory,
     observability,
@@ -803,6 +804,7 @@ def create_app(
     app.include_router(identity_approvals.router)
     app.include_router(directory.router)
     app.include_router(identity_connect.router)
+    app.include_router(identity_me.router)
     app.include_router(identity.router)
     app.include_router(teams.router)
     app.include_router(agent_access.router)
