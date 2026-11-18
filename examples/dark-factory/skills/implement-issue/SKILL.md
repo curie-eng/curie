@@ -231,7 +231,8 @@ starts `Answered on the ticket by <author>: <the decision, one sentence>`:
 `n. Answered on the ticket by <author>: <the decision>. Rejected: <the alternative the question offered>, because <author> chose the decision on the ticket. (plan) Evidence: <the comment that gave the answer>.`
 
 These entries count toward the seven, and the None declaration is then not
-available. The investigation hook refuses publication when the ticket carried
+available. When more than seven answers shaped the change, put the answers that
+belong together in one entry and start its choice with the first of them. The investigation hook refuses publication when the ticket carried
 the heading and no entry in the section starts this way.
 Preserve and update this section on every pull request revision, including
 CI repair rounds. A publication refusal for this section is recoverable:
@@ -334,8 +335,10 @@ failure. When a reported bug does not reproduce, or already works on this
 checkout, the thread alone gives nothing to build: ask for the input that
 shows the failure, or whether the ticket is already settled, and include the
 reproduction result. When a missing service, credential or tool keeps the
-reported behaviour from being exercised at all, ask too, and name the missing
-prerequisite. Never invent the product convention or silently expand scope.
+reported behaviour from being exercised at all, the ticket's people cannot
+supply it inside this session: that is a run reason, so stop with
+`Could not complete:` and name the missing prerequisite instead of asking.
+Never invent the product convention or silently expand scope.
 
 ### Ask on the ticket
 

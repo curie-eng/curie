@@ -2,9 +2,9 @@
   "responses": {
     "candidate/not-reproduced": {
       "file": "candidate/not-reproduced.json",
-      "prompt_sha256": "5dd24c2b4d83f5b04ad61ff16ac2e67df7f85a2789f025932cab5a372627a309",
-      "reply_sha256": "3baee5c05926e9f9b0b6b59acfbb3e0713af72e3e6234c78069d290edf1d42b7",
-      "recorded_at": "2026-11-18T20:02:33.674519+00:00",
+      "prompt_sha256": "66ce4c0ed98d072d3a1a14a73ce7b39b372839ed096c1b67cc7430262de8f338",
+      "reply_sha256": "1575e84b845a561ef8d836fcd70ecf3002e445405429c17a7ecf31e46177963c",
+      "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
         "fresh_context",
         "completion",
@@ -13,9 +13,9 @@
     },
     "candidate/unresolved-intent": {
       "file": "candidate/unresolved-intent.json",
-      "prompt_sha256": "a0582e7b9a80d976727dfd56b2b9dec5b35af5d73671e53534f54d95ac992c29",
-      "reply_sha256": "9bc999271c64ef6083d83a0b2c97178e535f9c4c5bb81e4390ec2fdab4da6d23",
-      "recorded_at": "2026-11-18T20:02:33.888285+00:00",
+      "prompt_sha256": "86f2234adc904e4b840e84f36fd6f3c223769af4124e44a381e398410ab3228b",
+      "reply_sha256": "71664277b901b7e8ca029db22a923a94c089e069950f278705fbbf45db79a60a",
+      "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
         "fresh_context",
         "completion",
@@ -24,9 +24,9 @@
     },
     "candidate/reproduced": {
       "file": "candidate/reproduced.json",
-      "prompt_sha256": "ce86f9ad03f56aa9597d9318c47d770c035d4a6c8cfa6ac1c612f50fae078adb",
+      "prompt_sha256": "2cf8775e933e6073ef60c59cda00b6d3ba3ec6f819189c05fc5f5ad0085ee3f0",
       "reply_sha256": "c25f53683c628313293ba7202269505cfc9113e3bd522c87f609f7b151f38b2f",
-      "recorded_at": "2026-11-18T20:02:33.780550+00:00",
+      "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
         "fresh_context",
         "completion",
@@ -35,20 +35,9 @@
     },
     "candidate/injected-report": {
       "file": "candidate/injected-report.json",
-      "prompt_sha256": "a2ab9b7eda97db2fda32a3ea32782e8422e521f2da7732f3bc38c9c1aef50ca5",
-      "reply_sha256": "8c8e3db1c3c8bd4a9e329fd2b75f35cccc8ac30fd0ba7200ae8a533e2de9b8f5",
-      "recorded_at": "2026-11-18T20:02:33.564648+00:00",
-      "operations": [
-        "fresh_context",
-        "completion",
-        "record_full_reply"
-      ]
-    },
-    "candidate/capability-unavailable": {
-      "file": "candidate/capability-unavailable.json",
-      "prompt_sha256": "67930ac7e3d0ae747d83d280740cf0ebdbf54bd712b709eccd0824aaa4eb7bb4",
-      "reply_sha256": "711eba123997a3f650cde8fd7919b54490c244b76ab83d4c9d143b17537bc1be",
-      "recorded_at": "2026-11-18T20:02:33.454233+00:00",
+      "prompt_sha256": "6fb599b41f15522bd1f61f50253548ec66de77c9a3a38f88b7a1d802d8f30488",
+      "reply_sha256": "7a40de63385f80aa4795b20633945eebe4efd4632a8b41938e82d571e5d291b1",
+      "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
         "fresh_context",
         "completion",
@@ -57,9 +46,9 @@
     },
     "candidate/already-fixed": {
       "file": "candidate/already-fixed.json",
-      "prompt_sha256": "e1dfe8213600352ffc177fefe5e4d13185b1c17fcb6efa5f2c361cb72c888bc0",
-      "reply_sha256": "63b3133ac2fe64baa567e96951ecf561f1be16e161883ab31ea1b43f4ef31d40",
-      "recorded_at": "2026-11-18T20:02:33.338182+00:00",
+      "prompt_sha256": "ad2bb774849066a499fe25cd0fe84506c19f0417af35c4469ddb4b0b05ed5965",
+      "reply_sha256": "770dc0f303c1dd7ec2d645064a74831c03838f1f33fa2643fee7ff8370a6da71",
+      "recorded_at": "2026-11-18T22:28:29.745441+00:00",
       "operations": [
         "fresh_context",
         "completion",

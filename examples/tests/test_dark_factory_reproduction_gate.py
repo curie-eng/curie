@@ -181,6 +181,36 @@ def test_rules_a_failed_probe_still_counts_as_an_observation(session: Session) -
     assert not denied(session.ask())
 
 
+def test_rules_a_quiet_failed_probe_without_output_counts(session: Session) -> None:
+    command = "python3 -c 'raise SystemExit(3)'"
+    pre = session.event("PreToolUse", "Bash", {"command": command}, tool_use_id="quiet")
+    assert not denied(pre)
+    # The CLI reports a failed call with no output as just "Exit code N".
+    done = session.event(
+        "PostToolUseFailure", "Bash", {"command": command}, tool_use_id="quiet", error="Exit code 3"
+    )
+    assert not denied(done), done
+    assert session.state()["runs"][-1]["exit_status"] == 3
+    assert not denied(session.ask())
+
+
+def test_rules_a_shell_cd_does_not_split_the_session_state(session: Session) -> None:
+    sub = session.cwd / "pkg"
+    sub.mkdir()
+    session.run("echo probe")
+    # The reported cwd follows a shell `cd`; the state still belongs to the checkout.
+    asked = session.event(
+        "PostToolUse", ASK, QUESTIONS, cwd=str(sub), tool_response=[{"type": "text", "text": "{}"}]
+    )
+    assert not denied(asked), asked
+    assert not (sub / ".curie").exists()
+    refusal = session.publish()
+    assert denied(refusal)
+    assert "asked questions" in reason(refusal)
+    from_sub = session.event("PreToolUse", PUBLISH, {"title": "t", "body": "b"}, cwd=str(sub))
+    assert denied(from_sub)
+
+
 def test_rules_publish_is_refused_after_a_successful_ask_in_the_session(
     session: Session,
 ) -> None:

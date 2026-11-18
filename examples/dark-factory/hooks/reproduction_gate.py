@@ -237,7 +237,7 @@ def output(response: Any, *, failed: bool) -> tuple[int, str]:
     if failed:
         if not isinstance(response, str):
             raise Refusal("The failed shell call has no observable exit status.")
-        match = re.match(r"Exit code (\d+)\n", response)
+        match = re.match(r"Exit code (\d+)(?:\n|$)", response)
         if not match:
             raise Refusal("The failed shell call has no observable exit status.")
         return int(match.group(1)), response[match.end() :][:MAX_OUTPUT]
@@ -333,6 +333,9 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
     if event not in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}:
         raise Refusal("Unknown hook event.")
     cwd = Path(required_text(data.get("cwd"), "checkout path")).resolve(strict=True)
+    # A shell `cd` moves the reported cwd into a subdirectory; the state and its
+    # exclude rule belong to the checkout root, so every event resolves it once.
+    cwd = Path(git(cwd, "rev-parse", "--show-toplevel")).resolve(strict=True)
     if event == "PreToolUse":
         mutation_guard(tool, inputs, cwd)
     heading = (
