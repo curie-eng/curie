@@ -315,6 +315,83 @@ def test_seeded_issue_uses_the_required_input_and_a_human_label_event(
     assert stub.unknown_requests == []
 
 
+@pytest.mark.parametrize("extension", ["admitted", "dynamic", "upgrade"])
+def test_factory_subclasses_preserve_github_label_intake_http(
+    tmp_path: Path,
+    recording: dict[str, Any],
+    issue_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extension: str,
+) -> None:
+    monkeypatch.syspath_prepend(str(STUB_ROOT.parent / "factory-e2e"))
+    monkeypatch.syspath_prepend(str(STUB_ROOT.parent / "factory-e2e" / "tests"))
+    github_module = sys.modules[_stub_type().__module__]
+    if extension == "admitted":
+        from c4_admitted_http import tracker_stub_type
+
+        server_type = tracker_stub_type(github_module, redact=lambda value: value)
+    elif extension == "dynamic":
+        from c4_admitted_http import tracker_stub_type
+        from c4_dynamic_base import dynamic_stub_type
+
+        monkeypatch.setattr(
+            github_module,
+            "GithubStub",
+            tracker_stub_type(github_module, redact=lambda value: value),
+        )
+        server_type = dynamic_stub_type(github_module, redact=lambda value: value)
+    else:
+        from test_c4_upgrade_migration import _github_fixture
+
+        server_type = _github_fixture(github_module)
+    server = server_type(tmp_path, recording, seed_tree=SEED_TREE, issue_file=issue_file)
+    try:
+        server.start()
+        with httpx.Client(
+            base_url=server.base_url,
+            verify=ssl.create_default_context(cafile=str(server.ca_file)),
+            trust_env=False,
+        ) as client:
+            try:
+                repository = client.get(f"/repos/{REPO}")
+            except httpx.RemoteProtocolError:
+                pytest.fail("factory subclass closed the GitHub intake connection")
+            assert repository.status_code == 200
+            assert repository.json()["full_name"] == REPO
+            assert client.get(f"/repos/{REPO}/installation").json()["id"] == 5501
+            issue = _ok(
+                client.post(
+                    f"/repos/{REPO}/issues",
+                    json={"title": "Exercise label intake", "body": ISSUE_BODY, "labels": []},
+                ),
+                201,
+            )
+            number = issue["number"]
+            labelled = client.post(
+                f"/repos/{REPO}/issues/{number}/labels",
+                json={"labels": ["acme-intake"]},
+                headers={"Authorization": "Bearer example-human-token"},
+            )
+            assert labelled.status_code == 200
+            found = _ok(client.get(f"/repos/{REPO}/issues", params={"labels": "acme-intake"}))
+            assert [row["number"] for row in found] == [number]
+            events = _ok(client.get(f"/repos/{REPO}/issues/{number}/events"))
+            assert events[-1]["event"] == "labeled"
+            assert events[-1]["actor"] == github_module.HUMAN
+            assert (
+                client.post(
+                    f"/repos/{REPO}/issues/{number}/labels",
+                    json={"labels": ["acme-bot-label"]},
+                ).status_code
+                == 200
+            )
+            events = _ok(client.get(f"/repos/{REPO}/issues/{number}/events"))
+            assert events[-1]["actor"] == github_module.BOT
+            assert server.unknown_requests == []
+    finally:
+        server.close()
+
+
 def test_app_discovery_and_token_scope_use_real_credentials(
     github: httpx.Client, stub: Any
 ) -> None:

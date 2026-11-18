@@ -186,7 +186,13 @@ def _github_fixture(module: Any) -> type:
             self._put("issue", 3815, issue)
 
         def _rest(
-            self, method: str, path: str, query: dict[str, list[str]], body: Any
+            self,
+            method: str,
+            path: str,
+            query: dict[str, list[str]],
+            body: Any,
+            *,
+            actor: dict[str, Any] = module.BOT,
         ) -> tuple[int, Any] | None:
             with sqlite3.connect(self._database) as database:
                 database.execute(
@@ -294,7 +300,7 @@ def _github_fixture(module: Any) -> type:
                     if path.endswith("/statuses"):
                         return 200, self._page(rows, query)
                     return 200, {"state": "success", "total_count": len(rows), "statuses": rows}
-            return super()._rest(method, path, query, body)
+            return super()._rest(method, path, query, body, actor=actor)
 
         def issue(self, number: int, labels: list[str], *, authorized: bool = True) -> None:
             actor = module.HUMAN if authorized else {

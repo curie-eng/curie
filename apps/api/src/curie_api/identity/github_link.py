@@ -10,7 +10,7 @@ import httpx
 from fastapi import HTTPException
 
 from ..config import Settings
-from ..forges.github.connection import html_base
+from ..forges.registry import forges_registry
 
 CALLBACK = "/identity/me/github-link/callback"
 TTL_SECONDS = 600
@@ -40,7 +40,7 @@ def configuration(settings: Settings) -> Configuration | None:
         or not settings.factory_github_app_client_secret.get_secret_value()
     ):
         return None
-    host = next((entry for entry in settings.forges.code_hosts if entry.kind == "github"), None)
+    host = forges_registry(settings).github_code_host()
     if host is None:
         return None
     redirect = urlsplit(settings.oidc_redirect_uri)
@@ -49,7 +49,7 @@ def configuration(settings: Settings) -> Configuration | None:
         return None
     callback = urlunsplit((redirect.scheme, redirect.netloc, prefix + CALLBACK, "", ""))
     return Configuration(
-        host.host, html_base(host.api_url, host.host), host.api_url.rstrip("/"), callback
+        host.config.host, host.html_base, host.config.api_url.rstrip("/"), callback
     )
 
 

@@ -270,7 +270,15 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                 handler.end_headers()
                 handler.wfile.write(captured.wfile.getvalue())
 
-        def _rest(self, method: str, path: str, query: Any, body: Any) -> Any:
+        def _rest(
+            self,
+            method: str,
+            path: str,
+            query: Any,
+            body: Any,
+            *,
+            actor: dict[str, Any] = module.BOT,
+        ) -> Any:
             prefix = f"/repositories/{self._repository_row()['id']}"
             if path == prefix or path.startswith(prefix + "/"):
                 path = f"/repos/{REPOSITORY}" + path[len(prefix) :]
@@ -352,13 +360,13 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
             if method == "GET" and path.startswith(f"/repos/{REPOSITORY}/branches/"):
                 # Branch protection contexts are embedded in the branch read.
                 # https://docs.github.com/en/rest/branches/branches#get-a-branch
-                answer = super()._rest(method, path, query, body)
+                answer = super()._rest(method, path, query, body, actor=actor)
                 if answer is not None and answer[0] == 200:
                     answer[1]["protection"] = {
                         "required_status_checks": {"contexts": ["dynamic-ci"]}
                     }
                 return answer
-            return super()._rest(method, path, query, body)
+            return super()._rest(method, path, query, body, actor=actor)
 
     return DynamicGitHub
 
