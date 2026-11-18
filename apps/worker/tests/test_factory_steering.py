@@ -37,12 +37,13 @@ direct message half is a guard of the same kind; its liveness half is not.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import itertools
 import json
 import uuid
 from collections.abc import Callable
-from typing import Any, get_args
+from typing import Any, cast, get_args
 
 import httpx
 import pytest
@@ -179,7 +180,8 @@ def _personal(principal_id: uuid.UUID) -> OwnerTuple:
 
 def _threads_at(root_ts: str) -> list[dict[str, Any]]:
     return _rows(
-        "SELECT work_item_id, channel_identity, channel, root_ts, first_sequence, origin "
+        "SELECT work_item_id, channel_identity, channel, root_ts, first_sequence, origin, "
+        "card_ts, requester_slack_user "
         "FROM curie.factory_slack_threads WHERE root_ts = :root",
         {"root": root_ts},
     )
@@ -403,10 +405,14 @@ def _kicked_off(
         CHANNEL,
         "kickoff",
     )
-    assert attempt.edits, "the placeholder was not edited with the reply"
-    assert attempt.edits[-1].text == steering_module.render_kickoff_reply(
-        "admitted", issue_url=_issue_url(number)
-    ), attempt.edits[-1].text
+    # The placeholder is the run's progress card (#5715): the admitted turn
+    # neither edits it nor posts a reply, and the thread stores its ts and
+    # the sender the card's notify replies mention.
+    assert attempt.delivery.placeholder is not None
+    assert attempt.edits == [], [call.text for call in attempt.edits]
+    assert stack.slack.thread_posts(stack.factory_token, root_ts) == []
+    assert thread["card_ts"] == attempt.delivery.placeholder, thread
+    assert request["requester"] == f"slack:{thread['requester_slack_user']}", thread
     assert stack.is_terminal(attempt.delivery.delivery_id)
     return request
 
@@ -447,20 +453,20 @@ def test_every_api_outcome_has_a_worker_headline() -> None:
     kickoff = set(get_args(FactorySlackKickoffOutcome))
     assert steer and kickoff
     assert steer - set(steering_module._HEADLINES) == set()
-    assert kickoff - set(steering_module._KICKOFF_HEADLINES) == set()
+    assert kickoff - set(steering_module._KICKOFF_HEADLINES) == {"admitted"}
     local = {
         steering_module.KICKOFF_EVIDENCE_MISSING,
         steering_module.KICKOFF_UNCONFIGURED,
         steering_module.KICKOFF_BUDGET_EXPIRED,
     }
     assert local <= set(steering_module._KICKOFF_HEADLINES)
-    for outcome in kickoff | local:
+    # An admitted kickoff has no reply text: its answer is the progress card.
+    refusals = (kickoff | local) - {"admitted"}
+    assert set(steering_module._KICKOFF_HEADLINES) <= refusals
+    for outcome in refusals:
         reply = steering_module.render_kickoff_reply(outcome, reason="example_reason")
         assert f"Outcome: {outcome} (example_reason)" in reply, reply
-        if outcome != "admitted":
-            _no_false_nothing_queued([reply])
-    admitted = steering_module.render_kickoff_reply("admitted", issue_url=_issue_url(7))
-    assert _issue_url(7) in admitted and "posted in this thread" in admitted, admitted
+        _no_false_nothing_queued([reply])
 
 
 # --- AC2: kickoff ---------------------------------------------------------------------
@@ -473,8 +479,9 @@ def test_root_and_unmapped_thread_issue_links_kick_off_before_any_sandbox(
 
     The sender's owner tuple is on the WorkItem and the request, the thread is
     recorded with origin ``kickoff`` at the root the message started, the
-    reply names the issue, and nothing reaches the sandbox substrate. The
-    first run's progress then posts into that root, with no root post owed.
+    turn posts no reply, and nothing reaches the sandbox substrate. The
+    first run's progress card is then that mention's placeholder, edited in
+    place, with no root post owed.
     """
 
     stack = steering
@@ -504,15 +511,15 @@ def test_root_and_unmapped_thread_issue_links_kick_off_before_any_sandbox(
     _assert_no_sandbox(stack)
     assert stack.valkey.exists(stack.steering_sent_key(root.delivery.delivery_id)) == 1
 
-    # The run's progress posts in the thread the message started.
+    # The run's progress card is the placeholder the mention got, edited in
+    # place (#5715): nothing else posts in the thread the message started.
     stack.start(request["id"])
     stack.report(request["id"], "plan", "Planned from the Slack kickoff")
     stack.drain()
-    texts = [
-        call.haystack
-        for call in stack.slack.thread_posts(stack.factory_token, root.delivery.message_ts)
-    ]
-    assert len(texts) == 1 and "Planned from the Slack kickoff" in texts[0], texts
+    assert stack.slack.thread_posts(stack.factory_token, root.delivery.message_ts) == []
+    assert root.delivery.placeholder is not None
+    cards = [call.haystack for call in stack.slack.edits_of(root.delivery.placeholder)]
+    assert cards and "Planned from the Slack kickoff" in cards[-1], cards
     assert stack.slack.roots(stack.factory_token) == []
     assert _rows("SELECT id FROM curie.factory_slack_posts WHERE kind = 'root'") == []
 
@@ -594,11 +601,12 @@ def test_the_kickoff_delivery_redelivered_after_its_root_is_mapped_replays_and_n
     assert replayed["outcome"] == "admitted" and replayed.get("replayed") is True, replayed
     assert replayed["request_id"] == str(expected), replayed
     assert _answers(stack, STEER_PATH) == [], "the kickoff redelivery was steered"
-    texts = stack.placeholder_texts(delivery.placeholder)
-    assert texts[-1] == steering_module.render_kickoff_reply(
-        "admitted", issue_url=_issue_url(number), replayed=True
-    ), texts
-    _no_false_nothing_queued(texts)
+    # The replay leaves the placeholder to the progress card (#5715), and the
+    # thread keeps the card ts the first admission stored.
+    assert stack.placeholder_texts(delivery.placeholder) == texts
+    assert stack.slack.thread_posts(stack.factory_token, delivery.message_ts) == []
+    (thread,) = _threads_at(delivery.message_ts)
+    assert thread["card_ts"] == delivery.placeholder, thread
     assert stack.is_terminal(delivery.delivery_id)
     assert stack.pending() == 0
     assert [row["id"] for row in stack.requests()] == [expected]
@@ -1041,7 +1049,7 @@ def test_an_unreadable_decision_stays_pending_and_admits_once_on_redelivery(
     assert stack.valkey.exists(stack.steering_sent_key(unread.delivery.delivery_id)) == 0
     assert stack.resend_invitations() == []
     assert stack.pending() == 1
-    _redelivered_once(stack, unread, number)
+    _redelivered_once(stack, unread)
 
     number = next(_ISSUES)
     healthy = stack.github.handle
@@ -1064,25 +1072,26 @@ def test_an_unreadable_decision_stays_pending_and_admits_once_on_redelivery(
     assert stack.resend_invitations() == []
     assert stack.pending() == 1
     assert not stack.is_terminal(down.delivery.delivery_id)
-    _redelivered_once(stack, down, number)
+    _redelivered_once(stack, down)
     _assert_no_sandbox(stack)
 
 
-def _redelivered_once(stack: SteeringStack, first: Attempt, number: int) -> None:
+def _redelivered_once(stack: SteeringStack, first: Attempt) -> None:
     """The consumer's reclaim admits the pending delivery, once, not as a replay."""
 
     known = {row["id"] for row in stack.requests()}
     answers = len(_answers(stack, KICKOFF_PATH))
+    before = stack.placeholder_texts(first.delivery.placeholder)
     assert stack.reclaim() == 1
     ((status, admitted),) = _answers(stack, KICKOFF_PATH)[answers:]
     assert status == 200 and admitted["outcome"] == "admitted", admitted
     assert admitted.get("replayed") is not True, admitted
     expected = _expected_request(stack, first.delivery)
     assert [row["id"] for row in stack.requests() if row["id"] not in known] == [expected]
-    texts = stack.placeholder_texts(first.delivery.placeholder)
-    assert texts[-1] == steering_module.render_kickoff_reply(
-        "admitted", issue_url=_issue_url(number)
-    ), texts
+    # The admission posts nothing: the placeholder becomes the progress card.
+    assert stack.placeholder_texts(first.delivery.placeholder) == before
+    (thread,) = _threads_at(first.delivery.message_ts)
+    assert thread["card_ts"] == first.delivery.placeholder, thread
     assert stack.is_terminal(first.delivery.delivery_id)
     assert stack.pending() == 0
     assert stack.resend_invitations() == []
@@ -1179,3 +1188,168 @@ def test_a_declared_driver_kickoff_resolves_its_principal_and_steering_refuses_i
         "lineage_closed",
     )
     _assert_no_sandbox(stack)
+
+
+# --- #5715: the admitted kickoff hands its placeholder to the progress card ---------
+#
+# Pure: the production client over an in-memory HTTP transport, with the stored
+# receipt read stubbed. The mapped read and the database are never touched.
+
+_CARD_IDENTITY = "default"
+_CARD_ROOT = "1800000900.000100"
+_CARD_PLACEHOLDER = "1800000900.000200"
+
+
+def _card_turn(placeholder: str | None) -> Any:
+    from aci_protocol import QueuedTurn, ReplyHandle
+
+    handle = ReplyHandle(kind="slack", channel=CHANNEL, placeholder=placeholder)
+    qevent = QueuedTurn(
+        event_id="EvCARD-1",
+        conversation_id=_CARD_ROOT,
+        author="U0EXAMPLE9",
+        text=_linking(7),
+        reply_handle=handle,
+        received_at="2026-11-16T00:00:00+00:00",
+    )
+    return steering_module._Turn(qevent, handle, _CARD_IDENTITY, _CARD_ROOT)
+
+
+def _card_receipt(turn: Any, *, thread_reply: bool = False) -> Any:
+    from curie_internal.slack_mention_receipt import SlackMentionReceipt
+
+    return SlackMentionReceipt(
+        version=1,
+        delivery_id=turn.qevent.event_id,
+        channel_identity=turn.identity,
+        channel=CHANNEL,
+        root_ts=_CARD_ROOT,
+        message_ts="1800000900.000300" if thread_reply else _CARD_ROOT,
+        user_id=turn.qevent.author,
+        body=turn.qevent.text,
+        evidence={},
+    )
+
+
+def _card_client(
+    answer: dict[str, Any], sent: list[tuple[str, dict[str, Any]]]
+) -> steering_module.FactorySteeringClient:
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json=answer)
+
+    return steering_module.FactorySteeringClient(
+        engine=cast(Any, None),
+        schema="curie",
+        redis=cast(Any, None),
+        api_base_url="http://api.invalid",
+        worker_token="example-worker-token",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handle)),
+        intent_key=lambda event_id: f"intent:{event_id}",
+    )
+
+
+def _card_decide(
+    monkeypatch: pytest.MonkeyPatch,
+    answer: dict[str, Any],
+    *,
+    placeholder: str | None,
+    steer: bool = False,
+    receipt: bool = True,
+) -> tuple[steering_module.SteeringReply | None, list[tuple[str, dict[str, Any]]]]:
+    turn = _card_turn(placeholder)
+    stored = _card_receipt(turn, thread_reply=steer) if receipt else None
+
+    async def read_receipt(_redis: Any, _delivery: str) -> Any:
+        return stored
+
+    async def record_intent() -> None:
+        return None
+
+    monkeypatch.setattr(steering_module, "read_receipt", read_receipt)
+    sent: list[tuple[str, dict[str, Any]]] = []
+    client = _card_client(answer, sent)
+
+    async def run() -> steering_module.SteeringReply | None:
+        if steer:
+            return await client._steer(turn, deadline=None, record_intent=record_intent)
+        return await client._kickoff(turn, mapped=False, deadline=None, record_intent=record_intent)
+
+    return asyncio.run(run()), sent
+
+
+_ADMITTED = {
+    "outcome": "admitted",
+    "request_id": "00000000-0000-4000-8000-000000000001",
+    "work_item_id": "00000000-0000-4000-8000-000000000002",
+    "issue_url": _issue_url(7),
+}
+
+
+@pytest.mark.parametrize("replayed", [False, True])
+@pytest.mark.parametrize("placeholder", [_CARD_PLACEHOLDER, None])
+def test_progress_card_admitted_kickoff_sends_its_placeholder_and_has_no_reply_text(
+    monkeypatch: pytest.MonkeyPatch, placeholder: str | None, replayed: bool
+) -> None:
+    """An admitted kickoff, fresh or replayed, is answered by the card, not a reply.
+
+    The kickoff request carries the turn's placeholder ts, null when the
+    dispatcher posted none, so the API can store it as the run's card.
+    """
+
+    reply, sent = _card_decide(
+        monkeypatch, {**_ADMITTED, "replayed": replayed}, placeholder=placeholder
+    )
+    ((path, body),) = sent
+    assert path == KICKOFF_PATH
+    assert "placeholder_ts" in body and body["placeholder_ts"] == placeholder, body
+    assert reply is not None and reply.admitted and reply.progress_card, reply
+    assert reply.text == "", reply.text
+    assert reply.request_id == _ADMITTED["request_id"], reply
+
+
+def test_progress_card_steer_request_carries_no_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The steer route's input forbids extra fields, and a revision keeps its reply."""
+
+    answer = {"outcome": "admitted", "request_id": _ADMITTED["request_id"]}
+    reply, sent = _card_decide(monkeypatch, answer, placeholder=_CARD_PLACEHOLDER, steer=True)
+    ((path, body),) = sent
+    assert path == STEER_PATH
+    assert "placeholder_ts" not in body, body
+    assert reply is not None and reply.admitted and not reply.progress_card, reply
+    assert reply.text == steering_module.render_reply("admitted"), reply.text
+
+
+@pytest.mark.parametrize("outcome", ["issue_closed", "thread_conflict", "admission_refused"])
+def test_progress_card_kickoff_refusals_keep_their_reply(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """A refused kickoff still replies with its headline and outcome code."""
+
+    reply, _sent = _card_decide(
+        monkeypatch, {"outcome": outcome, "reason": "example_reason"}, placeholder=None
+    )
+    assert reply is not None and not reply.admitted and not reply.progress_card, reply
+    assert reply.text == steering_module.render_kickoff_reply(outcome, reason="example_reason")
+    assert f"Outcome: {outcome} (example_reason)" in reply.text, reply.text
+
+
+def test_progress_card_local_kickoff_refusal_keeps_its_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kickoff with no stored receipt is refused locally, with no API call and its reply."""
+
+    reply, sent = _card_decide(monkeypatch, _ADMITTED, placeholder=_CARD_PLACEHOLDER, receipt=False)
+    assert sent == []
+    assert reply is not None and reply.outcome == KICKOFF_EVIDENCE_MISSING, reply
+    assert not reply.progress_card
+    assert f"Outcome: {KICKOFF_EVIDENCE_MISSING}" in reply.text, reply.text
+
+
+def test_progress_card_admitted_kickoff_has_no_rendered_reply() -> None:
+    """Nothing renders admitted kickoff text: the card replaces it (decision 9)."""
+
+    with pytest.raises(ValueError, match="progress card"):
+        steering_module.render_kickoff_reply("admitted")

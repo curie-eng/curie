@@ -354,7 +354,12 @@ async def _process_event(
                 if lease is not None:
                     lease.raise_if_lost()
                 if steered.admitted:
-                    await self._reply_for(qevent, route, steered.text)
+                    # An admitted kickoff (#5715) posts nothing and leaves the
+                    # placeholder unedited: the progress lane renders the
+                    # run's card into it. Only the reply is skipped; the turn
+                    # still settles through the same fenced completion.
+                    if not steered.progress_card:
+                        await self._reply_for(qevent, route, steered.text)
                     await self._complete(
                         qevent, route, "delivered", telemetry_outcome="done", lease=lease
                     )

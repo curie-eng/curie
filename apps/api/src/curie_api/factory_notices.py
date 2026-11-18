@@ -38,6 +38,7 @@ from typing import Any
 
 import httpx
 from curie_internal.factory_cause import cause_text as cause_text
+from curie_internal.factory_phase_view import PhaseView, phase_view
 from curie_internal.factory_triage import TRIAGED_LABEL, HandoffOutcome, status_comment_text
 from sqlalchemy import and_, case, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -52,7 +53,7 @@ from .factory_comment_text import (
     redact_factory_comment,
     status_marker,
 )
-from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
+from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, pill_for
 from .factory_reply_target import stored_reply_target
 from .factory_retry_policy import condition_text
 from .factory_triage_status import (

@@ -25,9 +25,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from curie_api.factory_progress import phase_view, pill_for
+from curie_api.factory_progress import pill_for
 from curie_api.models import ExecutionRequestPhaseReport
 from curie_internal import sandbox_token
+from curie_internal.factory_phase_view import phase_view
 from forge_fakes.github import LABEL, _issue_event, _post
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _rows,

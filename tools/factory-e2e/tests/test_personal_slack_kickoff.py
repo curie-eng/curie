@@ -1992,6 +1992,116 @@ def _streams_of(run: psk.LiveRun, shell: StreamShell) -> None:
     run.shell, run.kube = shell, psk.Kube(shell, CONTEXT, NAMESPACE)
 
 
+@pytest.mark.parametrize(
+    "listing_error",
+    [
+        pytest.param(None, id="available"),
+        pytest.param(psk.StepFailed("kubectl get exited 1"), id="api-error"),
+        pytest.param(OSError("API unavailable"), id="io-error"),
+        pytest.param(subprocess.TimeoutExpired("kubectl", 20), id="timeout"),
+    ],
+)
+def test_progress_card_main_discovery_retries_capture_before_the_follower_lists_the_pod(
+    tmp_path: Path,
+    listing_error: Exception | None,
+) -> None:
+    pending = _pod("acme-claim-1-runner", "uid-1", "Pending", running=False)
+    successful_answer = _claim_answer("acme-claim-1", {"pod": pending})
+    listings = 0
+
+    def answer(argv: list[str]) -> psk.Completed:
+        nonlocal listings
+        if "pods" in argv:
+            listings += 1
+            if listings == 2 and listing_error is not None:
+                raise listing_error
+        return successful_answer(argv)
+
+    live = _live_run(tmp_path, answer=answer)
+    run, ledger = live.run, live.ledger
+    files = _pod_files(_turns("msg_impl", IMPLEMENTER_MODEL, 1, 120, start=1))
+    records = [_file_record(name, 0, data) for name, data in files.items()]
+    records += [
+        {"kind": "sync", "sizes": {name: len(data) for name, data in files.items()}, "at": T0 + 2},
+        {"kind": "end"},
+    ]
+    output = [json.dumps(record).encode() + b"\n" for record in records]
+    shell = StreamShell(
+        run.runtime, ledger, answer, {"exec": [[], [], output], "logs": [[b"runner booting\n"]]}
+    )
+    _streams_of(run, shell)
+
+    run.discover_runner_pods()
+    observed = run.pods["uid-1"]
+    for thread in observed.threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    run.follow_pass()
+
+    assert observed.harvest.transcript_files() == files
+    assert observed.harvest.complete and observed.eof.is_set()
+    facts = run.attempt_facts()
+    assert facts is not None and len(facts.sessions) == 1
+    assert facts.sessions[0].output_tokens == 120
+    assert len([argv for argv in shell.spawned if "exec" in argv]) == 3
+    ledger.close()
+
+
+@pytest.mark.parametrize("stop", ["deadline", "cancel"])
+def test_progress_card_capture_listing_errors_preserve_retry_bounds(
+    tmp_path: Path, stop: str
+) -> None:
+    live = _live_run(tmp_path)
+    run, ledger = live.run, live.ledger
+
+    def answer(_argv: list[str]) -> psk.Completed:
+        if stop == "cancel":
+            run.follow_stop.set()
+        else:
+            live.clock.wait(psk.STREAM_RETRY_LIMIT)
+        raise psk.StepFailed("kubectl could not complete")
+
+    shell = StreamShell(run.runtime, ledger, answer, {"exec": [[]]})
+    _streams_of(run, shell)
+    observed = _runner_pod(run, "uid-1")
+    run.follow_stream(observed, run.kube.argv("exec", observed.name), lambda _line: None)
+
+    assert len(shell.spawned) == 1
+    assert observed.harvest.transcript_files() == {}
+    ledger.close()
+
+
+@pytest.mark.parametrize("present_uid", [None, "uid-replacement"])
+def test_progress_card_capture_stops_when_the_original_pod_is_gone(
+    tmp_path: Path, present_uid: str | None
+) -> None:
+    original = _pod("acme-claim-1-runner", "uid-1", "Pending", running=False)
+    remaining = (
+        []
+        if present_uid is None
+        else [dict(original, metadata=dict(original["metadata"], uid=present_uid))]
+    )
+
+    def answer(_argv: list[str]) -> psk.Completed:
+        return psk.Completed(0, json.dumps({"items": remaining}).encode(), b"")
+
+    live = _live_run(tmp_path, answer=answer)
+    run, ledger = live.run, live.ledger
+    shell = StreamShell(
+        run.runtime, ledger, answer, {"exec": [[]], "logs": [[b"runner stopped\n"]]}
+    )
+    _streams_of(run, shell)
+    observed = run.attach_pod(original)
+    assert observed is not None
+    for thread in observed.threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert observed.eof.is_set() and observed.harvest.transcript_files() == {}
+    assert len([argv for argv in shell.spawned if "exec" in argv]) == 1
+    ledger.close()
+
+
 def test_runner_log_tail_keeps_the_last_lines_scrubbed(tmp_path: Path) -> None:
     """Behavior: an attached runner's log stream keeps only its last 80 lines, each scanned
     raw and kept scrubbed, and settlement records them under a sanitized pod reference."""
@@ -2247,7 +2357,7 @@ def test_follower_attaches_a_pending_claim_pod_and_audits_on_the_main_thread(
     assert streams[0][-5:] == ["logs", "-f", "acme-claim-1-runner", "-c", "runner"]
     assert observed.watch.ran and list(observed.log_tail) == ["runner booting"]
     listing = run.kube.argv("get", "pods", "-l", psk.POD_CLAIM_LABEL, "-o", "json")
-    assert [argv for argv, _gate in shell.calls] == [listing]  # one listing per pass
+    assert [argv for argv, _gate in shell.calls] == [listing] * 4
     assert audits == [] and not observed.audited
     assert "runner_pods_seen" not in ledger.observations("grant")
     # The main thread's discovery audits the attached pod once it runs.
@@ -2356,7 +2466,12 @@ MOVED_HEAD = "b" * 40
 
 
 class FakeForge:
-    """The fixture repository's branches and pull requests, as the GitHub API shapes them."""
+    """GitHub shapes: https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    and https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request.
+
+    Branch deletion closing the PR and a later close returning 422 were observed
+    during a live fixture cleanup on 2026-11-17.
+    """
 
     repo = "acme/fixture"
 
@@ -2365,15 +2480,25 @@ class FakeForge:
         self.pulls: list[dict[str, Any]] = []
         self.deleted: list[str] = []
         self.closed: list[int] = []
+        self.calls: list[tuple[str, str]] = []
 
     def open_pull(self, number: int, branch: str) -> None:
         head = {"sha": self.branches[branch], "ref": branch}
-        self.pulls.append({"number": number, "state": "open", "head": head})
+        self.pulls.append(
+            {
+                "number": number,
+                "state": "open",
+                "merged": False,
+                "html_url": f"https://github.com/{self.repo}/pull/{number}",
+                "head": head,
+            }
+        )
 
     def repo_path(self, suffix: str) -> str:
         return f"/repos/{self.repo}{suffix}"
 
     def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        self.calls.append((method, path))
         prefix = f"/repos/{self.repo}"
         if method == "GET" and path.startswith(f"{prefix}/pulls?"):
             branch = urllib.parse.unquote(path.rsplit(":", 1)[1])
@@ -2382,10 +2507,15 @@ class FakeForge:
                 for pull in self.pulls
                 if pull["state"] == "open" and pull["head"]["ref"] == branch
             ]
+        if method == "GET" and path.startswith(f"{prefix}/pulls/"):
+            number = int(path.rsplit("/", 1)[1])
+            return 200, next(pull for pull in self.pulls if pull["number"] == number)
         if method == "PATCH" and path.startswith(f"{prefix}/pulls/"):
             number = int(path.rsplit("/", 1)[1])
             for pull in self.pulls:
                 if pull["number"] == number:
+                    if pull["state"] == "closed":
+                        return 422, {}
                     pull["state"] = "closed"
             self.closed.append(number)
             return 200, {}
@@ -2397,6 +2527,9 @@ class FakeForge:
         if method == "DELETE" and path.startswith(f"{prefix}/git/refs/heads/"):
             branch = path.removeprefix(f"{prefix}/git/refs/heads/")
             self.branches.pop(branch, None)
+            for pull in self.pulls:
+                if pull["head"]["ref"] == branch:
+                    pull["state"] = "closed"
             self.deleted.append(branch)
             return 204, None
         raise AssertionError((method, path))
@@ -2440,9 +2573,7 @@ def _recovering_run(
     run.sql = sql  # type: ignore[method-assign]
     run.forge = forge  # type: ignore[assignment]
     run.api = FakeApi(dict(zip(ids, publications, strict=True)))  # type: ignore[assignment]
-    run.finalizer.register("close-run-pulls", run.close_run_pulls)
-    run.finalizer.register("delete-run-branches", run.delete_run_branches)
-    run.finalizer.register("recover-publications", run.recover_publications)
+    run.register_publication_cleanup()
     run.queries = queries  # type: ignore[attr-defined]
     return live_run
 
@@ -2453,6 +2584,100 @@ def _inventory(live_run: Live) -> dict[str, str]:
         for row in live_run.ledger.cleanup_rows()
         if row["kind"].startswith("inventory:")
     }
+
+
+@pytest.mark.parametrize("branch_deleted_first", [False, True])
+def test_progress_card_cleanup_closes_pull_before_deleting_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, branch_deleted_first: bool
+) -> None:
+    forge = FakeForge()
+    branch = "curie/pub-1"
+    forge.branches[branch] = OWN_HEAD
+    forge.open_pull(7, branch)
+    request = forge.request
+
+    def racing_request(method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        status, payload = request(method, path, body)
+        if branch_deleted_first and method == "GET" and "/pulls?" in path and payload:
+            request("DELETE", forge.repo_path(f"/git/refs/heads/{branch}"))
+        return status, payload
+
+    monkeypatch.setattr(forge, "request", racing_request)
+    live_run = _recovering_run(
+        tmp_path,
+        forge,
+        live=True,
+        publications=[{"branch": branch, "lineage_head_sha": OWN_HEAD}],
+    )
+    try:
+        results = live_run.run.finalizer.run()
+        assert len(results) == 3 and all(ok for _, ok in results)
+        assert live_run.run.pulls_closed() and live_run.run.branches_absent()
+        assert forge.pulls[0]["state"] == "closed" and forge.pulls[0]["merged"] is False
+        assert forge.branches == {}
+        assert all(
+            row["status"] == "ok"
+            for row in live_run.ledger.cleanup_rows()
+            if row["kind"].startswith("step:")
+        )
+        patch = ("PATCH", forge.repo_path("/pulls/7"))
+        delete = ("DELETE", forge.repo_path(f"/git/refs/heads/{branch}"))
+        if branch_deleted_first:
+            assert ("GET", forge.repo_path("/pulls/7")) in forge.calls
+            assert forge.closed == []
+        else:
+            assert patch in forge.calls
+            assert forge.calls.index(patch) < forge.calls.index(delete)
+            assert forge.closed == [7]
+    finally:
+        live_run.ledger.close()
+
+
+@pytest.mark.parametrize(
+    ("patch_status", "get_status", "pull"),
+    [
+        (422, 200, {"state": "open", "merged": False}),
+        (422, 200, {"state": "closed", "merged": True}),
+        (422, 200, {"state": "closed"}),
+        (422, 200, None),
+        (422, 503, {"state": "closed", "merged": False}),
+        (403, 200, {"state": "closed", "merged": False}),
+    ],
+)
+def test_progress_card_cleanup_refuses_unproven_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patch_status: int,
+    get_status: int,
+    pull: Any,
+) -> None:
+    forge = FakeForge()
+    forge.branches["curie/pub-1"] = OWN_HEAD
+    forge.open_pull(7, "curie/pub-1")
+    request = forge.request
+
+    def failing_request(method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        if method == "PATCH":
+            return patch_status, {}
+        if method == "GET" and path == forge.repo_path("/pulls/7"):
+            return get_status, pull
+        return request(method, path, body)
+
+    monkeypatch.setattr(forge, "request", failing_request)
+    live_run = _recovering_run(
+        tmp_path,
+        forge,
+        live=True,
+        publications=[{"branch": "curie/pub-1", "lineage_head_sha": OWN_HEAD}],
+    )
+    try:
+        with pytest.raises(
+            psk.StepFailed,
+            match=f"forge (PATCH|GET) returned {get_status if get_status != 200 else patch_status}",
+        ):
+            live_run.run.close_run_pulls()
+    finally:
+        live_run.ledger.close()
 
 
 def test_finalize_cleans_a_publication_the_run_failed_before_reading_back(
@@ -3545,6 +3770,98 @@ def test_grant_probe_outside_the_ceiling_is_one_capped_haiku_turn(
 # --------------------------------------------------------------------------
 
 
+PULL_URL = f"https://github.com/{REPO}/pull/8"
+CARD_TS, READY_TS = REPLY_TS[0], REPLY_TS[1]
+
+
+def _finished_card_blocks(pull_url: str = PULL_URL, *, detail: str = "") -> list[dict[str, Any]]:
+    """The finished card as conversations.replies returns it (decision 4 of the card issue)."""
+
+    steps = (
+        "Reading the issue",
+        "Planning the change",
+        "Reviewing the plan",
+        "Writing the change",
+        "Reviewing the diff",
+        "Opening the pull request",
+        "Waiting for CI",
+    )
+    checklist = "\n".join(
+        f":white_check_mark: {label}" + (f" _{detail}_" if detail and not index else "")
+        for index, label in enumerate(steps)
+    )
+    return [
+        {"type": "header", "text": {"type": "plain_text", "text": "Factory run: finished"}},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"<{ISSUE_URL}|#7 Fix the greeting>\n`{REPO}` Started by <@{SENDER_USER}>"
+                f"\n\n{checklist}\n\n:tada: *Done.* Opened pull request #8: Fix the greeting. "
+                "CI passed.",
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View pull request #8"},
+                    "url": pull_url,
+                }
+            ],
+        },
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": "Finished in 12m 05s"}]},
+    ]
+
+
+def _card_body() -> str:
+    """The card's ``text`` fallback is its body, the section text."""
+
+    return str(_finished_card_blocks()[1]["text"]["text"])
+
+
+def _bot_reply(ts: str, text: str, blocks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return {"ts": ts, "user": CURIE_USER, "text": text, "blocks": blocks}
+
+
+def _progress_observations() -> dict[str, Any]:
+    """What a finished kickoff thread records: the card, then one ready reply."""
+
+    card = _bot_reply(CARD_TS, _card_body(), _finished_card_blocks())
+    # The read-back shape: conversations.replies wraps the bare URL the reply
+    # posted in Slack link markup (observed on a live kickoff thread in a test
+    # Slack workspace, 2026-11-16).
+    ready = _bot_reply(
+        READY_TS, f"<@{SENDER_USER}> your pull request is ready for review: <{PULL_URL}>"
+    )
+    return {
+        "thread": THREAD,
+        "expected_thread": THREAD,
+        "placeholder_ts": CARD_TS,
+        "card_ts": CARD_TS,
+        "requester_slack_user": SENDER_USER,
+        "bot_user": CURIE_USER,
+        "sender_user": SENDER_USER,
+        "thread_replies": [card, ready],
+        "pull_request_url": PULL_URL,
+        "pull_request_exists": True,
+        "posts": [
+            {
+                "kind": sks.READY_POST,
+                "ref_digest": sks.ref_digest(READY_TS),
+                "posted": True,
+                "failed": False,
+            }
+        ],
+        "thread_message_digests": sorted(
+            sks.ref_digest(ts) for ts in (KICKOFF_TS, CARD_TS, READY_TS)
+        ),
+        "foreign_messages": 0,
+        "root_posts": 0,
+    }
+
+
 def _passing_ledger(state: Path, *, rehearsal: bool = False) -> None:
     """Every observation a passing run records, in the shapes the driver records them."""
 
@@ -3686,27 +4003,7 @@ def _passing_ledger(state: Path, *, rehearsal: bool = False) -> None:
             ("grant", "transcript_error_classes"): sks.transcript_error_classes(facts.sessions),
             ("grant", "stderr_error_classes"): [],
             ("grant", "terminal_cause"): None,
-            ("progress", "thread"): THREAD,
-            ("progress", "expected_thread"): THREAD,
-            ("progress", "posts"): [
-                {
-                    "kind": kind,
-                    "ref_digest": sks.ref_digest(ts),
-                    "posted": True,
-                    "failed": False,
-                }
-                for kind, ts in (
-                    (sks.PULL_REQUEST_POST, REPLY_TS[1]),
-                    (sks.TERMINAL_POST, REPLY_TS[2]),
-                )
-            ],
-            ("progress", "thread_message_digests"): sorted(
-                sks.ref_digest(ts) for ts in (KICKOFF_TS, *REPLY_TS)
-            ),
-            ("progress", "foreign_messages"): 0,
-            ("progress", "root_posts"): 0,
-            ("progress", "kickoff_reply_outcome"): sks.ADMITTED,
-            ("progress", "pull_request_exists"): True,
+            **{("progress", key): value for key, value in _progress_observations().items()},
         }
         for (section, key), value in run_observations.items():
             ledger.record(section, key, value)
@@ -3788,11 +4085,17 @@ READS: dict[str, tuple[tuple[str, str], ...]] = {
         for key in (
             "thread",
             "expected_thread",
+            "placeholder_ts",
+            "card_ts",
+            "requester_slack_user",
+            "bot_user",
+            "sender_user",
+            "thread_replies",
+            "pull_request_url",
             "posts",
             "thread_message_digests",
             "foreign_messages",
             "root_posts",
-            "kickoff_reply_outcome",
             "pull_request_exists",
         )
     ),
@@ -3951,6 +4254,108 @@ def test_judge_reads_only_the_ledger_through_main(
     assert (code, payload["error"]) == (sks.EXIT_REFUSED, "ledger_missing")
 
 
+def test_progress_card_cleanup_rejudges_recorded_close_422_offline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    argv = [
+        "judge",
+        "--candidate",
+        CANDIDATE,
+        "--state-dir",
+        str(state),
+        "--run-id",
+        RUN_ID,
+        "--criterion",
+        "all",
+    ]
+    try:
+        ledger.record_cleanup(
+            "step:close-run-pulls", "close-run-pulls", "failed", "forge PATCH returned 422"
+        )
+        assert psk.main(argv, environ={"PATH": ""}) == sks.EXIT_FAIL
+        before = _output(capsys)[0]
+        ledger.record(
+            "cleanup",
+            "pull_request_state",
+            {"html_url": PULL_URL, "state": "closed", "merged": False, "closed_at": _stamp(60)},
+        )
+        assert psk.main(argv, environ={"PATH": ""}) == sks.EXIT_PASS
+        after = _output(capsys)[0]
+        assert all(after["checks"].values())
+        assert after["counts"] == before["counts"]
+        assert after["ceiling"] == before["ceiling"]
+        assert ledger.cleanup_rows()[-1]["status"] == "failed"
+        assert ledger.candidate() == CANDIDATE
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "missing",
+        "open",
+        "merged",
+        "unknown-merged",
+        "wrong-pr",
+        "no-run-pr",
+        "inventory-present",
+        "other-status",
+        "other-step",
+    ],
+)
+def test_progress_card_cleanup_rejudge_requires_matching_closed_unmerged_pull(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], invalid: str
+) -> None:
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        pull = {"html_url": PULL_URL, "state": "closed", "merged": False}
+        if invalid == "open":
+            pull["state"] = "open"
+        elif invalid == "merged":
+            pull["merged"] = True
+        elif invalid == "unknown-merged":
+            del pull["merged"]
+        elif invalid == "wrong-pr":
+            pull["html_url"] = f"https://github.com/{REPO}/pull/9"
+        if invalid != "missing":
+            ledger.record("cleanup", "pull_request_state", pull)
+        if invalid == "no-run-pr":
+            ledger.record("progress", "pull_request_url", None)
+        if invalid == "inventory-present":
+            ledger.record_cleanup("inventory:forge_prs", "forge_prs", "present")
+        kind = "delete-run-branches" if invalid == "other-step" else "close-run-pulls"
+        detail = (
+            "forge PATCH returned 403" if invalid == "other-status" else "forge PATCH returned 422"
+        )
+        ledger.record_cleanup(f"step:{kind}", kind, "failed", detail)
+        assert (
+            psk.main(
+                [
+                    "judge",
+                    "--candidate",
+                    CANDIDATE,
+                    "--state-dir",
+                    str(state),
+                    "--run-id",
+                    RUN_ID,
+                    "--criterion",
+                    "cleanup",
+                ],
+                environ={"PATH": ""},
+            )
+            == sks.EXIT_FAIL
+        )
+        assert _output(capsys)[0]["checks"]["cleanup.every_step_ok"] is False
+    finally:
+        ledger.close()
+
+
 # --------------------------------------------------------------------------
 # 7. Read-back: every post in the kickoff's own thread
 # --------------------------------------------------------------------------
@@ -3969,7 +4374,7 @@ def test_read_back_matcher_rejects_a_post_in_another_thread(tmp_path: Path) -> N
         "text": sks.kickoff_text(CURIE_USER, ISSUE_URL),
         "ts": KICKOFF_TS,
         "thread_ts": KICKOFF_TS,
-        "reply_count": 3,
+        "reply_count": 2,
     }
 
     def reply(ts: str, text: str, outcome: str | None = None) -> dict[str, Any]:
@@ -3990,27 +4395,35 @@ def test_read_back_matcher_rejects_a_post_in_another_thread(tmp_path: Path) -> N
 
     thread = [
         root,
-        reply(REPLY_TS[0], "Factory run started for this issue.", sks.ADMITTED),
-        reply(
-            REPLY_TS[1], "Pull request opened: <https://github.com/acme-corp/acme-fixture/pull/8>"
-        ),
-        reply(REPLY_TS[2], "Factory run finished."),
+        {
+            **reply(CARD_TS, _card_body()),
+            "blocks": _finished_card_blocks(),
+        },
+        reply(READY_TS, f"<@{SENDER_USER}> your pull request is ready for review: {PULL_URL}"),
     ]
-    elsewhere = {**thread[3], "ts": "1800000009.000009", "thread_ts": OTHER_ROOT_TS}
+    refusal = reply(REPLY_TS[2], "This run was refused.", sks.ENROLLMENT_INACTIVE)
+    elsewhere = {**thread[2], "ts": "1800000009.000009", "thread_ts": OTHER_ROOT_TS}
     assert sks.kickoff_text(CURIE_USER, ISSUE_URL) == f"<@{CURIE_USER}> [test action] {ISSUE_URL}"
-    assert sks.posts_in_thread([REPLY_TS[1], REPLY_TS[2]], thread, KICKOFF_TS)
-    assert not sks.posts_in_thread([REPLY_TS[1], elsewhere["ts"]], [*thread, elsewhere], KICKOFF_TS)
+    assert sks.posts_in_thread([CARD_TS, READY_TS], thread, KICKOFF_TS)
+    assert not sks.posts_in_thread([READY_TS, elsewhere["ts"]], [*thread, elsewhere], KICKOFF_TS)
     assert not sks.posts_in_thread([], thread, KICKOFF_TS)
     assert not sks.posts_in_thread([None], thread, KICKOFF_TS)
     assert not sks.in_thread(
-        {**thread[3], "ts": KICKOFF_TS, "thread_ts": OTHER_ROOT_TS}, KICKOFF_TS
+        {**thread[2], "ts": KICKOFF_TS, "thread_ts": OTHER_ROOT_TS}, KICKOFF_TS
     )
     assert sks.foreign_messages([*thread, elsewhere], KICKOFF_TS) == 1
     assert sks.thread_digests([*thread, elsewhere], KICKOFF_TS) == sorted(
         sks.ref_digest(str(message["ts"])) for message in thread
     )
-    assert sks.reply_outcome(thread, author=CURIE_USER) == sks.ADMITTED
-    assert sks.reply_outcome(thread, author=SENDER_USER) is None
+    # Refusal replies keep their Outcome text; a card carries none.
+    assert sks.reply_outcome(thread, author=CURIE_USER) is None
+    assert sks.reply_outcome([*thread, refusal], author=CURIE_USER) == sks.ENROLLMENT_INACTIVE
+    assert sks.reply_outcome([*thread, refusal], author=SENDER_USER) is None
+    assert [m["ts"] for m in sks.thread_replies([refusal, *thread, elsewhere], KICKOFF_TS)] == [
+        CARD_TS,
+        READY_TS,
+        REPLY_TS[2],
+    ]
 
     # The ping is answered only by Curie, inside the ping's thread, naming the sender.
     ping = {**root, "text": sks.ping_text(CURIE_USER)}
@@ -4036,6 +4449,274 @@ def test_read_back_matcher_rejects_a_post_in_another_thread(tmp_path: Path) -> N
         assert [name for name, ok in checks.items() if not ok] == [
             "progress.every_post_in_origin_thread"
         ]
+    finally:
+        ledger.close()
+
+
+def _progress_judged(tmp_path: Path, mutate: Callable[[dict[str, Any]], None]) -> list[str]:
+    """The progress checks that fail after ``mutate`` edits the recorded observations."""
+
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        observed = ledger.observations("progress")
+        mutate(observed)
+        for key, value in observed.items():
+            ledger.record("progress", key, value)
+        checks = sks.judge(ledger, "progress")["checks"]
+        return [name.removeprefix("progress.") for name, ok in checks.items() if not ok]
+    finally:
+        ledger.close()
+
+
+def test_progress_card_finished_thread_passes_every_check(tmp_path: Path) -> None:
+    """Behavior: the card as the edited placeholder and first reply, one ready reply
+    mentioning the sender, and nothing else from the bot passes every progress check."""
+
+    assert _progress_judged(tmp_path, lambda observed: None) == []
+    state = _private(tmp_path / "state2")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        result = sks.judge(ledger, "progress")
+        assert set(result["checks"]) == {
+            f"progress.{name}"
+            for name in (
+                "thread_is_kickoff_root",
+                "card_is_placeholder",
+                "card_is_first_reply",
+                "successful_pull_request",
+                "card_finished",
+                "one_ready_reply",
+                "nothing_else_from_the_bot",
+                "no_log_lines",
+                "every_post_delivered",
+                "every_post_in_origin_thread",
+                "no_generated_root",
+                "no_retired_post_kinds",
+                "no_foreign_messages",
+                "ready_posted_when_pull_request",
+            )
+        }
+        assert result["counts"]["progress.bot_replies"] == 2
+    finally:
+        ledger.close()
+
+
+def _edit_card(observed: dict[str, Any], edit: Callable[[list[dict[str, Any]]], None]) -> None:
+    edit(observed["thread_replies"][0]["blocks"])
+
+
+def _inject_log(observed: dict[str, Any], line: str) -> None:
+    observed["thread_replies"][0]["blocks"] = _finished_card_blocks(detail=line)
+
+
+def _drop_ready(observed: dict[str, Any]) -> None:
+    observed["thread_replies"].pop()
+
+
+def _extra_bot_reply(observed: dict[str, Any]) -> None:
+    observed["thread_replies"].append(_bot_reply("1800000005.000005", "Still working."))
+
+
+def _person_first(observed: dict[str, Any]) -> None:
+    observed["thread_replies"].insert(
+        0,
+        {"ts": "1800000001.500000", "user": SENDER_USER, "text": "hello", "blocks": None},
+    )
+
+
+def _ready_without_mention(observed: dict[str, Any]) -> None:
+    observed["thread_replies"][1]["text"] = f"your pull request is ready for review: {PULL_URL}"
+
+
+def _ready_for_another_pull_request(observed: dict[str, Any]) -> None:
+    other = "https://github.com/acme-corp/acme-fixture/pull/9"
+    observed["thread_replies"][1]["text"] = (
+        f"<@{SENDER_USER}> your pull request is ready for review: <{other}>"
+    )
+
+
+def _button_elsewhere(observed: dict[str, Any]) -> None:
+    observed["thread_replies"][0]["blocks"] = _finished_card_blocks(
+        "https://github.com/acme-corp/acme-fixture/pull/9"
+    )
+
+
+def _pending_step(observed: dict[str, Any]) -> None:
+    section = observed["thread_replies"][0]["blocks"][1]["text"]
+    section["text"] = section["text"].replace(
+        ":white_check_mark: Waiting for CI", ":white_circle: Waiting for CI"
+    )
+
+
+def _working_header(observed: dict[str, Any]) -> None:
+    observed["thread_replies"][0]["blocks"][0]["text"]["text"] = "Factory run: working"
+
+
+def _no_ready_row(observed: dict[str, Any]) -> None:
+    observed["posts"] = []
+
+
+def _retired_row(observed: dict[str, Any]) -> None:
+    observed["posts"].append({**observed["posts"][0], "kind": "terminal"})
+
+
+def _root_row(observed: dict[str, Any]) -> None:
+    observed["posts"].append({**observed["posts"][0], "kind": sks.ROOT_POST})
+    observed["root_posts"] = 1
+
+
+def _failed_row(observed: dict[str, Any]) -> None:
+    observed["posts"][0].update(posted=False, failed=True)
+
+
+def _post_elsewhere(observed: dict[str, Any]) -> None:
+    observed["posts"][0]["ref_digest"] = sks.ref_digest("1800000009.000009")
+
+
+@pytest.mark.parametrize(
+    ("mutate", "failing"),
+    [
+        (lambda o: o.update(placeholder_ts="1800000001.900000"), ["card_is_placeholder"]),
+        (lambda o: o.update(placeholder_ts=None), ["card_is_placeholder"]),
+        (_person_first, ["card_is_first_reply"]),
+        (_extra_bot_reply, ["one_ready_reply", "nothing_else_from_the_bot"]),
+        (_drop_ready, ["one_ready_reply", "nothing_else_from_the_bot"]),
+        (_ready_without_mention, ["one_ready_reply"]),
+        (_ready_for_another_pull_request, ["one_ready_reply"]),
+        (lambda o: o.update(requester_slack_user=CURIE_USER), ["one_ready_reply"]),
+        (_button_elsewhere, ["card_finished"]),
+        (_pending_step, ["card_finished"]),
+        (_working_header, ["card_finished"]),
+        (lambda o: _inject_log(o, "Phase plan_review (round 1): ok"), ["no_log_lines"]),
+        (lambda o: _inject_log(o, "Outcome: admitted"), ["no_log_lines"]),
+        (lambda o: _inject_log(o, "Run completed (completed)"), ["no_log_lines"]),
+        (lambda o: _inject_log(o, "PR open: x"), ["no_log_lines"]),
+        (lambda o: _inject_log(o, '{"phase": "plan"}'), ["no_log_lines"]),
+        (_no_ready_row, ["ready_posted_when_pull_request"]),
+        (_retired_row, ["no_retired_post_kinds"]),
+        (_root_row, ["no_generated_root"]),
+        (_failed_row, ["every_post_delivered", "ready_posted_when_pull_request"]),
+        (_post_elsewhere, ["every_post_in_origin_thread"]),
+        (lambda o: o.update(foreign_messages=1), ["no_foreign_messages"]),
+        (lambda o: o.update(thread={**THREAD, "origin": "configured"}), ["thread_is_kickoff_root"]),
+    ],
+)
+def test_progress_card_check_fails_on_its_own_counterexample(
+    tmp_path: Path, mutate: Callable[[dict[str, Any]], None], failing: list[str]
+) -> None:
+    """Behavior: each progress check fails on its own counterexample and on nothing else."""
+
+    assert _progress_judged(tmp_path, mutate) == failing
+
+
+def test_progress_card_failed_run_needs_a_person_and_one_notify_reply(tmp_path: Path) -> None:
+    """Behavior: with no pull request the card shows needs a person and the one notify
+    reply is the needs-person text mentioning the sender; a ready reply there fails."""
+
+    def failed_run(observed: dict[str, Any]) -> None:
+        observed["pull_request_exists"] = False
+        observed["pull_request_url"] = None
+        observed["posts"][0]["kind"] = sks.NEEDS_PERSON_POST
+        card, notify = observed["thread_replies"]
+        card["blocks"] = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "Factory run: needs a person"},
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":raising_hand: *Needs a person.* The plan failed review.",
+                },
+            },
+        ]
+        notify["text"] = f"<@{SENDER_USER}> this run needs you: The plan failed review."
+
+    assert _progress_judged(tmp_path, failed_run) == ["successful_pull_request"]
+
+    def wrong_notify(observed: dict[str, Any]) -> None:
+        failed_run(observed)
+        observed["thread_replies"][1]["text"] = f"<@{SENDER_USER}> your pull request is ready"
+
+    assert _progress_judged(tmp_path / "again", wrong_notify) == [
+        "successful_pull_request",
+        "one_ready_reply",
+    ]
+
+
+def test_progress_card_thread_dump_is_anonymized_and_printed_by_the_judge(tmp_path: Path) -> None:
+    """Behavior: the dump keeps block structure and text shape, replaces user ids, ts values,
+    team ids, URLs and repository names with stable placeholders, and the judge prints it."""
+
+    root = {
+        "type": "message",
+        "user": SENDER_USER,
+        "bot_id": SENDER_BOT,
+        "team": TEAM,
+        "text": sks.kickoff_text(CURIE_USER, ISSUE_URL),
+        "ts": KICKOFF_TS,
+        "thread_ts": KICKOFF_TS,
+    }
+    observed = _progress_observations()
+    replies = [
+        {
+            **reply,
+            "type": "message",
+            "bot_id": CURIE_BOT,
+            "team": TEAM,
+            "thread_ts": KICKOFF_TS,
+            "edited": {"user": CURIE_USER, "ts": reply["ts"]},
+        }
+        for reply in observed["thread_replies"]
+    ]
+    roles = {SENDER_USER: "SENDER", CURIE_USER: "CURIE"}
+    dump = sks.anonymize_thread([replies[1], root, replies[0]], root_ts=KICKOFF_TS, roles=roles)
+    text = json.dumps(dump)
+    for private in (
+        SENDER_USER,
+        CURIE_USER,
+        CURIE_BOT,
+        SENDER_BOT,
+        TEAM,
+        REPO,
+        "acme-corp",
+        "Fix the greeting",
+        *REPLY_TS,
+        KICKOFF_TS,
+    ):
+        assert private not in text
+    assert [message["ts"] for message in dump] == ["TS_1", "TS_2", "TS_3"]
+    assert (
+        dump[0]["text"]
+        == "<@CURIE> [test action] https://github.com/example-org/example-repo/issues/7"
+    )
+    assert dump[1]["edited"] is True
+    assert dump[2]["text"] == (
+        "<@SENDER> your pull request is ready for review: "
+        "<https://github.com/example-org/example-repo/pull/8>"
+    )
+    blocks = dump[1]["blocks"]
+    assert [block["type"] for block in blocks] == ["header", "section", "actions", "context"]
+    assert blocks[0]["text"]["text"] == "Factory run: finished"
+    assert blocks[1]["text"]["text"].startswith(
+        "<https://github.com/example-org/example-repo/issues/7|#7 TITLE>\n"
+        "`example-org/example-repo` Started by <@SENDER>"
+    )
+    assert ":tada: *Done.* Opened pull request #8: TITLE. CI passed." in blocks[1]["text"]["text"]
+    assert blocks[2]["elements"][0]["url"] == "https://github.com/example-org/example-repo/pull/8"
+
+    state = _private(tmp_path / "state")
+    _passing_ledger(state)
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        assert "progress.thread_dump" not in sks.judge(ledger, "progress")["observations"]
+        ledger.record("progress", "thread_dump", dump)
+        assert sks.judge(ledger, "progress")["observations"]["progress.thread_dump"] == dump
+        assert "progress.thread_dump" not in sks.judge(ledger, "slack")["observations"]
     finally:
         ledger.close()
 

@@ -162,6 +162,12 @@ async def read_publication_branch_head(
         base_branch = await publication_base_ref(session, code_host, publication, repository)
         head = await code_host.branch_head(repository, lineage.branch)
     except ForgeError as exc:
+        logger.warning(
+            "Publication branch lookup failed publication_id=%s error=%s reason=%s",
+            publication.id,
+            type(exc).__name__,
+            str(exc) or type(exc).__name__,
+        )
         raise forge_failure(exc) from None
     return PublicationBranchHeadOut(head_sha=head, base_branch=base_branch)
 
