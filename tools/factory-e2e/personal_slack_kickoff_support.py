@@ -923,24 +923,32 @@ def grant_notice_button_url(message: Mapping[str, Any]) -> str | None:
 
 
 def grant_notice_facts(
-    messages: Sequence[Mapping[str, Any]], *, expected: Sequence[str]
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    expected: Sequence[str],
+    counted: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Match each expected issue key to exactly one rejected-plan DM.
 
-    A notice that names none of ``expected`` is ignored. Each expected key
-    must be the only expected key in its message, and that message's own
-    button must carry the Claude plan URL. Two URLs on one message do not
-    cover a second key.
+    A notice that names none of ``expected`` or ``counted`` is ignored.
+    ``counted`` keys add to the count, so a late message for an earlier issue
+    is visible, but they do not have to be present for ``text_ok`` or
+    ``button_url_ok``. Each expected key must be the only key from either set
+    in its message, and that message's own button must carry the Claude plan
+    URL. Two URLs on one message do not cover a second key.
     """
 
     if not expected or any(not key for key in expected):
         raise ValueError("expected issue keys are required")
-    buckets: dict[str, list[Mapping[str, Any]]] = {key: [] for key in expected}
+    if any(not key for key in counted) or any(key in expected for key in counted):
+        raise ValueError("counted issue keys must be nonempty and distinct from expected")
+    keys = [*expected, *counted]
+    buckets: dict[str, list[Mapping[str, Any]]] = {key: [] for key in keys}
     for message in messages:
         text = message_text(message)
         if GRANT_NOTICE_MARK not in text:
             continue
-        hits = [key for key in expected if _names_issue_key(text, key)]
+        hits = [key for key in keys if _names_issue_key(text, key)]
         if len(hits) != 1:
             continue
         buckets[hits[0]].append(message)

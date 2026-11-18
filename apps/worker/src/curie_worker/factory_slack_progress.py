@@ -1524,8 +1524,16 @@ class PostgresFactorySlackStore:
         return None if recipient is None else str(recipient)
 
     async def grant_notice_title(self, work: FactoryGrantNotice) -> str | None:
-        """The first rejected request's issue title, read when the notice is sent."""
+        """The title of the request whose issue key this notice already stored.
 
+        Several runs can fail in one generation. The outbox keeps the first
+        issue key, and a later earlier failure must not lend its title. A
+        missing key returns nothing rather than another issue's title.
+        """
+
+        issue_key = str(work.payload.get("issue_key") or "").strip()
+        if not issue_key:
+            return None
         query = text(
             f"""
             SELECT n.subject_title
@@ -1538,6 +1546,10 @@ class PostgresFactorySlackStore:
                AND w.model_auth_mode = 'personal'
                AND q.status = 'failed'
                AND q.terminal_cause = 'authentication_required'
+               AND COALESCE(
+                       NULLIF(btrim(w.tracker_display_key), ''),
+                       '#' || w.tracker_issue_id
+                   ) = :issue_key
              ORDER BY q.terminal_at NULLS LAST, q.id
              LIMIT 1
             """
@@ -1550,6 +1562,7 @@ class PostgresFactorySlackStore:
                         "tenant_id": work.tenant_id,
                         "principal_id": work.principal_id,
                         "generation": work.generation,
+                        "issue_key": issue_key,
                     },
                 )
             ).scalar_one_or_none()
@@ -1814,11 +1827,8 @@ class FactorySlackProgressLoop:
             await self._store.fail_grant_notice(work, error=GRANT_NOTICE_NO_RECIPIENT)
             logger.info(GRANT_NOTICE_NO_RECIPIENT)
             return False
-        recipient = await self._store.resolve_grant_recipient(work)
-        if not recipient:
-            await self._store.fail_grant_notice(work, error=GRANT_NOTICE_NO_RECIPIENT)
-            logger.info(GRANT_NOTICE_NO_RECIPIENT)
-            return False
+        # The title read is the only await before the link is resolved. A
+        # revoke during that read must not be posted to the earlier user.
         payload = dict(work.payload)
         title = await self._store.grant_notice_title(work)
         if title:
@@ -1828,6 +1838,11 @@ class FactorySlackProgressLoop:
                 work, error=GRANT_NOTICE_TITLE_PENDING, permanent=False
             )
             logger.info(GRANT_NOTICE_TITLE_PENDING)
+            return False
+        recipient = await self._store.resolve_grant_recipient(work)
+        if not recipient:
+            await self._store.fail_grant_notice(work, error=GRANT_NOTICE_NO_RECIPIENT)
+            logger.info(GRANT_NOTICE_NO_RECIPIENT)
             return False
         text_value, links = render_grant_notice(payload)
         try:

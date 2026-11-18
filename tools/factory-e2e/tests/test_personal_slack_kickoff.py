@@ -4267,8 +4267,9 @@ def test_grant_notice_judge_counts_one_message_per_generation(
 
     A URL that is not on the button, two URLs on one message, or a second
     message for the same key does not pass. A notice for another issue is
-    ignored. A second message at the same generation fails the ledger judge.
-    The judge reads no Slack token.
+    ignored unless that issue is counted. A counted earlier issue adds to the
+    count without having to be present. A second message at the same generation
+    fails the ledger judge. The judge reads no Slack token.
     """
 
     button = f"{sks.CONSOLE_ORIGIN}{sks.GRANT_NOTICE_BUTTON_SUFFIX}"
@@ -4286,6 +4287,12 @@ def test_grant_notice_judge_counts_one_message_per_generation(
         "text_ok": True,
         "button_url_ok": True,
     }
+    late = sks.grant_notice_facts(
+        [first, second, _grant_dm("#9")],
+        expected=["#7", "#9"],
+        counted=["#8"],
+    )
+    assert late == {"count": 3, "text_ok": True, "button_url_ok": True}
     pooled = _grant_dm("#7", extra_button=button)
     bare = _grant_dm("#8", button="")
     bare["blocks"] = [

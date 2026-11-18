@@ -5939,16 +5939,15 @@ def test_grant_notice_card_names_the_claude_plan_page(stack: Stack) -> None:
     ]
 
 
-def test_grant_notice_card_does_not_call_a_disconnect_a_rejection(stack: Stack) -> None:
-    """Disconnect and replace are not a provider rejection.
+def test_grant_notice_card_keeps_a_rejection_after_the_owner_reconnects(stack: Stack) -> None:
+    """A recorded provider rejection stays a rejection after the owner reconnects.
 
-    A started personal run that loses its grant still ends
-    ``authentication_required``. The card says the enrollment was replaced or
-    disconnected. The notify reply keeps the shared cause sentence.
+    Deactivating the enrollment, or moving its generation, is that reconnect.
+    The stored cause is still ``authentication_required``, so the card keeps
+    the Claude plan sentence. The notify reply keeps the shared cause sentence.
     """
 
-    raw = cause_text("enrollment_fenced")
-    fence = raw[:1].upper() + raw[1:]
+    rejection = "Your Claude plan was rejected. Reconnect it on the Claude plan page."
     _seed_receiving_identity(stack.identity)
 
     def ended_card(owner: uuid.UUID, *, active: bool, generation: int) -> tuple[str, str]:
@@ -5965,8 +5964,7 @@ def test_grant_notice_card_does_not_call_a_disconnect_a_rejection(stack: Stack) 
     disconnected, _link = _seed_principal(f"U0{stack.tag.upper()}CD")
     _enroll(disconnected)
     card, root = ended_card(disconnected, active=False, generation=1)
-    assert "was rejected" not in card
-    assert fence in card
+    assert rejection in card
     assert _replies(stack, root, NEEDS_YOU) == [
         f"{NEEDS_YOU}{cause_text('authentication_required')}"
     ]
@@ -5974,8 +5972,7 @@ def test_grant_notice_card_does_not_call_a_disconnect_a_rejection(stack: Stack) 
     replaced, _other = _seed_principal(f"U0{stack.tag.upper()}CR")
     _enroll(replaced)
     card, root = ended_card(replaced, active=True, generation=2)
-    assert "was rejected" not in card
-    assert fence in card
+    assert rejection in card
     assert _replies(stack, root, NEEDS_YOU) == [
         f"{NEEDS_YOU}{cause_text('authentication_required')}"
     ]

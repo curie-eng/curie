@@ -9,9 +9,13 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from curie_internal.factory_cause import cause_text
+from curie_worker.factory_slack_card import CardRequest, CardSubject, render_card
+from sqlalchemy import text
 
 from apps.api.tests.conftest import _disposable_db as _disposable_db
 from apps.api.tests.conftest import clean_db as clean_db
@@ -297,3 +301,122 @@ def test_grant_notice_reads_the_title_when_it_sends(stack: Stack) -> None:
     assert f"#{bare_number} stopped" in line
     assert "  " not in line
     assert "Never filled" not in line
+
+
+def test_grant_notice_revoked_during_the_title_read_is_not_sent(stack: Stack) -> None:
+    """A link revoked while the title is read is not the recipient.
+
+    The title query is the await before resolution. Revoking inside that await
+    leaves no direct message and records ``grant_notice_no_recipient``.
+    """
+
+    tag = stack.tag.upper()
+    _seed_receiving_identity(stack.identity)
+    slack_user = f"U0{tag}TQ"
+    owner, link = _seed_principal(slack_user)
+    assert link is not None
+    _enroll(owner)
+    _personal_failure(stack, owner, title="During the title read")
+    _materialize_grant(stack)
+    store = stack.worker.progress._store
+    original = store.grant_notice_title
+
+    async def title_then_revoke(work: Any) -> str | None:
+        title = await original(work)
+        async with store._engine.begin() as connection:
+            updated = await connection.execute(
+                text(
+                    "UPDATE curie.identity_links SET revoked_at = now() "
+                    "WHERE id = :id RETURNING id"
+                ),
+                {"id": link},
+            )
+            assert updated.first() is not None
+        return title
+
+    store.grant_notice_title = title_then_revoke
+    try:
+        stack.drain()
+    finally:
+        store.grant_notice_title = original
+    assert _direct_messages(stack, slack_user) == []
+    (row,) = _grant_rows(owner)
+    assert row["posted_at"] is None
+    assert row["failed_at"] is not None
+    assert row["last_error"] == "grant_notice_no_recipient"
+    assert row["attempts"] == 0
+
+
+def test_grant_notice_title_matches_the_outbox_issue(stack: Stack) -> None:
+    """The send reads the title of the issue key the outbox stored.
+
+    A later failure backdated ahead of that issue must not replace the title.
+    """
+
+    tag = stack.tag.upper()
+    _seed_receiving_identity(stack.identity)
+    slack_user = f"U0{tag}TI"
+    owner, _link = _seed_principal(slack_user)
+    _enroll(owner)
+    number_b = _personal_failure(stack, owner, title="Placeholder")
+    request_b = _clear_title(owner)
+    _materialize_grant(stack)
+    owed = _grant_rows(owner)[0]
+    assert owed["payload"]["issue_key"] == f"#{number_b}"
+    assert "title" not in owed["payload"]
+    number_a = _personal_failure(stack, owner, title="Alpha", age_s=300)
+    _stamp_title(request_b, "Beta")
+    stack.drain()
+    (posted,) = _direct_messages(stack, slack_user)
+    text_value = str(posted.params["text"])
+    assert f"#{number_b}" in text_value
+    assert "Beta" in text_value
+    assert "Alpha" not in text_value
+    assert f"#{number_a}" not in text_value
+
+
+def _needs_person_card(*, cause: str, personal: bool) -> str:
+    now = datetime(2026, 11, 18, tzinfo=UTC)
+    subject = CardSubject(
+        repository="acme/widgets",
+        issue_label="#7",
+        issue_title="Fix the greeting",
+        issue_url="https://github.com/acme/widgets/issues/7",
+        requester_slack_user=None,
+        requester_login=None,
+    )
+    request = CardRequest(
+        status="failed",
+        terminal_cause=cause,
+        first=True,
+        declaration=None,
+        reports=(),
+        started_at=now,
+        terminal_at=now,
+        published_at=None,
+        pr_number=None,
+        pr_url=None,
+        pr_title=None,
+        plan_still_connected=False,
+        personal=personal,
+    )
+    return render_card(subject, request, now=now).message.text
+
+
+def test_grant_notice_card_uses_the_recorded_cause() -> None:
+    """Copy follows the recorded cause, including after the enrollment moves.
+
+    ``plan_still_connected`` is false, which is the reconnect that used to flip
+    a provider rejection onto the enrollment fence sentence.
+    """
+
+    rejection = "Your Claude plan was rejected. Reconnect it on the Claude plan page."
+    assert rejection in _needs_person_card(cause="authentication_required", personal=True)
+    fence = cause_text("enrollment_fenced")
+    fenced = _needs_person_card(cause="enrollment_fenced", personal=True)
+    assert fence[:1].upper() + fence[1:] in fenced
+    assert "was rejected" not in fenced
+    shared = cause_text("authentication_required")
+    service = _needs_person_card(cause="authentication_required", personal=False)
+    assert shared[:1].upper() + shared[1:] in service
+    assert rejection not in service

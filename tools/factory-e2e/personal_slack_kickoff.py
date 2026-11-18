@@ -4008,7 +4008,9 @@ class LiveRun:
         third_key = self._grant_issue_key(third)
         self._post_grant_kickoff(kit, third)
         self._wait_rejected_grant(int(third["number"]))
-        again = self._wait_grant_dms(kit, int(opened["count"]) + 1, [first_key, third_key])
+        again = self._wait_grant_dms(
+            kit, int(opened["count"]) + 1, [first_key, third_key], counted=[second_key]
+        )
         self.ledger.record("grant-notice", "dm_count_after_replace", again["count"])
         self.ledger.record("grant-notice", "replace_text_ok", again["text_ok"])
         self.ledger.record("grant-notice", "replace_button_ok", again["button_url_ok"])
@@ -4076,17 +4078,24 @@ class LiveRun:
                 keys.append(f"#{number}")
         return keys
 
-    def _grant_dm_facts(self, kit: SlackKit, expected: Sequence[str]) -> dict[str, Any]:
+    def _grant_dm_facts(
+        self, kit: SlackKit, expected: Sequence[str], *, counted: Sequence[str] = ()
+    ) -> dict[str, Any]:
         messages = kit.curie.direct_history(kit.sender_auth.user_id)
-        return sks.grant_notice_facts(messages, expected=expected)
+        return sks.grant_notice_facts(messages, expected=expected, counted=counted)
 
     def _wait_grant_dms(
-        self, kit: SlackKit, minimum: int, expected: Sequence[str]
+        self,
+        kit: SlackKit,
+        minimum: int,
+        expected: Sequence[str],
+        *,
+        counted: Sequence[str] = (),
     ) -> dict[str, Any]:
         found: dict[str, Any] = {}
 
         def ready() -> bool:
-            found.update(self._grant_dm_facts(kit, expected))
+            found.update(self._grant_dm_facts(kit, expected, counted=counted))
             return (
                 int(found.get("count") or 0) >= minimum
                 and found.get("text_ok") is True
