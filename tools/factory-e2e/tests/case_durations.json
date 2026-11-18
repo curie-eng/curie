@@ -7,7 +7,6 @@
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_continuation_revalidates_current_authority[removed_binding-factory_binding_missing-restarted]": 172.68,
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_continuation_revalidates_current_authority[tracker_surface-factory_surface_mismatch-held]": 171.09,
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_continuation_revalidates_current_authority[tracker_surface-factory_surface_mismatch-restarted]": 205.48,
-  "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_duplicate_effective_label_is_refused_at_admission": 112.21,
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_execute_revalidates_current_authority[agent_tenant-factory_tenant_mismatch]": 130.46,
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_execute_revalidates_current_authority[binding_owner-factory_binding_missing]": 367.17,
   "tools/factory-e2e/tests/test_c4_admitted_agent.py::test_execute_revalidates_current_authority[binding_tenant-factory_tenant_mismatch]": 129.26,
