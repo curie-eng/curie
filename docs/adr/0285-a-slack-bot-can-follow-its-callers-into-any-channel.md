@@ -1,4 +1,4 @@
-# 248. A Slack bot can follow its callers into any channel
+# 285. A Slack bot can follow its callers into any channel
 
 Date: 2026-10-24
 
