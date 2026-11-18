@@ -151,8 +151,10 @@ stackless Playwright suite; run `pnpm test`/`pnpm e2e` locally to match it.
 allowlist (currently `ARCHITECTURE.md`) carries a line-number citation, that every cited
 path and Python symbol resolves, that each graded seam's `grade:` agrees with the row its
 `vision_row:` names in `docs/architecture-vision.md`, that no two ADRs under
-`docs/adr/` claim the same number prefix, and that every `curie ...` command named in
-`docs/agents.md` resolves against `cli/command-manifest.json`. Run it after editing any interface-catalog doc
+`docs/adr/` claim the same number prefix across the working tree, `origin/main`,
+`origin/next`, and open PR additions (failing closed if that remote scan cannot
+run), and that every `curie ...` command named in `docs/agents.md` resolves
+against `cli/command-manifest.json`. Run it after editing any interface-catalog doc
 and commit the regenerated files; CI runs the same check (`scripts/check-docs.sh`) in the
 `python-static` job. To exempt a genuinely illustrative example path, put
 `<!-- doclint:ignore-line -->` on that line (or the line before it).
