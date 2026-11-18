@@ -564,6 +564,46 @@ def test_github_link_unconfigured_is_hidden_and_404(
     assert callback(api, start(api, owner), owner).headers["location"].endswith("github=linked")
 
 
+@pytest.mark.parametrize("configured", [True, False])
+@pytest.mark.parametrize(
+    "header",
+    [
+        "X-API-Key",
+        "X-Curie-Approval-Principal",
+        "X-Curie-Adapter-Principal",
+        "X-Curie-Worker-Token",
+    ],
+)
+def test_github_link_callback_refuses_foreign_credentials_and_consumes_state(
+    github_link_api: tuple[TestClient, GitHub],
+    github_link_owners: list[support.Owner],
+    header: str,
+    configured: bool,
+) -> None:
+    api, github = github_link_api
+    owner = github_link_owners[0]
+    state = start(api, owner)
+    api.cookies.clear()
+    settings = {} if configured else {"FACTORY_GITHUB_APP_CLIENT_ID": ""}
+    with support.environment(settings):
+        response = api.get(
+            CALLBACK,
+            params={"state": state, "code": "good"},
+            headers={**owner.headers(origin=None), header: "EXAMPLE-foreign-credential"},
+            follow_redirects=False,
+        )
+    assert response.status_code == 401
+    assert "location" not in response.headers
+    assert github.exchanges == 0
+    assert links(api, owner)["links"] == []
+    [row] = sql_dicts(
+        "SELECT consumed_at FROM curie.github_link_states WHERE state_hash = :hash",
+        {"hash": hashlib.sha256(state.encode()).hexdigest()},
+    )
+    assert row["consumed_at"] is not None
+    assert callback(api, state, owner).headers["location"].endswith("github=failed")
+
+
 def test_github_link_requires_principal_and_same_origin(
     github_link_api: tuple[TestClient, GitHub], github_link_owners: list[support.Owner]
 ) -> None:

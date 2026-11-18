@@ -309,7 +309,9 @@ async def prepare(request: Request) -> bool:
     key = request.headers.get("X-API-Key")
     if request.url.path.startswith("/identity/me/github-link"):
         from .identity.github_link import require_configuration
+        from .routers.personal_enrollments import require_owner_session_only
 
+        await require_owner_session_only(request)
         require_configuration(get_settings())
     if request.url.path.startswith(("/identity/authorities", "/identity/roles")):
         await require_platform_key(key)

@@ -59,7 +59,7 @@ def _enabled() -> None:
 @router.get(
     "/links",
     response_model=OwnedLinksOut,
-    dependencies=[Depends(_enabled), Depends(require_owner_session_only)],
+    dependencies=[Depends(require_owner_session_only), Depends(_enabled)],
 )
 async def list_links(principal: OwnerDep, session: SessionDep) -> OwnedLinksOut:
     rows = (
@@ -97,7 +97,7 @@ async def list_links(principal: OwnerDep, session: SessionDep) -> OwnedLinksOut:
 @router.delete(
     "/links/{link_id}",
     response_model=IdentityLinkRevokedOut,
-    dependencies=[Depends(_enabled), Depends(require_owner_session_only)],
+    dependencies=[Depends(require_owner_session_only), Depends(_enabled)],
 )
 async def unlink(
     link_id: uuid.UUID, principal: OwnerDep, _origin: SameOriginDep, session: SessionDep
@@ -202,7 +202,6 @@ async def github_link_callback(
     flow_session: Annotated[str | None, Cookie(alias=FLOW_COOKIE)] = None,
 ) -> RedirectResponse:
     settings = get_settings()
-    config = github_link.require_configuration(settings)
     state = request.query_params.get("state", "")
     row = (
         await session.execute(
@@ -221,11 +220,9 @@ async def github_link_callback(
         )
     ).one_or_none()
     await session.commit()
+    await require_owner_session_only(request)
+    config = github_link.require_configuration(settings)
     if row is None or row.expires_at <= row.consumed_at:
-        return _result("failed")
-    try:
-        await require_owner_session_only(request)
-    except HTTPException:
         return _result("failed")
     principal = await authorized_console_principal(session, console_session or flow_session or "")
     code = request.query_params.get("code", "")
