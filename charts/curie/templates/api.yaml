@@ -275,10 +275,10 @@ spec:
             - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
               value: {{ .Values.worker.workspace.maxArchiveBytes | int64 | quote }}
             {{- end }}
-            {{- if eq (include "curie.publicationCandidatesEnabled" .) "true" }}
-            # Publication candidates (#5428); recovery may already render the archive limit.
             - name: CURIE_PUBLICATION_CANDIDATES_ENABLED
-              value: "true"
+              value: {{ include "curie.publicationCandidatesEnabled" . | quote }}
+            {{- if eq (include "curie.publicationCandidatesEnabled" .) "true" }}
+            {{- /* Publication candidates (#5428). Recovery may already render the archive limit. */}}
             - name: CURIE_PUBLICATION_CANDIDATE_MAX_BYTES
               value: {{ include "curie.publicationCandidateMaxBytes" . | quote }}
             {{- if ne (include "curie.workspaceRecoveryEnabled" .) "true" }}

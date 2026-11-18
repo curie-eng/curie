@@ -248,6 +248,11 @@ jobs:
       - name: helm render assertions (workspace recovery)
         run: bash charts/curie/ci/workspace-recovery-assertions.sh
 
+      # Prove publication candidates default on, render off when workspaces are
+      # off, and still refuse a bad byte cap while workspaces are on.
+      - name: helm render assertions (publication candidates)
+        run: bash charts/curie/ci/publication-candidates-assertions.sh
+
       # Prove the retired BYO-model LiteLLM sidecar (issue #253) is absent by
       # default and that enabling its values flag is refused by the chart
       # guard. Runs the chart-owned assertion script.

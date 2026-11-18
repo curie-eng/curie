@@ -2149,13 +2149,15 @@ scratch volume, does not release it. A gated retry that is never released
 expires as `retry_condition_expired` naming its condition. A clean
 `sandbox_node_disrupted` failure is retried on the ordinary backoff.
 
-Publication recovery needs retained candidates, which are off by default. Set
-`worker.workspace.publicationCandidates.enabled` to true. That requires
-`agentSandbox.runner.workspace.enabled` and the internal worker token.
-`worker.workspace.publicationCandidates.maxBytes`, default 1073741824, caps
-all candidate bytes. Curie then keeps a private copy of each factory run's
-base and patch from before validation until 24 hours after the request's
-final disposition. With the switch off, a failed publication settles
+Publication recovery needs retained candidates.
+`worker.workspace.publicationCandidates.enabled` is on by default. Set it to
+false to turn retention off. Candidates still need
+`agentSandbox.runner.workspace.enabled` and the internal worker token. When
+workspaces are off, the chart renders the switch off and the install still
+succeeds. `worker.workspace.publicationCandidates.maxBytes`, default
+1073741824, caps all candidate bytes. Curie then keeps a private copy of each
+factory run's base and patch from before validation until 24 hours after the
+request's final disposition. With the switch off, a failed publication settles
 needs-human and nothing is recovered.
 
 Upgrade note: the finish route now requires `retry_safety`. A worker from an
