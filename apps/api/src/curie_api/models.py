@@ -29,11 +29,13 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    ColumnElement,
     UniqueConstraint,
     func,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .approval_wording import approval_display, describe_approval
@@ -1465,6 +1467,13 @@ class ExecutionRequest(Base):
             "OR (retry_condition_retry_at IS NULL AND retry_condition_scope_key IS NULL)",
             name="execution_requests_retry_condition_ck",
         ),
+        # Migration 0182: a guarded request's dispatch_not_before holds its
+        # waiting deadline, so no older dispatcher's claim matches it.
+        CheckConstraint(
+            "guarded_dispatch_not_before IS NULL "
+            "OR (wait_deadline IS NOT NULL AND dispatch_not_before >= wait_deadline)",
+            name="execution_requests_guarded_dispatch_ck",
+        ),
         # Migration 0175 (#5429): a publication recovery request names one
         # retained candidate by id and digest; a trigger keeps them immutable.
         CheckConstraint(
@@ -1521,6 +1530,13 @@ class ExecutionRequest(Base):
             "ix_execution_requests_dispatch_due",
             "dispatch_not_before",
             postgresql_where=text("status = 'waiting'"),
+        ),
+        Index(
+            "ix_execution_requests_guarded_dispatch_due",
+            "guarded_dispatch_not_before",
+            postgresql_where=text(
+                "status = 'waiting' AND guarded_dispatch_not_before IS NOT NULL"
+            ),
         ),
         Index(
             "ix_execution_requests_queued",
@@ -1583,6 +1599,14 @@ class ExecutionRequest(Base):
     published_generation: Mapped[int | None] = mapped_column(default=None)
     dispatch_not_before: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+    # The dispatch time only this release's dispatcher reads (migration 0182).
+    # Set for a resource gated retry and a publication recovery successor,
+    # which an older dispatcher would start as an ordinary implementation
+    # attempt; dispatch_not_before then holds the waiting deadline, kept there
+    # by a trigger. Read the effective time through ``dispatch_due``.
+    guarded_dispatch_not_before: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
     )
     dispatch_owner: Mapped[str | None] = mapped_column(Text, default=None)
     dispatch_epoch: Mapped[int] = mapped_column(
@@ -1694,6 +1718,18 @@ class ExecutionRequest(Base):
     work_item: Mapped[WorkItem] = relationship(
         back_populates="execution_requests", foreign_keys=[work_item_id]
     )
+
+    @hybrid_property
+    def dispatch_due(self) -> datetime:
+        """When this release's dispatcher may claim the request."""
+
+        guarded = self.guarded_dispatch_not_before
+        return guarded if guarded is not None else self.dispatch_not_before
+
+    @dispatch_due.inplace.expression
+    @classmethod
+    def _dispatch_due_expression(cls) -> ColumnElement[datetime]:
+        return func.coalesce(cls.guarded_dispatch_not_before, cls.dispatch_not_before)
 
 
 def new_card_token() -> str:

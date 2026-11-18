@@ -308,7 +308,7 @@ async def retry_work_item(
         "disposition": kind,
         "predecessor_request_id": predecessor.id,
         "predecessor_cause": cause,
-        "successor_dispatch_not_before": successor.dispatch_not_before,
+        "successor_dispatch_not_before": successor.dispatch_due,
         "successor_blocked_on": successor.blocked_on,
         "work_item_version": after.version,
         "retries_used": after.automatic_retries_used,

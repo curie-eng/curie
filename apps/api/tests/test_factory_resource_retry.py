@@ -37,6 +37,7 @@ from test_factory_retry import (
     _agent,
     _call,
     _configure,
+    _due,
     _execute,
     _expire_wait,
     _finish,
@@ -250,7 +251,7 @@ def test_clean_limit_failure_admits_one_gated_successor_with_the_delivered_limit
     }
     # A gated wait is probed, not slept until its waiting deadline.
     terminal_at = predecessor["terminal_at"]
-    due = successor["dispatch_not_before"]
+    due = _due(successor)
     assert terminal_at + _probe() <= due <= terminal_at + _probe() + timedelta(seconds=5)
     assert due < successor["wait_deadline"]
 
@@ -384,7 +385,7 @@ def test_gated_row_is_offered_only_after_its_probe_and_an_unmet_defer_is_uncount
         successor["capacity_deferrals"],
     )
     assert row["last_deferral_reason"] == "resource_gate_unmet"
-    assert now + _probe() - timedelta(seconds=5) <= row["dispatch_not_before"] <= now + _probe()
+    assert now + _probe() - timedelta(seconds=5) <= _due(row) <= now + _probe()
     assert row["acquire_owner"] is None
 
     # Not offered again before the next probe.
@@ -654,7 +655,7 @@ def test_node_disruption_admits_a_scheduled_ungated_successor_fenced_on_its_pred
     successor = _successor(item.request_id)
     assert successor is not None
     assert (successor["blocked_on"], successor["resource_gate"]) == (None, None)
-    backoff = successor["dispatch_not_before"] - predecessor["terminal_at"]
+    backoff = _due(successor) - predecessor["terminal_at"]
     assert timedelta(seconds=24) <= backoff <= timedelta(seconds=37)
 
     generation, grant = _offer(api, successor["id"])
@@ -671,7 +672,7 @@ def test_node_disruption_admits_a_scheduled_ungated_successor_fenced_on_its_pred
         successor["start_deferrals"],
         successor["capacity_deferrals"],
     )
-    assert now + _probe() - timedelta(seconds=5) <= row["dispatch_not_before"] <= now + _probe()
+    assert now + _probe() - timedelta(seconds=5) <= _due(row) <= now + _probe()
 
     # Liveness: once the claim is gone the ungated successor starts with any limits.
     generation, grant = _offer(api, successor["id"])

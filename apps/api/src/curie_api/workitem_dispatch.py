@@ -768,7 +768,9 @@ async def claim_due(
         .where(
             ExecutionRequest.status == "waiting",
             ExecutionRequest.wait_deadline > func.clock_timestamp(),
-            ExecutionRequest.dispatch_not_before <= func.clock_timestamp(),
+            # A guarded request's own dispatch time; its dispatch_not_before
+            # holds the waiting deadline so an older claim never matches it.
+            ExecutionRequest.dispatch_due <= func.clock_timestamp(),
             # A successor blocked on a typed condition is never dispatched
             # (ADR 0269), except a resource gate, which is offered every probe
             # so the worker can check the current limit (#5427).
@@ -806,7 +808,7 @@ async def claim_due(
                 ExecutionRequest.dispatch_lease_expires_at <= func.clock_timestamp(),
             ),
         )
-        .order_by(ExecutionRequest.dispatch_not_before)
+        .order_by(ExecutionRequest.dispatch_due)
         .limit(limit)
         .with_for_update(skip_locked=True)
     )
@@ -1558,7 +1560,7 @@ async def _apply_deferral(
     if not fails_start:
         result = DeferResult(
             dispatch_generation=request.dispatch_generation,
-            not_before=request.dispatch_not_before,
+            not_before=request.dispatch_due,
         )
         await session.commit()
         return result
@@ -2016,7 +2018,7 @@ async def finish(
     cause: str,
     detail: str | None,
     ci_fix_round: int | None,
-    retry_safety: RetrySafety,
+    retry_safety: RetrySafety | None,
     retry_condition: RetryConditionFact | None,
     exhausted_volume: str | None,
 ) -> WorkItemOutcome | DispatchConflict:
@@ -2538,7 +2540,7 @@ def request_view(row: ExecutionRequest) -> dict[str, Any]:
         "version": row.version,
         "dispatch_generation": row.dispatch_generation,
         "published_generation": row.published_generation,
-        "dispatch_not_before": row.dispatch_not_before,
+        "dispatch_not_before": row.dispatch_due,
         "capacity_deferrals": row.capacity_deferrals,
         "last_deferral_reason": row.last_deferral_reason,
         "last_start_failure_detail": row.last_start_failure_detail,
