@@ -20,6 +20,8 @@ Seven subcommands share one private SQLite ledger under ``--state-dir``:
    runs the disconnected control, then the full finalizer. ``rehearse --kickoff``
    also runs the kickoff and read-back on that never-issued token (no grant
    probe), so the paid path's diagnostics are captured with nothing to spend.
+   ``rehearse --grant-notice`` posts three unpaid kickoffs on that token and
+   records the rejected-plan direct messages for ``judge --criterion grant-notice``.
 5. ``run`` (also reachable as ``--live``) performs exactly one paid kickoff and
    the disconnected control, then finalizes every owned resource.
 6. ``refusal-connect`` (unpaid, no grant) proves the two private plan refusals.
@@ -133,6 +135,10 @@ RECEIPT_SECONDS = 90.0
 ADMISSION_SECONDS = 180.0
 REPLY_SECONDS = 240.0
 NOTIFY_POST_SECONDS = 600.0
+# A rejected grant ends after the runner starts. The DM follows on the progress pass.
+GRANT_NOTICE_TERMINAL_SECONDS = STARTUP_SECONDS
+GRANT_NOTICE_DM_SECONDS = 180.0
+GRANT_NOTICE_QUIET_SECONDS = 30.0
 CARD_SETTLE_SECONDS = 120.0
 PLACEHOLDER_SECONDS = 30.0
 CONTROL_QUIET_SECONDS = 30.0
@@ -516,6 +522,8 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "rehearse":
             # The kickoff and read-back on the rehearsal's own never-issued token.
             sub.add_argument("--kickoff", action="store_true")
+            # Three unpaid kickoffs: one DM, none more, then one more after replace.
+            sub.add_argument("--grant-notice", action="store_true")
         if name == "run":
             # The item's ledger across attempts: its cap and what earlier attempts were
             # charged, both from the caller's approval.
@@ -523,7 +531,9 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--item-charged-before", type=int, required=True)
         if name == "judge":
             sub.add_argument(
-                "--criterion", required=True, choices=[*sks.CRITERIA, "refusal-connect", "all"]
+                "--criterion",
+                required=True,
+                choices=[*sks.CRITERIA, "grant-notice", "refusal-connect", "all"],
             )
     return parser
 
@@ -1597,9 +1607,12 @@ def cmd_rehearse(args: argparse.Namespace, runtime: Runtime) -> int:
     ``--kickoff`` adds the kickoff and read-back, enrolled with the rehearsal's own
     never-issued token so nothing can be spent: the ceiling is ``--approve-live``
     and the live window ends at ``--grant-expires-at``, both required with it and
-    refused without it. ``--grant-file`` is refused either way.
+    refused without it. ``--grant-file`` is refused either way. ``--grant-notice``
+    is the unpaid rejected-plan leg and takes neither the ceiling nor a grant file.
     """
 
+    if args.kickoff and args.grant_notice:
+        raise sks.Refusal("arguments_invalid", "rehearse takes one of --kickoff or --grant-notice")
     supplied = [
         flag
         for flag, value, allowed in (
@@ -1637,6 +1650,7 @@ def cmd_rehearse(args: argparse.Namespace, runtime: Runtime) -> int:
         ledger=ledger,
         ceiling=ceiling,
         kickoff_diagnostic=ceiling is not None,
+        grant_notice=args.grant_notice,
     ).execute()
 
 
@@ -1686,6 +1700,7 @@ class LiveRun:
         shell: Shell | None = None,
         resolver: Callable[[str], list[str]] | None = None,
         kickoff_diagnostic: bool = False,
+        grant_notice: bool = False,
     ) -> None:
         self.inputs = inputs
         self.runtime = runtime
@@ -1693,6 +1708,7 @@ class LiveRun:
         self.ceiling = ceiling
         # ``rehearse --kickoff``: the run path's kickoff on the rehearsal's invalid token.
         self.kickoff_diagnostic = kickoff_diagnostic
+        self.grant_notice = grant_notice
         self.rehearsal = ceiling is None or kickoff_diagnostic
         self.command = "rehearse" if self.rehearsal else "run"
         self.clock = runtime.clock
@@ -1792,7 +1808,9 @@ class LiveRun:
             ("enroll", self.phase_enroll),
             ("fixtures", self.phase_fixtures),
         ]
-        if not self.rehearsal or self.kickoff_diagnostic:
+        if self.grant_notice:
+            phases.append(("grant-notice", self.phase_grant_notice))
+        elif not self.rehearsal or self.kickoff_diagnostic:
             phases += [("kickoff", self.phase_kickoff), ("read-back", self.phase_read_back)]
         phases.append(("control", self.phase_control))
         if self.rehearsal:
@@ -3949,6 +3967,136 @@ class LiveRun:
     def publication(self, publication_id: str) -> dict[str, Any]:
         value = self.require_api().get(f"/publications/{publication_id}")
         return value if isinstance(value, dict) else {}
+
+    # -- phase: rejected-plan direct message (#5720) ----------------------------------------
+
+    def phase_grant_notice(self) -> None:
+        """Three unpaid kickoffs on a never-issued token.
+
+        The first rejection posts one DM. A second kickoff at the same generation
+        posts none. ``subscription replace`` with another never-issued token, then
+        a third kickoff, posts exactly one more. The button URL ends at the
+        Claude plan page.
+        """
+
+        kit = self.require_kit()
+        first = self.issues["a"]
+        second = self._open_grant_issue("grant-same")
+        self._post_grant_kickoff(kit, first)
+        self._wait_rejected_grant(int(first["number"]))
+        opened = self._wait_grant_dms(kit, 1)
+        self.ledger.record("grant-notice", "dm_count_after_first", opened["count"])
+        self.ledger.record("grant-notice", "first_text_ok", opened["text_ok"])
+        self.ledger.record("grant-notice", "first_button_ok", opened["button_url_ok"])
+
+        self._post_grant_kickoff(kit, second)
+        self._wait_rejected_grant(int(second["number"]))
+        held = self._hold_grant_dm_count(kit, int(opened["count"]))
+        self.ledger.record("grant-notice", "dm_count_after_second", held["count"])
+        self.ledger.record("grant-notice", "second_settled", held["count"] == opened["count"])
+
+        generation = self.owner.get("generation")
+        token_file = self._never_issued_token("grant-notice-replace")
+        code, _body = self.subscription("replace", "--token-file", str(token_file))
+        _status_code, status = self.subscription("status")
+        replaced = status.get("generation")
+        if code != 0 or type(replaced) is not int or replaced == generation:
+            raise StepFailed("subscription replace did not move the generation")
+        third = self._open_grant_issue("grant-replaced")
+        self._post_grant_kickoff(kit, third)
+        self._wait_rejected_grant(int(third["number"]))
+        again = self._wait_grant_dms(kit, int(opened["count"]) + 1)
+        self.ledger.record("grant-notice", "dm_count_after_replace", again["count"])
+        self.ledger.record("grant-notice", "replace_text_ok", again["text_ok"])
+        self.ledger.record("grant-notice", "replace_button_ok", again["button_url_ok"])
+
+    def _open_grant_issue(self, label: str) -> dict[str, Any]:
+        forge = self.require_forge()
+        body = FIXTURE_ISSUE.read_text().replace("{nonce}", f"{self.nonce}-{label}")
+        title_match = _ISSUE_TITLE.match(body.splitlines()[0])
+        title = f"{title_match.group(1) if title_match else 'Fixture'} ({label})"
+        issue = forge.call(
+            "POST", forge.repo_path("/issues"), {"title": title, "body": body}, ok=(201,)
+        )
+        number = issue.get("number") if isinstance(issue, dict) else None
+        url = issue.get("html_url") if isinstance(issue, dict) else None
+        if not isinstance(number, int) or not isinstance(url, str):
+            raise StepFailed("a grant-notice issue was not created")
+        planted = {"number": number, "url": url}
+        self.issues[label] = planted
+        return planted
+
+    def _post_grant_kickoff(self, kit: SlackKit, issue: Mapping[str, Any]) -> str:
+        url = issue.get("url")
+        if not isinstance(url, str):
+            raise StepFailed("a grant-notice issue has no url")
+        ts = kit.sender.post(kit.channel, sks.kickoff_text(kit.curie_auth.user_id, url))
+        self.roots.append(ts)
+        return ts
+
+    def _wait_rejected_grant(self, number: int) -> None:
+        wanted = str(number)
+
+        def rejected() -> bool:
+            for item in self.work_item_rows():
+                if str(item.get("tracker_issue_id")) != wanted:
+                    continue
+                self.work_item_id = str(item.get("id") or "")
+                rows = self.request_rows()
+                if not rows:
+                    return False
+                latest = rows[-1]
+                return (
+                    latest.get("terminal") is True
+                    and latest.get("terminal_cause") == sks.AUTH_TERMINAL_CAUSE
+                )
+            return False
+
+        self.wait_until(
+            rejected,
+            seconds=GRANT_NOTICE_TERMINAL_SECONDS + ADMISSION_SECONDS,
+            what=f"issue {number} rejected the grant",
+            every=5,
+        )
+
+    def _grant_dm_facts(self, kit: SlackKit) -> dict[str, Any]:
+        messages = kit.curie.direct_history(kit.sender_auth.user_id)
+        return sks.grant_notice_facts(messages)
+
+    def _wait_grant_dms(self, kit: SlackKit, minimum: int) -> dict[str, Any]:
+        found: dict[str, Any] = {}
+
+        def ready() -> bool:
+            found.update(self._grant_dm_facts(kit))
+            return int(found.get("count") or 0) >= minimum
+
+        self.wait_until(
+            ready,
+            seconds=GRANT_NOTICE_DM_SECONDS,
+            what="the rejected-plan direct message",
+            every=5,
+        )
+        return found
+
+    def _hold_grant_dm_count(self, kit: SlackKit, expected: int) -> dict[str, Any]:
+        deadline = self.clock.monotonic() + GRANT_NOTICE_QUIET_SECONDS
+        last: dict[str, Any] = {}
+        while True:
+            last = self._grant_dm_facts(kit)
+            if int(last.get("count") or 0) != expected:
+                raise StepFailed("a same-generation kickoff posted another grant notice")
+            if self.clock.monotonic() >= deadline:
+                return last
+            self.clock.wait(5)
+
+    def _never_issued_token(self, name: str) -> Path:
+        """A well-formed token that was never issued. The value stays in the file."""
+
+        invalid = self.scrubber.hold(sks.HeldSecret("sk-ant-oat01-" + secrets.token_urlsafe(72)))
+        path = self.inputs.work_dir / name
+        write_private(path, invalid.reveal().encode() + b"\n")
+        self.finalizer.register(f"remove-{name}", lambda: path.unlink(True))
+        return path
 
     # -- phase: the disconnected control ----------------------------------------------------
 

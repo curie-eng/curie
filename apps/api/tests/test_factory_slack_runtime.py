@@ -374,6 +374,7 @@ async def _worker(
                 progress_engine,
                 schema=schema,
                 lease_owner=lease_owner,
+                console_origin="https://console.example.com",
             ),
             replies=SlackReplyAdapter(
                 DEFAULT_TOKEN, identity_tokens={identity: factory_token}, base_url=slack_url
@@ -5770,3 +5771,169 @@ def test_progress_card_kickoff_run_edits_its_placeholder_through_to_finished(
         for retired in ("Phase ", "Outcome: admitted", "Run completed", "PR open:"):
             assert retired not in call.haystack, call.haystack
         assert "{" not in call.text, call.text
+
+
+# --- rejected Claude plan direct message (#5720) ------------------------------------
+
+CONSOLE_ORIGIN = "https://console.example.com"
+RECONNECT_URL = f"{CONSOLE_ORIGIN}/settings/claude-plan"
+GRANT_SENTENCE = (
+    "Your Claude plan was rejected when Curie tried to use it, so your factory run for "
+)
+
+
+def _enroll(principal_id: uuid.UUID, *, generation: int = 1, active: bool = True) -> None:
+    """An active enrollment header, the row admission requires before a personal WorkItem."""
+
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    _rows(
+        "INSERT INTO curie.personal_claude_enrollments "
+        "(id, tenant_id, principal_id, generation, active, version) "
+        "VALUES (:id, :tenant, :principal, :generation, :active, 1)",
+        {
+            "id": uuid.uuid4(),
+            "tenant": DEFAULT_TENANT_ID,
+            "principal": principal_id,
+            "generation": generation,
+            "active": active,
+        },
+    )
+
+
+def _owner(principal_id: uuid.UUID, generation: int = 1) -> dict[str, Any]:
+    from curie_api.models import DEFAULT_TENANT_ID
+
+    return {
+        "tenant_id": str(DEFAULT_TENANT_ID),
+        "principal_id": str(principal_id),
+        "enrollment_generation": generation,
+    }
+
+
+def _set_enrollment(principal_id: uuid.UUID, *, generation: int, active: bool) -> None:
+    updated = _rows(
+        "UPDATE curie.personal_claude_enrollments SET generation = :generation, active = :active "
+        "WHERE principal_id = :principal RETURNING principal_id",
+        {"principal": principal_id, "generation": generation, "active": active},
+    )
+    assert updated, "the enrollment header is missing"
+
+
+def _grant_rows(principal_id: uuid.UUID | None = None) -> list[dict[str, Any]]:
+    if principal_id is None:
+        return _rows(
+            "SELECT principal_id, generation, channel_identity, recipient, payload, "
+            "posted_at, failed_at, last_error, attempts FROM curie.factory_grant_notices "
+            "ORDER BY created_at, id"
+        )
+    return _rows(
+        "SELECT principal_id, generation, channel_identity, recipient, payload, "
+        "posted_at, failed_at, last_error, attempts FROM curie.factory_grant_notices "
+        "WHERE principal_id = :principal ORDER BY generation",
+        {"principal": principal_id},
+    )
+
+
+def _personal_failure(
+    stack: Stack,
+    principal_id: uuid.UUID,
+    *,
+    generation: int = 1,
+    title: str = "Fix the greeting",
+    age_s: int = 0,
+) -> int:
+    """Admit one personal WorkItem and end it ``authentication_required`` before delivery.
+
+    ``age_s`` moves ``terminal_at`` earlier so the first failure at a generation
+    is the one the notice names.
+    """
+
+    number = next(_ISSUES)
+    request_id, _work_item_id = stack.admit(number, owner=_owner(principal_id, generation))
+    _stamp_title(request_id, title)
+    # A failed request that ran has a start and a deadline. The shape check
+    # rejects an unstarted authentication_required row.
+    stack.start(request_id)
+    _end_plain(request_id, "failed", "authentication_required")
+    if age_s:
+        _rows(
+            "UPDATE curie.execution_requests "
+            "SET terminal_at = now() - make_interval(secs => :age) WHERE id = :id",
+            {"id": request_id, "age": age_s},
+        )
+    return number
+
+
+def test_grant_notice_is_owed_once_while_that_generation_is_still_active(stack: Stack) -> None:
+    """One rejected plan owes one row. A later failure at that generation adds none.
+
+    A failure after the owner replaces the enrollment owes a new row for the new
+    generation. A failure whose enrollment was disconnected or replaced before
+    delivery owes none, and a service-mode failure owes none.
+    """
+
+    slack_user = f"U0{stack.tag.upper()}G1"
+    owner, _link = _seed_principal(slack_user)
+    _enroll(owner)
+    _seed_receiving_identity(stack.identity)
+    first = _personal_failure(stack, owner, title="Fix the greeting", age_s=120)
+    second = _personal_failure(stack, owner, title="A later failure")
+
+    disconnected, _none = _seed_principal(None)
+    _enroll(disconnected)
+    _personal_failure(stack, disconnected, title="Disconnected")
+    _set_enrollment(disconnected, generation=1, active=False)
+
+    replaced, _none = _seed_principal(f"U0{stack.tag.upper()}G2")
+    _enroll(replaced)
+    _personal_failure(stack, replaced, title="Replaced first")
+    _set_enrollment(replaced, generation=2, active=True)
+
+    service_request, _service_item = stack.admit(next(_ISSUES))
+    stack.start(service_request)
+    _end_plain(service_request, "failed", "authentication_required")
+    stack.drain()
+
+    owed = _grant_rows(owner)
+    assert [row["generation"] for row in owed] == [1], owed
+    assert owed[0]["recipient"] == slack_user
+    assert owed[0]["posted_at"] is not None
+    assert owed[0]["payload"]["issue_key"] == f"#{first}"
+    assert owed[0]["payload"]["title"] == "Fix the greeting"
+    assert f"#{second}" not in json.dumps(owed[0]["payload"])
+    assert _grant_rows(disconnected) == []
+    assert _grant_rows(replaced) == []
+
+    _set_enrollment(owner, generation=2, active=True)
+    _personal_failure(stack, owner, generation=2, title="After replace")
+    stack.drain()
+    assert [row["generation"] for row in _grant_rows(owner)] == [1, 2]
+    assert _grant_rows(replaced) == []
+    assert len(_grant_rows()) == 2
+
+
+def test_grant_notice_card_names_the_claude_plan_page(stack: Stack) -> None:
+    """The needs-a-person card for a rejected plan names the Claude plan page.
+
+    The notify reply keeps the shared cause sentence.
+    """
+
+    slack_user = f"U0{stack.tag.upper()}GC"
+    owner, _link = _seed_principal(slack_user)
+    _enroll(owner)
+    _seed_receiving_identity(stack.identity)
+    number = next(_ISSUES)
+    request_id, work_item_id = stack.admit(number, owner=_owner(owner))
+    _stamp_title(request_id, "Fix the greeting")
+    stack.start(request_id)
+    root = _kickoff_thread(stack, work_item_id, request_id)
+    _end_plain(request_id, "failed", "authentication_required")
+    stack.drain()
+
+    card = _last_card(stack, work_item_id)
+    assert "Your Claude plan was rejected. Reconnect it on the Claude plan page." in card
+    assert "personal Claude grant was missing" not in card
+    assert _replies(stack, root, NEEDS_YOU) == [
+        f"{NEEDS_YOU}{cause_text('authentication_required')}"
+    ]

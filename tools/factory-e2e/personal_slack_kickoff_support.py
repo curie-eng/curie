@@ -183,6 +183,10 @@ ENROLLMENT_INACTIVE = "enrollment_inactive"
 TEST_MARK = "[test action]"
 RECEIPT_PATTERN = receipt_key("*")
 AUTH_TERMINAL_CAUSE = "authentication_required"
+# The rejected-plan DM (#5720). The origin is the button's host, not a live console.
+CONSOLE_ORIGIN = "https://console.example.com"
+GRANT_NOTICE_MARK = "Your Claude plan was rejected when Curie tried to use it"
+GRANT_NOTICE_BUTTON_SUFFIX = "/settings/claude-plan"
 MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 MANAGED_BY_VALUE = "curie-personal-slack-kickoff"
 RUN_ANNOTATION = "curie.dev/personal-slack-kickoff-run"
@@ -811,6 +815,31 @@ class SlackWeb:
             if error.code != "message_not_found":
                 raise
 
+    def direct_history(self, user_id: str) -> list[dict[str, Any]]:
+        """``conversations.history`` of the direct message with ``user_id``, or none."""
+
+        cursor = ""
+        channel_id = ""
+        for _page in range(10):
+            params = {"types": "im", "limit": "200"}
+            if cursor:
+                params["cursor"] = cursor
+            listed = self.call("conversations.list", params)
+            for channel in listed.get("channels") or []:
+                if isinstance(channel, dict) and channel.get("user") == user_id:
+                    channel_id = str(channel.get("id") or "")
+                    break
+            if channel_id:
+                break
+            meta = listed.get("response_metadata")
+            cursor = str(meta.get("next_cursor") or "") if isinstance(meta, dict) else ""
+            if not cursor:
+                return []
+        if not channel_id:
+            return []
+        history = self.call("conversations.history", {"channel": channel_id, "limit": "200"})
+        return [item for item in history.get("messages") or [] if isinstance(item, dict)]
+
 
 def kickoff_text(curie_user: str, issue_url: str) -> str:
     """The declared driver's kickoff mention: the bot mention, the mark, the link."""
@@ -842,6 +871,38 @@ def message_text(message: Mapping[str, Any]) -> str:
 
     walk(message.get("blocks"))
     return "\n".join(parts)
+
+
+def _nested_urls(value: Any) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        url = value.get("url")
+        if isinstance(url, str):
+            found.append(url)
+        for item in value.values():
+            found.extend(_nested_urls(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_nested_urls(item))
+    return found
+
+
+def grant_notice_facts(messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """How many rejected-plan DMs ``messages`` holds, and whether each carries the button."""
+
+    notices = [message for message in messages if GRANT_NOTICE_MARK in message_text(message)]
+    button_urls = [
+        url
+        for message in notices
+        for url in _nested_urls(message.get("blocks"))
+        if url.endswith(GRANT_NOTICE_BUTTON_SUFFIX)
+    ]
+    kept = "stopped. The work is kept."
+    return {
+        "count": len(notices),
+        "text_ok": bool(notices) and all(kept in message_text(message) for message in notices),
+        "button_url_ok": bool(notices) and len(button_urls) >= len(notices),
+    }
 
 
 def reply_outcome(messages: Iterable[Mapping[str, Any]], *, author: str) -> str | None:
@@ -2662,6 +2723,7 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
         {"name": "CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "value": "false"},
     ]
     personal = {"name": "FACTORY_MODEL_AUTH_MODE", "value": PERSONAL_MODE}
+    console_origin = {"name": "CURIE_CONSOLE_ORIGIN", "value": CONSOLE_ORIGIN}
     return {
         "api": {
             "image": image("curie-api"),
@@ -2674,7 +2736,7 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
             "image": image("curie-worker"),
             "maxConcurrency": 1,
             "workItemMaxTurns": plan.implementer_turns,
-            "extraEnv": [dict(personal)],
+            "extraEnv": [dict(personal), dict(console_origin)],
         },
         "dispatcher": {
             "deploy": True,
@@ -3809,6 +3871,25 @@ def _judge_cleanup(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     return checks, {"steps": len(steps), "inventory": len(inventory)}
 
 
+def _judge_grant_notice(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
+    """One DM for the first rejection, none at that generation, one more after replace."""
+
+    observed = ledger.observations("grant-notice")
+    first = observed.get("dm_count_after_first")
+    second = observed.get("dm_count_after_second")
+    third = observed.get("dm_count_after_replace")
+    checks = {
+        "first_posts_one": first == 1
+        and _true(observed, "first_text_ok")
+        and _true(observed, "first_button_ok"),
+        "same_generation_adds_none": second == first == 1 and _true(observed, "second_settled"),
+        "replace_adds_one": third == 2
+        and _true(observed, "replace_text_ok")
+        and _true(observed, "replace_button_ok"),
+    }
+    return checks, {"direct_messages": int(third) if isinstance(third, int) else 0}
+
+
 _JUDGES: dict[str, Callable[[Ledger], tuple[dict[str, bool], dict[str, int]]]] = {
     "refusal-connect": _judge_refusal_connect,
     "slack": _judge_slack,
@@ -3819,6 +3900,7 @@ _JUDGES: dict[str, Callable[[Ledger], tuple[dict[str, bool], dict[str, int]]]] =
     "refusal": _judge_refusal,
     "budget": _judge_budget,
     "cleanup": _judge_cleanup,
+    "grant-notice": _judge_grant_notice,
 }
 
 
@@ -3833,7 +3915,8 @@ def judge(ledger: Ledger, criterion: str) -> dict[str, Any]:
             else list(REHEARSAL_CRITERIA if rehearsal else CRITERIA)
         )
     elif criterion in _JUDGES:
-        if rehearsal and criterion not in REHEARSAL_CRITERIA:
+        # The rejected-plan leg is unpaid, so a rehearsal ledger may carry it.
+        if rehearsal and criterion not in REHEARSAL_CRITERIA and criterion != "grant-notice":
             raise Refusal("rehearsal_ledger", "--criterion")
         names = [criterion]
     else:

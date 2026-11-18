@@ -1021,6 +1021,8 @@ class SlackReplyAdapter:
                 allow_free_text=intent.allow_free_text,
             )
         else:
+            # A plain post stays text-only. Links become URL buttons, which is
+            # how a grant notice carries "Reconnect your Claude plan" (#5720).
             text = message.text
             blocks = to_blocks(_reply_from_message(message)) if message.links else None
 

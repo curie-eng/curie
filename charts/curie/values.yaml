@@ -1306,6 +1306,11 @@ codeHostTrust:
 # "Personal Claude enrollment".
 personalClaude:
   grantNamespace: ""
+# Console origin for the rejected Claude plan direct message (#5720). Empty
+# omits the reconnect button. Set it to the console's absolute http(s) origin;
+# the button goes to <origin>/settings/claude-plan.
+console:
+  origin: ""
 # ---------------------------------------------------------------------------
 # The factory (#4397) as CURIE_FORGES; `curie cluster factory` writes it.
 # A credential names its Secret: existingSecret, existingSecretKey.

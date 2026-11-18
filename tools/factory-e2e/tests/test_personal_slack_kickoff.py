@@ -4230,6 +4230,68 @@ def test_judge_checks_observed_models_and_rehearsal_ledgers(tmp_path: Path) -> N
         rehearsal.close()
 
 
+def test_grant_notice_judge_counts_one_message_per_generation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A rehearsal ledger passes grant-notice from the recorded DM counts, and a second
+    message at the same generation fails it. The judge reads no Slack token."""
+
+    message = {
+        "text": (
+            "Your Claude plan was rejected when Curie tried to use it, so your factory "
+            "run for #7 Fix the greeting stopped. The work is kept."
+        ),
+        "blocks": [
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Reconnect your Claude plan"},
+                        "url": f"{sks.CONSOLE_ORIGIN}{sks.GRANT_NOTICE_BUTTON_SUFFIX}",
+                    }
+                ],
+            }
+        ],
+    }
+    facts = sks.grant_notice_facts([message, dict(message)])
+    assert facts == {"count": 2, "text_ok": True, "button_url_ok": True}
+    assert sks.grant_notice_facts([{"text": "ping"}])["count"] == 0
+
+    state = _private(tmp_path / "state")
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        ledger.ensure_run(CANDIDATE, phase="rehearse")
+        ledger.mark_live_kind("rehearse")
+        recorded = {
+            "dm_count_after_first": 1,
+            "first_text_ok": True,
+            "first_button_ok": True,
+            "dm_count_after_second": 1,
+            "second_settled": True,
+            "dm_count_after_replace": 2,
+            "replace_text_ok": True,
+            "replace_button_ok": True,
+        }
+        for key, value in recorded.items():
+            ledger.record("grant-notice", key, value)
+    finally:
+        ledger.close()
+
+    argv = ["judge", "--candidate", CANDIDATE, "--state-dir", str(state), "--run-id", RUN_ID]
+    code = psk.main([*argv, "--criterion", "grant-notice"], environ={"PATH": "/usr/bin"})
+    payload = _output(capsys)[0]
+    assert (code, payload["verdict"]) == (sks.EXIT_PASS, "pass")
+    assert payload["counts"]["grant-notice.direct_messages"] == 2
+
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        ledger.record("grant-notice", "dm_count_after_second", 2)
+        assert sks.judge(ledger, "grant-notice")["verdict"] == "fail"
+    finally:
+        ledger.close()
+
+
 def test_judge_reads_only_the_ledger_through_main(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -5295,6 +5357,9 @@ def test_install_values_and_oidc_split_horizon() -> None:
     assert values["personalClaude"] == {"grantNamespace": f"{NAMESPACE}-grants"}
     personal = {"name": "FACTORY_MODEL_AUTH_MODE", "value": sks.PERSONAL_MODE}
     assert personal in values["api"]["extraEnv"] and personal in values["worker"]["extraEnv"]
+    origin = {"name": "CURIE_CONSOLE_ORIGIN", "value": sks.CONSOLE_ORIGIN}
+    assert origin in values["worker"]["extraEnv"]
+    assert origin not in values["api"]["extraEnv"]
     egress = values["security"]["networkPolicy"]["allowedEgress"]
     assert [item["cidr"] for item in egress] == ["192.0.2.10/32", "192.0.2.11/32"]
     assert client_marker not in json.dumps(values)

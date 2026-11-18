@@ -256,7 +256,12 @@ def render_card(subject: CardSubject, request: CardRequest, *, now: datetime) ->
             label = f"View pull request {number}".rstrip()
             links.append(MessageLink(label=label[:_LINK_LABEL_MAX], url=url))
     elif state == "needs a person":
-        sentence = _sentence(cause_text(str(request.terminal_cause or "")))
+        # A rejected personal grant names the Claude plan page. Other causes
+        # keep the shared sentence, and the notify reply does too (#5720).
+        if request.terminal_cause == "authentication_required":
+            sentence = "Your Claude plan was rejected. Reconnect it on the Claude plan page."
+        else:
+            sentence = _sentence(cause_text(str(request.terminal_cause or "")))
         body.extend(["", f":raising_hand: *Needs a person.* {escaped(sentence)}"])
         url = _http(subject.issue_url)
         if url is not None:

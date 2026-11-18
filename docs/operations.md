@@ -2826,6 +2826,19 @@ custody read refuses (its own code, such as `custody_missing`), and
 runtime on another thread defers `owner_busy` like capacity, without spending
 a start attempt.
 
+When a personal run finishes `failed` with `authentication_required` and the
+owner's enrollment is still active at that run's generation, the worker sends
+the owner one Slack direct message for that principal and generation. The
+message names the issue and says the work is kept. It includes one button,
+Reconnect your Claude plan, to `<Console origin>/settings/claude-plan`. Set
+the worker environment `CURIE_CONSOLE_ORIGIN` from the chart value
+`console.origin` to that console origin. An empty origin still sends the
+message and omits the button. A later failure at the same generation sends
+nothing more. A failure after the owner disconnects or replaces the enrollment
+sends nothing, because they already changed it. A service-mode run sends
+nothing. There is no warning before a plan expires. Enrollment stores no
+expiry, and a token's shape does not say when it stops working.
+
 ## Talking to your agent
 
 The plugin bundle you just deployed is the agent's backend. There are two

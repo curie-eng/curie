@@ -424,6 +424,13 @@ spec:
             - name: CURIE_PERSONAL_GRANT_NAMESPACE
               value: {{ $personalGrantNamespace | quote }}
             {{- end }}
+            {{- $consoleOrigin := dig "console" "origin" "" .Values }}
+            {{- if $consoleOrigin }}
+            # Rejected Claude plan direct message (#5720). Rendered only when
+            # the console origin is set, so the reconnect button has a URL.
+            - name: CURIE_CONSOLE_ORIGIN
+              value: {{ $consoleOrigin | quote }}
+            {{- end }}
             # The action executor switch (ACTION-EXECUTOR-1). The API renders
             # the same value from the same helper; the two must never differ.
             - name: CURIE_ACTION_EXECUTOR_ENABLED
