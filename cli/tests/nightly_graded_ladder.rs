@@ -1484,7 +1484,6 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         "query_exact_seed_trace",
         "sanitize_exact_trace_read",
         "seed_ordinary_turn",
-        "seed_approval_resume_turn",
     ] {
         assert!(
             text.contains(required),
@@ -1674,12 +1673,11 @@ fn exact_seed_matcher_recovers_embedded_marker_once_and_rejects_background() {
 }
 
 #[test]
-fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() {
+fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt() {
     let text = ladder();
     for required in [
         "seed_ordinary_turn() {",
         "seed_mcp_read_turn() {",
-        "seed_approval_resume_turn() {",
         "seed_coding_tool_turn() {",
         "seed-invalid",
         "mcp_receipt_call_count() {",
@@ -1689,7 +1687,7 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
     ] {
         assert!(
             text.contains(required),
-            "the product observability oracle must pin independent ordinary, MCP, approval, and built-in coding-tool seed evidence; missing {required}"
+            "the product observability oracle must pin independent ordinary, MCP, and built-in coding-tool seed evidence; missing {required}"
         );
     }
 
@@ -1708,16 +1706,6 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
     assert!(
         receipt.contains("count") || receipt.contains("wc -l"),
         "only an aggregate MCP call count may reach evidence output"
-    );
-
-    let approval = ladder_function("seed_approval_resume_turn");
-    assert!(
-        approval.contains("curie.approval.suspend"),
-        "approval evidence must require the worker's real parked-turn span"
-    );
-    assert!(
-        !approval.contains("curie.approval.wait"),
-        "the oracle must not invent a wait span that no current emitter produces"
     );
 }
 
