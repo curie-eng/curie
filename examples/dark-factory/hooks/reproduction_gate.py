@@ -8,7 +8,9 @@ Rules, per session:
 2. Each completed Bash call is recorded as an observation.
 3. A ``get_issue`` result containing the factory question heading is recorded; a
    result that is not a decodable ticket (an overflow notice, an oversize input) is
-   recorded as carrying it, and so is state lost to a checkout cleanup.
+   recorded as carrying it, and so is state lost to a checkout cleanup; a later
+   decodable ticket without the heading clears that overflow guess, never a heading
+   seen in a decoded ticket.
 4. A successful ``ask_questions`` call is recorded.
 5. ``mcp__curie__ask_questions`` is refused until one Bash observation exists.
 6. ``mcp__curie__publish_changes`` is refused after a recorded successful ask.
@@ -191,6 +193,7 @@ def load(
             "runs": [],
             "pending": {},
             "question_heading": False,
+            "heading_unverified": False,
             "asked": False,
         }
     if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_STATE:
@@ -203,6 +206,7 @@ def load(
         or not isinstance(state.get("pending"), dict)
         or type(state.get("question_heading")) is not bool
         or type(state.get("asked")) is not bool
+        or type(state.get("heading_unverified", False)) is not bool
     ):
         raise Refusal("Reproduction state does not belong to this session and checkout.")
     if not isinstance(state.get("base_revision"), str) or not re.fullmatch(
@@ -338,6 +342,27 @@ def issue_ticket(response: Any) -> str | None:
     return None
 
 
+def note_ticket_read(state: dict[str, Any], ticket: str | None) -> None:
+    """Record what a ``get_issue`` result shows about the question heading.
+
+    A result that is not a decodable ticket (an overflow notice that replaced a large
+    body, or an unreadable result) cannot show whether the thread holds questions, so
+    it counts as holding them and publication needs the citation line. That guess is
+    kept apart from a heading seen in a decoded ticket: a later decodable ticket with
+    no heading clears the guess, never a heading that was seen.
+    """
+    if ticket is None:
+        if not state["question_heading"]:
+            state["question_heading"] = True
+            state["heading_unverified"] = True
+    elif QUESTION_HEADING in ticket:
+        state["question_heading"] = True
+        state["heading_unverified"] = False
+    elif state.get("heading_unverified") is True:
+        state["question_heading"] = False
+        state["heading_unverified"] = False
+
+
 def acquire(lock: Any) -> None:
     """Wait briefly for a concurrent call of this hook, then refuse."""
     waited = time.monotonic() + LOCK_SECONDS
@@ -366,14 +391,7 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
     if event == "PreToolUse":
         mutation_guard(tool, inputs, cwd)
     ticket = issue_ticket(data.get("tool_response")) if tool.endswith("get_issue") else None
-    # A result that is not a decodable ticket (an overflow notice that replaced a large
-    # body, or an unreadable result) cannot show whether the thread holds questions, so
-    # it counts as holding them and publication needs the citation line.
-    heading = (
-        event == "PostToolUse"
-        and tool.endswith("get_issue")
-        and (ticket is None or QUESTION_HEADING in ticket)
-    )
+    read = event == "PostToolUse" and tool.endswith("get_issue")
     response = data.get("tool_response")
     asked = (
         event == "PostToolUse"
@@ -381,7 +399,7 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
         and not (isinstance(response, dict) and response.get("isError"))
     )
     gated = event == "PreToolUse" and tool in {ASK_TOOL, PUBLISH_TOOL}
-    if tool != "Bash" and not heading and not asked and not gated:
+    if tool != "Bash" and not read and not asked and not gated:
         return {}
     session = required_text(
         os.environ.get("CURIE_SESSION_ID") or data.get("session_id"), "session identity"
@@ -411,8 +429,8 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
             save(path, state)
         if tool == "Bash":
             record(state, event, data, cwd)
-        elif heading:
-            state["question_heading"] = True
+        elif read:
+            note_ticket_read(state, ticket)
         elif asked:
             state["asked"] = True
         elif tool == ASK_TOOL:

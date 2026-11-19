@@ -710,6 +710,55 @@ def test_registered_hook_leaves_publication_open_after_a_decodable_ticket_withou
     assert out is not None and not denied(out)
 
 
+def oversize_ticket_read(registered: Registered) -> None:
+    ticket = f"{HEADING}\n\n1. Which?\n\n" + "comment text. " * (3 * 1024 * 1024 // 14)
+    out = registered.dispatch("PostToolUse", ISSUE_READ, {}, tool_response=issue_response(ticket))
+    assert out is not None and "size limit" in reason(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and denied(out)
+
+
+def test_registered_hook_clears_an_overflow_heading_when_a_retry_decodes_without_questions(
+    registered: Registered,
+) -> None:
+    oversize_ticket_read(registered)
+    out = registered.dispatch(
+        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response("# Title\n\nFix add.")
+    )
+    assert out is not None and not denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and not denied(out)
+
+
+def test_registered_hook_still_requires_the_citation_when_a_retry_decodes_with_an_answer(
+    registered: Registered,
+) -> None:
+    oversize_ticket_read(registered)
+    answered = f"{HEADING}\n\n1. Which?\n\nUse the second."
+    out = registered.dispatch("PostToolUse", ISSUE_READ, {}, tool_response=issue_response(answered))
+    assert out is not None and not denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": CITED_BODY})
+    assert out is not None and not denied(out)
+
+
+def test_registered_hook_keeps_a_seen_heading_through_an_overflow_and_a_clean_retry(
+    registered: Registered,
+) -> None:
+    out = registered.dispatch(
+        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response(f"{HEADING}\n\n1. Which?")
+    )
+    assert out is not None and not denied(out)
+    oversize_ticket_read(registered)
+    out = registered.dispatch(
+        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response("# Title\n\nFix add.")
+    )
+    assert out is not None and not denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and denied(out)
+
+
 def test_registered_hook_keeps_citations_through_a_checkout_cleanup(
     registered: Registered,
 ) -> None:
