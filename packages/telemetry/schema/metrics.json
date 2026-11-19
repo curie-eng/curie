@@ -2386,7 +2386,7 @@
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 18
+      "cardinality_bound": 19
     },
     "curie.work_item.reconciler.step.consecutive_failures": {
       "type": "gauge",
@@ -2419,7 +2419,7 @@
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 18
+      "cardinality_bound": 19
     },
     "curie.eval.process": {
       "type": "counter",
