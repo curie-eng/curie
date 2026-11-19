@@ -862,6 +862,7 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
         APPROVAL_TOOL_NAME,
         ISSUE_TOOL_NAME,
         PROGRESS_TOOL_NAME,
+        PROPOSE_RULE_TOOL_NAME,
         QUESTION_TOOL_NAME,
         TRACKER_RESULT_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
@@ -873,7 +874,7 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
     expected = platform_tool_names(state_server_mounted=False, memory_tools_mounted=True)
     # The probe boots with no potential write tool, progress URL or issue reader,
     # so approval, progress, issue, tracker result and question tools are
-    # absent; the three memory tools are.
+    # absent, as is propose_rule; the three memory tools are.
     assert MEMORY_TOOLS <= published
     assert published == expected - {
         PROGRESS_TOOL_NAME,
@@ -882,6 +883,7 @@ def test_the_exemption_set_matches_what_a_memory_boot_publishes(
         ISSUE_TOOL_NAME,
         TRACKER_RESULT_TOOL_NAME,
         QUESTION_TOOL_NAME,
+        PROPOSE_RULE_TOOL_NAME,
     }
 
 
