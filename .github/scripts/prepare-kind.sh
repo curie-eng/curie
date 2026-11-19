@@ -26,6 +26,21 @@ if grep -Fxq -- "$cluster" "$directory/clusters"; then
   echo 'refusing to replace an existing cluster' >&2
   exit 1
 fi
+# The node's containerd does not read the host daemon's registry-mirrors, so
+# without this every docker.io image the chart names is pulled anonymously
+# from Docker Hub and hits its shared-IP rate limit (429). mirror.gcr.io is
+# Google's public Docker Hub cache; Docker Hub stays the fallback on a miss.
+if grep -q '^containerdConfigPatches:' "$config"; then
+  echo 'refusing a kind config that already sets containerdConfigPatches' >&2
+  exit 1
+fi
+effective="$directory/kind.yaml"
+cat "$config" - >"$effective" <<'EOF'
+containerdConfigPatches:
+  - |
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+      endpoint = ["https://mirror.gcr.io", "https://registry-1.docker.io"]
+EOF
 bash "$(dirname "${BASH_SOURCE[0]}")/pull-image.sh" "$image"
 manifest="$directory/calico.yaml"
 curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$manifest" \
@@ -33,7 +48,7 @@ curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$manifest" \
 echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $manifest" \
   | sha256sum --check --strict
 ready() {
-  kind create cluster --name "$cluster" --config "$config" --image "$image" --wait 0s || return
+  kind create cluster --name "$cluster" --config "$effective" --image "$image" --wait 0s || return
   kubectl --context "$context" apply -f "$manifest" || return
   kubectl --context "$context" -n kube-system rollout status daemonset/calico-node --timeout=300s || return
   kubectl --context "$context" wait --for=condition=Ready node --all --timeout=300s
