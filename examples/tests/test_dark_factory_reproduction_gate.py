@@ -672,6 +672,62 @@ def test_registered_hook_leaves_publication_open_after_an_oversize_non_ticket_re
     assert out is not None and not denied(out)
 
 
+def test_registered_hook_keeps_citations_when_the_cli_replaces_a_large_ticket_with_its_notice(
+    registered: Registered,
+) -> None:
+    # Claude Code replaces a tool result over its size limit with this notice, so the hook
+    # sees the preview and never the body (shape observed in a session transcript).
+    notice = (
+        "<persisted-output>\nOutput too large (3.0MB). Full output saved to: "
+        "/tmp/tool-results/get_issue.txt\n\nPreview (first 2KB):\n"
+        '{\n  "issue": "#7",\n  "url": "https://github.com/Acme/bot/issues/7",\n  "ticket": "# Title\\n'
+    )
+    out = registered.dispatch("PostToolUse", ISSUE_READ, {}, tool_response=notice)
+    assert out is not None and not denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": CITED_BODY})
+    assert out is not None and not denied(out)
+
+
+def test_registered_hook_leaves_publication_open_after_a_decodable_ticket_without_questions(
+    registered: Registered,
+) -> None:
+    out = registered.dispatch(
+        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response("# Title\n\nFix add.")
+    )
+    assert out is not None and not denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and not denied(out)
+
+
+def test_registered_hook_keeps_citations_through_a_checkout_cleanup(
+    registered: Registered,
+) -> None:
+    out = registered.dispatch(
+        "PostToolUse", ISSUE_READ, {}, tool_response=issue_response(f"{HEADING}\n\n1. Which?")
+    )
+    assert out is not None and not denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and denied(out)
+    registered.session.git("clean", "-fdx", "-q")
+    assert not (registered.session.cwd / STATE).exists()
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": CITED_BODY})
+    assert out is not None and not denied(out)
+
+
+def test_registered_hook_does_not_mistake_a_refused_first_ask_for_lost_state(
+    registered: Registered,
+) -> None:
+    out = registered.dispatch("PreToolUse", ASK, QUESTIONS)
+    assert out is not None and denied(out)
+    registered.bash("python3 -c 'from calc import add; print(add(2, 3))'")
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and not denied(out)
+
+
 @pytest.mark.parametrize(
     ("event", "tool", "inputs"),
     [

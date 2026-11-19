@@ -7,7 +7,8 @@ Rules, per session:
    text, names this hook, ``hooks.json`` or the hook's state is refused.
 2. Each completed Bash call is recorded as an observation.
 3. A ``get_issue`` result containing the factory question heading is recorded; a
-   result too large to decode is recorded as carrying it.
+   result that is not a decodable ticket (an overflow notice, an oversize input) is
+   recorded as carrying it, and so is state lost to a checkout cleanup.
 4. A successful ``ask_questions`` call is recorded.
 5. ``mcp__curie__ask_questions`` is refused until one Bash observation exists.
 6. ``mcp__curie__publish_changes`` is refused after a recorded successful ask.
@@ -312,6 +313,31 @@ def exclude_state(cwd: Path) -> None:
             handle.write(f"{prefix}{pattern}\n")
 
 
+def issue_ticket(response: Any) -> str | None:
+    """The ``ticket`` text of a ``get_issue`` result, or None when none can be decoded."""
+    texts: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            texts.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            for key in ("text", "content"):
+                collect(value.get(key))
+
+    collect(response)
+    for text in texts:
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("ticket"), str):
+            return payload["ticket"]
+    return None
+
+
 def acquire(lock: Any) -> None:
     """Wait briefly for a concurrent call of this hook, then refuse."""
     waited = time.monotonic() + LOCK_SECONDS
@@ -339,10 +365,14 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
     cwd = Path(git(cwd, "rev-parse", "--show-toplevel")).resolve(strict=True)
     if event == "PreToolUse":
         mutation_guard(tool, inputs, cwd)
+    ticket = issue_ticket(data.get("tool_response")) if tool.endswith("get_issue") else None
+    # A result that is not a decodable ticket (an overflow notice that replaced a large
+    # body, or an unreadable result) cannot show whether the thread holds questions, so
+    # it counts as holding them and publication needs the citation line.
     heading = (
         event == "PostToolUse"
         and tool.endswith("get_issue")
-        and QUESTION_HEADING in json.dumps(data.get("tool_response"), ensure_ascii=False)
+        and (ticket is None or QUESTION_HEADING in ticket)
     )
     response = data.get("tool_response")
     asked = (
@@ -369,10 +399,16 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
         acquire(lock)
         anchor_directory = Path(git(cwd, "rev-parse", "--absolute-git-dir")) / STATE_NAME
         anchor_directory.mkdir(mode=0o700, exist_ok=True)
-        base_revision = load_base_revision(
-            anchor_directory / f"{key}.json", cwd, create=not path.exists()
-        )
+        anchor = anchor_directory / f"{key}.json"
+        # The anchor lives in the git directory and outlives a checkout cleanup that
+        # removes the ignored state; its survival without the state means the state was
+        # lost, so the question heading it may have recorded counts as read.
+        lost = not path.exists() and anchor.exists()
+        base_revision = load_base_revision(anchor, cwd, create=not path.exists())
         state = load(path, session, cwd, create=True, base_revision=base_revision)
+        if not path.exists():
+            state["question_heading"] = state["question_heading"] or lost
+            save(path, state)
         if tool == "Bash":
             record(state, event, data, cwd)
         elif heading:
