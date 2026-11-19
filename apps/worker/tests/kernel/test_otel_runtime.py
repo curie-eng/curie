@@ -25,11 +25,14 @@ from aci_protocol import (
 )
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
+    agent_metric_label,
+    configure_meter_provider,
     extract_trace_context,
     inject_trace_context,
     operation_span,
     record_metric,
 )
+from curie_telemetry import metrics as telemetry_metrics
 from curie_telemetry.metrics import record_metric as validate_record_metric
 from curie_worker import consumer as consumer_module
 from curie_worker import runner_client as runner_client_module
@@ -41,12 +44,13 @@ from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import HttpIdentityBinding
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.kernel import constants as kernel_constants
 from curie_worker.kernel import log as kernel_log
 from curie_worker.kernel import routing as kernel_routing
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.sandbox import MissingAgentPoolError, QuotaRejection
 from curie_worker.sandbox import substrate as substrate_module
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.trace import (
     SpanKind,
     StatusCode,
@@ -314,62 +318,65 @@ class _MetricBinding:
 
 @pytest.mark.usefixtures("fresh_agent_metric_labels")
 @pytest.mark.parametrize(
-    ("agent_name", "expected"),
-    [("acme-bot", "acme-bot"), ("other", "other"), ("unbound", "other"),
-     ("not a slug", "other"), ("x" * 64, "other")],
+    ("agent_name", "expected", "saturated"),
+    [
+        (None, "unbound", False),
+        ("acme-bot", "acme-bot", False),
+        ("other", "other", False),
+        ("unbound", "other", False),
+        ("not a slug", "other", False),
+        ("x" * 64, "other", False),
+        pytest.param("acme-overflow", "other", True, id="overflow"),
+    ],
 )
 def test_turn_duration_uses_the_agent_turn_counter_label(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
-    agent_name: str,
+    agent_name: str | None,
     expected: str,
+    saturated: bool,
 ) -> None:
-    """Duration and the agent counter share the normalized agent label."""
+    """The real worker records the same terminal duration in both histograms."""
+
+    if saturated:
+        for index in range(32):
+            agent_metric_label(f"acme-{index}")
+
+    monkeypatch.setattr(telemetry_metrics, "_provider", telemetry_metrics._provider)
+    monkeypatch.setattr(telemetry_metrics, "_instruments", telemetry_metrics._instruments)
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader], shutdown_on_exit=False)
+    configure_meter_provider(provider)
 
     async def go() -> None:
-        probe = _install(monkeypatch)
-        async with make_harness() as unbound:
-            await unbound.kernel.process_event(_qevent("plain", thread="thread-unbound-agent"))
-            unlabeled = _metrics(probe, "curie.turn.completed")
-            assert unlabeled
-            assert "agent" not in unlabeled[-1].attributes
-            agent_points = _metrics(probe, "curie.agent.turn.completed")
-            assert agent_points[-1].attributes["agent"] == "unbound"
-            assert agent_points[-1].attributes["outcome"] == "done"
-            duration = _metrics(probe, "curie.turn.duration")[-1]
-            assert duration.attributes == agent_points[-1].attributes
-            assert duration.value >= 0
+        binding = _MetricBinding(agent_name) if agent_name is not None else None
+        async with make_harness(binding=binding) as h:
+            await h.kernel.process_event(_qevent("complete this turn"))
 
-        probe.metrics.clear()
-        async with make_harness(binding=_MetricBinding(agent_name)) as named:
-            await named.kernel.process_event(_qevent("named", thread="thread-named-agent"))
-            fleet = _metrics(probe, "curie.turn.completed")
-            assert fleet and "agent" not in fleet[-1].attributes
-            named_points = _metrics(probe, "curie.agent.turn.completed")
-            assert named_points[-1].attributes["agent"] == expected
-            duration = _metrics(probe, "curie.turn.duration")[-1]
-            assert duration.attributes == named_points[-1].attributes
-            validate_record_metric(
-                "curie.turn.duration", duration.value, attributes=duration.attributes
-            )
-            assert named_points[-1].attributes["service.name"] == "curie-worker"
-            # The probe stores attributes. The real recorder must accept them.
-            validate_record_metric(
-                "curie.agent.turn.completed",
-                attributes=named_points[-1].attributes,
-            )
-            validate_record_metric(
-                "curie.turn.completed",
-                attributes=fleet[-1].attributes,
-            )
-            token = kernel_constants._TURN_AGENT.set("unbound")
-            try:
-                named.kernel._record_agent_turn("done")
-            finally:
-                kernel_constants._TURN_AGENT.reset(token)
-            assert _metrics(probe, "curie.agent.turn.completed")[-1].attributes["agent"] == "other"
-
-    asyncio.run(go())
+    try:
+        asyncio.run(go())
+        data = reader.get_metrics_data()
+        assert data is not None
+        points = {
+            metric.name: metric.data.data_points
+            for resource in data.resource_metrics
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+        }
+        [agent_duration] = points["curie.agent.turn.duration"]
+        [fleet_duration] = points["curie.turn.duration"]
+        [agent_counter] = points["curie.agent.turn.completed"]
+        [fleet_counter] = points["curie.turn.completed"]
+        fleet_attributes = {"service.name": "curie-worker", "source": "worker", "outcome": "done"}
+        assert fleet_duration.attributes == fleet_counter.attributes == fleet_attributes
+        assert agent_duration.attributes == agent_counter.attributes == {
+            **fleet_attributes,
+            "agent": expected,
+        }
+        assert agent_duration.count == fleet_duration.count == 1
+        assert agent_duration.sum == fleet_duration.sum > 0
+    finally:
+        provider.shutdown()
 
 
 def test_side_effect_failure_has_its_own_terminal_metric_and_span_class(

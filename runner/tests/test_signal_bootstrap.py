@@ -261,12 +261,11 @@ def test_runner_turn_records_declared_metrics_through_configured_provider() -> N
         }
         duration = points["curie.turn.duration"]
         assert len(duration) == 1
-        assert dict(duration[0].attributes) == {
-            "service.name": "curie-runner",
-            "source": "runner",
-            "outcome": "done",
-            "agent": "unbound",
-        }
+        assert duration[0].attributes == completed[0].attributes
+        [agent_duration] = points["curie.runner.turn.duration"]
+        assert agent_duration.attributes == {**duration[0].attributes, "agent": "unbound"}
+        assert agent_duration.count == duration[0].count == 1
+        assert agent_duration.sum == duration[0].sum > 0
         assert all(
             "session-example" not in str(point.attributes)
             and "U0EXAMPLE1" not in str(point.attributes)
@@ -313,7 +312,7 @@ def test_runner_boot_passes_configured_agent_to_turn_duration(
     try:
         anyio.run(go)
         assert provider.force_flush(timeout_millis=5000)
-        duration = _metric_points(reader)["curie.turn.duration"]
+        duration = _metric_points(reader)["curie.runner.turn.duration"]
         assert len(duration) == 1
         assert duration[0].attributes["agent"] == expected
     finally:

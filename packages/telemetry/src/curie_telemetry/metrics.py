@@ -108,14 +108,16 @@ _TURN_COMPLETED_ATTRIBUTES = {
     "source": _TURN_SOURCES,
     "outcome": _TURN_OUTCOMES,
 }
-_TURN_DURATION_ATTRIBUTES = {
-    **_TURN_COMPLETED_ATTRIBUTES,
-    "agent": _bounded_agent_label(),
-}
 # The fleet-wide turn counter stays unlabeled (#2952).
 _AGENT_TURN_ATTRIBUTES: dict[str, Any] = {
     "service.name": ["curie-worker"],
     "source": ["worker"],
+    "outcome": _TURN_OUTCOMES,
+    "agent": _bounded_agent_label(),
+}
+_RUNNER_TURN_DURATION_ATTRIBUTES = {
+    "service.name": ["curie-runner"],
+    "source": ["runner"],
     "outcome": _TURN_OUTCOMES,
     "agent": _bounded_agent_label(),
 }
@@ -850,7 +852,7 @@ _METRICS: dict[str, dict[str, Any]] = {
         _TURN_REFUSED_ATTRIBUTES,
     ),
     "curie.turn.duration": _definition(
-        "histogram", "s", "End to end turn duration.", False, _TURN_DURATION_ATTRIBUTES
+        "histogram", "s", "End to end turn duration.", False, _TURN_COMPLETED_ATTRIBUTES
     ),
     "curie.agent.turn.completed": _definition(
         "counter",
@@ -861,6 +863,15 @@ _METRICS: dict[str, dict[str, Any]] = {
         "share other. A turn with no resolved agent is unbound. The cap is per "
         "process, so a fleet query can still fold a slug into other on one worker.",
         True,
+        _AGENT_TURN_ATTRIBUTES,
+    ),
+    "curie.agent.turn.duration": _definition(
+        "histogram",
+        "s",
+        "End to end turn duration for one agent. The agent label follows "
+        "curie.agent.turn.completed: at most 32 slugs per process, the rest other, "
+        "a turn with no resolved agent unbound.",
+        False,
         _AGENT_TURN_ATTRIBUTES,
     ),
     "curie.schedule.fire": _definition(
@@ -960,6 +971,13 @@ _METRICS: dict[str, dict[str, Any]] = {
     ),
     "curie.sandbox.cleanup": _definition(
         "counter", "{sandbox}", "Failed and orphan sandbox cleanup.", True, _SANDBOX_ATTRIBUTES
+    ),
+    "curie.runner.turn.duration": _definition(
+        "histogram",
+        "s",
+        "Runner turn duration for one agent, using the shared bounded agent label.",
+        False,
+        _RUNNER_TURN_DURATION_ATTRIBUTES,
     ),
     "curie.runner.rpc.request.duration": _definition(
         "histogram", "s", "Runner RPC request duration.", False, _RUNNER_RPC_ATTRIBUTES

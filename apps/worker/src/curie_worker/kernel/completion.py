@@ -450,7 +450,7 @@ async def _complete(
         "outcome": telemetry_outcome,
     }
     log.record_metric("curie.turn.completed", attributes=attributes)
-    agent_label = self._record_agent_turn(telemetry_outcome)
+    agent_attributes = self._record_agent_turn(telemetry_outcome)
     try:
         received = datetime.fromisoformat(qevent.received_at)
         if received.tzinfo is None:
@@ -461,9 +461,8 @@ async def _complete(
         )
     except ValueError:
         duration = 0.0
-    log.record_metric(
-        "curie.turn.duration", duration, attributes={**attributes, "agent": agent_label}
-    )
+    log.record_metric("curie.turn.duration", duration, attributes=attributes)
+    log.record_metric("curie.agent.turn.duration", duration, attributes=agent_attributes)
 
 
 async def _settle_and_publish(
@@ -569,20 +568,15 @@ async def _settle_targetless(
     self._record_agent_turn(telemetry_outcome)
 
 
-def _record_agent_turn(self: Kernel, telemetry_outcome: str) -> str:
-    """Count the terminal turn and return its shared agent metric label."""
-
-    label = agent_metric_label(constants._TURN_AGENT.get())
-    log.record_metric(
-        "curie.agent.turn.completed",
-        attributes={
-            "service.name": "curie-worker",
-            "source": "worker",
-            "outcome": telemetry_outcome,
-            "agent": label,
-        },
-    )
-    return label
+def _record_agent_turn(self: Kernel, telemetry_outcome: str) -> dict[str, str]:
+    attributes = {
+        "service.name": "curie-worker",
+        "source": "worker",
+        "outcome": telemetry_outcome,
+        "agent": agent_metric_label(constants._TURN_AGENT.get()),
+    }
+    log.record_metric("curie.agent.turn.completed", attributes=attributes)
+    return attributes
 
 
 async def _deliver_completion(self: Kernel, record: CompletionRecord, *, generation: str) -> bool:

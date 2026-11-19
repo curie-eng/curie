@@ -1,6 +1,24 @@
 {
   "schema_version": "v1",
   "metrics": {
+    "curie.factory.intake.label_pass.age_seconds": {
+      "type": "gauge",
+      "unit": "s",
+      "description": "Age of the last clean repository label pass.",
+      "monotonic": false,
+      "attributes": {
+        "repository": {
+          "kind": "bounded",
+          "ceiling": 20,
+          "reserved": [
+            "other"
+          ],
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        }
+      },
+      "cardinality_bound": 21
+    },
     "curie.factory.intake.notice.oldest_owed_age_seconds": {
       "type": "gauge",
       "unit": "s",
@@ -118,6 +136,33 @@
           "deadline_halted",
           "capacity_wait_expired",
           "stale_owner"
+        ]
+      },
+      "cardinality_bound": 240
+    },
+    "curie.agent.turn.completed": {
+      "type": "counter",
+      "unit": "{turn}",
+      "description": "Terminal turns for one agent. Agent-labeled metrics in each process share at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
+      "monotonic": true,
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ],
+        "source": [
+          "worker"
+        ],
+        "outcome": [
+          "done",
+          "awaiting_approval",
+          "budget_halted",
+          "classified_failure",
+          "side_effect_halted",
+          "idle",
+          "interrupted",
+          "deadline_halted",
+          "capacity_wait_expired",
+          "stale_owner"
         ],
         "agent": {
           "kind": "bounded",
@@ -130,13 +175,13 @@
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"
         }
       },
-      "cardinality_bound": 8160
+      "cardinality_bound": 340
     },
-    "curie.agent.turn.completed": {
-      "type": "counter",
-      "unit": "{turn}",
-      "description": "Terminal turns for one agent. Agent-labeled metrics in each process share at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
-      "monotonic": true,
+    "curie.agent.turn.duration": {
+      "type": "histogram",
+      "unit": "s",
+      "description": "End to end turn duration for one agent. The agent label follows curie.agent.turn.completed: at most 32 slugs per process, the rest other, a turn with no resolved agent unbound.",
+      "monotonic": false,
       "attributes": {
         "service.name": [
           "curie-worker"
@@ -924,6 +969,43 @@
         ]
       },
       "cardinality_bound": 160
+    },
+    "curie.runner.turn.duration": {
+      "type": "histogram",
+      "unit": "s",
+      "description": "Runner turn duration for one agent, using the shared bounded agent label.",
+      "monotonic": false,
+      "attributes": {
+        "service.name": [
+          "curie-runner"
+        ],
+        "source": [
+          "runner"
+        ],
+        "outcome": [
+          "done",
+          "awaiting_approval",
+          "budget_halted",
+          "classified_failure",
+          "side_effect_halted",
+          "idle",
+          "interrupted",
+          "deadline_halted",
+          "capacity_wait_expired",
+          "stale_owner"
+        ],
+        "agent": {
+          "kind": "bounded",
+          "ceiling": 32,
+          "reserved": [
+            "other",
+            "unbound"
+          ],
+          "overflow": "other",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"
+        }
+      },
+      "cardinality_bound": 340
     },
     "curie.runner.rpc.request.duration": {
       "type": "histogram",
@@ -2561,24 +2643,6 @@
         ]
       },
       "cardinality_bound": 18
-    },
-    "curie.factory.intake.label_pass.age_seconds": {
-      "type": "gauge",
-      "unit": "s",
-      "description": "Age of the last clean repository label pass.",
-      "monotonic": false,
-      "attributes": {
-        "repository": {
-          "kind": "bounded",
-          "ceiling": 20,
-          "reserved": [
-            "other"
-          ],
-          "overflow": "other",
-          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
-        }
-      },
-      "cardinality_bound": 21
     }
   }
 }

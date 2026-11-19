@@ -1527,7 +1527,7 @@ class SessionRunner:
             terminal_for_log = False
 
             def emit_completed_metrics() -> None:
-                """Emit the terminal metric pair once, synchronously."""
+                """Emit the terminal metrics once, synchronously."""
 
                 nonlocal metrics_emitted
                 if metrics_emitted:
@@ -1540,10 +1540,13 @@ class SessionRunner:
                 }
                 elapsed = time.monotonic() - start
                 record_metric("curie.turn.completed", attributes=completed_attributes)
+                record_metric("curie.turn.duration", elapsed, attributes=completed_attributes)
                 record_metric(
-                    "curie.turn.duration", elapsed,
+                    "curie.runner.turn.duration",
+                    elapsed,
                     attributes={
-                        **completed_attributes, "agent": agent_metric_label(self._agent_name),
+                        **completed_attributes,
+                        "agent": agent_metric_label(self._agent_name),
                     },
                 )
 

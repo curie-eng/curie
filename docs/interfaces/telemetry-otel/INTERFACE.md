@@ -115,10 +115,10 @@ than an open bag of `gen_ai.*` names.
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, or
   deployment identifiers. Three bounded identifier dimensions are declared:
-  `curie.agent.turn.completed`, `curie.turn.duration`,
-  `curie.approval.lifecycle`, `curie.approval.pending`, and
-  `curie.approval.pending.age` share the `agent` dimension. All five instruments
-  use the same normalization and admission budget: at most 32 distinct slugs
+  `curie.agent.turn.completed`, `curie.agent.turn.duration`,
+  `curie.runner.turn.duration`, `curie.approval.lifecycle`,
+  `curie.approval.pending`, and `curie.approval.pending.age` share the `agent`
+  dimension. Their shared admission budget allows at most 32 distinct slugs
   per process, plus `other` and `unbound`. Names that are not 1 to 63 character
   slugs, and names past the ceiling, share `other`
   (`packages/telemetry/src/curie_telemetry/metrics.py::agent_metric_label`).
@@ -126,10 +126,14 @@ than an open bag of `gen_ai.*` names.
   can be named on one worker and counted as `other` on another. A rising
   `agent="other"` series means the ceiling or the slug rule is hiding a name.
   `unbound` means no agent was resolved for the turn or approval. A real agent
-  named `other` or `unbound` shares `other`. The worker uses exactly the same
-  label on a turn's duration and agent completion counter. The runner uses
-  its existing configured connector agent name, or `unbound` when absent.
-  The fleet counter `curie.turn.completed` keeps its existing attributes.
+  named `other` or `unbound` shares `other`. The worker records
+  `curie.agent.turn.duration` with the same seconds and outcome as the fleet
+  histogram `curie.turn.duration` and the same attributes as
+  `curie.agent.turn.completed`. Query `outcome="done"` on the worker histogram
+  for per-agent time to complete. The runner records `curie.runner.turn.duration`
+  with its configured connector agent name, or `unbound` when absent, and the
+  same seconds as its fleet histogram. The fleet instruments
+  `curie.turn.completed` and `curie.turn.duration` omit the agent attribute.
   Approval resolution and expiry use the approval's stored agent, and approval
   resume looks up that agent independently of a channel's current binding.
   An unavailable resume telemetry lookup shares `other` and never blocks the

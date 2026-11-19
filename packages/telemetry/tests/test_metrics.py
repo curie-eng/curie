@@ -729,7 +729,7 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
         "outcome": "deadline_halted",
     }
     record_metric("curie.turn.completed", attributes=attributes)
-    record_metric("curie.turn.duration", 1.5, attributes={**attributes, "agent": "unbound"})
+    record_metric("curie.turn.duration", 1.5, attributes=attributes)
     manifest = _read(_MANIFEST)["metrics"]
     for name in ("curie.turn.completed", "curie.turn.duration"):
         outcomes = manifest[name]["attributes"]["outcome"]
@@ -738,8 +738,7 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
             assert sibling in outcomes
         assert "capacity_wait_expired" in outcomes
         assert "fenced_out" not in outcomes
-        expected_bound = 240 * (34 if name == "curie.turn.duration" else 1)
-        assert manifest[name]["cardinality_bound"] == expected_bound
+        assert manifest[name]["cardinality_bound"] == 240
 
 
 def test_deploy_notice_suppressed_is_two_closed_series() -> None:
@@ -1016,16 +1015,46 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
     assert manifest["cardinality_bound"] == 10 * (32 + 2)
 
 
+@pytest.mark.usefixtures("fresh_agent_metric_labels")
+def test_agent_turn_duration_matches_the_agent_counter_contract(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    provider, reader = metrics
+    manifest = _read(_MANIFEST)["metrics"]
+    duration = manifest["curie.agent.turn.duration"]
+    counter = manifest["curie.agent.turn.completed"]
+    assert duration["type"] == "histogram"
+    assert duration["unit"] == "s"
+    assert duration["monotonic"] is False
+    assert duration["attributes"] == counter["attributes"]
+    assert duration["cardinality_bound"] == counter["cardinality_bound"]
+    assert "agent" not in manifest["curie.turn.duration"]["attributes"]
 
-@pytest.mark.parametrize("first_metric", [
-    "curie.agent.turn.completed",
-    "curie.turn.duration",
-    "curie.approval.lifecycle",
-    "curie.approval.pending",
-    "curie.approval.pending.age",
-])
+    base = {"service.name": "curie-worker", "source": "worker", "outcome": "done"}
+    record_metric("curie.agent.turn.duration", 1.5, attributes={**base, "agent": "not a slug"})
+    with pytest.raises(ValueError, match="missing declared attribute"):
+        record_metric("curie.agent.turn.duration", 1.0, attributes=base)
+    with pytest.raises(ValueError, match="undeclared attribute"):
+        record_metric("curie.turn.duration", 1.0, attributes={**base, "agent": "acme-0"})
+    assert provider.force_flush(timeout_millis=5000)
+    series = _exported_series(reader)["curie.agent.turn.duration"]
+    assert {dict(point)["agent"] for point in series} == {"other"}
+
+
+@pytest.mark.parametrize(
+    "first_metric",
+    [
+        "curie.agent.turn.completed",
+        "curie.agent.turn.duration",
+        "curie.runner.turn.duration",
+        "curie.approval.lifecycle",
+        "curie.approval.pending",
+        "curie.approval.pending.age",
+    ],
+)
 def test_agent_labels_share_admission_across_turn_and_approval_metrics(
-    metrics: tuple[MeterProvider, InMemoryMetricReader], first_metric: str,
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+    first_metric: str,
 ) -> None:
     previous_provider, _ = metrics
     reader = InMemoryMetricReader()
@@ -1036,8 +1065,15 @@ def test_agent_labels_share_admission_across_turn_and_approval_metrics(
         "curie.agent.turn.completed": {
             "service.name": "curie-worker", "source": "worker", "outcome": "done",
         },
-        "curie.turn.duration": {
-            "service.name": "curie-worker", "source": "worker", "outcome": "done",
+        "curie.agent.turn.duration": {
+            "service.name": "curie-worker",
+            "source": "worker",
+            "outcome": "done",
+        },
+        "curie.runner.turn.duration": {
+            "service.name": "curie-runner",
+            "source": "runner",
+            "outcome": "done",
         },
         "curie.approval.lifecycle": {
             "service.name": "curie-api", "operation": "resolve", "outcome": "resolved",
@@ -1060,8 +1096,9 @@ def test_agent_labels_share_admission_across_turn_and_approval_metrics(
             for agent in ("acme-overflow", "not a slug", "x" * 64, "acme-0", "unbound"):
                 record_metric(name, attributes={**attributes[name], "agent": agent})
         assert provider.force_flush(timeout_millis=5000)
-        for name, series in _exported_series(reader).items():
-            assert name in attributes
+        exported = _exported_series(reader)
+        assert set(exported) == set(attributes)
+        for name, series in exported.items():
             labels = {dict(point)["agent"] for point in series}
             assert {"other", "acme-0", "unbound"} <= labels
             assert not labels.intersection({"acme-overflow", "not a slug", "x" * 64})
