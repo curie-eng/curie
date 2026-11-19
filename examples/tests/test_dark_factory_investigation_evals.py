@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_runner.question_tool import question_input_issues
 
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "examples/dark-factory"
@@ -97,20 +98,11 @@ def decision(reply: str) -> tuple[str, dict[str, Any], list[str]]:
     if not isinstance(inputs, dict):
         raise ValueError("The tool input is not an object.")
     if tool == ASK:
-        if set(inputs) != {"summary", "questions"}:
-            raise ValueError("ask_questions takes exactly summary and questions.")
+        # The production tool's own validator, so a call it would refuse never grades well.
+        issues = question_input_issues(inputs)
+        if issues:
+            raise ValueError("; ".join(issues))
         summary, questions = inputs["summary"], inputs["questions"]
-        if not isinstance(summary, str) or not 1 <= len(summary) <= 4000:
-            raise ValueError("The summary must be 1 to 4,000 characters.")
-        if not isinstance(questions, list) or not 1 <= len(questions) <= 10:
-            raise ValueError("ask_questions needs 1 to 10 questions.")
-        for question in questions:
-            if (
-                not isinstance(question, str)
-                or not 1 <= len(question) <= 1000
-                or "\n\n" in question.replace("\r\n", "\n")
-            ):
-                raise ValueError("Each question is 1 to 1,000 characters with no blank line.")
         facts = _string_object(summary)
         if facts is None or set(facts) != ASK_FACTS:
             raise ValueError("The summary is not a replay fact sheet.")
@@ -238,6 +230,21 @@ def test_grader_refuses_a_question_call_outside_the_tool_schema(mutate: Any) -> 
     assert grade("unresolved-intent", json.dumps(call)) == []
     mutate(call)
     assert grade("unresolved-intent", json.dumps(call))
+
+
+@pytest.mark.parametrize(
+    "questions",
+    [["   \n\t "], ["First?\n   \nSecond?"], ["First?\n\u200b\nSecond?"]],
+)
+def test_grader_refuses_what_the_production_question_tool_refuses(questions: list[str]) -> None:
+    # not-reproduced asks no alternative, so only the tool's own bounds can reject these.
+    call = exemplar("not-reproduced")
+    assert grade("not-reproduced", json.dumps(call)) == []
+    call["input"].update(questions=questions)
+    assert question_input_issues(call["input"])
+    assert grade("not-reproduced", json.dumps(call))
+    call["input"].update(summary="  \n ")
+    assert grade("not-reproduced", json.dumps(call))
 
 
 @pytest.mark.parametrize(

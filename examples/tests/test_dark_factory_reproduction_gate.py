@@ -27,9 +27,10 @@ HEADING = "### Questions from the factory (round 1 of 3)"
 QUESTIONS = {"summary": "add(2, 3) returned -1.", "questions": ["Which result is intended?"]}
 CITED_BODY = (
     "Restore addition.\n\nCloses #7\n\n## Decisions\n"
-    "1. Answered on the ticket by a maintainer: add returns the integer sum. Rejected: "
-    "keeping subtraction, because the maintainer chose the sum on the ticket. (plan) "
-    "Evidence: the answer comment on the ticket.\n\n## Acceptance checklist\n1. Done.\n"
+    "1. Keep integer addition. Rejected: float addition, because the tests compare integers. "
+    "(plan) Evidence: tests/test_calc.py.\n"
+    "Answered on the ticket by a maintainer: add returns the integer sum.\n\n"
+    "## Acceptance checklist\n1. Done.\n"
 )
 UNCITED_BODY = (
     "Restore addition.\n\nCloses #7\n\n## Decisions\n"
@@ -237,11 +238,16 @@ def test_rules_publish_needs_a_citation_line_after_a_question_heading(session: S
     refusal = session.publish(UNCITED_BODY)
     assert denied(refusal)
     assert "Answered on the ticket by" in reason(refusal)
-    indented = CITED_BODY.replace("1. Answered", "  1. Answered")
+    indented = CITED_BODY.replace("\nAnswered", "\n  Answered")
     assert denied(session.publish(indented))
+    numbered = CITED_BODY.replace("\nAnswered", "\n2. Answered")
+    assert denied(session.publish(numbered))
     assert not denied(session.publish(CITED_BODY))
-    bare = CITED_BODY.replace("1. Answered", "Answered")
-    assert not denied(session.publish(bare))
+    # One line per answer relied on, with no limit of seven.
+    many = CITED_BODY.replace(
+        "\n\n## Acceptance", "".join(f"\nAnswered on the ticket by a maintainer: {n}." for n in range(9)) + "\n\n## Acceptance"
+    )
+    assert not denied(session.publish(many))
 
 
 def test_rules_the_heading_is_remembered_for_the_session(session: Session) -> None:

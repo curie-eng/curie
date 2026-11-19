@@ -752,6 +752,39 @@ def test_publish_decisions_missing_body_is_recoverable(session: Session) -> None
     assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
 
 
+ENTRY = "1. Keep integers. Rejected: floats, because the tests compare integers. (plan) Evidence: tests."
+
+
+def _cited(count: int) -> str:
+    return "".join(f"Answered on the ticket by a maintainer: decision {n}.\n" for n in range(count))
+
+
+@pytest.mark.parametrize(
+    ("body", "allowed"),
+    [
+        # One line per answer relied on: nine answers do not trip the seven-entry cap.
+        (f"## Decisions\n{ENTRY}\n{_cited(9)}", True),
+        (f"## Decisions\n{_cited(9)}", True),
+        (f"## Decisions\n{ENTRY}\n{_cited(1)}\n## Checklist\n1. Done.\n", True),
+        # The cap still holds for numbered decisions, and the None declaration is not
+        # mixed with citation lines.
+        ("## Decisions\n" + "\n".join(ENTRY.replace("1.", f"{n}.", 1) for n in range(1, 8))
+         + f"\n8. x. Rejected: y, because z. (plan) Evidence: w.\n{_cited(1)}", False),
+        (f"## Decisions\nNone: the change follows directly from the acceptance criteria.\n{_cited(1)}", False),
+        # A citation prefix alone or with no author text is not a citation line.
+        ("## Decisions\nAnswered on the ticket by \n", False),
+        (f"## Decisions\n{ENTRY}\n  {_cited(1)}", False),
+    ],
+)
+def test_publish_decisions_accepts_one_citation_line_per_answer(
+    session: Session, body: str, allowed: bool
+) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    decision = session.pre(PUBLISH, {"body": body})
+    assert decision["permissionDecision"] == ("allow" if allowed else "deny")
+
+
 ADVERSARIAL_ENTRY = "x. Rejected: y, because z. (nomatch) Evidence: w. "
 
 

@@ -552,7 +552,7 @@ def test_factory_transcript_replays_the_actual_scheduled_sender_frame() -> None:
     )
     lane = ms.scrub(prompt)
     exchanges = [item for item in ms.load_transcript(path) if item["lane_key"] == lane]
-    assert [item["ordinal"] for item in exchanges] == list(range(18))
+    assert [item["ordinal"] for item in exchanges] == list(range(19))
     script = ms.ModelScript(path)
     script.start()
     try:

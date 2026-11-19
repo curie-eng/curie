@@ -14,7 +14,7 @@ Rules, per session:
 6. ``mcp__curie__publish_changes`` is refused after a recorded successful ask.
 7. ``mcp__curie__publish_changes`` is refused when a question heading was
    recorded and the body's Decisions section has no line starting
-   ``Answered on the ticket by `` (after an optional ``n. `` entry number).
+   ``Answered on the ticket by ``.
 
 Every other tool passes. The state lives in the checkout under
 ``.curie/factory-investigation``, which the hook lists in the repository's
@@ -45,7 +45,7 @@ LOCK_SECONDS = 2
 ASK_TOOL = "mcp__curie__ask_questions"
 PUBLISH_TOOL = "mcp__curie__publish_changes"
 QUESTION_HEADING = "### Questions from the factory"
-CITATION = re.compile(r"^(?:[1-9][0-9]*\. )?Answered on the ticket by ")
+CITATION = re.compile(r"^Answered on the ticket by \S")
 STATE_NAME = "factory-investigation"
 STATE_DIRECTORY = ".curie/" + STATE_NAME
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}

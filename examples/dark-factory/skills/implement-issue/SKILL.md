@@ -224,16 +224,18 @@ exactly one of these two forms:
 Never mix the None declaration with entries or add prose inside the section.
 
 When the ticket you read carries a factory question heading
-(`### Questions from the factory (round N of 3)`), the section records one
-entry for each answer on the ticket the change relies on, and its choice
-starts `Answered on the ticket by <author>: <the decision, one sentence>`:
+(`### Questions from the factory (round N of 3)`), the section also holds one
+line for each answer on the ticket the change relies on, after the numbered
+entries and in this form:
 
-`n. Answered on the ticket by <author>: <the decision>. Rejected: <the alternative the question offered>, because <author> chose the decision on the ticket. (plan) Evidence: <the comment that gave the answer>.`
+`Answered on the ticket by <author>: <the decision, one sentence>`
 
-These entries count toward the seven, and the None declaration is then not
-available. When more than seven answers shaped the change, put the answers that
-belong together in one entry and start its choice with the first of them. The investigation hook refuses publication when the ticket carried
-the heading and no entry in the section starts this way.
+These lines are not numbered decisions: the parser accepts any number of them
+beside the entries and does not count them toward the seven, so every answer you
+relied on gets its own line. A section with only citation lines needs no None
+declaration, and the None declaration is not used beside them. The investigation
+hook refuses publication when the ticket carried the heading and no line in the
+section starts this way.
 Preserve and update this section on every pull request revision, including
 CI repair rounds. A publication refusal for this section is recoverable:
 correct the body and request publication again without changing the reviewed

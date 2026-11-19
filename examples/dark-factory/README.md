@@ -238,8 +238,9 @@ completed Bash call as an observation, a `get_issue` result that contains a
 `ask_questions` call. It refuses `mcp__curie__ask_questions` until the session
 has one Bash observation, refuses `mcp__curie__publish_changes` after a
 successful ask in the same session, and refuses publication when the ticket
-carried a question heading and the Decisions section has no entry starting
-`Answered on the ticket by `. It also refuses an edit or Bash command that
+carried a question heading and the Decisions section has no line starting
+`Answered on the ticket by `. The decisions parser accepts those lines beside the
+numbered entries and does not count them toward its seven. It also refuses an edit or Bash command that
 names the hook, `hooks.json` or its state. The state lives in the checkout
 under `.curie/factory-investigation`, which the hook lists in the repository's
 `info/exclude` so it never joins the published candidate or the checkout
