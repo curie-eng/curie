@@ -75,9 +75,7 @@ def assert_first_response(label_at: datetime, investigating_at: datetime | None)
     _within(label_at, investigating_at, RESPONSE_SECONDS, f"the line {INVESTIGATING_LINE!r}")
 
 
-def question_comments(
-    comments: Iterable[Mapping[str, Any]], issue: int
-) -> list[Mapping[str, Any]]:
+def question_comments(comments: Iterable[Mapping[str, Any]], issue: int) -> list[Mapping[str, Any]]:
     return [
         comment
         for comment in comments

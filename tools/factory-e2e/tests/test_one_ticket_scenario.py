@@ -123,9 +123,7 @@ def test_question_items_other_than_one_and_two_are_refused() -> None:
     with pytest.raises(ots.OneTicketAssertionError, match="items 1 and 2"):
         ots.assert_one_question_comment([_questions("1. Only one?\n")], ots.ISSUE, BOT_LOGIN)
     with pytest.raises(ots.OneTicketAssertionError, match="items 1 and 2"):
-        ots.assert_one_question_comment(
-            [_questions("1. A?\n2. B?\n3. C?\n")], ots.ISSUE, BOT_LOGIN
-        )
+        ots.assert_one_question_comment([_questions("1. A?\n2. B?\n3. C?\n")], ots.ISSUE, BOT_LOGIN)
 
 
 def test_a_missing_investigating_line_is_refused() -> None:
@@ -158,7 +156,9 @@ def test_a_question_ending_that_left_a_request_running_is_refused() -> None:
     with pytest.raises(ots.OneTicketAssertionError, match="still running"):
         ots.assert_questions_state(issue, [_request(1, "running")])
     with pytest.raises(ots.OneTicketAssertionError, match="lacks the"):
-        ots.assert_questions_state({"labels": []}, [_request(1, "completed", cause="questions_asked")])
+        ots.assert_questions_state(
+            {"labels": []}, [_request(1, "completed", cause="questions_asked")]
+        )
 
 
 def test_a_follow_up_request_at_the_end_is_refused() -> None:
@@ -243,9 +243,7 @@ def _intake_verdicts(stub: Any, since: str) -> dict[int, tuple[bool, str]]:
                         app_id=tracker.app_id,
                     )
                     permission = await tracker.label_permission(
-                        dataclasses.replace(
-                            notice, sender_id=actor[0], sender_login=actor[1]
-                        )
+                        dataclasses.replace(notice, sender_id=actor[0], sender_login=actor[1])
                     )
                     verdict = f"answer:{actor[1]}:{permission}"
                 except FeedbackIgnored as exc:

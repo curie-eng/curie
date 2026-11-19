@@ -39,9 +39,7 @@ COMMENT_LIST_PATH = f"/repos/{REPOSITORY}/issues/comments"
 QUIET_POLLS = 3
 READER = {"id": 6610, "login": "onlooker", "type": "User"}
 OTHER_BOT = {"id": 6611, "login": "helper-bot[bot]", "type": "Bot"}
-ANSWER_TEXT = (
-    "Accept `k` and also `kelvin`. Refuse a Kelvin value below zero with an error."
-)
+ANSWER_TEXT = "Accept `k` and also `kelvin`. Refuse a Kelvin value below zero with an error."
 FOLLOW_UP_TEXT = "Thanks for asking, that is all from me."
 
 
@@ -165,7 +163,7 @@ class OneTicket:
         )
 
     def wait_for_intake_passes(self, since: int, github: Any) -> None:
-        """Wait until the intake has listed the tracker's comments QUIET_POLLS times since ``since``.
+        """Wait until the intake has listed the comments QUIET_POLLS times since ``since``.
 
         Nothing happening is only evidence once the intake has looked.
         """
@@ -236,9 +234,7 @@ class OneTicket:
         """The request's own status comment once its run ended."""
 
         marker = f"<!-- curie-execution-request:{request_id} -->"
-        return [
-            c for c in self.comments() if marker in c["body"] and fe._NOTICE_FINAL in c["body"]
-        ]
+        return [c for c in self.comments() if marker in c["body"] and fe._NOTICE_FINAL in c["body"]]
 
     def execute(self, github: Any) -> None:
         bot = github.BOT["login"]
@@ -266,9 +262,7 @@ class OneTicket:
         self.stub.append_comment(ots.ISSUE, "I would also like this.", author=READER)
         self.stub.append_comment(ots.ISSUE, "Automated notice.", author=OTHER_BOT)
         self.wait_for_intake_passes(since, github)
-        ots.assert_ignored_comments(
-            len(observed["requests"]), len(self.observe()["requests"])
-        )
+        ots.assert_ignored_comments(len(observed["requests"]), len(self.observe()["requests"]))
 
         # The labeller's plain answer, and a second plain comment beside it.
         answer = self.stub.append_comment(ots.ISSUE, ANSWER_TEXT, author=github.HUMAN)
@@ -296,12 +290,8 @@ class OneTicket:
             answer_comment_id=answer["id"],
             follow_up_comment_id=follow_up["id"],
             pull_request=pull["html_url"],
-            investigating_seconds=(
-                self.sightings["investigating"] - label_at
-            ).total_seconds(),
-            answer_received_seconds=(
-                self.sightings["answer_received"] - answer_at
-            ).total_seconds(),
+            investigating_seconds=(self.sightings["investigating"] - label_at).total_seconds(),
+            answer_received_seconds=(self.sightings["answer_received"] - answer_at).total_seconds(),
             second_request_seconds=(ots.instant(second["created_at"]) - answer_at).total_seconds(),
             lanes=self.router.evidence(),
         )
