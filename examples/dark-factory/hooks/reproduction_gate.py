@@ -6,7 +6,8 @@ Rules, per session:
 1. A Write, Edit, MultiEdit or NotebookEdit whose path, or a Bash command whose
    text, names this hook, ``hooks.json`` or the hook's state is refused.
 2. Each completed Bash call is recorded as an observation.
-3. A ``get_issue`` result containing the factory question heading is recorded.
+3. A ``get_issue`` result containing the factory question heading is recorded; a
+   result too large to decode is recorded as carrying it.
 4. A successful ``ask_questions`` call is recorded.
 5. ``mcp__curie__ask_questions`` is refused until one Bash observation exists.
 6. ``mcp__curie__publish_changes`` is refused after a recorded successful ask.
@@ -401,6 +402,28 @@ def handle(data: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def note_oversize_ticket_read(raw: bytes) -> None:
+    """Fail closed when a ticket read is too large to decode.
+
+    The runner returns a ticket of up to 4 MiB, so a real ``get_issue`` result can
+    exceed the input limit and its question heading could not be seen. The leading
+    top-level fields of the event name the session, checkout, event and tool; when
+    they say a ``get_issue`` result completed, record the heading as present, so
+    publication needs the citation line until the thread can be decoded.
+    """
+    head = raw.decode("utf-8", "replace")
+    fields: dict[str, str] = {}
+    for name in ("session_id", "cwd", "hook_event_name", "tool_name"):
+        found = re.search(rf'"{name}"\s*:\s*("(?:[^"\\]|\\.)*")', head)
+        if found:
+            fields[name] = json.loads(found.group(1))
+    if fields.get("hook_event_name") != "PostToolUse" or not fields.get(
+        "tool_name", ""
+    ).endswith("get_issue"):
+        return
+    handle({**fields, "tool_input": {}, "tool_response": QUESTION_HEADING})
+
+
 def main() -> None:
     try:
         try:
@@ -408,6 +431,7 @@ def main() -> None:
             signal.setitimer(signal.ITIMER_REAL, DEADLINE_SECONDS)
             raw = sys.stdin.buffer.read(MAX_INPUT + 1)
             if len(raw) > MAX_INPUT:
+                note_oversize_ticket_read(raw)
                 raise Refusal("The hook input exceeds its size limit.")
             result = handle(decode(raw))
         finally:

@@ -646,6 +646,32 @@ def test_registered_hook_records_the_question_heading_from_get_issue(
     assert out is not None and not denied(out)
 
 
+def test_registered_hook_holds_the_citation_rule_for_an_oversize_ticket_read(
+    registered: Registered,
+) -> None:
+    # The runner returns up to 4 MiB of ticket, past the hook's 2 MiB input limit.
+    ticket = f"{HEADING}\n\n1. Which?\n\n" + "comment text. " * (3 * 1024 * 1024 // 14)
+    assert len(json.dumps(issue_response(ticket))) > 2 * 1024 * 1024
+    out = registered.dispatch("PostToolUse", ISSUE_READ, {}, tool_response=issue_response(ticket))
+    assert out is not None and "size limit" in reason(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": CITED_BODY})
+    assert out is not None and not denied(out)
+
+
+def test_registered_hook_leaves_publication_open_after_an_oversize_non_ticket_result(
+    registered: Registered,
+) -> None:
+    big = {"stdout": "x" * (3 * 1024 * 1024), "stderr": "", "interrupted": False}
+    out = registered.dispatch(
+        "PostToolUse", "Bash", {"command": "cat big"}, tool_use_id="big", tool_response=big
+    )
+    assert out is not None and denied(out)
+    out = registered.dispatch("PreToolUse", PUBLISH, {"title": "t", "body": UNCITED_BODY})
+    assert out is not None and not denied(out)
+
+
 @pytest.mark.parametrize(
     ("event", "tool", "inputs"),
     [
