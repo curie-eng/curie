@@ -46,7 +46,7 @@ class CaptureRun:
     def __init__(self, tmp_path: Path, helpers: Any) -> None:
         self.helpers = helpers
         self.session = helpers.Session(tmp_path)
-        self.run = helpers.HooksJsonRuntime(self.session)
+        self.run = helpers.HooksJsonRuntime(self.session, other_hooks=False)
         self.database = tmp_path / "calls.sqlite3"
         with sqlite3.connect(self.database) as db:
             db.execute("CREATE TABLE calls (capture INTEGER NOT NULL)")

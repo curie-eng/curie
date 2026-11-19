@@ -2254,9 +2254,13 @@ class HooksJsonRuntime:
     assertions see the review gate alone while the investigation gate also runs.
     """
 
-    def __init__(self, session: Session, bundle: Path = BUNDLE) -> None:
+    def __init__(
+        self, session: Session, bundle: Path = BUNDLE, *, other_hooks: bool = True
+    ) -> None:
         self.session = session
         self.bundle = bundle
+        # A test that counts the review gate's own Git calls runs it alone.
+        self.other_hooks = other_hooks
         self.hooks = json.loads((bundle / "hooks" / "hooks.json").read_text())["hooks"]
         self.env = {**session.env, "CLAUDE_PLUGIN_ROOT": str(bundle)}
         self.invocations: list[tuple[str, str | None]] = []
@@ -2271,6 +2275,8 @@ class HooksJsonRuntime:
                 if tool is None or not re.fullmatch(matcher, tool):
                     continue
             for registered in entry["hooks"]:
+                if hook not in registered["command"] and not self.other_hooks:
+                    continue
                 command = registered["command"].replace("${CLAUDE_PLUGIN_ROOT}", str(self.bundle))
                 payload: dict[str, Any] = {
                     "session_id": "sess-fresh",
