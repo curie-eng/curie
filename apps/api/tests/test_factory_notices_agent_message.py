@@ -114,6 +114,7 @@ def _settled_handoff(fixture: Any, detail: str) -> tuple[str, str]:
                     retry_safety=None,
                     retry_condition=None,
                     exhausted_volume=None,
+                    finisher="worker",
                 )
                 assert not isinstance(outcome, WorkItemConflict), outcome
         finally:

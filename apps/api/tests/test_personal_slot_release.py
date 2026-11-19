@@ -23,7 +23,10 @@ worker HTTP routes, and terminate wakes come from
 
 from __future__ import annotations
 
+import hashlib
+import uuid
 from collections.abc import Iterator
+from datetime import timedelta
 from typing import Any, Literal
 from uuid import UUID
 
@@ -44,6 +47,8 @@ from test_workitems import _grant_opened_pull_request
 WORKER_TOKEN = "personal-slot-release-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
 OBSERVATION = support.TERMINATION_OBSERVATION
+RECOVERY_BASE = "b" * 40
+RECOVERY_ARCHIVE_LIMIT = 268435456
 
 
 @pytest.fixture
@@ -398,6 +403,91 @@ def test_ci_failed_verdict_releases_the_parked_personal_slot(
         cause="ci_failed",
         epoch=epoch,
     )
+
+
+def _reserve_recovery(api: TestClient, admitted: support.Admitted) -> httpx.Response:
+    """Start the finisher's ADR 0251 recovery capture of its failed run."""
+
+    support.rows(
+        "UPDATE curie.work_items SET base_branch = 'main', base_source = 'default', "
+        "base_commit = :base WHERE id = :id",
+        {"base": RECOVERY_BASE, "id": admitted.work_item_id},
+    )
+    [row] = support.rows(
+        "SELECT runtime_epoch, dispatch_generation FROM curie.execution_requests WHERE id = :id",
+        {"id": admitted.request_id},
+    )
+    return api.post(
+        "/v1/internal/workspace-recovery/reserve",
+        json={
+            "work_item_id": str(admitted.work_item_id),
+            "source_request_id": str(admitted.request_id),
+            "runtime_epoch": row["runtime_epoch"],
+            "dispatch_generation": row["dispatch_generation"],
+            "idempotency_key": uuid.uuid4().hex,
+            "repository": {
+                "provider": "github",
+                "host": "github.com",
+                "project_id": "101",
+                "path": support.REPO,
+            },
+            "base_commit": RECOVERY_BASE,
+            "target_branch": "main",
+            "base_archive_limit_bytes": RECOVERY_ARCHIVE_LIMIT,
+            "objects": [
+                {
+                    "kind": kind,
+                    "size_bytes": size,
+                    "sha256": hashlib.sha256(kind.encode()).hexdigest(),
+                }
+                for kind, size in (("base", 100), ("patch", 30), ("manifest", 20))
+            ],
+        },
+        headers=WORKER_HEADERS,
+    )
+
+
+def test_failed_resumed_parked_personal_finish_keeps_a_short_lease(
+    world: support.World, runs_stream: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker's own failed finish of a turn that ran under a parked CI hold.
+
+    The parked lease becomes the short lease any finish leaves rather than
+    being released, so the worker's ADR 0251 recovery capture still has live
+    authority and the terminate wake waits for that lease to lapse.
+    """
+
+    support.configure_api(monkeypatch, worker_token=WORKER_TOKEN)
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setenv("CURIE_WORKSPACE_RECOVERY_MAX_BYTES", "10000000")
+    monkeypatch.setenv("CURIE_WORKSPACE_MAX_ARCHIVE_BYTES", str(RECOVERY_ARCHIVE_LIMIT))
+    get_settings.cache_clear()
+    ttl = timedelta(seconds=get_settings().work_item_runtime_ttl_seconds)
+    with TestClient(create_app()) as api:
+        admitted, epoch = _started(api, world, 58410)
+        _park_for_ci(admitted, pr=58410)
+
+        support.finish_failed(admitted.request_id, epoch, cause="model_error")
+
+        row = _request(admitted.request_id)
+        assert (row["status"], row["terminal_cause"]) == ("failed", "model_error")
+        assert row["teardown_unconfirmed_at"] is not None
+        assert (row["parked"], row["lease_lapsed"]) == (False, False)
+        [lease] = support.rows(
+            "SELECT runtime_heartbeat_expires_at - clock_timestamp() AS remaining "
+            "FROM curie.execution_requests WHERE id = :id",
+            {"id": admitted.request_id},
+        )
+        assert timedelta(0) < lease["remaining"] <= ttl
+        assert _wakes() == []
+        _conflict(_claim(api, admitted.request_id, support.OTHER_RUNTIME_OWNER), "duplicate")
+        reserved = _reserve_recovery(api, admitted)
+        assert reserved.status_code == 200, reserved.text
+
+        _expire_lease(admitted.request_id)
+
+        assert _wakes() == [admitted.request_id]
+    get_settings.cache_clear()
 
 
 # --- an expired request already carries its observation --------------------------------

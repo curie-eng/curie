@@ -2067,6 +2067,7 @@ async def finish(
         retry_safety=retry_safety,
         retry_condition=retry_condition,
         exhausted_volume=exhausted_volume,
+        finisher="worker",
     )
     if isinstance(result, WorkItemConflict):
         # The conflict path commits and expires this row.

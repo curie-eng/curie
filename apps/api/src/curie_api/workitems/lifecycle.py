@@ -1969,6 +1969,7 @@ async def terminalize_execution(
     retry_safety: RetrySafety | None,
     retry_condition: RetryConditionFact | None,
     exhausted_volume: str | None,
+    finisher: Literal["worker", "control_plane"],
 ) -> WorkItemResult:
     """Settle a running request completed or failed.
 
@@ -1979,7 +1980,9 @@ async def terminalize_execution(
     transaction, before terminal settlement. ``exhausted_volume`` is the
     scratch volume a ``sandbox_scratch_exhausted`` finish named (#5427); the
     terminal UPDATE adds it to the request's delivered limits record, where
-    the successor's gate reads it.
+    the successor's gate reads it. ``finisher`` names who ends the run: the
+    worker's own finish, or a settlement the control plane makes itself. It
+    decides what becomes of a lease parked at the execution deadline.
     """
 
     work_item = await lock_work_item(session, work_item_id)
@@ -2157,12 +2160,18 @@ async def terminalize_execution(
     # personal request's sandbox claim holds that slot until a worker deletes
     # it, and the worker's own release runs only when its turn settles the
     # request, so this write owes the teardown (#5840): terminate wakes follow
-    # until a worker records the runtime gone. A parked CI or approval hold is
-    # released so any worker can claim it. Service rows are unchanged.
+    # until a worker records the runtime gone. When the control plane settles
+    # the run, a parked CI or approval hold is released so any worker can claim
+    # it at once. When the worker finishes it, a parked hold becomes the short
+    # lease an ordinary finish leaves, so its ADR 0251 recovery capture keeps
+    # live authority and the wake waits for that lease to lapse. Service rows
+    # are unchanged.
     teardown_values: dict[str, Any] = (
         {
             "teardown_unconfirmed_at": func.clock_timestamp(),
-            "runtime_heartbeat_expires_at": _release_parked_hold(),
+            "runtime_heartbeat_expires_at": (
+                _shorten_parked_hold() if finisher == "worker" else _release_parked_hold()
+            ),
         }
         if request.model_auth_mode == "personal" and request.started_at is not None
         else {}
@@ -2260,6 +2269,7 @@ async def complete_execution(
         retry_safety=retry_safety,
         retry_condition=retry_condition,
         exhausted_volume=None,
+        finisher="control_plane",
     )
 
 
@@ -2288,6 +2298,7 @@ async def fail_execution(
         retry_safety=retry_safety,
         retry_condition=retry_condition,
         exhausted_volume=None,
+        finisher="control_plane",
     )
 
 
@@ -2418,6 +2429,7 @@ async def settle_ci_verdict(
                 retry_safety=None,
                 retry_condition=None,
                 exhausted_volume=None,
+                finisher="control_plane",
             )
         if isinstance(result, WorkItemOutcome):
             await session.execute(
@@ -2447,6 +2459,7 @@ async def settle_ci_verdict(
         retry_safety=None,
         retry_condition=None,
         exhausted_volume=None,
+        finisher="control_plane",
     )
 
 
@@ -2499,6 +2512,21 @@ def _release_parked_hold() -> ColumnElement[datetime]:
         (
             ExecutionRequest.runtime_heartbeat_expires_at == ExecutionRequest.execution_deadline,
             func.clock_timestamp(),
+        ),
+        else_=ExecutionRequest.runtime_heartbeat_expires_at,
+    )
+
+
+def _shorten_parked_hold() -> ColumnElement[datetime]:
+    # A worker finishing a turn that ran under a parked CI or approval hold
+    # keeps a live short lease, as any other finish does, so its ADR 0251
+    # recovery capture keeps live authority; the terminate wake waits for that
+    # lease to lapse (#5840). An ordinary short lease is kept as it is.
+    return case(
+        (
+            ExecutionRequest.runtime_heartbeat_expires_at == ExecutionRequest.execution_deadline,
+            func.clock_timestamp()
+            + timedelta(seconds=get_settings().work_item_runtime_ttl_seconds),
         ),
         else_=ExecutionRequest.runtime_heartbeat_expires_at,
     )
