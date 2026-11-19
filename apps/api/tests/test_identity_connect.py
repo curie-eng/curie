@@ -1053,20 +1053,21 @@ def test_ordinary_connect_login_never_mints_console_administration(
     assert console_sessions() == before
 
 
-@pytest.mark.parametrize("groups", [None, ["members"]], ids=["missing", "wrong"])
+@pytest.mark.parametrize("groups", [None, "staff"], ids=["missing", "wrong"])
 def test_shared_issuer_connect_claims_depend_on_directory(
-    connect_browser, monkeypatch: pytest.MonkeyPatch, groups: list[str] | None
+    connect_browser, monkeypatch: pytest.MonkeyPatch, groups: str | None
 ) -> None:
     import re
     from urllib.parse import urlsplit
 
     import httpx
+    from curie_api.routers.identity_connect import CONNECT_COOKIE, CSRF_COOKIE, PROOF_COOKIE
 
     client, directory_token, directory_id, directory_principal_id, _, idp = connect_browser
     idp.redirect_uri = "https://testserver/console/oidc/callback"
     monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", "personal")
     monkeypatch.setenv("CURIE_OIDC_REDIRECT_URI", idp.redirect_uri)
-    monkeypatch.setenv("CURIE_OIDC_REQUIRED_CLAIMS", '{"groups":"operators"}')
+    monkeypatch.setenv("CURIE_OIDC_REQUIRED_CLAIMS", '{"groups":"curie-admins"}')
     monkeypatch.setenv("CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "false")
     get_settings.cache_clear()
     if groups is not None:
@@ -1158,9 +1159,15 @@ def test_shared_issuer_connect_claims_depend_on_directory(
     callback = sign_in()
     assert callback.status_code == console_refusal.status_code
     assert callback.json() == console_refusal.json()
+    expired_cookies = {
+        cookie.partition("=")[0]
+        for cookie in callback.headers.get_list("set-cookie")
+        if "Max-Age=0" in cookie
+    }
+    assert {CONNECT_COOKIE, CSRF_COOKIE, PROOF_COOKIE} <= expired_cookies
     assert asyncio.run(personal_counts()) == before
 
-    idp.extra_claims["groups"] = ["operators"]
+    idp.extra_claims["groups"] = ["curie-admins"]
     assert client.get(personal_path).status_code == 200
     callback = sign_in()
     assert callback.status_code == 303, callback.text

@@ -513,7 +513,10 @@ async def oidc_callback(
         connect_row is None
         or await session.get(TenantIdentityProvider, connect_row.tenant_id) is None
     ) and not oidc.meets_required_claims(claims, get_settings().oidc_required_claims):
-        return _refuse_callback("ID token lacks a required claim")
+        response = _refuse_callback("ID token lacks a required claim")
+        if connect_row is not None:
+            clear_connect_cookies(response)
+        return response
     # @spec HTTP-PRINCIPAL-ADOPTION-V1-10, HTTP-PRINCIPAL-ADOPTION-V1-11.
     try:
         principal = await crud_console.resolve_principal(
