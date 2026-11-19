@@ -39,7 +39,7 @@ from uuid import uuid4
 
 import anyio
 import pytest
-from aci_protocol import Event, Final, ToolNote, parse_ndjson_line
+from aci_protocol import Event, Final, SessionStatus, ToolNote, parse_ndjson_line
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_runner import __main__ as boot
@@ -319,11 +319,13 @@ def _called_propose_rule(notes: list[ToolNote]) -> bool:
 def test_live_revision_proposes_a_rule_only_for_general_feedback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feedback: str, proposes: bool
 ) -> None:
-    notes, _final, stub = _drive(tmp_path, monkeypatch, feedback)
+    notes, final, stub = _drive(tmp_path, monkeypatch, feedback)
     trajectory = [note.tool for note in notes]
     if not proposes:
-        # The control must have run the factory, not stopped before any tool.
+        # The control must have run the factory to the end of its turn, not
+        # stopped before any tool or failed after an unrelated first call.
         assert notes, "the control turn made no tool call at all"
+        assert final.status is SessionStatus.DONE, (final.status, final.text)
         assert not _called_propose_rule(notes), trajectory
         assert stub.rule_posts == []
         return
