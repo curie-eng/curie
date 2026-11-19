@@ -1,0 +1,426 @@
+{
+  "attempt": 1,
+  "identities": {
+    "app_login": "fixture-app[bot]",
+    "writer_id": 9000001,
+    "reader_id": 9000002,
+    "repository_id": 9100001,
+    "repository_url": "https://code-host.example.invalid/fixture-owner/fixture-repo",
+    "default_branch": "main",
+    "repository_path": "fixture-owner/fixture-repo"
+  },
+  "agent": {
+    "tenant_id": "tenant-fake",
+    "memory_rule_proposals": true
+  },
+  "preflight": {
+    "open_items": [],
+    "work_items": []
+  },
+  "session_probe": {
+    "writer": {
+      "session_kind": "principal",
+      "principal_status": 200,
+      "principal_id": "principal-writer",
+      "tenant_id": "tenant-fake"
+    },
+    "reader": {
+      "session_kind": "principal",
+      "principal_status": 200,
+      "principal_id": "principal-reader",
+      "tenant_id": "tenant-fake"
+    }
+  },
+  "beat_a": {
+    "issue_number": 11,
+    "labelled_at": "2030-01-01T00:00:00Z",
+    "comments": [
+      {
+        "id": 1,
+        "body": "Investigating this ticket.",
+        "created_at": "2030-01-01T00:00:20Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        }
+      },
+      {
+        "id": 2,
+        "body": "Before I start, I need one decision.\n\n1. How many decimal places should the CLI print?\n2. Should identity conversions print a unit suffix?\n\ncurie-factory-questions:11",
+        "created_at": "2030-01-01T00:05:00Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        }
+      }
+    ],
+    "issue_labels": [
+      "factory",
+      "curie-factory:questions"
+    ],
+    "quiet_snapshot": {
+      "observed_at": "2030-01-01T00:06:10Z",
+      "requests": [
+        {
+          "id": "request-1",
+          "status": "completed",
+          "created_at": "2030-01-01T00:00:25Z",
+          "work_item_id": "work-item-a",
+          "finished_at": "2030-01-01T00:05:05Z"
+        }
+      ]
+    },
+    "work_item_id": "work-item-a"
+  },
+  "beat_b": {
+    "answer": {
+      "id": 3,
+      "body": "Show 2 decimal places in the CLI output.",
+      "created_at": "2030-01-01T00:10:00Z",
+      "user": {
+        "id": 9000001
+      },
+      "issue_number": 11
+    },
+    "requests": [
+      {
+        "id": "request-1",
+        "status": "completed",
+        "created_at": "2030-01-01T00:00:25Z",
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:05:05Z"
+      },
+      {
+        "id": "request-2",
+        "status": "completed",
+        "created_at": "2030-01-01T00:10:30Z",
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:24:00Z"
+      }
+    ],
+    "open_pulls": [
+      {
+        "number": 12,
+        "body": "Closes #11\n\n## Decisions\n\nAnswered on the ticket by fixture-writer: print 2 decimal places.\n",
+        "created_at": "2030-01-01T00:25:00Z",
+        "head": {
+          "ref": "curie/issue-11",
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ],
+    "issues": [
+      {
+        "number": 11,
+        "user": {
+          "login": "fixture-writer",
+          "id": 9000001
+        }
+      }
+    ]
+  },
+  "beat_c": {
+    "pull_number": 12,
+    "pull_before": {
+      "head": {
+        "ref": "curie/issue-11",
+        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "post": {
+      "method": "POST",
+      "path": "/repos/fixture-owner/fixture-repo/pulls/12/reviews",
+      "body": {
+        "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "event": "COMMENT",
+        "body": "",
+        "comments": [
+          {
+            "path": "unitconv/tests/test_convert.py",
+            "line": 40,
+            "body": "Use `self.assertAlmostEqual(..., places=6)` for every floating point result; every float assertion in this repository's tests does that."
+          }
+        ]
+      }
+    },
+    "review": {
+      "id": 7001,
+      "state": "COMMENTED",
+      "submitted_at": "2030-01-01T00:30:00Z",
+      "user": {
+        "id": 9000001
+      },
+      "pull_request_url": "https://api.code-host.example.invalid/repos/fixture-owner/fixture-repo/pulls/12"
+    },
+    "review_comments": [
+      {
+        "path": "unitconv/tests/test_convert.py",
+        "line": 40,
+        "body": "Use `self.assertAlmostEqual(..., places=6)` for every floating point result; every float assertion in this repository's tests does that.",
+        "pull_request_review_id": 7001
+      }
+    ],
+    "diff_added_lines": {
+      "unitconv/tests/test_convert.py": [
+        38,
+        39,
+        40,
+        41
+      ]
+    },
+    "requests": [
+      {
+        "id": "request-1",
+        "created_at": "2030-01-01T00:00:25Z",
+        "objective": "",
+        "tool_notes": [],
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:05:05Z"
+      },
+      {
+        "id": "request-2",
+        "created_at": "2030-01-01T00:10:30Z",
+        "objective": "",
+        "tool_notes": [
+          "Read"
+        ],
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:24:00Z"
+      },
+      {
+        "id": "96fdb3de-72f5-5142-9f06-1232ff930e96",
+        "created_at": "2030-01-01T00:30:20Z",
+        "objective": "Review feedback on unitconv/tests/test_convert.py line 40: Use `self.assertAlmostEqual(..., places=6)` for every floating point result; every float assertion in this repository's tests does that.",
+        "tool_notes": [
+          "Read",
+          "Edit",
+          "mcp__curie__propose_rule"
+        ],
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:39:00Z"
+      }
+    ],
+    "pull_after": {
+      "head": {
+        "ref": "curie/issue-11",
+        "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "committed_at": "2030-01-01T00:40:00Z"
+      }
+    },
+    "branches": [
+      "main",
+      "curie/issue-11"
+    ]
+  },
+  "beat_d": {
+    "rules_before_merge": {
+      "rules": [],
+      "in_force_count": 0,
+      "in_force_limit": 16
+    },
+    "merged_at": "2030-01-01T00:45:00Z",
+    "merged_by_id": 9000001,
+    "rules_after_merge": {
+      "observed_at": "2030-01-01T00:45:30Z",
+      "output": {
+        "rules": [
+          {
+            "id": "rule-id-1",
+            "number": 1,
+            "label": "R1",
+            "state": "proposed",
+            "source_url": "https://code-host.example.invalid/fixture-owner/fixture-repo/pull/12#pullrequestreview-7001",
+            "version": 1
+          }
+        ],
+        "in_force_count": 0,
+        "in_force_limit": 16
+      }
+    }
+  },
+  "beat_e": {
+    "reader_permission": "read",
+    "rule_before": {
+      "id": "rule-id-1",
+      "version": 1
+    },
+    "reader_command": {
+      "exit_code": 1,
+      "output": {
+        "error": "memory_rules.write_access_required: no linked write access",
+        "fix": "Ask someone who can merge to this repository."
+      },
+      "elapsed_seconds": 1.2,
+      "rule_id": "rule-id-1"
+    },
+    "rule_after_reader": {
+      "version": 1
+    },
+    "writer_command": {
+      "exit_code": 0,
+      "output": {
+        "id": "rule-id-1",
+        "label": "R1",
+        "state": "accepted",
+        "accepted_by": {
+          "principal_id": "principal-writer",
+          "display_name": "Fixture Writer"
+        },
+        "version": 2,
+        "applies_from": "next_ticket"
+      },
+      "elapsed_seconds": 1.5,
+      "rule_id": "rule-id-1"
+    }
+  },
+  "beat_f": {
+    "issue_number": 13,
+    "instruction_set": true,
+    "labelled_at": "2030-01-01T01:00:00Z",
+    "open_pulls": [
+      {
+        "number": 14,
+        "body": "Closes #13\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @fixture-app.\nLearned rules: in force; rules:R1; sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nRequester preferences: applied; sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n",
+        "created_at": "2030-01-01T01:20:00Z"
+      }
+    ],
+    "work_item": {
+      "memory_rules": {
+        "state": "selected",
+        "count": 1,
+        "rule_numbers": [
+          1
+        ],
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "format_version": 1
+      }
+    },
+    "diff_added_lines": [
+      "    def test_delisle(self):",
+      "        self.assertAlmostEqual(",
+      "            convert(100, 'c', 'de'), 0.0, places=6",
+      "        )"
+    ]
+  },
+  "beat_g": {
+    "issue_number": 15,
+    "labelled_at": "2030-01-01T01:30:00Z",
+    "remove_command": {
+      "exit_code": 0,
+      "output": {
+        "id": "rule-id-1",
+        "label": "R1",
+        "state": "removed",
+        "version": 3,
+        "removed_by": {
+          "principal_id": "principal-writer",
+          "display_name": "Fixture Writer"
+        },
+        "removed_at": "2030-01-01T01:28:00Z"
+      },
+      "elapsed_seconds": 1.1,
+      "rule_id": "rule-id-1"
+    },
+    "open_pulls": [
+      {
+        "number": 14,
+        "body": "Closes #13\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @fixture-app.\nLearned rules: in force; rules:R1; sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        "created_at": "2030-01-01T01:20:00Z"
+      },
+      {
+        "number": 16,
+        "body": "Closes #15\n\nAsk the factory: comment on this pull request. The first 10 revisions need no mention; after that, mention @fixture-app.\nRequester preferences: applied; sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n",
+        "created_at": "2030-01-01T01:50:00Z"
+      }
+    ],
+    "work_item": {
+      "memory_rules": {
+        "state": "absent",
+        "count": 0,
+        "rule_numbers": [],
+        "sha256": null,
+        "format_version": null
+      }
+    }
+  },
+  "beat_h": {
+    "observed_at": "2030-01-01T02:03:30Z",
+    "work_items": [],
+    "comments": [],
+    "label_events": [
+      {
+        "event": "labeled",
+        "label": {
+          "name": "factory-unbound-run1"
+        },
+        "actor": {
+          "login": "fixture-writer",
+          "id": 9000001
+        },
+        "created_at": "2030-01-01T02:00:00Z"
+      }
+    ],
+    "retired_bundle": {
+      "exit_code": 1,
+      "output": {
+        "issues": [
+          {
+            "code": "bundle.result_declaration_retired",
+            "location": "workflow/result.json"
+          }
+        ]
+      },
+      "version_before": "v3",
+      "version_after": "v3"
+    },
+    "label": "factory-unbound-run1"
+  },
+  "usage": {
+    "samples": [
+      {
+        "label": "before_a",
+        "usage": 10.0
+      },
+      {
+        "label": "after_a",
+        "usage": 11.25
+      },
+      {
+        "label": "after_b",
+        "usage": 12.5
+      },
+      {
+        "label": "after_c",
+        "usage": 13.75
+      },
+      {
+        "label": "after_d",
+        "usage": 15.0
+      },
+      {
+        "label": "after_e",
+        "usage": 16.25
+      },
+      {
+        "label": "after_f",
+        "usage": 17.5
+      },
+      {
+        "label": "after_g",
+        "usage": 18.75
+      },
+      {
+        "label": "after_h",
+        "usage": 20.0
+      }
+    ]
+  },
+  "teardown": {
+    "verified": true,
+    "namespace_gone": true,
+    "session_files_deleted": true,
+    "code_host_links_removed": true,
+    "dex_deleted": true,
+    "issues_closed": true
+  }
+}

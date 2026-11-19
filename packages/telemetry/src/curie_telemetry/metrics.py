@@ -708,6 +708,7 @@ _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
         "request_owner_lost_cancellations",
         "publish_terminate_wakes",
         "settle_overdue_cancellations",
+        "redrive_question_rounds",
         "readmit_pending",
         "drain_answer_retries",
         "reconcile_missed_labels",

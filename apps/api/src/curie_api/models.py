@@ -346,6 +346,9 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether the agent may propose learned memory rules (#5795). It gates
+    # proposals only: a rule a person accepted applies whatever this says.
+    memory_rule_proposals: Mapped[bool] = mapped_column(default=False, server_default="false")
     # Whether this agent's connector calls carry the verified human requester
     # (ADR 0270 decision 1, @spec CONNECTOR-REQUESTER-1). Operator-owned and
     # off by default. Written only by the `PATCH /agents/{id}` compare-and-set
@@ -1004,6 +1007,14 @@ class WorkItem(Base):
             name="work_items_coding_selection_ck",
         ),
         CheckConstraint(
+            "((memory_rules_state = 'absent' AND memory_rules_count = 0 "
+            "AND memory_rules_sha256 IS NULL AND memory_rules_format_version IS NULL) "
+            "OR (memory_rules_state = 'selected' AND memory_rules_count BETWEEN 1 AND 16 "
+            "AND memory_rules_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND memory_rules_format_version = 1)) IS TRUE",
+            name="work_items_memory_rules_ck",
+        ),
+        CheckConstraint(
             "length(btrim(tracker_kind)) > 0 AND length(btrim(tracker_host)) > 0 "
             "AND length(btrim(tracker_scope_id)) > 0 AND length(btrim(tracker_issue_id)) > 0 "
             "AND (tracker_display_key IS NULL OR length(btrim(tracker_display_key)) > 0) "
@@ -1118,6 +1129,12 @@ class WorkItem(Base):
     coding_instructions_revision: Mapped[int | None] = mapped_column(BigInteger, default=None)
     coding_instructions_sha256: Mapped[str | None] = mapped_column(String(64), default=None)
     coding_instructions_format_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    # The learned rules pinned at admission (#5795). ``absent`` carries no
+    # digest; ``selected`` names one to 16 rules and the digest of their text.
+    memory_rules_state: Mapped[str] = mapped_column(Text, default="absent", server_default="absent")
+    memory_rules_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    memory_rules_sha256: Mapped[str | None] = mapped_column(CHAR(64), default=None)
+    memory_rules_format_version: Mapped[int | None] = mapped_column(Integer, default=None)
     conversation_id: Mapped[str]
     publication_lineage_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey(
@@ -1246,6 +1263,239 @@ class WorkItemCodingSnapshot(Base):
     text: Mapped[str] = mapped_column(Text)
 
 
+class WorkItemMemoryRuleSnapshot(Base):
+    """The accepted learned rules pinned at admission, deleted with the WorkItem (#5795)."""
+
+    __tablename__ = "work_item_memory_rule_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "cardinality(rule_numbers) BETWEEN 1 AND 16",
+            name="work_item_memory_rule_snapshots_numbers_ck",
+        ),
+        CheckConstraint(
+            "octet_length(text) <= 4096", name="work_item_memory_rule_snapshots_text_ck"
+        ),
+        CheckConstraint(
+            "sha256 = encode(sha256(convert_to(text, 'UTF8')), 'hex')",
+            name="work_item_memory_rule_snapshots_sha256_ck",
+        ),
+        {"schema": SCHEMA},
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"), primary_key=True
+    )
+    rule_numbers: Mapped[list[int]] = mapped_column(ARRAY(BigInteger))
+    text: Mapped[str] = mapped_column(Text)
+    sha256: Mapped[str] = mapped_column(CHAR(64))
+
+
+MEMORY_RULE_STATES = (
+    "candidate",
+    "proposed",
+    "accepted",
+    "rejected",
+    "removed",
+    "superseded",
+    "discarded",
+)
+_MEMORY_RULE_STATE_LIST = ", ".join(f"'{state}'" for state in MEMORY_RULE_STATES)
+_NUMBERLESS_STATES = "('candidate', 'superseded', 'discarded')"
+
+
+class MemoryRule(Base):
+    """One learned rule owned by an agent and scoped to the agent, a binding or a repository.
+
+    ``number`` is allocated when the rule becomes ``proposed``, so a hidden
+    candidate never burns a visible number. Every accept, reject and remove
+    names a person. The lifecycle lives in ``curie_internal.memory_rules``.
+    """
+
+    __tablename__ = "memory_rules"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "agent_id"],
+            [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
+            name="memory_rules_tenant_agent_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "accepted_by"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="memory_rules_accepted_by_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "rejected_by"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="memory_rules_rejected_by_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "removed_by"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="memory_rules_removed_by_fkey",
+        ),
+        UniqueConstraint("id", "tenant_id", "agent_id", name="memory_rules_id_owner_key"),
+        UniqueConstraint("source_request_id", name="memory_rules_source_request_key"),
+        UniqueConstraint("agent_id", "source_turn", name="memory_rules_source_turn_key"),
+        CheckConstraint(
+            "scope_kind IN ('agent', 'binding', 'repository') AND "
+            "((scope_kind = 'agent' AND scope_key = '') "
+            "OR (scope_kind <> 'agent' AND length(scope_key) > 0))",
+            name="memory_rules_scope_ck",
+        ),
+        CheckConstraint(f"state IN ({_MEMORY_RULE_STATE_LIST})", name="memory_rules_state_ck"),
+        CheckConstraint(
+            f"(number IS NULL) = (state IN {_NUMBERLESS_STATES}) "
+            "AND (number IS NULL OR number >= 1)",
+            name="memory_rules_number_ck",
+        ),
+        CheckConstraint(
+            "octet_length(text) BETWEEN 1 AND 240 "
+            "AND position(chr(13) in text) = 0 AND position(chr(10) in text) = 0",
+            name="memory_rules_text_ck",
+        ),
+        CheckConstraint(
+            "sha256 = encode(sha256(convert_to(text, 'UTF8')), 'hex')",
+            name="memory_rules_sha256_ck",
+        ),
+        CheckConstraint("format_version = 1", name="memory_rules_format_version_ck"),
+        CheckConstraint(
+            "octet_length(reason) BETWEEN 1 AND 240 "
+            "AND position(chr(13) in reason) = 0 AND position(chr(10) in reason) = 0",
+            name="memory_rules_reason_ck",
+        ),
+        CheckConstraint(
+            "(state <> 'candidate' OR source_request_id IS NOT NULL) "
+            "AND (source_request_id IS NULL OR source_turn IS NULL)",
+            name="memory_rules_source_ck",
+        ),
+        CheckConstraint(
+            "((accepted_by IS NOT NULL) = (state IN ('accepted', 'removed'))) "
+            "AND ((accepted_at IS NOT NULL) = (state IN ('accepted', 'removed'))) "
+            "AND ((rejected_by IS NOT NULL) = (state = 'rejected')) "
+            "AND ((rejected_at IS NOT NULL) = (state = 'rejected')) "
+            "AND ((removed_by IS NOT NULL) = (state = 'removed')) "
+            "AND ((removed_at IS NOT NULL) = (state = 'removed'))",
+            name="memory_rules_acceptance_ck",
+        ),
+        CheckConstraint("version >= 1", name="memory_rules_version_ck"),
+        Index(
+            "memory_rules_scope_number_key",
+            "agent_id",
+            "scope_kind",
+            "scope_key",
+            "number",
+            unique=True,
+            postgresql_where=text("number IS NOT NULL"),
+        ),
+        Index(
+            "memory_rules_source_lineage_key",
+            "source_lineage_id",
+            unique=True,
+            postgresql_where=text(
+                "source_lineage_id IS NOT NULL "
+                "AND state IN ('proposed', 'accepted', 'rejected', 'removed')"
+            ),
+        ),
+        Index("ix_memory_rules_scope_state", "agent_id", "scope_kind", "scope_key", "state"),
+        {"schema": SCHEMA},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    scope_kind: Mapped[str] = mapped_column(Text)
+    scope_key: Mapped[str] = mapped_column(Text)
+    scope_label: Mapped[str] = mapped_column(Text)
+    number: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    state: Mapped[str] = mapped_column(Text)
+    text: Mapped[str] = mapped_column(Text)
+    sha256: Mapped[str] = mapped_column(CHAR(64))
+    format_version: Mapped[int] = mapped_column(Integer, default=1)
+    reason: Mapped[str] = mapped_column(Text)
+    proposed_by: Mapped[str] = mapped_column(Text)
+    proposed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            f"{SCHEMA}.execution_requests.id",
+            name="memory_rules_source_request_fkey",
+            ondelete="SET NULL",
+        ),
+        default=None,
+    )
+    source_turn: Mapped[str | None] = mapped_column(Text, default=None)
+    source_lineage_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            f"{SCHEMA}.thread_publication_lineages.id",
+            name="memory_rules_source_lineage_fkey",
+            ondelete="SET NULL",
+        ),
+        default=None,
+    )
+    source_url: Mapped[str | None] = mapped_column(Text, default=None)
+    accepted_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    rejected_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    removed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MemoryRuleEvent(Base):
+    """One append-only audit row per learned rule state change (#5795)."""
+
+    __tablename__ = "memory_rule_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["rule_id", "tenant_id", "agent_id"],
+            [
+                f"{SCHEMA}.memory_rules.id",
+                f"{SCHEMA}.memory_rules.tenant_id",
+                f"{SCHEMA}.memory_rules.agent_id",
+            ],
+            name="memory_rule_events_rule_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="memory_rule_events_principal_fkey",
+        ),
+        CheckConstraint(
+            "event IN ('propose', 'promote', 'accept', 'reject', 'remove', 'supersede', 'discard')",
+            name="memory_rule_events_event_ck",
+        ),
+        CheckConstraint(
+            f"(from_state IS NULL OR from_state IN ({_MEMORY_RULE_STATE_LIST})) "
+            f"AND to_state IN ({_MEMORY_RULE_STATE_LIST}) "
+            "AND ((event = 'propose') = (from_state IS NULL))",
+            name="memory_rule_events_state_ck",
+        ),
+        CheckConstraint(
+            "actor_kind IN ('agent', 'platform', 'principal') "
+            "AND ((actor_kind = 'principal') = (principal_id IS NOT NULL))",
+            name="memory_rule_events_actor_ck",
+        ),
+        Index("ix_memory_rule_events_rule", "rule_id", "id"),
+        {"schema": SCHEMA},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    rule_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    event: Mapped[str] = mapped_column(Text)
+    from_state: Mapped[str | None] = mapped_column(Text, default=None)
+    to_state: Mapped[str] = mapped_column(Text)
+    actor_kind: Mapped[str] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(Text)
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ExecutionRequest(Base):
     """One bounded execution attempt owned by a WorkItem."""
 
@@ -1258,6 +1508,10 @@ class ExecutionRequest(Base):
             "AND (coding_instructions_evidence = 'none' "
             "OR coding_instructions_selection_id IS NOT NULL)",
             name="execution_requests_coding_selection_ck",
+        ),
+        CheckConstraint(
+            "memory_rules_evidence IN ('none', 'pending', 'applied', 'failed')",
+            name="execution_requests_memory_rules_evidence_ck",
         ),
         CheckConstraint("sequence > 0", name="execution_requests_sequence_ck"),
         CheckConstraint("version >= 1", name="execution_requests_version_ck"),
@@ -1575,6 +1829,7 @@ class ExecutionRequest(Base):
     coding_instructions_evidence: Mapped[str] = mapped_column(
         Text, default="none", server_default="none"
     )
+    memory_rules_evidence: Mapped[str] = mapped_column(Text, default="none", server_default="none")
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
     wait_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
