@@ -228,9 +228,14 @@ pub async fn memory_rule_act(opts: MemoryRuleActOpts) -> Result<MemoryRulesOutpu
     }
     let client = OwnerApiClient::new(&api_url, cookie)?;
     let agent = client.find_agent(&opts.agent).await?;
-    let change = client
-        .act_memory_rule(&agent.id, &rule_id, action, opts.expected_version)
-        .await?;
+    let body = crate::api_requests::MemoryRuleDecision {
+        expected_version: opts.expected_version,
+    };
+    let change = match opts.verb {
+        MemoryRuleVerb::Accept => client.accept_memory_rule(&agent.id, &rule_id, &body).await,
+        MemoryRuleVerb::Reject => client.reject_memory_rule(&agent.id, &rule_id, &body).await,
+        MemoryRuleVerb::Remove => client.remove_memory_rule(&agent.id, &rule_id, &body).await,
+    }?;
     Ok(MemoryRulesOutput::Changed {
         verb: opts.verb,
         change,

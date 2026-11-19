@@ -6850,27 +6850,78 @@ impl OwnerApiClient {
         .await
     }
 
-    /// `POST /agents/{id}/memory/rules/{rule_id}/{action}` with the version the
+    /// `POST /agents/{id}/memory/rules/{rule_id}/accept` with the version the
     /// caller read. The response is returned as the API sent it.
-    pub async fn act_memory_rule(
+    pub async fn accept_memory_rule(
         &self,
         agent_id: &str,
         rule_id: &str,
-        action: &str,
-        expected_version: i64,
+        body: &crate::api_requests::MemoryRuleDecision,
     ) -> Result<serde_json::Value> {
         let request = self
             .http
             .post(format!(
-                "{}/agents/{agent_id}/memory/rules/{rule_id}/{action}",
+                "{}/agents/{agent_id}/memory/rules/{rule_id}/accept",
                 self.base_url
             ))
             .header(reqwest::header::COOKIE, self.cookie.header_value()?)
             .header(reqwest::header::ORIGIN, self.origin.clone())
-            .json(&serde_json::json!({ "expected_version": expected_version }));
+            .json::<crate::api_requests::MemoryRuleDecision>(body);
         self.exchange(
             request,
-            "POST /agents/{id}/memory/rules/{rule_id}/{action}",
+            "POST /agents/{id}/memory/rules/{rule_id}/accept",
+            "a learned rule change",
+            memory_rules_refusal,
+        )
+        .await
+    }
+
+    /// `POST /agents/{id}/memory/rules/{rule_id}/reject` with the version the
+    /// caller read. The response is returned as the API sent it.
+    pub async fn reject_memory_rule(
+        &self,
+        agent_id: &str,
+        rule_id: &str,
+        body: &crate::api_requests::MemoryRuleDecision,
+    ) -> Result<serde_json::Value> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/agents/{agent_id}/memory/rules/{rule_id}/reject",
+                self.base_url
+            ))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<crate::api_requests::MemoryRuleDecision>(body);
+        self.exchange(
+            request,
+            "POST /agents/{id}/memory/rules/{rule_id}/reject",
+            "a learned rule change",
+            memory_rules_refusal,
+        )
+        .await
+    }
+
+    /// `POST /agents/{id}/memory/rules/{rule_id}/remove` with the version the
+    /// caller read. The response is returned as the API sent it.
+    pub async fn remove_memory_rule(
+        &self,
+        agent_id: &str,
+        rule_id: &str,
+        body: &crate::api_requests::MemoryRuleDecision,
+    ) -> Result<serde_json::Value> {
+        let request = self
+            .http
+            .post(format!(
+                "{}/agents/{agent_id}/memory/rules/{rule_id}/remove",
+                self.base_url
+            ))
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?)
+            .header(reqwest::header::ORIGIN, self.origin.clone())
+            .json::<crate::api_requests::MemoryRuleDecision>(body);
+        self.exchange(
+            request,
+            "POST /agents/{id}/memory/rules/{rule_id}/remove",
             "a learned rule change",
             memory_rules_refusal,
         )
