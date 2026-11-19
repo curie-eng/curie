@@ -115,11 +115,6 @@ class GithubStub:
         self._thread: threading.Thread | None = None
         self._real_start: float | None = None
         self._closed = False
-        # When set, GET rules/branches answers the plan-gated 403 GitHub Free
-        # returns for a private repository, and the repository row is private.
-        # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
-        # https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets
-        self.plan_gated_branch_rules = False
         self._git_root = self.root / "repositories"
         self._repository = self._git_root / f"{REPOSITORY}.git"
 
@@ -515,7 +510,6 @@ class GithubStub:
             "default_branch": "main",
             "html_url": f"{self.base_url}/{REPOSITORY}",
             "clone_url": self.clone_url,
-            **({"private": True} if self.plan_gated_branch_rules else {}),
         }
 
     def _checks(self, sha: str) -> list[dict[str, Any]]:
@@ -986,19 +980,8 @@ class GithubStub:
                 return 404, {"message": "Not Found"}
             return 200, {"permission": row[0], "role_name": row[0], "user": json.loads(row[1])}
         if method == "GET" and tail.startswith("rules/branches/"):
-            # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
-            if self.plan_gated_branch_rules:
-                # The message GitHub returns when rulesets are outside the plan.
-                return 403, {
-                    "message": (
-                        "Upgrade to GitHub Pro or make this repository public "
-                        "to enable this feature"
-                    ),
-                    "documentation_url": (
-                        "https://docs.github.com/rest/repos/rules#get-rules-for-a-branch"
-                    ),
-                }
             # No ruleset on this fixture. HTTP 404 contributes no required names.
+            # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
             return 404, {"message": "Not Found"}
         if method == "GET" and tail.startswith("branches/"):
             branch = tail.removeprefix("branches/")

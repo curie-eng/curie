@@ -35,15 +35,12 @@ pure ``decide``:
   is ``timed_out`` (``ci_timeout``). The notice names those shards and does
   not say the aggregate never started.
   Publication applies only operator-configured labels. A rules
-  HTTP 404, an empty rules list, or a plan-gated rules 403 on a private
-  repository (GitHub's plan-upgrade message and ``private: true``) adds no
-  names from that source. A transient required-check read stays
+  HTTP 404 or an empty rules list adds no names. A transient required-check read stays
   pending until the deadline and then ends ``ci_timeout``. Any other unreadable
-  read ends ``ci_unverified`` immediately. A 403 names the read it refused
+  read ends ``ci_unverified`` immediately, and a 403 names the read it refused
   (``github_forbidden_list_check_runs``, ``github_forbidden_get_combined_status``,
   ``github_forbidden_get_branch_rules`` or ``github_forbidden_get_branch``)
-  and, when GitHub sent one, the notice quotes that message instead of
-  claiming a missing App permission (#5222);
+  rather than claiming a missing App permission (#5222);
 - a failing check run or commit status whose ``name`` or ``context`` is also
   failing on the commit the PR's base branch points to now is pre-existing,
   not caused by the change (#4105). Only caused failures fail the gate or
@@ -202,15 +199,12 @@ class CiView:
     ``conflicted`` also when the pull request's head is not ``head_sha``. ``reason`` is
     set, with nothing observed, when the code host could not answer; it is a
     fixed reason code and never carries a response body, header, URL or token.
-    ``provider_message`` is GitHub's clipped ``message`` for a refused read the
-    notice quotes. It is empty for every other reason.
     """
 
     head_sha: str | None
     checks: tuple[NormalizedCheck, ...] = ()
     diagnostics: tuple[CiDiagnostic, ...] = ()
     reason: str | None = None
-    provider_message: str | None = None
     base_failing: frozenset[str] = frozenset()
     conflicted: bool | None = None
     merged: bool | None = None
@@ -679,8 +673,7 @@ def decide(
             if expired:
                 return Verdict(kind="timed_out", reason=reason)
             return Verdict(kind="pending", reason=reason)
-        quote = view.provider_message if reason in GITHUB_FORBIDDEN_OPERATIONS else None
-        return Verdict(kind="unverified", reason=reason, note=quote)
+        return Verdict(kind="unverified", reason=reason)
     if view.conflicted is True and view.merged is not True:
         if now < published_at + timedelta(seconds=CI_GRACE_SECONDS):
             return Verdict(kind="pending", reason="merge_conflict_grace")
@@ -1085,23 +1078,18 @@ def tried_summary(
         lines.append(f"Pending checks: {_check_list(verdict.pending)}")
     if verdict.reason:
         lines.append(f"Reason: {verdict.reason}")
+    if verdict.note:
+        lines.append(verdict.note)
     operation = GITHUB_FORBIDDEN_OPERATIONS.get(verdict.reason or "")
-    if operation is not None and verdict.note:
-        # Quote GitHub's message. Do not infer a missing App permission from
-        # the status (#5222).
-        lines.append(f'GitHub refused {operation}. GitHub said: "{verdict.note}".')
-    else:
-        if verdict.note:
-            lines.append(verdict.note)
-        if operation is not None:
-            # No message was captured. Still name the read and do not infer a
-            # missing App permission from the status alone (#5222).
-            lines.append(
-                f"GitHub refused {operation}. That names the read the CI wait could "
-                "not complete, not which App permission is missing: the checks stay "
-                "unread until the GitHub side can serve the read."
-            )
-    if operation is None and verdict.reason == "github_forbidden":
+    if operation is not None:
+        # The attributed 403 names the read GitHub refused (#5222); it still
+        # does not say which App permission is missing, so no grant is claimed.
+        lines.append(
+            f"GitHub refused {operation}. That names the read the CI wait could "
+            "not complete, not which App permission is missing: the checks stay "
+            "unread until the GitHub side can serve the read."
+        )
+    elif verdict.reason == "github_forbidden":
         lines.append(
             "GitHub returned 403 to a CI read. The refusal does not say which "
             "read or which App permission, so the checks cannot be read."
@@ -1372,16 +1360,7 @@ async def inspect_ci(
                 if view.reason is None or (
                     view.reason in TRANSIENT and reason not in TRANSIENT
                 ):
-                    quote = getattr(failure, "provider_message", None)
-                    view = replace(
-                        view,
-                        reason=reason,
-                        provider_message=(
-                            quote
-                            if reason in GITHUB_FORBIDDEN_OPERATIONS and isinstance(quote, str)
-                            else None
-                        ),
-                    )
+                    view = replace(view, reason=reason)
         if metadata_only and fresh_after is None:
             verdict = Verdict(kind="unverified", reason="metadata_update_unverified")
         else:
