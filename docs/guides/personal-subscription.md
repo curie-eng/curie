@@ -327,6 +327,13 @@ substrate is Kubernetes. That error is
    enrolled subscription.
    [Issue 5640](https://github.com/curie-eng/curie/issues/5640) tracks that
    limit.
+3. Curie does not warn before a Claude plan expires. Expiry is not knowable.
+   Enrollment checks only that the token is 1 to 4096 printable characters,
+   and it stores no expiry. When a run fails because the plan was rejected,
+   and the enrollment is still active at that run's generation, Curie sends
+   one Slack direct message for that generation. The message has a button to
+   the Claude plan page. It does not send another for the same generation,
+   and it sends none after you disconnect or replace the enrollment.
 
 ## Link your GitHub account
 

@@ -1535,6 +1535,9 @@ class WorkerConfig(BaseSettings):
     factory_slack_interval_s: float = Field(
         default=2.0, gt=0, validation_alias="CURIE_FACTORY_SLACK_INTERVAL_S"
     )
+    # Console origin for the rejected-plan DM's reconnect button (#5720).
+    # Empty omits the button. The value is an absolute http(s) origin.
+    console_origin: str = Field(default="", validation_alias="CURIE_CONSOLE_ORIGIN")
     # The cron scheduler (ADR-0099, #268) is always on; this is only its tick.
     # A slot fires on the first tick at or after it, so the tick bounds lateness.
     cron_tick_interval_s: float = Field(

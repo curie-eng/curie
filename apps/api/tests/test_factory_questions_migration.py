@@ -1,4 +1,4 @@
-"""Migration 0183 adds the factory question rounds and answer receipts (#5785).
+"""Migration 0184 adds the factory question rounds and answer receipts (#5785).
 
 The upgrade creates ``factory_question_rounds``,
 ``factory_question_round_counts`` (the lifetime count a cancellation keeps)
@@ -25,8 +25,8 @@ from _migration_support import (
 from alembic import command
 from sqlalchemy.exc import IntegrityError
 
-REVISION = "0183"
-BELOW = "0182"
+REVISION = "0184"
+BELOW = "0183"
 STAMP = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)
 DIGEST = "ab" * 32
 QUESTIONS_LABEL = "curie-factory:questions"
@@ -61,7 +61,7 @@ def _work_item(issue: int) -> tuple[uuid.UUID, uuid.UUID]:
     agent_id, item_id, request_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     sql_rows(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
-        {"id": agent_id, "name": f"m0183-{agent_id.hex[:8]}"},
+        {"id": agent_id, "name": f"m0184-{agent_id.hex[:8]}"},
     )
     sql_rows(
         "INSERT INTO curie.work_items "
@@ -76,7 +76,7 @@ def _work_item(issue: int) -> tuple[uuid.UUID, uuid.UUID]:
             "id": item_id,
             "issue": str(issue),
             "agent": agent_id,
-            "conversation": f"m0183-{item_id.hex[:8]}",
+            "conversation": f"m0184-{item_id.hex[:8]}",
             "stamp": STAMP,
         },
     )

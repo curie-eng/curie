@@ -1294,7 +1294,7 @@ class ExecutionRequest(Base):
         # started completed or failed request may carry a confirmed teardown
         # observation) with one branch changed: an unstarted expired request
         # may also end ``retry_condition_expired`` when it was blocked. Then
-        # migration 0183 (#5785): a started completed request may also end
+        # migration 0184 (#5785): a started completed request may also end
         # ``questions_asked``, a request that posted questions and opened no
         # pull request.
         CheckConstraint(
@@ -2677,6 +2677,63 @@ class FactorySlackRefusalPost(Base):
     failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     last_error: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FactoryGrantNotice(Base):
+    """One Slack DM owed when a personal Claude plan is rejected (#5720).
+
+    One row per tenant principal and enrollment generation, inserted while that
+    enrollment is still active at the WorkItem's generation. ``recipient`` is
+    the owner's Slack user id at insert, null when no single link or binding
+    could be resolved then. Delivery reads the active link again and does not
+    post to this snapshot. The lease, attempt and acknowledgement columns match
+    ``factory_slack_posts``. The payload holds the issue key, title, issue URL
+    and reconnect URL, and never a token, generation or Secret name.
+    """
+
+    __tablename__ = "factory_grant_notices"
+    __table_args__ = (
+        CheckConstraint("generation >= 1", name="factory_grant_notices_generation_ck"),
+        CheckConstraint(
+            "recipient IS NULL OR channel_identity IS NOT NULL",
+            name="factory_grant_notices_recipient_ck",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="factory_grant_notices_principal_fkey",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "principal_id",
+            "generation",
+            name="factory_grant_notices_principal_generation_key",
+        ),
+        Index(
+            "ix_factory_grant_notices_owed",
+            "created_at",
+            "id",
+            postgresql_where=text("posted_at IS NULL AND failed_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    generation: Mapped[int] = mapped_column(BigInteger)
+    channel_identity: Mapped[str | None] = mapped_column(Text, default=None)
+    recipient: Mapped[str | None] = mapped_column(Text, default=None)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    posted_ref: Mapped[str | None] = mapped_column(Text, default=None)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
 
 class FactoryTriageDelegation(Base):
     """One triage selection's single-use authority to start one implementation run (#5588).

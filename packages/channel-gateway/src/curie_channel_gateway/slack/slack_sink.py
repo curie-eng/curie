@@ -1002,9 +1002,12 @@ class SlackReplyAdapter:
         # into the approval card's Approve/Reject buttons. A message with no
         # interaction degrades to a plain text post (the mandatory text fallback).
         intent = message.interaction
-        blocks: list[dict[str, Any]] | None
         # A reply wire 1.1 delivery_id keys any other create (ADR-0130 d4).
         client_msg_id: str | None = delivery_id
+        # Approval cards always have blocks. A plain post has them only when
+        # the message carries links, so the type stays optional (#5720).
+        text: str
+        blocks: list[dict[str, Any]] | None
         if isinstance(intent, ConfirmIntent):
             # A 1.0 approval has no delivery_id, so it keeps its historical
             # approval UUID key. On 1.1, ADR-0130 d4 makes delivery_id the
@@ -1021,6 +1024,8 @@ class SlackReplyAdapter:
                 allow_free_text=intent.allow_free_text,
             )
         else:
+            # A plain post stays text-only. Links become URL buttons, which is
+            # how a grant notice carries "Reconnect your Claude plan" (#5720).
             text = message.text
             blocks = to_blocks(_reply_from_message(message)) if message.links else None
 

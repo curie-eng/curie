@@ -183,6 +183,10 @@ ENROLLMENT_INACTIVE = "enrollment_inactive"
 TEST_MARK = "[test action]"
 RECEIPT_PATTERN = receipt_key("*")
 AUTH_TERMINAL_CAUSE = "authentication_required"
+# The rejected-plan DM (#5720). The origin is the button's host, not a live console.
+CONSOLE_ORIGIN = "https://console.example.com"
+GRANT_NOTICE_MARK = "Your Claude plan was rejected when Curie tried to use it"
+GRANT_NOTICE_BUTTON_SUFFIX = "/settings/claude-plan"
 MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 MANAGED_BY_VALUE = "curie-personal-slack-kickoff"
 RUN_ANNOTATION = "curie.dev/personal-slack-kickoff-run"
@@ -811,6 +815,37 @@ class SlackWeb:
             if error.code != "message_not_found":
                 raise
 
+    def direct_conversation(self, user_id: str) -> tuple[str, list[dict[str, Any]]]:
+        """The IM channel id with ``user_id`` and its history, or an empty channel."""
+
+        cursor = ""
+        channel_id = ""
+        for _page in range(10):
+            params = {"types": "im", "limit": "200"}
+            if cursor:
+                params["cursor"] = cursor
+            listed = self.call("conversations.list", params)
+            for channel in listed.get("channels") or []:
+                if isinstance(channel, dict) and channel.get("user") == user_id:
+                    channel_id = str(channel.get("id") or "")
+                    break
+            if channel_id:
+                break
+            meta = listed.get("response_metadata")
+            cursor = str(meta.get("next_cursor") or "") if isinstance(meta, dict) else ""
+            if not cursor:
+                return "", []
+        if not channel_id:
+            return "", []
+        history = self.call("conversations.history", {"channel": channel_id, "limit": "200"})
+        messages = [item for item in history.get("messages") or [] if isinstance(item, dict)]
+        return channel_id, messages
+
+    def direct_history(self, user_id: str) -> list[dict[str, Any]]:
+        """``conversations.history`` of the direct message with ``user_id``, or none."""
+
+        return self.direct_conversation(user_id)[1]
+
 
 def kickoff_text(curie_user: str, issue_url: str) -> str:
     """The declared driver's kickoff mention: the bot mention, the mark, the link."""
@@ -842,6 +877,114 @@ def message_text(message: Mapping[str, Any]) -> str:
 
     walk(message.get("blocks"))
     return "\n".join(parts)
+
+
+def _names_issue_key(text: str, key: str) -> bool:
+    """Whether ``key`` stands alone in ``text`` (``#7`` does not match ``#70``)."""
+
+    if not key:
+        return False
+    return re.search(rf"(?<!\S){re.escape(key)}(?!\S)", text) is not None
+
+
+def _button_blocks(message: Mapping[str, Any]) -> list[Any]:
+    blocks = message.get("blocks")
+    if isinstance(blocks, str):
+        try:
+            blocks = json.loads(blocks)
+        except json.JSONDecodeError:
+            return []
+    return blocks if isinstance(blocks, list) else []
+
+
+def grant_notice_button_url(message: Mapping[str, Any]) -> str | None:
+    """The one reconnect URL on this message's own button, or none.
+
+    A URL in the text or in another block does not count. Two button URLs do
+    not count as one.
+    """
+
+    urls: list[str] = []
+    for block in _button_blocks(message):
+        if not isinstance(block, dict) or block.get("type") != "actions":
+            continue
+        elements = block.get("elements")
+        if not isinstance(elements, list):
+            continue
+        for element in elements:
+            if not isinstance(element, dict) or element.get("type") != "button":
+                continue
+            url = element.get("url")
+            if isinstance(url, str):
+                urls.append(url)
+    if len(urls) != 1 or not urls[0].endswith(GRANT_NOTICE_BUTTON_SUFFIX):
+        return None
+    return urls[0]
+
+
+def grant_notice_facts(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    expected: Sequence[str],
+    counted: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Match each expected issue key to exactly one rejected-plan DM.
+
+    A notice that names none of ``expected`` or ``counted`` is ignored.
+    ``counted`` keys add to the count, so a late message for an earlier issue
+    is visible, but they do not have to be present for ``text_ok`` or
+    ``button_url_ok``. Each expected key must be the only key from either set
+    in its message, and that message's own button must carry the Claude plan
+    URL. Two URLs on one message do not cover a second key.
+    """
+
+    if not expected or any(not key for key in expected):
+        raise ValueError("expected issue keys are required")
+    if any(not key for key in counted) or any(key in expected for key in counted):
+        raise ValueError("counted issue keys must be nonempty and distinct from expected")
+    keys = [*expected, *counted]
+    buckets: dict[str, list[Mapping[str, Any]]] = {key: [] for key in keys}
+    for message in messages:
+        text = message_text(message)
+        if GRANT_NOTICE_MARK not in text:
+            continue
+        hits = [key for key in keys if _names_issue_key(text, key)]
+        if len(hits) != 1:
+            continue
+        buckets[hits[0]].append(message)
+    kept = "stopped. The work is kept."
+    text_ok = all(
+        len(buckets[key]) == 1 and kept in message_text(buckets[key][0]) for key in expected
+    )
+    button_url_ok = all(
+        len(buckets[key]) == 1 and grant_notice_button_url(buckets[key][0]) is not None
+        for key in expected
+    )
+    return {
+        "count": sum(len(rows) for rows in buckets.values()),
+        "text_ok": text_ok,
+        "button_url_ok": button_url_ok,
+    }
+
+
+def grant_dm_timestamps(
+    messages: Sequence[Mapping[str, Any]], *, author: str, issue_keys: Sequence[str]
+) -> list[str]:
+    """Timestamps of rejected-plan DMs ``author`` posted that name one issue key."""
+
+    found: list[str] = []
+    for message in messages:
+        if message.get("user") != author:
+            continue
+        text = message_text(message)
+        if GRANT_NOTICE_MARK not in text:
+            continue
+        if not any(_names_issue_key(text, key) for key in issue_keys):
+            continue
+        stamp = message.get("ts")
+        if isinstance(stamp, str):
+            found.append(stamp)
+    return found
 
 
 def reply_outcome(messages: Iterable[Mapping[str, Any]], *, author: str) -> str | None:
@@ -2662,6 +2805,7 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
         {"name": "CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "value": "false"},
     ]
     personal = {"name": "FACTORY_MODEL_AUTH_MODE", "value": PERSONAL_MODE}
+    console_origin = {"name": "CURIE_CONSOLE_ORIGIN", "value": CONSOLE_ORIGIN}
     return {
         "api": {
             "image": image("curie-api"),
@@ -2674,7 +2818,7 @@ def install_values(plan: InstallPlan) -> dict[str, Any]:
             "image": image("curie-worker"),
             "maxConcurrency": 1,
             "workItemMaxTurns": plan.implementer_turns,
-            "extraEnv": [dict(personal)],
+            "extraEnv": [dict(personal), dict(console_origin)],
         },
         "dispatcher": {
             "deploy": True,
@@ -3809,6 +3953,25 @@ def _judge_cleanup(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
     return checks, {"steps": len(steps), "inventory": len(inventory)}
 
 
+def _judge_grant_notice(ledger: Ledger) -> tuple[dict[str, bool], dict[str, int]]:
+    """One DM for the first rejection, none at that generation, one more after replace."""
+
+    observed = ledger.observations("grant-notice")
+    first = observed.get("dm_count_after_first")
+    second = observed.get("dm_count_after_second")
+    third = observed.get("dm_count_after_replace")
+    checks = {
+        "first_posts_one": first == 1
+        and _true(observed, "first_text_ok")
+        and _true(observed, "first_button_ok"),
+        "same_generation_adds_none": second == first == 1 and _true(observed, "second_settled"),
+        "replace_adds_one": third == 2
+        and _true(observed, "replace_text_ok")
+        and _true(observed, "replace_button_ok"),
+    }
+    return checks, {"direct_messages": int(third) if isinstance(third, int) else 0}
+
+
 _JUDGES: dict[str, Callable[[Ledger], tuple[dict[str, bool], dict[str, int]]]] = {
     "refusal-connect": _judge_refusal_connect,
     "slack": _judge_slack,
@@ -3819,6 +3982,7 @@ _JUDGES: dict[str, Callable[[Ledger], tuple[dict[str, bool], dict[str, int]]]] =
     "refusal": _judge_refusal,
     "budget": _judge_budget,
     "cleanup": _judge_cleanup,
+    "grant-notice": _judge_grant_notice,
 }
 
 
@@ -3833,7 +3997,8 @@ def judge(ledger: Ledger, criterion: str) -> dict[str, Any]:
             else list(REHEARSAL_CRITERIA if rehearsal else CRITERIA)
         )
     elif criterion in _JUDGES:
-        if rehearsal and criterion not in REHEARSAL_CRITERIA:
+        # The rejected-plan leg is unpaid, so a rehearsal ledger may carry it.
+        if rehearsal and criterion not in REHEARSAL_CRITERIA and criterion != "grant-notice":
             raise Refusal("rehearsal_ledger", "--criterion")
         names = [criterion]
     else:
