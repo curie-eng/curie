@@ -36,12 +36,9 @@ merge requests. See the [capability status](../capabilities.md#workspaces-and-in
 - An Anthropic or OpenRouter model credential with available credit.
 - A small code repository with an initial commit and a passing baseline.
 
-A public trial repository should hold no sensitive content. A private
-repository on GitHub Free also works. The factory treats GitHub's plan-upgrade
-refusal of the branch-rules read on that private repository as no rules from
-that API, then reads classic branch protection and the checks on the head. A
-different 403, including that message on a public repository, still stops the
-CI check, and the comment quotes GitHub's message.
+For GitHub Free, use a public trial repository with no sensitive content.
+Private trials need a plan that supports private repository rulesets; otherwise
+GitHub blocks the factory's final CI check.
 
 Use interactive Bash. Keep the same terminal and trial variables through
 cleanup. Each path uses polling, so no webhook or tunnel is needed. See

@@ -313,18 +313,6 @@ class _GitHubComments(BaseHTTPRequestHandler):
         if annotations is not None:
             self._send(200, server.annotations.get(int(annotations.group(1)), []))
             return True
-        if path == f"/repos/{REPO}":
-            # https://docs.github.com/en/rest/repos/repos#get-a-repository
-            self._send(
-                200,
-                {
-                    "id": REPO_ID,
-                    "full_name": REPO,
-                    "private": server.repository_private is True,
-                    "default_branch": "main",
-                },
-            )
-            return True
         rules = re.fullmatch(rf"/repos/{repo}/rules/branches/(.+)", path)
         if rules is not None:
             # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
@@ -492,9 +480,6 @@ class _CommentServer(ThreadingHTTPServer):
         # Branch name -> (status, body) for GET /rules/branches/{branch}.
         # Missing means HTTP 404, which contributes no required check names.
         self.rules: dict[str, tuple[int, Any]] = {}
-        # GET /repos/{owner}/{repo} ``private``. False is a public repository.
-        # https://docs.github.com/en/rest/repos/repos#get-a-repository
-        self.repository_private = False
         # Branch name -> protection object included on GET /branches/{branch}.
         self.protections: dict[str, dict[str, Any]] = {}
         # #3741. 403 matches a token with no Actions write permission.
