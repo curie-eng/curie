@@ -729,16 +729,44 @@ def answer_request_id(issue: TrackerIssueRef, comment_id: str) -> uuid.UUID:
     return uuid.uuid5(uuid.NAMESPACE_URL, f"curie-answer:{issue_key}:{comment_id}")
 
 
-def _after_fence(created_at: datetime | None, answer_after: datetime | None) -> bool:
+# A tracker comment id that orders comments by creation: GitHub, GitLab and
+# Jira number comments with increasing positive integers.
+_ORDERED_COMMENT_ID = re.compile(r"[1-9][0-9]{0,18}")
+
+
+def _comment_order(comment_id: str | None) -> int | None:
+    if comment_id is None or not _ORDERED_COMMENT_ID.fullmatch(comment_id):
+        return None
+    return int(comment_id)
+
+
+def _after_fence(
+    created_at: datetime | None,
+    comment_id: str,
+    answer_after: datetime | None,
+    question_comment_id: str | None,
+) -> bool:
     """Whether a comment was created after the current question (decision 3).
 
     A missing time, a time with no zone, or a row with no fence fails closed.
+    When the comment and the question comment both carry the tracker's
+    ordered numeric ids, the ids decide: a tracker reports creation times in
+    whole seconds on its own clock, while ``answer_after`` is the database
+    clock with microseconds, so a reply posted in the same second as the
+    question would read as older, and a comment written before the question
+    would read as newer whenever the tracker's clock runs ahead. The time
+    then only has to fall in or after the question's second. Without
+    comparable ids the time alone decides, refusing a tie.
     """
 
     if created_at is None or answer_after is None:
         return False
     if created_at.tzinfo is None or created_at.utcoffset() is None:
         return False
+    answer_order = _comment_order(comment_id)
+    question_order = _comment_order(question_comment_id)
+    if answer_order is not None and question_order is not None:
+        return answer_order > question_order and created_at >= answer_after.replace(microsecond=0)
     return created_at > answer_after
 
 
@@ -854,7 +882,7 @@ async def _decide(session: AsyncSession, work_item: WorkItem, facts: AnswerFacts
     )
     if row is None or row.state not in (OUTSTANDING, ANSWERED):
         return AnswerOutcome(NOT_OUTSTANDING, None, False)
-    if not _after_fence(facts.created_at, row.answer_after):
+    if not _after_fence(facts.created_at, facts.comment_id, row.answer_after, row.comment_id):
         return AnswerOutcome(NOT_AFTER_QUESTION, None, False)
     seen_version, seen_state, seen_pending = row.version, row.state, row.pending_request_id
     pending = seen_pending

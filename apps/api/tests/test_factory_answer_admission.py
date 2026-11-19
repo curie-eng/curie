@@ -384,9 +384,16 @@ def test_fence_refuses_a_comment_not_created_after_the_question(
 ) -> None:
     triage = _settled_asked(admitted, monkeypatch, 5141)
     fence = _fence(triage)
-    # Created when the question was, before it, with no time, and with a time
-    # that names no zone.
-    for created_at in (fence, fence - SECOND, None, fence.replace(tzinfo=None) + SECOND):
+    # Created in the second before the question's, well before it, with no
+    # time, and with a time that names no zone. (A comment created after the
+    # question in its own second is an answer: see the immediate-answer test.)
+    before_its_second = fence.replace(microsecond=0) - timedelta(microseconds=1)
+    for created_at in (
+        before_its_second,
+        fence - SECOND,
+        None,
+        fence.replace(tzinfo=None) + SECOND,
+    ):
         before = _counts()
         comment_id = _comment(triage)
         refused = _admit(triage, comment_id, created_at)
@@ -416,6 +423,8 @@ def test_fence_moves_to_the_second_round(admitted: Any, monkeypatch: pytest.Monk
 
     # The answer-started request asks round 2, then ends without a pull request.
     successor = _take_over(triage, first.request_id)
+    # Written after round 1's question and before round 2's.
+    between_id = _comment(triage)
     asked = _ask(successor, ["Round 2: which file holds the rows?"])
     assert asked.status_code == 200, asked.text
     assert asked.json() == {"round": 2, "rounds_limit": 3}
@@ -430,12 +439,69 @@ def test_fence_moves_to_the_second_round(admitted: Any, monkeypatch: pytest.Monk
     assert round_two > round_one
 
     before = _counts()
-    between = _admit(triage, _comment(triage), round_one + (round_two - round_one) / 2)
+    between = _admit(triage, between_id, round_one + (round_two - round_one) / 2)
     assert between == AnswerOutcome("not_after_question", None, False)
     assert _counts() == (before[0], before[1] + 1)
 
     _second_id, second = _answer(triage)
     assert second.outcome == "admitted"
+
+
+@pytest.mark.parametrize("offset", [timedelta(0), None], ids=["same_instant", "same_second"])
+def test_fence_admits_an_immediate_answer_in_the_question_s_second(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, offset: timedelta | None
+) -> None:
+    """A reply posted right after the question, in the same second, is an answer.
+
+    A tracker reports creation times in whole seconds, so a reply in the
+    question's second carries a time at or before ``answer_after`` (the
+    database clock, with microseconds); the comment ids order it after the
+    question comment.
+    """
+
+    triage = _settled_asked(admitted, monkeypatch, 5143)
+    fence = _fence(triage)
+    created_at = fence.replace(microsecond=0) if offset is None else fence + offset
+    requests = _requests(triage.work_item_id)
+
+    comment_id = _comment(triage)
+    result = _admit(triage, comment_id, created_at)
+
+    expected = factory_questions.answer_request_id(triage.issue, comment_id)
+    assert result == AnswerOutcome("admitted", expected, False)
+    assert [r["id"] for r in _requests(triage.work_item_id)] == [
+        *(r["id"] for r in requests),
+        expected,
+    ]
+
+
+@pytest.mark.parametrize(
+    "delta", [SECOND * 0, 2 * SECOND], ids=["same_second", "tracker_clock_ahead"]
+)
+def test_fence_refuses_a_comment_written_before_the_question_delivered_late(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, delta: timedelta
+) -> None:
+    """A comment written before the question comment is never its answer, even
+    when its reported time reads as later: in the same second, or on a tracker
+    whose clock runs ahead of the database's."""
+
+    triage = _running(admitted, monkeypatch, 5144 if delta else 5145)
+    early_id = _comment(triage)
+    response = _ask(triage)
+    assert response.status_code == 200, response.text
+    tr._finish(triage, "failed", "no_pull_request")
+    fence = _fence(triage)
+    requests = _requests(triage.work_item_id)
+    before = _counts()
+
+    created_at = fence.replace(microsecond=0) if not delta else fence + delta
+    refused = _admit(triage, early_id, created_at)
+
+    assert refused == AnswerOutcome("not_after_question", None, False)
+    assert _requests(triage.work_item_id) == requests
+    assert _counts() == (before[0], before[1] + 1)
+    row = _round_row(triage.work_item_id)
+    assert row is not None and (row["state"], row["pending_request_id"]) == ("outstanding", None)
 
 
 # Criterion 6: no open round, a cancelled WorkItem, and replays -------------------------
