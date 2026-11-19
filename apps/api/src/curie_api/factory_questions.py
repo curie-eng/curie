@@ -15,6 +15,13 @@ the WorkItem's lifetime round count, which outlives the row. The
 round record stores identities, a count, a digest and a fence, never question
 or answer text (ADR 0187, ADR 0199).
 
+It also owns answer admission (#5786): `admit_answer` is the one rule every
+tracker's intake hands a recognised, authorized ticket comment to. It decides
+whether the comment answers the current round, folds several answers into one
+attempt, queues one follow-up behind a live run, and keeps one receipt per
+comment so a redelivery returns its first outcome. It never reads the
+comment's text.
+
 Lock order: every write takes the WorkItem row lock first, then the request
 lock where it needs one, then the question row, as every
 `workitems/lifecycle.py` transition does. The one exception is the tracker
@@ -26,32 +33,39 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final
 
 import httpx
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import factory_tracker_result_runtime as runtime
-from .config import Settings
+from .config import Settings, get_settings
 from .factory_comment_text import publishable_model_text
 from .forges.errors import ForgeError
 from .forges.ports import MarkedComments
-from .forges.types import ReplyTarget, TrackerIssueRef
+from .forges.registry import forges_registry
+from .forges.trackers import issue_link, reply_route
+from .forges.types import MarkedComment, ReplyTarget, TrackerIssueRef
 from .github_app import GitHubAppError
 from .models import (
     FACTORY_QUESTION_ROUND_LIMIT,
     ExecutionRequest,
+    FactoryAnswerReceipt,
     FactoryQuestionRound,
     FactoryQuestionRoundCount,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
 )
+
+logger = logging.getLogger(__name__)
 
 ROUND_LIMIT: Final = FACTORY_QUESTION_ROUND_LIMIT
 QUESTIONS_ASKED: Final = "questions_asked"
@@ -428,11 +442,12 @@ async def post_round(
     *,
     request_id: uuid.UUID,
     posting: Posting,
-) -> str:
+) -> MarkedComment:
     """Write the round's marked comment; outside any transaction.
 
-    Returns the tracker's comment id. Every failure, a configuration one
-    included, is `TrackerUnavailable`.
+    Returns the tracker's comment: its id and, when the tracker reports it,
+    its creation time on the tracker's clock. Every failure, a configuration
+    one included, is `TrackerUnavailable`.
     """
 
     try:
@@ -443,7 +458,7 @@ async def post_round(
             )
     except (GitHubAppError, ForgeError, ValueError, TimeoutError):
         raise TrackerUnavailable from None
-    return result.comment.id
+    return result.comment
 
 
 async def post_and_record(
@@ -462,10 +477,12 @@ async def post_and_record(
     second tracker write (decision 9). Only the question row and the count
     row are locked, never the WorkItem, so settlement and cancellation (the
     WorkItem lock, then the row) wait for at most the capped tracker write and
-    cannot deadlock with it. ``answer_after`` is the database clock read by
-    the UPDATE after the write returned (``clock_timestamp()``, not the
-    transaction start), so no comment written before the question can pass
-    the fence. A tracker failure rolls back and leaves the round ``posting``.
+    cannot deadlock with it. ``comment_id`` and ``answer_after`` are the
+    question comment's tracker id and its creation time on the tracker's own
+    clock, the boundary the answer fence compares against. A tracker that
+    reports no creation time falls back to the database clock read by the
+    UPDATE after the write returned (``clock_timestamp()``). A tracker
+    failure rolls back and leaves the round ``posting``.
     """
 
     work_item_id = posting.work_item.id
@@ -485,7 +502,7 @@ async def post_and_record(
             # Read before the UPDATE: the session synchronizes ``row`` with it.
             posted = row.rounds_used + 1
             try:
-                comment_id = await post_round(
+                question = await post_round(
                     settings, client, request_id=request_id, posting=posting
                 )
             except TrackerUnavailable:
@@ -496,9 +513,13 @@ async def post_and_record(
                 .where(FactoryQuestionRound.work_item_id == work_item_id)
                 .values(
                     state=OUTSTANDING,
-                    comment_id=comment_id,
+                    comment_id=question.id,
                     rounds_used=posted,
-                    answer_after=func.clock_timestamp(),
+                    answer_after=(
+                        func.clock_timestamp()
+                        if question.created_at is None
+                        else question.created_at
+                    ),
                     version=FactoryQuestionRound.version + 1,
                     updated_at=func.clock_timestamp(),
                 )
@@ -644,3 +665,300 @@ async def asked_round(
     if count is None or count.last_asking_request_id != request_id or count.rounds_used < 1:
         return None
     return int(count.rounds_used)
+
+
+# Answer admission (#5786) --------------------------------------------------------
+
+ADMITTED: Final = "admitted"
+COALESCED: Final = "coalesced"
+QUEUED_FOLLOW_UP: Final = "queued_follow_up"
+NOT_OUTSTANDING: Final = "not_outstanding"
+NOT_AFTER_QUESTION: Final = "not_after_question"
+# Every receipt outcome, as `FACTORY_ANSWER_RECEIPT_OUTCOMES` (the table's CHECK) lists them.
+ANSWER_OUTCOMES: Final = (
+    ADMITTED,
+    COALESCED,
+    QUEUED_FOLLOW_UP,
+    NOT_OUTSTANDING,
+    NOT_AFTER_QUESTION,
+    WORK_ITEM_CANCELLED,
+)
+# The outcomes whose receipt names the request the comment created; that
+# request's status comment leads with `ANSWER_RECEIVED_LINE`.
+ANSWER_STARTED_OUTCOMES: Final = (ADMITTED, QUEUED_FOLLOW_UP)
+ANSWER_RECEIVED_LINE: Final = "Answer received. The factory is working on this ticket again."
+# A pending request in one of these has not started, so the attempt it starts
+# reads every answer made before it does.
+_NOT_STARTED: Final = frozenset({"queued", "waiting"})
+
+
+@dataclass(frozen=True)
+class AnswerFacts:
+    """A recognised answer comment, as the tracker's intake hands it over.
+
+    The intake has already checked the author's start authority, that the
+    author is a human and not the factory, and that the ticket is labelled and
+    open. ``created_at`` is the tracker's own creation time of the comment;
+    ``requester`` is the author in the ``<tracker kind>:<actor id>:<login>``
+    form the mention paths write. The comment's text is never carried.
+    """
+
+    work_item_id: uuid.UUID
+    issue: TrackerIssueRef
+    comment_id: str
+    created_at: datetime | None
+    requester: str
+
+
+@dataclass(frozen=True)
+class AnswerOutcome:
+    outcome: str
+    request_id: uuid.UUID | None
+    replayed: bool
+
+
+class AnswerNotAdmitted(Exception):
+    """The answer's request could not be created; nothing was written."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(f"factory answer not admitted: {code}")
+
+
+def answer_request_id(issue: TrackerIssueRef, comment_id: str) -> uuid.UUID:
+    """The id of the request an answer comment creates (decision 4.4).
+
+    Keyed by the WorkItem's issue key, never its display key, which changes
+    when a Jira issue moves.
+    """
+
+    issue_key = f"{issue.kind}:{issue.host}:{issue.scope_id}:{issue.issue_id}"
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"curie-answer:{issue_key}:{comment_id}")
+
+
+# A tracker comment id that orders comments by creation: GitHub, GitLab and
+# Jira number comments with increasing positive integers.
+_ORDERED_COMMENT_ID = re.compile(r"[1-9][0-9]{0,18}")
+
+
+def _comment_order(comment_id: str | None) -> int | None:
+    if comment_id is None or not _ORDERED_COMMENT_ID.fullmatch(comment_id):
+        return None
+    return int(comment_id)
+
+
+def _after_fence(
+    created_at: datetime | None,
+    comment_id: str,
+    answer_after: datetime | None,
+    question_comment_id: str | None,
+) -> bool:
+    """Whether a comment was created after the current question (decision 3).
+
+    A missing time, a time with no zone, or a row with no fence fails closed.
+    The boundary is the tracker's own: the question comment's id and its
+    creation time on the tracker's clock. When the comment and the question
+    comment both carry the tracker's ordered numeric ids, the ids alone
+    decide, since a tracker reports creation times in whole seconds, so a
+    reply in the question's own second ties. Without comparable ids the
+    tracker's creation times decide, refusing a tie.
+    """
+
+    if created_at is None or answer_after is None:
+        return False
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        return False
+    answer_order = _comment_order(comment_id)
+    question_order = _comment_order(question_comment_id)
+    if answer_order is not None and question_order is not None:
+        return answer_order > question_order
+    return created_at > answer_after
+
+
+def _log_answer(
+    outcome: str,
+    work_item_id: uuid.UUID,
+    comment_id: str,
+    request_id: uuid.UUID | None,
+    *,
+    replayed: bool = False,
+) -> None:
+    # Identifiers only: the comment's text never reaches a log (ADR 0187).
+    message = (
+        "factory answer replayed %s work_item=%s comment=%s request=%s"
+        if replayed
+        else "factory answer %s work_item=%s comment=%s request=%s"
+    )
+    logger.info(message, outcome, work_item_id, comment_id, request_id)
+
+
+async def admit_answer(session: AsyncSession, facts: AnswerFacts) -> AnswerOutcome:
+    """Decide what one answer comment does, in one transaction; commits.
+
+    Under the WorkItem lock: a receipt for (WorkItem, comment) replays its
+    outcome and changes nothing. Otherwise the first rule that applies wins:
+    a cancelled WorkItem; a row absent, ``posting``, ``cleared`` or
+    ``exhausted`` (``not_outstanding``); a comment not created after the
+    row's ``answer_after`` (``not_after_question``); a pending request that
+    has not started (``coalesced``); else one implementation request through
+    `lifecycle.create_revision_request`, waiting when nothing is live
+    (``admitted``) and queued behind the live request otherwise
+    (``queued_follow_up``). Only a queued or waiting pending request
+    coalesces: an ``answered`` row whose pending request has started, one
+    ``cancellation_requested`` included, queues a follow-up. The live request
+    is never cancelled. Exactly one receipt is written with the effect.
+
+    Lock order is the module's: the WorkItem, then the requests (inside the
+    lifecycle call), then the question row. The row is read without a lock
+    for the decision and written last, guarded by the version read. Every
+    writer of the row except `post_and_record` holds the WorkItem lock, and
+    that one only moves a ``posting`` row, which is never acted on here.
+
+    Raises ValueError when the facts do not name the WorkItem's own ticket or
+    carry no comment id, and `AnswerNotAdmitted` with ``work_item_not_found``
+    when the WorkItem no longer exists, or with the conflict code when the
+    request could not be created. This function owns its transaction: any exception rolls it back
+    before it propagates, so a caller that catches it and commits persists
+    nothing of the answer (a lifecycle commit only released a savepoint).
+    """
+
+    try:
+        return await _admit(session, facts)
+    except BaseException:
+        await session.rollback()
+        raise
+
+
+async def _admit(session: AsyncSession, facts: AnswerFacts) -> AnswerOutcome:
+    from .workitems import lifecycle
+
+    if not facts.comment_id.strip():
+        raise ValueError("an answer needs its tracker comment id")
+    work_item = await lifecycle.lock_work_item(session, facts.work_item_id)
+    if work_item is None:
+        # The caller found it, so it was deleted since. A receipt needs its
+        # WorkItem (a foreign key), so no outcome can be recorded durably.
+        raise AnswerNotAdmitted("work_item_not_found")
+    if work_item.tracker_issue != facts.issue:
+        raise ValueError("the answer's issue is not the WorkItem's ticket")
+
+    receipt = await session.scalar(
+        select(FactoryAnswerReceipt)
+        .where(
+            FactoryAnswerReceipt.work_item_id == work_item.id,
+            FactoryAnswerReceipt.comment_key == facts.comment_id,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if receipt is not None:
+        stored = AnswerOutcome(receipt.outcome, receipt.request_id, True)
+        await session.commit()
+        _log_answer(
+            stored.outcome, work_item.id, facts.comment_id, stored.request_id, replayed=True
+        )
+        return stored
+
+    outcome = await _decide(session, work_item, facts)
+    session.add(
+        FactoryAnswerReceipt(
+            work_item_id=work_item.id,
+            comment_key=facts.comment_id,
+            outcome=outcome.outcome,
+            request_id=outcome.request_id,
+        )
+    )
+    await session.commit()
+    _log_answer(outcome.outcome, work_item.id, facts.comment_id, outcome.request_id)
+    return outcome
+
+
+async def _decide(session: AsyncSession, work_item: WorkItem, facts: AnswerFacts) -> AnswerOutcome:
+    """Apply decision 4 under the WorkItem lock; the caller writes the receipt."""
+
+    from . import workitem_dispatch
+    from .workitems.lifecycle import WorkItemOutcome
+
+    if work_item.cancelled_at is not None:
+        return AnswerOutcome(WORK_ITEM_CANCELLED, None, False)
+    row: FactoryQuestionRound | None = await session.scalar(
+        select(FactoryQuestionRound)
+        .where(FactoryQuestionRound.work_item_id == work_item.id)
+        .execution_options(populate_existing=True)
+    )
+    if row is None or row.state not in (OUTSTANDING, ANSWERED):
+        return AnswerOutcome(NOT_OUTSTANDING, None, False)
+    if not _after_fence(facts.created_at, facts.comment_id, row.answer_after, row.comment_id):
+        return AnswerOutcome(NOT_AFTER_QUESTION, None, False)
+    seen_version, seen_state, seen_pending = row.version, row.state, row.pending_request_id
+    pending = seen_pending
+    # A waiting request past its wait deadline can no longer be claimed; the
+    # expiry sweep (on the same clock) ends it, so an answer never coalesces
+    # into it.
+    from .workitems.lifecycle import database_now
+
+    startable = (
+        await session.scalar(
+            select(ExecutionRequest.id).where(
+                ExecutionRequest.id == pending,
+                ExecutionRequest.status.in_(_NOT_STARTED),
+                or_(
+                    ExecutionRequest.wait_deadline.is_(None),
+                    ExecutionRequest.wait_deadline > await database_now(session),
+                ),
+            )
+        )
+        if pending is not None
+        else None
+    )
+    if startable is not None:
+        result = AnswerOutcome(COALESCED, None, False)
+    else:
+        pending = answer_request_id(work_item.tracker_issue, facts.comment_id)
+        registry = forges_registry(get_settings())
+        kind, address, conversation = reply_route(
+            registry, work_item.tracker_issue, work_item.repository.path
+        )
+        revision = workitem_dispatch.TicketRevision(
+            objective=issue_link(registry, work_item.tracker_issue, work_item.repository),
+            requester=facts.requester,
+            kind=kind,
+            address=address,
+            reply_conversation_id=conversation,
+        )
+        # The lifecycle commits only release this savepoint, so the request,
+        # the row and the receipt commit together.
+        async with AsyncSession(
+            bind=await session.connection(),
+            join_transaction_mode="create_savepoint",
+            expire_on_commit=False,
+        ) as transaction:
+            created = await workitem_dispatch.create_answer_request(
+                transaction, work_item=work_item, request_id=pending, revision=revision
+            )
+        if not isinstance(created, WorkItemOutcome):
+            raise AnswerNotAdmitted(created.code)
+        assert created.request is not None
+        status = created.request.status
+        result = AnswerOutcome(
+            ADMITTED if status == "waiting" else QUEUED_FOLLOW_UP, created.request.id, False
+        )
+    if seen_state != ANSWERED or seen_pending != pending:
+        changed = await session.scalar(
+            update(FactoryQuestionRound)
+            .where(
+                FactoryQuestionRound.work_item_id == work_item.id,
+                FactoryQuestionRound.version == seen_version,
+            )
+            .values(
+                state=ANSWERED,
+                pending_request_id=pending,
+                version=FactoryQuestionRound.version + 1,
+                updated_at=func.clock_timestamp(),
+            )
+            .returning(FactoryQuestionRound.work_item_id)
+        )
+        if changed is None:
+            # Unreachable while the WorkItem lock is held: every other writer
+            # of an outstanding or answered row takes it first.
+            raise AnswerNotAdmitted("question_row_changed")
+    return result
