@@ -2150,7 +2150,15 @@ pub fn quickstart_release_matches(
         .pointer("/security/gvisor/mode")
         .and_then(|value| value.as_str())
         == Some("off");
-    recorded_model == Some(model) && real_model && (!kind_target || gvisor_off)
+    // A kind release that still publishes a NodePort (an install from before
+    // quickstart kept these ClusterIP) is not at target, so a rerun converges
+    // it with `--no-expose`.
+    let exposed = ["/ui/service/type", "/langfuse/web/service/type"]
+        .iter()
+        .any(|pointer| {
+            values.pointer(pointer).and_then(|value| value.as_str()) == Some("NodePort")
+        });
+    recorded_model == Some(model) && real_model && (!kind_target || (gvisor_off && !exposed))
 }
 
 async fn capture_helm_json(cmd: &crate::ops::OpsCommand) -> Result<Option<serde_json::Value>> {
@@ -2798,6 +2806,38 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("skip cluster up"), "{text}");
         assert!(!text.contains("curie cluster up"), "{text}");
+    }
+
+    /// A kind release from before quickstart kept the console ClusterIP still
+    /// publishes NodePorts, so a rerun must run `cluster up --no-expose` instead
+    /// of skipping it; a release on any other cluster keeps its exposure.
+    #[test]
+    fn a_kind_release_that_still_exposes_a_nodeport_is_not_at_target() {
+        let metadata = serde_json::json!({"version": "0.12.2", "chart": "curie-0.12.2"});
+        let exposed = |component: &str| {
+            let mut values = serde_json::json!({
+                "security": {"gvisor": {"mode": "off"}},
+                "agentSandbox": {"runner": {"model": DEFAULT_MODEL, "fakeModel": false}},
+                "ui": {"service": {"type": "ClusterIP"}},
+                "langfuse": {"web": {"service": {"type": "ClusterIP"}}}
+            });
+            match component {
+                "ui" => values["ui"]["service"]["type"] = serde_json::json!("NodePort"),
+                _ => values["langfuse"]["web"]["service"]["type"] = serde_json::json!("NodePort"),
+            }
+            values
+        };
+        for component in ["ui", "langfuse"] {
+            let values = exposed(component);
+            assert!(
+                !quickstart_release_matches("0.12.2", &metadata, &values, DEFAULT_MODEL, true),
+                "{component}"
+            );
+            assert!(
+                quickstart_release_matches("0.12.2", &metadata, &values, DEFAULT_MODEL, false),
+                "{component}"
+            );
+        }
     }
 
     #[test]

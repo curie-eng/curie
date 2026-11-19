@@ -3,7 +3,7 @@
 //! that live only while the command runs.
 //!
 //! Nothing is published on the host until an operator runs this command. The
-//! forwards are children of this process, bound to `127.0.0.1`, and are stopped
+//! forwards are children of this process, bound to loopback, and are stopped
 //! and reaped on Ctrl-C, SIGTERM, or when any one of them dies. A SIGKILL of
 //! this process cannot run that cleanup and leaves the forwards running; stop
 //! them with `kill` on the `kubectl port-forward` processes.
@@ -143,8 +143,8 @@ fn plan_forward(
 }
 
 /// The `kubectl port-forward` for one forward: the builder `cluster status`
-/// hints and the API reads share, pinned to the IPv4 loopback address so
-/// nothing but this host can reach it.
+/// hints and the API reads share, pinned to `localhost` (the loopback
+/// addresses of both IP versions) so nothing but this host can reach it.
 fn forward_command(namespace: &str, fullname: &ReleaseFullname, forward: &Forward) -> OpsCommand {
     let mut command = crate::message::port_forward_command(
         namespace,
@@ -153,17 +153,37 @@ fn forward_command(namespace: &str, fullname: &ReleaseFullname, forward: &Forwar
         forward.local,
         forward.remote,
     );
-    // Right after `-n <namespace> port-forward`.
-    command.args.insert(3, plain("--address"));
-    command.args.insert(4, plain("127.0.0.1"));
+    pin_to_loopback(&mut command);
     command
 }
 
+/// Put `--address localhost` right after the `port-forward` verb, wherever
+/// that sits in the argv.
+fn pin_to_loopback(command: &mut OpsCommand) {
+    let after_verb = command
+        .argv()
+        .iter()
+        .position(|token| token == "port-forward")
+        .map_or(command.args.len(), |at| at + 1);
+    command.args.splice(
+        after_verb..after_verb,
+        [plain("--address"), plain("localhost")],
+    );
+}
+
+/// The first local port two forwards both ask for.
 fn local_port_conflict(forwards: &[Forward]) -> Option<u16> {
-    let (first, rest) = forwards.split_first()?;
-    rest.iter()
-        .find(|other| other.local == first.local)
-        .map(|other| other.local)
+    let mut seen = std::collections::BTreeSet::new();
+    forwards
+        .iter()
+        .find(|forward| !seen.insert(forward.local))
+        .map(|forward| forward.local)
+}
+
+fn conflict_error(port: u16) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the Console and Langfuse cannot both use local port {port}; pass --ui-port or --langfuse-port"
+    )
 }
 
 /// What `cluster access` reports once every forward is open.
@@ -200,7 +220,7 @@ impl CliOutput for ClusterAccessOutput {
 /// `cluster access --dry-run`: the commands that would run. The service ports
 /// are read from the cluster at runtime, so the forward lines use the chart
 /// defaults and say so.
-pub fn access_plan(opts: &AccessOpts) -> DryRunPlan {
+pub fn access_plan(opts: &AccessOpts) -> Result<DryRunPlan> {
     let fullname = dry_run_fullname(&opts.common.release);
     let mut lines = vec![
         "# The service ports are read from the cluster at runtime; the port-forward lines below show the chart defaults."
@@ -209,11 +229,12 @@ pub fn access_plan(opts: &AccessOpts) -> DryRunPlan {
     for surface in &SURFACES {
         lines.push(svc_cmd(&opts.common, &fullname, surface.suffix).display());
     }
+    let mut forwards = Vec::new();
     for (surface, (remote, override_port)) in SURFACES
         .iter()
         .zip([(80_u16, opts.ui_port), (3000, opts.langfuse_port)])
     {
-        let forward = Forward {
+        forwards.push(Forward {
             suffix: surface.suffix,
             label: surface.label,
             port_flag: surface.port_flag,
@@ -221,10 +242,15 @@ pub fn access_plan(opts: &AccessOpts) -> DryRunPlan {
             local: override_port.unwrap_or_else(|| default_local_port(surface, remote)),
             remote,
             path: api_suffix_path(surface.api),
-        };
-        lines.push(forward_command(&opts.common.namespace, &fullname, &forward).display());
+        });
     }
-    DryRunPlan { lines }
+    if let Some(port) = local_port_conflict(&forwards) {
+        return Err(conflict_error(port));
+    }
+    for forward in &forwards {
+        lines.push(forward_command(&opts.common.namespace, &fullname, forward).display());
+    }
+    Ok(DryRunPlan { lines })
 }
 
 /// Run the forwards in the foreground until Ctrl-C (or SIGTERM), then stop
@@ -263,9 +289,20 @@ pub async fn access(opts: AccessOpts) -> Result<()> {
         );
     }
     if let Some(port) = local_port_conflict(&forwards) {
-        bail!(
-            "the Console and Langfuse cannot both use local port {port}; pass --ui-port or --langfuse-port"
-        );
+        return Err(conflict_error(port));
+    }
+    for forward in &forwards {
+        if let Some(signs_in_at) = SURFACES
+            .iter()
+            .find(|surface| surface.label == forward.label)
+            .and_then(|surface| surface.default_local)
+            .filter(|signs_in_at| *signs_in_at != forward.local)
+        {
+            crate::ui::ui().warn(&format!(
+                "the {} signs in at localhost:{signs_in_at}, so signing in redirects there, not to localhost:{}",
+                forward.label, forward.local
+            ));
+        }
     }
 
     let mut shutdown = shutdown_signal()?;
@@ -282,6 +319,14 @@ pub async fn access(opts: AccessOpts) -> Result<()> {
         match started {
             Ok((child, _)) => running.push((forward, child)),
             Err(error) => {
+                // A terminal Ctrl-C also stops the kubectl that was starting.
+                if tokio::time::timeout(SIGNAL_RACE_GRACE, shutdown.changed())
+                    .await
+                    .is_ok()
+                {
+                    stop_all(running).await;
+                    return Ok(());
+                }
                 let failure = format!(
                     "could not open the {} port-forward on localhost:{}: {error:#} If that local port is in use, pass {} to choose another.",
                     forward.label, forward.local, forward.port_flag
@@ -297,7 +342,7 @@ pub async fn access(opts: AccessOpts) -> Result<()> {
         skipped,
     });
     crate::ui::ui().note(
-        "Forwarding on 127.0.0.1 only, for as long as this command runs. Press Ctrl-C to stop.",
+        "Forwarding on loopback only, for as long as this command runs. Press Ctrl-C to stop.",
     );
 
     let outcome = wait_for_end(&mut running, &mut shutdown).await;
@@ -337,11 +382,13 @@ async fn wait_for_end(
 }
 
 /// Stop every forward and wait for it, so none outlives this command.
-async fn stop_all(running: Vec<(Forward, tokio::process::Child)>) {
-    for (forward, mut child) in running {
+async fn stop_all(mut running: Vec<(Forward, tokio::process::Child)>) {
+    for (_, child) in running.iter_mut() {
         if child.start_kill().is_err() {
             // Already exited; the wait below reaps it.
         }
+    }
+    for (forward, mut child) in running {
         match tokio::time::timeout(STOP_GRACE, child.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => crate::ui::ui().warn(&format!(
@@ -452,14 +499,68 @@ mod tests {
         let command = forward_command("curie", &fullname(), &forward);
         assert_eq!(
             command.display(),
-            "kubectl -n curie port-forward --address 127.0.0.1 svc/curie-ui 18080:80"
+            "kubectl -n curie port-forward --address localhost svc/curie-ui 18080:80"
         );
         let langfuse = plan(&SURFACES[1], Some(CLUSTERIP_LANGFUSE), None).unwrap();
         assert_eq!(
             forward_command("curie", &fullname(), &langfuse).display(),
-            "kubectl -n curie port-forward --address 127.0.0.1 svc/curie-langfuse-web 23000:3000"
+            "kubectl -n curie port-forward --address localhost svc/curie-langfuse-web 23000:3000"
         );
         assert!(!command.display().contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn the_address_flag_follows_the_verb_wherever_it_sits() {
+        let mut command = OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("--context"),
+                plain("kind-x"),
+                plain("-n"),
+                plain("curie"),
+                plain("port-forward"),
+                plain("svc/curie-ui"),
+                plain("18080:80"),
+            ],
+        );
+        pin_to_loopback(&mut command);
+        assert_eq!(
+            command.display(),
+            "kubectl --context kind-x -n curie port-forward --address localhost svc/curie-ui 18080:80"
+        );
+    }
+
+    #[test]
+    fn any_two_forwards_sharing_a_local_port_conflict() {
+        let make = |local| Forward {
+            suffix: "ui",
+            label: "Console",
+            port_flag: "--ui-port",
+            service: "s".into(),
+            local,
+            remote: 80,
+            path: "",
+        };
+        assert_eq!(local_port_conflict(&[make(1), make(2), make(2)]), Some(2));
+        assert_eq!(local_port_conflict(&[make(1), make(2), make(3)]), None);
+    }
+
+    #[test]
+    fn the_dry_run_refuses_colliding_local_ports_like_a_live_run() {
+        let opts = AccessOpts {
+            common: CommonOpts {
+                namespace: "curie".into(),
+                release: "curie".into(),
+                dry_run: true,
+            },
+            ui_port: Some(23000),
+            langfuse_port: None,
+        };
+        let error = access_plan(&opts).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("local port 23000"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -481,7 +582,8 @@ mod tests {
             },
             ui_port: None,
             langfuse_port: Some(13000),
-        });
+        })
+        .unwrap();
         let text = plan.lines.join("\n");
         assert!(
             text.contains("kubectl get svc curie-ui -n curie -o json"),
@@ -493,7 +595,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "kubectl -n curie port-forward --address 127.0.0.1 svc/curie-ui 18080:80"
+                "kubectl -n curie port-forward --address localhost svc/curie-ui 18080:80"
             ),
             "{text}"
         );

@@ -245,7 +245,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 langfuse_port,
             };
             if dry_run {
-                emit(ops::access_plan(&opts))
+                emit(ops::access_plan(&opts)?)
             } else {
                 ops::access(opts).await
             }
