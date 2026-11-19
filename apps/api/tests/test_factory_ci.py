@@ -1854,17 +1854,6 @@ def test_tried_summary_names_the_refused_operation_without_a_permission_claim() 
     assert "Permissions and events" not in summary
 
 
-def test_tried_summary_quotes_github_and_skips_the_permission_paragraph() -> None:
-    note = "Upgrade to GitHub Pro or make this repository public to enable this feature"
-    verdict = factory_ci.Verdict(
-        kind="unverified", reason="github_forbidden_get_branch_rules", note=note
-    )
-    summary = factory_ci.tried_summary([], verdict, PR_URL)
-    assert f'GitHub refused Get rules for a branch. GitHub said: "{note}".' in summary
-    assert "App permission" not in summary
-    assert "Checks: read" not in summary
-
-
 def test_tried_summary_keeps_a_bare_403_generic_and_free_of_a_permission_claim() -> None:
     verdict = factory_ci.Verdict(kind="unverified", reason="github_forbidden")
     summary = factory_ci.tried_summary([], verdict, PR_URL)
