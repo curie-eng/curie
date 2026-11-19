@@ -41,7 +41,7 @@ from datetime import datetime
 from typing import Final
 
 import httpx
-from sqlalchemy import and_, delete, func, not_, or_, select, update
+from sqlalchemy import and_, delete, exists, func, not_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -664,7 +664,11 @@ async def locked_round(
 
 
 async def rows_an_older_replica_settled(
-    session: AsyncSession, *, unpublished_causes: frozenset[str], limit: int
+    session: AsyncSession,
+    *,
+    unpublished_causes: frozenset[str],
+    limit: int,
+    work_item_id: uuid.UUID | None = None,
 ) -> list[uuid.UUID]:
     """WorkItems whose question row a settlement did not reach.
 
@@ -681,6 +685,13 @@ async def rows_an_older_replica_settled(
        and the asker failed with a cause the question ending never converts);
     3. an ``answered`` row whose queued answer is terminal, other than the
        asker itself.
+
+    An asker the re-drive would leave failed (a tracker result, or a request
+    other than its queued answer admitted after it) is selected only once the
+    row can clear, so no row is selected on every pass. ``work_item_id``
+    narrows the check to one WorkItem: the re-drive repeats it under the
+    WorkItem lock, since a relabel and a new ask can change the row between
+    the selection and the lock.
     """
 
     asker = aliased(ExecutionRequest)
@@ -690,10 +701,17 @@ async def rows_an_older_replica_settled(
         pending.id.is_not(None),
         pending.terminal_at.is_(None),
     )
+    later = aliased(ExecutionRequest)
     convertible = and_(
         asker.status == "failed",
         asker.terminal_cause.in_(unpublished_causes),
+        asker.completion_contract.is_distinct_from(runtime.CONTRACT_TRACKER_RESULT),
         FactoryQuestionRound.state.in_((OUTSTANDING, ANSWERED)),
+        ~exists().where(
+            later.work_item_id == asker.work_item_id,
+            later.sequence > asker.sequence,
+            later.id.is_distinct_from(FactoryQuestionRound.pending_request_id),
+        ),
     )
     asker_unsettled = and_(
         asker.terminal_at.is_not(None),
@@ -718,6 +736,9 @@ async def rows_an_older_replica_settled(
                     or_(asker_unsettled, answer_unsettled),
                 ),
             )
+        )
+        .where(
+            *(() if work_item_id is None else (FactoryQuestionRound.work_item_id == work_item_id,))
         )
         .order_by(FactoryQuestionRound.updated_at, FactoryQuestionRound.work_item_id)
         .limit(limit)

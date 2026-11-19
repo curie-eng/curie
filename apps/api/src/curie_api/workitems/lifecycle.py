@@ -624,8 +624,9 @@ async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UU
     round a new replica posted. It runs the same transitions without the
     round hooks: its finish leaves an asker that ended without a pull
     request ``failed`` instead of with the question ending, and its
-    cancellation keeps the row. Under the WorkItem lock this applies what the
-    settlement on this version would have:
+    cancellation keeps the row. Under the WorkItem lock, and only while the
+    row is still one the selection names, this applies what the settlement on
+    this version would have:
 
     1. A cancelled WorkItem's row is deleted, as its cancellation would.
     2. An asker whose posted round is current and that failed with an
@@ -644,11 +645,17 @@ async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UU
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
         return
-    if work_item.cancelled_at is not None:
-        await factory_questions.delete_for_cancellation(session, work_item_id)
-        return
     row = await factory_questions.locked_round(session, work_item_id)
     if row is None:
+        return
+    # Selected before the lock: a relabel and a new ask since then make the
+    # row a new round this version settles itself.
+    if not await factory_questions.rows_an_older_replica_settled(
+        session, unpublished_causes=_UNPUBLISHED_CAUSES, limit=1, work_item_id=work_item_id
+    ):
+        return
+    if work_item.cancelled_at is not None:
+        await factory_questions.delete_for_cancellation(session, work_item_id)
         return
     pending_id = row.pending_request_id
     asker = await lock_request(session, work_item_id=work_item_id, request_id=row.asking_request_id)
@@ -2790,6 +2797,11 @@ async def readmit(
             .limit(1)
         )
         return await outcome(session, work_item, predecessor, replayed=True)
+    if work_item.cancelled_at is not None:
+        # A cancellation deletes the question row, but one an older API
+        # replica took during a rolling upgrade kept it; the relabel must not
+        # inherit the cancelled round (#5785).
+        await factory_questions.delete_for_cancellation(session, work_item_id)
     now = await database_now(session)
     moving = await session.scalar(
         select(FactoryBaseTransition)
@@ -2946,6 +2958,9 @@ async def admit_pending_readmit(
     if active is not None and active.status != "waiting":
         await session.commit()
         return None
+    if work_item.cancelled_at is not None:
+        # As in readmit: drop a round an older replica's cancellation kept.
+        await factory_questions.delete_for_cancellation(session, work_item_id)
     moving = await session.scalar(
         select(FactoryBaseTransition.id)
         .where(

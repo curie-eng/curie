@@ -32,6 +32,7 @@ next settlement path cannot skip this proof.
 from __future__ import annotations
 
 import ast
+import contextlib
 import sys
 import uuid
 from collections.abc import Iterator
@@ -75,7 +76,6 @@ NEEDS_HUMAN = "curie-factory:needs-human"
 PR_OPEN = "curie-factory:pr-open"
 RUNNING = "curie-factory:running"
 ASKS_FOR_ANSWER = "Questions asked (round 1 of 3). Answer in a plain comment on this ticket."
-_TERMINAL = {"completed", "failed", "expired", "cancelled"}
 QUESTION_ENDING = {"status": "completed", "terminal_cause": "questions_asked"}
 
 # The settlement hooks #5785 added to the lifecycle. A replica built before
@@ -147,6 +147,33 @@ def _shows_the_question(sink: Any, triage: tr._Triage, number: int) -> None:
     body = _status_body(sink, triage.request_id)
     assert ASKS_FOR_ANSWER in body
     assert "Could not complete" not in body
+
+
+def _after_asker(triage: tr._Triage) -> list[tuple[uuid.UUID, str]]:
+    """Every request the WorkItem admitted after the asker, any status."""
+
+    requests = _requests(triage.work_item_id)
+    after = requests[[r["id"] for r in requests].index(triage.request_id) + 1 :]
+    return [(r["id"], r["status"]) for r in after]
+
+
+def _to_redrive(triage: tr._Triage) -> list[uuid.UUID]:
+    """The WorkItems the re-drive would select now."""
+
+    async def go() -> list[uuid.UUID]:
+        async with triage.client.app.state.sessionmaker() as session:
+            return await lifecycle.question_rounds_to_redrive(session, limit=100)
+
+    return [i for i in triage.client.portal.call(go) if i == triage.work_item_id]
+
+
+def _redrive(triage: tr._Triage) -> None:
+    async def go() -> None:
+        async with triage.client.app.state.sessionmaker() as session:
+            await lifecycle.redrive_question_round(session, work_item_id=triage.work_item_id)
+            await session.commit()
+
+    triage.client.portal.call(go)
 
 
 def _one_continuation(triage: tr._Triage, revision: uuid.UUID) -> None:
@@ -331,9 +358,45 @@ def test_a_relabel_before_the_roll_is_the_one_continuation(
     assert _request(triage.request_id)["status"] == "failed"
     row = _round_row(triage.work_item_id)
     assert row is not None and row["state"] == "cleared"
-    live = [r["id"] for r in _requests(triage.work_item_id) if r["status"] not in _TERMINAL]
-    assert live == [relabelled]
+    assert _after_asker(triage) == [(relabelled, "waiting")]
     assert QUESTIONS_LABEL not in _state_labels(sink, 1205)
+    assert _to_redrive(triage) == []
+
+
+def test_a_relabel_beside_a_queued_answer_is_not_redriven_again(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An answer is queued while the asker runs, the asker's finish lands on
+    an older replica, and the label is re-added before the answer is
+    promoted. The re-drive leaves the failed asker as it is (the relabel
+    already continued the attempt) and the row is not selected again on the
+    next pass. The requests after the asker are the ones a ticket gets with
+    no older replica: the relabel's run, then the queued answer."""
+
+    _client, github, sink = admitted
+
+    def run(number: int, *, older: bool) -> tuple[tr._Triage, uuid.UUID, uuid.UUID]:
+        triage = _asked(admitted, monkeypatch, number)
+        revision = _queue_revision(triage)
+        _answer(triage.work_item_id, revision)
+        with _older_replica() if older else contextlib.nullcontext():
+            tr._finish(triage, "failed", "no_pull_request")
+        tr._label(triage.client, github, number)
+        relabelled = _requests(triage.work_item_id)[-1]["id"]
+        return triage, revision, relabelled
+
+    triage, revision, relabelled = run(1207, older=True)
+    _after_the_roll()
+    assert _request(triage.request_id)["status"] == "failed"
+    row = _round_row(triage.work_item_id)
+    assert row is not None and (row["state"], row["pending_request_id"]) == ("answered", revision)
+    assert _to_redrive(triage) == []
+    mixed = _after_asker(triage)
+    assert mixed == [(revision, "queued"), (relabelled, "waiting")]
+
+    baseline, base_revision, base_relabelled = run(1257, older=False)
+    _reconcile()
+    assert _after_asker(baseline) == [(base_revision, "queued"), (base_relabelled, "waiting")]
 
 
 # Owner loss on an older replica -------------------------------------------------------
@@ -398,6 +461,75 @@ def test_an_older_replica_cancelling_after_the_question_ending_drops_the_round(
     posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
     assert posted.status_code == 200, posted.text
     assert posted.json() == {"round": 2, "rounds_limit": 3}
+
+
+def test_a_relabel_after_an_older_cancellation_drops_the_round(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older replica cancels the WorkItem after the question ending and
+    keeps the row; the label is re-added on a new replica before any re-drive.
+    The relabel drops the cancelled round, as the new cancellation would have,
+    so the fresh run is not taken for an answer to it and asks round 2."""
+
+    _client, github, sink = admitted
+    triage = _asked(admitted, monkeypatch, 1213)
+    tr._finish(triage, "failed", "no_pull_request")
+    _reconcile()
+    with _older_replica():
+        _cancel(triage)
+    assert _round_row(triage.work_item_id) is not None
+
+    tr._label(triage.client, github, 1213)
+    assert _round_row(triage.work_item_id) is None
+    relabelled = _requests(triage.work_item_id)[-1]["id"]
+    assert _after_asker(triage) == [(relabelled, "waiting")]
+    _after_the_roll()
+    assert _round_row(triage.work_item_id) is None
+    fresh = _take_over(triage, relabelled)
+    posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
+    assert posted.status_code == 200, posted.text
+    assert posted.json() == {"round": 2, "rounds_limit": 3}
+
+
+def test_a_new_round_after_the_selection_is_left_to_its_own_settlement(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-drive selects a WorkItem whose queued answer an older replica
+    ended without the round hook. Before it takes the lock, the label is
+    re-added and the fresh run asks round 2, which keeps the old pending
+    request on the row. The stale selection must not settle that request
+    against the new round."""
+
+    _client, github, sink = admitted
+    triage = _asked(admitted, monkeypatch, 1214)
+    tr._finish(triage, "failed", "no_pull_request")
+    _reconcile()
+    revision = _queue_revision(triage)
+    _answer(triage.work_item_id, revision)
+    # The older replica ended the queued answer without settling the round.
+    tr._exec(
+        "UPDATE curie.execution_requests SET status = 'cancelled', "
+        "terminal_cause = 'issue_cancelled', terminal_at = clock_timestamp(), "
+        "version = version + 1 WHERE id = :id",
+        {"id": revision},
+    )
+    assert _to_redrive(triage) == [triage.work_item_id]
+
+    tr._label(triage.client, github, 1214)
+    relabelled = _requests(triage.work_item_id)[-1]["id"]
+    fresh = _take_over(triage, relabelled)
+    posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
+    assert posted.status_code == 200, posted.text
+    before = _round_row(triage.work_item_id)
+    assert before is not None
+    assert (before["asking_request_id"], before["pending_request_id"]) == (relabelled, revision)
+
+    _redrive(triage)
+    after = _round_row(triage.work_item_id)
+    assert after is not None
+    assert (after["state"], after["asking_request_id"]) == ("outstanding", relabelled)
+    tr._finish(fresh, "failed", "no_pull_request")
+    assert _request(relabelled) == QUESTION_ENDING
 
 
 def _record_termination(triage: tr._Triage) -> None:
