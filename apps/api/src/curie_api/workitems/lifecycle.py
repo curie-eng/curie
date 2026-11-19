@@ -608,6 +608,117 @@ async def settle_terminal(
         await transcripts.expire_for_work_item(session, work_item)
 
 
+async def question_rounds_to_redrive(session: AsyncSession, *, limit: int) -> list[uuid.UUID]:
+    """WorkItems whose question round an older API replica settled past."""
+
+    return await factory_questions.rows_an_older_replica_settled(
+        session, unpublished_causes=_UNPUBLISHED_CAUSES, limit=limit
+    )
+
+
+async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UUID) -> None:
+    """Apply the round settlement an older API replica skipped (#5785).
+
+    The API rolls one replica at a time, so during an upgrade a replica built
+    before the question rounds can settle, cancel or expire a request whose
+    round a new replica posted. It runs the same transitions without the
+    round hooks: its finish leaves an asker that ended without a pull
+    request ``failed`` instead of with the question ending, and its
+    cancellation keeps the row. Under the WorkItem lock this applies what the
+    settlement on this version would have:
+
+    1. A cancelled WorkItem's row is deleted, as its cancellation would.
+    2. An asker whose posted round is current and that failed with an
+       unpublished cause takes the question ending after all: ``completed``
+       with ``questions_asked``, and its status comment is reopened to say
+       so. Not when a publication owns its terminus, or when a request other
+       than the round's queued answer was admitted after it (a retry the
+       older replica started): the attempt already continued, so converting
+       would start a second one.
+    3. ``settle_round`` then runs for the terminal asker, and for a terminal
+       queued answer, exactly as at settlement.
+
+    The caller commits.
+    """
+
+    work_item = await lock_work_item(session, work_item_id)
+    if work_item is None:
+        return
+    if work_item.cancelled_at is not None:
+        await factory_questions.delete_for_cancellation(session, work_item_id)
+        return
+    row = await factory_questions.locked_round(session, work_item_id)
+    if row is None:
+        return
+    pending_id = row.pending_request_id
+    asker = await lock_request(session, work_item_id=work_item_id, request_id=row.asking_request_id)
+    if asker is not None and asker.terminal_at is not None:
+        if await _older_question_ending(session, work_item, asker, pending_id):
+            await session.execute(
+                update(ExecutionRequest)
+                .where(
+                    ExecutionRequest.id == asker.id,
+                    ExecutionRequest.version == asker.version,
+                    ExecutionRequest.status == "failed",
+                )
+                .values(
+                    status="completed",
+                    terminal_cause=factory_questions.QUESTIONS_ASKED,
+                    version=ExecutionRequest.version + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+            )
+            await session.execute(
+                update(FactoryStatusComment)
+                .where(FactoryStatusComment.execution_request_id == asker.id)
+                .values(
+                    terminal_cause=factory_questions.QUESTIONS_ASKED,
+                    finalized_at=case(
+                        (FactoryStatusComment.refused_at.is_(None), None),
+                        else_=FactoryStatusComment.finalized_at,
+                    ),
+                    sync_invalidated=FactoryStatusComment.sync_owner.is_not(None),
+                )
+            )
+            asker = await reload_request(session, asker.id)
+        await factory_questions.settle_round(session, work_item, asker)
+    if pending_id is None or asker is None or pending_id == asker.id:
+        return
+    pending = await reload_request(session, pending_id)
+    if pending.terminal_at is not None:
+        await factory_questions.settle_round(session, work_item, pending)
+
+
+async def _older_question_ending(
+    session: AsyncSession,
+    work_item: WorkItem,
+    asker: ExecutionRequest,
+    pending_id: uuid.UUID | None,
+) -> bool:
+    """Whether a terminal asker earned the question ending its settlement skipped."""
+
+    if (
+        asker.status != "failed"
+        or (asker.terminal_cause or "").strip() not in _UNPUBLISHED_CAUSES
+        or asker.completion_contract == CONTRACT_TRACKER_RESULT
+    ):
+        return False
+    if (
+        await factory_questions.question_ending(session, work_item.id, asker.id)
+        != factory_questions.QUESTIONS_ASKED
+    ):
+        return False
+    if await _publication_owns_terminus(session, work_item, asker):
+        return False
+    later = select(ExecutionRequest.id).where(
+        ExecutionRequest.work_item_id == work_item.id,
+        ExecutionRequest.sequence > asker.sequence,
+    )
+    if pending_id is not None:
+        later = later.where(ExecutionRequest.id != pending_id)
+    return await session.scalar(later.limit(1)) is None
+
+
 CancellationCause = Literal["issue_cancelled", "issue_deleted"]
 
 

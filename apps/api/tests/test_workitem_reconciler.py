@@ -70,6 +70,7 @@ RECONCILER_STEPS = (
     "_request_owner_lost_cancellations",
     "_publish_terminate_wakes",
     "_settle_overdue_cancellations",
+    "_redrive_question_rounds",
     "_readmit_pending",
     "_reconcile_missed_labels",
     "_poll_trackers",

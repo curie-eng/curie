@@ -357,6 +357,8 @@ _DESIRED_LABEL = {
     "cancelled": "",
 }
 _PUBLISHING_STATUSES = ("pending", "approved", "launching", "running")
+# The label a release without question rounds gives a question ending.
+_OLDER_QUESTIONS_LABEL = _DESIRED_LABEL["completed"]
 _WAITING_FOR_PROGRESS = "_Waiting for the agent to report progress._"
 # The first line of a live implementation run's status comment on its ticket
 # (#5785 decision 13): posted at admission, before any model progress.
@@ -1062,6 +1064,16 @@ async def _claim_next(
         # A fresh run after the merge: the merged pull request is not its own.
         pr_state = None
     if pr_state == "merged" and request.status in {"completed", "failed", "expired"}:
+        row.finalized_at = None
+    if (
+        request.status == "completed"
+        and request.terminal_cause == QUESTIONS_ASKED
+        and row.applied_label == _OLDER_QUESTIONS_LABEL
+    ):
+        # An API replica built before the question rounds (#5785) finalized
+        # this comment during a rolling upgrade: it renders the unknown cause
+        # as a failure and labels a completed request pr-open, which this
+        # version never applies to a question ending. Write the body again.
         row.finalized_at = None
     now = await _clock(session)
     await session.execute(

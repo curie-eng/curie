@@ -41,9 +41,10 @@ from datetime import datetime
 from typing import Final
 
 import httpx
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, not_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from . import factory_tracker_result_runtime as runtime
 from .config import Settings, get_settings
@@ -646,6 +647,82 @@ async def delete_for_cancellation(session: AsyncSession, work_item_id: uuid.UUID
     await session.execute(
         delete(FactoryQuestionRound).where(FactoryQuestionRound.work_item_id == work_item_id)
     )
+
+
+# Rows an older replica left behind --------------------------------------------------
+
+# The states a settlement moves on; ``cleared`` is settled already.
+_SETTLED_ON: Final = (POSTING, OUTSTANDING, ANSWERED, EXHAUSTED)
+
+
+async def locked_round(
+    session: AsyncSession, work_item_id: uuid.UUID
+) -> FactoryQuestionRound | None:
+    """The WorkItem's question row, locked; the caller holds the WorkItem lock."""
+
+    return await _round_row(session, work_item_id)
+
+
+async def rows_an_older_replica_settled(
+    session: AsyncSession, *, unpublished_causes: frozenset[str], limit: int
+) -> list[uuid.UUID]:
+    """WorkItems whose question row a settlement did not reach.
+
+    During a rolling upgrade an API replica built before the question rounds
+    settles, cancels and expires requests without the round hooks: its
+    finish fails an asker the question ending would have completed, and its
+    cancellation keeps the row. Every settlement on this version applies the
+    hooks in the settling transaction, so outside that the states selected
+    here do not persist:
+
+    1. the row of a cancelled WorkItem (the cancellation deletes it);
+    2. a row whose asking request is terminal without the question ending,
+       unless an answer it queued is still live (rule 1 keeps it ``answered``,
+       and the asker failed with a cause the question ending never converts);
+    3. an ``answered`` row whose queued answer is terminal, other than the
+       asker itself.
+    """
+
+    asker = aliased(ExecutionRequest)
+    pending = aliased(ExecutionRequest)
+    pending_live = and_(
+        FactoryQuestionRound.state == ANSWERED,
+        pending.id.is_not(None),
+        pending.terminal_at.is_(None),
+    )
+    convertible = and_(
+        asker.status == "failed",
+        asker.terminal_cause.in_(unpublished_causes),
+        FactoryQuestionRound.state.in_((OUTSTANDING, ANSWERED)),
+    )
+    asker_unsettled = and_(
+        asker.terminal_at.is_not(None),
+        not_(and_(asker.status == "completed", asker.terminal_cause == QUESTIONS_ASKED)),
+        or_(convertible, not_(pending_live)),
+    )
+    answer_unsettled = and_(
+        FactoryQuestionRound.state == ANSWERED,
+        pending.terminal_at.is_not(None),
+        pending.id != FactoryQuestionRound.asking_request_id,
+    )
+    ids = await session.scalars(
+        select(FactoryQuestionRound.work_item_id)
+        .join(WorkItem, WorkItem.id == FactoryQuestionRound.work_item_id)
+        .outerjoin(asker, asker.id == FactoryQuestionRound.asking_request_id)
+        .outerjoin(pending, pending.id == FactoryQuestionRound.pending_request_id)
+        .where(
+            or_(
+                WorkItem.cancelled_at.is_not(None),
+                and_(
+                    FactoryQuestionRound.state.in_(_SETTLED_ON),
+                    or_(asker_unsettled, answer_unsettled),
+                ),
+            )
+        )
+        .order_by(FactoryQuestionRound.updated_at, FactoryQuestionRound.work_item_id)
+        .limit(limit)
+    )
+    return list(ids)
 
 
 async def asked_round(
