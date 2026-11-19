@@ -4,13 +4,38 @@ GitHub keeps its webhook, ETag poll and missed-label reconciler. Every other
 configured tracker binding is polled here through `Tracker.poll_marked`, and
 each notice goes through the same admission the GitHub path applies:
 
-1. ``verify_current``, then the binding's start authority for a label add or
-   a mention (an actor without it is ignored, as GitHub ignores a non-writer);
+1. ``verify_current``, then the binding's start authority for a label add, a
+   mention or an answer (an actor without it is ignored, as GitHub ignores a
+   non-writer);
 2. the surface the label serves on the binding (none or two refuse
    ``binding_missing``), and the label refusal rules of #4361 decision 9;
 3. the repository (`forges.resolution`) and base (`factory_base`, with the
    chosen binding's policy) choice, each refused with one marked comment;
-4. the shared WorkItem dispatch: ``readmit``, ``admit_revision`` or a cancel.
+4. the shared WorkItem dispatch: ``readmit``, ``admit_revision``,
+   `factory_questions.admit_answer` or a cancel.
+
+Answers (#5789). Each label's poll passes two issue sets: ``running``, the
+binding scope's WorkItems not cancelled, which the adapter re-reads for a
+cancellation, and ``answering``, those of them whose question row is
+``posting``, ``outstanding`` or ``answered``. On an answering issue the adapter
+turns every new comment by a person into an ``ANSWER`` notice, mention or not.
+The notice passes ``verify_current`` (the issue is still labelled and open and
+the comment stands) and the binding's start authority read now, then goes to
+`factory_questions.admit_answer` with the comment's tracker id and creation
+time, which owns the fence, the coalescing, the follow-up and the receipt. The
+sweep passes no answering set.
+
+A ``posting`` row is in the answering set on purpose. Its question comment may
+already be on the ticket while the row is not yet ``outstanding`` (the tracker
+write landed but its answer was lost, and the asking request retries the
+route). `admit_answer` would answer such a comment ``not_outstanding`` and keep
+that receipt forever, so the intake reads the row under the WorkItem lock first
+(every row writer but the tracker write holds it, and that one only moves a
+``posting`` row on) and, on ``posting``, holds the issue as a deferral does,
+logged at INFO, with no hold comment: its later notices wait, the cursor stays,
+and the next poll replays the page. A ``posting`` row ends ``outstanding`` (the
+write is recorded) or ``cleared`` (the asking request ended), so the hold lasts
+at most the asking request's lifetime.
 
 A running WorkItem of a configured tracker whose scope no binding serves any
 more (the binding was removed or rescoped) can no longer be polled, admitted or
@@ -39,13 +64,13 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, assert_never
 
 import httpx
 from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import factory_rediscovery, workitem_dispatch
+from . import factory_questions, factory_rediscovery, workitem_dispatch
 from .config import Settings
 from .factory_admission import LABEL_REFUSAL_MARKER, cancel_work_item, label_refusal
 from .forges.authority import may_start_with
@@ -77,7 +102,7 @@ from .forges.types import (
 )
 from .github_factory import lock_issue, work_item_for
 from .github_review_events import FeedbackUnavailable
-from .models import ExecutionRequest, FactoryPollCursor, WorkItem
+from .models import ExecutionRequest, FactoryPollCursor, FactoryQuestionRound, WorkItem
 from .workitem_dispatch import Admission
 from .workitems import lifecycle
 
@@ -91,6 +116,25 @@ _LOCK_ARGS = {"classid": 3745, "objid": 197}
 # On a page read the label's pass stops; on one notice only its issue is held.
 # Either way the label's cursor stays.
 _DEFERRED = (Unavailable, Unauthorized, FeedbackUnavailable)
+
+# The question rows whose ticket comments are read as answers (#5789 decision
+# 1). ``posting`` is one: see `_AnswerAwaitsQuestion`.
+_ANSWERING_STATES = (
+    factory_questions.POSTING,
+    factory_questions.OUTSTANDING,
+    factory_questions.ANSWERED,
+)
+
+
+class _AnswerAwaitsQuestion(Exception):
+    """An answer arrived while its question row is still ``posting``.
+
+    The question comment may be on the ticket already, but the row is not yet
+    ``outstanding``, so admitting now would record a permanent
+    ``not_outstanding`` receipt. The label pass holds the issue without a hold
+    comment, and the next poll replays the notice.
+    """
+
 
 HOLD_MARKER = "curie-factory-intake-hold"
 _HOLD_BODY = (
@@ -187,7 +231,7 @@ async def _poll_locked(
                 continue
             surface_kind, location = binding_location(binding, tracker)
             scope = _Scope(registry, settings, client, tracker, binding, surface_kind, location)
-            running = await _running(sessionmaker, scope)
+            running, answering = await _running(sessionmaker, scope)
             labels = await _labels(sessionmaker, scope, running)
             sweeps = {
                 label
@@ -204,6 +248,7 @@ async def _poll_locked(
                     sessionmaker,
                     scope,
                     running,
+                    answering,
                     labels if polling else sorted(sweeps),
                     polling=polling,
                     sweeps=sweeps,
@@ -260,29 +305,37 @@ async def _labels(
 
 async def _running(
     sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope
-) -> dict[str, list[TrackerIssueRef]]:
-    """The binding scope's WorkItems not cancelled, by the label that admitted them."""
+) -> tuple[dict[str, list[TrackerIssueRef]], dict[str, list[TrackerIssueRef]]]:
+    """The binding scope's WorkItems not cancelled, by the label that admitted
+    them, and the answering ones among them: those whose question row is in
+    ``_ANSWERING_STATES``, grouped the same way."""
 
     async with sessionmaker() as session:
-        rows = await session.scalars(
-            select(WorkItem).where(
+        rows = await session.execute(
+            select(WorkItem, FactoryQuestionRound.state)
+            .outerjoin(FactoryQuestionRound, FactoryQuestionRound.work_item_id == WorkItem.id)
+            .where(
                 WorkItem.tracker_kind == scope.tracker.kind,
                 WorkItem.tracker_host == scope.tracker.host,
                 WorkItem.tracker_scope_id == scope.binding.tracker_scope_id,
                 WorkItem.cancelled_at.is_(None),
             )
         )
-        grouped: dict[str, list[TrackerIssueRef]] = {}
-        for item in rows:
+        running: dict[str, list[TrackerIssueRef]] = {}
+        answering: dict[str, list[TrackerIssueRef]] = {}
+        for item, state in rows.tuples():
             label = item.trigger_label or scope.tracker.label
-            grouped.setdefault(label, []).append(item.tracker_issue)
-    return grouped
+            running.setdefault(label, []).append(item.tracker_issue)
+            if state in _ANSWERING_STATES:
+                answering.setdefault(label, []).append(item.tracker_issue)
+    return running, answering
 
 
 async def _poll_binding(
     sessionmaker: async_sessionmaker[AsyncSession],
     scope: _Scope,
     running: dict[str, list[TrackerIssueRef]],
+    answering: dict[str, list[TrackerIssueRef]],
     labels: list[str],
     *,
     polling: bool,
@@ -303,7 +356,13 @@ async def _poll_binding(
         # sweep, which skips that issue until the next pass.
         held: set[TrackerIssueRef] = set()
         polled = not polling or await _poll_label(
-            sessionmaker, scope, tracker, label, running.get(label, []), held
+            sessionmaker,
+            scope,
+            tracker,
+            label,
+            running.get(label, []),
+            answering.get(label, []),
+            held,
         )
         if polling and polled:
             await _observe_existing_bases(sessionmaker, scope, tracker, label)
@@ -433,19 +492,21 @@ async def _poll_label(
     tracker: Tracker,
     label: str,
     running: list[TrackerIssueRef],
+    answering: list[TrackerIssueRef],
     held: set[TrackerIssueRef],
 ) -> bool:
     """Poll one label from its stored cursor; False when the page was not read.
 
     A deferred notice adds its issue to ``held``: that issue's later notices
     wait, the others are applied, and the cursor stays for the next poll to
-    replay.
+    replay. An answer to a question still ``posting`` holds its issue the same
+    way, without a hold comment.
     """
 
     key = f"marked:{label}"
     stored = await _load_cursor(sessionmaker, scope, key)
     try:
-        page = await tracker.poll_marked(stored, running=tuple(running), answering=())
+        page = await tracker.poll_marked(stored, running=tuple(running), answering=tuple(answering))
     except _DEFERRED as exc:
         _deferred(scope, label, "poll", exc)
         return False
@@ -467,6 +528,15 @@ async def _poll_label(
         except _DEFERRED as exc:
             held.add(notice.issue)
             await _hold(scope, tracker, label, notice.issue, exc)
+        except _AnswerAwaitsQuestion:
+            # Identifiers only; nothing is posted on the ticket.
+            held.add(notice.issue)
+            logger.info(
+                "tracker intake for binding %s label %r holds an answer: its question is "
+                "still posting",
+                scope.binding.name,
+                label,
+            )
     if not held:
         await _save_cursor(sessionmaker, scope, key, page.cursor)
     return True
@@ -547,8 +617,10 @@ async def _apply(
 ) -> None:
     """Apply one notice under its issue lock, committing what it decided.
 
-    A deliberate refusal returns; a deferral raises one of ``_DEFERRED`` so the
-    notice's issue is held and the label's cursor stays.
+    A deliberate refusal returns; a deferral raises one of ``_DEFERRED``, or
+    `_AnswerAwaitsQuestion`, so the notice's issue is held and the label's
+    cursor stays. An answer's admission commits or rolls back its own
+    transaction, so the closing commit then has nothing left to write.
     """
 
     async with sessionmaker() as session:
@@ -560,7 +632,9 @@ async def _apply(
                 await _admit(session, scope, tracker, label, notice)
             elif notice.disposition is Disposition.MENTION:
                 await _mention(session, scope, tracker, notice)
-            else:
+            elif notice.disposition is Disposition.ANSWER:
+                await _answer(session, scope, tracker, notice)
+            elif notice.disposition is Disposition.CANCEL:
                 await _cancel(
                     session,
                     scope,
@@ -568,6 +642,8 @@ async def _apply(
                     notice,
                     cause="issue_deleted" if notice.event_id == "deleted" else "issue_cancelled",
                 )
+            else:
+                assert_never(notice.disposition)
         except NotFound:
             await session.rollback()
             if notice.disposition is Disposition.CANCEL:
@@ -575,6 +651,7 @@ async def _apply(
                 await _cancel(session, scope, label, notice, cause="issue_deleted")
                 await session.commit()
                 return
+            # A mention or an answer on a missing issue is dropped.
             logger.info(
                 "tracker intake for binding %s skipped a notice on a missing issue",
                 scope.binding.name,
@@ -817,6 +894,56 @@ async def _mention(
     ) as dispatch:
         result = await workitem_dispatch.admit_revision(dispatch, admission)
     _log_dispatch(scope, result)
+
+
+async def _answer(
+    session: AsyncSession, scope: _Scope, tracker: Tracker, notice: MarkedNotice
+) -> None:
+    """Hand a person's comment on an answering issue to the answer core (#5789
+    decisions 4 and 5): who may answer is who may start the ticket, read now.
+
+    Logs identifiers only, never the comment's text. Raises
+    `_AnswerAwaitsQuestion` while the question row is ``posting``.
+    """
+
+    issue = notice.issue
+    existing = await work_item_for(session, issue)
+    if existing is None:
+        return
+    binding = scope.binding
+    if not await may_start_with(binding.start_authority, issue, notice.actor, tracker=tracker):
+        logger.info(
+            "tracker intake for binding %s ignored an answer by an account without start authority",
+            binding.name,
+        )
+        return
+    # Under the WorkItem lock the row cannot move into ``posting``; only the
+    # tracker write, which does not take this lock, moves it out of it.
+    locked = await lifecycle.lock_work_item(session, existing.id)
+    if locked is None:
+        return
+    state = await session.scalar(
+        select(FactoryQuestionRound.state).where(FactoryQuestionRound.work_item_id == locked.id)
+    )
+    if state == factory_questions.POSTING:
+        await session.rollback()
+        raise _AnswerAwaitsQuestion
+    facts = factory_questions.AnswerFacts(
+        work_item_id=locked.id,
+        issue=issue,
+        comment_id=mention_comment_id(issue.kind, notice.event_id),
+        created_at=notice.occurred_at,
+        requester=f"{tracker.kind}:{notice.actor.id}:{notice.actor.login}",
+    )
+    try:
+        await factory_questions.admit_answer(session, facts)
+    except factory_questions.AnswerNotAdmitted as refused:
+        logger.info(
+            "tracker intake for binding %s did not admit an answer on work item %s: %s",
+            binding.name,
+            locked.id,
+            refused.code,
+        )
 
 
 async def _cancel(

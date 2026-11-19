@@ -261,6 +261,7 @@ class _Fault:
     status: int
     headers: dict[str, str]
     body: Any
+    applied: bool = False
 
 
 class JiraFake:
@@ -576,12 +577,19 @@ class JiraFake:
         after: int = 0,
         headers: Mapping[str, str] | None = None,
         body: Any = None,
+        applied: bool = False,
     ) -> None:
         """The request of one of ``kinds`` made after ``after`` more such
-        requests answers ``status`` once."""
+        requests answers ``status`` once.
+
+        With ``applied`` the site carries the request out first and only its
+        answer is lost (a write that landed behind a gateway error), so the
+        caller sees ``status`` while the change stands. Such a write is not
+        counted in ``writes``, which counts only the writes the caller saw
+        accepted."""
 
         wanted = frozenset({kinds} if isinstance(kinds, str) else kinds)
-        self._faults.append(_Fault(wanted, after, status, dict(headers or {}), body))
+        self._faults.append(_Fault(wanted, after, status, dict(headers or {}), body, applied))
 
     def fail_next_page(self, *, after: int = 0) -> None:
         """The listing page (search, changelog or comments) read after ``after``
@@ -800,6 +808,8 @@ class JiraFake:
         self._caller_zone = caller.time_zone if caller is not None else "UTC"
         fault = self._fault_for(recorded.kind)
         if fault is not None:
+            if fault.applied:
+                await handler(request, recorded, caller)
             body = fault.body if fault.body is not None else payload("error_rate_limited")
             return JSONResponse(body, status_code=fault.status, headers=fault.headers)
         return await handler(request, recorded, caller)
