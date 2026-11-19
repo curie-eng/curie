@@ -496,6 +496,11 @@ async def update_agent(
     if data.memory_writes is not None:
         # Same plain-None rule as `memory`: omitted (or null) is unchanged.
         agent = await crud_agents.update_agent_memory_writes(session, agent, data.memory_writes)
+    if data.memory_rule_proposals is not None:
+        # Same plain-None rule as `memory_writes` (#5796): omitted is unchanged.
+        agent = await crud_agents.update_agent_memory_rule_proposals(
+            session, agent, data.memory_rule_proposals
+        )
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
         agent = await crud_agents.update_agent_approval_tools(

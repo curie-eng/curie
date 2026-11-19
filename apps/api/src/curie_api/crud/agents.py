@@ -392,6 +392,19 @@ async def update_agent_memory_writes(
     return agent
 
 
+async def update_agent_memory_rule_proposals(
+    session: AsyncSession, agent: Agent, memory_rule_proposals: bool
+) -> Agent:
+    """Set whether a factory revision run may propose one learned rule (#5796).
+    Takes effect at the next request's completion contract; stored rules are
+    untouched, and a rule a person accepted applies whatever this says."""
+
+    agent.memory_rule_proposals = memory_rule_proposals
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_approval_tools(
     session: AsyncSession, agent: Agent, tools: list[str]
 ) -> Agent:

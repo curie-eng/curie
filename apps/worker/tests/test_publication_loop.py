@@ -138,6 +138,15 @@ async def publication_store() -> AsyncIterator[tuple[AsyncEngine, str, PostgresP
                     "updated_at timestamp NOT NULL DEFAULT now())"
                 )
             )
+            # The columns the terminal write's rule settlement reads (#5796);
+            # these lineages hold no rule candidates.
+            await connection.execute(
+                text(
+                    f'CREATE TABLE "{schema}".memory_rules ('
+                    "id uuid PRIMARY KEY, tenant_id uuid, agent_id uuid, scope_kind text, "
+                    "scope_key text, source_lineage_id uuid, state text, proposed_at timestamptz)"
+                )
+            )
             await connection.execute(
                 text(f'CREATE TABLE "{schema}".work_items (id uuid PRIMARY KEY, base_branch text)')
             )

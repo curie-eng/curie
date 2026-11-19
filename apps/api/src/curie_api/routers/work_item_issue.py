@@ -1,11 +1,13 @@
 """The single issue read authorized by a factory issue read capability (ADR 0187),
-its two tracker result siblings (ADR 0277, #5586) and the question route (#5785).
+its two tracker result siblings (ADR 0277, #5586), the question route (#5785)
+and the rule proposal route (#5796, ADR 0287).
 
 The same ``wir`` capability authorizes ``/work-items/completion-contract`` (the
 runner asks which contract its execution runs under; a tracker result request
-reserves its one model session there) and ``/work-items/tracker-result`` (the
-runner's ``submit_tracker_result`` tool), and ``/work-items/questions`` (the
-runner's ``ask_questions`` tool). Each re-checks that the capability names the
+reserves its one model session there), ``/work-items/tracker-result`` (the
+runner's ``submit_tracker_result`` tool), ``/work-items/questions`` (the
+runner's ``ask_questions`` tool) and ``/work-items/rule-proposal`` (the
+runner's ``propose_rule`` tool). Each re-checks that the capability names the
 durable WorkItem's issue before and after any tracker call.
 """
 
@@ -17,6 +19,7 @@ import time
 import uuid
 from typing import Annotated, Final, NoReturn
 
+from curie_internal.memory_rules import InvalidRule
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -29,12 +32,15 @@ from curie_api.schemas.workitems import (
     IssueReadResult,
     QuestionsOut,
     QuestionsSubmission,
+    RuleProposalOut,
+    RuleProposalSubmission,
     TrackerResultOut,
     TrackerResultSubmission,
 )
 
 from .. import factory_questions as questions_core
 from .. import factory_tracker_result_runtime as runtime
+from .. import memory_rule_lifecycle as rules_core
 from .. import requester_instruction_context
 from ..auth import require_internal_worker_token
 from ..config import get_settings
@@ -356,11 +362,16 @@ async def read_completion_contract(
             result_kinds=[],
             session_usd_allowance=None,
             execution=None,
+            rule_proposal=False,
         )
     # ADR 0278 (#5592): the runner waits for the worker's envelope for this
     # execution, and checks it against this binding, before any model work.
     execution = await requester_instruction_context.execution_binding(
         session, pair.work_item, pair.request
+    )
+    # ADR 0287 (#5796): the runner mounts ``propose_rule`` only on this offer.
+    eligible = await rules_core.rule_proposal_eligibility(
+        session, request_id=claims.execution_request_id, work_item_id=claims.work_item_id
     )
     await session.rollback()
     return CompletionContractOut(
@@ -368,6 +379,7 @@ async def read_completion_contract(
         result_kinds=list(view.result_kinds),
         session_usd_allowance=view.session_usd_allowance,
         execution=execution,
+        rule_proposal=eligible is not None,
     )
 
 
@@ -581,3 +593,120 @@ async def post_questions(
     except questions_core.QuestionsRefused as refused:
         raise _question_refused(refused.code) from None
     return QuestionsOut(round=begun.round, rounds_limit=questions_core.ROUND_LIMIT)
+
+
+# The rule proposal route (#5796, ADR 0287) ---------------------------------------------
+
+# Two fields of at most 240 bytes each, with room for every character escaped.
+_RULE_PROPOSAL_BODY_MAX_BYTES: Final = 8 * 1024
+_RULE_PROPOSAL_KEYS: Final = frozenset({"rule", "reason"})
+# Documented, not bound: the handler reads the body itself, after the
+# capability, so no body is answered with FastAPI's echoing 422.
+_RULE_PROPOSAL_BODY = RuleProposalSubmission.model_json_schema(
+    ref_template="#/components/schemas/{model}"
+)
+_RULE_REFUSALS = {
+    rules_core.NOT_ELIGIBLE: (403, "this execution may not propose a rule"),
+    rules_core.ALREADY_PROPOSED: (409, "this execution already proposed a rule"),
+    "invalid_body": (422, "the body must be one JSON object with string rule and reason"),
+    "invalid_text": (422, "the rule or reason must be one non-empty line"),
+    "too_large": (422, "the rule or reason is over 240 bytes"),
+    "reserved_text": (422, "the rule or reason holds reserved platform text"),
+}
+
+
+def _rule_refused(request_id: uuid.UUID, code: str, sizes: tuple[int, int]) -> HTTPException:
+    # Only the request id, the outcome and byte counts: never the text (ADR 0287).
+    logger.info(
+        "rule proposal refused request=%s code=%s rule_bytes=%d reason_bytes=%d",
+        request_id,
+        code,
+        *sizes,
+    )
+    status_code, message = _RULE_REFUSALS[code]
+    return issue_read_error(status_code, code, message)
+
+
+def _utf8_size(value: str) -> int:
+    return len(value.encode("utf-8", errors="replace"))
+
+
+async def _rule_proposal_submission(request: Request) -> tuple[str, str] | None:
+    """The body's ``(rule, reason)``, or None for anything that is not one JSON
+    object of exactly those two string fields within the size bound."""
+
+    try:
+        raw = await read_bounded_body(
+            request, _RULE_PROPOSAL_BODY_MAX_BYTES, subject="rule proposal body"
+        )
+        parsed = json.loads(raw, parse_constant=_refuse_json_constant, parse_float=_finite_float)
+    except (HTTPException, ValueError, RecursionError):
+        return None
+    if not isinstance(parsed, dict) or set(parsed) != _RULE_PROPOSAL_KEYS:
+        return None
+    rule, reason = parsed["rule"], parsed["reason"]
+    if not isinstance(rule, str) or not isinstance(reason, str):
+        return None
+    return rule, reason
+
+
+@router.post(
+    "/rule-proposal",
+    response_model=RuleProposalOut,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": _RULE_PROPOSAL_BODY}},
+        }
+    },
+)
+async def post_rule_proposal(
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    claims: Annotated[IssueReadClaims, Depends(require_issue_read)],
+) -> RuleProposalOut:
+    """Store this execution's one learned rule candidate (#5796, ADR 0287).
+
+    The capability's request and WorkItem decide everything but the text: the
+    agent, the repository scope, the source request, pull request lineage and
+    URL, and the proposer (the request's verified requester). The candidate
+    stays hidden until the pull request merges. A capability that does not
+    name its WorkItem's issue is 409 ``invalid_context``; a request that is
+    not an eligible revision is 403 ``rule_proposal_not_eligible``; a second
+    proposal of the request is 409 ``rule_already_proposed``; a body that is
+    not one JSON object of exactly ``rule`` and ``reason`` strings is 422
+    ``invalid_body``; text outside the bounds is 422 ``invalid_text``,
+    ``too_large`` or ``reserved_text``. No refusal and no log line carries the
+    submitted text.
+    """
+
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        await _named_pair(session, claims)
+    except runtime.RuntimeRefused as refused:
+        raise _refused(refused.code) from None
+    request_id = claims.execution_request_id
+    submitted = await _rule_proposal_submission(request)
+    if submitted is None:
+        raise _rule_refused(request_id, "invalid_body", (0, 0))
+    rule, reason = submitted
+    sizes = (_utf8_size(rule), _utf8_size(reason))
+    try:
+        await rules_core.propose_candidate(
+            session,
+            request_id=request_id,
+            work_item_id=claims.work_item_id,
+            rule=rule,
+            reason=reason,
+        )
+    except rules_core.ProposalRefused as refused:
+        raise _rule_refused(request_id, refused.code, sizes) from None
+    except InvalidRule as invalid:
+        raise _rule_refused(request_id, invalid.code, sizes) from None
+    logger.info(
+        "rule proposal stored request=%s code=candidate rule_bytes=%d reason_bytes=%d",
+        request_id,
+        *sizes,
+    )
+    return RuleProposalOut(status="candidate")

@@ -3,8 +3,16 @@
 A learned rule is a one-line, bounded text that a person accepts. It is later
 delivered to a model, so the text must never be able to forge platform text:
 no line breaks, no reserved headings, no section markers. This module is pure.
-Apart from ``select_memory_rules`` at the end, which reads one scope through the
-caller's session, it performs no IO and touches no database.
+Apart from ``select_memory_rules`` and ``settle_lineage_candidates`` at the end,
+which read and write through the caller's session or connection, it performs no
+IO and touches no database.
+
+``settle_lineage_candidates`` is the one settlement of a pull request lineage's
+rule candidates (ADR 0287 decision 5, #5796). Every writer of a terminal
+lineage state calls it inside the transaction of that write: the API's
+``crud.lineages`` writers through ``curie_api.memory_rule_lifecycle`` and the
+worker's ``PostgresPublicationStore.mark_lineage_terminal`` directly. A new
+terminal lineage writer must call it too.
 
 Arithmetic fact: the snapshot byte bound can bind before the count bound does.
 Sixteen rules of 240 bytes with small rule numbers still fit (about 3.9 KiB),
@@ -18,6 +26,7 @@ bound and the snapshot byte bound.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Annotated, Literal, Self
@@ -31,8 +40,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from sqlalchemy import RowMapping
 from sqlalchemy import text as sql_text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 MAX_RULE_BYTES = 240
 MAX_ACCEPTED_PER_SCOPE = 16
@@ -411,3 +421,112 @@ async def select_memory_rules(
     if not rows:
         return AbsentMemoryRules(reason="no_rules")
     return selected_from_rules([(row[0], row[1]) for row in rows])
+
+
+_SAFE_SCHEMA = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
+_PLATFORM_ACTOR = "platform"
+
+
+async def _settle_one(
+    connection: AsyncSession | AsyncConnection,
+    schema: str,
+    row: RowMapping,
+    event: RuleEvent,
+    *,
+    number: int | None = None,
+) -> None:
+    to_state = next_state("candidate", event)
+    changed = (
+        await connection.execute(
+            sql_text(
+                f'UPDATE "{schema}".memory_rules SET state = :to_state, number = :number, '
+                "version = version + 1, updated_at = clock_timestamp() "
+                "WHERE id = :id AND state = 'candidate' RETURNING id"
+            ),
+            {"to_state": to_state, "number": number, "id": row["id"]},
+        )
+    ).first()
+    if changed is None:
+        return
+    await connection.execute(
+        sql_text(
+            f'INSERT INTO "{schema}".memory_rule_events '
+            "(rule_id, tenant_id, agent_id, event, from_state, to_state, actor_kind, actor) "
+            "VALUES (:rule_id, :tenant_id, :agent_id, :event, 'candidate', :to_state, "
+            "'platform', :actor)"
+        ),
+        {
+            "rule_id": row["id"],
+            "tenant_id": row["tenant_id"],
+            "agent_id": row["agent_id"],
+            "event": event,
+            "to_state": to_state,
+            "actor": _PLATFORM_ACTOR,
+        },
+    )
+
+
+async def settle_lineage_candidates(
+    connection: AsyncSession | AsyncConnection,
+    *,
+    lineage_id: UUID,
+    terminal_state: str,
+    schema: str = "curie",
+) -> None:
+    """Promote, supersede or discard a lineage's rule candidates.
+
+    Runs inside the caller's transaction, after its terminal lineage write and
+    before its commit; it never commits or rolls back. ``merged`` promotes the
+    newest candidate (by ``proposed_at``, then ``id``) to ``proposed`` with the
+    next free number in its scope, allocated under a ``FOR UPDATE`` lock on the
+    owning agent row, and supersedes every older one; ``closed`` discards every
+    candidate. Only ``candidate`` rows change, so a second pass changes
+    nothing. Each change bumps ``version`` and ``updated_at`` and writes one
+    ``memory_rule_events`` row with actor kind ``platform``.
+    """
+
+    if terminal_state not in ("merged", "closed"):
+        raise ValueError("terminal publication lineage state is invalid")
+    if not _SAFE_SCHEMA.fullmatch(schema):
+        raise ValueError("memory rule schema is invalid")
+    candidates = (
+        (
+            await connection.execute(
+                sql_text(
+                    "SELECT id, tenant_id, agent_id, scope_kind, scope_key "
+                    f'FROM "{schema}".memory_rules '
+                    "WHERE source_lineage_id = :lineage AND state = 'candidate' "
+                    "ORDER BY proposed_at DESC, id DESC"
+                ),
+                {"lineage": lineage_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    if not candidates:
+        return
+    if terminal_state == "closed":
+        for row in candidates:
+            await _settle_one(connection, schema, row, "discard")
+        return
+    newest, older = candidates[0], candidates[1:]
+    # Numbers are allocated per agent scope under the agent row lock, so two
+    # promotions in one scope never take the same number.
+    await connection.execute(
+        sql_text(f'SELECT id FROM "{schema}".agents WHERE id = :agent FOR UPDATE'),
+        {"agent": newest["agent_id"]},
+    )
+    highest = (
+        await connection.execute(
+            sql_text(
+                f'SELECT max(number) FROM "{schema}".memory_rules '
+                "WHERE agent_id = :agent AND scope_kind = :kind AND scope_key = :key"
+            ),
+            {"agent": newest["agent_id"], "kind": newest["scope_kind"], "key": newest["scope_key"]},
+        )
+    ).scalar()
+    for row in older:
+        await _settle_one(connection, schema, row, "supersede")
+    current = highest if isinstance(highest, int) else 0
+    await _settle_one(connection, schema, newest, "promote", number=current + 1)
