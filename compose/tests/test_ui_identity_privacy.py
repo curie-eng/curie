@@ -99,4 +99,7 @@ def test_identity_secrets_are_absent_from_nginx_logs_even_on_upstream_failure(ui
         assert all(secret not in output for secret in (bearer, code, state)), output
     for response in responses:
         assert response.headers["cache-control"] == "private, no-store"
-        assert response.headers["referrer-policy"] == "no-referrer"
+    # The connect document uses strict-origin so its confirm POST keeps a real
+    # Origin. The OIDC callback is a redirect and stays no-referrer.
+    assert responses[0].headers["referrer-policy"] == "strict-origin"
+    assert responses[1].headers["referrer-policy"] == "no-referrer"
