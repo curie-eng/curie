@@ -122,6 +122,7 @@ KNOWN_BODY_MODULES = frozenset(
         "curie_api.schemas.workspaces",
         "curie_api.turn_progress",
         "curie_api.workitem_dispatch",
+        "curie_api.memory_rules_context",
         "curie_api.requester_instruction_context",
         # The work item finish body nests `aci_protocol.events.RetryCondition`.
         "aci_protocol.events",
