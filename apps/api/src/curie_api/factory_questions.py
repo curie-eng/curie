@@ -770,8 +770,10 @@ async def admit_answer(session: AsyncSession, facts: AnswerFacts) -> AnswerOutco
     has not started (``coalesced``); else one implementation request through
     `lifecycle.create_revision_request`, waiting when nothing is live
     (``admitted``) and queued behind the live request otherwise
-    (``queued_follow_up``). The live request is never cancelled. Exactly one
-    receipt is written with the effect.
+    (``queued_follow_up``). Only a queued or waiting pending request
+    coalesces: an ``answered`` row whose pending request has started, one
+    ``cancellation_requested`` included, queues a follow-up. The live request
+    is never cancelled. Exactly one receipt is written with the effect.
 
     Lock order is the module's: the WorkItem, then the requests (inside the
     lifecycle call), then the question row. The row is read without a lock
@@ -779,15 +781,24 @@ async def admit_answer(session: AsyncSession, facts: AnswerFacts) -> AnswerOutco
     writer of the row except `post_and_record` holds the WorkItem lock, and
     that one only moves a ``posting`` row, which is never acted on here.
 
-    Raises ValueError, writing nothing, when the facts do not name the
-    WorkItem's own ticket or carry no comment id; `AnswerNotAdmitted` when the
-    request could not be created.
+    Raises ValueError when the facts do not name the WorkItem's own ticket or
+    carry no comment id, and `AnswerNotAdmitted` when the request could not be
+    created. This function owns its transaction: any exception rolls it back
+    before it propagates, so a caller that catches it and commits persists
+    nothing of the answer (a lifecycle commit only released a savepoint).
     """
 
+    try:
+        return await _admit(session, facts)
+    except BaseException:
+        await session.rollback()
+        raise
+
+
+async def _admit(session: AsyncSession, facts: AnswerFacts) -> AnswerOutcome:
     from .workitems import lifecycle
 
     if not facts.comment_id.strip():
-        await session.rollback()
         raise ValueError("an answer needs its tracker comment id")
     work_item = await lifecycle.lock_work_item(session, facts.work_item_id)
     if work_item is None:
@@ -797,7 +808,6 @@ async def admit_answer(session: AsyncSession, facts: AnswerFacts) -> AnswerOutco
         _log_answer(NOT_OUTSTANDING, facts.work_item_id, facts.comment_id, None)
         return AnswerOutcome(NOT_OUTSTANDING, None, False)
     if work_item.tracker_issue != facts.issue:
-        await session.rollback()
         raise ValueError("the answer's issue is not the WorkItem's ticket")
 
     receipt = await session.scalar(
@@ -880,7 +890,6 @@ async def _decide(session: AsyncSession, work_item: WorkItem, facts: AnswerFacts
                 transaction, work_item=work_item, request_id=pending, revision=revision
             )
         if not isinstance(created, WorkItemOutcome):
-            await session.rollback()
             raise AnswerNotAdmitted(created.code)
         assert created.request is not None
         status = created.request.status
@@ -905,6 +914,5 @@ async def _decide(session: AsyncSession, work_item: WorkItem, facts: AnswerFacts
         if changed is None:
             # Unreachable while the WorkItem lock is held: every other writer
             # of an outstanding or answered row takes it first.
-            await session.rollback()
             raise AnswerNotAdmitted("question_row_changed")
     return result

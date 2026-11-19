@@ -31,7 +31,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_factory_tracker_results as tr
-from curie_api import factory_questions
+from curie_api import factory_questions, workitem_dispatch
 from curie_api.factory_notices import INVESTIGATING_LINE
 from curie_api.factory_questions import AnswerFacts, AnswerOutcome
 from curie_api.forges.capabilities import Operation
@@ -58,7 +58,7 @@ from test_factory_question_ending import (
     _status_body,
     _take_over,
 )
-from test_factory_terminus import _reconcile
+from test_factory_terminus import REPO, _attach_publication, _reconcile
 
 ANSWER_LINE = "Answer received. The factory is working on this ticket again."
 AUTHOR = Actor("4242", "answer-author")
@@ -230,6 +230,49 @@ def test_admits_refuses_a_comment_on_another_ticket_writing_nothing(
     assert _counts() == before
     row = _round_row(triage.work_item_id)
     assert row is not None and row["state"] == "outstanding"
+
+
+def test_admits_nothing_when_the_snapshot_write_fails_and_the_caller_commits(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _settled_asked(admitted, monkeypatch, 5103)
+    comment_id = _comment(triage)
+    answer_id = factory_questions.answer_request_id(triage.issue, comment_id)
+    created_at = _fence(triage) + SECOND
+    original = workitem_dispatch._write_snapshot
+
+    async def failing(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("snapshot write failed")
+
+    # The waiting path's snapshot write fails after the lifecycle commit has
+    # released its savepoint.
+    monkeypatch.setattr(workitem_dispatch, "_write_snapshot", failing)
+    facts = AnswerFacts(
+        work_item_id=triage.work_item_id,
+        issue=triage.issue,
+        comment_id=comment_id,
+        created_at=created_at,
+        requester=REQUESTER,
+    )
+
+    async def careless_caller() -> None:
+        async with triage.client.app.state.sessionmaker() as session:
+            with pytest.raises(RuntimeError):
+                await factory_questions.admit_answer(session, facts)
+            # The caller swallows the error and commits the same session.
+            await session.commit()
+
+    triage.client.portal.call(careless_caller)
+
+    assert _rows("SELECT id FROM curie.execution_requests WHERE id = :id", {"id": answer_id}) == []
+    assert [r["id"] for r in _requests(triage.work_item_id)] == [triage.request_id]
+    assert _receipts(triage.work_item_id) == {}
+    row = _round_row(triage.work_item_id)
+    assert row is not None and (row["state"], row["pending_request_id"]) == ("outstanding", None)
+
+    monkeypatch.setattr(workitem_dispatch, "_write_snapshot", original)
+    assert _admit(triage, comment_id, created_at) == AnswerOutcome("admitted", answer_id, False)
+    assert _snapshot(answer_id)["objective"] == _snapshot(triage.request_id)["objective"]
 
 
 # Criterion 2: answers before the attempt starts coalesce ----------------------------
@@ -570,6 +613,36 @@ def test_status_line_leads_a_queued_follow_up_once_promoted(
     _reconcile()
     body = _status_body(sink, result.request_id)
     assert body.startswith(ANSWER_LINE)
+    assert INVESTIGATING_LINE not in body
+
+
+def test_status_line_leads_a_follow_up_that_continues_on_the_askers_pull_request(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _client, _github, sink = admitted
+    asker = _asked(admitted, monkeypatch, 5193)
+    _comment_id, result = _answer(asker)
+    follow_up = result.request_id
+    assert result.outcome == "queued_follow_up" and follow_up is not None
+
+    # The asker then opens a pull request: the route refuses asking after
+    # publishing, not publishing after asking. The publication is the one the
+    # terminus and status comment tests attach (`_attach_publication`, a
+    # succeeded publication on an open lineage), and the reconciler settles it.
+    _attach_publication(asker.work_item_id, status="succeeded", pr=571)
+    _reconcile()
+    assert _request(asker.request_id)["status"] == "completed"
+    row = _round_row(asker.work_item_id)
+    assert row is not None
+    assert (row["state"], row["pending_request_id"]) == ("answered", follow_up)
+
+    _promote(asker)
+    assert _request(follow_up)["status"] == "waiting"
+    _reconcile()
+
+    body = _status_body(sink, follow_up)
+    continuation = f"Continuing on the existing pull request: https://github.com/{REPO}/pull/571"
+    assert body.startswith(f"{ANSWER_LINE}\n\n{continuation}\n\n")
     assert INVESTIGATING_LINE not in body
 
 
