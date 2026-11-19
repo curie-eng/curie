@@ -28,6 +28,21 @@ therefore either commits before the terminal write and is settled by it, or
 waits for it and is refused as ineligible; and agent deletion either waits for
 a proposal or settlement, or runs first and leaves it refused or with nothing
 to settle.
+
+A proposal is taken only from the live execution. After the recheck it asks
+the issue read route's own fence (``issue_read.read_issue_authority`` with
+``running``): the request is ``running`` with a runtime owner, its heartbeat
+lease and its execution deadline are unexpired, and its WorkItem is not
+cancelled. A finished revision's capability still verifies until it
+expires, so without this fence a late call
+could store a candidate newer than the live revision's and supersede it on
+merge. The eligibility answer itself does not demand a running execution,
+because the completion contract reads it at sandbox boot, before the start.
+
+A database failure while storing is answered ``ProposalUnavailable``, which
+carries no text: the engine displays bound parameters in its error messages,
+so the SQLAlchemy error, which would carry the rule and the reason, is dropped
+here and never reaches a log or a traceback.
 """
 
 from __future__ import annotations
@@ -47,9 +62,10 @@ from curie_internal.memory_rules import (
     validate_rule_text,
 )
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .issue_read import IssueReadRefused, read_issue_authority
 from .models import (
     Agent,
     ExecutionRequest,
@@ -73,6 +89,10 @@ class ProposalRefused(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class ProposalUnavailable(Exception):
+    """The database could not store the proposal; carries no text and no cause."""
 
 
 @dataclass(frozen=True)
@@ -99,7 +119,9 @@ async def rule_proposal_eligibility(
     target ``pull_request`` or ``review_thread`` with a URL) with a recorded
     requester, the WorkItem is bound to a publication lineage that is still
     ``open``, and the WorkItem is not cancelled. Reads only; fails closed on
-    anything missing.
+    anything missing. It does not ask whether the execution is running: the
+    completion contract reads it at sandbox boot, before the start, and
+    ``propose_candidate`` adds that fence itself.
     """
 
     row = (
@@ -189,7 +211,11 @@ async def propose_candidate(
     Raises ``ProposalRefused`` (``rule_proposal_not_eligible`` or
     ``rule_already_proposed``) or ``InvalidRule`` (``invalid_text``,
     ``too_large``, ``reserved_text``); every refusal rolls back and stores
-    nothing. Neither exception carries the submitted text.
+    nothing. A request that is no longer the live execution (not ``running``,
+    no runtime owner, an expired heartbeat lease or execution deadline, or a
+    cancelled WorkItem) is ``rule_proposal_not_eligible`` (module docstring).
+    A database failure rolls back as far as it can and raises
+    ``ProposalUnavailable``. No exception carries the submitted text.
     """
 
     try:
@@ -230,6 +256,12 @@ async def propose_candidate(
             or eligible.agent_id != first.agent_id
         ):
             raise ProposalRefused(NOT_ELIGIBLE)
+        # Only the live execution proposes: a finished revision's capability
+        # still verifies (module docstring).
+        try:
+            await read_issue_authority(session, execution_request_id=request_id, running=True)
+        except IssueReadRefused:
+            raise ProposalRefused(NOT_ELIGIBLE) from None
         if (
             await session.scalar(
                 select(MemoryRule.id).where(MemoryRule.source_request_id == request_id)
@@ -275,13 +307,26 @@ async def propose_candidate(
         )
         await session.commit()
     except IntegrityError as exc:
-        await session.rollback()
+        await _rollback_quietly(session)
         if _constraint(exc) == _SOURCE_REQUEST_KEY:
             raise ProposalRefused(ALREADY_PROPOSED) from None
-        raise
+        # Its message displays the bound rule and reason: never re-raised.
+        raise ProposalUnavailable from None
+    except StatementError:
+        await _rollback_quietly(session)
+        raise ProposalUnavailable from None
     except (ProposalRefused, InvalidRule):
         await session.rollback()
         raise
+
+
+async def _rollback_quietly(session: AsyncSession) -> None:
+    """Roll back after a database failure; a dead connection may refuse even that."""
+
+    try:
+        await session.rollback()
+    except (SQLAlchemyError, OSError):
+        pass
 
 
 async def lock_rule_owner(session: AsyncSession, agent_id: uuid.UUID) -> bool:

@@ -17,9 +17,10 @@ drives the production terminal writer under it, checks the candidates are
 still ``candidate``, then ends the roll with a new replica's reconciler pass
 and checks the outcome: on merge exactly one ``proposed`` rule with the next
 number in its scope and the rest ``superseded``, on close all ``discarded``,
-with exactly one event per change; a later pass changes nothing. The last
-case runs two new replicas' sweeps at once over one terminal lineage: it
-settles exactly once.
+with exactly one event per change; a later pass changes nothing. One case
+runs two new replicas' sweeps at once over one terminal lineage: it settles
+exactly once. The last starts the reconciler as the API does with the forge
+pass off (an interval of 0): its settlement-only loop still settles.
 """
 
 # ruff: noqa: F811  (the shared fixtures are imported, then requested)
@@ -27,6 +28,7 @@ settles exactly once.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 import uuid
 from collections.abc import Iterator
@@ -34,11 +36,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 import pytest
 from curie_api.config import get_settings
 from curie_api.crud import lineages as crud_lineages
 from curie_api.forges.types import PullRequestState
-from curie_api.lineage_reconciler import LineageReconciler
+from curie_api.lineage_reconciler import LineageReconciler, start_lineage_reconciler
 from curie_worker import publication_store
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -235,4 +238,68 @@ def test_two_new_replicas_sweeping_one_terminal_lineage_settle_it_once(
     assert len(promotes) == 1
     assert [rule["state"] for rule in stored_rules()].count("proposed") == 1
     assert len(stored_events()) == 4
+    _assert_unchanged_by_a_later_pass()
+
+
+@pytest.mark.parametrize("state", [PullRequestState.MERGED, PullRequestState.CLOSED])
+def test_with_the_forge_pass_off_the_settlement_loop_still_settles_once(
+    rules: tuple[TestClient, ReviewGitHubAPI],
+    monkeypatch: pytest.MonkeyPatch,
+    state: PullRequestState,
+) -> None:
+    client, api = rules
+    _older, newer = _two_candidates(client, api)
+    with _older_replica():
+        result = reconcile({newer.pr: state})
+    assert (result.merged, result.closed) == (
+        (1, 0) if state is PullRequestState.MERGED else (0, 1)
+    )
+    assert _candidates() == ["candidate", "candidate"]
+    events = len(stored_events())
+
+    settings = get_settings().model_copy(
+        update={"factory_lineage_reconcile_interval_s": 0, "work_item_reconciler_enabled": True}
+    )
+    original = LineageReconciler.settle_terminal_lineages
+    sweeps: list[int] = []
+    swept = asyncio.Event()
+
+    async def observed(self: LineageReconciler) -> int:
+        settled = await original(self)
+        sweeps.append(settled)
+        swept.set()
+        return settled
+
+    monkeypatch.setattr(LineageReconciler, "settle_terminal_lineages", observed)
+
+    async def run() -> asyncio.Task[None] | None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with httpx.AsyncClient() as http:
+                sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+                # With the WorkItem reconcilers off, nothing starts.
+                off = settings.model_copy(update={"work_item_reconciler_enabled": False})
+                assert start_lineage_reconciler(sessionmaker, off, http) is None
+                task = start_lineage_reconciler(sessionmaker, settings, http)
+                if task is None:
+                    return None
+                try:
+                    await asyncio.wait_for(swept.wait(), timeout=60)
+                finally:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                return task
+        finally:
+            await engine.dispose()
+
+    task = asyncio.run(run())
+
+    assert task is not None
+    assert sweeps == [2]
+    if state is PullRequestState.MERGED:
+        _assert_promoted(RULE_B, RULE_A, 1)
+    else:
+        _assert_discarded(RULE_A, RULE_B)
+    assert len(stored_events()) == events + 2
     _assert_unchanged_by_a_later_pass()

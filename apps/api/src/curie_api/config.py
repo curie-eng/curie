@@ -376,6 +376,7 @@ class Settings(BaseSettings):
     # How often the API reads each factory pull request still open on its
     # lineage, to record one merged or closed outside a publication (#3831).
     # Runs with the work item reconciler and factory ingress; 0 disables it.
+    # The learned rule settlement sweep keeps running alone when it is off.
     factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
     # How often the API publishes optional UI evidence a worker uploaded for a
     # recorded publication, as one marked pull request comment. It reads the

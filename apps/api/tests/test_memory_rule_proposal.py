@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import sys
 import uuid
 from collections.abc import Iterator, Mapping
@@ -29,6 +30,8 @@ from curie_api.forges.types import PullRequest, PullRequestRef, PullRequestState
 from curie_api.issue_read_token import mint, verify_claims
 from curie_api.lineage_reconciler import LineageReconciler, PassResult
 from fastapi.testclient import TestClient
+from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -329,15 +332,16 @@ def test_completion_contract_offers_rule_proposal_only_to_eligible_revisions(
     assert contract(client, merged.capability).json()["rule_proposal"] is False
     assert contract(client, closed.capability).json()["rule_proposal"] is False
 
-    # A cancelled WorkItem: the contract refuses the execution outright, so it
-    # never offers the tool, and the eligibility it reads is false.
+    # A cancelled WorkItem: the contract refuses the execution outright (the
+    # fence that stops its runner before any model work), and the refusal
+    # answers ``rule_proposal`` false; the eligibility it reads is false too.
     cancelled = eligible_revision(client, api)
     assert eligibility(cancelled) is not None
     cancel_work_item(client, cancelled.work_item_id)
     refused = contract(client, cancelled.capability)
     assert refused.status_code == 409, refused.text
     assert code(refused) == "invalid_context"
-    assert "rule_proposal" not in refused.text
+    assert refused.json()["detail"]["rule_proposal"] is False
     assert eligibility(cancelled) is None
 
     # The offers above did not touch the eligible revisions.
@@ -385,11 +389,11 @@ def test_completion_contract_answers_rule_proposal_false_for_a_cancelled_work_it
     assert answered.json()["rule_proposal"] is False
     assert eligibility(run) is None
 
-    # The next call meets the fence: refused, with no offer at all.
+    # The next call meets the fence: refused, and the refusal offers nothing.
     refused = contract(client, run.capability)
     assert refused.status_code == 409, refused.text
     assert code(refused) == "invalid_context"
-    assert "rule_proposal" not in refused.text
+    assert refused.json()["detail"]["rule_proposal"] is False
     assert stored_rules() == []
 
 
@@ -565,7 +569,8 @@ def test_a_capability_for_another_work_item_is_refused_like_the_completion_contr
 
     assert contract_refusal.status_code == 409, contract_refusal.text
     assert refused.status_code == 409, refused.text
-    assert refused.json() == contract_refusal.json()
+    # The same refusal; the contract's alone also offers no rule proposal.
+    assert contract_refusal.json()["detail"] == {**refused.json()["detail"], "rule_proposal": False}
     assert code(refused) == "invalid_context"
     assert RULE not in refused.text
     assert stored_rules() == []
@@ -607,3 +612,133 @@ def test_a_proposal_after_the_terminal_lineage_write_is_refused(
 
     assert (refused.status_code, code(refused)) == (403, "rule_proposal_not_eligible")
     assert stored_rules() == [] and stored_events() == []
+
+
+# Only the live execution proposes ------------------------------------------------
+
+
+def test_a_finished_executions_capability_is_refused_and_stores_nothing(
+    rules: tuple[TestClient, ReviewGitHubAPI],
+) -> None:
+    client, api = rules
+    run = eligible_revision(client, api)
+    finish_running(run.request_id)
+    # Still an eligible revision on an open pull request: only the finished
+    # execution refuses it.
+    assert eligibility(run) is not None
+
+    refused = propose(client, run.capability, {"rule": RULE, "reason": REASON})
+
+    assert (refused.status_code, code(refused)) == (403, "rule_proposal_not_eligible")
+    assert RULE not in refused.text
+    assert stored_rules() == [] and stored_events() == []
+
+
+def test_a_finished_revision_cannot_supersede_the_live_revisions_rule(
+    rules: tuple[TestClient, ReviewGitHubAPI],
+) -> None:
+    """Revision A finishes without proposing, revision B proposes, then A's
+    still-signed capability posts. Stored, A's would be the newest candidate
+    and the merge would promote it over B's."""
+
+    client, api = rules
+    number, first, pr, lineage_id = pull_request(client, api)
+    _complete(client, first["id"])
+    switch(client, agent_of(first["work_item_id"]), True)
+    earlier = revise(client, api, number=number, pr=pr, lineage_id=lineage_id)
+    finish_running(earlier.request_id)
+    live = revise(
+        client, api, number=number, pr=pr, lineage_id=lineage_id, event="pull_request_review"
+    )
+    live_rule = "Name every test after the behavior it proves."
+    stored = propose(client, live.capability, {"rule": live_rule, "reason": REASON})
+    assert stored.status_code == 200, stored.text
+
+    late = propose(client, earlier.capability, {"rule": RULE, "reason": REASON})
+
+    assert (late.status_code, code(late)) == (403, "rule_proposal_not_eligible")
+    assert [rule["text"] for rule in stored_rules()] == [live_rule]
+    assert reconcile({pr: PullRequestState.MERGED}).merged == 1
+    (promoted,) = stored_rules()
+    assert (promoted["text"], promoted["state"], promoted["number"]) == (live_rule, "proposed", 1)
+    assert promoted["source_request_id"] == live.request_id
+
+
+def test_an_expired_heartbeat_lease_is_refused_and_stores_nothing(
+    rules: tuple[TestClient, ReviewGitHubAPI],
+) -> None:
+    client, api = rules
+    run = eligible_revision(client, api)
+    # No production writer shortens a lease in a test; the request stays
+    # running until the reconciler notices the lost owner, as the issue read
+    # suite models it.
+    _execute(
+        "UPDATE curie.execution_requests "
+        "SET runtime_heartbeat_expires_at = now() - interval '1 second' WHERE id = :id",
+        {"id": run.request_id},
+    )
+    assert eligibility(run) is not None
+
+    refused = propose(client, run.capability, {"rule": RULE, "reason": REASON})
+
+    assert (refused.status_code, code(refused)) == (403, "rule_proposal_not_eligible")
+    assert stored_rules() == [] and stored_events() == []
+
+
+# A database failure while storing --------------------------------------------------
+
+_RULE_INSERT = re.compile(r"\s*INSERT INTO (\w+\.)?memory_rules\b")
+
+
+def test_a_database_failure_while_storing_is_unavailable_and_never_logs_the_text(
+    rules: tuple[TestClient, ReviewGitHubAPI], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The engine displays bound parameters, so the database error raised by
+    the candidate insert carries the rule and the reason; the route answers
+    503 without it and nothing logs it."""
+
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="sqlalchemy")
+    client, api = rules
+    run = eligible_revision(client, api)
+    engine = client.app.state.engine.sync_engine
+    raised: list[OperationalError] = []
+
+    def fail_rule_insert(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if _RULE_INSERT.match(statement):
+            failure = OperationalError(
+                statement, parameters, ConnectionError("server closed the connection")
+            )
+            raised.append(failure)
+            raise failure
+
+    event.listen(engine, "before_cursor_execute", fail_rule_insert)
+    try:
+        response = propose(client, run.capability, {"rule": RULE, "reason": REASON})
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_rule_insert)
+
+    assert response.status_code == 503, response.text
+    assert code(response) == "rule_proposal_unavailable"
+    assert response.headers["cache-control"] == "no-store"
+    assert RULE not in response.text and REASON not in response.text
+    assert stored_rules() == [] and stored_events() == []
+    # The insert ran and its error carried the text the route dropped (its
+    # message displays these parameters, truncated only by length).
+    (failure,) = raised
+    params = failure.params
+    carried = list(params.values()) if isinstance(params, dict) else list(params or ())
+    assert RULE in carried and REASON in carried
+    _assert_unlogged(caplog, RULE, REASON)
+
+    # Nothing was half stored: the same request proposes once the database answers.
+    retried = propose(client, run.capability, {"rule": RULE, "reason": REASON})
+    assert retried.status_code == 200, retried.text
+    assert [rule["text"] for rule in stored_rules()] == [RULE]

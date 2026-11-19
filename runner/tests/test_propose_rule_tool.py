@@ -35,6 +35,7 @@ from curie_runner.approval import (
     is_platform_owned_tool,
 )
 from curie_runner.fake import FakeModelSession
+from curie_runner.harness.claude.preflight_blocked import PreflightBlockedSession
 from curie_runner.issue_read import CAPABILITY_HEADER, ISSUE_READ_TOKEN_ENV, ISSUE_READ_URL_ENV
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.propose_rule import PROPOSE_RULE_SCHEMA, propose_rule_handler
@@ -76,8 +77,10 @@ class _Api:
         *,
         answer: tuple[int, Any] = (200, {"status": "candidate"}),
         drop: bool = False,
+        contract_status: int = 200,
     ) -> None:
         self.contract = contract if contract is not None else IMPLEMENTATION
+        self.contract_status = contract_status
         self.answer = answer
         self.drop = drop
         self.contract_calls: list[Any] = []
@@ -89,7 +92,7 @@ class _Api:
         async def contract(request: web.Request) -> web.Response:
             body = await request.read()
             self.contract_calls.append(json.loads(body) if body else None)
-            return web.json_response(self.contract)
+            return web.json_response(self.contract, status=self.contract_status)
 
         async def rule(request: web.Request) -> web.StreamResponse:
             self.rule_calls.append((await request.json(), request.headers.get(CAPABILITY_HEADER)))
@@ -265,6 +268,30 @@ def test_propose_rule_mounts_only_when_the_contract_offers_it(
     assert api.rule_calls == []
 
 
+# The API's refusal of a WorkItem cancelled before the call, byte for byte.
+CANCELLED_REFUSAL: dict[str, Any] = {
+    "detail": {
+        "code": "invalid_context",
+        "message": "the execution no longer grants this call",
+        "rule_proposal": False,
+    }
+}
+
+
+def test_a_cancelled_work_items_refusal_starts_no_model_and_mounts_no_tool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bound: list[BoundContract]
+) -> None:
+    api = _Api(CANCELLED_REFUSAL, contract_status=409)
+    session = _boot_session(monkeypatch, tmp_path, api)
+    assert api.contract_calls == [{}]
+    # The refusal still blocks the session: no contract is bound, so no
+    # propose_rule handler exists and no model session is constructed.
+    assert bound == []
+    assert isinstance(session, PreflightBlockedSession)
+    assert not isinstance(session, _ModelSession)
+    assert api.rule_calls == []
+
+
 def test_the_tool_is_a_platform_owned_side_effecting_name() -> None:
     assert PROPOSE_RULE_TOOL_NAME == "mcp__curie__propose_rule"
     for state in (False, True):
@@ -352,8 +379,22 @@ def test_a_refusal_is_a_readable_error_that_never_repeats_the_rule(
 
 @pytest.mark.parametrize(
     "answer",
-    [(429, {}), (503, {"detail": {"code": "unavailable"}}), (500, b"not json"), (404, {})],
-    ids=["429", "503", "500", "404"],
+    [
+        (429, {}),
+        (503, {"detail": {"code": "unavailable"}}),
+        (
+            503,
+            {
+                "detail": {
+                    "code": "rule_proposal_unavailable",
+                    "message": "The rule proposal could not be stored; retry shortly",
+                }
+            },
+        ),
+        (500, b"not json"),
+        (404, {}),
+    ],
+    ids=["429", "503", "503-rule-proposal-unavailable", "500", "404"],
 )
 def test_other_failures_are_readable_errors(answer: tuple[int, Any]) -> None:
     result = _propose(_Api(answer=answer), {"rule": RULE, "reason": REASON})

@@ -110,18 +110,22 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   stores the execution's one learned rule candidate (`memory_rule_lifecycle`):
   only a revision admitted from reviewer feedback, of an agent with
   `memory_rule_proposals` on, on an open pull request lineage of a WorkItem
-  that is not cancelled, may propose (else 403 `rule_proposal_not_eligible`),
-  once per request (409 `rule_already_proposed`). The agent, repository scope,
+  that is not cancelled, may propose, and only while its execution is the
+  live one the issue read route accepts (else 403 `rule_proposal_not_eligible`),
+  once per request (409 `rule_already_proposed`); a database failure is 503
+  `rule_proposal_unavailable` and never logs the text. The agent, repository scope,
   source request, lineage and URL and the proposer come from the capability
   and the stored request; the body is exactly `rule` and `reason`, read after
   the capability, and no refusal or log line echoes it. The completion
-  contract's `rule_proposal` answers the same eligibility. Every terminal
+  contract's `rule_proposal` answers the same eligibility, and its 409
+  refusals carry `rule_proposal: false`. Every terminal
   lineage write (the `crud/lineages.py` writers and the worker's
   `PostgresPublicationStore.mark_lineage_terminal`) settles that lineage's
   candidates in its own transaction through the one shared
   `curie_internal.memory_rules.settle_lineage_candidates`, and the lineage
   reconciler's pass settles any terminal lineage still holding a candidate
-  (one an older replica recorded during a rolling upgrade). Every proposal and
+  (one an older replica recorded during a rolling upgrade); with the forge pass
+  off, that settlement sweep runs alone. Every proposal and
   settlement holds the agent row `FOR KEY SHARE` (or, on the publication
   advance, the WorkItem row) before its request and lineage locks, the order
   agent deletion takes; settlement itself never locks the agent row.

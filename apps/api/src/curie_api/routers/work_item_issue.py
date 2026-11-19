@@ -276,6 +276,25 @@ def _refused(code: str) -> HTTPException:
     )
 
 
+def _contract_refused(code: str) -> HTTPException:
+    """A completion contract refusal, which also offers no rule proposal.
+
+    A WorkItem cancelled before the call is refused here (409
+    ``invalid_context``), the fence that stops its runner before any model
+    work; the body still answers ``rule_proposal`` false (ADR 0287, #5796).
+    """
+
+    return HTTPException(
+        409,
+        {
+            "code": code,
+            "message": _REFUSAL_MESSAGES.get(code, "the tracker result was refused"),
+            "rule_proposal": False,
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _tracker_unavailable() -> HTTPException:
     return issue_read_error(
         503, "tracker_unavailable", "The tracker could not answer; retry shortly"
@@ -347,7 +366,8 @@ async def read_completion_contract(
                 settings=settings,
             )
     except runtime.RuntimeRefused as refused:
-        raise _refused(refused.code) from None
+        # Every refusal also answers ``rule_proposal`` false (ADR 0287).
+        raise _contract_refused(refused.code) from None
     except (runtime.SourceUnavailable, IssueReadUnavailable):
         raise _tracker_unavailable() from None
     if claims.publication_recovery:
@@ -613,6 +633,7 @@ _RULE_REFUSALS = {
     "too_large": (422, "the rule or reason is over 240 bytes"),
     "reserved_text": (422, "the rule or reason holds reserved platform text"),
 }
+_RULE_UNAVAILABLE: Final = "rule_proposal_unavailable"
 
 
 def _rule_refused(request_id: uuid.UUID, code: str, sizes: tuple[int, int]) -> HTTPException:
@@ -692,6 +713,9 @@ async def post_rule_proposal(
         raise _rule_refused(request_id, "invalid_body", (0, 0))
     rule, reason = submitted
     sizes = (_utf8_size(rule), _utf8_size(reason))
+    # A request that is no longer the live execution (finished, or its lease
+    # or deadline expired) is refused as not eligible; a database failure
+    # while storing is 503 ``rule_proposal_unavailable``, to retry.
     try:
         await rules_core.propose_candidate(
             session,
@@ -704,6 +728,14 @@ async def post_rule_proposal(
         raise _rule_refused(request_id, refused.code, sizes) from None
     except InvalidRule as invalid:
         raise _rule_refused(request_id, invalid.code, sizes) from None
+    except rules_core.ProposalUnavailable:
+        # The request id and the outcome only: the database error is dropped.
+        logger.warning(
+            "rule proposal unavailable request=%s code=%s", request_id, _RULE_UNAVAILABLE
+        )
+        raise issue_read_error(
+            503, _RULE_UNAVAILABLE, "The rule proposal could not be stored; retry shortly"
+        ) from None
     logger.info(
         "rule proposal stored request=%s code=candidate rule_bytes=%d reason_bytes=%d",
         request_id,
