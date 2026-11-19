@@ -16,6 +16,8 @@ import asyncio
 import math
 
 import httpx
+import pytest
+from curie_api.forges.errors import Unavailable
 from curie_api.forges.github.comments import static_token
 from curie_api.forges.github.tracker import GitHubTracker
 
@@ -35,7 +37,7 @@ def _comment(index: int) -> dict[str, object]:
     }
 
 
-def _link(url: httpx.URL, page: int, last: int) -> str:
+def _link(url: httpx.URL, page: int, last: int, *, with_last: bool = True) -> str:
     def to(target: int, rel: str) -> str:
         return f'<{url.copy_set_param("page", str(target))}>; rel="{rel}"'
 
@@ -44,13 +46,14 @@ def _link(url: httpx.URL, page: int, last: int) -> str:
         parts.append(to(page - 1, "prev"))
     if page < last:
         parts.append(to(page + 1, "next"))
-        parts.append(to(last, "last"))
+        if with_last:
+            parts.append(to(last, "last"))
     if page > 1:
         parts.append(to(1, "first"))
     return ", ".join(parts)
 
 
-def _read(total: int) -> tuple[str, list[int]]:
+def _read(total: int, *, with_last: bool = True) -> tuple[str, list[int]]:
     requested: list[int] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -71,7 +74,7 @@ def _read(total: int) -> tuple[str, list[int]]:
         requested.append(page)
         last = max(1, math.ceil(total / PER_PAGE))
         batch = [_comment(i) for i in range(1, total + 1)][(page - 1) * PER_PAGE : page * PER_PAGE]
-        headers = {"link": _link(request.url, page, last)} if last > 1 else {}
+        headers = {"link": _link(request.url, page, last, with_last=with_last)} if last > 1 else {}
         return httpx.Response(200, json=batch, headers=headers)
 
     async def own_login() -> str:
@@ -137,3 +140,17 @@ def test_a_short_thread_renders_exactly_as_before() -> None:
         "## Comment by maintainer at 2026-10-01T00:00:02Z\n\ncomment 2\n\n"
         "## Comment by maintainer at 2026-10-01T00:00:03Z\n\ncomment 3\n"
     )
+
+
+def test_a_next_only_listing_is_followed_forward_and_returned_whole() -> None:
+    ticket, requested = _read(250, with_last=False)
+
+    assert requested == [1, 2, 3]
+    assert "not read" not in ticket
+    bodies = [s.split("\n\n", 1)[1].strip() for s in ticket.split("\n\n## Comment by ")[1:]]
+    assert bodies == [f"comment {i}" for i in range(1, 251)]
+
+
+def test_a_next_only_listing_beyond_ten_pages_is_unavailable() -> None:
+    with pytest.raises(Unavailable):
+        _read(1100, with_last=False)

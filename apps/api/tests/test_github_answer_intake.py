@@ -37,6 +37,7 @@ import sys
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ import test_factory_tracker_results as tr
 from curie_api import factory_questions
 from curie_api.config import get_settings
 from curie_api.factory_facts_schema import REQUEST_MARKER
+from curie_api.factory_label_reconcile import reconcile_missed_labels
 from curie_api.factory_poll_intake import poll_once
 from curie_api.forges.types import TrackerIssueRef
 from curie_api.github_factory_events import FactoryNotice
@@ -82,10 +84,12 @@ TOKEN = "ghs_answer_intake_fixture"
 ANSWER = "Replace the rows on a re-run."
 REFUSED_PREFIX = "factory answer refused"
 
-WRITER = {"id": 7101, "login": "river-writer", "type": "User"}
-MAINTAINER = {"id": 7102, "login": "mira-maintainer", "type": "User"}
-READER = {"id": 7103, "login": "rhea-reader", "type": "User"}
+WRITER = {"id": 7101, "login": "writer-user", "type": "User"}
+MAINTAINER = {"id": 7102, "login": "maintainer-user", "type": "User"}
+READER = {"id": 7103, "login": "reader-user", "type": "User"}
 HELPER_BOT = {"id": 7104, "login": "helper-tool[bot]", "type": "Bot"}
+# The App installed again on the repository under a new installation id.
+REINSTALLED = INSTALLATION_ID + 1
 # The factory's own App, and another App a person may act through.
 OWN_APP = {"id": int(APP_ID), "slug": APP_SLUG}
 OTHER_APP = {"id": 8001, "slug": "other-tool"}
@@ -95,7 +99,7 @@ class _Credentials:
     """The App's installation token for the fixture repository, on every path."""
 
     def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
-        if repo != REPO or installation_id != INSTALLATION_ID:
+        if repo != REPO or installation_id not in (INSTALLATION_ID, REINSTALLED):
             raise RuntimeError("unexpected installation")
         return TOKEN
 
@@ -579,19 +583,10 @@ def test_follow_up_queues_behind_the_running_answer(world: World, path: str) -> 
 # Criterion 6: a mention is an answer while a question is open; facts keep theirs ------
 
 
-@pytest.mark.parametrize("path", PATHS)
-def test_mention_while_outstanding_is_one_answer(world: World, path: str) -> None:
-    number = 6160 if path == "webhook" else 6161
-    triage = _outstanding(world, number)
-    comment = world.github.add_comment(
-        number, f"@{MENTION} replace the rows on a re-run.", user=WRITER
-    )
+def _mention_id(number: int, comment: dict[str, Any]) -> uuid.UUID:
+    """The request id a mention revision of ``comment`` by the writer would take."""
 
-    result = _deliver(world, path, comment, number)
-
-    if result is not None:
-        assert result["status"] == "factory_admitted", result
-    mention = FactoryNotice(
+    return FactoryNotice(
         uuid.uuid4(),
         "issue_comment",
         "created",
@@ -605,22 +600,41 @@ def test_mention_while_outstanding_is_one_answer(world: World, path: str) -> Non
         label_event_at=None,
         comment_id=comment["id"],
     ).request_id
-    assert _ids(triage) == [triage.request_id, _answer_id(triage, comment)]
-    assert mention not in _ids(triage)
 
 
-@pytest.mark.parametrize("path", PATHS)
-def test_facts_request_comment_is_never_an_answer(world: World, path: str) -> None:
-    number = 6162 if path == "webhook" else 6163
-    triage = _outstanding(world, number)
+def _facts_body() -> str:
+    """A facts request `parse_request` accepts."""
+
     query = {
         "schema_version": 1,
         "trigger_label": LABEL,
         "executables": ["uv", "python3.13"],
         "services": ["postgres"],
     }
-    body = f"@{APP_SLUG}\n\n{REQUEST_MARKER}\n```json\n{json.dumps(query)}\n```"
-    request = world.github.add_comment(number, body, user=WRITER)
+    return f"@{APP_SLUG}\n\n{REQUEST_MARKER}\n```json\n{json.dumps(query)}\n```"
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_mention_while_outstanding_is_one_answer(world: World, path: str) -> None:
+    number = 6160 if path == "webhook" else 6161
+    triage = _outstanding(world, number)
+    comment = world.github.add_comment(
+        number, f"@{MENTION} replace the rows on a re-run.", user=WRITER
+    )
+
+    result = _deliver(world, path, comment, number)
+
+    if result is not None:
+        assert result["status"] == "factory_admitted", result
+    assert _ids(triage) == [triage.request_id, _answer_id(triage, comment)]
+    assert _mention_id(number, comment) not in _ids(triage)
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_facts_request_comment_is_never_an_answer(world: World, path: str) -> None:
+    number = 6162 if path == "webhook" else 6163
+    triage = _outstanding(world, number)
+    request = world.github.add_comment(number, _facts_body(), user=WRITER)
 
     result = _deliver(world, path, request, number)
 
@@ -761,3 +775,184 @@ def test_posting_window_answer_is_admitted_once(world: World, path: str) -> None
     expected = _answer_id(triage, comment)
     assert _ids(triage) == [triage.request_id, expected]
     assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
+
+
+def _reconcile(world: World) -> int:
+    """One webhook mode missed-label reconciler pass, its production entry point."""
+
+    client = world.client
+
+    async def go() -> int:
+        return await reconcile_missed_labels(
+            client.app.state.sessionmaker,
+            get_settings(),
+            client.app.state.http_client,
+            now=datetime.now(UTC),
+        )
+
+    admitted: int = client.portal.call(go)
+    return admitted
+
+
+def test_posting_window_answer_is_admitted_by_the_reconciler(world: World) -> None:
+    """Webhook mode: GitHub never redelivers the 503 by itself, so the webhook
+    keeps the comment in its scope's cursor and the reconciler reads it again."""
+
+    assert get_settings().factory_intake == "webhook"
+    number = 6192
+    triage = _running(world, number)
+    world.github.store_then_fail = 502
+    assert _ask(triage).status_code == 503
+    world.github.tick()
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+
+    deferred = _post(world.client, "issue_comment", _payload(comment, number))
+
+    assert deferred.status_code == 503, deferred.text
+    assert _retry_keys() == {f"answer-retry:{comment['id']}"}
+    assert _ask(triage).status_code == 200
+    _settle(triage)
+    assert _ids(triage) == [triage.request_id]
+
+    _reconcile(world)
+
+    expected = _answer_id(triage, comment)
+    assert _ids(triage) == [triage.request_id, expected]
+    assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
+    assert _retry_keys() == set()
+
+    _reconcile(world)
+
+    assert _ids(triage) == [triage.request_id, expected]
+    assert _retry_keys() == set()
+
+
+# Review round 1 (#5787) ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("first", PATHS)
+def test_dedupe_mention_answer_after_the_round_clears(world: World, first: str) -> None:
+    """An answer that also mentions the factory stays an answer: once its
+    attempt ends and the round is cleared, the other door replays it and
+    never admits it as a mention revision."""
+
+    number = 6200 if first == "webhook" else 6201
+    triage = _outstanding(world, number)
+    comment = world.github.add_comment(number, f"@{MENTION} replace the rows.", user=WRITER)
+    _deliver(world, first, comment, number)
+    answered = _answer_id(triage, comment)
+    assert _ids(triage) == [triage.request_id, answered]
+    successor = _take_over(triage, answered)
+    tr._finish(successor, "failed", "budget_exceeded")
+    row = _round_row(triage.work_item_id)
+    assert row is not None and row["state"] == "cleared", row
+    before = _ids(triage)
+
+    second = _deliver(world, "poll" if first == "webhook" else "webhook", comment, number)
+
+    if second is not None:
+        assert second["status"] == "factory_duplicate", second
+    assert _ids(triage) == before
+    assert _mention_id(number, comment) not in _ids(triage)
+
+
+def test_refused_edit_after_permission_granted(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A poll pass sees an edit only as a newer ``updated_at``; a comment
+    created before the listing's threshold is never decided again."""
+
+    caplog.set_level(logging.INFO)
+    number = 6202
+    triage = _outstanding(world, number)
+    refused = world.github.add_comment(number, ANSWER, user=READER)
+    world.github.tick()
+    world.github.add_comment(number, "Build status noted.", user=HELPER_BOT)
+    _poll(world)
+    assert _refusals(caplog, refused) == {"answer_not_authorized"}
+    world.github.grant(READER, "write")
+    world.github.tick()
+    world.github.edit_comment(refused["id"], "Replace the rows on a re-run, please.")
+
+    _poll(world)
+
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+
+
+def test_facts_body_on_the_authenticated_read_is_never_an_answer(world: World) -> None:
+    """The webhook payload claims a plain answer; GitHub's own read of the
+    comment returns a facts request, which keeps precedence."""
+
+    number = 6203
+    triage = _outstanding(world, number)
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+    payload = _payload(comment, number)
+    world.github.edit_comment(comment["id"], _facts_body())
+
+    response = _post(world.client, "issue_comment", payload)
+
+    assert response.status_code == 200, response.text
+    assert _code(response.json()) == "ordinary_comment", response.text
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+
+
+def test_refused_binding_missing(world: World) -> None:
+    number = 6204
+    triage = _outstanding(world, number)
+    (item,) = _rows(
+        "SELECT agent_id FROM curie.work_items WHERE id = :id", {"id": triage.work_item_id}
+    )
+    # The agent's only GitHub surface moves to another repository.
+    moved = world.client.patch(
+        f"/agents/{item['agent_id']}/channels",
+        params={"kind": "github", "address": REPO},
+        headers={"X-API-Key": get_settings().api_key},
+        json={"kind": "github", "address": "acme-corp/other-bot"},
+    )
+    assert moved.status_code == 200, moved.text
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+
+    result = _deliver(world, "webhook", comment, number)
+
+    assert _code(result) == "binding_missing", result
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+
+
+def test_refused_installation_mismatch(world: World) -> None:
+    number = 6205
+    triage = _outstanding(world, number)
+    (item,) = _rows(
+        "SELECT code_host_installation_id FROM curie.work_items WHERE id = :id",
+        {"id": triage.work_item_id},
+    )
+    assert item["code_host_installation_id"] == INSTALLATION_ID
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+    payload = _payload(comment, number)
+    payload["installation"] = {"id": REINSTALLED}
+
+    response = _post(world.client, "issue_comment", payload)
+
+    assert response.status_code == 200, response.text
+    assert _code(response.json()) == "installation_mismatch", response.text
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+
+
+def test_refused_payload_claims_another_author(world: World) -> None:
+    """Authority comes from GitHub's read of the comment, not the payload."""
+
+    number = 6206
+    triage = _outstanding(world, number)
+    comment = world.github.add_comment(number, ANSWER, user=READER)
+    claimed = {**comment, "user": dict(WRITER)}
+    payload = _issue_event("created", number, comment=claimed, sender=dict(WRITER))
+
+    response = _post(world.client, "issue_comment", payload)
+
+    assert response.status_code == 200, response.text
+    assert _code(response.json()) == "answer_not_authorized", response.text
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}

@@ -108,21 +108,19 @@ _MAX_PAGES = 50
 _LINK_LAST = re.compile(r'<([^>]*)>\s*;\s*rel="last"')
 
 
-def _last_page(headers: httpx.Headers) -> int:
+def _last_page(headers: httpx.Headers) -> int | None:
     """The last page number from the `Link` header's `rel="last"` entry.
 
     https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
     GitHub sends `rel="last"` whenever there is a following page and omits the
-    header on a single page. A `rel="next"` without a usable `rel="last"` is not
-    a listing this read can bound.
+    header on a single page. None means a `rel="next"` without a `rel="last"`,
+    which the read follows forward instead.
     """
 
     link = headers.get("link", "")
     found = _LINK_LAST.search(link)
     if found is None:
-        if 'rel="next"' in link:
-            raise Unavailable("issue comments")
-        return 1
+        return None if 'rel="next"' in link else 1
     values = parse_qs(urlsplit(found.group(1)).query).get("page", [])
     if len(values) != 1 or not values[0].isdecimal() or int(values[0]) < 1:
         raise Unavailable("issue comments")
@@ -1137,9 +1135,10 @@ class GitHubTracker:
         Nothing is parsed into the platform or stored.
 
         A thread of more than a thousand comments returns the newest thousand,
-        oldest first. That costs at most 11 comment page requests plus the issue
-        (the ten pages ending at the last page, and one earlier page when the
-        last page is partial).
+        oldest first. That costs at most 12 comment page requests plus the issue
+        (page 1, the ten pages ending at the last page, and one earlier page
+        when the last page is partial). A listing with `rel="next"` but no
+        `rel="last"` is followed forward for at most ten pages, else refused.
         """
 
         base = f"{self._api}/repositories/{self.repository_id}/issues/{number}"
@@ -1149,8 +1148,17 @@ class GitHubTracker:
             comments: list[IssueComment] = []
             first_batch, headers = await self._comment_page(base, token, 1)
             last_page = _last_page(headers)
-            first = max(1, last_page - _ISSUE_READ_MAX_COMMENT_PAGES + 1)
             pages: dict[int, list[Any]] = {1: first_batch}
+            if last_page is None:
+                # No `rel="last"`: follow `rel="next"` for at most ten pages. A
+                # longer listing cannot have its newest comments located.
+                last_page = 1
+                while 'rel="next"' in headers.get("link", ""):
+                    if last_page == _ISSUE_READ_MAX_COMMENT_PAGES:
+                        raise Unavailable("issue comments")
+                    last_page += 1
+                    pages[last_page], headers = await self._comment_page(base, token, last_page)
+            first = max(1, last_page - _ISSUE_READ_MAX_COMMENT_PAGES + 1)
             for page in range(first, last_page + 1):
                 if page not in pages:
                     pages[page] = (await self._comment_page(base, token, page))[0]

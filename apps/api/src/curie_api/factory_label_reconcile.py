@@ -158,6 +158,19 @@ async def _reconcile_repository(
     repository_id = repository.get("id")
     if type(repository_id) is not int or repository_id <= 0:
         raise Unavailable(f"/repos/{repo}")
+    # This pass runs only in webhook mode, where nothing else reads again an
+    # answer the webhook deferred with a 503 (#5787); the poll pass drains the
+    # same keys in poll mode.
+    from .factory_poll_intake import drain_answer_retries
+
+    await drain_answer_retries(
+        sessionmaker,
+        settings,
+        intake.for_repository(
+            client, repo_full_name=repo, repository_id=repository_id, token=static_token(token)
+        ),
+        installation_id=installation_id,
+    )
     admitted = 0
     for label in labels:
         tracker = intake.for_repository(
