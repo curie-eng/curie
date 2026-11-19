@@ -605,6 +605,55 @@ async def admit_revision(
     return await outcome(session, reloaded, written, replayed=requested.replayed)
 
 
+@dataclass(frozen=True)
+class TicketRevision:
+    """The snapshot of a revision that answers on the WorkItem's own ticket."""
+
+    objective: str
+    requester: str
+    kind: str
+    address: str
+    reply_conversation_id: str
+
+
+async def create_answer_request(
+    session: AsyncSession,
+    *,
+    work_item: WorkItem,
+    request_id: uuid.UUID,
+    revision: TicketRevision,
+) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
+    """Create the implementation request an answer starts (#5786).
+
+    ``work_item`` is the caller's locked row, so its version is the expected
+    one. The request is created exactly as `admit_revision` creates a
+    mention's: waiting when nothing is live on the WorkItem, else queued
+    behind it. A waiting request gets its admission snapshot under the
+    implementation contract, which makes it dispatchable. Commits like the
+    lifecycle functions it calls.
+    """
+
+    now = await database_now(session)
+    requested = await lifecycle.create_revision_request(
+        session,
+        work_item_id=work_item.id,
+        request_id=request_id,
+        wait_deadline=now + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        expected_work_item_version=work_item.version,
+        snapshot=_snapshot_values(revision),
+    )
+    if isinstance(requested, WorkItemConflict):
+        return requested
+    assert requested.request is not None
+    if requested.request.status == "queued":
+        return requested
+    written = await _write_snapshot(session, request_id, revision, IMPLEMENTATION)
+    if isinstance(written, DispatchConflict):
+        return written
+    reloaded = await reload_work_item(session, work_item.id)
+    return await outcome(session, reloaded, written, replayed=requested.replayed)
+
+
 async def readmit(
     session: AsyncSession, facts: Any
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
