@@ -683,8 +683,11 @@ async def rows_an_older_replica_settled(
     2. a row whose asking request is terminal without the question ending,
        unless an answer it queued is still live (rule 1 keeps it ``answered``,
        and the asker failed with a cause the question ending never converts);
-    3. an ``answered`` row whose queued answer is terminal, other than the
-       asker itself.
+    3. an ``answered`` row whose queued answer, admitted after the asker,
+       is terminal;
+    4. a ``cleared`` row whose posted round was answered and whose asker an
+       older replica failed: the queued answer ran and settled here before
+       the re-drive reached the asker, which still lacks the question ending.
 
     An asker the re-drive would leave failed (a tracker result, or a request
     other than its queued answer admitted after it) is selected only once the
@@ -702,26 +705,39 @@ async def rows_an_older_replica_settled(
         pending.terminal_at.is_(None),
     )
     later = aliased(ExecutionRequest)
-    convertible = and_(
+    failed_asker = and_(
         asker.status == "failed",
         asker.terminal_cause.in_(unpublished_causes),
         asker.completion_contract.is_distinct_from(runtime.CONTRACT_TRACKER_RESULT),
-        FactoryQuestionRound.state.in_((OUTSTANDING, ANSWERED)),
         ~exists().where(
             later.work_item_id == asker.work_item_id,
             later.sequence > asker.sequence,
             later.id.is_distinct_from(FactoryQuestionRound.pending_request_id),
         ),
     )
+    convertible = and_(failed_asker, FactoryQuestionRound.state.in_((OUTSTANDING, ANSWERED)))
+    # The answer to this round: a queued request admitted after the asker.
+    # A relabel that superseded an earlier round's answer leaves that older
+    # request on the row.
+    answer_ended = and_(
+        pending.id.is_not(None),
+        pending.terminal_at.is_not(None),
+        pending.sequence > asker.sequence,
+    )
     asker_unsettled = and_(
         asker.terminal_at.is_not(None),
         not_(and_(asker.status == "completed", asker.terminal_cause == QUESTIONS_ASKED)),
         or_(convertible, not_(pending_live)),
     )
-    answer_unsettled = and_(
-        FactoryQuestionRound.state == ANSWERED,
-        pending.terminal_at.is_not(None),
-        pending.id != FactoryQuestionRound.asking_request_id,
+    answer_unsettled = and_(FactoryQuestionRound.state == ANSWERED, answer_ended)
+    answered_unconverted = and_(
+        FactoryQuestionRound.state == CLEARED,
+        FactoryQuestionRound.comment_id.is_not(None),
+        answer_ended,
+        failed_asker,
+        # This version refuses to fail such an asker at all (#4158), so one
+        # with a publication of its own is never converted; never select it.
+        ~exists().where(Publication.execution_request_id == asker.id),
     )
     ids = await session.scalars(
         select(FactoryQuestionRound.work_item_id)
@@ -735,6 +751,7 @@ async def rows_an_older_replica_settled(
                     FactoryQuestionRound.state.in_(_SETTLED_ON),
                     or_(asker_unsettled, answer_unsettled),
                 ),
+                answered_unconverted,
             )
         )
         .where(

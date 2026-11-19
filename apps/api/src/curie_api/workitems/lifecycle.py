@@ -636,8 +636,15 @@ async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UU
        than the round's queued answer was admitted after it (a retry the
        older replica started): the attempt already continued, so converting
        would start a second one.
-    3. ``settle_round`` then runs for the terminal asker, and for a terminal
-       queued answer, exactly as at settlement.
+       This holds too when the queued answer already ran and settled here,
+       which left the row ``cleared``.
+    3. ``settle_round`` then runs for the terminal asker, and for the
+       terminal queued answer of an ``answered`` row, exactly as at
+       settlement.
+    4. The status label recorded for the converted asker and for that answer
+       is forgotten, so the status pass writes the ticket's label again: an
+       older pass records labels while keeping ``curie-factory:questions``,
+       which it does not know, on the ticket.
 
     The caller commits.
     """
@@ -658,9 +665,15 @@ async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UU
         await factory_questions.delete_for_cancellation(session, work_item_id)
         return
     pending_id = row.pending_request_id
+    answered = row.state == factory_questions.ANSWERED
+    posted = row.state in (factory_questions.OUTSTANDING, factory_questions.ANSWERED) or (
+        row.state == factory_questions.CLEARED and row.comment_id is not None
+    )
+    converted = False
     asker = await lock_request(session, work_item_id=work_item_id, request_id=row.asking_request_id)
     if asker is not None and asker.terminal_at is not None:
-        if await _older_question_ending(session, work_item, asker, pending_id):
+        if posted and await _older_question_ending(session, work_item, asker, pending_id):
+            converted = True
             await session.execute(
                 update(ExecutionRequest)
                 .where(
@@ -680,6 +693,7 @@ async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UU
                 .where(FactoryStatusComment.execution_request_id == asker.id)
                 .values(
                     terminal_cause=factory_questions.QUESTIONS_ASKED,
+                    applied_label=None,
                     finalized_at=case(
                         (FactoryStatusComment.refused_at.is_(None), None),
                         else_=FactoryStatusComment.finalized_at,
@@ -688,12 +702,24 @@ async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UU
                 )
             )
             asker = await reload_request(session, asker.id)
-        await factory_questions.settle_round(session, work_item, asker)
+        if row.state != factory_questions.CLEARED:
+            await factory_questions.settle_round(session, work_item, asker)
     if pending_id is None or asker is None or pending_id == asker.id:
         return
     pending = await reload_request(session, pending_id)
-    if pending.terminal_at is not None:
+    # Only this round's answer: a relabel that superseded an earlier round's
+    # answer leaves that request on the row of the next round.
+    if pending.terminal_at is None or pending.sequence < asker.sequence:
+        return
+    if answered:
         await factory_questions.settle_round(session, work_item, pending)
+    elif not converted:
+        return
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(FactoryStatusComment.execution_request_id == pending.id)
+        .values(applied_label=None)
+    )
 
 
 async def _older_question_ending(
@@ -708,11 +734,6 @@ async def _older_question_ending(
         asker.status != "failed"
         or (asker.terminal_cause or "").strip() not in _UNPUBLISHED_CAUSES
         or asker.completion_contract == CONTRACT_TRACKER_RESULT
-    ):
-        return False
-    if (
-        await factory_questions.question_ending(session, work_item.id, asker.id)
-        != factory_questions.QUESTIONS_ASKED
     ):
         return False
     if await _publication_owns_terminus(session, work_item, asker):

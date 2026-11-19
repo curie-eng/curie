@@ -108,10 +108,18 @@ def _older_replica() -> Iterator[None]:
         yield
 
 
-def _older_status_pass(sink: Any, request_id: uuid.UUID, number: int) -> None:
-    """What an older replica's status pass writes for a ``completed`` request
-    with a cause it does not know: a failure body, ``pr-open`` added (removing
-    only the labels it knows, never the question label) and recorded as
+def _older_status_pass(
+    sink: Any,
+    request_id: uuid.UUID,
+    number: int,
+    *,
+    label: str = PR_OPEN,
+    cause: str = "questions_asked",
+) -> None:
+    """What an older replica's status pass writes for a finished request: a
+    failure body (it renders ``questions_asked``, a cause it does not know,
+    as one), ``label`` added (``pr-open`` for a ``completed`` request) while
+    removing only the labels it knows, never the question label, recorded as
     applied, and the row finalized with that body's digest."""
 
     everything = list(sink.comments) + [c for listed in sink.lists.values() for c in listed]
@@ -119,17 +127,17 @@ def _older_status_pass(sink: Any, request_id: uuid.UUID, number: int) -> None:
     body = (
         f"{marker_for(request_id)}\n"
         "Could not complete: the run stopped for a reason Curie did not recognize.\n"
-        "Cause: questions_asked\n"
+        f"Cause: {cause}\n"
     )
     comment["body"] = body
     labels = sink.issue_labels.setdefault(number, set())
-    labels -= {"curie-factory:queued", RUNNING, NEEDS_HUMAN}
-    labels.add(PR_OPEN)
+    labels -= {"curie-factory:queued", RUNNING, NEEDS_HUMAN, PR_OPEN}
+    labels.add(label)
     tr._exec(
         "UPDATE curie.factory_terminal_notices SET applied_label = :label, "
         "rendered_digest = :digest, finalized_at = clock_timestamp() "
         "WHERE execution_request_id = :id",
-        {"label": PR_OPEN, "digest": body_digest(body), "id": request_id},
+        {"label": label, "digest": body_digest(body), "id": request_id},
     )
 
 
@@ -176,6 +184,48 @@ def _redrive(triage: tr._Triage) -> None:
     triage.client.portal.call(go)
 
 
+def _answer_snapshot(triage: tr._Triage, revision: uuid.UUID) -> None:
+    """The run snapshot of a promoted answer, as the answer core writes it:
+    the asker's requester and reply route and the answer as the objective.
+    `_queue_revision` leaves it empty, and a request without one is never
+    dispatched."""
+
+    tr._exec(
+        "UPDATE curie.execution_requests AS answer SET "
+        "objective = 'Answer: replace the rows on a re-run.', "
+        "requester = asker.requester, reply_kind = asker.reply_kind, "
+        "reply_address = asker.reply_address, "
+        "reply_conversation_id = asker.reply_conversation_id "
+        "FROM curie.execution_requests AS asker "
+        "WHERE answer.id = :answer AND answer.status = 'waiting' AND asker.id = :asker",
+        {"answer": revision, "asker": triage.request_id},
+    )
+
+
+def _run_continuation(triage: tr._Triage, revision: uuid.UUID) -> tr._Triage:
+    _answer_snapshot(triage, revision)
+    return _take_over(triage, revision)
+
+
+def _continued(sink: Any, triage: tr._Triage, number: int, revision: uuid.UUID) -> dict[str, Any]:
+    """Run the answer's continuation to its end and record what the ticket
+    shows while it runs and after."""
+
+    continuation = _run_continuation(triage, revision)
+    _reconcile()
+    running = _state_labels(sink, number)
+    tr._finish(continuation, "failed", "no_pull_request")
+    _reconcile()
+    row = _round_row(triage.work_item_id)
+    return {
+        "running": running,
+        "labels": _state_labels(sink, number),
+        "asks": ASKS_FOR_ANSWER in _status_body(sink, revision),
+        "requests": [(r["status"], r["terminal_cause"]) for r in _requests(triage.work_item_id)],
+        "row": None if row is None else row["state"],
+    }
+
+
 def _one_continuation(triage: tr._Triage, revision: uuid.UUID) -> None:
     """The answer's revision is the only request after the asker, and live."""
 
@@ -204,10 +254,10 @@ def _snapshot(sink: Any, triage: tr._Triage, number: int, revision: uuid.UUID) -
 
 def _new_replicas_only(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int, *, answer_at: str
-) -> dict[str, Any]:
-    """The same ask and answer with no older replica anywhere. ``answer_at``
-    places the answer as the mixed run did: before the asker finished, before
-    the first pass after it, or after that pass."""
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The same ask, answer and continuation with no older replica anywhere.
+    ``answer_at`` places the answer as the mixed run did: before the asker
+    finished, before the first pass after it, or after that pass."""
 
     _client, _github, sink = admitted
     triage = _asked(admitted, monkeypatch, number)
@@ -225,7 +275,7 @@ def _new_replicas_only(
         _answer(triage.work_item_id, revision)
     _reconcile()
     _reconcile()
-    return _snapshot(sink, triage, number, revision)
+    return _snapshot(sink, triage, number, revision), _continued(sink, triage, number, revision)
 
 
 def _matches_new_replicas_only(
@@ -239,7 +289,9 @@ def _matches_new_replicas_only(
 ) -> None:
     """After the answer the ticket ends where it ends with no older replica:
     the asker ended with the question, the answer is its one continuation,
-    and the labels and comments are the same."""
+    and the labels and comments are the same. The continuation then runs and
+    ends: the ticket leaves the question state while it runs, the round
+    clears, and the labels and comment show its own outcome."""
 
     _client, _github, sink = admitted
     _reconcile()
@@ -247,7 +299,17 @@ def _matches_new_replicas_only(
     mixed = _snapshot(sink, triage, number, revision)
     assert mixed["requests"][0] == ("completed", "questions_asked")
     assert mixed["one_continuation"] is True
-    assert mixed == _new_replicas_only(admitted, monkeypatch, number + 50, answer_at=answer_at)
+    after = _continued(sink, triage, number, revision)
+    assert after["running"] == {RUNNING}
+    assert after["labels"] == {NEEDS_HUMAN}
+    assert after["asks"] is False
+    assert after["row"] == "cleared"
+    assert after["requests"] == [
+        ("completed", "questions_asked"),
+        ("failed", "no_pull_request"),
+    ]
+    baseline = _new_replicas_only(admitted, monkeypatch, number + 50, answer_at=answer_at)
+    assert (mixed, after) == baseline
 
 
 # The worker's finish reaches an older replica ----------------------------------------
@@ -532,6 +594,101 @@ def test_a_new_round_after_the_selection_is_left_to_its_own_settlement(
     assert _request(relabelled) == QUESTION_ENDING
 
 
+def test_a_round_after_a_superseded_answer_keeps_its_question_ending(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relabel supersedes round 1's waiting answer, which stays on the row;
+    the relabelled run asks round 2 and an older replica takes its finish.
+    The re-drive gives round 2 its question ending and leaves it
+    ``outstanding``: the superseded answer belongs to round 1."""
+
+    _client, github, sink = admitted
+    triage = _asked(admitted, monkeypatch, 1215)
+    tr._finish(triage, "failed", "no_pull_request")
+    _reconcile()
+    revision = _queue_revision(triage)
+    _answer(triage.work_item_id, revision)
+    _reconcile()
+    tr._label(triage.client, github, 1215)
+    assert _request(revision) == {"status": "cancelled", "terminal_cause": "issue_cancelled"}
+    relabelled = _requests(triage.work_item_id)[-1]["id"]
+    fresh = _take_over(triage, relabelled)
+    posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
+    assert posted.json() == {"round": 2, "rounds_limit": 3}
+    with _older_replica():
+        tr._finish(fresh, "failed", "no_pull_request")
+    assert _request(relabelled)["status"] == "failed"
+
+    _after_the_roll()
+    assert _request(relabelled) == QUESTION_ENDING
+    row = _round_row(triage.work_item_id)
+    assert row is not None
+    assert (row["state"], row["asking_request_id"], row["rounds_used"]) == (
+        "outstanding",
+        relabelled,
+        2,
+    )
+    assert _state_labels(sink, 1215) == {QUESTIONS_LABEL}
+
+
+def test_an_answer_that_ran_before_the_redrive_still_gives_the_asker_its_ending(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older replica fails the asker and promotes its queued answer; the
+    continuation runs and ends on a new replica, which clears the round before
+    any re-drive. The asker still ends with the question, and the ticket shows
+    the continuation's outcome, as with no older replica."""
+
+    _client, _github, sink = admitted
+    triage = _asked(admitted, monkeypatch, 1216)
+    revision = _queue_revision(triage)
+    _answer(triage.work_item_id, revision)
+    with _older_replica():
+        tr._finish(triage, "failed", "no_pull_request")
+        _reconcile()
+    continuation = _run_continuation(triage, revision)
+    tr._finish(continuation, "failed", "no_pull_request")
+    assert _round_row(triage.work_item_id)["state"] == "cleared"  # type: ignore[index]
+    assert _request(triage.request_id)["status"] == "failed"
+
+    _after_the_roll()
+    assert _request(triage.request_id) == QUESTION_ENDING
+    assert _round_row(triage.work_item_id)["state"] == "cleared"  # type: ignore[index]
+    assert _after_asker(triage) == [(revision, "failed")]
+    assert _state_labels(sink, 1216) == {NEEDS_HUMAN}
+    assert _to_redrive(triage) == []
+
+
+def test_an_older_status_pass_on_the_continuation_does_not_keep_the_question_label(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The answer's continuation runs and ends while older replicas take its
+    status updates. An older pass removes only the labels it knows, so the
+    question label stays beside the continuation's own. After the roll the
+    ticket carries the continuation's label alone."""
+
+    _client, _github, sink = admitted
+    triage = _asked(admitted, monkeypatch, 1217)
+    tr._finish(triage, "failed", "no_pull_request")
+    _reconcile()
+    revision = _queue_revision(triage)
+    _answer(triage.work_item_id, revision)
+    _reconcile()
+    continuation = _run_continuation(triage, revision)
+    # The continuation's comment is posted; the older pass that takes its
+    # running update adds the running label and keeps the question label.
+    _reconcile()
+    sink.issue_labels[1217] = {QUESTIONS_LABEL, RUNNING}
+    with _older_replica():
+        tr._finish(continuation, "failed", "no_pull_request")
+    _older_status_pass(sink, revision, 1217, label=NEEDS_HUMAN, cause="no_pull_request")
+    assert _state_labels(sink, 1217) == {QUESTIONS_LABEL, NEEDS_HUMAN}
+
+    _after_the_roll()
+    assert _round_row(triage.work_item_id)["state"] == "cleared"  # type: ignore[index]
+    assert _state_labels(sink, 1217) == {NEEDS_HUMAN}
+
+
 def _record_termination(triage: tr._Triage) -> None:
     """The worker records that the cancelled request's sandbox is gone."""
 
@@ -648,6 +805,9 @@ _EXPECTED_USES = {
         "post_and_record",
     },
     "curie_api/workitems/lifecycle.py": {
+        "ANSWERED",
+        "CLEARED",
+        "OUTSTANDING",
         "QUESTIONS_ASKED",
         "QUESTION_ROUNDS_EXHAUSTED",
         "locked_round",
