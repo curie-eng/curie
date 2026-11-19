@@ -866,7 +866,12 @@ _TABLES = ("factory_question_round", "factory_answer_receipt")
 # settlement path whose behaviour beside an older replica is not yet proved:
 # add its case here first.
 _EXPECTED_USES = {
+    # The answer receipt (#5786) only picks the answer-received lead line of
+    # a status body; an older pass renders the same request without it.
     "curie_api/factory_notices.py": {
+        "ANSWER_RECEIVED_LINE",
+        "ANSWER_STARTED_OUTCOMES",
+        "FactoryAnswerReceipt",
         "QUESTIONS_ASKED",
         "QUESTIONS_LABEL",
         "ROUND_LIMIT",
