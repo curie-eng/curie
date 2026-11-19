@@ -43,7 +43,7 @@ import copy
 import itertools
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -306,6 +306,7 @@ class JiraFake:
         self._link_ids = itertools.count(10900)
         self._keys: dict[str, itertools.count[int]] = {}
         self._faults: list[_Fault] = []
+        self._before: list[tuple[str, Callable[[], None]]] = []
         self.app = self._build_app()
 
     # Clock ---------------------------------------------------------------
@@ -597,6 +598,13 @@ class JiraFake:
 
         self.fail_next(LISTINGS, status=500, after=after)
 
+    def before_next(self, kind: str, action: Callable[[], None]) -> None:
+        """Run ``action`` once, just before the site serves the next request of
+        ``kind``: something a person or another process does on the site's
+        side while the caller is between two of its reads."""
+
+        self._before.append((kind, action))
+
     def _fault_for(self, kind: str) -> _Fault | None:
         for fault in self._faults:
             if kind not in fault.kinds:
@@ -806,6 +814,11 @@ class JiraFake:
         if caller is None and not anonymous:
             return JSONResponse(payload("error_unauthorized"), status_code=401)
         self._caller_zone = caller.time_zone if caller is not None else "UTC"
+        for pending in self._before:
+            if pending[0] == recorded.kind:
+                self._before.remove(pending)
+                pending[1]()
+                break
         fault = self._fault_for(recorded.kind)
         if fault is not None:
             if fault.applied:

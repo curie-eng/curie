@@ -883,3 +883,106 @@ def test_answer_first_poll_again_after_a_held_page_admits_the_answer(
     assert _receipts(item["id"]) == {
         comment_id: ("admitted", _answer_id(intake.ref(issue), comment_id))
     }
+
+
+# --- review round 2: a mention's answer currency, and a snapshot that went stale ----------
+
+# A second surface label that sorts before the tracker's own, so its poll runs
+# first in a pass (the intake polls a binding's labels in sorted order).
+EARLY = "early-fast"
+
+
+@pytest.fixture
+def gitlab_early_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[gl.GitLabInstall]:
+    """Two surfaces on one binding: ``EARLY`` and the tracker's own label."""
+
+    yield from gl.gitlab_install(monkeypatch, tmp_path, labels=(None, EARLY))
+
+
+@pytest.mark.parametrize("change", ["closed", "unlabelled", "open"])
+def test_answer_mention_on_an_earlier_labels_poll_needs_the_open_labelled_issue(
+    gitlab_early_label: gl.GitLabInstall, change: str
+) -> None:
+    """A developer's reply that mentions the bot on an answering issue, then the
+    issue is closed or loses the tracker's own label (its WorkItem's trigger
+    label) before the next pass. The earlier label's poll runs first and
+    delivers the reply as a mention, whose own check reads only the note
+    (https://docs.gitlab.com/api/notes/#get-single-issue-note); answering it
+    needs the issue open (``state``,
+    https://docs.gitlab.com/api/issues/#single-project-issue) and labelled, so
+    no request starts, and the own label's poll then cancels the WorkItem.
+    Left open and labelled, the reply starts exactly one request."""
+
+    install = gitlab_early_label
+    backend = install.backend
+    # The earlier surface is in use, so its label's poll reads a cursor.
+    other = backend.add_issue("Widget parser drops a quoted field", author=backend.developer)
+    backend.label_issue(other, EARLY, backend.developer)
+    iid, work_item_id = _gitlab_asked(install)
+    [early_item] = gl.work_items(other)
+    assert early_item["trigger_label"] == EARLY
+    before = _ids(work_item_id)
+
+    note_id = backend.issue_note(iid, backend.developer, gl.mention_body(install))
+    if change == "closed":
+        install.fake.set_issue_state(iid, "closed", backend.developer)
+    elif change == "unlabelled":
+        backend.label_issue(iid, install.label, backend.developer, add=False)
+    gl.reconcile()
+
+    if change == "open":
+        _assert_admitted(work_item_id, install.issue_ref(iid), str(note_id), before)
+        return
+    assert _ids(work_item_id) == before
+    assert _receipts(work_item_id) == {}
+    [item] = gl.work_items(iid)
+    assert item["cancelled_at"] is not None
+
+
+def test_answer_snapshot_taken_before_the_round_cleared_keeps_a_fresh_mention(
+    intake: Intake,
+) -> None:
+    """The pass takes its answering set while the round is ``answered``. Before
+    the tracker read, the answer's run ends without a question, which clears
+    the round, and the starter's newer reply mentions the bot. The pass
+    delivers the reply as an answer: it is held with no receipt and the cursor
+    stays. The next pass, whose snapshot leaves the issue out, delivers it as
+    a mention, which starts exactly one request."""
+
+    intake.agent()
+    issue = _issue(intake)
+    work_item_id = _asked(intake, issue)
+    before = _ids(work_item_id)
+    first = intake.jira.add_comment(issue.id, intake.starter, ANSWER_TEXT)
+    intake.poll()
+    answer = _assert_admitted(work_item_id, intake.ref(issue), first, before)
+    epoch = _start(intake, answer)
+
+    # An ADF ``mention`` node naming the bot (the comment body is ADF,
+    # https://developer.atlassian.com/cloud/jira/platform/apis/document/nodes/mention/).
+    reply = intake.jira.add_comment(
+        issue.id,
+        intake.starter,
+        jira_fake.adf_mention(jira_fake.BOT_ACCOUNT_ID, jira_fake.BOT_NAME, after=" also trim"),
+    )
+    cursor = _cursor()
+    # The pass's JQL search is its first tracker read, after the snapshot
+    # (https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/#api-rest-api-3-search-jql-post).
+    intake.jira.before_next("search", lambda: _finish(intake.client, answer, epoch))
+    intake.poll()
+
+    assert _round_state(work_item_id) == ("cleared", answer)
+    assert _cursor() == cursor
+    assert _receipts(work_item_id) == {first: ("admitted", answer)}
+    assert _ids(work_item_id) == [*before, answer]
+
+    intake.poll()
+
+    ids = _ids(work_item_id)
+    assert ids[: len(before) + 1] == [*before, answer]
+    assert len(ids) == len(before) + 2
+    assert _answer_id(intake.ref(issue), reply) not in ids
+    assert _receipts(work_item_id) == {first: ("admitted", answer)}
+    assert _cursor() != cursor

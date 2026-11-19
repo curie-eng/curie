@@ -31,7 +31,20 @@ mentions the factory can still arrive as a ``MENTION``. Its kind is therefore
 decided at admission, under the WorkItem lock: a comment that already has an
 answer receipt starts nothing more, and a mention on a WorkItem whose question
 row is ``posting``, ``outstanding`` or ``answered`` goes to the answer core
-like an answer. One comment never starts both an answer and a mention.
+like an answer, once ``verify_current`` holds it current as an answer under
+the WorkItem's trigger label (the issue still carries that label and is open;
+a mention alone is current while its comment stands). One comment never starts
+both an answer and a mention.
+
+The snapshot can also be stale the other way: the round was ``answered`` when
+the poll took it, then the answer's run ended and cleared it before the
+tracker read a newer comment. That comment arrives as an ``ANSWER`` although
+nothing is asked any more, and `admit_answer` would keep a permanent
+``not_outstanding`` receipt that also suppresses it as a mention. So a
+delivered answer whose row, read under the WorkItem lock, is no longer
+``posting``, ``outstanding`` or ``answered`` is held like a ``posting`` one
+below. The next poll's snapshot leaves the issue out, so the replayed comment
+arrives as a mention if it mentions the factory, and as nothing otherwise.
 
 A ``posting`` row is in the answering set on purpose. Its question comment may
 already be on the ticket while the row is not yet ``outstanding`` (the tracker
@@ -70,7 +83,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, assert_never
 
@@ -141,13 +154,20 @@ _ANSWERING_STATES = (
 
 
 class _AnswerAwaitsQuestion(Exception):
-    """An answer arrived while its question row is still ``posting``.
+    """An answer arrived while its question row is still ``posting``, or after
+    the row left the answering states the poll's snapshot saw.
 
-    The question comment may be on the ticket already, but the row is not yet
-    ``outstanding``, so admitting now would record a permanent
-    ``not_outstanding`` receipt. The label pass holds the issue without a hold
-    comment, and the next poll replays the notice.
+    While ``posting`` the question comment may be on the ticket already, but
+    the row is not yet ``outstanding``; once the row is ``cleared`` or
+    ``exhausted`` the comment is no answer at all. Either way admitting now
+    would record a permanent ``not_outstanding`` receipt. The label pass holds
+    the issue without a hold comment, and the next poll replays the notice
+    against a fresh snapshot. ``reason`` is logged and names no ticket content.
     """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 HOLD_MARKER = "curie-factory-intake-hold"
@@ -542,14 +562,14 @@ async def _poll_label(
         except _DEFERRED as exc:
             held.add(notice.issue)
             await _hold(scope, tracker, label, notice.issue, exc)
-        except _AnswerAwaitsQuestion:
+        except _AnswerAwaitsQuestion as waiting:
             # Identifiers only; nothing is posted on the ticket.
             held.add(notice.issue)
             logger.info(
-                "tracker intake for binding %s label %r holds an answer: its question is "
-                "still posting",
+                "tracker intake for binding %s label %r holds an answer: %s",
                 scope.binding.name,
                 label,
+                waiting.reason,
             )
     if not held:
         await _save_cursor(sessionmaker, scope, key, page.cursor)
@@ -906,6 +926,19 @@ async def _mention(
         select(FactoryQuestionRound.state).where(FactoryQuestionRound.work_item_id == work_item_id)
     )
     if state in _ANSWERING_STATES:
+        # An answer must stand on the open issue that still carries the
+        # WorkItem's trigger label (#5789 decision 3); a mention's own check,
+        # under another label's poll, does not say so.
+        trigger_label = existing.trigger_label or scope.tracker.label
+        as_answer = replace(notice, disposition=Disposition.ANSWER, marker=trigger_label)
+        if not await tracker.verify_current(as_answer):
+            logger.info(
+                "tracker intake for binding %s ignored a mention on work item %s that is "
+                "no current answer",
+                binding.name,
+                work_item_id,
+            )
+            return
         await _to_answer_core(session, scope, tracker, notice, work_item_id)
         return
     surface = await agent_binding(session, existing.agent_id, scope.surface_kind, scope.location)
@@ -945,7 +978,8 @@ async def _answer(
     decisions 4 and 5): who may answer is who may start the ticket, read now.
 
     Logs identifiers only, never the comment's text. Raises
-    `_AnswerAwaitsQuestion` while the question row is ``posting``.
+    `_AnswerAwaitsQuestion` while the question row is ``posting``, or when it
+    left the answering states after the poll's snapshot.
     """
 
     issue = notice.issue
@@ -970,7 +1004,8 @@ async def _to_answer_core(
     work_item_id: uuid.UUID,
 ) -> None:
     """`factory_questions.admit_answer` for an authorized comment, held while
-    the question row is ``posting``. The caller checked start authority."""
+    the question row is ``posting`` or no longer answering. The caller checked
+    start authority."""
 
     # Under the WorkItem lock the row cannot move into ``posting``; only the
     # tracker write, which does not take this lock, moves it out of it.
@@ -981,7 +1016,12 @@ async def _to_answer_core(
     )
     if state == factory_questions.POSTING:
         await session.rollback()
-        raise _AnswerAwaitsQuestion
+        raise _AnswerAwaitsQuestion("its question is still posting")
+    if state not in _ANSWERING_STATES:
+        # Only an adapter's ``ANSWER`` reaches this: the round left the
+        # answering states after the poll's snapshot.
+        await session.rollback()
+        raise _AnswerAwaitsQuestion("its question round ended after the poll's snapshot")
     issue = notice.issue
     facts = factory_questions.AnswerFacts(
         work_item_id=work_item_id,
