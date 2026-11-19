@@ -17,6 +17,7 @@ import shutil
 import stat
 import subprocess
 import textwrap
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -112,6 +113,8 @@ def _setup_commands(tmp_path: Path, **controls: object) -> tuple[dict[str, str],
                 print("ci-fixture")
             if args[:2] == ["create", "cluster"]:
                 data["creates"] += 1
+                data["configs"] = [*data.get("configs", []),
+                                   pathlib.Path(args[args.index("--config") + 1]).read_text()]
                 if data.get("create_failure"):
                     status = 1
         elif tool == "kubectl":
@@ -185,6 +188,48 @@ def test_image_pull_retries_only_bounded_gateway_failures(
     )
     assert result.returncode == status, result.stdout + result.stderr
     assert json.loads(state.read_text())["pulls"] == pulls
+
+
+def test_kind_nodes_pull_docker_hub_through_the_mirror(tmp_path: Path) -> None:
+    # The kind node's containerd does not read the host daemon's
+    # registry-mirrors, so without its own mirror every docker.io image the
+    # chart names (busybox for the AVX preflight hook, among others) is pulled
+    # anonymously from Docker Hub and hits its shared-IP rate limit (429).
+    env, state = _setup_commands(tmp_path)
+    config = tmp_path / "kind.yaml"
+    config.write_text(
+        "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n  - role: control-plane\n"
+    )
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / ".github/scripts/prepare-kind.sh"), "ci-fixture", str(config)],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    (created,) = json.loads(state.read_text())["configs"]
+    document = yaml.safe_load(created)
+    assert document["nodes"] == [{"role": "control-plane"}]
+    patch = tomllib.loads("\n".join(document["containerdConfigPatches"]))
+    registry = patch["plugins"]["io.containerd.grpc.v1.cri"]["registry"]
+    assert registry["mirrors"]["docker.io"]["endpoint"] == [
+        f"https://{MIRROR_HOST}",
+        "https://registry-1.docker.io",
+    ]
+
+
+def test_kind_setup_refuses_a_config_that_already_patches_containerd(tmp_path: Path) -> None:
+    env, state = _setup_commands(tmp_path)
+    config = tmp_path / "kind.yaml"
+    config.write_text(
+        "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n"
+        "containerdConfigPatches:\n  - |\n    x = 1\n"
+    )
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / ".github/scripts/prepare-kind.sh"), "ci-fixture", str(config)],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "containerdConfigPatches" in result.stderr
+    assert json.loads(state.read_text())["creates"] == 0
 
 
 def test_kind_setup_refuses_a_corrupt_manifest_before_creating_a_cluster(tmp_path: Path) -> None:
