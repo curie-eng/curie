@@ -224,9 +224,19 @@ def _drive(
     from curie_runner.sdk_auth import CREDENTIALS_ENV, resolve_model_credential
 
     _require_credential()
+    # The model call must reach the provider the key names, never an ambient
+    # Anthropic endpoint or credential the calling shell, or the caller's own
+    # Claude settings, happen to carry: a fresh config dir, as the sandbox has.
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
     stub = _PlatformStub()
     bundle = tmp_path / "dark-factory"
     shutil.copytree(BUNDLE_SOURCE, bundle)
+    # The bundle's connectors.yaml declares only its deployed runner image
+    # layer (no connectors), which a release locks at render time. This runner
+    # runs in process, not in that image, so the copy drops the declaration.
+    (bundle / "connectors.yaml").unlink()
     workspace = _workspace(tmp_path)
     model = os.environ.get("OPENROUTER_MODEL", _DEFAULT_MODEL)
     sdk_env: dict[str, str] = {CREDENTIALS_ENV: _OPENROUTER_KEY}
