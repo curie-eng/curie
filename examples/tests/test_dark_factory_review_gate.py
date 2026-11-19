@@ -752,7 +752,10 @@ def test_publish_decisions_missing_body_is_recoverable(session: Session) -> None
     assert session.pre(PUBLISH, {"body": VALID_PR_BODY})["permissionDecision"] == "allow"
 
 
-ENTRY = "1. Keep integers. Rejected: floats, because the tests compare integers. (plan) Evidence: tests."
+ENTRY = (
+    "1. Keep integers. Rejected: floats, because the tests compare integers. "
+    "(plan) Evidence: tests."
+)
 
 
 def _cited(count: int) -> str:
@@ -768,9 +771,17 @@ def _cited(count: int) -> str:
         (f"## Decisions\n{ENTRY}\n{_cited(1)}\n## Checklist\n1. Done.\n", True),
         # The cap still holds for numbered decisions, and the None declaration is not
         # mixed with citation lines.
-        ("## Decisions\n" + "\n".join(ENTRY.replace("1.", f"{n}.", 1) for n in range(1, 8))
-         + f"\n8. x. Rejected: y, because z. (plan) Evidence: w.\n{_cited(1)}", False),
-        (f"## Decisions\nNone: the change follows directly from the acceptance criteria.\n{_cited(1)}", False),
+        (
+            "## Decisions\n"
+            + "\n".join(ENTRY.replace("1.", f"{n}.", 1) for n in range(1, 8))
+            + f"\n8. x. Rejected: y, because z. (plan) Evidence: w.\n{_cited(1)}",
+            False,
+        ),
+        (
+            "## Decisions\nNone: the change follows directly from the acceptance criteria.\n"
+            + _cited(1),
+            False,
+        ),
         # A citation prefix alone or with no author text is not a citation line.
         ("## Decisions\nAnswered on the ticket by \n", False),
         (f"## Decisions\n{ENTRY}\n  {_cited(1)}", False),

@@ -245,7 +245,9 @@ def test_rules_publish_needs_a_citation_line_after_a_question_heading(session: S
     assert not denied(session.publish(CITED_BODY))
     # One line per answer relied on, with no limit of seven.
     many = CITED_BODY.replace(
-        "\n\n## Acceptance", "".join(f"\nAnswered on the ticket by a maintainer: {n}." for n in range(9)) + "\n\n## Acceptance"
+        "\n\n## Acceptance",
+        "".join(f"\nAnswered on the ticket by a maintainer: {n}." for n in range(9))
+        + "\n\n## Acceptance",
     )
     assert not denied(session.publish(many))
 
@@ -686,7 +688,8 @@ def test_registered_hook_keeps_citations_when_the_cli_replaces_a_large_ticket_wi
     notice = (
         "<persisted-output>\nOutput too large (3.0MB). Full output saved to: "
         "/tmp/tool-results/get_issue.txt\n\nPreview (first 2KB):\n"
-        '{\n  "issue": "#7",\n  "url": "https://github.com/Acme/bot/issues/7",\n  "ticket": "# Title\\n'
+        '{\n  "issue": "#7",\n  "url": "https://github.com/Acme/bot/issues/7",\n'
+        '  "ticket": "# Title\\n'
     )
     out = registered.dispatch("PostToolUse", ISSUE_READ, {}, tool_response=notice)
     assert out is not None and not denied(out)
