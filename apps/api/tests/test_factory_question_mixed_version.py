@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import logging
 import sys
 import uuid
 from collections.abc import Iterator
@@ -71,6 +72,24 @@ from test_factory_question_ending import (
     _versions,
 )
 from test_factory_terminus import _reconcile
+from test_factory_tracker_answer_intake import (
+    ANSWER_TEXT,
+    _admitted,
+    _issue,
+    _mint,
+    _start,
+)
+from test_factory_tracker_answer_intake import _ask as _ask_on_jira
+from test_factory_tracker_answer_intake import _finish as _finish_on_jira
+from test_factory_tracker_answer_intake import _receipts as _answer_receipts
+from test_factory_tracker_intake import (  # noqa: F401  (fixtures)
+    HOLD_MARKER,
+    Intake,
+    _cursor,
+    _marker,
+    intake,
+    make_intake,
+)
 
 NEEDS_HUMAN = "curie-factory:needs-human"
 PR_OPEN = "curie-factory:pr-open"
@@ -850,6 +869,111 @@ def test_an_older_status_pass_is_rewritten_after_the_roll(
     _matches_new_replicas_only(admitted, monkeypatch, triage, revision, number)
 
 
+# The tracker intake reads an answer beside an older replica ------------------------------
+
+
+def _redrive_after_the_roll(intake: Intake) -> None:
+    """The roll is done: a new replica's reconciler runs its question round
+    re-drive. Only that step of the pass runs, since the pass's tracker poll
+    would reach the network on this install rather than the Jira fake."""
+
+    import redis.asyncio as aioredis
+    from curie_api.config import get_settings
+    from curie_api.workitem_reconciler import WorkItemReconciler
+    from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+
+    async def go() -> None:
+        valkey = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+        try:
+            reconciler = WorkItemReconciler(
+                intake.client.app.state.sessionmaker, valkey, get_settings()
+            )
+            await reconciler._redrive_question_rounds()
+        finally:
+            await valkey.aclose()
+
+    intake.client.portal.call(go)
+
+
+def _selected_for_redrive(intake: Intake, work_item_id: uuid.UUID) -> bool:
+    async def go() -> list[uuid.UUID]:
+        async with intake.client.app.state.sessionmaker() as session:
+            return await lifecycle.question_rounds_to_redrive(session, limit=100)
+
+    return work_item_id in intake.client.portal.call(go)
+
+
+@pytest.mark.usefixtures("clean_db")
+def test_an_answer_to_a_posting_round_is_held_until_the_redrive(
+    intake: Intake, caplog: pytest.LogCaptureFixture
+) -> None:
+    """On Jira the question comment is written but the create's answer is
+    lost, so the round stays ``posting``. An older replica then takes the
+    asker's finish (``no_pull_request``) without the round hooks, so the row
+    stays ``posting`` beside a failed asker, and a person answers. The tracker
+    intake holds the answer: no request, no receipt, no hold comment, and the
+    label's cursor stays.
+
+    After the roll the re-drive settles the round as this version would have:
+    the round was never recorded as posted, so the failed asker keeps its
+    cause and the row is ``cleared``. The issue then leaves the answering set,
+    so the next intake pass no longer reads the comment as an answer: it
+    admits nothing, writes no receipt, and saves the cursor past the comment.
+    The hold lasts until the re-drive, never longer."""
+
+    caplog.set_level(logging.INFO)
+    intake.agent()
+    issue = _issue(intake)
+    work_item_id, request_id = _admitted(intake, issue)
+    epoch = _start(intake, request_id)
+    capability = _mint(intake.client, request_id)
+    intake.jira.fail_next("comment_create", status=502, applied=True)
+    lost = _ask_on_jira(intake, capability)
+    assert lost.status_code == 503, lost.text
+    question = factory_questions.marker_for(request_id)
+    assert [_marker(c) for c in intake.jira.own_comments(issue.id)] == [question]
+    assert _round_row(work_item_id)["state"] == "posting"  # type: ignore[index]
+
+    with _older_replica():
+        _finish_on_jira(intake.client, request_id, epoch)
+    assert _request(request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
+    assert _round_row(work_item_id)["state"] == "posting"  # type: ignore[index]
+
+    cursor = _cursor()
+    assert cursor is not None
+    intake.jira.add_comment(issue.id, intake.starter, ANSWER_TEXT)
+    intake.poll()
+
+    assert "still posting" in caplog.text
+    assert ANSWER_TEXT not in caplog.text
+    assert [r["id"] for r in _requests(work_item_id)] == [request_id]
+    assert _answer_receipts(work_item_id) == {}
+    assert HOLD_MARKER not in {_marker(c) for c in intake.jira.own_comments(issue.id)}
+    assert _cursor() == cursor
+    assert _selected_for_redrive(intake, work_item_id)
+
+    _redrive_after_the_roll(intake)
+    row = _round_row(work_item_id)
+    assert row is not None
+    assert (row["state"], row["pending_request_id"], row["rounds_used"]) == ("cleared", None, 0)
+    assert _request(request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
+    assert not _selected_for_redrive(intake, work_item_id)
+
+    caplog.clear()
+    intake.poll()
+
+    assert "still posting" not in caplog.text
+    assert [r["id"] for r in _requests(work_item_id)] == [request_id]
+    assert _answer_receipts(work_item_id) == {}
+    assert HOLD_MARKER not in {_marker(c) for c in intake.jira.own_comments(issue.id)}
+    advanced = _cursor()
+    assert advanced is not None and advanced != cursor
+    # Settled once: a later pass changes nothing.
+    intake.poll()
+    assert [r["id"] for r in _requests(work_item_id)] == [request_id]
+    assert _answer_receipts(work_item_id) == {}
+
+
 # Guard: every reader and writer of the round state is covered above --------------------
 
 _API_SRC = Path(__file__).resolve().parents[1] / "src" / "curie_api"
@@ -866,6 +990,16 @@ _TABLES = ("factory_question_round", "factory_answer_receipt")
 # settlement path whose behaviour beside an older replica is not yet proved:
 # add its case here first.
 _EXPECTED_USES = {
+    # Answers (#5789): test_an_answer_to_a_posting_round_is_held_until_the_redrive.
+    "curie_api/factory_tracker_intake.py": {
+        "ANSWERED",
+        "AnswerFacts",
+        "AnswerNotAdmitted",
+        "FactoryQuestionRound",
+        "OUTSTANDING",
+        "POSTING",
+        "admit_answer",
+    },
     # The answer receipt (#5786) only picks the answer-received lead line of
     # a status body; an older pass renders the same request without it.
     "curie_api/factory_notices.py": {
