@@ -838,8 +838,6 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 budget_usd: 5.0,
                 output_tokens: 250000,
                 credit_remaining_usd: Some(73.49),
-                namespace: "curie".to_string(),
-                release: "curie".to_string(),
             },
             "AgentAdded" => QuickstartOutput::AgentAdded {
                 context: "example-context".to_string(),

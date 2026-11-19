@@ -663,9 +663,6 @@ pub enum QuickstartOutput {
         output_tokens: u64,
         /// OpenRouter credit left to the model credential, when it was read.
         credit_remaining_usd: Option<f64>,
-        /// The release's namespace and name, for the `cluster access` hint only.
-        namespace: String,
-        release: String,
     },
     /// An agent added to a release that already records factory intake.
     AgentAdded {
@@ -683,6 +680,18 @@ pub enum QuickstartOutput {
         output_tokens: u64,
         credit_remaining_usd: Option<f64>,
     },
+}
+
+impl QuickstartOutput {
+    /// The closing `cluster access` line for a finished install on a kind
+    /// context, printed by the caller after the result is emitted: it needs the
+    /// release's namespace and name, which the result does not carry.
+    pub fn console_access_hint(&self, namespace: &str, release: &str) -> Option<String> {
+        match self {
+            Self::Ready { context, .. } => console_access_hint(context, namespace, release),
+            _ => None,
+        }
+    }
 }
 
 impl crate::ui::CliOutput for QuickstartOutput {
@@ -720,9 +729,6 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 budget_usd,
                 output_tokens,
                 credit_remaining_usd,
-                // Only the human render uses these, for the `cluster access` hint.
-                namespace: _,
-                release: _,
             } => serde_json::json!({
                 "phase": "ready",
                 "context": context,
@@ -804,8 +810,6 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 budget_usd,
                 output_tokens,
                 credit_remaining_usd,
-                namespace,
-                release,
                 ..
             } => {
                 let mention_note = if *mention_inferred {
@@ -837,9 +841,6 @@ impl crate::ui::CliOutput for QuickstartOutput {
                     "Reviewers run {REVIEWER_MODEL}. Plan on {} USD of OpenRouter credit per run.{credit_left}",
                     budget_display(RUN_CREDIT_USD)
                 ));
-                if let Some(hint) = console_access_hint(context, namespace, release) {
-                    ui.payload(&hint);
-                }
             }
             Self::AgentAdded {
                 context,
@@ -3281,9 +3282,12 @@ mod tests {
             budget_usd: DEFAULT_BUDGET_USD,
             output_tokens: DEFAULT_OUTPUT_TOKENS_PER_RUN,
             credit_remaining_usd: None,
-            namespace: "curie".into(),
-            release: "curie".into(),
         };
+        assert!(
+            ready.console_access_hint("curie", "curie").is_some_and(
+                |hint| hint.contains("curie cluster access --context kind-curie-factory")
+            )
+        );
         let json = crate::ui::CliOutput::to_json(&ready);
         assert_eq!(json["repo"], "acme/widgets");
         assert_eq!(
