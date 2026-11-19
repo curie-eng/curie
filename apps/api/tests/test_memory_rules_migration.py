@@ -228,6 +228,97 @@ def test_upgrade_downgrade_upgrade_and_every_object_exists(
     assert identity == "YES"
 
 
+# Column name -> (type as the server prints it, nullable): decisions 2 to 7 of #5795.
+_UUID, _TEXT, _BIGINT, _INT = "uuid", "text", "bigint", "integer"
+_TSTZ, _CHAR64, _BOOL = "timestamp with time zone", "character(64)", "boolean"
+_RULE_COLUMNS: dict[str, tuple[str, bool]] = {
+    "id": (_UUID, False),
+    "tenant_id": (_UUID, False),
+    "agent_id": (_UUID, False),
+    "scope_kind": (_TEXT, False),
+    "scope_key": (_TEXT, False),
+    "scope_label": (_TEXT, False),
+    "number": (_BIGINT, True),
+    "state": (_TEXT, False),
+    "text": (_TEXT, False),
+    "sha256": (_CHAR64, False),
+    "format_version": (_INT, False),
+    "reason": (_TEXT, False),
+    "proposed_by": (_TEXT, False),
+    "proposed_at": (_TSTZ, False),
+    "source_request_id": (_UUID, True),
+    "source_turn": (_TEXT, True),
+    "source_lineage_id": (_UUID, True),
+    "source_url": (_TEXT, True),
+    "accepted_by": (_UUID, True),
+    "accepted_at": (_TSTZ, True),
+    "rejected_by": (_UUID, True),
+    "rejected_at": (_TSTZ, True),
+    "removed_by": (_UUID, True),
+    "removed_at": (_TSTZ, True),
+    "version": (_INT, False),
+    "created_at": (_TSTZ, False),
+    "updated_at": (_TSTZ, False),
+}
+_EVENT_COLUMNS: dict[str, tuple[str, bool]] = {
+    "id": (_BIGINT, False),
+    "rule_id": (_UUID, False),
+    "tenant_id": (_UUID, False),
+    "agent_id": (_UUID, False),
+    "event": (_TEXT, False),
+    "from_state": (_TEXT, True),
+    "to_state": (_TEXT, False),
+    "actor_kind": (_TEXT, False),
+    "actor": (_TEXT, False),
+    "principal_id": (_UUID, True),
+    "created_at": (_TSTZ, False),
+}
+_SNAPSHOT_COLUMNS: dict[str, tuple[str, bool]] = {
+    "work_item_id": (_UUID, False),
+    "rule_numbers": ("bigint[]", False),
+    "text": (_TEXT, False),
+    "sha256": (_CHAR64, False),
+}
+_ADDED_COLUMNS: dict[str, dict[str, tuple[str, bool]]] = {
+    "agents": {"memory_rule_proposals": (_BOOL, False)},
+    "work_items": {
+        "memory_rules_state": (_TEXT, False),
+        "memory_rules_count": (_INT, False),
+        "memory_rules_sha256": (_CHAR64, True),
+        "memory_rules_format_version": (_INT, True),
+    },
+    "execution_requests": {"memory_rules_evidence": (_TEXT, False)},
+}
+
+
+def _columns(table: str) -> dict[str, tuple[str, bool]]:
+    return {
+        row[0]: (row[1], not row[2])
+        for row in sql_rows(
+            "SELECT attname, format_type(atttypid, atttypmod), attnotnull FROM pg_attribute "
+            "WHERE attrelid = CAST(:table AS regclass) AND attnum > 0 AND NOT attisdropped",
+            {"table": f"curie.{table}"},
+        )
+    }
+
+
+def test_every_column_of_every_new_table_and_added_column_is_exactly_as_decided(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    isolated_migration_db.at(REVISION)
+
+    assert _columns("memory_rules") == _RULE_COLUMNS
+    assert _columns("memory_rule_events") == _EVENT_COLUMNS
+    assert _columns("work_item_memory_rule_snapshots") == _SNAPSHOT_COLUMNS
+    for table, added in _ADDED_COLUMNS.items():
+        found = _columns(table)
+        assert {name: found.get(name) for name in added} == added, table
+    # The release below left every one of those columns out of its own tables.
+    isolated_migration_db.at(BELOW)
+    for table, added in _ADDED_COLUMNS.items():
+        assert not set(added) & set(_columns(table)), table
+
+
 def test_existing_rows_read_absent_and_none_after_the_upgrade(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
