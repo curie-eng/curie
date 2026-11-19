@@ -73,7 +73,8 @@ The agent pins the PR head and base, preserves your checkout and explains:
 * End to end tests added by the PR, separate from plan tests, unit tests,
   author reported live runs and current head CI evidence.
 * Changed, new and removed components, each with a brief account of its role.
-* A sequence diagram for material runtime flows and fallback paths.
+* A sequence diagram for material runtime flows and fallback paths, rendered as
+  Mermaid where supported or as readable text in Claude Code's terminal.
 * Added unit scenarios, algorithm changes, and data models or migrations.
 * Security, production and operational consequences, with links to specific
   diff lines and an explicit account of remaining gaps.

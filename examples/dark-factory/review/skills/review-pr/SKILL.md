@@ -56,11 +56,14 @@ that makes the result clearer:
    role and change. Identify new components and why they exist, and removed or
    replaced components and why. Distinguish internal helpers from deployable or
    public components. Say when no component was added or deleted.
-4. **Changed scenarios.** Use a compact Mermaid sequence diagram when actors,
-   order, trust boundaries or fallback paths matter. Show the old and new
-   flow, or branches of the new flow, for each material scenario. Explain the
-   observable change in plain language. Skip a diagram that would only repeat
-   a single action.
+4. **Changed scenarios.** Use a compact sequence diagram when actors, order,
+   trust boundaries or fallback paths matter. Show the old and new flow, or
+   branches of the new flow, for each material scenario. In a client that
+   renders Mermaid, use Mermaid. In Claude Code or another text-only client,
+   show the diagram inline as readable plain text with actors, arrows and
+   numbered steps; never leave the reader with Mermaid source alone. Explain
+   the observable change in plain language. Skip a diagram that would only
+   repeat a single action.
 5. **Unit scenarios.** Describe added or changed unit tests by the behavior and
    positive, negative or edge conditions they assert. Name relevant existing
    regression coverage and what the assertions cannot establish.

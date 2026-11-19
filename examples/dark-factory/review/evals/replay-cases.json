@@ -16,6 +16,13 @@
       "forbidden": ["Calling green CI proof of host reachability", "Calling loopback an authentication boundary", "Assuming the migration is reversible without inspecting it", "Remote writes"]
     },
     {
+      "id": "text-only-sequence-diagram",
+      "setup": "Review PR 10 in Claude Code's terminal. Its changed flow starts an access command, opens two loopback port forwards, and stops both when interrupted. Mermaid code fences appear as source text rather than rendered diagrams in this client.",
+      "user_turns": ["Use review-pr to explain the changed runtime scenarios."],
+      "expected": ["Shows a readable text sequence diagram inline with actors, ordered calls, and interrupt cleanup", "Explains the observable change in plain language", "Links the flow to verified current diff lines"],
+      "forbidden": ["Mermaid source as the only diagram", "Claiming the forwards survive command exit", "Remote writes"]
+    },
+    {
       "id": "failed-human-observation",
       "setup": "At head A, the first manual step expects HTTP 400 for an invalid name. Human output shows HTTP 500. No base comparison has run.",
       "user_turns": ["I got HTTP 500. What next?"],

@@ -27,6 +27,23 @@ For a sequence diagram, show material actors and calls rather than every
 function. Include an alternate branch for a failure or fallback when it
 changes the outcome. Mark what persists after a command exits. Show old and
 new flows when that is needed to see the change. Use prose for a single action.
+Choose the diagram format for the client's actual display. If Mermaid fences
+render, use a concise Mermaid sequence diagram. If they appear as code, draw
+the flow as plain text in the response, for example:
+
+```text
+User             CLI                Kubernetes
+ |-- access ----->|                     |
+ |               |-- port forwards ---->|
+ |               |<-- ready ------------|
+ |<-- URLs -------|                     |
+ |-- interrupt -->|-- stop forwards --->|
+```
+
+Label any alternate failure or fallback branch below the main flow. Keep
+actors and branch outcomes legible in an ordinary terminal width. A
+Mermaid source block or optional rendered file may accompany the text diagram,
+but neither replaces it when the current client cannot display the visual.
 
 Trace significant hunks to the requested outcome. Explain changed inputs,
 outputs, errors, defaults, compatibility, permissions and migrations where
