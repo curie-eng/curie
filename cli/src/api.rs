@@ -6818,6 +6818,34 @@ impl OwnerApiClient {
         match_agent(agents, identifier).map_err(anyhow::Error::new)
     }
 
+    /// `GET /agents/{id}/memory/rules` with the session cookie.
+    pub async fn list_memory_rules(
+        &self,
+        agent_id: &str,
+        state: Option<&str>,
+        scope_key: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(state) = state {
+            query.push(("state", state));
+        }
+        if let Some(scope_key) = scope_key {
+            query.push(("scope_key", scope_key));
+        }
+        let request = self
+            .http
+            .get(format!("{}/agents/{agent_id}/memory/rules", self.base_url))
+            .query(&query)
+            .header(reqwest::header::COOKIE, self.cookie.header_value()?);
+        self.exchange(
+            request,
+            "GET /agents/{id}/memory/rules",
+            "the learned rule list",
+            memory_rules_refusal,
+        )
+        .await
+    }
+
     /// `POST /agents/{id}/memory/rules/{rule_id}/{action}` with the version the
     /// caller read. The response is returned as the API sent it.
     pub async fn act_memory_rule(

@@ -1,6 +1,6 @@
 //! `curie cluster memory --rules | --accept | --reject | --remove`: list an
 //! agent's learned rules, and accept, reject or remove one as the signed-in
-//! person. Listing uses the cluster connection (platform key or session). An
+//! person. Listing uses the platform key, or the session file when one is given. An
 //! action reads a private session file and never the platform key.
 
 use std::path::PathBuf;
@@ -84,24 +84,86 @@ pub struct MemoryRuleActOpts {
 }
 
 fn rule_id_usage() -> anyhow::Error {
-    let fix = "pass the rule id exactly as `curie cluster memory <agent> --rules` prints it";
+    let fix = "copy the rule id (a 36-character UUID, not the R label) from `curie cluster memory <agent> --rules`";
     CliError::usage(format!("the rule id is not a valid id; {fix}"))
         .with_fix(fix)
         .into()
 }
 
-/// A rule id goes into a URL path, so only the characters of a UUID pass.
-fn checked_rule_id(rule_id: &str) -> Result<&str> {
-    let ok = !rule_id.is_empty()
-        && rule_id.len() <= 64
-        && rule_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
-    if ok {
-        Ok(rule_id)
-    } else {
-        Err(rule_id_usage())
+/// A rule id goes into a URL path, so only a canonical hyphenated UUID passes.
+/// It is sent lowercased.
+fn checked_rule_id(rule_id: &str) -> Result<String> {
+    match uuid::Uuid::parse_str(rule_id) {
+        Ok(id) if rule_id.len() == 36 => Ok(id.hyphenated().to_string()),
+        _ => Err(rule_id_usage()),
     }
+}
+
+fn query_string(state: &Option<String>, scope_key: &Option<String>) -> String {
+    let mut query = Vec::new();
+    if let Some(state) = state {
+        query.push(format!("state={state}"));
+    }
+    if let Some(scope_key) = scope_key {
+        query.push(format!("scope_key={scope_key}"));
+    }
+    if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query.join("&"))
+    }
+}
+
+/// Options for listing with a session file instead of the platform key.
+pub struct MemoryRuleListSessionOpts {
+    pub agent: String,
+    pub state: Option<String>,
+    pub scope_key: Option<String>,
+    pub session_file: PathBuf,
+    pub api_url: Option<String>,
+    pub namespace: String,
+    pub release: String,
+    pub dry_run: bool,
+}
+
+/// `memory --rules --session-file`: list rules as the signed-in person.
+pub async fn memory_rules_list_session(
+    opts: MemoryRuleListSessionOpts,
+) -> Result<MemoryRulesOutput> {
+    let cookie = super::subscription::read_session_cookie(&opts.session_file)?;
+    let (api_url, _tunnel) = super::resolve_cluster_api(
+        opts.api_url.clone(),
+        &opts.namespace,
+        &opts.release,
+        opts.dry_run,
+    )
+    .await?;
+    if opts.dry_run {
+        let base = if opts.api_url.is_none() {
+            "http://127.0.0.1:<tunnel port>".to_string()
+        } else {
+            api_url.trim_end_matches('/').to_string()
+        };
+        return Ok(MemoryRulesOutput::DryRun(DryRunPlan {
+            lines: vec![
+                format!(
+                    "GET {base}/agents/<id>/memory/rules{}  (would resolve agent {:?} first)",
+                    query_string(&opts.state, &opts.scope_key),
+                    opts.agent
+                ),
+                format!(
+                    "credential: Console session cookie from {} (value not shown); no platform key",
+                    opts.session_file.display()
+                ),
+            ],
+        }));
+    }
+    let client = OwnerApiClient::new(&api_url, cookie)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let rules = client
+        .list_memory_rules(&agent.id, opts.state.as_deref(), opts.scope_key.as_deref())
+        .await?;
+    Ok(MemoryRulesOutput::Rules(rules))
 }
 
 /// `memory --rules`: list rules through the cluster connection.
@@ -111,18 +173,7 @@ pub async fn memory_rules_list(
     scope_key: Option<String>,
 ) -> Result<MemoryRulesOutput> {
     if opts.dry_run {
-        let mut query = Vec::new();
-        if let Some(state) = &state {
-            query.push(format!("state={state}"));
-        }
-        if let Some(scope_key) = &scope_key {
-            query.push(format!("scope_key={scope_key}"));
-        }
-        let query = if query.is_empty() {
-            String::new()
-        } else {
-            format!("?{}", query.join("&"))
-        };
+        let query = query_string(&state, &scope_key);
         return Ok(MemoryRulesOutput::DryRun(DryRunPlan {
             lines: vec![
                 format!(
@@ -145,7 +196,7 @@ pub async fn memory_rules_list(
 /// `memory --accept | --reject | --remove`: change one rule as the person whose
 /// session file is given.
 pub async fn memory_rule_act(opts: MemoryRuleActOpts) -> Result<MemoryRulesOutput> {
-    let rule_id = checked_rule_id(&opts.rule_id)?.to_string();
+    let rule_id = checked_rule_id(&opts.rule_id)?;
     let cookie = super::subscription::read_session_cookie(&opts.session_file)?;
     let (api_url, _tunnel) = super::resolve_cluster_api(
         opts.api_url.clone(),
@@ -199,8 +250,9 @@ fn field<'a>(rule: &'a Value, key: &str) -> &'a str {
 
 fn rule_line(rule: &Value) -> String {
     format!(
-        "{}  {}  v{}  {}  {}",
+        "{}  {}  {}  v{}  {}  {}",
         plain(field(rule, "label")),
+        plain(field(rule, "id")),
         plain(field(rule, "state")),
         rule.get("version").and_then(Value::as_i64).unwrap_or(0),
         plain(field(rule, "scope_label")),

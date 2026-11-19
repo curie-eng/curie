@@ -1818,6 +1818,21 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     })
                     .await?,
                 )
+            } else if let (true, Some(session_file)) = (rules.rules, rules.session_file.clone()) {
+                // Listing with a session never resolves the platform key.
+                emit(
+                    commands::memory_rules_list_session(commands::MemoryRuleListSessionOpts {
+                        agent,
+                        state: rules.rule_state,
+                        scope_key: rules.scope_key,
+                        session_file,
+                        api_url: conn.api_url,
+                        namespace: conn.namespace,
+                        release: conn.release,
+                        dry_run,
+                    })
+                    .await?,
+                )
             } else {
                 let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
                     conn.api_url,

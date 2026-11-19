@@ -9,8 +9,10 @@ account can write to that repository right now.
 The write check reads the code host with no database transaction open, by the
 repository's immutable id; the label stored on the rule is passed to the
 adapter only as the credential hint an id read needs and never decides
-identity. The decision itself is one transaction under the agent row lock,
-which serializes the per-scope cap.
+identity. The decision itself is one transaction under the identity reader
+fence and then the agent row lock, which serializes the per-scope cap; under
+the fence it re-reads the exact link the provider check used, so a link
+revoked while the code host was being read refuses the decision.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .. import identity_fence
 from ..approval_auth import enforce_console_cookie_origin
 from ..auth import require_api_key, require_principal_session
 from ..config import get_settings
@@ -364,14 +367,22 @@ def _parse_scope(scope_key: str, label: str) -> _Scope | None:
     return _Scope(kind, host, project_id, label)
 
 
+@dataclass(frozen=True)
+class _Link:
+    """One identity link and the code host account id it names."""
+
+    id: uuid.UUID
+    account_id: str
+
+
 async def _linked_accounts(
     session: AsyncSession, tenant_id: uuid.UUID, principal_id: uuid.UUID, scope: _Scope
-) -> list[str]:
-    """The principal's active account ids in the namespace of the scope's host."""
+) -> list[_Link]:
+    """The principal's active links in the namespace of the scope's host."""
 
     host = scope.host.lower()
     rows = await session.execute(
-        select(IdentityLink.provider_native_id)
+        select(IdentityLink.id, IdentityLink.provider_native_id)
         .join(IdentityNamespace, IdentityNamespace.id == IdentityLink.identity_namespace_id)
         .where(
             IdentityNamespace.tenant_id == tenant_id,
@@ -386,7 +397,7 @@ async def _linked_accounts(
         )
         .order_by(IdentityLink.id)
     )
-    return [str(account) for account in rows.scalars().all()]
+    return [_Link(link_id, str(account)) for link_id, account in rows.tuples().all()]
 
 
 async def _write_refusal(
@@ -439,6 +450,9 @@ class _Checked:
     principal_id: uuid.UUID
     scope_kind: str
     scope_key: str
+    scope: _Scope
+    # The exact link whose account the code host said can write.
+    link: _Link
 
 
 async def _check(
@@ -456,11 +470,11 @@ async def _check(
         raise _refusal("not_found")
     found = (
         await session.execute(
+            # Any state: one that allows no action is 409 invalid_transition, not 404.
             select(MemoryRule.scope_kind, MemoryRule.scope_key, MemoryRule.scope_label).where(
                 MemoryRule.id == rule_id,
                 MemoryRule.agent_id == agent_id,
                 MemoryRule.tenant_id == tenant_id,
-                MemoryRule.state.in_(LISTED_STATES),
             )
         )
     ).one_or_none()
@@ -472,21 +486,22 @@ async def _check(
     scope = _parse_scope(scope_key, scope_label)
     if scope is None:
         raise _refusal("write_access_unverifiable")
-    accounts = await _linked_accounts(session, tenant_id, principal_id, scope)
-    if not accounts:
+    links = await _linked_accounts(session, tenant_id, principal_id, scope)
+    if not links:
         raise _refusal(
             "write_access_required",
             message="No code host account on this repository's host is linked to you.",
             fix=_NO_LINK_FIX,
         )
-    if len(accounts) > 1:
+    if len(links) > 1:
         raise _refusal("write_access_unverifiable")
+    (link,) = links
     # End the read transaction: no snapshot or lock is held across provider reads.
     await session.rollback()
-    refusal = await _write_refusal(client, scope, accounts[0])
+    refusal = await _write_refusal(client, scope, link.account_id)
     if refusal is not None:
         raise refusal
-    return _Checked(tenant_id, principal_id, scope_kind, scope_key)
+    return _Checked(tenant_id, principal_id, scope_kind, scope_key, scope, link)
 
 
 async def _snapshot_refusal(
@@ -531,8 +546,18 @@ async def _apply(
     event: RuleEvent,
     expected_version: int,
 ) -> MemoryRuleOut:
-    """One transaction under the agent row lock; raises a refusal on any check."""
+    """One transaction under the identity reader fence and the agent row lock;
+    raises a refusal on any check."""
 
+    # The fence first, as every identity reader takes it before its row locks:
+    # an identity writer holds it exclusively before its own, so the order
+    # never inverts. Until commit no link can be revoked or changed.
+    await identity_fence.lock_identity_reader(session)
+    current = await _linked_accounts(
+        session, checked.tenant_id, checked.principal_id, checked.scope
+    )
+    if current != [checked.link]:
+        raise _refusal("write_access_required")
     agent_tenant = await session.scalar(
         select(Agent.tenant_id).where(Agent.id == agent_id).with_for_update()
     )
@@ -542,7 +567,6 @@ async def _apply(
             MemoryRule.id == rule_id,
             MemoryRule.agent_id == agent_id,
             MemoryRule.tenant_id == checked.tenant_id,
-            MemoryRule.state.in_(LISTED_STATES),
         )
         .with_for_update()
         .execution_options(populate_existing=True)
@@ -587,6 +611,7 @@ async def _apply(
         )
     )
     await session.flush()
+    # Every state a decision reaches is a listed, numbered one.
     (item,) = await _items(session, _rule_query(agent_id).where(MemoryRule.id == rule_id))
     await session.commit()
     return item

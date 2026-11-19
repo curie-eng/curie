@@ -9150,7 +9150,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session. Used by --accept, --reject and --remove, which never send the platform key",
+              "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session. Used by --accept, --reject and --remove, which never send the platform key. With --rules it lists with the session instead of the platform key",
               "id": "session_file",
               "long": "session-file",
               "positional": false,

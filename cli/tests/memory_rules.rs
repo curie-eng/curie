@@ -194,7 +194,13 @@ fn rules_human_output_names_label_state_scope_and_text() {
     ]);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
     let shown = text(&output);
-    for part in ["R3", "proposed", "acme-corp/acme-bot", "run the formatter"] {
+    for part in [
+        "R3",
+        RULE_ID,
+        "proposed",
+        "acme-corp/acme-bot",
+        "run the formatter",
+    ] {
         assert!(shown.contains(part), "missing {part}: {shown}");
     }
 }
@@ -390,4 +396,83 @@ fn an_unreachable_server_exits_3() {
     assert_eq!(output.status.code(), Some(3), "{}", text(&output));
     assert!(output.status.code() != Some(0));
     assert_no_secrets(&output);
+}
+
+#[test]
+fn rules_with_a_session_file_sends_the_cookie_and_never_a_key() {
+    let fixture = Fixture::new();
+    let session = fixture.session(0o600);
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("GET", p) if p.starts_with(&format!("/agents/{AGENT_ID}/memory/rules")) => {
+            Response::json(200, &rule_list().to_string())
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let output = fixture.run(&[
+        "--json",
+        "cluster",
+        "memory",
+        "acme-bot",
+        "--rules",
+        "--session-file",
+        session.to_str().expect("UTF-8 path"),
+        "--api-url",
+        &server.base_url,
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert_eq!(object(&output)["rules"][0]["id"], RULE_ID);
+    let requests = server.recorded();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    for request in &requests {
+        assert_cookie_only(request);
+    }
+    assert_no_secrets(&output);
+}
+
+#[test]
+fn rules_with_a_session_file_open_to_others_is_refused_before_any_request() {
+    let fixture = Fixture::new();
+    let session = fixture.session(0o644);
+    let server = serve(|req| panic!("no request may be sent: {req:?}"));
+    let output = fixture.run(&[
+        "--json",
+        "cluster",
+        "memory",
+        "acme-bot",
+        "--rules",
+        "--session-file",
+        session.to_str().expect("UTF-8 path"),
+        "--api-url",
+        &server.base_url,
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+    // The private-file check refused it, not a flag rule: the mode is named.
+    assert!(
+        text(&output).contains("accessible to group or others (mode 0644)"),
+        "{}",
+        text(&output)
+    );
+    assert!(server.recorded().is_empty());
+    assert_no_secrets(&output);
+}
+
+#[test]
+fn a_rule_label_or_malformed_id_is_a_usage_error_before_any_request() {
+    let fixture = Fixture::new();
+    let session = fixture.session(0o600);
+    let server = serve(|req| panic!("no request may be sent: {req:?}"));
+    for bad in ["R3", "22222222222222222222222222222222", "not-a-uuid"] {
+        let mut args = act_args("--accept", &session, &server.base_url);
+        let at = args.iter().position(|a| *a == RULE_ID).expect("id arg");
+        args[at] = bad;
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{bad}: {}", text(&output));
+        assert!(
+            text(&output).contains("--rules"),
+            "{bad}: {}",
+            text(&output)
+        );
+    }
+    assert!(server.recorded().is_empty());
 }

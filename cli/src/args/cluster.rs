@@ -119,7 +119,8 @@ pub(crate) struct MemoryRuleArgs {
         conflicts_with_all = [
             "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
             "accept", "reject", "remove",
-        ]
+        ],
+        group = "rule_verb"
     )]
     pub(crate) rules: bool,
     /// With --rules, show only rules in this state: proposed, accepted,
@@ -133,7 +134,7 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(
         long,
         value_name = "RULE_ID",
-        group = "rule_action",
+        groups = ["rule_action", "rule_verb"],
         requires_all = ["expected_version", "session_file"],
         conflicts_with_all = [
             "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
@@ -145,7 +146,7 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(
         long,
         value_name = "RULE_ID",
-        group = "rule_action",
+        groups = ["rule_action", "rule_verb"],
         requires_all = ["expected_version", "session_file"],
         conflicts_with_all = [
             "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
@@ -157,7 +158,7 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(
         long,
         value_name = "RULE_ID",
-        group = "rule_action",
+        groups = ["rule_action", "rule_verb"],
         requires_all = ["expected_version", "session_file"],
         conflicts_with_all = [
             "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
@@ -175,8 +176,9 @@ pub(crate) struct MemoryRuleArgs {
     pub(crate) expected_version: Option<i64>,
     /// Private file (mode 0600 or stricter) holding only the value of your
     /// Console session cookie, __Host-curie_console_session. Used by --accept,
-    /// --reject and --remove, which never send the platform key.
-    #[arg(long, value_name = "PATH", requires = "rule_action")]
+    /// --reject and --remove, which never send the platform key. With --rules
+    /// it lists with the session instead of the platform key.
+    #[arg(long, value_name = "PATH", requires = "rule_verb")]
     pub(crate) session_file: Option<PathBuf>,
 }
 

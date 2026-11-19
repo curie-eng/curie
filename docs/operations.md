@@ -3028,8 +3028,9 @@ cap together. Reject and remove never meet either bound.
 
 Refusals carry `detail` with `code`, `message` and `fix`:
 
-1. 403 `memory_rules.write_access_required`: no linked account on the host, or
-   the account cannot write to the repository.
+1. 403 `memory_rules.write_access_required`: no linked account on the host,
+   the account cannot write to the repository, or the link was revoked or
+   changed while GitHub was being read.
 2. 403 `memory_rules.write_access_unverifiable`: the scope is not a GitHub
    repository keyed by its numeric id on a configured code host, its id now
    answers for another repository or none, or the person has more than one

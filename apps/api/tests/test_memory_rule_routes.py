@@ -594,6 +594,45 @@ def test_refusal_principal_without_a_link_needs_write_access(stack: Stack) -> No
     _accepts(stack, rule_id)
 
 
+def _revoke_on_permission_read(link_id: uuid.UUID, revoked: list[uuid.UUID]) -> Override:
+    """Revoke ``link_id`` once, through another connection, while the code host
+    answers the permission read, then let the fake answer it as before."""
+
+    def override(request: httpx.Request) -> httpx.Response | None:
+        if revoked or "/collaborators/" not in request.url.path:
+            return None
+        statement = (
+            "UPDATE curie.identity_links SET revoked_at = now() "
+            "WHERE id = :id AND revoked_at IS NULL RETURNING id"
+        )
+        # This handler runs on the app's event loop; the update needs its own.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            (row,) = pool.submit(pe.rows, statement, {"id": link_id}).result(timeout=60)
+        revoked.append(row["id"])
+        return None
+
+    return override
+
+
+def test_refusal_link_revoked_during_the_code_host_read(stack: Stack) -> None:
+    """The permission read answers ``write``; only the re-read of the exact link
+    under the identity fence, after the provider reads, can refuse."""
+
+    link_id = _link(stack, stack.owner)
+    revoked: list[uuid.UUID] = []
+    stack.overrides.append(_revoke_on_permission_read(link_id, revoked))
+    rule_id = _rule(stack)
+    before = _snapshot(rule_id)
+    response = _decide(stack, rule_id)
+    _refused(response, 403, "memory_rules.write_access_required", rule_id, before)
+    assert revoked == [link_id]
+    assert [r for r in stack.seen if "/collaborators/" in r.url.path]
+    # Liveness: the same flow, with the override spent, accepts on a fresh link.
+    _link(stack, stack.owner)
+    _accepts(stack, rule_id)
+    assert revoked == [link_id]
+
+
 def test_refusal_revoked_link_needs_write_access(stack: Stack) -> None:
     link_id = _link(stack, stack.owner)
     revoked = stack.client.post(
@@ -777,6 +816,23 @@ def test_refusal_invalid_transition(stack: Stack, state: str, action: str) -> No
     _link(stack, stack.owner)
     rule_id = _rule(stack, state=state)
     before = _snapshot(rule_id)
+    response = _decide(stack, rule_id, action)
+    _refused(response, 409, "memory_rules.invalid_transition", rule_id, before)
+    _accepts(stack, _rule(stack))
+
+
+@pytest.mark.parametrize("action", ["accept", "reject", "remove"])
+@pytest.mark.parametrize("state", ["superseded", "discarded"])
+def test_refusal_invalid_transition_from_an_unlisted_state(
+    stack: Stack, state: str, action: str
+) -> None:
+    """A rule the list never shows still answers the transition refusal, not 404.
+    A candidate needs an execution request row this module does not seed."""
+
+    _link(stack, stack.owner)
+    rule_id = _rule(stack, state=state)
+    before = _snapshot(rule_id)
+    assert before[0]["version"] == 1
     response = _decide(stack, rule_id, action)
     _refused(response, 409, "memory_rules.invalid_transition", rule_id, before)
     _accepts(stack, _rule(stack))
