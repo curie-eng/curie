@@ -243,13 +243,18 @@ def _proposed_by_capability(stack: TestClient, request_id: uuid.UUID, rule: str)
     assert response.status_code == 200, response.text
 
 
-def _advance_terminal(
-    stack: TestClient, publication_id: str, state: Literal["merged", "closed"]
+NEXT_HEAD = "2123456789abcdef0123456789abcdef01234567"
+
+
+def _advance(
+    stack: TestClient, publication_id: str, state: Literal["open", "merged", "closed"]
 ) -> None:
-    """The worker's terminal outcome for a revision publication: the pull
-    request was found merged or closed. Called the way ``_open_pr`` calls the
-    service: the route would verify the identity against a live GitHub App,
-    which this PAT-only stack does not have."""
+    """The worker's outcome for a revision publication, called the way
+    ``_open_pr`` calls the service: the route would verify the identity
+    against a live GitHub App, which this PAT-only stack does not have.
+    ``merged`` or ``closed``: the pull request was found terminal at its
+    stored head. ``open``: the revision pushed ``NEXT_HEAD`` onto the open
+    pull request, a normal revision push."""
 
     lease_owner = "rule-lifecycle-worker"
     (leased,) = _rows_of(
@@ -265,6 +270,7 @@ def _advance_terminal(
 
     async def advance() -> None:
         async with stack.app.state.sessionmaker() as session:
+            head = NEXT_HEAD if state == "open" else lineage["head_sha"]
             advanced = await crud_lineages.advance_publication_lineage(
                 session,
                 uuid.UUID(publication_id),
@@ -276,7 +282,7 @@ def _advance_terminal(
                     state=state,
                     pr_number=outcomes.PR_NUMBER,
                     pr_url=outcomes.PR_URL,
-                    head_sha=lineage["head_sha"],
+                    head_sha=head,
                     metadata_updated_at=None,
                 ),
                 identity=VerifiedPublicationIdentity(
@@ -287,11 +293,21 @@ def _advance_terminal(
                     base_ref="main",
                 ),
                 github_html_base="https://github.com",
-                first_parent_proof=None,
+                first_parent_proof=(
+                    await outcomes._first_parent_proof(session, publication_id, head)
+                    if state == "open"
+                    else None
+                ),
             )
-            assert advanced.status == state
+            assert (advanced.status, advanced.head_sha) == (state, head)
 
     stack.portal.call(advance)
+
+
+def _advance_terminal(
+    stack: TestClient, publication_id: str, state: Literal["merged", "closed"]
+) -> None:
+    _advance(stack, publication_id, state)
 
 
 def _rows_of(statement: str, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -304,10 +320,14 @@ def _rows_of(statement: str, params: dict[str, Any]) -> list[dict[str, Any]]:
     return outcomes.with_session(body)
 
 
-@pytest.mark.parametrize("state", ["merged", "closed"])
-def test_a_terminal_publication_advance_settles_the_lineage_candidates(
-    stack: TestClient, auth_headers: dict[str, str], state: Literal["merged", "closed"]
-) -> None:
+def _revision_candidates(
+    stack: TestClient, auth_headers: dict[str, str], rules: tuple[str, ...]
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """An open factory pull request, two revisions from review feedback on it,
+    each proposing the next of ``rules`` (if any) while it runs, and the
+    newer revision's publication approved. Returns the agent, the first
+    publication and the revision publication."""
+
     agent = outcomes._agent(stack, auth_headers)
     switched = stack.patch(
         f"/agents/{agent['agent_id']}",
@@ -326,7 +346,8 @@ def test_a_terminal_publication_advance_settles_the_lineage_candidates(
     outcomes._complete(active)
     _promote_next(active.work_item_id)
     outcomes._start(stack, older.request_id)
-    _proposed_by_capability(stack, older.request_id, RULE_A)
+    if rules:
+        _proposed_by_capability(stack, older.request_id, rules[0])
     newer = outcomes._admit_revision(_review_facts(agent["agent_id"], 2))
     # The older revision ends without publishing. `finish` completes a request
     # only once it published (or with a no-change reply this PAT-only stack
@@ -340,10 +361,11 @@ def test_a_terminal_publication_advance_settles_the_lineage_candidates(
     )
     _promote_next(active.work_item_id)
     outcomes._start(stack, newer.request_id)
-    _proposed_by_capability(stack, newer.request_id, RULE_B)
-    assert [rule["state"] for rule in stored_rules()] == ["candidate", "candidate"]
+    if len(rules) > 1:
+        _proposed_by_capability(stack, newer.request_id, rules[1])
+    assert [rule["state"] for rule in stored_rules()] == ["candidate"] * min(len(rules), 2)
 
-    # The newer revision publishes and finds its pull request terminal.
+    # The newer revision publishes.
     outcomes._execute(
         "UPDATE curie.publications SET outcome_history_ready_at = now() WHERE id = :id",
         {"id": uuid.UUID(publication["id"])},
@@ -351,6 +373,16 @@ def test_a_terminal_publication_advance_settles_the_lineage_candidates(
     revision = outcomes._publish(stack, agent["deployment_id"], base_sha=outcomes.HEAD_SHA)
     assert revision["lineage_id"] == publication["lineage_id"]
     outcomes._resolve(stack, auth_headers, revision["approval_id"])
+    return agent, publication, revision
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+def test_a_terminal_publication_advance_settles_the_lineage_candidates(
+    stack: TestClient, auth_headers: dict[str, str], state: Literal["merged", "closed"]
+) -> None:
+    _agent, publication, revision = _revision_candidates(stack, auth_headers, (RULE_A, RULE_B))
+
+    # The revision finds its pull request terminal.
     _advance_terminal(stack, revision["id"], state)
 
     rows = _by_text()

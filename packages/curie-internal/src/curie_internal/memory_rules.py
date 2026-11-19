@@ -11,8 +11,20 @@ IO and touches no database.
 rule candidates (ADR 0287 decision 5, #5796). Every writer of a terminal
 lineage state calls it inside the transaction of that write: the API's
 ``crud.lineages`` writers through ``curie_api.memory_rule_lifecycle`` and the
-worker's ``PostgresPublicationStore.mark_lineage_terminal`` directly. A new
-terminal lineage writer must call it too.
+worker's ``PostgresPublicationStore.mark_lineage_terminal`` directly. The API's
+lineage reconciler also sweeps terminal lineages that still hold candidates,
+which a writer from before this feature left unsettled. A new terminal lineage
+writer must call it too.
+
+Lock order. Settlement takes no agent row lock: agent deletion locks the agent
+row first and then, through its cascades, the lineage and the rule rows, so a
+settlement that locked the agent after its caller's lineage write could
+deadlock with it. Instead every caller holds the owning agent row ``FOR KEY
+SHARE`` (or, on the publication advance, the WorkItem row, which deletion locks
+second) before it writes the lineage, so deletion and settlement serialize on
+that first row. Settlement then locks the lineage's ``candidate`` rows ``FOR
+UPDATE`` in one fixed order, and a promotion takes the transaction advisory
+lock of its scope (``rule_number_lock_key``) to allocate the number.
 
 Arithmetic fact: the snapshot byte bound can bind before the count bound does.
 Sixteen rules of 240 bytes with small rule numbers still fit (about 3.9 KiB),
@@ -425,6 +437,26 @@ async def select_memory_rules(
 
 _SAFE_SCHEMA = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}")
 _PLATFORM_ACTOR = "platform"
+_NUMBER_LOCK_DOMAIN = b"curie.memory_rules.number"
+
+
+def rule_number_lock_key(agent_id: UUID, scope_kind: str, scope_key: str) -> int:
+    """The ``pg_advisory_xact_lock`` key that serializes number allocation in one scope.
+
+    The key is the first 8 bytes, read as a big-endian signed integer, of the
+    SHA-256 of ``curie.memory_rules.number``, the agent id's canonical text,
+    the scope kind and the scope key, each followed by a NUL byte (NUL cannot
+    occur in any of them). A collision between two scopes only makes them wait
+    for each other; it never shares a number, which the scope's unique index
+    still guards.
+    """
+
+    digest = hashlib.sha256()
+    parts = (_NUMBER_LOCK_DOMAIN, str(agent_id).encode(), scope_kind.encode(), scope_key.encode())
+    for part in parts:
+        digest.update(part)
+        digest.update(b"\x00")
+    return int.from_bytes(digest.digest()[:8], "big", signed=True)
 
 
 async def _settle_one(
@@ -434,7 +466,7 @@ async def _settle_one(
     event: RuleEvent,
     *,
     number: int | None = None,
-) -> None:
+) -> bool:
     to_state = next_state("candidate", event)
     changed = (
         await connection.execute(
@@ -447,7 +479,7 @@ async def _settle_one(
         )
     ).first()
     if changed is None:
-        return
+        return False
     await connection.execute(
         sql_text(
             f'INSERT INTO "{schema}".memory_rule_events '
@@ -464,6 +496,7 @@ async def _settle_one(
             "actor": _PLATFORM_ACTOR,
         },
     )
+    return True
 
 
 async def settle_lineage_candidates(
@@ -472,17 +505,21 @@ async def settle_lineage_candidates(
     lineage_id: UUID,
     terminal_state: str,
     schema: str = "curie",
-) -> None:
-    """Promote, supersede or discard a lineage's rule candidates.
+) -> int:
+    """Promote, supersede or discard a lineage's rule candidates; the count changed.
 
     Runs inside the caller's transaction, after its terminal lineage write and
-    before its commit; it never commits or rolls back. ``merged`` promotes the
-    newest candidate (by ``proposed_at``, then ``id``) to ``proposed`` with the
-    next free number in its scope, allocated under a ``FOR UPDATE`` lock on the
-    owning agent row, and supersedes every older one; ``closed`` discards every
-    candidate. Only ``candidate`` rows change, so a second pass changes
-    nothing. Each change bumps ``version`` and ``updated_at`` and writes one
-    ``memory_rule_events`` row with actor kind ``platform``.
+    before its commit; it never commits or rolls back. The caller already holds
+    the owning agent row ``FOR KEY SHARE`` or the WorkItem row (module
+    docstring). The lineage's ``candidate`` rows are locked ``FOR UPDATE`` in
+    one order, so a concurrent second settlement waits for the first and then
+    finds none. ``merged`` promotes the newest candidate (by ``proposed_at``,
+    then ``id``) to ``proposed`` with the next free number in its scope,
+    allocated under the scope's transaction advisory lock, and supersedes every
+    older one; ``closed`` discards every candidate. Only ``candidate`` rows
+    change, so a second pass changes nothing. Each change bumps ``version`` and
+    ``updated_at`` and writes one ``memory_rule_events`` row with actor kind
+    ``platform``. Returns how many candidates changed.
     """
 
     if terminal_state not in ("merged", "closed"):
@@ -496,7 +533,7 @@ async def settle_lineage_candidates(
                     "SELECT id, tenant_id, agent_id, scope_kind, scope_key "
                     f'FROM "{schema}".memory_rules '
                     "WHERE source_lineage_id = :lineage AND state = 'candidate' "
-                    "ORDER BY proposed_at DESC, id DESC"
+                    "ORDER BY proposed_at DESC, id DESC FOR UPDATE"
                 ),
                 {"lineage": lineage_id},
             )
@@ -505,17 +542,19 @@ async def settle_lineage_candidates(
         .all()
     )
     if not candidates:
-        return
+        return 0
     if terminal_state == "closed":
-        for row in candidates:
-            await _settle_one(connection, schema, row, "discard")
-        return
+        return sum([await _settle_one(connection, schema, row, "discard") for row in candidates])
     newest, older = candidates[0], candidates[1:]
-    # Numbers are allocated per agent scope under the agent row lock, so two
-    # promotions in one scope never take the same number.
+    # Numbers are allocated per agent scope under the scope's advisory lock, so
+    # two promotions in one scope never take the same number.
     await connection.execute(
-        sql_text(f'SELECT id FROM "{schema}".agents WHERE id = :agent FOR UPDATE'),
-        {"agent": newest["agent_id"]},
+        sql_text("SELECT pg_advisory_xact_lock(:key)"),
+        {
+            "key": rule_number_lock_key(
+                newest["agent_id"], newest["scope_kind"], newest["scope_key"]
+            )
+        },
     )
     highest = (
         await connection.execute(
@@ -526,7 +565,7 @@ async def settle_lineage_candidates(
             {"agent": newest["agent_id"], "kind": newest["scope_kind"], "key": newest["scope_key"]},
         )
     ).scalar()
-    for row in older:
-        await _settle_one(connection, schema, row, "supersede")
+    changed = [await _settle_one(connection, schema, row, "supersede") for row in older]
     current = highest if isinstance(highest, int) else 0
-    await _settle_one(connection, schema, newest, "promote", number=current + 1)
+    changed.append(await _settle_one(connection, schema, newest, "promote", number=current + 1))
+    return sum(changed)

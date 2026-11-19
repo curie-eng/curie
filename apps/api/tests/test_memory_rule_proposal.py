@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from curie_api import memory_rule_lifecycle
+from curie_api import factory_tracker_result_runtime, memory_rule_lifecycle, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.forges.types import PullRequest, PullRequestRef, PullRequestState
 from curie_api.issue_read_token import mint, verify_claims
@@ -342,6 +342,54 @@ def test_completion_contract_offers_rule_proposal_only_to_eligible_revisions(
 
     # The offers above did not touch the eligible revisions.
     assert contract(client, run.capability).json()["rule_proposal"] is True
+    assert stored_rules() == []
+
+
+def test_completion_contract_answers_rule_proposal_false_for_a_cancelled_work_item(
+    rules: tuple[TestClient, ReviewGitHubAPI], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1's cancelled case. A WorkItem cancelled before the call is refused
+    409 by the precheck fence (the test above), so its run starts no model. A
+    cancellation that lands after that fence and before the eligibility read
+    is the reachable case: the contract answers 200 with ``rule_proposal``
+    false. The cancel is injected at that seam through the real cancellation
+    write, wrapping the precheck the route calls."""
+
+    client, api = rules
+    run = eligible_revision(client, api)
+    (row,) = _rows("SELECT version FROM curie.work_items WHERE id = :id", {"id": run.work_item_id})
+    precheck = factory_tracker_result_runtime.contract_precheck
+
+    async def precheck_then_cancel(session: AsyncSession, pair: Any) -> Any:
+        view = await precheck(session, pair)
+        # The route rolls back right after the precheck; doing it first lets
+        # the cancellation take the rows the precheck read.
+        await session.rollback()
+        async with client.app.state.sessionmaker() as other:
+            await workitem_dispatch.cancel(
+                other, work_item_id=run.work_item_id, expected_version=row["version"]
+            )
+            await other.commit()
+        return view
+
+    with monkeypatch.context() as patch:
+        patch.setattr(factory_tracker_result_runtime, "contract_precheck", precheck_then_cancel)
+        answered = contract(client, run.capability)
+
+    (after,) = _rows(
+        "SELECT cancelled_at FROM curie.work_items WHERE id = :id", {"id": run.work_item_id}
+    )
+    assert after["cancelled_at"] is not None
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["completion_contract"] == "implementation"
+    assert answered.json()["rule_proposal"] is False
+    assert eligibility(run) is None
+
+    # The next call meets the fence: refused, with no offer at all.
+    refused = contract(client, run.capability)
+    assert refused.status_code == 409, refused.text
+    assert code(refused) == "invalid_context"
+    assert "rule_proposal" not in refused.text
     assert stored_rules() == []
 
 

@@ -119,7 +119,12 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   lineage write (the `crud/lineages.py` writers and the worker's
   `PostgresPublicationStore.mark_lineage_terminal`) settles that lineage's
   candidates in its own transaction through the one shared
-  `curie_internal.memory_rules.settle_lineage_candidates`.
+  `curie_internal.memory_rules.settle_lineage_candidates`, and the lineage
+  reconciler's pass settles any terminal lineage still holding a candidate
+  (one an older replica recorded during a rolling upgrade). Every proposal and
+  settlement holds the agent row `FOR KEY SHARE` (or, on the publication
+  advance, the WorkItem row) before its request and lineage locks, the order
+  agent deletion takes; settlement itself never locks the agent row.
   State and other scoped credentials do not authorize these routes, and `wir`
   authorizes no other route.
 - **Channel read is a scoped credential exception (ADR 0100, #2877).**

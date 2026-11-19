@@ -612,6 +612,20 @@ class PostgresPublicationStore:
             "first_parent_sha": first_parent_sha,
         }
         async with self._engine.begin() as connection:
+            # The owning agent row first, the order agent deletion takes, so the
+            # rule settlement below never deadlocks with it
+            # (curie_internal.memory_rules lock order).
+            await connection.execute(
+                text(
+                    f"""
+                    SELECT a.id FROM "{self._schema}".agents a
+                      JOIN {self._lineages} l ON l.agent_id = a.id
+                     WHERE l.id = :lineage_id
+                       FOR KEY SHARE OF a
+                    """
+                ),
+                parameters,
+            )
             publication = (
                 await connection.execute(
                     text(

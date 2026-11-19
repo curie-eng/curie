@@ -15,12 +15,19 @@ its scope and every older one ``superseded``; on ``closed`` every candidate
 becomes ``discarded``. Only ``candidate`` rows change, so a second pass over a
 terminal lineage changes nothing.
 
-Lock order. A proposal takes its request row (``FOR KEY SHARE``) and then its
+Lock order, agent first, the order agent deletion takes (it locks the agent
+row, then the WorkItems, and reaches requests, rules and lineages through its
+deletes and cascades). A proposal takes the agent row (``FOR KEY SHARE``,
+``lock_rule_owner``), then its request row (``FOR KEY SHARE``) and then its
 lineage row (``FOR SHARE``) before it rechecks eligibility and inserts. A
-terminal writer updates the lineage row (after locking the publication's
-WorkItem and request rows, on the publication path) and only then settles,
-locking the agent row. A proposal therefore either commits before the terminal
-write and is settled by it, or waits for it and is refused as ineligible.
+terminal writer takes the agent row ``FOR KEY SHARE`` too (or, on the
+publication advance, the WorkItem and request rows) before it updates the
+lineage row, and only then settles, which locks the lineage's candidate rows
+and never the agent row (``curie_internal.memory_rules``). A proposal
+therefore either commits before the terminal write and is settled by it, or
+waits for it and is refused as ineligible; and agent deletion either waits for
+a proposal or settlement, or runs first and leaves it refused or with nothing
+to settle.
 """
 
 from __future__ import annotations
@@ -186,15 +193,16 @@ async def propose_candidate(
     """
 
     try:
-        if (
-            await rule_proposal_eligibility(
-                session, request_id=request_id, work_item_id=work_item_id
-            )
-            is None
-        ):
+        first = await rule_proposal_eligibility(
+            session, request_id=request_id, work_item_id=work_item_id
+        )
+        if first is None:
             raise ProposalRefused(NOT_ELIGIBLE)
         text = validate_rule_text(rule)
         why = validate_reason(reason)
+        # Agent first (module docstring): an agent deleted meanwhile is gone.
+        if not await lock_rule_owner(session, first.agent_id):
+            raise ProposalRefused(NOT_ELIGIBLE)
         await session.execute(
             select(ExecutionRequest.id)
             .where(ExecutionRequest.id == request_id)
@@ -216,7 +224,11 @@ async def propose_candidate(
         eligible = await rule_proposal_eligibility(
             session, request_id=request_id, work_item_id=work_item_id
         )
-        if eligible is None or eligible.lineage_id != lineage_id:
+        if (
+            eligible is None
+            or eligible.lineage_id != lineage_id
+            or eligible.agent_id != first.agent_id
+        ):
             raise ProposalRefused(NOT_ELIGIBLE)
         if (
             await session.scalar(
@@ -272,17 +284,35 @@ async def propose_candidate(
         raise
 
 
+async def lock_rule_owner(session: AsyncSession, agent_id: uuid.UUID) -> bool:
+    """Hold the agent row ``FOR KEY SHARE``; False when the agent is gone.
+
+    Every transaction that proposes or settles a learned rule takes this first
+    (module docstring), so agent deletion, which locks the agent row ``FOR
+    UPDATE`` before anything else, serializes with it instead of deadlocking.
+    """
+
+    return (
+        await session.scalar(
+            select(Agent.id).where(Agent.id == agent_id).with_for_update(read=True, key_share=True)
+        )
+    ) is not None
+
+
 async def settle_lineage_rule_candidates(
     session: AsyncSession,
     lineage_id: uuid.UUID,
     terminal_state: str,
-) -> None:
+) -> int:
     """Promote, supersede or discard the lineage's candidates (ADR 0287 decision 5).
 
     Runs inside the caller's transaction, after its terminal lineage write and
     before its commit; it never commits or rolls back. The one implementation
     is ``curie_internal.memory_rules.settle_lineage_candidates``, which the
-    worker's terminal lineage write calls too.
+    worker's terminal lineage write calls too. Returns how many candidates
+    changed.
     """
 
-    await settle_lineage_candidates(session, lineage_id=lineage_id, terminal_state=terminal_state)
+    return await settle_lineage_candidates(
+        session, lineage_id=lineage_id, terminal_state=terminal_state
+    )
