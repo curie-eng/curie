@@ -26,11 +26,19 @@ For Claude Code, use `--agent claude-code`. Other supported clients are `copilot
 `gemini` and `cursor`. The same [client directories and refresh behavior](factory-preparation.md#get-the-skill)
 apply, with the folder named `review-pr`. Add `--global` for use across
 repositories, `--dir DIR` for an exact existing project directory, or `--dry-run`
-to inspect the destinations. The command installs both `prepare-factory-ticket`
-and `review-pr` offline, with only Markdown payloads.
+to inspect the destinations. The command installs the bundled factory skills,
+including `prepare-factory-ticket` and `review-pr`, offline with only Markdown
+payloads.
 It requires no Python, Docker or running Curie deployment. Project tests still
 require the project's tooling. Installer receipts prove copied files, not client
 activation or access to a factory.
+
+Claude Cowork uses skills uploaded to the Claude account, not files installed in
+Claude Code's local `.claude/skills/` directory. To use this skill in Cowork,
+ZIP the `review-pr/` folder with its `SKILL.md` and both `references/` files,
+then upload it in Claude under Customize > Skills > + Create skill > Upload a
+skill. Enable the uploaded skill before opening a new Cowork task. The CLI
+installer's `--agent claude-code` option does not upload a skill to Cowork.
 
 In Codex, refresh the session if necessary, then start with:
 

@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Explain a pull request for an architect, including its purpose, system impact, runtime flows, tests, algorithms, data changes and risks. Guide local verification and separately approved feedback or completion through existing host tools.
+description: Review a PR for an architect. Explain its purpose, system impact, runtime flows, tests, algorithms, data changes and risks. Guide local verification and approved feedback.
 ---
 
 # Review a pull request
