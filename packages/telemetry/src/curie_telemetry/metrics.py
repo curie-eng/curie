@@ -709,6 +709,7 @@ _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
         "publish_terminate_wakes",
         "settle_overdue_cancellations",
         "readmit_pending",
+        "drain_answer_retries",
         "reconcile_missed_labels",
         "poll_trackers",
         "sync_status_comments",

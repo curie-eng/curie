@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
@@ -43,7 +43,7 @@ from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
-from .models import AgentChannel, WorkItem
+from .models import AgentChannel, FactoryPollCursor, WorkItem
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name
 from .workspace_policy import repository_is_allowed
 
@@ -136,6 +136,75 @@ async def reconcile_missed_labels(
     return admitted
 
 
+async def drain_webhook_answer_retries(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> None:
+    """Read again the answers a webhook deferred with a 503 (#5787).
+
+    GitHub never redelivers that 503 by itself, so in webhook mode the work
+    item reconciler calls this on every tick, whatever the label sweep's
+    interval; in poll mode the poll pass drains the same keys. One query finds
+    the cursor rows holding any ``answer-retry:`` key, so a tick with none
+    costs only that. Each scope is read with its repository's installation
+    token and tracker, as the label sweep reads it.
+    """
+
+    keys = func.jsonb_object_keys(FactoryPollCursor.etags).table_valued("key").render_derived()
+    async with sessionmaker() as session:
+        rows = (
+            await session.execute(
+                select(FactoryPollCursor.tracker_scope_id, FactoryPollCursor.scope_path).where(
+                    FactoryPollCursor.tracker_kind == GITHUB,
+                    select(keys.c.key)
+                    .where(keys.c.key.startswith(github_factory.ANSWER_RETRY))
+                    .exists(),
+                )
+            )
+        ).all()
+    if not rows:
+        return
+    from .factory_poll_intake import drain_answer_retries
+
+    registry = forges_registry(settings)
+    intake = factory_tracker(registry)
+    for scope_id, scope_path in rows:
+        try:
+            repo = normalize_repo_full_name(scope_path)
+        except InvalidRepoFullName:
+            continue
+        if not repository_is_allowed(repo, settings.github_repo_allowlist):
+            continue
+        try:
+            installation_id, token = await run_in_threadpool(
+                factory_credentials(registry).fresh_installation_token, repo, None
+            )
+            repository = await read_repository(
+                client, api=intake.config.api_url, repo_full_name=repo, token=token
+            )
+            repository_id = repository.get("id")
+            if type(repository_id) is not int or str(repository_id) != scope_id:
+                # Renamed away or replaced: this scope is not this name now.
+                logger.info("factory answer retries for %s deferred: scope moved", repo)
+                continue
+            await drain_answer_retries(
+                sessionmaker,
+                settings,
+                intake.for_repository(
+                    client,
+                    repo_full_name=repo,
+                    repository_id=repository_id,
+                    token=static_token(token),
+                ),
+                installation_id=installation_id,
+            )
+        except Unavailable as exc:
+            logger.info("factory answer retries for %s deferred: %s unavailable", repo, exc)
+        except (GitHubAppError, GitHubInstallationRefused, ValueError):
+            logger.info("factory answer retries for %s deferred: no installation", repo)
+
+
 async def _reconcile_repository(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -158,19 +227,6 @@ async def _reconcile_repository(
     repository_id = repository.get("id")
     if type(repository_id) is not int or repository_id <= 0:
         raise Unavailable(f"/repos/{repo}")
-    # This pass runs only in webhook mode, where nothing else reads again an
-    # answer the webhook deferred with a 503 (#5787); the poll pass drains the
-    # same keys in poll mode.
-    from .factory_poll_intake import drain_answer_retries
-
-    await drain_answer_retries(
-        sessionmaker,
-        settings,
-        intake.for_repository(
-            client, repo_full_name=repo, repository_id=repository_id, token=static_token(token)
-        ),
-        installation_id=installation_id,
-    )
     admitted = 0
     for label in labels:
         tracker = intake.for_repository(

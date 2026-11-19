@@ -2373,6 +2373,7 @@
           "publish_terminate_wakes",
           "settle_overdue_cancellations",
           "readmit_pending",
+          "drain_answer_retries",
           "reconcile_missed_labels",
           "poll_trackers",
           "sync_status_comments",
@@ -2384,7 +2385,7 @@
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 17
+      "cardinality_bound": 18
     },
     "curie.work_item.reconciler.step.consecutive_failures": {
       "type": "gauge",
@@ -2404,6 +2405,7 @@
           "publish_terminate_wakes",
           "settle_overdue_cancellations",
           "readmit_pending",
+          "drain_answer_retries",
           "reconcile_missed_labels",
           "poll_trackers",
           "sync_status_comments",
@@ -2415,7 +2417,7 @@
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 17
+      "cardinality_bound": 18
     },
     "curie.eval.process": {
       "type": "counter",

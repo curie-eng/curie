@@ -46,6 +46,7 @@ from typing import Any, Literal
 import httpx
 from curie_telemetry import record_metric
 from sqlalchemy import Text, cast, desc, func, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 from starlette.concurrency import run_in_threadpool
@@ -921,13 +922,17 @@ async def drain_answer_retries(
     tracker: GitHubTracker,
     *,
     installation_id: int,
-) -> None:
-    """Retry the ``answer-retry:`` keys of ``tracker``'s scope where no poll
-    pass runs: in webhook mode the webhook records them (a 503 GitHub never
-    redelivers) and the missed-label reconciler calls this.
+    serves: bool = True,
+) -> set[int]:
+    """Retry the ``answer-retry:`` keys of ``tracker``'s scope (#5787) and
+    return the comment ids decided as answers.
 
-    Each settled key is removed on its own (jsonb ``-``), never by rewriting
-    the cursor, so a key a webhook adds meanwhile is kept.
+    The poll pass calls this before its listing; in webhook mode, where the
+    webhook records the keys (a 503 GitHub never redelivers), the work item
+    reconciler does. The keys are read from the row as it is now, and each
+    settled key is removed on its own (jsonb ``-``), never by rewriting the
+    cursor, so a key a webhook adds meanwhile is kept. A repository no surface
+    serves drops its keys unread.
     """
 
     scope = (tracker.kind, tracker.host, str(tracker.repository_id))
@@ -937,20 +942,25 @@ async def drain_answer_retries(
     keys = {
         key: trailing_id(key.replace(":", "/")) for key in etags if key.startswith(ANSWER_RETRY)
     }
-    results = await retry_answers(
-        sessionmaker,
-        settings,
-        tracker,
-        installation_id=installation_id,
-        comment_ids=[comment_id for comment_id in keys.values() if comment_id is not None],
+    results = (
+        await retry_answers(
+            sessionmaker,
+            settings,
+            tracker,
+            installation_id=installation_id,
+            comment_ids=[comment_id for comment_id in keys.values() if comment_id is not None],
+        )
+        if serves
+        else {}
     )
+    handled = {comment_id for comment_id, result in results.items() if result == "handled"}
     done = [
         key
         for key, comment_id in keys.items()
         if comment_id is None or results.get(comment_id) != "deferred"
     ]
     if not done:
-        return
+        return handled
     async with sessionmaker() as session:
         for key in done:
             await session.execute(
@@ -966,6 +976,25 @@ async def drain_answer_retries(
                 )
             )
         await session.commit()
+    return handled
+
+
+def _edited_before(comment: dict[str, Any], threshold: datetime | None) -> bool:
+    """Whether a listed comment is an edit of one an earlier pass already saw.
+
+    Created before the listing's threshold, it is listed only for a newer
+    ``updated_at``. Created in the threshold's own second, which the inclusive
+    ``since`` lists again, it is an edit only when ``updated_at`` is later than
+    ``created_at``; a reply posted in that second is new.
+    """
+
+    created = parse_time(comment.get("created_at"))
+    if created is None or threshold is None:
+        return False
+    if created < threshold:
+        return True
+    updated = parse_time(comment.get("updated_at"))
+    return created == threshold and updated is not None and updated > created
 
 
 async def _admit_mentions(
@@ -1014,28 +1043,10 @@ async def _admit_mentions(
             logger.info("factory facts observation deferred reason=unreadable")
         else:
             cursor.etags.pop(key, None)
-    answer_keys: dict[str, int] = {}
-    for key in list(cursor.etags):
-        if not key.startswith(ANSWER_RETRY):
-            continue
-        retry_id = trailing_id(key.replace(":", "/"))
-        if retry_id is None or not serves:
-            cursor.etags.pop(key, None)
-            continue
-        answer_keys[key] = retry_id
-    retries = await retry_answers(
-        sessionmaker,
-        settings,
-        tracker,
-        installation_id=installation_id,
-        comment_ids=answer_keys.values(),
+    # A comment decided as an answer here is not decided again by the listing.
+    retried |= await drain_answer_retries(
+        sessionmaker, settings, tracker, installation_id=installation_id, serves=serves
     )
-    for key, retry_id in answer_keys.items():
-        if retries[retry_id] != "deferred":
-            cursor.etags.pop(key, None)
-        if retries[retry_id] == "handled":
-            # Decided as an answer: the listing must not decide it again.
-            retried.add(retry_id)
     since = since_param(cursor.comments_since, now)
     listed, etag = await tracker.issue_comments_since(since, cursor.etags.get("issue-comments"))
     threshold = parse_time(since)
@@ -1083,16 +1094,7 @@ async def _admit_mentions(
             and answer_on not in owned_pulls
             and (answer_on in answering or (mentioned and answer_on in factory_issues))
         ):
-            created = parse_time(comment.get("created_at"))
-            if (
-                answer_on in answering
-                and created is not None
-                and threshold is not None
-                and created < threshold
-            ):
-                # Created before this listing's threshold, so listed only for a
-                # newer ``updated_at``: an edit of a comment an earlier pass
-                # already saw, never a new answer or mention.
+            if answer_on in answering and _edited_before(comment, threshold):
                 continue
             notice = _answer_notice(
                 comment, tracker, installation_id=installation_id, mention=mentioned
@@ -1102,7 +1104,17 @@ async def _admit_mentions(
                     if await _admit_answer(sessionmaker, settings, tracker, notice, comment):
                         continue
                 except (ForgeError, FeedbackUnavailable):
-                    cursor.etags[f"{ANSWER_RETRY}{notice.comment_id}"] = "pending"
+                    assert notice.comment_id is not None
+                    async with sessionmaker() as session:
+                        await github_factory.add_answer_retry(
+                            session,
+                            kind=tracker.kind,
+                            host=tracker.host,
+                            scope_id=str(repository_id),
+                            scope_path=repo,
+                            comment_id=notice.comment_id,
+                        )
+                        await session.commit()
                     logger.info("factory answer deferred comment=%s", notice.comment_id)
                     continue
         if comment.get("performed_via_github_app") is not None:
@@ -1262,7 +1274,13 @@ async def _load_cursor(sessionmaker: async_sessionmaker[AsyncSession], scope: _S
         if row is None:
             return Cursor()
         raw = row.etags if isinstance(row.etags, dict) else {}
-        etags = {str(key): value for key, value in raw.items() if isinstance(value, str)}
+        # ``answer-retry:`` keys are read from the row when they are retried,
+        # never carried in the pass's cursor (#5787).
+        etags = {
+            str(key): value
+            for key, value in raw.items()
+            if isinstance(value, str) and not str(key).startswith(ANSWER_RETRY)
+        }
         return Cursor(
             comments_since=row.comments_since,
             review_comments_since=row.review_comments_since,
@@ -1274,10 +1292,19 @@ async def _load_cursor(sessionmaker: async_sessionmaker[AsyncSession], scope: _S
 async def _save_cursor(
     sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope, cursor: Cursor, *, labels: bool
 ) -> None:
+    """Write the pass's share of the scope's cursor row.
+
+    The row is read FOR UPDATE, so this read-modify-write of the other keys
+    cannot interleave with another writer. ``answer-retry:`` keys belong to
+    neither half: they are kept as the row holds them now, since only the
+    atomic add (`github_factory.add_answer_retry`) and the drain's removal
+    change them (#5787).
+    """
+
     async with sessionmaker() as session:
-        row = await session.get(FactoryPollCursor, scope.key)
-        if row is None:
-            row = FactoryPollCursor(
+        await session.execute(
+            pg_insert(FactoryPollCursor)
+            .values(
                 tracker_kind=scope.kind,
                 tracker_host=scope.host,
                 tracker_scope_id=scope.scope_id,
@@ -1285,24 +1312,36 @@ async def _save_cursor(
                 comments_since=cursor.comments_since,
                 review_comments_since=cursor.review_comments_since,
                 reviews_since=cursor.reviews_since,
-                etags=dict(cursor.etags),
+                etags={},
                 updated_at=datetime.now(UTC),
             )
-            session.add(row)
-        else:
-            row.scope_path = scope.path
-            if not labels:
-                row.comments_since = cursor.comments_since
-                row.review_comments_since = cursor.review_comments_since
-                row.reviews_since = cursor.reviews_since
+            .on_conflict_do_nothing(
+                index_elements=[
+                    FactoryPollCursor.tracker_kind,
+                    FactoryPollCursor.tracker_host,
+                    FactoryPollCursor.tracker_scope_id,
+                ]
+            )
+        )
+        row = await session.get(
+            FactoryPollCursor, scope.key, with_for_update=True, populate_existing=True
+        )
+        assert row is not None
+        row.scope_path = scope.path
+        if not labels:
+            row.comments_since = cursor.comments_since
+            row.review_comments_since = cursor.review_comments_since
+            row.reviews_since = cursor.reviews_since
 
-            def owned(key: str) -> bool:
-                return (key == "issues" or key.startswith("issues:")) == labels
+        def owned(key: str) -> bool:
+            if key.startswith(ANSWER_RETRY):
+                return False
+            return (key == "issues" or key.startswith("issues:")) == labels
 
-            previous = row.etags if isinstance(row.etags, dict) else {}
-            row.etags = {
-                **{key: value for key, value in previous.items() if not owned(key)},
-                **{key: value for key, value in cursor.etags.items() if owned(key)},
-            }
-            row.updated_at = datetime.now(UTC)
+        previous = row.etags if isinstance(row.etags, dict) else {}
+        row.etags = {
+            **{key: value for key, value in previous.items() if not owned(key)},
+            **{key: value for key, value in cursor.etags.items() if owned(key)},
+        }
+        row.updated_at = datetime.now(UTC)
         await session.commit()

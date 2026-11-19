@@ -37,7 +37,6 @@ import sys
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -50,12 +49,13 @@ import test_factory_tracker_results as tr
 from curie_api import factory_questions
 from curie_api.config import get_settings
 from curie_api.factory_facts_schema import REQUEST_MARKER
-from curie_api.factory_label_reconcile import reconcile_missed_labels
 from curie_api.factory_poll_intake import poll_once
 from curie_api.forges.types import TrackerIssueRef
 from curie_api.github_factory_events import FactoryNotice
 from curie_api.main import create_app
 from curie_api.workitem_dispatch import DispatchConflict, acquire
+from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
 from forge_fakes import factory_wake
 from forge_fakes.github import (
@@ -71,12 +71,14 @@ from forge_fakes.github import (
     PlantedIssue,
     _issue_event,
     _post,
+    _signature,
     fake_installation_tokens,
 )
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _rows,
     comments,
 )
+from redis.asyncio import Redis
 from test_factory_question_ending import _ask, _request, _requests, _round_row, _take_over
 
 PATHS = ("webhook", "poll")
@@ -139,7 +141,7 @@ def world(comments: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[World]:
     github.grant(MAINTAINER, "maintain")
     github.grant(READER, "read")
     with TestClient(create_app()) as client:
-        external = httpx.AsyncClient(transport=httpx.MockTransport(github.handle))
+        external = httpx.AsyncClient(transport=httpx.MockTransport(github.handle_async))
         client.app.state.http_client = external
         created = client.post(
             "/agents",
@@ -777,28 +779,43 @@ def test_posting_window_answer_is_admitted_once(world: World, path: str) -> None
     assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
 
 
-def _reconcile(world: World) -> int:
-    """One webhook mode missed-label reconciler pass, its production entry point."""
+def _reconciler_tick(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One `WorkItemReconciler` tick, its scheduled entry point, with the
+    clients it opens behind the GitHub stand-in."""
 
-    client = world.client
+    github = world.github
+    original = httpx.AsyncClient
 
-    async def go() -> int:
-        return await reconcile_missed_labels(
-            client.app.state.sessionmaker,
-            get_settings(),
-            client.app.state.http_client,
-            now=datetime.now(UTC),
-        )
+    class Client(original):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["transport"] = httpx.MockTransport(github.handle_async)
+            super().__init__(*args, **kwargs)
 
-    admitted: int = client.portal.call(go)
-    return admitted
+    async def go() -> None:
+        valkey = Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+        try:
+            await WorkItemReconciler(
+                world.client.app.state.sessionmaker, valkey, get_settings()
+            ).run_once()
+        finally:
+            await valkey.aclose()
+
+    with monkeypatch.context() as patched:
+        patched.setattr(httpx, "AsyncClient", Client)
+        world.client.portal.call(go)
 
 
-def test_posting_window_answer_is_admitted_by_the_reconciler(world: World) -> None:
+def test_posting_window_answer_is_admitted_by_the_reconciler_tick(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Webhook mode: GitHub never redelivers the 503 by itself, so the webhook
-    keeps the comment in its scope's cursor and the reconciler reads it again."""
+    keeps the comment in its scope's cursor and every reconciler tick reads
+    it again, even with the missed-label sweep switched off."""
 
-    assert get_settings().factory_intake == "webhook"
+    monkeypatch.setenv("FACTORY_RECONCILE_INTERVAL_S", "0")
+    get_settings.cache_clear()
+    settings = get_settings()
+    assert (settings.factory_intake, settings.factory_reconcile_interval_s) == ("webhook", 0)
     number = 6192
     triage = _running(world, number)
     world.github.store_then_fail = 502
@@ -814,16 +831,91 @@ def test_posting_window_answer_is_admitted_by_the_reconciler(world: World) -> No
     _settle(triage)
     assert _ids(triage) == [triage.request_id]
 
-    _reconcile(world)
+    _reconciler_tick(world, monkeypatch)
 
     expected = _answer_id(triage, comment)
     assert _ids(triage) == [triage.request_id, expected]
     assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
     assert _retry_keys() == set()
 
-    _reconcile(world)
+    _reconciler_tick(world, monkeypatch)
 
     assert _ids(triage) == [triage.request_id, expected]
+    assert _retry_keys() == set()
+
+
+def test_posting_window_webhook_key_survives_a_concurrent_poll_pass(world: World) -> None:
+    """A webhook records its key after a poll pass loaded its cursor; the
+    pass's cursor save keeps it, and the next pass's drain admits the answer."""
+
+    number = 6193
+    triage = _running(world, number)
+    world.github.store_then_fail = 502
+    assert _ask(triage).status_code == 503
+    world.github.tick()
+    answered: list[dict[str, Any]] = []
+    app = world.client.app
+
+    async def answer_mid_pass() -> None:
+        # Posted after the pass's listing was answered, so the pass never
+        # lists it; delivered while the pass still holds its cursor.
+        comment = world.github.add_comment(number, ANSWER, user=WRITER)
+        answered.append(comment)
+        body = json.dumps(_payload(comment, number)).encode()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as webhook:
+            response = await webhook.post(
+                "/github/webhook",
+                content=body,
+                headers={
+                    "X-GitHub-Delivery": str(uuid.uuid4()),
+                    "X-GitHub-Event": "issue_comment",
+                    "X-Hub-Signature-256": _signature(body),
+                    "Content-Type": "application/json",
+                },
+            )
+        assert response.status_code == 503, response.text
+
+    world.github.after_listing = answer_mid_pass
+
+    _poll(world)
+
+    (comment,) = answered
+    assert _retry_keys() == {f"answer-retry:{comment['id']}"}
+    assert _ids(triage) == [triage.request_id]
+    assert _ask(triage).status_code == 200
+    _settle(triage)
+
+    _poll(world)
+
+    expected = _answer_id(triage, comment)
+    assert _ids(triage) == [triage.request_id, expected]
+    assert _receipts(triage) == {str(comment["id"]): ("admitted", expected)}
+    assert _retry_keys() == set()
+
+
+def test_posting_window_answer_edited_into_facts_is_never_an_answer(world: World) -> None:
+    """A deferred comment whose body becomes a facts request before its retry
+    goes to the facts exchange: no answer and no mention request."""
+
+    number = 6194
+    triage = _running(world, number)
+    world.github.store_then_fail = 502
+    assert _ask(triage).status_code == 503
+    world.github.tick()
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+    _poll(world)
+    assert _retry_keys() == {f"answer-retry:{comment['id']}"}
+    world.github.tick()
+    world.github.edit_comment(comment["id"], _facts_body())
+    assert _ask(triage).status_code == 200
+    _settle(triage)
+
+    _poll(world)
+
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
     assert _retry_keys() == set()
 
 
@@ -954,5 +1046,73 @@ def test_refused_payload_claims_another_author(world: World) -> None:
 
     assert response.status_code == 200, response.text
     assert _code(response.json()) == "answer_not_authorized", response.text
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+
+
+def test_refused_edit_at_the_cursor_boundary(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refused comment is the newest a pass lists, so the next listing's
+    inclusive threshold is its own second; its later edit is still an edit."""
+
+    caplog.set_level(logging.INFO)
+    number = 6207
+    triage = _outstanding(world, number)
+    world.github.tick()
+    refused = world.github.add_comment(number, ANSWER, user=READER)
+    _poll(world)
+    assert _refusals(caplog, refused) == {"answer_not_authorized"}
+    world.github.grant(READER, "write")
+    world.github.tick()
+    world.github.edit_comment(refused["id"], "Replace the rows on a re-run, please.")
+
+    _poll(world)
+
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+
+
+def test_boundary_reply_in_the_cursor_second_is_new(world: World) -> None:
+    """A reply created in the threshold's own second and never edited is new."""
+
+    number = 6208
+    triage = _outstanding(world, number)
+    question = _question(world, number)
+    _poll(world)
+    reply = world.github.add_comment(number, ANSWER, user=WRITER)
+    assert reply["created_at"] == reply["updated_at"] == question["created_at"]
+
+    _poll(world)
+
+    expected = _answer_id(triage, reply)
+    assert _ids(triage) == [triage.request_id, expected]
+    assert _receipts(triage) == {str(reply["id"]): ("admitted", expected)}
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_refused_retained_service_item_in_personal_mode(
+    world: World, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, path: str
+) -> None:
+    """A WorkItem kept from service mode is refused an answer once the install
+    runs personal mode, with the code a mention gets."""
+
+    caplog.set_level(logging.INFO)
+    number = 6209 if path == "webhook" else 6210
+    triage = _outstanding(world, number)
+    (item,) = _rows(
+        "SELECT model_auth_mode FROM curie.work_items WHERE id = :id",
+        {"id": triage.work_item_id},
+    )
+    assert item["model_auth_mode"] == "service"
+    monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", "personal")
+    get_settings.cache_clear()
+    comment = world.github.add_comment(number, ANSWER, user=WRITER)
+
+    result = _deliver(world, path, comment, number)
+
+    if result is not None:
+        assert _code(result) == "personal_owner_required", result
+    assert _refusals(caplog, comment) == {"personal_owner_required"}
     assert _ids(triage) == [triage.request_id]
     assert _receipts(triage) == {}

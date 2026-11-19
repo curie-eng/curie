@@ -16,6 +16,7 @@ import itertools
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -552,6 +553,9 @@ class IssueCommentsAPI(GitHubAPI):
        https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
     5. ``store_then_fail``: the next comment create is stored, then answered
        with that status, as when GitHub's response is lost after the write.
+    6. ``after_listing``: a step `handle_async` runs once, after the next
+       repository-wide listing is answered and before the caller reads it, so
+       a test can make something happen in the middle of a poll pass.
 
     Issue state and labels per issue come from `GitHubAPI.planted_issues`.
     The repository issue and review comment listings answer empty
@@ -565,6 +569,7 @@ class IssueCommentsAPI(GitHubAPI):
         self.stored: dict[int, dict[str, Any]] = {}
         self.collaborators: dict[str, tuple[int, str]] = {}
         self.store_then_fail: int | None = None
+        self.after_listing: Callable[[], Awaitable[None]] | None = None
         self.answer_listings = True
 
     def tick(self, seconds: int = 1) -> None:
@@ -613,6 +618,20 @@ class IssueCommentsAPI(GitHubAPI):
         return [
             self.stored[key] for key in sorted(self.stored) if self.stored[key]["issue_url"] == url
         ]
+
+    async def handle_async(self, request: httpx.Request) -> httpx.Response:
+        """`handle` for an async client, running ``after_listing`` once."""
+
+        response = self.handle(request)
+        step = self.after_listing
+        if (
+            step is not None
+            and request.method == "GET"
+            and request.url.path == f"/repos/{REPO}/issues/comments"
+        ):
+            self.after_listing = None
+            await step()
+        return response
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path

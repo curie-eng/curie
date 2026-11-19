@@ -80,7 +80,7 @@ from .models import (
     PersonalClaudeEnrollment,
     WorkItem,
 )
-from .personal_execution import OwnerContext
+from .personal_execution import ModelAuthMode, OwnerContext, existing_work_item_refusal
 from .workitem_dispatch import Admission, DispatchConflict
 from .workspace_policy import repository_is_allowed
 
@@ -840,7 +840,7 @@ TICKET_CLOSED = "ticket_closed"
 TRIGGER_LABEL_ABSENT = "trigger_label_absent"
 COMMENT_UNAVAILABLE = "comment_unavailable"
 # The poll cursor key prefix of an answer comment to read again (#5787): the
-# poll pass, or in webhook mode the missed-label reconciler, drains it.
+# poll pass, or in webhook mode the work item reconciler, drains it.
 ANSWER_RETRY = "answer-retry:"
 # Rows a comment can answer, or will once the round's tracker write lands.
 _ANSWERABLE = frozenset(
@@ -877,30 +877,33 @@ def _facts_request(body: object) -> bool:
     return True
 
 
-async def record_answer_retry(
-    session: AsyncSession, notice: FactoryNotice, registry: ForgeRegistry
+async def add_answer_retry(
+    session: AsyncSession,
+    *,
+    kind: str,
+    host: str,
+    scope_id: str,
+    scope_path: str,
+    comment_id: int,
 ) -> None:
-    """Keep ``answer-retry:<comment id>`` in the issue scope's poll cursor, in
-    the caller's transaction (#5787).
+    """Keep ``answer-retry:<comment id>`` in the scope's poll cursor, in the
+    caller's transaction (#5787).
 
-    A webhook answer that cannot be decided yet is answered 503, which GitHub
-    never redelivers by itself; the key is what reads it again, through the
-    poll pass or, in webhook mode, the missed-label reconciler. The key is
-    merged into ``etags`` (jsonb ``||``), never a rewrite of the whole object,
-    so a concurrent writer of another key is kept.
+    The key is merged into the row as it is now (jsonb ``||``, the row created
+    with no since values when absent), never written from a cursor snapshot,
+    so a concurrent writer of another key is kept. The poll pass's cursor save
+    never writes or drops these keys; only this and the retry drain's jsonb
+    ``-`` change them.
     """
 
-    if notice.comment_id is None:
-        return
-    issue = notice_issue(notice, registry)
-    added = cast({f"{ANSWER_RETRY}{notice.comment_id}": "pending"}, JSONB)
+    added = cast({f"{ANSWER_RETRY}{comment_id}": "pending"}, JSONB)
     await session.execute(
         pg_insert(FactoryPollCursor)
         .values(
-            tracker_kind=issue.kind,
-            tracker_host=issue.host,
-            tracker_scope_id=issue.scope_id,
-            scope_path=notice.repo_full_name,
+            tracker_kind=kind,
+            tracker_host=host,
+            tracker_scope_id=scope_id,
+            scope_path=scope_path,
             etags=added,
         )
         .on_conflict_do_update(
@@ -915,6 +918,38 @@ async def record_answer_retry(
             },
         )
     )
+
+
+async def record_answer_retry(
+    session: AsyncSession, notice: FactoryNotice, registry: ForgeRegistry
+) -> None:
+    """Keep a deferred webhook answer for a later read (#5787).
+
+    A webhook answer that cannot be decided yet is answered 503, which GitHub
+    never redelivers by itself; the key is what reads it again, through the
+    poll pass or, in webhook mode, the work item reconciler's answer drain.
+    """
+
+    if notice.comment_id is None:
+        return
+    issue = notice_issue(notice, registry)
+    await add_answer_retry(
+        session,
+        kind=issue.kind,
+        host=issue.host,
+        scope_id=issue.scope_id,
+        scope_path=notice.repo_full_name,
+        comment_id=notice.comment_id,
+    )
+
+
+@dataclass(frozen=True)
+class _AnswerOwner:
+    """An answer's admission facts as the owner guard reads them: the
+    install's mode and no named owner, exactly as a mention's (#5787)."""
+
+    model_auth_mode: ModelAuthMode
+    owner: None = None
 
 
 async def admit_answer_notice(
@@ -951,7 +986,10 @@ async def admit_answer_notice(
     is never an answer. Before any GitHub read the WorkItem's agent must still
     have a GitHub surface on the repository (``binding_missing``) and the
     delivery must come from the WorkItem's installation
-    (``installation_mismatch``), as for a mention.
+    (``installation_mismatch``), and the install's model auth mode must fit
+    the WorkItem (`personal_execution.existing_work_item_refusal`, so a
+    retained service WorkItem under personal mode is ``personal_owner_required``),
+    each as for a mention.
 
     The caller holds the issue lock (`lock_issue`) and commits; the answer
     core runs in a savepoint of the caller's transaction. ``tracker`` may be a
@@ -998,6 +1036,11 @@ async def admit_answer_notice(
         and item.code_host_installation_id != notice.installation_id
     ):
         return _refuse_answer("installation_mismatch", item, notice)
+    mode_refusal = await existing_work_item_refusal(
+        session, item, _AnswerOwner(settings.factory_model_auth_mode)
+    )
+    if mode_refusal is not None:
+        return _refuse_answer(mode_refusal.code, item, notice)
     github = tracker if isinstance(tracker, GitHubTracker) else await tracker()
     if comment is None:
         try:
