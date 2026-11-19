@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Protocol
 
 import aiohttp
@@ -36,6 +37,8 @@ PREFLIGHT_BLOCKED = "memory_rules_context_preflight_blocked"
 PREFLIGHT_BLOCKED_EVIDENCE = "unchanged"
 # API refusals of the envelope read that fail the request rather than retry it.
 _FAILING_READS = frozenset({"memory_rules_unavailable"})
+# The API accepts only a short lowercase code as a relayed reason.
+_REASON = re.compile(r"[a-z_]{1,64}")
 
 
 class RunnerDelivery(Protocol):
@@ -131,8 +134,12 @@ async def deliver(
         raise MemoryRulesContextRefused("runner_unacknowledged")
     reason = body.get("reason") if body is not None else None
     failed = acknowledgment.get("outcome") == "failed"
+    # The runner's reason is relayed only when it is a short code the API accepts;
+    # anything else (a 422 there would skip the terminal detail) becomes the generic one.
     refusal = (
-        reason if isinstance(reason, str) and failed else ("runner_refused" if failed else None)
+        reason
+        if isinstance(reason, str) and _REASON.fullmatch(reason) and failed
+        else ("runner_refused" if failed else None)
     )
     try:
         evidence = await _relay(work_items, run, epoch, acknowledgment, refusal)

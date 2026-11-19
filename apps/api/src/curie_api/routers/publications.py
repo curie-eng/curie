@@ -532,6 +532,17 @@ async def create_publication(
     session: SessionDep,
     response: Response,
 ) -> PublicationOut:
+    # #5798: only the platform writes the learned rules line. Refused before any
+    # other work, so a patch problem never masks the reserved line.
+    if memory_rules_context.carries_annotation(data.body):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.learned_rules_annotation_reserved",
+                "message": "a line starting with 'Learned rules:' is written only "
+                "by the platform; remove it and publish again",
+            },
+        )
     try:
         patch = data.decoded_patch()
     except ValueError as exc:
@@ -551,16 +562,6 @@ async def create_publication(
             {
                 "code": "publication.requester_annotation_reserved",
                 "message": "a line starting with 'Requester preferences:' is written only "
-                "by the platform; remove it and publish again",
-            },
-        )
-    # #5798: only the platform writes the learned rules line either.
-    if memory_rules_context.carries_annotation(data.body):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            {
-                "code": "publication.learned_rules_annotation_reserved",
-                "message": "a line starting with 'Learned rules:' is written only "
                 "by the platform; remove it and publish again",
             },
         )

@@ -253,3 +253,50 @@ def test_a_missing_or_tampered_snapshot_is_refused_never_absent(
         assert _code(refused) == "memory_rules_unavailable"
         assert CANARY not in refused.text
         assert _evidence(admitted.request_id) == "pending"
+
+
+def test_an_incomplete_acknowledgment_never_changes_a_pending_evidence(
+    api: TestClient, world: support.World
+) -> None:
+    pinned, epoch = _running(api, world, 579813)
+    url = f"{PREFIX}/requests/{pinned.request_id}/memory-rules-context/acknowledgment"
+
+    # Neither an acknowledgment nor a worker failure reason.
+    bare = api.post(url, json={"runtime_epoch": epoch}, headers=WORKER_HEADERS)
+    # An applied acknowledgment that does not name its envelope version.
+    unversioned = api.post(
+        url,
+        json={
+            "runtime_epoch": epoch,
+            "acknowledgment": {
+                "work_item_id": str(pinned.work_item_id),
+                "execution_request_id": str(pinned.request_id),
+                "execution_fence": epoch,
+                "outcome": "applied",
+                "sha256": TWO_DIGEST,
+            },
+        },
+        headers=WORKER_HEADERS,
+    )
+
+    assert _code(bare) == "acknowledgment_mismatch"
+    assert _code(unversioned) == "acknowledgment_mismatch"
+    assert _evidence(pinned.request_id) == "pending"
+    # Liveness: the versioned acknowledgment still applies.
+    applied = _ack(api, pinned, epoch, "applied", sha256=TWO_DIGEST)
+    assert applied.status_code == 200 and applied.json() == {"evidence": "applied"}
+
+
+def test_an_incomplete_acknowledgment_never_changes_an_absent_pin_evidence(
+    api: TestClient, world: support.World
+) -> None:
+    absent, epoch = _running(api, world, 579814, rules=False)
+    url = f"{PREFIX}/requests/{absent.request_id}/memory-rules-context/acknowledgment"
+
+    bare = api.post(url, json={"runtime_epoch": epoch}, headers=WORKER_HEADERS)
+
+    assert _code(bare) == "acknowledgment_mismatch"
+    assert _evidence(absent.request_id) == "none"
+    # Liveness: a worker failure reason alone still records a failure.
+    failed = _ack(api, absent, epoch, None, reason="runner_unacknowledged")
+    assert failed.status_code == 200 and failed.json() == {"evidence": "failed"}

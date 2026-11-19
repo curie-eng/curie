@@ -190,6 +190,27 @@ def test_a_submitted_body_carrying_the_line_is_refused_and_nothing_is_published(
     assert _learned_lines(_factory_publication_body(created.json()["id"])) == [LINE]
 
 
+@pytest.mark.parametrize(
+    "bad_patch", ["not base64!!", "QQ==" * 4_000_000], ids=["undecodable", "oversized"]
+)
+def test_the_reserved_line_is_refused_before_any_patch_check(
+    _factory_publication_case: Case, bad_patch: str
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    _pin(request_id)
+    assert _acknowledge(client, request_id, "applied", sha256=DIGEST).status_code == 200
+    body = {**payload, "body": f"{BODY}\n{LINE}\n", "patch_b64": bad_patch}
+
+    refused = _post_factory_publication(client, body)
+
+    # Not 422 (undecodable patch) or 413 (oversized patch): the reserved line first.
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.learned_rules_annotation_reserved"
+    # The control: without the line the same bad patch is refused on its own terms.
+    control = _post_factory_publication(client, {**body, "body": BODY})
+    assert control.status_code in (413, 422), control.text
+
+
 def test_a_line_that_only_mentions_learned_rules_mid_line_is_not_reserved(
     _factory_publication_case: Case,
 ) -> None:

@@ -145,8 +145,15 @@ async def accept_acknowledgment(
         return found
     request, item = found
     ack: MemoryRulesAcknowledgmentV1 | None = None
+    if body.acknowledgment is None and body.reason is None:
+        # Neither a runner acknowledgment nor a worker failure: nothing to record.
+        await session.rollback()
+        return Refused("acknowledgment_mismatch")
     if body.acknowledgment is not None:
         try:
+            if "envelope_version" not in body.acknowledgment:
+                # The model defaults the version; an acknowledgment must name it.
+                raise ValueError("missing envelope_version")
             ack = MemoryRulesAcknowledgmentV1.model_validate(body.acknowledgment)
         except (ValidationError, ValueError):
             await session.rollback()

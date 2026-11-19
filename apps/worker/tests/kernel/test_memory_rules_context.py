@@ -271,6 +271,33 @@ def test_a_runner_refusal_of_the_rules_is_relayed_with_its_reason(make_harness: 
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("bad_reason", ["too-large", "Too_Large", "x" * 65, "", 7])
+def test_a_runner_reason_the_api_would_refuse_is_relayed_as_runner_refused(
+    make_harness: Any, bad_reason: object
+) -> None:
+    async def exercise() -> None:
+        async with _harness(make_harness) as h:
+            work_items = _RecordingWorkItems(selected=True)
+            h.kernel._work_items = work_items
+            request_id = uuid.uuid4()
+            h.runner.memory_rules_context_answer = (
+                200,
+                {"acknowledgment": _failed_ack(request_id), "reason": bad_reason},
+            )
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            # The API only accepts a short lowercase code, so a 422 there would skip
+            # the terminal detail: the generic reason is relayed and shown instead.
+            ((ack, reason),) = work_items.relayed
+            assert ack is not None and reason == "runner_refused"
+            _assert_failed_before_model_work(h, work_items, _rules_detail("runner_refused"))
+
+    asyncio.run(exercise())
+
+
 def test_a_failed_acknowledgment_without_a_reason_fails_as_runner_refused(
     make_harness: Any,
 ) -> None:
