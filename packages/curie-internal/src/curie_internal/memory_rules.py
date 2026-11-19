@@ -20,8 +20,11 @@ import hashlib
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Annotated, Literal, Self
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from sqlalchemy import text as sql_text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 MAX_RULE_BYTES = 240
 MAX_ACCEPTED_PER_SCOPE = 16
@@ -219,6 +222,15 @@ class SelectedMemoryRules(_Contract):
     count: int
     format_version: Literal[1] = FORMAT_VERSION
 
+    @field_validator("format_version", mode="before")
+    @classmethod
+    def _format_version_is_an_int(cls, value: object) -> object:
+        # Strict ``Literal[1]`` still accepts ``True`` and ``1.0``, in Python and
+        # in JSON, because both equal 1. Refuse anything that is not an int.
+        if type(value) is not int:
+            raise ValueError("invalid_selected_rules")
+        return value
+
     @model_validator(mode="after")
     def _valid_selection(self) -> Self:
         numbers = self.rule_numbers
@@ -270,3 +282,42 @@ def selected_from_rules(rules: Sequence[tuple[int, str]]) -> SelectedMemoryRules
         sha256=rules_sha256(text),
         count=len(rules),
     )
+
+
+SCOPE_KINDS = ("agent", "binding", "repository")
+
+
+async def select_memory_rules(
+    session: AsyncSession,
+    *,
+    agent_id: UUID,
+    scope_kind: str,
+    scope_key: str,
+) -> SelectedMemoryRules | AbsentMemoryRules:
+    """Read the accepted rules of one exact scope, oldest acceptance first.
+
+    Runs inside the caller's transaction and writes nothing. A scope holding
+    more than ``MAX_ACCEPTED_PER_SCOPE`` accepted rules raises ``ScopeOverfull``;
+    the accept route keeps a scope within that bound.
+    """
+
+    if scope_kind not in SCOPE_KINDS or type(scope_key) is not str:
+        raise InvalidRule("invalid_text")
+    rows = (
+        await session.execute(
+            sql_text(
+                "SELECT number, text FROM curie.memory_rules "
+                "WHERE agent_id = :agent AND scope_kind = :kind AND scope_key = :key "
+                "AND state = 'accepted' ORDER BY accepted_at, id LIMIT :limit"
+            ),
+            {
+                "agent": agent_id,
+                "kind": scope_kind,
+                "key": scope_key,
+                "limit": MAX_ACCEPTED_PER_SCOPE + 1,
+            },
+        )
+    ).all()
+    if not rows:
+        return AbsentMemoryRules(reason="no_rules")
+    return selected_from_rules([(row[0], row[1]) for row in rows])

@@ -792,8 +792,9 @@ print(json.dumps(graph))
         // Guarded automatic retry dispatch times require 0182.
         // Grant notices require 0183.
         // Factory question rounds require 0184.
-        assert_eq!(candidate.schema_min, "0184");
-        assert_eq!(candidate.schema_head, "0184");
+        // Learned memory rules require 0185.
+        assert_eq!(candidate.schema_min, "0185");
+        assert_eq!(candidate.schema_head, "0185");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -863,7 +864,8 @@ print(json.dumps(graph))
         assert!(!live_in_window("0180", &current));
         assert!(!live_in_window("0182", &current));
         assert!(!live_in_window("0183", &current));
-        assert!(live_in_window("0184", &current));
+        assert!(!live_in_window("0184", &current));
+        assert!(live_in_window("0185", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
