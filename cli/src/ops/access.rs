@@ -547,13 +547,14 @@ mod tests {
 
     #[test]
     fn a_namespace_named_like_the_verb_does_not_take_the_address_flag() {
+        let name = "port-forward";
         let mut command = OpsCommand::new(
             "kubectl",
             vec![
                 plain("--context"),
-                plain("port-forward"),
+                plain(name),
                 plain("-n"),
-                plain("port-forward"),
+                plain(name),
                 plain("port-forward"),
                 plain("svc/curie-ui"),
                 plain("18080:80"),
@@ -562,7 +563,9 @@ mod tests {
         pin_to_loopback(&mut command);
         assert_eq!(
             command.display(),
-            "kubectl --context port-forward -n port-forward port-forward --address localhost svc/curie-ui 18080:80"
+            format!(
+                "kubectl --context {name} -n {name} port-forward --address localhost svc/curie-ui 18080:80"
+            )
         );
     }
 
