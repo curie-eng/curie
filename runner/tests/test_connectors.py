@@ -881,10 +881,12 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
     # report_progress mounts only when the worker injected the progress env
     # (#3077); its name is exempt regardless, like an omitted request_approval.
     # get_issue (ADR 0187) mounts only with the worker's issue read env, and
-    # submit_tracker_result (ADR 0277) only under a tracker_result contract.
+    # submit_tracker_result (ADR 0277) only under a tracker_result contract,
+    # and ask_questions (ADR 0286) only under an implementation contract.
     from curie_runner.approval import (
         ISSUE_TOOL_NAME,
         PROGRESS_TOOL_NAME,
+        QUESTION_TOOL_NAME,
         TRACKER_RESULT_TOOL_NAME,
     )
 
@@ -892,6 +894,7 @@ def test_the_tool_policy_exemption_set_matches_what_the_boot_publishes(
         PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
         TRACKER_RESULT_TOOL_NAME,
+        QUESTION_TOOL_NAME,
     }
 
 
@@ -981,6 +984,7 @@ def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
     from curie_runner.approval import (
         ISSUE_TOOL_NAME,
         PROGRESS_TOOL_NAME,
+        QUESTION_TOOL_NAME,
         TRACKER_RESULT_TOOL_NAME,
     )
 
@@ -988,6 +992,7 @@ def test_a_boot_without_a_state_url_publishes_and_exempts_no_state_tools(
         PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
         TRACKER_RESULT_TOOL_NAME,
+        QUESTION_TOOL_NAME,
     }
     assert not any(name.startswith(f"mcp__{STATE_SERVER_NAME}__") for name in published)
 

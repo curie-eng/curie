@@ -4962,6 +4962,37 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/questions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Post Questions
+         * @description Post this execution's numbered questions on its own ticket (#5785).
+         *
+         *     The platform composes the comment and writes it as one marked comment per
+         *     asking request through the tracker's marked-comment write. The round is
+         *     recorded ``posting`` and committed before the tracker write, and
+         *     ``outstanding`` after it, with the answer fence read from the database
+         *     clock then. A replay of the same body by the same request answers the
+         *     first result with no second write. Refusals are 409 with a fixed code and
+         *     nothing echoed; a tracker failure is 503 ``tracker_unavailable`` and
+         *     leaves the round ``posting``, which settlement treats as not asked. The
+         *     body is read only after the capability is verified, and any body that is
+         *     not a JSON object inside the bounds is 409 ``invalid_questions``.
+         */
+        post: operations["post_questions_work_items_questions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/tracker-result": {
         parameters: {
             query?: never;
@@ -11107,6 +11138,16 @@ export interface components {
              * Format: uuid
              */
             revision_id: string;
+        };
+        /**
+         * QuestionsOut
+         * @description The posted round: ``round`` of ``rounds_limit`` for the WorkItem.
+         */
+        QuestionsOut: {
+            /** Round */
+            round: number;
+            /** Rounds Limit */
+            rounds_limit: number;
         };
         /**
          * QueuedTurn
@@ -24607,6 +24648,52 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["IssueReadResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_questions_work_items_questions_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Issue-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Questions
+                     * @description 1 to 10 questions, each 1 to 1,000 characters with no blank line.
+                     */
+                    questions?: unknown;
+                    /**
+                     * Summary
+                     * @description What the investigation found, 1 to 4,000 characters, including a reproduction result when there is one.
+                     */
+                    summary?: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QuestionsOut"];
                 };
             };
             /** @description Validation Error */

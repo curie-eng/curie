@@ -91,6 +91,7 @@ from .harness.claude.approval import (
 from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
+from .harness.claude.question_tool import wrap_questions_handler
 from .harness.claude.requester_guard import build_subagent_guard
 from .harness.claude.tracker_result_tool import wrap_tracker_result_handler
 from .harness.contribution import HarnessContribution
@@ -1352,6 +1353,7 @@ def build_runner(
         # when the observed surface has no actionable tools.
         def curie_server(
             tracker_result_tool: SdkMcpTool[Any] | None = None,
+            question_tool: SdkMcpTool[Any] | None = None,
         ) -> McpSdkServerConfig:
             return build_approval_server(
                 approval_gate,
@@ -1388,6 +1390,7 @@ def build_runner(
                     if attachment_access is not None else ()
                 ),
                 tracker_result_tool=tracker_result_tool,
+                question_tool=question_tool,
             )
 
         platform_servers: dict[str, Any] = {
@@ -1418,13 +1421,24 @@ def build_runner(
                 disallowed_tools=config.catalogue_disallowed_tools,
                 max_budget_usd=config.max_usd_per_day,
             )
+            # An implementation contract mounts ``ask_questions`` (#5785) the
+            # same way; ``bind_completion_contract`` sets at most one of the two.
             session_platform_servers = (
                 platform_servers
-                if bound.result_handler is None
+                if bound.result_handler is None and bound.question_handler is None
                 else {
                     **platform_servers,
                     APPROVAL_SERVER_NAME: curie_server(
-                        wrap_tracker_result_handler(bound.result_handler)
+                        (
+                            wrap_tracker_result_handler(bound.result_handler)
+                            if bound.result_handler is not None
+                            else None
+                        ),
+                        (
+                            wrap_questions_handler(bound.question_handler)
+                            if bound.question_handler is not None
+                            else None
+                        ),
                     ),
                 }
             )

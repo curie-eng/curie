@@ -78,6 +78,7 @@ from .personal_auth import (
     require_claude_reviewer_model,
     require_owner_grant,
 )
+from .side_effects import ARGUMENTS_WITHHELD_TOOLS
 from .startup_diagnostics import StderrTail, sdk_initialize_diagnostics
 
 install_mcp_argv_offload()
@@ -193,6 +194,35 @@ _SETTING_SOURCES: tuple[SettingSource, ...] = ("user", "project", "local")
 _SDK_DISABLE_TERMINAL_TITLE_ENV = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
+def _withhold_arguments(entries: list[Any]) -> list[Any]:
+    """Empty the input of each withheld tool call in an assistant entry.
+
+    The native mirror leaves the runner as the turn's checkpoint, so the input
+    the action frame withholds (ADR 0286 decision 4) is withheld here too. Only
+    a ``tool_use`` block of an assistant message's own content is a call; any
+    other payload, including another tool's input or result that happens to
+    hold a call-shaped value, is kept verbatim. The portable projection writes
+    the same empty input, so native and portable content still correspond
+    exactly on replay. ``entries`` is a fresh copy and is changed in place.
+    """
+
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") in ARGUMENTS_WITHHELD_TOOLS
+            ):
+                block["input"] = {}
+    return entries
+
+
 class _SeededSessionStore:
     """SDK mirror seeded from portable messages or an optional native checkpoint."""
 
@@ -235,7 +265,7 @@ class _SeededSessionStore:
         return HarnessReplayState(
             harness="claude",
             kind=kind,
-            entries=tuple(json.loads(json.dumps(selected))),
+            entries=tuple(_withhold_arguments(json.loads(json.dumps(selected)))),
         )
 
     def request_full_checkpoint(self) -> None:
@@ -404,7 +434,12 @@ def _content_block_to_dict(block: object) -> dict[str, Any] | None:
     if isinstance(block, ThinkingBlock):
         return {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
     if isinstance(block, ToolUseBlock):
-        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+        return {
+            "type": "tool_use",
+            "id": block.id,
+            "name": block.name,
+            "input": {} if block.name in ARGUMENTS_WITHHELD_TOOLS else block.input,
+        }
     if isinstance(block, ToolResultBlock):
         result: dict[str, Any] = {
             "type": "tool_result",

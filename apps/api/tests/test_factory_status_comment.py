@@ -1909,6 +1909,10 @@ def test_later_request_status_comments_continue_on_the_existing_pr_until_termina
     assert running_comment["id"] == comment_id
     assert "Status: RUNNING" in running_comment["body"]
     assert continuation in running_comment["body"]
+    # A follow-up on an existing pull request cannot ask questions (#5785), so
+    # it leads with the continuation and never claims to be investigating.
+    assert running_comment["body"].startswith(continuation)
+    assert "Investigating this ticket." not in running_comment["body"]
     assert FINAL_MARKER not in running_comment["body"]
     assert _rows(
         "SELECT status FROM curie.execution_requests WHERE id = :id", {"id": successor}

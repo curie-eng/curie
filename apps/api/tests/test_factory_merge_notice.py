@@ -27,8 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api import factory_notices
 from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import INVESTIGATING_LINE
 from curie_api.forges.memory import InMemoryTracker
 from curie_api.forges.types import PullRequest, PullRequestRef, PullRequestState, ReplyTarget
+from forge_fakes.github import LABEL, _issue_event, _post
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     HEAD_A,
     _rows,
@@ -41,6 +43,7 @@ from test_factory_status_comment import (
     STATE_LABELS,
     _admit,
     _curie_labels,
+    _execute,
     _finish_failed,
     _marked,
     _observe_lineage_state,
@@ -396,3 +399,84 @@ def test_merged_pull_request_after_a_revision_reaches_the_tickets_own_comment(
     sink.requests.clear()
     _reconcile()
     assert _writes(sink) == []
+
+
+def _state_labels(sink: Any, number: int) -> set[str]:
+    """Every state label the pass owns on the issue, the questions label included."""
+
+    return set(sink.issue_labels.get(number, set())) & set(factory_notices.STATE_LABELS)
+
+
+def _latest_request(work_item_id: uuid.UUID) -> uuid.UUID:
+    rows = _rows(
+        "SELECT id FROM curie.execution_requests WHERE work_item_id = :id "
+        "ORDER BY sequence DESC LIMIT 1",
+        {"id": work_item_id},
+    )
+    return uuid.UUID(str(rows[0]["id"]))
+
+
+@pytest.mark.parametrize(
+    ("ending", "label"),
+    [("failed", NEEDS_HUMAN), ("questions", "curie-factory:questions")],
+)
+def test_a_fresh_run_after_the_merge_keeps_its_own_lead_line_and_label(
+    admitted: Any,  # noqa: F811
+    ending: str,
+    label: str,
+) -> None:
+    """The label added again after the pull request merged starts a fresh run
+    on the same WorkItem, which keeps the merged lineage. The merge notice and
+    its label removal belong to the runs admitted before the merge, not to it."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    work_item_id = first["work_item_id"]
+    url = f"https://github.com/{REPO}/pull/{pr}"
+    _observe_lineage_state(client, work_item_id, "merged")
+    _reconcile()
+    assert _state_labels(sink, number) == set()
+
+    github.issue_number = number
+    github.advance_label_event(number)
+    response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert response.json()["status"] == "factory_admitted", response.text
+    fresh = _latest_request(work_item_id)
+    assert fresh != first["id"]
+    fresh_epoch = _start_running(client, fresh)
+    _reconcile()
+    path = f"/repos/{REPO}/issues/{number}/comments"
+
+    def body(request_id: uuid.UUID) -> str:
+        return next(c["body"] for c in sink.lists[path] if marker_for(request_id) in c["body"])
+
+    running = body(fresh)
+    assert INVESTIGATING_LINE in running
+    assert "Continuing on the existing pull request" not in running
+    assert _state_labels(sink, number) == {"curie-factory:running"}
+
+    if ending == "questions":
+        # The fresh run posted round 1, then ends as the question ending does.
+        _execute(
+            "INSERT INTO curie.factory_question_rounds "
+            "(work_item_id, rounds_used, state, asking_request_id, comment_id, body_sha256, "
+            "answer_after) VALUES (:id, 1, 'outstanding', :asker, '1', :digest, now())",
+            {"id": work_item_id, "asker": fresh, "digest": "ab" * 32},
+        )
+        _execute(
+            "INSERT INTO curie.factory_question_round_counts "
+            "(work_item_id, rounds_used, last_asking_request_id) VALUES (:id, 1, :asker)",
+            {"id": work_item_id, "asker": fresh},
+        )
+        _finish_failed(client, fresh, fresh_epoch, "no_pull_request")
+    else:
+        _finish_failed(client, fresh, fresh_epoch, "runner_escalated", "Still broken.")
+    _reconcile()
+
+    assert _state_labels(sink, number) == {label}
+    final = body(fresh)
+    assert "Pull request merged" not in final
+    assert f"{url} (merged)" not in final
+    # The run whose pull request merged keeps its own notice.
+    assert f"Pull request merged: {url}" in body(first["id"])

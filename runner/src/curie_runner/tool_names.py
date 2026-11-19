@@ -71,3 +71,7 @@ PLATFORM_SLACK_TOOL_NAMES: Final[frozenset[str]] = CHANNEL_READ_TOOL_NAMES | CAN
 # The tracker-result platform tool on the ``curie`` server (ADR 0277, #5586).
 # Named here, free of any SDK import, so the approval gate can exempt it.
 TRACKER_RESULT_TOOL: Final = "submit_tracker_result"
+
+# The factory question tool on the ``curie`` server (#5785): a run that cannot
+# build its ticket without a person's answers posts its questions on the ticket.
+QUESTION_TOOL: Final = "ask_questions"

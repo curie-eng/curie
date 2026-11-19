@@ -1293,7 +1293,10 @@ class ExecutionRequest(Base):
         # which like ``owner_lost`` ends failed with an observation, and a
         # started completed or failed request may carry a confirmed teardown
         # observation) with one branch changed: an unstarted expired request
-        # may also end ``retry_condition_expired`` when it was blocked.
+        # may also end ``retry_condition_expired`` when it was blocked. Then
+        # migration 0184 (#5785): a started completed request may also end
+        # ``questions_asked``, a request that posted questions and opened no
+        # pull request.
         CheckConstraint(
             "((status = 'failed' AND started_at IS NULL AND execution_deadline IS NULL "
             "AND terminal_at IS NOT NULL AND terminal_cause = 'start_failed' "
@@ -1319,7 +1322,8 @@ class ExecutionRequest(Base):
             "AND termination_observation IS NULL) "
             "OR (status = 'completed' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
-            "AND terminal_cause IS NOT NULL AND terminal_cause = 'completed') "
+            "AND terminal_cause IS NOT NULL "
+            "AND terminal_cause IN ('completed', 'questions_asked')) "
             "OR (status = 'failed' AND started_at IS NOT NULL "
             "AND execution_deadline IS NOT NULL AND terminal_at IS NOT NULL "
             "AND terminal_cause IS NOT NULL "
@@ -1836,7 +1840,7 @@ class FactoryStatusComment(Base):
             "applied_label IS NULL OR applied_label IN "
             "('', 'curie:queued', 'curie:running', 'curie:pr-open', 'curie:needs-human', "
             "'curie-factory:queued', 'curie-factory:running', 'curie-factory:pr-open', "
-            "'curie-factory:needs-human', 'curie-factory:triaged')",
+            "'curie-factory:needs-human', 'curie-factory:triaged', 'curie-factory:questions')",
             name="factory_terminal_notices_applied_label_ck",
         ),
         # Application N-1's delivery scan still reads this one.
@@ -2258,6 +2262,136 @@ class FactoryTrackerResultReceipt(Base):
     )
     # The web link to the marked result comment on the source issue (#5586).
     result_comment_url: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+FACTORY_QUESTION_ROUND_STATES = ("posting", "outstanding", "answered", "cleared", "exhausted")
+FACTORY_QUESTION_ROUND_LIMIT = 3
+FACTORY_ANSWER_RECEIPT_OUTCOMES = (
+    "admitted",
+    "coalesced",
+    "queued_follow_up",
+    "not_outstanding",
+    "not_after_question",
+    "work_item_cancelled",
+)
+
+
+class FactoryQuestionRound(Base):
+    """A WorkItem's factory question rounds (#5785, one-ticket ADR decision 4).
+
+    One row per WorkItem holds the round count across attempts and names the
+    request whose question is current. No question or answer text is stored:
+    only the tracker's comment id and a digest of the comment the platform
+    wrote. ``rounds_used`` counts rounds whose comment was posted, so it is
+    zero while the first round is ``posting`` or after a first post that never
+    landed and settled ``cleared``. Cancelling the WorkItem deletes the row;
+    the lifetime count lives on in ``FactoryQuestionRoundCount``, and a row
+    created after a relabel starts from it.
+    """
+
+    __tablename__ = "factory_question_rounds"
+    __table_args__ = (
+        CheckConstraint(
+            f"rounds_used BETWEEN 0 AND {FACTORY_QUESTION_ROUND_LIMIT}",
+            name="factory_question_rounds_rounds_used_ck",
+        ),
+        CheckConstraint(
+            f"state IN ({_sql_values(FACTORY_QUESTION_ROUND_STATES)})",
+            name="factory_question_rounds_state_ck",
+        ),
+        CheckConstraint(
+            "rounds_used >= 1 OR state IN ('posting', 'cleared')",
+            name="factory_question_rounds_posted_ck",
+        ),
+        CheckConstraint(
+            f"body_sha256 ~ {_HEX64}",
+            name="factory_question_rounds_body_sha256_ck",
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    rounds_used: Mapped[int] = mapped_column(Integer, default=0)
+    state: Mapped[str] = mapped_column(Text)
+    asking_request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    comment_id: Mapped[str | None] = mapped_column(Text, default=None)
+    body_sha256: Mapped[str] = mapped_column(Text)
+    # Set when a round's comment is posted; #5786 reads it as the answer fence.
+    answer_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # The newest request an answer created (#5786); the question route never
+    # reads or writes it.
+    pending_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class FactoryQuestionRoundCount(Base):
+    """The question rounds a WorkItem posted in its lifetime (#5785, ADR 0286 decision 8).
+
+    Cancelling the WorkItem deletes its ``FactoryQuestionRound``; this count
+    survives, so a relabel, which reuses the WorkItem, does not reset the cap.
+    ``last_asking_request_id`` names the request that posted the latest round,
+    so its status comment keeps its round number after the question row is
+    gone. Incremented in the transaction that records a posted round.
+    """
+
+    __tablename__ = "factory_question_round_counts"
+    __table_args__ = (
+        CheckConstraint(
+            f"rounds_used BETWEEN 0 AND {FACTORY_QUESTION_ROUND_LIMIT}",
+            name="factory_question_round_counts_rounds_used_ck",
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    rounds_used: Mapped[int] = mapped_column(Integer, default=0)
+    last_asking_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FactoryAnswerReceipt(Base):
+    """One durable receipt per answer comment (#5786; created by #5785's migration).
+
+    A redelivered comment returns its first outcome, including one folded into
+    an existing attempt, which created no request.
+    """
+
+    __tablename__ = "factory_answer_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            f"outcome IN ({_sql_values(FACTORY_ANSWER_RECEIPT_OUTCOMES)})",
+            name="factory_answer_receipts_outcome_ck",
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    comment_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    outcome: Mapped[str] = mapped_column(Text)
+    request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class FactoryTrackerResultArtifact(Base):

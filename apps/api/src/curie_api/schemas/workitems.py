@@ -106,6 +106,32 @@ class TrackerResultOut(BaseModel):
     ticket_url: str | None
 
 
+class QuestionsSubmission(BaseModel):
+    """The runner question tool's call (#5785): what the investigation found and
+    the numbered questions. The API checks the bounds and composes the comment;
+    input outside them, a missing field, a field of another type or a body that
+    is not one JSON object included, is refused 409 ``invalid_questions`` with
+    nothing echoed, as is a comment that would pass 25,000 characters once
+    composed and redacted."""
+
+    summary: Any = Field(
+        default=None,
+        description="What the investigation found, 1 to 4,000 characters, including a "
+        "reproduction result when there is one.",
+    )
+    questions: Any = Field(
+        default=None,
+        description="1 to 10 questions, each 1 to 1,000 characters with no blank line.",
+    )
+
+
+class QuestionsOut(BaseModel):
+    """The posted round: ``round`` of ``rounds_limit`` for the WorkItem."""
+
+    round: int
+    rounds_limit: int
+
+
 WorkItemOutcomeState = Literal[
     "queued",
     "waiting",

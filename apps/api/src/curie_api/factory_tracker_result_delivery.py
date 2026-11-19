@@ -160,7 +160,6 @@ import enum
 import hashlib
 import logging
 import re
-import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -172,7 +171,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.config import Settings
-from curie_api.factory_comment_text import redact_factory_comment
+from curie_api.factory_comment_text import publishable_model_text
 from curie_api.factory_tracker_results import (
     FindingsProposal,
     FindingsReason,
@@ -777,47 +776,6 @@ async def seal_platform_findings(
 # Rendering ------------------------------------------------------------------
 
 
-def _without_controls(text: str) -> str:
-    """The text with no control or invisible format character.
-
-    Drops C0 (newline and tab kept), DEL, C1, every format character
-    (category ``Cf``: the bidi embeddings, overrides and isolates, the
-    marks U+200E/U+200F/U+061C, zero-width joiners and spaces, the BOM, tag
-    characters) and lone surrogates. A line or paragraph separator becomes a
-    newline. A right-to-left override would otherwise reorder the App's own
-    lines a reader sees below the model's text.
-    """
-
-    kept: list[str] = []
-    for char in text.replace("\r\n", "\n"):
-        category = unicodedata.category(char)
-        if char in "\n\t":
-            kept.append(char)
-        elif category in ("Zl", "Zp"):
-            kept.append("\n")
-        elif category not in ("Cc", "Cf", "Cs"):
-            kept.append(char)
-    return "".join(kept)
-
-
-def _publishable(text: str) -> str:
-    """Redacted, with no control character, no HTML comment opener left to
-    carry a marker, and no live mention.
-
-    Controls go first, so a zero-width character cannot split a secret past
-    redaction. The tracker posts this text under the App's identity, so a
-    model-written ``@login`` would notify that account. A U+200B after every
-    ``@`` (added after the strip) keeps the text readable and stops the
-    mention, as `factory_notices` does for the agent's last message.
-    """
-
-    return (
-        redact_factory_comment(_without_controls(text))
-        .replace("<!--", "&lt;!--")
-        .replace("@", "@\u200b")
-    )
-
-
 def _fenced(text: str) -> str:
     """The text as one code block no line of it can close.
 
@@ -841,11 +799,11 @@ def _ticket_comment(proposal: TicketProposal, url: str) -> str:
             "",
             "Reproduction command:",
             "",
-            _fenced(_publishable(reproduction.command)),
+            _fenced(publishable_model_text(reproduction.command)),
             "",
             "Observed result:",
             "",
-            _fenced(_publishable(reproduction.observed)),
+            _fenced(publishable_model_text(reproduction.observed)),
         ]
     )
 
@@ -862,11 +820,11 @@ def _findings_comment(proposal: FindingsProposal | PlatformFindings) -> str:
         "",
         "What was tried:",
         "",
-        _fenced(_publishable(proposal.tried)),
+        _fenced(publishable_model_text(proposal.tried)),
         "",
         "What is missing:",
         "",
-        _fenced(_publishable(proposal.missing)),
+        _fenced(publishable_model_text(proposal.missing)),
     ]
     return "\n".join(lines)
 
@@ -1517,8 +1475,8 @@ async def _linked_issue(
         return await tracker.create_linked_issue(
             sealed.source,
             output_identity=sealed.output_identity,
-            title=_publishable(proposal.title),
-            body=_publishable(proposal.body),
+            title=publishable_model_text(proposal.title),
+            body=publishable_model_text(proposal.body),
             # The source's base labels only (ADR 0277 decision 13). No trigger
             # label: the implementation label is the handoff's to apply (#5588).
             labels=base_labels,

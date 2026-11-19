@@ -1,18 +1,20 @@
 """The single issue read authorized by a factory issue read capability (ADR 0187),
-and its two tracker result siblings (ADR 0277, #5586).
+its two tracker result siblings (ADR 0277, #5586) and the question route (#5785).
 
 The same ``wir`` capability authorizes ``/work-items/completion-contract`` (the
 runner asks which contract its execution runs under; a tracker result request
 reserves its one model session there) and ``/work-items/tracker-result`` (the
-runner's ``submit_tracker_result`` tool). Each re-checks that the capability
-names the durable WorkItem's issue before and after any tracker call.
+runner's ``submit_tracker_result`` tool), and ``/work-items/questions`` (the
+runner's ``ask_questions`` tool). Each re-checks that the capability names the
+durable WorkItem's issue before and after any tracker call.
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
-from typing import Annotated, Final
+from typing import Annotated, Final, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from redis.asyncio import Redis
@@ -24,10 +26,13 @@ from curie_api.schemas.workitems import (
     IssueReadContext,
     IssueReadContextMint,
     IssueReadResult,
+    QuestionsOut,
+    QuestionsSubmission,
     TrackerResultOut,
     TrackerResultSubmission,
 )
 
+from .. import factory_questions as questions_core
 from .. import factory_tracker_result_runtime as runtime
 from .. import requester_instruction_context
 from ..auth import require_internal_worker_token
@@ -53,6 +58,7 @@ from ..issue_read import (
 )
 from ..issue_read_token import IssueReadClaims, mint, verify_claims
 from ..models import ExecutionRequest
+from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)
 
@@ -449,3 +455,120 @@ async def submit_tracker_result(
             "ticket_url": answer.ticket_url,
         }
     )
+
+
+# The question route (#5785) ----------------------------------------------------------
+
+_QUESTION_REFUSALS = {
+    questions_core.INVALID_CONTEXT: "the execution no longer grants this call",
+    questions_core.INVALID_QUESTIONS: "the questions are outside the tool's bounds",
+    questions_core.NOT_IMPLEMENTATION_CONTRACT: "this execution does not run the "
+    "implementation contract",
+    questions_core.REQUEST_NOT_RUNNING: "this execution is not running",
+    questions_core.WORK_ITEM_CANCELLED: "this work item is cancelled",
+    questions_core.PULL_REQUEST_OPEN: "this work item already has an open pull request",
+    questions_core.ALREADY_PUBLISHED: "this execution already published",
+    questions_core.ALREADY_ASKED: "this execution already posted different questions",
+    questions_core.QUESTION_ROUNDS_EXHAUSTED: "this ticket's question rounds are used",
+}
+
+
+def _question_refused(code: str) -> HTTPException:
+    return issue_read_error(409, code, _QUESTION_REFUSALS.get(code, "the questions were refused"))
+
+
+# Far above any input inside the bounds, even with every character escaped.
+_QUESTIONS_BODY_MAX_BYTES: Final = 256 * 1024
+# Documented, not bound: the handler reads the body itself, after the
+# capability, so no body shape is answered with FastAPI's echoing 422.
+_QUESTIONS_BODY = {
+    key: value
+    for key, value in QuestionsSubmission.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    ).items()
+    if key != "$defs"
+}
+
+
+def _refuse_json_constant(name: str) -> NoReturn:
+    raise ValueError(f"not a JSON value: {name}")
+
+
+async def _questions_submission(request: Request) -> QuestionsSubmission:
+    """The body as a submission, or 409 ``invalid_questions`` echoing nothing
+    for anything that is not one JSON object within the size bound."""
+
+    try:
+        raw = await read_bounded_body(request, _QUESTIONS_BODY_MAX_BYTES, subject="questions body")
+    except HTTPException:
+        raise _question_refused(questions_core.INVALID_QUESTIONS) from None
+    try:
+        # NaN and the infinities are not JSON (RFC 8259); refuse them like any
+        # other body outside the shape rather than carry them on.
+        parsed = json.loads(raw, parse_constant=_refuse_json_constant)
+    except (ValueError, RecursionError):
+        raise _question_refused(questions_core.INVALID_QUESTIONS) from None
+    if not isinstance(parsed, dict):
+        raise _question_refused(questions_core.INVALID_QUESTIONS)
+    return QuestionsSubmission.model_validate(parsed)
+
+
+@router.post(
+    "/questions",
+    response_model=QuestionsOut,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": _QUESTIONS_BODY}},
+        }
+    },
+)
+async def post_questions(
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    claims: Annotated[IssueReadClaims, Depends(require_issue_read)],
+) -> QuestionsOut:
+    """Post this execution's numbered questions on its own ticket (#5785).
+
+    The platform composes the comment and writes it as one marked comment per
+    asking request through the tracker's marked-comment write. The round is
+    recorded ``posting`` and committed before the tracker write, and
+    ``outstanding`` after it, with the answer fence read from the database
+    clock then. A replay of the same body by the same request answers the
+    first result with no second write. Refusals are 409 with a fixed code and
+    nothing echoed; a tracker failure is 503 ``tracker_unavailable`` and
+    leaves the round ``posting``, which settlement treats as not asked. The
+    body is read only after the capability is verified, and any body that is
+    not a JSON object inside the bounds is 409 ``invalid_questions``.
+    """
+
+    response.headers["Cache-Control"] = "no-store"
+    data = await _questions_submission(request)
+    if not questions_core.input_valid(data.summary, data.questions):
+        raise _question_refused(questions_core.INVALID_QUESTIONS)
+    try:
+        await _named_pair(session, claims)
+    except runtime.RuntimeRefused as refused:
+        raise _question_refused(refused.code) from None
+    try:
+        begun = await questions_core.begin_round(
+            session,
+            request_id=claims.execution_request_id,
+            summary=data.summary,
+            questions=data.questions,
+        )
+        if isinstance(begun, questions_core.Posting):
+            try:
+                begun = await questions_core.post_and_record(
+                    session,
+                    get_settings(),
+                    request.app.state.http_client,
+                    request_id=claims.execution_request_id,
+                    posting=begun,
+                )
+            except questions_core.TrackerUnavailable:
+                raise _tracker_unavailable() from None
+    except questions_core.QuestionsRefused as refused:
+        raise _question_refused(refused.code) from None
+    return QuestionsOut(round=begun.round, rounds_limit=questions_core.ROUND_LIMIT)

@@ -2227,7 +2227,9 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
             try:
                 async with engine.begin() as conn:
                     assignment = {
-                        "merged": "status = 'merged'",
+                        # The merge write stamps updated_at, as
+                        # mark_publication_lineage_terminal does.
+                        "merged": "status = 'merged', updated_at = now()",
                         "closed": "status = 'closed'",
                         "missing_pr_url": (
                             "pr_number = NULL, pr_url = NULL, code_host_kind = NULL, "
@@ -2338,7 +2340,9 @@ def test_a_relabel_outside_an_adopted_pull_request_still_fails(admitted: Any, ca
         detail = "Could not complete: the requested change needs a design decision."
     statement = {
         "merged": (
-            "UPDATE curie.thread_publication_lineages SET status = 'merged' WHERE id = "
+            # The merge write stamps updated_at, as mark_publication_lineage_terminal does.
+            "UPDATE curie.thread_publication_lineages SET status = 'merged', updated_at = now() "
+            "WHERE id = "
             "(SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
         ),
         "closed": (

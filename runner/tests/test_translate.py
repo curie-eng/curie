@@ -407,6 +407,28 @@ def test_each_side_effecting_call_gets_its_own_flag() -> None:
     assert [f.arguments for f in flags] == [{"command": "ls"}, {"file_path": "/tmp/x"}]
 
 
+def test_the_question_call_reports_no_arguments() -> None:
+    """ADR 0286 decision 4: question text stays on the tracker, so the action
+    frame for ``ask_questions`` names the call and carries no arguments."""
+
+    state = TurnState()
+    msg = AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="q",
+                name="mcp__curie__ask_questions",
+                input={"summary": "Found it.", "questions": ["Which branch?"]},
+            ),
+        ],
+        model="m",
+    )
+    flags = [e for e in _translate(msg, state) if e.type == "side_effect_flag"]
+    assert [(f.tool, f.call_id, f.arguments) for f in flags] == [
+        ("mcp__curie__ask_questions", "q", None)
+    ]
+    assert state.side_effect_emitted
+
+
 def test_the_no_retry_signal_still_latches() -> None:
     """ADR-0013's rule reads presence, not count, and kernel.py is sacred."""
 
