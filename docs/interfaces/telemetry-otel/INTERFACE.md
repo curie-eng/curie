@@ -115,19 +115,15 @@ than an open bag of `gen_ai.*` names.
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, or
   deployment identifiers. Three bounded identifier dimensions are declared:
-  `curie.agent.turn.completed` and `curie.agent.turn.duration`, whose
-  `agent` label admits at most 32 distinct slugs per process and per instrument
-  and folds the rest,
+  `curie.agent.turn.completed`, whose
+  `agent` label admits at most 32 distinct slugs per process and folds the rest,
   plus any name that is not a 1 to 63 character slug, into `other`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`).
   Admission is first-come and resets when the process restarts, so the same slug
   can be named on one worker and counted as `other` on another. A rising
   `agent="other"` series means the ceiling or the slug rule is hiding a name.
   `unbound` is only a turn that never resolved an agent. A real agent named
-  `other` or `unbound` shares `other`. The worker records
-  `curie.agent.turn.duration` with the same seconds and outcome as the
-  unlabeled `curie.turn.duration`, so per-agent time to complete is its
-  `outcome="done"` series. Every other instrument refuses an
+  `other` or `unbound` shares `other`. Every other instrument refuses an
   agent identifier. `curie.action_executor.execution` admits at most 16 distinct connector
   slugs per process through its `connector` dimension, folding invalid names and
   overflow into `other` (`packages/telemetry/src/curie_telemetry/metrics.py`).

@@ -372,6 +372,22 @@ def test_opted_in_refusals_and_unavailability_stay_v1_without_a_requester(
         )
 
 
+def test_unverified_ingress_projects_no_requester_on_an_opted_in_turn(
+    stores: SimpleNamespace,
+) -> None:
+    stores.provider.outcomes[membership.SENDER] = "unresolved"
+    with invocation(stores, raw=True) as case:
+        assert case.context.outcome == "unresolved"
+        assert case.context.canonical is None and case.context.principal is None
+        requester_identity(case.scope["agent"], True)
+        for stage in ("prepare", "start"):
+            request = authority.request_for(case, stage=stage)
+            assert_v2(authority.post_check(case.client, request), request, requester=None)
+        assert lookups(case, 0)[-2:] == [
+            ("invocation", membership.SENDER), ("invocation", membership.SENDER),
+        ]
+
+
 @pytest.mark.parametrize("outcome", ["unresolved", "inactive"])
 def test_a_fresh_lookup_that_is_not_resolved_projects_a_null_requester(
     stores: SimpleNamespace, outcome: str,
@@ -599,9 +615,14 @@ def test_an_unresolved_original_invoker_projects_a_null_requester_on_an_approved
         requester_identity(case.scope["agent"], True)
         live = approved_check(case)
         assert_v2(authority.post_check(case.client, live), live, requester=expected)
+        assert expected["subject"] != APPROVER_SUBJECT
         case.provider.outcomes[membership.SENDER] = "unresolved"
+        before = len(case.provider.requests)
         request = approved_check(case, stage="start")
         assert_v2(authority.post_check(case.client, request), request, requester=None)
+        assert sorted(lookups(case, before)) == [
+            ("approval", APPROVER), ("invocation", membership.SENDER),
+        ]
 
 
 def test_the_grant_check_stays_v1_for_an_opted_in_agent(stores: SimpleNamespace) -> None:
