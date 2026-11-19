@@ -75,6 +75,10 @@
           "why": "cli/src/commands/work.rs renders lifecycle state, cause and publication. Admission selection metadata is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
         },
         {
+          "field": "memory_rules",
+          "why": "cli/src/commands/work.rs renders lifecycle state, cause and publication. The learned rules pinned at admission (#5798) are exposed by the API and are outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
           "field": "requester_principal_id",
           "why": "cli/src/commands/work.rs reads requester display text and execution ownership. It does not consume the admission requester reference exposed by the API."
         },
@@ -138,6 +142,10 @@
         {
           "field": "coding_instructions_evidence",
           "why": "cli/src/commands/work.rs does not apply or acknowledge coding instructions. Per-request selection evidence is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
+        },
+        {
+          "field": "memory_rules_evidence",
+          "why": "cli/src/commands/work.rs does not apply or acknowledge learned rules. Per-request learned rules evidence (#5798) is exposed by the API and is outside the versioned work-items/v2.2 JSON projection."
         },
         {
           "field": "retry_of_request_id",

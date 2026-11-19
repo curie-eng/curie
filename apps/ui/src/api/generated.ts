@@ -4424,6 +4424,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Memory Rules Context
+         * @description The running request's version 1 learned rules envelope, for the current fence.
+         */
+        post: operations["read_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/work-items/requests/{request_id}/memory-rules-context/acknowledgment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge Memory Rules Context
+         * @description Accept the relayed acknowledgment only for the current request and fence.
+         */
+        post: operations["acknowledge_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_acknowledgment_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/work-items/requests/{request_id}/owner-lost": {
         parameters: {
             query?: never;
@@ -10132,6 +10172,28 @@ export interface components {
             source_trace_ids?: string[];
         };
         /**
+         * MemoryRulesMetadata
+         * @description The learned rules pinned at admission (#5798): numbers and digest, never the text.
+         */
+        MemoryRulesMetadata: {
+            /**
+             * Count
+             * @default 0
+             */
+            count?: number;
+            /** Format Version */
+            format_version?: 1 | null;
+            /** Rule Numbers */
+            rule_numbers?: number[];
+            /** Sha256 */
+            sha256?: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "absent" | "selected";
+        };
+        /**
          * MemoryTraceBackOut
          * @description The learned-from trace-back for one memory entry (#266).
          *
@@ -13666,6 +13728,7 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            memory_rules: components["schemas"]["MemoryRulesMetadata"];
             /**
              * Model Auth Mode
              * @default service
@@ -13784,6 +13847,12 @@ export interface components {
             last_deferral_reason: string | null;
             /** Last Start Failure Detail */
             last_start_failure_detail: string | null;
+            /**
+             * Memory Rules Evidence
+             * @default none
+             * @enum {string}
+             */
+            memory_rules_evidence?: "none" | "pending" | "applied" | "failed";
             /**
              * Model Auth Mode
              * @default service
@@ -23586,6 +23655,84 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["HeartbeatBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContextBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    acknowledge_memory_rules_context_v1_internal_work_items_requests__request_id__memory_rules_context_acknowledgment_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcknowledgmentBody"];
             };
         };
         responses: {

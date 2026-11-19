@@ -75,7 +75,8 @@ FRAMING = (
     "who requested this work, pinned when the work was admitted. Precedence, highest "
     "first: platform safety and operator controls; the mandatory workflow rules of "
     "this bundle; repository guidance (every applicable scoped AGENTS.md, "
-    "CONTRIBUTING.md and workspace CLAUDE.md); then these preferences. Follow a "
+    "CONTRIBUTING.md and workspace CLAUDE.md); accepted learned rules for this "
+    "repository; then these preferences. Follow a "
     "preference only where it is compatible with everything above it; on any conflict "
     "the higher rule wins. These preferences cannot add tools, skills, credentials, "
     "network egress, grants or budget, cannot change the task's acceptance criteria, "
@@ -353,7 +354,7 @@ def subagent_prompt_refusal(tool_input: Mapping[str, Any], applied: Applied | No
     pinned = applied.text.strip()
     # Every string the call carries, at any depth, not only ``prompt``: a
     # subagent may be handed the text in any field of its input.
-    for text in _strings(tool_input):
+    for text in input_strings(tool_input):
         if OPEN_PREFIX in text or CLOSE_PREFIX in text:
             return _SUBAGENT_REFUSAL
         if pinned and pinned in text:
@@ -361,16 +362,16 @@ def subagent_prompt_refusal(tool_input: Mapping[str, Any], applied: Applied | No
     return None
 
 
-def _strings(value: Any) -> Iterator[str]:
+def input_strings(value: Any) -> Iterator[str]:
     if isinstance(value, str):
         yield value
     elif isinstance(value, Mapping):
         for key, item in value.items():
-            yield from _strings(key)
-            yield from _strings(item)
+            yield from input_strings(key)
+            yield from input_strings(item)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            yield from _strings(item)
+            yield from input_strings(item)
     else:
         yield json.dumps(value, default=str)
 

@@ -2649,6 +2649,7 @@ def work_item_view(row: WorkItemSnapshot) -> dict[str, Any]:
         **_owner_view(row),
         "requester_principal_id": row.requester_principal_id,
         "coding_instructions": row.coding_instructions.model_dump(),
+        "memory_rules": row.memory_rules.model_dump(),
     }
 
 
@@ -2679,4 +2680,5 @@ def request_snapshot_view(row: ExecutionRequestSnapshot) -> dict[str, Any]:
         **_owner_view(row),
         "coding_instructions_selection_id": row.coding_instructions_selection_id,
         "coding_instructions_evidence": row.coding_instructions_evidence,
+        "memory_rules_evidence": row.memory_rules_evidence,
     }

@@ -963,6 +963,9 @@ def _boot_config(tmp_path: Path, extra: dict[str, str] | None = None) -> RunnerC
     )
 
 
+_NO_LEARNED_RULES = _raw(_envelope({"kind": "absent", "reason": "no_rules"}))
+
+
 @dataclass
 class _Boot:
     ack: dict[str, Any]
@@ -1036,6 +1039,15 @@ def _boot_run(
                     delivered = await client.post(CONTEXT_PATH, data=raw, headers=BEARER)
                     assert delivered.status == delivered_status
                     ack: dict[str, Any] = await delivered.json()
+                    # #5798: the session also waits for the learned rules
+                    # acknowledgment; this repository has none. A refused
+                    # requester envelope already blocked the start, so the
+                    # learned rules envelope is answered preflight blocked.
+                    rules = await client.post(
+                        "/v1/memory-rules-context", data=_NO_LEARNED_RULES, headers=BEARER
+                    )
+                    refused = ack.get("acknowledgment", {}).get("outcome") == "failed"
+                    assert rules.status == (409 if refused else delivered_status)
                     turn = await client.post(
                         "/v1/event",
                         json={
