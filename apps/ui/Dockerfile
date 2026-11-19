@@ -70,7 +70,10 @@ server {
         access_log off;
         error_log /dev/null;
         add_header Cache-Control "private, no-store" always;
-        add_header Referrer-Policy "no-referrer" always;
+        # no-referrer makes the confirm POST send Origin null. strict-origin
+        # keeps that Origin and still omits the token path from Referer.
+        add_header Referrer-Policy "strict-origin" always;
+        proxy_hide_header Referrer-Policy;
         gzip off;
         proxy_pass ${CURIE_API_TARGET}/identity/connect/;
         proxy_set_header Host $http_host;
