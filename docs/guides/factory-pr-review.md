@@ -75,10 +75,12 @@ The agent pins the PR head and base, preserves your checkout and explains:
 * Changed, new and removed components, each with a brief account of its role.
 * A sequence diagram for material runtime flows and fallback paths. The agent
   uses Mermaid where it renders and otherwise draws a wider monospaced swimlane
-  inline, with aligned actor columns and separate numbered state notes.
+  inline, with aligned actor columns, labeled alternate groups and separate
+  numbered state notes.
 * Added unit scenarios, algorithm changes, and data models or migrations.
 * Security, production and operational consequences, with links to specific
-  diff lines and an explicit account of remaining gaps.
+  diff lines and an explicit account of remaining gaps. Findings come near the
+  end, after the purpose, architecture, behavior and test evidence.
 
 The review says when a category does not apply. It does not call a plan test
 end to end proof or assume a passing check establishes a live outcome.

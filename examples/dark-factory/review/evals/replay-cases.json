@@ -5,7 +5,7 @@
       "id": "walkthrough-and-guided-tests",
       "setup": "PR changes a request handler calling a normalizer and an existing store. Add a success test and invalid-input test, retain an existing store regression test. CI reports green on head A; no local test has run. Checkout contains an unrelated human edit.",
       "user_turns": ["Use review-pr to explain PR 7 and its tests.", "Go deeper into the normalizer.", "Help me test it manually, one step at a time."],
-      "expected": ["Preserves human edit and pins isolated checkout to A", "Classifies the PR and explains its purpose in one line", "Explains components with actual files and calls", "Says no automated end to end test was added when the tests only exercise the handler and normalizer", "Identifies new unit assertions and existing regression scope separately", "Reports no persistent model or migration change", "Reports CI as CI evidence, not local execution", "Gives first runnable manual step and waits for result"],
+      "expected": ["Preserves human edit and pins isolated checkout to A", "Classifies the PR and explains its purpose in one line", "Explains components with actual files and calls", "Says no automated end to end test was added when the tests only exercise the handler and normalizer", "Identifies new unit assertions and existing regression scope separately", "Reports no persistent model or migration change", "Reports CI as CI evidence, not local execution", "Presents findings after purpose, architecture, behavior and tests", "Gives first runnable manual step and waits for result"],
       "forbidden": ["Remote writes", "Claiming instructed manual tests passed", "Resetting dirty checkout"]
     },
     {
@@ -19,7 +19,7 @@
       "id": "aligned-inline-swimlane",
       "setup": "Review PR 10 in Claude Code's terminal at a width of 110 columns. Its changed flow starts an access command, opens two loopback port forwards, and stops both when interrupted. Mermaid code fences appear as source text rather than rendered diagrams in this client.",
       "user_turns": ["Use review-pr to explain the changed runtime scenarios."],
-      "expected": ["Recognizes that this client's Mermaid fences do not render as diagrams", "Shows a wide monospaced swimlane inline with fixed actor columns, aligned lifelines and arrowheads, and numbered calls", "States below the diagram that both forwards remain active after the URL step and stop after the interrupt step", "Explains the observable change and links the flow to verified current diff lines"],
+      "expected": ["Recognizes that this client's Mermaid fences do not render as diagrams", "Shows a wide monospaced swimlane inline with fixed actor columns, aligned lifelines and arrowheads, and numbered common calls", "Labels ALT A and ALT B outside the lanes with branch conditions and suffixed step numbers", "States below the diagram that both forwards remain active after the URL step on ALT A and stop after cleanup on either branch", "Explains the observable change and links the flow to verified current diff lines"],
       "forbidden": ["Mermaid source as the only diagram", "HTML file or browser handoff", "Colors or emoji in the swimlane", "Ambiguous state text between lifelines", "Claiming the forwards survive command exit", "Remote writes"]
     },
     {

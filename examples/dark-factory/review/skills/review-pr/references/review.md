@@ -39,12 +39,16 @@ short actor names and message labels. Each actor's vertical lifeline must stay
 at the same character position on every row, and each arrowhead must land on
 the receiving lifeline. Number the messages. Put a state note below the block
 and identify the step that establishes it; never place an unlabeled state note
-between lifelines where it could be mistaken for an arrow label. Put a failure
-or fallback in a separate small diagram or a clearly numbered branch. Split
-old and new flows instead of squeezing both into one crowded diagram. Avoid
-colors, emoji and external HTML files for this inline view. Check the alignment
-and line length before replying; shorten labels or split the flow if the host
-will wrap it. For example:
+between lifelines where it could be mistaken for an arrow label. For an
+alternate group, show common steps once, then label each branch outside the
+lanes as `ALT A` and `ALT B` with its condition. Number branch messages `4a`,
+`4b` and so on while keeping the same actor columns. For an optional or
+repeated group, label the guard or loop condition and the step at which it
+ends. Put state notes below the block and name the branch they apply to.
+Split old and new flows instead of squeezing both into one crowded diagram.
+Avoid colors, emoji and external HTML files for this inline view. Check the
+alignment and line length before replying; shorten labels or split the flow
+if the host will wrap it. For example:
 
 ```text
           User                                 Access CLI                                  Kubernetes
@@ -52,14 +56,20 @@ will wrap it. For example:
 1.        |---------- start access ------------>                                           |
 2.        |                                    |------------- forward Console ------------->
 3.        |                                    |------------ forward Langfuse ------------->
-4.        <--------- localhost URLs -----------|                                           |
-5.        |------------- Ctrl-C --------------->                                           |
-6.        |                                    |----------- stop both forwards ------------>
+
+ALT A: both forwards become ready
+4a.       <--------- localhost URLs -----------|                                           |
+5a.       |------------- Ctrl-C --------------->                                           |
+6a.       |                                    |----------- stop both forwards ------------>
+
+ALT B: either forward exits
+4b.       |                                    |----------- stop other forward ------------>
+5b.       <---------- return error ------------|                                           |
 ```
 
-State after step 4: both forwards remain active while the command runs.
-State after step 6: neither forward remains active. These state notes describe
-what the arrows accomplished; they are not additional messages.
+State after step 4a: both forwards remain active while the command runs.
+State after step 6a or 4b: neither forward remains active. These state notes
+describe what the arrows accomplished; they are not additional messages.
 
 Trace significant hunks to the requested outcome. Explain changed inputs,
 outputs, errors, defaults, compatibility, permissions and migrations where

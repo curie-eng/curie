@@ -45,8 +45,7 @@ that makes the result clearer:
    slice or another accurate type. State the problem and intended outcome. For
    a feature slice, explain the full feature goal, this PR's contribution,
    verified related issues or PRs, dependencies and remaining work. Mark any
-   inferred context as inference. Surface a critical review blocker immediately
-   after this orientation.
+   inferred context as inference.
 2. **End to end evidence.** Name the end to end scenarios added in this PR,
    their real entry points, assertions and limits. Separate automated end to
    end tests from integration or plan tests, author reported manual runs, your
@@ -74,12 +73,14 @@ that makes the result clearer:
    contracts. For persistent data, explain migration order, existing records,
    compatibility, rollback and backfill. State explicitly when no persistent
    model or migration changes.
-7. **Architectural assessment.** Give actionable findings with severity,
-   trigger, consequence and the change or decision needed. Check changed
+7. **Findings and architectural assessment.** After the purpose, system map,
+   changed flows, tests and data context, give actionable findings with
+   severity, trigger, consequence and the change or decision needed. Check changed
    defaults, security and network exposure, identity, production versus
    development behavior, failure handling, observability and reversibility.
-   Name consequential gaps and unresolved questions. Do not conclude there are
-   no findings until these paths have been checked.
+   Name consequential gaps and unresolved questions. Keep findings near the end
+   of the review, including high severity findings, so their context is clear.
+   Do not conclude there are no findings until these paths have been checked.
 
 Link substantive sections to verified lines in the current PR diff where
 possible and link related issues directly. For behavior outside the diff, link
