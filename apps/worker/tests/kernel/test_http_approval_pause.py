@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -20,13 +21,19 @@ import httpx
 import pytest
 from aci_protocol import Final, SessionStatus
 from curie_internal.identity_approval import ApprovalCreationIdentityV1
-from curie_worker.approvals import ApprovalClient, ApprovalContinuityRefused, CreatedApproval
+from curie_worker.approvals import (
+    TICKET_RETRY_REPLY,
+    ApprovalClient,
+    ApprovalContinuityRefused,
+    CreatedApproval,
+)
 from curie_worker.binding import GRANT_ARGUMENTS_ENV, GRANT_TOOL_ENV
 from curie_worker.capacity_wait import WAIT_REPLY_REF_FIELD
 from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
-from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.delivery_lease import DeliveryLeaseStore, LeaseLostError
 from curie_worker.identity_authority import TurnAuthorityUnavailable
-from curie_worker.kernel import identity
+from curie_worker.kernel import constants, identity
+from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from ..queue_fixtures import qevent
@@ -467,17 +474,29 @@ def test_selected_email_turn_without_approver_emails_reaches_identity_creation(
 
 
 @pytest.mark.parametrize(
-    ("status", "detail", "settled"),
+    ("status", "detail", "settled", "told"),
     [
-        (422, "approval_ticket_preparation_expired", True),
-        (422, "approver_dm_recipient_count", True),
-        (503, "authority_unavailable", False),
+        (422, "approval_ticket_preparation_expired", True, True),
+        (422, "approval_ticket_invalid_ticket", True, True),
+        (422, "approval_ticket_arguments_mismatch", True, True),
+        (409, "approval_ticket_replayed", True, True),
+        (422, "approval_ticket_arguments_unstable", True, False),
+        (422, "approval_ticket_requester_mismatch", True, False),
+        (422, "invalid_approval_context", True, False),
+        (403, "caller_not_allowed", True, False),
+        (422, "approver_dm_recipient_count", True, False),
+        (503, "authority_unavailable", False, False),
     ],
 )
 def test_definite_creation_refusal_settles_the_turn(
-    make_harness: Any, status: int, detail: str, settled: bool,
+    make_harness: Any, status: int, detail: str, settled: bool, told: bool,
 ) -> None:
-    """A coded creation refusal ACKs the turn. Availability failure stays pending."""
+    """A coded creation refusal ACKs the turn. Availability failure stays pending.
+
+    Draft ADR 0288 decision 3: a refusal of the prepared ticket itself replaces
+    the placeholder with one plain sentence; every refusal about a person, a
+    route or availability stays silent.
+    """
 
     async def run() -> None:
         async def handle(_request: httpx.Request) -> httpx.Response:
@@ -507,6 +526,16 @@ def test_definite_creation_refusal_settles_the_turn(
                 entry_id, observed = await pending_entry(h, consumer, {
                     "payload": raw, "curie_identity_context_v1": CAPSULE,
                 })
+                # Whether the terminal marker existed when each event left.
+                marked_at_emit: list[bool] = []
+                emit = h.sink.emit
+
+                async def observing_emit(*args: Any, **kwargs: Any) -> Any:
+                    done_key = h.config.done_key(event.event_id)
+                    marked_at_emit.append(bool(await h.async_redis.exists(done_key)))
+                    return await emit(*args, **kwargs)
+
+                h.sink.emit = observing_emit
                 await consumer._handle(entry_id, observed)
                 pending = await h.async_redis.xpending(
                     h.config.stream, h.config.consumer_group,
@@ -515,10 +544,151 @@ def test_definite_creation_refusal_settles_the_turn(
                 assert pending["pending"] == (0 if settled else 1)
                 assert done is settled
                 assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
-                assert h.sink.events == []
+                if told:
+                    assert [event.event for event, _, _ in h.sink.events] == ["reply.update"]
+                    assert h.sink.updates == [
+                        (event.reply_handle.channel, event.reply_handle.placeholder,
+                         TICKET_RETRY_REPLY),
+                    ]
+                    assert detail not in TICKET_RETRY_REPLY
+                    assert marked_at_emit == [True], "the notice follows the terminal marker"
+                else:
+                    assert h.sink.events == []
+                assert h.sink.posts == []
                 assert all(
                     item.operating_mode != "Suspended"
                     for item in h.fake_k8s.sandboxes.values()
                 )
+
+    asyncio.run(run())
+
+
+def test_an_undelivered_ticket_refusal_notice_keeps_the_terminal_outcome(
+    make_harness: Any,
+) -> None:
+    """Draft ADR 0288 decision 3: the notice is best effort, the refusal stays terminal."""
+
+    async def run() -> None:
+        async def handle(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(422, json={"detail": "approval_ticket_invalid_ticket"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            approvals = ApprovalClient(
+                api_base_url="https://core.example.test",
+                api_key="SyntheticPlatformKey",
+                client=http,
+                read_timeout_s=30,
+                worker_token="SyntheticPrivateWorkerToken",
+            )
+            async with make_harness(
+                binding=Binding(), identity_authority=Core(), approvals=approvals,
+            ) as h:
+                h.runner.default_script = awaiting()
+                h.sink.fail_events.add("reply.update")
+                event = qevent("synthetic undelivered notice")
+                consumer = Consumer(
+                    redis=h.async_redis,
+                    kernel=h.kernel,
+                    config=h.config,
+                    leases=DeliveryLeaseStore(h.async_redis, h.config),
+                    reminders=refuse_unconfigured_reminder,
+                )
+                entry_id, observed = await pending_entry(h, consumer, {
+                    "payload": raw_payload(event), "curie_identity_context_v1": CAPSULE,
+                })
+                await consumer._handle(entry_id, observed)
+                pending = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                assert pending["pending"] == 0
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+                assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
+                assert h.sink.events == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("adapter", "told"),
+    [(None, True), (CLUSTER_MESSAGE_ADAPTER, False)],
+    ids=["slack", "relay"],
+)
+def test_the_ticket_refusal_notice_leaves_the_relay_to_its_own_settlement(
+    make_harness: Any, adapter: str | None, told: bool,
+) -> None:
+    """Draft ADR 0288 decision 3: the relay waiter gets only its existing refusal reply."""
+
+    async def run() -> None:
+        async with make_harness(binding=Binding(), identity_authority=Core()) as h:
+            event = qevent("synthetic notice", adapter=adapter)
+            await h.kernel._notice_after_refusal(event, TICKET_RETRY_REPLY)
+            texts = [text for _, _, text in h.sink.updates]
+            assert texts == ([TICKET_RETRY_REPLY] if told else [])
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("how", ["lost", "expired"])
+def test_a_lease_lost_while_the_marker_is_written_sends_no_ticket_notice(
+    make_harness: Any, how: str,
+) -> None:
+    """Draft ADR 0288 decision 3: a stale owner never tells the requester.
+
+    The lease is still held at the lifecycle's lease check and is lost, or its
+    confirmed window runs out before the heartbeat notices, while the done
+    marker is written. Another owner may now hold the event, so this one sends
+    nothing.
+    """
+
+    async def run() -> None:
+        async def handle(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(422, json={"detail": "approval_ticket_invalid_ticket"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            approvals = ApprovalClient(
+                api_base_url="https://core.example.test",
+                api_key="SyntheticPlatformKey",
+                client=http,
+                read_timeout_s=30,
+                worker_token="SyntheticPrivateWorkerToken",
+            )
+            async with make_harness(
+                binding=Binding(), identity_authority=Core(), approvals=approvals,
+            ) as h:
+                h.runner.default_script = awaiting()
+                event = qevent("synthetic lease lost at the marker")
+                consumer = Consumer(
+                    redis=h.async_redis,
+                    kernel=h.kernel,
+                    config=h.config,
+                    leases=DeliveryLeaseStore(h.async_redis, h.config),
+                    reminders=refuse_unconfigured_reminder,
+                )
+                entry_id, observed = await pending_entry(h, consumer, {
+                    "payload": raw_payload(event), "curie_identity_context_v1": CAPSULE,
+                })
+                mark_done = h.kernel._markers.mark_done
+                lost: list[bool] = []
+
+                async def losing_mark_done(*args: Any, **kwargs: Any) -> Any:
+                    result = await mark_done(*args, **kwargs)
+                    lease = constants._DELIVERY_LEASE.get()
+                    assert lease is not None, "the refusal runs under a delivery lease"
+                    if how == "lost":
+                        lease.lost.set()
+                    else:
+                        lease.local_deadline_monotonic = time.monotonic() - 1
+                    lost.append(True)
+                    return result
+
+                h.kernel._markers.mark_done = losing_mark_done
+                # The stale owner's settlement refuses to ACK: a lost lease is
+                # logged and left pending, an expired window raises at the ACK.
+                try:
+                    await consumer._handle(entry_id, observed)
+                except LeaseLostError:
+                    assert how == "expired"
+                assert lost == [True], "the refusal reached the done marker"
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+                assert h.sink.updates == []
+                assert h.sink.posts == []
 
     asyncio.run(run())

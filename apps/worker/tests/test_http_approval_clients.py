@@ -359,6 +359,9 @@ def test_only_validated_fixed_api_denials_become_private_continuity_refusal(
             with pytest.raises(error_type) as error:
                 await invoke(owner)
             private_error(error, "identity_approval_refused")
+            # Draft ADR 0288 decision 3: the exact code rides as an attribute,
+            # never in the message, so the kernel can tell a ticket refusal apart.
+            assert error.value.code == detail
         assert len(seen) == 1 and all(stream.finished for stream in streams)
 
     asyncio.run(go())
