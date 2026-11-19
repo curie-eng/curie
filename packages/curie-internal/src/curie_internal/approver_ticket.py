@@ -236,8 +236,20 @@ def unverified_key_id(token: str) -> str:
     Bounded framing, closed shape and canonical JSON are checked. Always verify
     the original ticket with the registered key selected by this untrusted id.
     """
+    return unverified_claims(token).key_id
+
+
+def unverified_claims(token: str) -> ApprovalTicket:
+    """Read an UNTRUSTED ticket's closed claims; never proves origin or signature.
+
+    The same bounded framing, closed shape and canonical JSON checks as
+    ``unverified_key_id``, and no signature, key or freshness check. A reader
+    may use the result only to choose among values it already holds (the
+    runner's ticket carry, ADR 0288); every authority decision still verifies
+    the original ticket with the registered key.
+    """
     _, body, _ = _ticket_envelope(token)
-    return _ticket_claims(body).key_id
+    return _ticket_claims(body)
 
 
 def parse_ticket(token: str, *, public_key: VerifyKey) -> ApprovalTicket:
