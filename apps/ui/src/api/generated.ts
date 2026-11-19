@@ -4898,6 +4898,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/work-item-progress/{request_id}/handoff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Report Work Item Handoff */
+        post: operations["report_work_item_handoff_v1_work_item_progress__request_id__handoff_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/work-item-progress/{request_id}/usage": {
         parameters: {
             query?: never;
@@ -9417,6 +9434,23 @@ export interface components {
             /** Size Bytes */
             size_bytes: number | null;
         };
+        /** Finding */
+        Finding: {
+            /** Next Step */
+            next_step: string;
+            /**
+             * Owner
+             * @enum {string}
+             */
+            owner: "agent" | "human" | "platform" | "unknown";
+            /**
+             * Source
+             * @constant
+             */
+            source: "agent_reported";
+            /** Summary */
+            summary: string;
+        };
         /** FinishBody */
         FinishBody: {
             /** Cause */
@@ -12608,6 +12642,24 @@ export interface components {
             /** Repo Full Name */
             repo_full_name: string;
         };
+        /** RunHandoff */
+        RunHandoff: {
+            /** Findings */
+            findings?: components["schemas"]["Finding"][];
+            /** Human Decision */
+            human_decision?: string | null;
+            /** Later Gate */
+            later_gate?: string | null;
+            /** Next Action */
+            next_action: string;
+            /**
+             * Next Owner
+             * @enum {string}
+             */
+            next_owner: "agent" | "human" | "platform" | "unknown";
+            /** Verification */
+            verification?: components["schemas"]["Verification"][];
+        };
         /**
          * RunnerPods
          * @description The runner sandbox pods in a namespace (populates the Logs pod dropdown).
@@ -13535,6 +13587,25 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /** Verification */
+        Verification: {
+            /** Acceptance Criteria */
+            acceptance_criteria?: string[];
+            /** Check */
+            check: string;
+            /** Command */
+            command?: string | null;
+            /**
+             * Source
+             * @constant
+             */
+            source: "agent_reported";
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "passed" | "failed" | "unverified" | "not_run";
         };
         /**
          * VerificationObservation
@@ -24615,6 +24686,43 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["ProgressReport"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    report_work_item_handoff_v1_work_item_progress__request_id__handoff_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunHandoff"];
             };
         };
         responses: {

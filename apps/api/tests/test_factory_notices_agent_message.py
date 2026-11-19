@@ -134,7 +134,7 @@ def _settled_handoff(fixture: Any, detail: str) -> tuple[str, str]:
     return notice["detail"], body
 
 
-def test_long_handoff_renders_whole_as_quote(admitted: Any) -> None:  # noqa: F811
+def test_long_agent_message_stays_off_public_tracker(admitted: Any) -> None:  # noqa: F811
     prefix = "**Plan review needs a decision**\n\n1. Check `parser.py`.\n"
     question = "\n\nWhich parser should the maintainer choose?"
     detail = prefix + "x" * (3000 - len(prefix) - len(question)) + question
@@ -143,14 +143,10 @@ def test_long_handoff_renders_whole_as_quote(admitted: Any) -> None:  # noqa: F8
     stored, body = _settled_handoff(admitted, detail)
 
     assert stored == detail
-    _, quoted, _ = _quoted(body)
-    assert quoted == detail
-    assert "> **Plan review needs a decision**\n>\n> 1. Check `parser.py`.\n" in body
-    assert body.splitlines().count(">") == 2
-    assert body.count("\n> ") == len(detail.splitlines()) - 2
-    assert body.count("Which parser should the maintainer choose?") == 1
-    assert "..." not in body
-    assert "```text" not in body
+    assert "Agent's last message:" not in body
+    assert "Which parser should the maintainer choose?" not in body
+    assert "No pull request was published" in body
+    assert "Next owner:" in body
 
 
 def test_an_oversized_handoff_is_bounded_before_rendering(admitted: Any) -> None:  # noqa: F811
@@ -161,7 +157,7 @@ def test_an_oversized_handoff_is_bounded_before_rendering(admitted: Any) -> None
 
     assert stored == "x" * 3997 + "..."
     assert len(stored) == 4000
-    assert _quoted(body)[1] == stored
+    assert "Agent's last message:" not in body
     assert "overflow" not in body
 
 
@@ -179,7 +175,8 @@ def test_notice_detail_redacts_a_secret_crossing_the_bound_before_clipping(
     for text in (stored, body):
         assert "PRIVATE KEY" not in text
         assert "s" * 10 not in text
-        assert "[REDACTED:pem_private_key]" in text
+    assert "[REDACTED:pem_private_key]" in stored
+    assert "[REDACTED:pem_private_key]" not in body
 
 
 def test_unchanged_issue_usage_stays_outside_the_handoff_quote(
@@ -221,8 +218,7 @@ def test_unchanged_issue_usage_stays_outside_the_handoff_quote(
     assert f"https://github.com/{REPO}/pull/{number}" in body
     assert "In response to" not in body
     quoted, outside = _commonmark_content(body)
-    assert detail in quoted
-    assert detail not in outside
+    assert detail not in body
     (usage,) = [line for line in outside if line.startswith("Usage:")]
     assert usage.startswith(
         "Usage: implementer 1,500,000 tokens ($2.00), reviewers 300,000 tokens ($0.40), "

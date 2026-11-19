@@ -21,7 +21,7 @@ import aiohttp
 from aci_protocol import BootEnv
 from claude_agent_sdk import SdkMcpTool, tool
 
-from .tool_names import PROGRESS_TOOL
+from .tool_names import PROGRESS_TOOL, RUN_HANDOFF_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ class ProgressClient:
         self._url = url
         self._token = token
 
-    async def post(self, body: dict[str, Any]) -> int | None:
+    async def post(self, body: dict[str, Any], *, suffix: str = "") -> int | None:
         """Return the final HTTP status, or None after a transport failure.
 
         One retry on a transport error or a 5xx.
@@ -191,7 +191,7 @@ class ProgressClient:
                 async with (
                     aiohttp.ClientSession(timeout=timeout) as session,
                     session.post(
-                        self._url, json=body, headers={"X-API-Key": self._token}
+                        self._url + suffix, json=body, headers={"X-API-Key": self._token}
                     ) as response,
                 ):
                     status = response.status
@@ -262,6 +262,76 @@ def build_progress_tool(
         )
 
     return report_progress
+
+
+def build_run_handoff_tool(client: ProgressClient) -> SdkMcpTool[Any]:
+    """Optional, request-bound structured evidence submitted before a run ends."""
+
+    def text(maximum: int) -> dict[str, Any]:
+        return {"type": "string", "minLength": 1, "maxLength": maximum}
+
+    finding = {
+        "type": "object",
+        "properties": {
+            "summary": text(160),
+            "owner": {"type": "string", "enum": ["agent", "human", "platform", "unknown"]},
+            "next_step": text(160),
+            "source": {"type": "string", "const": "agent_reported"},
+        },
+        "required": ["summary", "owner", "next_step", "source"],
+        "additionalProperties": False,
+    }
+    verification = {
+        "type": "object",
+        "properties": {
+            "check": text(100),
+            "command": text(240),
+            "state": {"type": "string", "enum": ["passed", "failed", "unverified", "not_run"]},
+            "source": {"type": "string", "const": "agent_reported"},
+            "acceptance_criteria": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^AC[1-9][0-9]*$"},
+                "minItems": 1,
+                "maxItems": 10,
+                "uniqueItems": True,
+            },
+        },
+        "required": ["check", "command", "state", "source", "acceptance_criteria"],
+        "additionalProperties": False,
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "next_owner": {"type": "string", "enum": ["agent", "human", "platform", "unknown"]},
+            "next_action": text(200),
+            "human_decision": text(200),
+            "later_gate": text(200),
+            "findings": {"type": "array", "items": finding, "maxItems": 10},
+            "verification": {"type": "array", "items": verification, "maxItems": 20},
+        },
+        "required": ["next_owner", "next_action"],
+        "additionalProperties": False,
+    }
+
+    @tool(
+        RUN_HANDOFF_TOOL,
+        "Report a short end-of-run handoff before your final answer. These are "
+        "agent-reported claims, not platform verification. Do not include secrets "
+        "or customer identifiers. For every verification entry, name the numbered "
+        "acceptance criteria it actually checks (AC1, AC2, etc.); report each "
+        "criterion's state separately when the results differ. Give a short "
+        "behavior description in check and the exact verification command in "
+        "command, even when its state is not_run; never say it ran if it did not.",
+        schema,
+    )
+    async def report_run_handoff(args: dict[str, Any]) -> dict[str, Any]:
+        status = await client.post(args, suffix="/handoff")
+        if status == 201:
+            return {"content": [{"type": "text", "text": "run handoff recorded"}]}
+        detail = f"status {status}" if status is not None else "the api was unreachable"
+        return _error(f"Run handoff was not recorded ({detail}). Continue the work.")
+
+    return report_run_handoff
 
 
 def resolve_progress(

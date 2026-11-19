@@ -66,6 +66,7 @@ ISSUE_PROMPT = f"Resolve {ISSUE_URL}"
 PR_URL = f"https://github.com/{WORK_ITEM_REPO}/pull/77"
 PUBLISH_TOOL = "mcp__curie__publish_changes"
 PROGRESS_TOOL = "mcp__curie__report_progress"
+RUN_HANDOFF_TOOL = "mcp__curie__report_run_handoff"
 # A credential shape the shared redaction policy (curie_telemetry.redact
 # ``github_pat``) replaces. Assembled so no literal token sits in the source.
 GITHUB_TOKEN = "gh" + "p_" + "A1b2C3d4" * 5
@@ -753,6 +754,21 @@ def test_a_no_change_reply_after_a_potential_write_still_gets_a_continuation(
         assert len(opened) == 2
         assert "publish_changes" in opened[1]
         assert items.finishes[0]["detail"] == continuation
+        assert terminal
+
+    asyncio.run(exercise())
+
+
+def test_a_no_change_reply_with_handoff_telemetry_skips_continuation(make_harness) -> None:
+    async def exercise() -> None:
+        reply = "No changes needed: the existing pull request already covers this request."
+        opened, items, terminal = await _run_execute(
+            make_harness,
+            [[_tool("Read"), _tool(RUN_HANDOFF_TOOL), _done(reply)]],
+            publication_creator=_PublicationApi(_revision_lineage(PR_URL, "1700000000.000001")),
+        )
+        assert len(opened) == 1
+        assert items.finishes[0]["detail"] == reply
         assert terminal
 
     asyncio.run(exercise())
