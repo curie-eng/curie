@@ -633,6 +633,66 @@ def test_refusal_link_revoked_during_the_code_host_read(stack: Stack) -> None:
     assert revoked == [link_id]
 
 
+_DEACTIVATE = {
+    "principal": (
+        "UPDATE curie.principals SET status = :status WHERE id = :id RETURNING id",
+        "disabled",
+    ),
+    "tenant": (
+        "UPDATE curie.tenants SET status = :status WHERE id = :id RETURNING id",
+        "suspended",
+    ),
+}
+
+
+def _set_status(subject: str, row_id: uuid.UUID, active: bool) -> None:
+    statement, inactive = _DEACTIVATE[subject]
+    status = "active" if active else inactive
+    (_found,) = pe.rows(statement, {"id": row_id, "status": status})
+
+
+def _deactivate_on_permission_read(
+    subject: str, row_id: uuid.UUID, done: list[uuid.UUID]
+) -> Override:
+    """Disable the principal or suspend its tenant once, through another
+    connection, while the code host answers the permission read, then let the
+    fake answer ``write`` as before."""
+
+    def override(request: httpx.Request) -> httpx.Response | None:
+        if done or "/collaborators/" not in request.url.path:
+            return None
+        # This handler runs on the app's event loop; the update needs its own.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_set_status, subject, row_id, False).result(timeout=60)
+        done.append(row_id)
+        return None
+
+    return override
+
+
+@pytest.mark.parametrize("subject", ["principal", "tenant"])
+def test_refusal_principal_deactivated_during_the_code_host_read(
+    stack: Stack, subject: str
+) -> None:
+    """The session authenticated an active principal and the permission read
+    answers ``write``; only the re-read of the principal and its tenant under
+    the identity fence, after the provider reads, can refuse."""
+
+    _link(stack, stack.owner)
+    row_id = stack.owner.principal_id if subject == "principal" else stack.tenant_id
+    done: list[uuid.UUID] = []
+    stack.overrides.append(_deactivate_on_permission_read(subject, row_id, done))
+    rule_id = _rule(stack)
+    before = _snapshot(rule_id)
+    _refused(_decide(stack, rule_id), 401, UNAUTHENTICATED, rule_id, before)
+    assert done == [row_id]
+    assert [r for r in stack.seen if "/collaborators/" in r.url.path]
+    # Liveness: active again, the same flow (override spent) accepts.
+    _set_status(subject, row_id, True)
+    _accepts(stack, rule_id)
+    assert done == [row_id]
+
+
 def test_refusal_revoked_link_needs_write_access(stack: Stack) -> None:
     link_id = _link(stack, stack.owner)
     revoked = stack.client.post(

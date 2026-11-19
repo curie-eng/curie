@@ -313,6 +313,33 @@ fn an_api_refusal_exits_1_with_error_and_fix() {
 }
 
 #[test]
+fn a_coded_503_outage_exits_3_with_error_and_fix() {
+    let fixture = Fixture::new();
+    let session = fixture.session(0o600);
+    let server = serve(|req| match req.method.as_str() {
+        "GET" => agent_list(),
+        _ => Response::json(
+            503,
+            &json!({"detail": {
+                "code": "memory_rules.code_host_unavailable",
+                "message": "The code host did not answer.",
+                "fix": "Retry once the code host is reachable.",
+            }})
+            .to_string(),
+        ),
+    });
+    let output = fixture.run(&act_args("--accept", &session, &server.base_url));
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output));
+    let value = object(&output);
+    assert!(value["error"]
+        .as_str()
+        .expect("error text")
+        .contains("memory_rules.code_host_unavailable"));
+    assert_eq!(value["fix"], "Retry once the code host is reachable.");
+    assert_no_secrets(&output);
+}
+
+#[test]
 fn dry_run_prints_one_plan_object_and_makes_no_request() {
     let fixture = Fixture::new();
     let session = fixture.session(0o600);

@@ -2986,9 +2986,10 @@ WorkItem's snapshot and in its recorded transcript until they expire.
 
 A learned rule is a one-line rule an agent proposes, for example after a
 merged pull request. A proposed rule applies only after a person accepts it.
-Accepting or removing a rule changes only stored rows: a running request keeps
-the rules it was admitted with, and the next ticket's admission reads the new
-set, so every decision answers `"applies_from": "next_ticket"`.
+Accepting or removing a rule changes only stored rows. The decision is
+recorded now and takes effect at the next ticket's admission once admission
+reads learned rules (#5798); a running request keeps the rules it was admitted
+with. Every decision answers `"applies_from": "next_ticket"`.
 
 The routes:
 
@@ -3026,7 +3027,8 @@ large numbers can reach the byte bound before the count bound. Accept checks
 both under a lock on the agent row, so two concurrent accepts cannot pass the
 cap together. Reject and remove never meet either bound.
 
-Refusals carry `detail` with `code`, `message` and `fix`:
+Coded refusals carry `detail` with `code`, `message` and `fix`; OpenAPI
+declares that body as `MemoryRuleRefusal`:
 
 1. 403 `memory_rules.write_access_required`: no linked account on the host,
    the account cannot write to the repository, or the link was revoked or
@@ -3042,6 +3044,12 @@ Refusals carry `detail` with `code`, `message` and `fix`:
    `limit`) and `memory_rules.snapshot_full` (with `limit_bytes`).
 6. 503 `memory_rules.code_host_unavailable` when GitHub cannot be read, and
    `memory_rules.unavailable` when the database cannot. Nothing changes; retry.
+7. 422 `memory_rules.invalid_request` for a malformed query, path or body.
+
+A refused credential (401) or console origin (403) is a plain `detail` string
+instead, declared as `MemoryRuleAuthRefusal`. A principal disabled, or whose
+tenant was suspended, while GitHub was being read is refused under the
+identity fence with the same 401 as a dead session, and nothing changes.
 
 From the CLI, `curie cluster memory <agent> --rules` lists rules over the
 cluster connection; add `--rule-state STATE` or `--scope-key KEY` to filter,

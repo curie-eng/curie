@@ -64,4 +64,36 @@ class MemoryRulesOut(BaseModel):
 
 class MemoryRuleDecisionOut(BaseModel):
     rule: MemoryRuleOut
-    applies_from: Literal["next_ticket"]
+    applies_from: Literal["next_ticket"] = Field(
+        description=(
+            "The decision is recorded now and takes effect at the next ticket's "
+            "admission once admission reads learned rules (#5798); a running request "
+            "keeps the rules it was admitted with."
+        )
+    )
+
+
+class MemoryRuleRefusalDetail(BaseModel):
+    """A coded refusal: ``code`` is ``memory_rules.<name>``."""
+
+    code: str
+    message: str
+    fix: str
+    # Only on ``memory_rules.stale_version``.
+    current_version: int | None = None
+    # Only on ``memory_rules.scope_full``.
+    limit: int | None = None
+    # Only on ``memory_rules.snapshot_full``.
+    limit_bytes: int | None = None
+
+
+class MemoryRuleRefusal(BaseModel):
+    """Every coded learned rule refusal, a malformed request's 422 included."""
+
+    detail: MemoryRuleRefusalDetail
+
+
+class MemoryRuleAuthRefusal(BaseModel):
+    """A refused credential or console origin: one plain reason string."""
+
+    detail: str

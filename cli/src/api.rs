@@ -6480,7 +6480,11 @@ fn memory_rules_refusal(operation: &str, status: reqwest::StatusCode, body: &str
         return crate::exit::CliError {
             message: format!("{code}: {message}"),
             fix: Some(fix),
-            class: Failure,
+            class: if matches!(status.as_u16(), 502..=504) {
+                Transient
+            } else {
+                Failure
+            },
         }
         .into();
     }

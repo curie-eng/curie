@@ -972,7 +972,9 @@ export interface paths {
         put?: never;
         /**
          * Accept Rule
-         * @description Accept a proposed rule; it applies from the next ticket's admission.
+         * @description Accept a proposed rule. The decision is recorded now and takes effect at the
+         *     next ticket's admission once admission reads learned rules (#5798); a running
+         *     request keeps the rules it was admitted with.
          */
         post: operations["accept_rule_agents__agent_id__memory_rules__rule_id__accept_post"];
         delete?: never;
@@ -1012,7 +1014,9 @@ export interface paths {
         put?: never;
         /**
          * Remove Rule
-         * @description Remove an accepted rule; the next ticket's admission no longer carries it.
+         * @description Remove an accepted rule. The decision is recorded now and takes effect at the
+         *     next ticket's admission once admission reads learned rules (#5798); a running
+         *     request keeps the rules it was admitted with.
          */
         post: operations["remove_rule_agents__agent_id__memory_rules__rule_id__remove_post"];
         delete?: never;
@@ -10251,6 +10255,14 @@ export interface components {
             /** Source Trace Ids */
             source_trace_ids?: string[];
         };
+        /**
+         * MemoryRuleAuthRefusal
+         * @description A refused credential or console origin: one plain reason string.
+         */
+        MemoryRuleAuthRefusal: {
+            /** Detail */
+            detail: string;
+        };
         /** MemoryRuleDecider */
         MemoryRuleDecider: {
             /** Display Name */
@@ -10273,6 +10285,7 @@ export interface components {
         MemoryRuleDecisionOut: {
             /**
              * Applies From
+             * @description The decision is recorded now and takes effect at the next ticket's admission once admission reads learned rules (#5798); a running request keeps the rules it was admitted with.
              * @constant
              */
             applies_from: "next_ticket";
@@ -10327,6 +10340,31 @@ export interface components {
             text: string;
             /** Version */
             version: number;
+        };
+        /**
+         * MemoryRuleRefusal
+         * @description Every coded learned rule refusal, a malformed request's 422 included.
+         */
+        MemoryRuleRefusal: {
+            detail: components["schemas"]["MemoryRuleRefusalDetail"];
+        };
+        /**
+         * MemoryRuleRefusalDetail
+         * @description A coded refusal: ``code`` is ``memory_rules.<name>``.
+         */
+        MemoryRuleRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Current Version */
+            current_version?: number | null;
+            /** Fix */
+            fix: string;
+            /** Limit */
+            limit?: number | null;
+            /** Limit Bytes */
+            limit_bytes?: number | null;
+            /** Message */
+            message: string;
         };
         /** MemoryRuleScopeOut */
         MemoryRuleScopeOut: {
@@ -16630,13 +16668,49 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryRulesOut"];
                 };
             };
-            /** @description Validation Error */
+            /** @description No platform key or live console session */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description Console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
                 };
             };
         };
@@ -16668,13 +16742,58 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryRuleDecisionOut"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
                 };
             };
         };
@@ -16706,13 +16825,58 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryRuleDecisionOut"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
                 };
             };
         };
@@ -16744,13 +16908,58 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryRuleDecisionOut"];
                 };
             };
-            /** @description Validation Error */
+            /** @description Not an active principal's console session, or another credential sent */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"] | components["schemas"]["MemoryRuleAuthRefusal"];
+                };
+            };
+            /** @description `memory_rules.not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.invalid_request` */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
+                };
+            };
+            /** @description `memory_rules.code_host_unavailable` or `memory_rules.unavailable` */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRuleRefusal"];
                 };
             };
         };

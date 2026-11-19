@@ -11,7 +11,8 @@ repository's immutable id; the label stored on the rule is passed to the
 adapter only as the credential hint an id read needs and never decides
 identity. The decision itself is one transaction under the identity reader
 fence and then the agent row lock, which serializes the per-scope cap; under
-the fence it re-reads the exact link the provider check used, so a link
+the fence it re-reads the principal and its tenant, and the exact link the
+provider check used, so a principal disabled, a tenant suspended or a link
 revoked while the code host was being read refuses the decision.
 """
 
@@ -48,6 +49,7 @@ from .. import identity_fence
 from ..approval_auth import enforce_console_cookie_origin
 from ..auth import require_api_key, require_principal_session
 from ..config import get_settings
+from ..crud.console import principal_is_active
 from ..deps import SessionDep
 from ..forges import types as forge_types
 from ..forges.capabilities import Operation, supports
@@ -57,10 +59,12 @@ from ..forges.types import Actor, RepositoryRef
 from ..models import Agent, IdentityLink, IdentityNamespace, MemoryRule, MemoryRuleEvent, Principal
 from ..schemas.memory_rules import (
     ListedRuleState,
+    MemoryRuleAuthRefusal,
     MemoryRuleDecider,
     MemoryRuleDecision,
     MemoryRuleDecisionOut,
     MemoryRuleOut,
+    MemoryRuleRefusal,
     MemoryRuleScopeOut,
     MemoryRulesOut,
     RuleScopeKind,
@@ -150,6 +154,40 @@ _REFUSALS: dict[str, tuple[int, str, str]] = {
         "The rule store could not be reached.",
         "Retry in a moment; nothing was changed.",
     ),
+}
+# The refusal bodies each route really answers, so OpenAPI never declares
+# FastAPI's default validation-error array for the coded 422.
+_CODED: dict[str, Any] = {"model": MemoryRuleRefusal}
+_LIST_RESPONSES: dict[int | str, dict[str, Any]] = {
+    401: {"model": MemoryRuleAuthRefusal, "description": "No platform key or live console session"},
+    403: {"model": MemoryRuleAuthRefusal, "description": "Console session origin rejected"},
+    404: {**_CODED, "description": "`memory_rules.not_found`"},
+    422: {**_CODED, "description": "`memory_rules.invalid_request`"},
+    503: {**_CODED, "description": "`memory_rules.unavailable`"},
+}
+_DECISION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    401: {
+        "model": MemoryRuleAuthRefusal,
+        "description": "Not an active principal's console session, or another credential sent",
+    },
+    403: {
+        "model": MemoryRuleRefusal | MemoryRuleAuthRefusal,
+        "description": "`memory_rules.write_access_required`, "
+        "`memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, "
+        "or the console session origin rejected",
+    },
+    404: {**_CODED, "description": "`memory_rules.not_found`"},
+    409: {
+        **_CODED,
+        "description": "`memory_rules.stale_version`, `memory_rules.invalid_transition`, "
+        "`memory_rules.scope_full`, `memory_rules.snapshot_full` or "
+        "`memory_rules.invalid_rule`",
+    },
+    422: {**_CODED, "description": "`memory_rules.invalid_request`"},
+    503: {
+        **_CODED,
+        "description": "`memory_rules.code_host_unavailable` or `memory_rules.unavailable`",
+    },
 }
 _NO_LINK_FIX = (
     "Link your code host account first: an operator links it with "
@@ -293,7 +331,7 @@ async def _in_force_counts(
     return {(kind, key): int(count) for kind, key, count in rows.tuples().all()}
 
 
-@router.get("/{agent_id}/memory/rules", response_model=MemoryRulesOut)
+@router.get("/{agent_id}/memory/rules", response_model=MemoryRulesOut, responses=_LIST_RESPONSES)
 async def list_rules(
     agent_id: uuid.UUID,
     session: SessionDep,
@@ -553,6 +591,16 @@ async def _apply(
     # an identity writer holds it exclusively before its own, so the order
     # never inverts. Until commit no link can be revoked or changed.
     await identity_fence.lock_identity_reader(session)
+    # The session dependency authenticated the principal before the provider
+    # reads; one disabled, or whose tenant was suspended, since then is refused
+    # with the same 401 that dependency answers.
+    principal = await session.get(Principal, checked.principal_id, populate_existing=True)
+    if (
+        principal is None
+        or principal.tenant_id != checked.tenant_id
+        or not await principal_is_active(session, principal)
+    ):
+        raise HTTPException(401, UNAUTHENTICATED, headers=NO_STORE)
     current = await _linked_accounts(
         session, checked.tenant_id, checked.principal_id, checked.scope
     )
@@ -640,7 +688,9 @@ async def _decide(
 
 
 @decision_router.post(
-    "/{agent_id}/memory/rules/{rule_id}/accept", response_model=MemoryRuleDecisionOut
+    "/{agent_id}/memory/rules/{rule_id}/accept",
+    response_model=MemoryRuleDecisionOut,
+    responses=_DECISION_RESPONSES,
 )
 async def accept_rule(
     request: Request,
@@ -651,13 +701,17 @@ async def accept_rule(
     _origin: SameOriginDep,
     session: SessionDep,
 ) -> MemoryRuleDecisionOut:
-    """Accept a proposed rule; it applies from the next ticket's admission."""
+    """Accept a proposed rule. The decision is recorded now and takes effect at the
+    next ticket's admission once admission reads learned rules (#5798); a running
+    request keeps the rules it was admitted with."""
 
     return await _decide(request, session, principal, agent_id, rule_id, "accept", body)
 
 
 @decision_router.post(
-    "/{agent_id}/memory/rules/{rule_id}/reject", response_model=MemoryRuleDecisionOut
+    "/{agent_id}/memory/rules/{rule_id}/reject",
+    response_model=MemoryRuleDecisionOut,
+    responses=_DECISION_RESPONSES,
 )
 async def reject_rule(
     request: Request,
@@ -674,7 +728,9 @@ async def reject_rule(
 
 
 @decision_router.post(
-    "/{agent_id}/memory/rules/{rule_id}/remove", response_model=MemoryRuleDecisionOut
+    "/{agent_id}/memory/rules/{rule_id}/remove",
+    response_model=MemoryRuleDecisionOut,
+    responses=_DECISION_RESPONSES,
 )
 async def remove_rule(
     request: Request,
@@ -685,6 +741,8 @@ async def remove_rule(
     _origin: SameOriginDep,
     session: SessionDep,
 ) -> MemoryRuleDecisionOut:
-    """Remove an accepted rule; the next ticket's admission no longer carries it."""
+    """Remove an accepted rule. The decision is recorded now and takes effect at the
+    next ticket's admission once admission reads learned rules (#5798); a running
+    request keeps the rules it was admitted with."""
 
     return await _decide(request, session, principal, agent_id, rule_id, "remove", body)

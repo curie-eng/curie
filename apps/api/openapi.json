@@ -11971,6 +11971,20 @@
         "title": "MemoryProvenanceOut",
         "type": "object"
       },
+      "MemoryRuleAuthRefusal": {
+        "description": "A refused credential or console origin: one plain reason string.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "MemoryRuleAuthRefusal",
+        "type": "object"
+      },
       "MemoryRuleDecider": {
         "properties": {
           "display_name": {
@@ -12018,6 +12032,7 @@
         "properties": {
           "applies_from": {
             "const": "next_ticket",
+            "description": "The decision is recorded now and takes effect at the next ticket's admission once admission reads learned rules (#5798); a running request keeps the rules it was admitted with.",
             "title": "Applies From",
             "type": "string"
           },
@@ -12195,6 +12210,76 @@
           "version"
         ],
         "title": "MemoryRuleOut",
+        "type": "object"
+      },
+      "MemoryRuleRefusal": {
+        "description": "Every coded learned rule refusal, a malformed request's 422 included.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/MemoryRuleRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "MemoryRuleRefusal",
+        "type": "object"
+      },
+      "MemoryRuleRefusalDetail": {
+        "description": "A coded refusal: ``code`` is ``memory_rules.<name>``.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "current_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Version"
+          },
+          "fix": {
+            "title": "Fix",
+            "type": "string"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit"
+          },
+          "limit_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Bytes"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "fix"
+        ],
+        "title": "MemoryRuleRefusalDetail",
         "type": "object"
       },
       "MemoryRuleScopeOut": {
@@ -26119,15 +26204,55 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "No platform key or live console session"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "Console session origin rejected"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.not_found`"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`memory_rules.invalid_request`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.unavailable`"
           }
         },
         "summary": "List Rules",
@@ -26138,7 +26263,7 @@
     },
     "/agents/{agent_id}/memory/rules/{rule_id}/accept": {
       "post": {
-        "description": "Accept a proposed rule; it applies from the next ticket's admission.",
+        "description": "Accept a proposed rule. The decision is recorded now and takes effect at the\nnext ticket's admission once admission reads learned rules (#5798); a running\nrequest keeps the rules it was admitted with.",
         "operationId": "accept_rule_agents__agent_id__memory_rules__rule_id__accept_post",
         "parameters": [
           {
@@ -26199,15 +26324,73 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "Not an active principal's console session, or another credential sent"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                    }
+                  ],
+                  "title": "Response 403 Accept Rule Agents  Agent Id  Memory Rules  Rule Id  Accept Post"
+                }
+              }
+            },
+            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.not_found`"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule`"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`memory_rules.invalid_request`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.code_host_unavailable` or `memory_rules.unavailable`"
           }
         },
         "summary": "Accept Rule",
@@ -26279,15 +26462,73 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "Not an active principal's console session, or another credential sent"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                    }
+                  ],
+                  "title": "Response 403 Reject Rule Agents  Agent Id  Memory Rules  Rule Id  Reject Post"
+                }
+              }
+            },
+            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.not_found`"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule`"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`memory_rules.invalid_request`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.code_host_unavailable` or `memory_rules.unavailable`"
           }
         },
         "summary": "Reject Rule",
@@ -26298,7 +26539,7 @@
     },
     "/agents/{agent_id}/memory/rules/{rule_id}/remove": {
       "post": {
-        "description": "Remove an accepted rule; the next ticket's admission no longer carries it.",
+        "description": "Remove an accepted rule. The decision is recorded now and takes effect at the\nnext ticket's admission once admission reads learned rules (#5798); a running\nrequest keeps the rules it was admitted with.",
         "operationId": "remove_rule_agents__agent_id__memory_rules__rule_id__remove_post",
         "parameters": [
           {
@@ -26359,15 +26600,73 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                }
+              }
+            },
+            "description": "Not an active principal's console session, or another credential sent"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleRefusal"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MemoryRuleAuthRefusal"
+                    }
+                  ],
+                  "title": "Response 403 Remove Rule Agents  Agent Id  Memory Rules  Rule Id  Remove Post"
+                }
+              }
+            },
+            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.not_found`"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.stale_version`, `memory_rules.invalid_transition`, `memory_rules.scope_full`, `memory_rules.snapshot_full` or `memory_rules.invalid_rule`"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`memory_rules.invalid_request`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleRefusal"
+                }
+              }
+            },
+            "description": "`memory_rules.code_host_unavailable` or `memory_rules.unavailable`"
           }
         },
         "summary": "Remove Rule",
