@@ -65,8 +65,11 @@ diff and behavior changes, new and regression tests, and guides local manual
 verification. It can publish approved feedback through existing host tools,
 request a configured factory revision and complete an explicitly approved merge.
 The [PR review guide](../../docs/guides/factory-pr-review.md) explains the workflow.
-The skill stays under `review/skills/`, outside this bundle's executable `skills/`
-tree, and adds no platform runtime or tracker integration.
+The skill begins with the PR type and one line summary, then explains the
+feature context, end to end evidence, changed components, runtime scenarios,
+unit tests, algorithms, data migrations and architectural risks with diff
+links. It stays under `review/skills/`, outside this bundle's executable
+`skills/` tree, and adds no platform runtime or tracker integration.
 
 ## Prepare a specification locally
 

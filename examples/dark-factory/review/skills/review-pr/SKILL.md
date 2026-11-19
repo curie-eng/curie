@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Walk through a pull request's architecture, diff, behavior and test coverage, guide local verification, and publish approved feedback or merge an approved PR using existing host tools.
+description: Explain a pull request for an architect, including its purpose, system impact, runtime flows, tests, algorithms, data changes and risks. Guide local verification and separately approved feedback or completion through existing host tools.
 ---
 
 # Review a pull request
@@ -35,16 +35,58 @@ actually execute. Record the exact head and base for the review.
 
 ## Explain and verify with the human
 
-Read [the inspection and testing procedure](references/review.md). Start with a
-concise architectural map showing components, source files and how calls or data
-flow between them. Explain the significant diff at the level needed to assess
-the change, then offer deeper examination of a chosen component. Answer follow-up
-questions in that same review; do not restart the whole walkthrough each time.
+Read [the inspection and testing procedure](references/review.md). Give a
+decision ready review that a reader can understand without reading the whole
+diff. Scale its depth to the PR. Use this order, combining brief sections where
+that makes the result clearer:
 
-Enumerate new test scenarios and their actual assertions, relevant existing
-regression tests, behavior changes and remaining gaps. Map the issue's acceptance
-criteria to implementation and verification, including approved deferred external
-qualification. A passing fixture test does not prove the deferred live outcome.
+1. **Type, context and one line summary.** Say whether this is a bug fix,
+   documentation change, security fix, performance change, refactor, feature
+   slice or another accurate type. State the problem and intended outcome. For
+   a feature slice, explain the full feature goal, this PR's contribution,
+   verified related issues or PRs, dependencies and remaining work. Mark any
+   inferred context as inference. Surface a critical review blocker immediately
+   after this orientation.
+2. **End to end evidence.** Name the end to end scenarios added in this PR,
+   their real entry points, assertions and limits. Separate automated end to
+   end tests from integration or plan tests, author reported manual runs, your
+   own runs and checks on the current head. State explicitly when no automated
+   end to end test was added.
+3. **System map.** Give each primary changed component one line describing its
+   role and change. Identify new components and why they exist, and removed or
+   replaced components and why. Distinguish internal helpers from deployable or
+   public components. Say when no component was added or deleted.
+4. **Changed scenarios.** Use a compact Mermaid sequence diagram when actors,
+   order, trust boundaries or fallback paths matter. Show the old and new
+   flow, or branches of the new flow, for each material scenario. Explain the
+   observable change in plain language. Skip a diagram that would only repeat
+   a single action.
+5. **Unit scenarios.** Describe added or changed unit tests by the behavior and
+   positive, negative or edge conditions they assert. Name relevant existing
+   regression coverage and what the assertions cannot establish.
+6. **Algorithms and data.** Explain significant decision rules, ordering,
+   retries, complexity or state transitions, including whether an algorithm is
+   new or changed. Describe new or changed data models and API or storage
+   contracts. For persistent data, explain migration order, existing records,
+   compatibility, rollback and backfill. State explicitly when no persistent
+   model or migration changes.
+7. **Architectural assessment.** Give actionable findings with severity,
+   trigger, consequence and the change or decision needed. Check changed
+   defaults, security and network exposure, identity, production versus
+   development behavior, failure handling, observability and reversibility.
+   Name consequential gaps and unresolved questions. Do not conclude there are
+   no findings until these paths have been checked.
+
+Link substantive sections to verified lines in the current PR diff where
+possible and link related issues directly. For behavior outside the diff, link
+the relevant source and identify it as existing behavior. Explain the important
+change at the level needed to assess it, then offer deeper examination of a
+chosen component. Answer follow up questions in the same review without
+restarting the walkthrough.
+
+Map the issue's acceptance criteria to implementation and verification,
+including approved deferred external qualification. A passing fixture or plan
+test does not prove a deferred live outcome.
 
 Prepare a local manual test plan with commands, expected observations, failure
 signals and cleanup. When the human wants guided testing, give one step at a time

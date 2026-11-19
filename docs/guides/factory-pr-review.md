@@ -60,10 +60,18 @@ reapply customizations. There is no automatic update checker or version resolver
 
 The agent pins the PR head and base, preserves your checkout and explains:
 
-* The components, their files and how calls or data move between them.
-* Significant diff changes and observable changes to behavior.
-* New test scenarios and assertions, relevant existing regression tests, and gaps.
-* How the implementation meets the issue's criteria, including deferred checks.
+* Whether the PR is a fix, documentation change, feature slice or other type,
+  with its purpose, one line summary and related feature context.
+* End to end tests added by the PR, separate from plan tests, unit tests,
+  author reported live runs and current head CI evidence.
+* Changed, new and removed components, each with a brief account of its role.
+* A sequence diagram for material runtime flows and fallback paths.
+* Added unit scenarios, algorithm changes, and data models or migrations.
+* Security, production and operational consequences, with links to specific
+  diff lines and an explicit account of remaining gaps.
+
+The review says when a category does not apply. It does not call a plan test
+end to end proof or assume a passing check establishes a live outcome.
 
 Ask to inspect a component more deeply at any point. For example:
 
