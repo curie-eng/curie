@@ -1340,8 +1340,7 @@ class MemoryRule(Base):
         CheckConstraint(
             "scope_kind IN ('agent', 'binding', 'repository') AND "
             "((scope_kind = 'agent' AND scope_key = '') "
-            "OR (scope_kind <> 'agent' AND length(scope_key) > 0)) "
-            "AND length(scope_label) > 0",
+            "OR (scope_kind <> 'agent' AND length(scope_key) > 0))",
             name="memory_rules_scope_ck",
         ),
         CheckConstraint(f"state IN ({_MEMORY_RULE_STATE_LIST})", name="memory_rules_state_ck"),
@@ -1365,7 +1364,6 @@ class MemoryRule(Base):
             "AND position(chr(13) in reason) = 0 AND position(chr(10) in reason) = 0",
             name="memory_rules_reason_ck",
         ),
-        CheckConstraint("length(proposed_by) > 0", name="memory_rules_proposed_by_ck"),
         CheckConstraint(
             "(state <> 'candidate' OR source_request_id IS NOT NULL) "
             "AND (source_request_id IS NULL OR source_turn IS NULL)",
@@ -1475,7 +1473,7 @@ class MemoryRuleEvent(Base):
             name="memory_rule_events_state_ck",
         ),
         CheckConstraint(
-            "actor_kind IN ('agent', 'platform', 'principal') AND length(actor) > 0 "
+            "actor_kind IN ('agent', 'platform', 'principal') "
             "AND ((actor_kind = 'principal') = (principal_id IS NOT NULL))",
             name="memory_rule_events_actor_ck",
         ),

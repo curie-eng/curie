@@ -131,44 +131,41 @@ def test_only_the_exact_scope_of_the_exact_agent_is_selected_in_acceptance_order
     clean_db: None,
 ) -> None:
     agent, other_agent, person = _agent(), _agent(), _principal()
-    # Number order differs from acceptance order, and two rules tie on time.
+    # Number order differs from acceptance order, and two rules tie on time. The
+    # tied ids sort opposite to their insertion order, so only ``ORDER BY id``
+    # (not heap order) puts them right.
+    low = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    high = uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
     _accepted(agent, person, 5, "Prefer small functions.", at=0)
+    _accepted(agent, person, 9, "Tied nine.", at=1, id=high)
+    _accepted(agent, person, 4, "Tied four.", at=1, id=low)
     _accepted(agent, person, 2, "Name tests after behavior.", at=3)
-    tied = sorted(
-        [
-            _accepted(agent, person, 9, "Tied nine.", at=1),
-            _accepted(agent, person, 4, "Tied four.", at=1),
-        ]
-    )
-    lines = {
-        number: text
-        for number, text in (
-            (5, "Prefer small functions."),
-            (2, "Name tests after behavior."),
-            (9, "Tied nine."),
-            (4, "Tied four."),
-        )
-    }
-    # The same text elsewhere never leaks in.
+    # The same text and key elsewhere never leak in: another scope kind with the
+    # same key, another key, the agent scope, and another agent.
+    _accepted(agent, person, 1, "Prefer small functions.", scope_kind="binding", scope_key=REPO)
     _accepted(agent, person, 1, "Prefer small functions.", scope_key=OTHER_REPO)
-    _accepted(agent, person, 1, "Prefer small functions.", scope_kind="binding", scope_key=BINDING)
     _accepted(agent, person, 1, "Prefer small functions.", scope_kind="agent", scope_key="")
     _accepted(other_agent, person, 1, "Prefer small functions.")
 
     selected = _select(agent)
 
     assert isinstance(selected, SelectedMemoryRules)
-    ties = pe.rows(
-        "SELECT number FROM curie.memory_rules WHERE id = ANY(:ids) ORDER BY id",
-        {"ids": tied},
+    assert selected.rule_numbers == (5, 4, 9, 2)
+    assert selected.text == canonical_text(
+        [
+            (5, "Prefer small functions."),
+            (4, "Tied four."),
+            (9, "Tied nine."),
+            (2, "Name tests after behavior."),
+        ]
     )
-    expected = [5, *[row["number"] for row in ties], 2]
-    assert list(selected.rule_numbers) == expected
-    pairs = [(number, lines[number]) for number in expected]
-    assert selected.text == canonical_text(pairs)
     assert selected.sha256 == rules_sha256(selected.text)
     assert selected.count == 4
     assert selected.format_version == 1
+    # The binding scope with the repository's key selects its own rule only.
+    binding = _select(agent, "binding", REPO)
+    assert isinstance(binding, SelectedMemoryRules)
+    assert binding.text == "R1: Prefer small functions."
 
 
 @pytest.mark.parametrize(

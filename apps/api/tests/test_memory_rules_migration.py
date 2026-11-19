@@ -190,7 +190,6 @@ def test_upgrade_downgrade_upgrade_and_every_object_exists(
         "memory_rules_sha256_ck",
         "memory_rules_format_version_ck",
         "memory_rules_reason_ck",
-        "memory_rules_proposed_by_ck",
         "memory_rules_source_ck",
         "memory_rules_acceptance_ck",
         "memory_rules_version_ck",
@@ -489,19 +488,67 @@ def test_the_database_refuses_nul_with_the_driver_character_error(
     assert sql_rows("SELECT count(*) FROM curie.memory_rules")[0][0] == 0
 
 
-def test_deleting_a_request_unlinks_a_proposed_rule(
+def test_deleting_a_request_drops_its_candidate_and_unlinks_a_proposed_rule(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
+    # The release below deletes a WorkItem (and so its requests) before an agent.
+    # A candidate's check refuses a NULL source request, so the delete must not
+    # leave the candidate behind to be nulled.
     isolated_migration_db.at(REVISION)
     tenant, _, agent = _owner()
     item, request = _work_item(agent, 7)
-    rule = _rule(tenant, agent, number=1, source_request_id=request)
-    _insert("memory_rules", rule)
+    proposed = _rule(tenant, agent, number=1, source_request_id=request)
+    _insert("memory_rules", proposed)
+    other_item, other_request = _work_item(agent, 8)
+    candidate = _rule(
+        tenant, agent, number=None, state="candidate", source_request_id=other_request
+    )
+    _insert("memory_rules", candidate)
+    _insert(
+        "memory_rule_events",
+        {
+            "rule_id": candidate["id"],
+            "tenant_id": tenant,
+            "agent_id": agent,
+            "event": "propose",
+            "from_state": None,
+            "to_state": "candidate",
+            "actor_kind": "platform",
+            "actor": "factory",
+        },
+    )
     sql_rows("DELETE FROM curie.work_items WHERE id = :id", {"id": item})
     kept = sql_rows(
-        "SELECT source_request_id FROM curie.memory_rules WHERE id = :id", {"id": rule["id"]}
+        "SELECT source_request_id FROM curie.memory_rules WHERE id = :id", {"id": proposed["id"]}
     )
     assert [row[0] for row in kept] == [None]
+    sql_rows("DELETE FROM curie.work_items WHERE id = :id", {"id": other_item})
+    assert sql_rows("SELECT count(*) FROM curie.memory_rules")[0][0] == 1
+    assert sql_rows("SELECT count(*) FROM curie.memory_rule_events")[0][0] == 0
+    # An older release then deletes the whole agent without error.
+    sql_rows("DELETE FROM curie.agents WHERE id = :id", {"id": agent})
+    assert sql_rows("SELECT count(*) FROM curie.memory_rules")[0][0] == 0
+
+
+def test_the_candidate_trigger_goes_with_the_downgrade(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    isolated_migration_db.at(REVISION)
+
+    def triggers() -> int:
+        return int(
+            sql_rows(
+                "SELECT count(*) FROM pg_trigger "
+                "WHERE tgname = 'memory_rules_drop_request_candidates'"
+            )[0][0]
+        )
+
+    assert triggers() == 1
+    command.downgrade(alembic_config(), "-1")
+    assert triggers() == 0
+    assert not sql_rows(
+        "SELECT 1 FROM pg_proc WHERE proname = 'memory_rules_drop_request_candidates'"
+    )
 
 
 def test_the_work_item_pin_and_snapshot_checks(

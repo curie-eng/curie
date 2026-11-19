@@ -3,7 +3,8 @@
 A learned rule is a one-line, bounded text that a person accepts. It is later
 delivered to a model, so the text must never be able to forge platform text:
 no line breaks, no reserved headings, no section markers. This module is pure.
-It performs no IO and touches no database.
+Apart from ``select_memory_rules`` at the end, which reads one scope through the
+caller's session, it performs no IO and touches no database.
 
 Arithmetic fact: the snapshot byte bound can bind before the count bound does.
 Sixteen rules of 240 bytes with small rule numbers still fit (about 3.9 KiB),

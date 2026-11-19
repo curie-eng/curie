@@ -10,8 +10,13 @@
 5. ``execution_requests.memory_rules_evidence``: whether a run loaded them.
 
 Expand only: a release without this revision never reads the new columns or
-tables. The downgrade refuses while any rule, event, snapshot, pin or evidence
-exists, then drops everything the upgrade added.
+tables. A hidden candidate names its source request, and its check refuses a
+NULL there, so deleting a request (which an older release does when it deletes a
+WorkItem or an agent) would fail. A row trigger on ``execution_requests`` deletes
+the candidates of a request being deleted, which a release without this revision
+needs and a newer one does not notice. The downgrade refuses while any rule,
+event, snapshot, pin or evidence exists, then drops everything the upgrade
+added, including each agent's ``memory_rule_proposals`` switch.
 
 Revision ID: 0185
 Revises: 0184
@@ -33,6 +38,7 @@ LOCK_TIMEOUT_MS = 15000
 RULES = "memory_rules"
 EVENTS = "memory_rule_events"
 SNAPSHOTS = "work_item_memory_rule_snapshots"
+CANDIDATE_TRIGGER = "memory_rules_drop_request_candidates"
 PIN_CHECK = "work_items_memory_rules_ck"
 EVIDENCE_CHECK = "execution_requests_memory_rules_evidence_ck"
 
@@ -59,6 +65,7 @@ def _stamp(name: str) -> sa.Column:
 
 
 def upgrade() -> None:
+    op.execute(sa.text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"))
     op.add_column(
         "agents",
         sa.Column("memory_rule_proposals", sa.Boolean(), nullable=False, server_default=sa.false()),
@@ -132,8 +139,7 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "scope_kind IN ('agent', 'binding', 'repository') AND "
             "((scope_kind = 'agent' AND scope_key = '') "
-            "OR (scope_kind <> 'agent' AND length(scope_key) > 0)) "
-            "AND length(scope_label) > 0",
+            "OR (scope_kind <> 'agent' AND length(scope_key) > 0))",
             name=f"{RULES}_scope_ck",
         ),
         sa.CheckConstraint(f"state IN ({_STATES})", name=f"{RULES}_state_ck"),
@@ -152,7 +158,6 @@ def upgrade() -> None:
             f"octet_length(reason) BETWEEN 1 AND 240 AND {_ONE_LINE.format(c='reason')}",
             name=f"{RULES}_reason_ck",
         ),
-        sa.CheckConstraint("length(proposed_by) > 0", name=f"{RULES}_proposed_by_ck"),
         sa.CheckConstraint(
             "(state <> 'candidate' OR source_request_id IS NOT NULL) "
             "AND (source_request_id IS NULL OR source_turn IS NULL)",
@@ -226,13 +231,26 @@ def upgrade() -> None:
             name=f"{EVENTS}_state_ck",
         ),
         sa.CheckConstraint(
-            "actor_kind IN ('agent', 'platform', 'principal') AND length(actor) > 0 "
+            "actor_kind IN ('agent', 'platform', 'principal') "
             "AND ((actor_kind = 'principal') = (principal_id IS NOT NULL))",
             name=f"{EVENTS}_actor_ck",
         ),
         schema=S,
     )
     op.create_index(f"ix_{EVENTS}_rule", EVENTS, ["rule_id", "id"], schema=S)
+    op.execute(
+        sa.text(
+            f"CREATE FUNCTION {S}.{CANDIDATE_TRIGGER}() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            f"BEGIN DELETE FROM {S}.{RULES} "
+            "WHERE source_request_id = OLD.id AND state = 'candidate'; RETURN OLD; END $$"
+        )
+    )
+    op.execute(
+        sa.text(
+            f"CREATE TRIGGER {CANDIDATE_TRIGGER} BEFORE DELETE ON {S}.execution_requests "
+            f"FOR EACH ROW EXECUTE FUNCTION {S}.{CANDIDATE_TRIGGER}()"
+        )
+    )
 
     op.add_column(
         "work_items",
@@ -300,6 +318,8 @@ def downgrade() -> None:
     )
     if present:
         raise RuntimeError("memory_rules_present")
+    op.execute(sa.text(f"DROP TRIGGER {CANDIDATE_TRIGGER} ON {S}.execution_requests"))
+    op.execute(sa.text(f"DROP FUNCTION {S}.{CANDIDATE_TRIGGER}()"))
     op.drop_constraint(EVIDENCE_CHECK, "execution_requests", schema=S)
     op.drop_column("execution_requests", "memory_rules_evidence", schema=S)
     op.drop_table(SNAPSHOTS, schema=S)
