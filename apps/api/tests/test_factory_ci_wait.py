@@ -3016,9 +3016,140 @@ def test_required_checks_refused_names_the_rules_operation_and_never_completes(
     assert body.startswith("Could not complete:")
     assert "Reason: github_forbidden_get_branch_rules" in body
     assert "Get rules for a branch" in body
+    assert 'GitHub said: "Resource not accessible by integration"' in body
+    assert "App permission" not in body
     assert "Checks: read" not in body
     assert "Completed:" not in body
     assert _ci_turns(published["id"]) == []
+
+
+# GitHub Free's plan-upgrade sentence for a private repository's rules read.
+# Hardcoded so this module still collects when the product constant is absent:
+# the pin reverses product files and must fail an assertion, not an import.
+_PLAN_UPGRADE_MESSAGE = (
+    "Upgrade to GitHub Pro or make this repository public to enable this feature"
+)
+
+
+def test_plan_gated_private_branch_rules_403_completes_like_no_rules(admitted: Any) -> None:
+    """A private plan-upgrade 403 adds no required names, same as no rules.
+
+    https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+    https://docs.github.com/en/rest/repos/repos#get-a-repository
+    """
+
+    client, github, sink = admitted
+    number = 9861
+    sink.ci_script = [ci_green()]
+    sink.repository_private = True
+    sink.rules["main"] = (403, {"message": _PLAN_UPGRADE_MESSAGE})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _body(sink, published["id"]).startswith("Completed:")
+
+
+def test_plan_gated_private_rules_still_require_classic_protection(admitted: Any) -> None:
+    """Classic branch protection still gates the request after the plan-gated read."""
+
+    client, github, sink = admitted
+    number = 9862
+    sink.ci_script = [ci_green()]
+    sink.repository_private = True
+    sink.rules["main"] = (403, {"message": _PLAN_UPGRADE_MESSAGE})
+    sink.protections["main"] = {"required_status_checks": {"contexts": ["label-gate"]}}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(published["id"]) == []
+
+    _reconcile_later(3700)
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "label-gate" in body
+    assert "Cause: ci_unverified" in body
+    assert "Completed:" not in body
+
+
+def test_plan_gated_rules_message_on_a_public_repo_quotes_github(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9863
+    sink.ci_script = [ci_green()]
+    sink.repository_private = False
+    sink.rules["main"] = (403, {"message": _PLAN_UPGRADE_MESSAGE})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "Reason: github_forbidden_get_branch_rules" in body
+    assert f'GitHub said: "{_PLAN_UPGRADE_MESSAGE}"' in body
+    assert "App permission" not in body
+    assert "Completed:" not in body
+
+
+def test_plan_gated_rules_message_with_a_trailing_period_completes(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9864
+    sink.ci_script = [ci_green()]
+    sink.repository_private = True
+    sink.rules["main"] = (403, {"message": _PLAN_UPGRADE_MESSAGE + "."})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+
+
+def test_rules_401_stays_unverified(admitted: Any) -> None:
+    """401 on the rules read is still an immediate refusal. 404 is covered above."""
+
+    client, github, sink = admitted
+    number = 9865
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (401, {"message": "unchanged"})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "Reason: github_unauthorized" in body
+    assert "Completed:" not in body
+
+
+def test_rules_5xx_stays_pending_until_the_deadline(admitted: Any) -> None:
+    """5xx on the rules read stays the transient ``github_error`` it is today."""
+
+    client, github, sink = admitted
+    number = 9866
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (500, {"message": "unchanged"})
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert "Completed:" not in _body(sink, published["id"])
+
+    _reconcile_later(3700)
+
+    assert _terminal(number) == ("failed", "ci_timeout")
+    body = _body(sink, published["id"])
+    assert "Reason: github_error" in body
+    assert "Completed:" not in body
 
 
 def test_no_ci_with_a_verified_empty_required_set_completes_after_the_grace(
@@ -3055,6 +3186,8 @@ def test_no_ci_with_a_refused_required_check_read_never_completes(admitted: Any)
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
     assert "Reason: github_forbidden_get_branch_rules" in body
+    assert 'GitHub said: "refused"' in body
+    assert "App permission" not in body
     assert "Completed:" not in body
 
 
