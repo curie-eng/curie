@@ -156,12 +156,29 @@ def _acquire(request_id: UUID, *, owner: str = support.RUNTIME_OWNER) -> None:
 def _finished(
     api: TestClient, world: support.World, agent_id: UUID, issue: int, *, cause: str
 ) -> tuple[support.Admitted, int]:
-    """A started request the worker finished ``failed`` with ``cause``."""
+    """A started request the worker finished ``failed`` with ``cause``, unmarked.
+
+    The finish itself marks a personal request ``teardown_unconfirmed_at``
+    (#5840). These tests are about the fence marking a terminal row that lacks
+    the mark, so the flag is cleared to seed a row that ended before #5840's
+    mark; nothing else of the finished row changes.
+    """
 
     admitted = _admit(api, world, agent_id, issue)
     epoch = support.start_request(admitted.request_id)
     support.finish_failed(admitted.request_id, epoch, cause=cause)
+    _unmark(admitted.request_id)
     return admitted, epoch
+
+
+def _unmark(request_id: UUID) -> None:
+    """Seed a terminal row that ended before #5840's mark: clear the flag."""
+
+    support.rows(
+        "UPDATE curie.execution_requests SET teardown_unconfirmed_at = NULL "
+        "WHERE id = :id AND teardown_unconfirmed_at IS NOT NULL",
+        {"id": request_id},
+    )
 
 
 def _completed(request_id: UUID) -> None:
@@ -694,6 +711,7 @@ def test_confirmation_preserves_the_prior_terminal_outcome_and_epoch(
         _completed(first.request_id)
     else:
         support.finish_failed(first.request_id, epoch, cause="model_error")
+        _unmark(first.request_id)
     _fence(world)
     before = _request(first.request_id)
     assert before["teardown_unconfirmed_at"] is not None

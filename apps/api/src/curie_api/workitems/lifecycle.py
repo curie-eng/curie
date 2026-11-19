@@ -2153,6 +2153,20 @@ async def terminalize_execution(
             )
         }
     )
+    # ADR 0268 decision 4 gives a personal owner one active process. A started
+    # personal request's sandbox claim holds that slot until a worker deletes
+    # it, and the worker's own release runs only when its turn settles the
+    # request, so this write owes the teardown (#5840): terminate wakes follow
+    # until a worker records the runtime gone. A parked CI or approval hold is
+    # released so any worker can claim it. Service rows are unchanged.
+    teardown_values: dict[str, Any] = (
+        {
+            "teardown_unconfirmed_at": func.clock_timestamp(),
+            "runtime_heartbeat_expires_at": _release_parked_hold(),
+        }
+        if request.model_auth_mode == "personal" and request.started_at is not None
+        else {}
+    )
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -2176,6 +2190,7 @@ async def terminalize_execution(
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
             **volume_values,
+            **teardown_values,
         )
         .returning(ExecutionRequest.id)
     )
@@ -3173,7 +3188,10 @@ async def fence_enrollment_generation(
        records the teardown.
     2. A started ``completed``, ``failed`` or ``expired`` request with no
        termination observation is marked ``teardown_unconfirmed_at``, so
-       terminate wakes run until a worker records its runtime gone.
+       terminate wakes run until a worker records its runtime gone. A
+       completed or failed one is normally marked already by its own terminal
+       write (#5840); this covers rows that ended without the mark, such as
+       rows settled before it.
     3. ``cancellation_requested`` requests already end with an observation,
        and ``queued`` and ``waiting`` ones are fenced by their generation, so
        neither changes. The WorkItem is never cancelled.
@@ -3659,7 +3677,8 @@ async def _confirm_settled_teardown(
     """Record a worker teardown a terminal request still owes.
 
     Either a force-settled cancellation or a started completed, failed or
-    expired request an enrollment fence marked (#5377). The request is already
+    expired request its own terminal write (#5840) or an enrollment fence
+    (#5377) marked. The request is already
     terminal and its notice already went out, so this only records the
     observation (replacing a settle placeholder) and clears the flag. Its
     status, cause, ``terminal_at`` and runtime epoch stay as they were.

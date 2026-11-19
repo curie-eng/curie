@@ -2105,7 +2105,11 @@ def _unconfirmed_settle_teardown() -> ColumnElement[bool]:
 
 
 def _unconfirmed_terminal_teardown() -> ColumnElement[bool]:
-    """A started terminal request whose runtime teardown an enrollment fence owes (#5377).
+    """A started terminal request whose runtime teardown is still owed.
+
+    A started personal request's own completed or failed write marks it
+    (#5840); the enrollment fence (#5377) marks one that ended without that
+    mark, for example a row settled before it.
 
     The sibling rule is narrower than a settled cancellation's: only a request
     that may own the thread's sandbox blocks the teardown, that is a running or
