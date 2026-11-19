@@ -84,8 +84,13 @@ PLATFORM_SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset(
 # frame or in the turn's transcript record (its portable messages and native
 # checkpoint, see ``adapter``). ``ask_questions`` carries the question text,
 # which ADR 0286 decision 4 keeps on the tracker only: the action ledger and the
-# transcript record that the call happened, not what it asked.
-ARGUMENTS_WITHHELD_TOOLS: frozenset[str] = frozenset({"mcp__curie__ask_questions"})
+# transcript record that the call happened, not what it asked. ``propose_rule``
+# (ADR 0287, #5796) carries a rule that stays hidden until its pull request
+# merges and a person accepts it, and text the API refused must never be readable
+# anywhere, so its arguments are withheld the same way.
+ARGUMENTS_WITHHELD_TOOLS: frozenset[str] = frozenset(
+    {"mcp__curie__ask_questions", "mcp__curie__propose_rule"}
+)
 
 assert not (PLATFORM_SIDE_EFFECTING_TOOLS & PLATFORM_IDEMPOTENT_TOOLS), (
     "a platform side-effecting tool must not be in the idempotent set"
