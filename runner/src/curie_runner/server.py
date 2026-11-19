@@ -268,7 +268,7 @@ def create_app(
             web.post("/v1/ui-evidence/index", _ui_evidence_index),
             web.post("/v1/ui-evidence/image", _ui_evidence_image),
             web.post("/v1/requester-context", _requester_context),
-            web.post(MEMORY_RULES_CONTEXT_PATH, _memory_rules_context),
+            web.post("/v1/memory-rules-context", _memory_rules_context),
         ]
     )
     app.on_startup.append(_on_startup)
