@@ -228,10 +228,17 @@ fn delete_and_channel_selection_conflict_with_add_and_every_guidance_flag() {
 fn operators_cannot_supply_an_expected_version_flag() {
     for tier in ["local", "cluster"] {
         dry_plan(tier, &["--delete", FACT]);
+        // Cluster has --expected-version for learned rules (#5797); clap refuses it
+        // without a rule action, so a fact delete still never takes a version.
+        let evidence = if tier == "cluster" {
+            "required arguments were not provided"
+        } else {
+            "unexpected argument"
+        };
         refused(
             tier,
             &["--delete", FACT, "--expected-version", "1", "--dry-run"],
-            "unexpected argument",
+            evidence,
         );
     }
 }

@@ -44,9 +44,10 @@ use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
     ChannelsOutput, CodingInstructionsOutput, DeleteOutput, DirectoryOutput, HookFireOutput,
-    HookOutput, KillOutput, MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
-    ResetThreadOutput, ResumeOutput, SchedulesOutput, SkillApprovalsOutput, SubscriptionOutput,
-    SubscriptionVerb, VersionsOutput, WakeKeyOutput, WorkItemsOutput,
+    HookOutput, KillOutput, MemoryChannel, MemoryOutput, MemoryRulesOutput, OverridesOutput,
+    PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
+    SkillApprovalsOutput, SubscriptionOutput, SubscriptionVerb, VersionsOutput, WakeKeyOutput,
+    WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -615,6 +616,22 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 source: "operator".to_string(),
                 fresh_session_required: true,
                 message_verb: "local".to_string(),
+            },
+        ],
+    );
+    m.insert(
+        "MemoryRulesOutput",
+        samples![
+            "DryRun" => MemoryRulesOutput::DryRun(plan()),
+            "Rules" => MemoryRulesOutput::Rules(serde_json::json!({
+                "rules": [], "scopes": [], "in_force_limit": 16,
+            })),
+            "Changed" => MemoryRulesOutput::Changed {
+                verb: curie::commands::MemoryRuleVerb::Accept,
+                change: serde_json::json!({
+                    "rule": {"id": "r", "state": "accepted"},
+                    "applies_from": "next_ticket",
+                }),
             },
         ],
     );

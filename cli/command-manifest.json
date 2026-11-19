@@ -9231,6 +9231,74 @@
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "List learned rules (`GET /agents/{id}/memory/rules`)",
+              "id": "rules",
+              "long": "rules",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "With --rules, show only rules in this state: proposed, accepted, rejected or removed",
+              "id": "rule_state",
+              "long": "rule-state",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "With --rules, show only rules of this exact scope key",
+              "id": "scope_key",
+              "long": "scope-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Accept this proposed rule. Needs --expected-version and --session-file",
+              "id": "accept",
+              "long": "accept",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Reject this proposed rule. Needs --expected-version and --session-file",
+              "id": "reject",
+              "long": "reject",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove this accepted rule. Needs --expected-version and --session-file",
+              "id": "remove",
+              "long": "remove",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Version of the rule to change, as `--rules` reports it",
+              "id": "expected_version",
+              "long": "expected-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Private file (mode 0600 or stricter) holding only the value of your Console session cookie, __Host-curie_console_session. Used by --accept, --reject and --remove, which never send the platform key",
+              "id": "session_file",
+              "long": "session-file",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,

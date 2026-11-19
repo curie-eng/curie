@@ -2982,6 +2982,75 @@ own access controls and expiry and not the WorkItem snapshot's, as for requester
 preferences. A rule removed after a WorkItem was admitted can therefore remain in that
 WorkItem's snapshot and in its recorded transcript until they expire.
 
+### Learned rules
+
+A learned rule is a one-line rule an agent proposes, for example after a
+merged pull request. A proposed rule applies only after a person accepts it.
+Accepting or removing a rule changes only stored rows: a running request keeps
+the rules it was admitted with, and the next ticket's admission reads the new
+set, so every decision answers `"applies_from": "next_ticket"`.
+
+The routes:
+
+1. `GET /agents/{agent_id}/memory/rules` lists the agent's `proposed`,
+   `accepted`, `rejected` and `removed` rules, ordered by scope and number,
+   with each scope's `in_force_count` (its accepted rules) and
+   `in_force_limit`. It takes the platform key or a console session, like the
+   rest of the memory API. Filter with `state`, `scope_kind` and `scope_key`;
+   any other state is refused with 422.
+2. `POST /agents/{agent_id}/memory/rules/{rule_id}/accept`, `.../reject` and
+   `.../remove` take the body `{"expected_version": N}`, the version the
+   person last read. Accept and reject act on a proposed rule, remove on an
+   accepted one. Each records who decided and when, bumps the version, and
+   writes one audit event.
+
+Only a signed-in person decides. The action routes accept a principal console
+session from the console's own origin and refuse the platform key, an
+`Authorization` header and every other credential with 401. The person's
+tenant must own the agent.
+
+The write access rule: for a rule in a repository scope, the person needs an
+active link to a GitHub account on that repository's host, and that account
+must have `write`, `maintain` or `admin` permission on the repository when
+they act. The API reads the account's current login by its immutable id,
+resolves the repository by the immutable id stored in the rule's scope, and
+only then reads the permission. It never uses the repository path stored on
+the rule, so after a rename a writer on a different repository at the old path
+cannot decide the original's rules. An operator links a person with
+`POST /identity/admin/{tenant_id}/code-host-links`. Rules in agent or binding
+scope cannot be decided through these routes yet.
+
+Each scope holds at most 16 accepted rules, and their delivered text, one
+`R<number>: <text>` line per rule, must stay within 4096 bytes. Long rules with
+large numbers can reach the byte bound before the count bound. Accept checks
+both under a lock on the agent row, so two concurrent accepts cannot pass the
+cap together. Reject and remove never meet either bound.
+
+Refusals carry `detail` with `code`, `message` and `fix`:
+
+1. 403 `memory_rules.write_access_required`: no linked account on the host, or
+   the account cannot write to the repository.
+2. 403 `memory_rules.write_access_unverifiable`: the scope is not a GitHub
+   repository keyed by its numeric id on a configured code host, its id now
+   answers for another repository or none, or the person has more than one
+   linked account on the host.
+3. 403 `memory_rules.scope_not_supported`: an agent or binding scope rule.
+4. 404 `memory_rules.not_found`: no such agent or rule for this person.
+5. 409 `memory_rules.stale_version` (with `current_version`),
+   `memory_rules.invalid_transition`, `memory_rules.scope_full` (with
+   `limit`) and `memory_rules.snapshot_full` (with `limit_bytes`).
+6. 503 `memory_rules.code_host_unavailable` when GitHub cannot be read, and
+   `memory_rules.unavailable` when the database cannot. Nothing changes; retry.
+
+From the CLI, `curie cluster memory <agent> --rules` lists rules over the
+cluster connection; add `--rule-state STATE` or `--scope-key KEY` to filter,
+and `--json` for the API object. `curie cluster memory <agent> --accept RULE_ID
+--expected-version N --session-file PATH` decides one rule, and `--reject` and
+`--remove` take the same arguments. The session file holds only the console
+session cookie value and must be readable by its owner alone (mode 0600 or
+stricter). Acting never sends the platform key. `--dry-run` prints the request
+it would send without sending it.
+
 ### Driving the deployed agent
 
 ```bash

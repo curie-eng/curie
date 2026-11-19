@@ -107,6 +107,93 @@ pub(crate) struct SubscriptionSession {
     pub(crate) dry_run: bool,
 }
 
+/// The learned rule flags of `cluster memory`. `--rules` lists; `--accept`,
+/// `--reject` and `--remove` act as the signed-in person, so they read a
+/// private session file and never the platform key.
+#[derive(Args, Debug, Default, Clone)]
+#[group(skip)]
+pub(crate) struct MemoryRuleArgs {
+    /// List learned rules (`GET /agents/{id}/memory/rules`).
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "accept", "reject", "remove",
+        ]
+    )]
+    pub(crate) rules: bool,
+    /// With --rules, show only rules in this state: proposed, accepted,
+    /// rejected or removed.
+    #[arg(long, value_name = "STATE", requires = "rules")]
+    pub(crate) rule_state: Option<String>,
+    /// With --rules, show only rules of this exact scope key.
+    #[arg(long, value_name = "KEY", requires = "rules")]
+    pub(crate) scope_key: Option<String>,
+    /// Accept this proposed rule. Needs --expected-version and --session-file.
+    #[arg(
+        long,
+        value_name = "RULE_ID",
+        group = "rule_action",
+        requires_all = ["expected_version", "session_file"],
+        conflicts_with_all = [
+            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "reject", "remove",
+        ]
+    )]
+    pub(crate) accept: Option<String>,
+    /// Reject this proposed rule. Needs --expected-version and --session-file.
+    #[arg(
+        long,
+        value_name = "RULE_ID",
+        group = "rule_action",
+        requires_all = ["expected_version", "session_file"],
+        conflicts_with_all = [
+            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "accept", "remove",
+        ]
+    )]
+    pub(crate) reject: Option<String>,
+    /// Remove this accepted rule. Needs --expected-version and --session-file.
+    #[arg(
+        long,
+        value_name = "RULE_ID",
+        group = "rule_action",
+        requires_all = ["expected_version", "session_file"],
+        conflicts_with_all = [
+            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "accept", "reject",
+        ]
+    )]
+    pub(crate) remove: Option<String>,
+    /// Version of the rule to change, as `--rules` reports it.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(i64).range(1..),
+        requires = "rule_action"
+    )]
+    pub(crate) expected_version: Option<i64>,
+    /// Private file (mode 0600 or stricter) holding only the value of your
+    /// Console session cookie, __Host-curie_console_session. Used by --accept,
+    /// --reject and --remove, which never send the platform key.
+    #[arg(long, value_name = "PATH", requires = "rule_action")]
+    pub(crate) session_file: Option<PathBuf>,
+}
+
+impl MemoryRuleArgs {
+    /// The one rule change asked for, with the rule id.
+    pub(crate) fn action(&self) -> Option<(commands::MemoryRuleVerb, String)> {
+        use commands::MemoryRuleVerb as Verb;
+        [
+            (Verb::Accept, &self.accept),
+            (Verb::Reject, &self.reject),
+            (Verb::Remove, &self.remove),
+        ]
+        .into_iter()
+        .find_map(|(verb, id)| id.clone().map(|id| (verb, id)))
+    }
+}
+
 /// The grant file an enroll, replace or reconnect sends.
 #[derive(Args, Debug, Clone)]
 pub(crate) struct SubscriptionTokenFile {
@@ -1450,6 +1537,8 @@ pub(crate) enum ClusterAction {
         channel: Option<String>,
         #[command(flatten)]
         guidance: MemoryGuidanceArgs,
+        #[command(flatten)]
+        rules: MemoryRuleArgs,
     },
     /// The action ledger and its undo: list and read an agent's recorded
     /// actions, ask for an undo, and read an execution's receipt.
