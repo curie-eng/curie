@@ -173,6 +173,9 @@ class WorkItemReconciler:
             # worker was told to tear down before the settle pass.
             ("publish_terminate_wakes", self._publish_terminate_wakes),
             ("settle_overdue_cancellations", self._settle_overdue_cancellations),
+            # A question round an older API replica settled past during a
+            # rolling upgrade (#5785), before readmission and promotion.
+            ("redrive_question_rounds", self._redrive_question_rounds),
             ("readmit_pending", self._readmit_pending),
             ("reconcile_missed_labels", self._reconcile_missed_labels),
             ("poll_trackers", self._poll_trackers),
@@ -536,6 +539,16 @@ class WorkItemReconciler:
                     row.id,
                     settle_seconds,
                 )
+
+    async def _redrive_question_rounds(self) -> None:
+        async with self._sessionmaker() as session:
+            ids = await lifecycle.question_rounds_to_redrive(
+                session, limit=self._settings.work_item_batch_limit
+            )
+        for work_item_id in ids:
+            async with self._sessionmaker() as session:
+                await lifecycle.redrive_question_round(session, work_item_id=work_item_id)
+                await session.commit()
 
     async def _readmit_pending(self) -> None:
         async with self._sessionmaker() as session:
