@@ -1306,3 +1306,107 @@ def test_start_and_finish_send_delivered_limits_and_exhausted_volume() -> None:
         "max_turns": 1000,
     }
     assert finish["exhausted_volume"] == "workspace"
+
+
+@pytest.mark.parametrize(
+    "order",
+    ["beat_answers_first", "finish_answers_first", "finish_refused_stale", "no_finish"],
+)
+def test_a_stale_beat_is_only_a_lost_epoch_when_this_runs_finish_did_not_commit(
+    order: str,
+) -> None:
+    """A beat in flight when this run's own finish commits is not a stale owner (#5840).
+
+    The API refuses a heartbeat for any row that is no longer running, so the
+    beat that crosses a committed finish comes back ``stale_owner`` whichever
+    answer arrives first. Abandoning on it skips the failed run's recovery
+    capture. A finish the API refuses as ``stale_owner`` (a stolen epoch), or no
+    finish at all, still abandons.
+    """
+
+    async def go() -> None:
+        finish_committed = asyncio.Event()
+        beat_answered = asyncio.Event()
+        finish_returned = asyncio.Event()
+        beat_sent = asyncio.Event()
+        beats: list[str] = []
+        stale: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            verb = request.url.path.rsplit("/", 1)[-1]
+            if verb == "heartbeat":
+                beats.append(order)
+                beat_sent.set()
+                if order == "finish_answers_first":
+                    await finish_returned.wait()
+                elif order != "no_finish":
+                    await finish_committed.wait()
+                beat_answered.set()
+                # The internal heartbeat route's 409 for a row no longer running.
+                return httpx.Response(409, json={"detail": {"code": "stale_owner"}})
+            assert verb == "finish"
+            if order == "finish_refused_stale":
+                finish_committed.set()
+                await beat_answered.wait()
+                return httpx.Response(409, json={"detail": {"code": "stale_owner"}})
+            finish_committed.set()
+            if order == "beat_answers_first":
+                await beat_answered.wait()
+                # Let the heartbeat task act on its answer before this one lands.
+                for _ in range(50):
+                    await asyncio.sleep(0)
+            return httpx.Response(200, json={})
+
+        async def on_stop(_thread: str, _run: WorkItemRun) -> None:
+            raise AssertionError("no cancellation was requested")
+
+        async def on_stale(_thread: str, run: WorkItemRun) -> None:
+            stale.append(order)
+            run.abandoned = True
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            run = WorkItemRun(
+                client=WorkItemDispatchClient(
+                    api_base_url="http://api.example", worker_token="example-token", client=http
+                ),
+                request_id=REQUEST_ID,
+                owner="worker-1",
+                grant=_grant(),
+                wake=WAKE,
+                event_id="event",
+                thread_key="slack:C1:thread",
+                on_stop=on_stop,
+                on_stale=on_stale,
+            )
+            run.started = True
+            run.runtime_epoch = 1
+            beat = asyncio.create_task(run._heartbeat_loop(0.01))
+            run._heartbeat_task = beat
+            try:
+                if order != "no_finish":
+                    await asyncio.wait_for(beat_sent.wait(), 5)
+                    try:
+                        await run.finish(
+                            outcome="failed",
+                            cause="runner_failed",
+                            detail=None,
+                            ci_fix_round=None,
+                            retry_safety="uncertain",
+                            retry_condition=None,
+                            exhausted_volume=None,
+                        )
+                    except WorkItemConflict as exc:
+                        assert order == "finish_refused_stale"
+                        assert exc.code == "stale_owner"
+                    finish_returned.set()
+                await asyncio.wait_for(asyncio.shield(beat), 5)
+            finally:
+                await run.close()
+
+        committed = order in {"beat_answers_first", "finish_answers_first"}
+        assert beats == [order]
+        assert stale == ([] if committed else [order])
+        assert run.abandoned is (not committed)
+        assert run.finished is committed
+
+    asyncio.run(go())

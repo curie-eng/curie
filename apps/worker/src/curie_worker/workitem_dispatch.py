@@ -916,6 +916,10 @@ class WorkItemRun:
         # Cancellation, termination, deadline and owner loss never set it.
         self.recovery_eligible = False
         self.held = False
+        # Set while this run's own finish call is in flight and after it ends,
+        # so a heartbeat refused because that finish committed is not read as
+        # a lost epoch (#5840).
+        self._finish_done: asyncio.Event | None = None
         self.runtime_epoch: int | None = None
         self.claim_name: str | None = None
         self.sandbox_name: str | None = None
@@ -1049,19 +1053,24 @@ class WorkItemRun:
     ) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
-        await self._client.finish(
-            self.request_id,
-            runtime_epoch=self.runtime_epoch,
-            outcome=outcome,
-            cause=cause,
-            detail=detail,
-            ci_fix_round=ci_fix_round,
-            retry_safety=retry_safety,
-            retry_condition=retry_condition,
-            exhausted_volume=exhausted_volume,
-            budget_s=self._write_budget_s(),
-        )
-        self.finished = True
+        done = asyncio.Event()
+        self._finish_done = done
+        try:
+            await self._client.finish(
+                self.request_id,
+                runtime_epoch=self.runtime_epoch,
+                outcome=outcome,
+                cause=cause,
+                detail=detail,
+                ci_fix_round=ci_fix_round,
+                retry_safety=retry_safety,
+                retry_condition=retry_condition,
+                exhausted_volume=exhausted_volume,
+                budget_s=self._write_budget_s(),
+            )
+            self.finished = True
+        finally:
+            done.set()
 
     async def close(self) -> None:
         """Drop renewal and heartbeat. A stop in flight is allowed to finish."""
@@ -1147,6 +1156,8 @@ class WorkItemRun:
                     )
                 except WorkItemConflict as exc:
                     if exc.code == "stale_owner":
+                        if await self._own_finish_committed():
+                            return
                         await self._invoke_stop(self._on_stale)
                         return
                     logger.warning(
@@ -1173,6 +1184,27 @@ class WorkItemRun:
                     return
         except asyncio.CancelledError:
             raise
+
+    async def _own_finish_committed(self) -> bool:
+        """True when a ``stale_owner`` heartbeat answer is this run's own finish.
+
+        The API refuses a heartbeat for any row that is no longer running, so a
+        beat already in flight when this run's finish commits comes back
+        ``stale_owner`` too, and its answer can arrive before or after the
+        finish answer. Reading it as a lost epoch would abandon the run, and an
+        abandoned run releases nothing, so a failed run would skip its ADR 0251
+        recovery capture and the personal teardown wake would delete the
+        workspace (#5840). Wait for a finish in flight to end, then trust only
+        a committed finish. ``_finish_or_settle`` marks a ``not_running`` answer
+        finished in the same step the finish raises, before this wait resumes.
+        A finish refused or lost on the wire leaves ``finished`` false, and the
+        stale answer keeps abandoning as before.
+        """
+
+        done = self._finish_done
+        if done is not None:
+            await done.wait()
+        return self.finished
 
     async def _invoke_stop(self, callback: StopCallback) -> None:
         self._stopping = True

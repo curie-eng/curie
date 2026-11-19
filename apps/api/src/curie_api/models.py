@@ -1899,9 +1899,10 @@ class ExecutionRequest(Base):
         DateTime(timezone=True), default=None
     )
     # A runtime teardown no worker has confirmed: a forced settle with no
-    # receipt, or a started terminal request an enrollment fence (#5377)
-    # marked. Terminate wakes keep going out until a worker records the
-    # teardown and clears this.
+    # receipt, a started personal request's own completed or failed write
+    # (#5840), or a started terminal request an enrollment fence (#5377)
+    # marked because it ended without that mark. Terminate wakes keep going
+    # out until a worker records the teardown and clears this.
     teardown_unconfirmed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
