@@ -12,6 +12,7 @@ durable WorkItem's issue before and after any tracker call.
 import asyncio
 import json
 import logging
+import math
 import time
 import uuid
 from typing import Annotated, Final, NoReturn
@@ -494,6 +495,13 @@ def _refuse_json_constant(name: str) -> NoReturn:
     raise ValueError(f"not a JSON value: {name}")
 
 
+def _finite_float(literal: str) -> float:
+    value = float(literal)
+    if not math.isfinite(value):
+        raise ValueError("not a finite number")
+    return value
+
+
 async def _questions_submission(request: Request) -> QuestionsSubmission:
     """The body as a submission, or 409 ``invalid_questions`` echoing nothing
     for anything that is not one JSON object within the size bound."""
@@ -503,9 +511,10 @@ async def _questions_submission(request: Request) -> QuestionsSubmission:
     except HTTPException:
         raise _question_refused(questions_core.INVALID_QUESTIONS) from None
     try:
-        # NaN and the infinities are not JSON (RFC 8259); refuse them like any
-        # other body outside the shape rather than carry them on.
-        parsed = json.loads(raw, parse_constant=_refuse_json_constant)
+        # NaN and the infinities are not JSON (RFC 8259), and a number too
+        # large for a float (1e999) decodes to one; refuse them like any other
+        # body outside the shape rather than carry them on.
+        parsed = json.loads(raw, parse_constant=_refuse_json_constant, parse_float=_finite_float)
     except (ValueError, RecursionError):
         raise _question_refused(questions_core.INVALID_QUESTIONS) from None
     if not isinstance(parsed, dict):

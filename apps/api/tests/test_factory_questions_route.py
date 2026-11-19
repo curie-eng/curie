@@ -623,6 +623,10 @@ _MALFORMED_BODIES = {
     "nan beside the fields": _with_constant("NaN"),
     "infinity beside the fields": _with_constant("Infinity"),
     "negative infinity in a list": _with_constant("[-Infinity]"),
+    # A number too large for a float decodes to an infinity.
+    "overflowing number beside the fields": _with_constant("1e999"),
+    "negative overflowing number nested": _with_constant('{"y": [-1e999]}'),
+    "overflowing number at the top level": "1e999",
 }
 
 
