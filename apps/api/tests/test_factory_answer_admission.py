@@ -1,7 +1,8 @@
 """The one rule that decides whether a ticket comment answers the factory (#5786).
 
-`factory_questions.admit_answer` has no production caller yet (each
-tracker's intake calls it once it recognises a comment, #5787 and #5789), so
+`factory_questions.admit_answer` is called by each tracker's intake once it
+recognises a comment (GitHub's is `github_factory.admit_answer_notice`, #5787,
+covered end to end by test_github_answer_intake.py; the others are #5789), so
 these tests call it directly with the facts an intake hands over. Every state
 it acts on is produced by the production path: a labelled issue admitted
 through the signed webhook, the request acquired and started as the worker
@@ -655,6 +656,19 @@ def test_not_outstanding_when_no_round_is_open(
     before = _counts()
 
     comment_id = _comment(triage)
+    if state == "posting":
+        # The round's comment may already be on the ticket with this answer
+        # after it (#5787 X2): nothing is written, so the answer is decided
+        # again once the round is recorded ``outstanding``.
+        for _delivery in range(2):
+            with pytest.raises(factory_questions.AnswerNotAdmitted) as refused:
+                _admit(triage, comment_id, created_at)
+            assert refused.value.code == factory_questions.QUESTION_POSTING
+            assert _requests(triage.work_item_id) == requests
+            assert _counts() == before
+            assert _receipts(triage.work_item_id) == {}
+            assert _round_row(triage.work_item_id) == row
+        return
     result = _admit(triage, comment_id, created_at)
 
     assert result == AnswerOutcome("not_outstanding", None, False)

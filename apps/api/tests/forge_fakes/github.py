@@ -16,6 +16,7 @@ import itertools
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -498,6 +499,192 @@ class GitHubAPI:
         if planted.pull_request:
             issue["pull_request"] = {"url": f"https://api.github.com/repos/{REPO}/pulls/{number}"}
         return httpx.Response(200, json=issue)
+
+
+def github_time(moment: datetime) -> str:
+    """A GitHub REST timestamp: ISO 8601 in UTC to the whole second, ``Z``
+    suffixed, as every comment's ``created_at`` and ``updated_at`` are
+    (https://docs.github.com/en/rest/issues/comments#get-an-issue-comment)."""
+
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _at(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _since(value: str | None) -> datetime | None:
+    return _at(value) if value else None
+
+
+def _page_of(request: httpx.Request, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    params = request.url.params
+    per_page = int(params.get("per_page", "30"))
+    page = int(params.get("page", "1"))
+    return items[(page - 1) * per_page : page * per_page]
+
+
+class IssueCommentsAPI(GitHubAPI):
+    """`GitHubAPI` that keeps issue comments the way GitHub does (#5787).
+
+    Every default of `GitHubAPI` stays as it is; this subclass adds a comment
+    store the factory's question write, the answer intake and a poll pass all
+    read and write:
+
+    1. One id sequence for every comment, increasing, so a later comment has a
+       larger numeric ``id``, and ``created_at`` / ``updated_at`` in GitHub's
+       whole-second ``Z`` form from a clock the test moves (``tick``).
+    2. Create, list, read by id and edit, with each comment's ``user`` (whose
+       ``type`` is ``User`` or ``Bot``), ``performed_via_github_app`` (the App a
+       person or bot acted through, or null) and ``issue_url``:
+       https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
+       https://docs.github.com/en/rest/issues/comments#list-issue-comments
+       https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
+       https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
+       A comment the installation token writes is authored by the App's bot
+       user and carries ``performed_via_github_app`` with the App's id.
+    3. The repository-wide listing a poll pass reads, filtered by ``since`` on
+       ``updated_at`` (an edit only moves ``updated_at``) and sorted by
+       creation, oldest first:
+       https://docs.github.com/en/rest/issues/comments#list-issue-comments-for-a-repository
+    4. Permission answers per login, with the user's immutable id. GitHub's
+       legacy ``permission`` field folds ``maintain`` into ``write`` and
+       ``triage`` into ``read``; ``role_name`` keeps the role:
+       https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
+    5. ``store_then_fail``: the next comment create is stored, then answered
+       with that status, as when GitHub's response is lost after the write.
+    6. ``after_listing``: a step `handle_async` runs once, after the next
+       repository-wide listing is answered and before the caller reads it, so
+       a test can make something happen in the middle of a poll pass.
+
+    Issue state and labels per issue come from `GitHubAPI.planted_issues`.
+    The repository issue and review comment listings answer empty
+    (``answer_listings``).
+    """
+
+    def __init__(self, *, api: str = GITHUB_API) -> None:
+        super().__init__()
+        self.api = api.rstrip("/")
+        self.clock = datetime.now(UTC).replace(microsecond=0)
+        self.stored: dict[int, dict[str, Any]] = {}
+        self.collaborators: dict[str, tuple[int, str]] = {}
+        self.store_then_fail: int | None = None
+        self.after_listing: Callable[[], Awaitable[None]] | None = None
+        self.answer_listings = True
+
+    def tick(self, seconds: int = 1) -> None:
+        self.clock += timedelta(seconds=seconds)
+
+    def grant(self, user: dict[str, Any], role: str) -> None:
+        """``user``'s role on the repository: admin, maintain, write, triage, read or none."""
+
+        self.collaborators[user["login"]] = (user["id"], role)
+
+    def add_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        user: dict[str, Any],
+        app: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """A comment created on issue ``number`` now, by ``user`` acting
+        through ``app`` (None when not through an App)."""
+
+        comment_id = next(self._comment_ids)
+        stamp = github_time(self.clock)
+        comment = {
+            "id": comment_id,
+            "body": body,
+            "user": dict(user),
+            "performed_via_github_app": None if app is None else dict(app),
+            "issue_url": f"{self.api}/repos/{REPO}/issues/{number}",
+            "html_url": f"https://github.com/{REPO}/issues/{number}#issuecomment-{comment_id}",
+            "author_association": "NONE",
+            "created_at": stamp,
+            "updated_at": stamp,
+        }
+        self.stored[comment_id] = comment
+        return comment
+
+    def edit_comment(self, comment_id: int, body: str) -> dict[str, Any]:
+        comment = self.stored[comment_id]
+        comment["body"] = body
+        comment["updated_at"] = github_time(self.clock)
+        return comment
+
+    def on_issue(self, number: int) -> list[dict[str, Any]]:
+        url = f"{self.api}/repos/{REPO}/issues/{number}"
+        return [
+            self.stored[key] for key in sorted(self.stored) if self.stored[key]["issue_url"] == url
+        ]
+
+    async def handle_async(self, request: httpx.Request) -> httpx.Response:
+        """`handle` for an async client, running ``after_listing`` once."""
+
+        response = self.handle(request)
+        step = self.after_listing
+        if (
+            step is not None
+            and request.method == "GET"
+            and request.url.path == f"/repos/{REPO}/issues/comments"
+        ):
+            self.after_listing = None
+            await step()
+        return response
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        root = re.escape(f"/repos/{REPO}")
+        if path == f"/repos/{REPO}/issues/comments" and request.method == "GET":
+            since = _since(request.url.params.get("since"))
+            listed = sorted(
+                (
+                    comment
+                    for comment in self.stored.values()
+                    if since is None or _at(comment["updated_at"]) >= since
+                ),
+                key=lambda comment: (comment["created_at"], comment["id"]),
+            )
+            return httpx.Response(200, json=_page_of(request, listed))
+        single = re.fullmatch(rf"{root}/issues/comments/(\d+)", path)
+        if single is not None:
+            found = self.stored.get(int(single.group(1)))
+            if found is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            if request.method == "PATCH":
+                found = self.edit_comment(found["id"], json.loads(request.content)["body"])
+            return httpx.Response(200, json=found)
+        thread = re.fullmatch(rf"{root}/issues/(\d+)/comments", path)
+        if thread is not None:
+            number = int(thread.group(1))
+            if request.method == "POST":
+                created = self.add_comment(
+                    number,
+                    json.loads(request.content)["body"],
+                    user=APP_BOT_USER,
+                    app={"id": int(APP_ID), "slug": APP_SLUG},
+                )
+                if self.store_then_fail is not None:
+                    status, self.store_then_fail = self.store_then_fail, None
+                    return httpx.Response(status, json={"message": "Server Error"})
+                return httpx.Response(201, json=created)
+            return httpx.Response(200, json=_page_of(request, self.on_issue(number)))
+        permission = re.fullmatch(rf"{root}/collaborators/([^/]+)/permission", path)
+        if permission is not None and unquote(permission.group(1)) in self.collaborators:
+            login = unquote(permission.group(1))
+            user_id, role = self.collaborators[login]
+            legacy = {"maintain": "write", "triage": "read"}.get(role, role)
+            self.permission_requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "permission": legacy,
+                    "role_name": role,
+                    "user": {"id": user_id, "login": login, "type": "User"},
+                },
+            )
+        return super().handle(request)
 
 
 class _Credentials:

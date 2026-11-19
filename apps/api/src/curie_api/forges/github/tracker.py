@@ -34,10 +34,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import httpx
 
@@ -96,11 +97,34 @@ logger = logging.getLogger("curie_api.factory_notices")
 _ISSUE_READ_PROVIDER_TIMEOUT_SECONDS = 5.0
 _ISSUE_READ_MAX_RESPONSE_BYTES = 2_097_152
 _ISSUE_READ_COMMENTS_PER_PAGE = 100
-# Ten pages is a thousand comments. A longer thread is truncated and says so,
-# rather than turning one tool call into an unbounded walk of the API.
+# Ten pages is a thousand comments. A longer thread reads the ten pages ending
+# at its last page, so the newest comments (the ones that carry the latest
+# answer) are kept, and says the earlier ones were not read.
 _ISSUE_READ_MAX_COMMENT_PAGES = 10
 # A port listing longer than this many pages is not trusted to be complete.
 _MAX_PAGES = 50
+
+
+_LINK_LAST = re.compile(r'<([^>]*)>\s*;\s*rel="last"')
+
+
+def _last_page(headers: httpx.Headers) -> int | None:
+    """The last page number from the `Link` header's `rel="last"` entry.
+
+    https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
+    GitHub sends `rel="last"` whenever there is a following page and omits the
+    header on a single page. None means a `rel="next"` without a `rel="last"`,
+    which the read follows forward instead.
+    """
+
+    link = headers.get("link", "")
+    found = _LINK_LAST.search(link)
+    if found is None:
+        return None if 'rel="next"' in link else 1
+    values = parse_qs(urlsplit(found.group(1)).query).get("page", [])
+    if len(values) != 1 or not values[0].isdecimal() or int(values[0]) < 1:
+        raise Unavailable("issue comments")
+    return int(values[0])
 
 
 @dataclass(frozen=True)
@@ -117,7 +141,7 @@ class IssueContent:
     state: str | None
     author: str | None
     comments: list[IssueComment]
-    comments_truncated: bool
+    earlier_comments_omitted: bool
 
 
 @dataclass(frozen=True)
@@ -373,13 +397,25 @@ class GitHubTracker:
 
     async def read_comment(self, comment_id: int) -> TrackerComment:
         """Re-read request content and provenance through the installation credential."""
-        value = await self._get(f"{self._repo_path}/issues/comments/{comment_id}")
-        if not isinstance(value, dict) or value.get("id") != comment_id:
-            raise Unavailable("comment")
-        comment = self.facts_comment(value)
+        comment = self.facts_comment(await self.issue_comment(comment_id))
         if comment is None:
             raise Unavailable("comment")
         return comment
+
+    async def issue_comment(self, comment_id: int) -> dict[str, Any]:
+        """One issue comment as GitHub answers it now, through the installation
+        credential: its ``user``, ``performed_via_github_app``, ``issue_url``
+        and ``created_at`` are the factory's own read, not a payload's claim
+        (#5787). A 404 is `NotFound`; any other failure, or a payload that is
+        not this comment, is a `ForgeError`.
+
+        https://docs.github.com/en/rest/issues/comments#get-an-issue-comment
+        """
+
+        value = await self._get(f"{self._repo_path}/issues/comments/{comment_id}")
+        if not isinstance(value, dict) or value.get("id") != comment_id:
+            raise Unavailable("comment")
+        return value
 
     async def facts_issue_is_plain(self, ref: TrackerIssueRef) -> bool:
         number = self._number(ref)
@@ -679,12 +715,12 @@ class GitHubTracker:
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         content = await self.read_issue_content(self._number(issue))
         parts = [f"# {content.title}", content.body]
+        if content.earlier_comments_omitted:
+            parts.append("_Earlier comments were not read._")
         for comment in content.comments:
             author = comment.author or "unknown"
             when = f" at {comment.created_at}" if comment.created_at else ""
             parts.append(f"## Comment by {author}{when}\n\n{comment.body}")
-        if content.comments_truncated:
-            parts.append("_Later comments were not read._")
         return "\n\n".join(parts) + "\n"
 
     async def read_source_content(self, issue: TrackerIssueRef) -> SourceContent:
@@ -1079,12 +1115,30 @@ class GitHubTracker:
                     raise Unavailable("issue")
             return json.loads(body), response.headers
 
+    async def _comment_page(
+        self, base: str, token: str, page: int
+    ) -> tuple[list[Any], httpx.Headers]:
+        batch, headers = await self._stream_json(
+            f"{base}/comments",
+            token=token,
+            params={"per_page": _ISSUE_READ_COMMENTS_PER_PAGE, "page": page},
+        )
+        if not isinstance(batch, list):
+            raise Unavailable("issue comments")
+        return batch, headers
+
     async def read_issue_content(self, number: int) -> IssueContent:
         """The issue and its comments, verbatim, addressed by repository id.
 
         Addressing the repository by its numeric id keeps a rename or a transfer
         from redirecting the read to a different repository than the WorkItem's.
         Nothing is parsed into the platform or stored.
+
+        A thread of more than a thousand comments returns the newest thousand,
+        oldest first. That costs at most 12 comment page requests plus the issue
+        (page 1, the ten pages ending at the last page, and one earlier page
+        when the last page is partial). A listing with `rel="next"` but no
+        `rel="last"` is followed forward for at most ten pages, else refused.
         """
 
         base = f"{self._api}/repositories/{self.repository_id}/issues/{number}"
@@ -1092,30 +1146,47 @@ class GitHubTracker:
         try:
             issue, _ = await self._stream_json(base, token=token)
             comments: list[IssueComment] = []
-            truncated = False
-            for page in range(1, _ISSUE_READ_MAX_COMMENT_PAGES + 1):
-                batch, headers = await self._stream_json(
-                    f"{base}/comments",
-                    token=token,
-                    params={"per_page": _ISSUE_READ_COMMENTS_PER_PAGE, "page": page},
-                )
-                if not isinstance(batch, list):
-                    raise Unavailable("issue comments")
-                for comment in batch:
-                    if not isinstance(comment, dict):
+            first_batch, headers = await self._comment_page(base, token, 1)
+            last_page = _last_page(headers)
+            pages: dict[int, list[Any]] = {1: first_batch}
+            if last_page is None:
+                # No `rel="last"`: follow `rel="next"` for at most ten pages. A
+                # longer listing cannot have its newest comments located.
+                last_page = 1
+                while 'rel="next"' in headers.get("link", ""):
+                    if last_page == _ISSUE_READ_MAX_COMMENT_PAGES:
                         raise Unavailable("issue comments")
-                    created = comment.get("created_at")
-                    comments.append(
-                        IssueComment(
-                            author=_login(comment.get("user")),
-                            created_at=created if isinstance(created, str) else None,
-                            body=_text(comment.get("body")),
-                        )
+                    last_page += 1
+                    pages[last_page], headers = await self._comment_page(base, token, last_page)
+            first = max(1, last_page - _ISSUE_READ_MAX_COMMENT_PAGES + 1)
+            for page in range(first, last_page + 1):
+                if page not in pages:
+                    pages[page] = (await self._comment_page(base, token, page))[0]
+            if (
+                last_page > _ISSUE_READ_MAX_COMMENT_PAGES
+                and len(pages[last_page]) < _ISSUE_READ_COMMENTS_PER_PAGE
+            ):
+                # A partial last page leaves the newest ten pages short of a
+                # thousand comments, so one earlier page completes the window.
+                first -= 1
+                if first not in pages:
+                    pages[first] = (await self._comment_page(base, token, first))[0]
+            window = [c for page in range(first, last_page + 1) for c in pages[page]]
+            limit = _ISSUE_READ_MAX_COMMENT_PAGES * _ISSUE_READ_COMMENTS_PER_PAGE
+            earlier_omitted = last_page > _ISSUE_READ_MAX_COMMENT_PAGES
+            if earlier_omitted:
+                window = window[-limit:]
+            for comment in window:
+                if not isinstance(comment, dict):
+                    raise Unavailable("issue comments")
+                created = comment.get("created_at")
+                comments.append(
+                    IssueComment(
+                        author=_login(comment.get("user")),
+                        created_at=created if isinstance(created, str) else None,
+                        body=_text(comment.get("body")),
                     )
-                if 'rel="next"' not in headers.get("link", ""):
-                    break
-            else:
-                truncated = True
+                )
         except (httpx.HTTPError, ValueError):
             raise Unavailable("issue") from None
         if (
@@ -1133,7 +1204,7 @@ class GitHubTracker:
             state=state if isinstance(state, str) else None,
             author=_login(issue.get("user")),
             comments=comments,
-            comments_truncated=truncated,
+            earlier_comments_omitted=earlier_omitted,
         )
 
     # GitHub intake reads ------------------------------------------------

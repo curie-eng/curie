@@ -177,6 +177,7 @@ class WorkItemReconciler:
             # rolling upgrade (#5785), before readmission and promotion.
             ("redrive_question_rounds", self._redrive_question_rounds),
             ("readmit_pending", self._readmit_pending),
+            ("drain_answer_retries", self._drain_answer_retries),
             ("reconcile_missed_labels", self._reconcile_missed_labels),
             ("poll_trackers", self._poll_trackers),
             ("redispatch_lapsed_acquisitions", self._redispatch_lapsed_acquisitions),
@@ -723,6 +724,24 @@ class WorkItemReconciler:
         )
         # Already-enqueued counts as published: the round has its turn.
         return True
+
+    async def _drain_answer_retries(self) -> None:
+        """Read again the answers a webhook deferred (#5787), on every tick.
+
+        Not gated on ``factory_reconcile_interval_s``: GitHub never redelivers
+        the deferral, so this is the only reader in webhook mode. Poll mode's
+        pass drains them itself.
+        """
+
+        settings = self._settings
+        if not settings.factory_enabled or settings.factory_intake == "poll":
+            return
+        async with httpx.AsyncClient(
+            timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+        ) as client:
+            await factory_label_reconcile.drain_webhook_answer_retries(
+                self._sessionmaker, settings, client
+            )
 
     async def _reconcile_missed_labels(self) -> None:
         """Admit labeled issues whose delivery GitHub never retried (#3081)."""

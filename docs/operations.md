@@ -1547,13 +1547,20 @@ applying anything, and `--disable` turns intake off.
 
 Bind the agent with a `github` channel whose address is the repository
 `owner/name`. No Slack binding is required. The configured label is only the
-initial admission convention. A later bounded execution requires a new issue
-comment that explicitly mentions that login and whose sender currently has
-write or admin permission. Ordinary comments, edits, and events sent by the
-App do not execute work. Removing that label or closing the issue cancels
-waiting work and requests termination of a running execution. Cancellation
-stays requested until the runtime reports that it stopped. An already linked
-pull request stays linked, and later publication is refused.
+initial admission convention. While the factory's question is open on the
+issue, a plain comment from anyone who could have started the ticket (current
+write or admin permission) answers it and restarts the work, with no mention
+needed. Edits, bot comments, and comments made through the factory's own App
+never do, and a closed issue or a removed trigger label refuses the answer. A
+reply that arrives while the question is still being recorded is read again
+by the poll pass, or in webhook mode by the work item reconciler. Otherwise a
+later bounded execution requires a new issue comment that explicitly mentions
+that login and whose sender currently has write or admin permission; ordinary
+comments, edits, and events sent by the App do not execute work. Removing
+that label or closing the issue cancels waiting work and requests termination
+of a running execution. Cancellation stays requested until the runtime
+reports that it stopped. An already linked pull request stays linked, and
+later publication is refused.
 
 Polling reads each bound repository every `factory.trackers[].pollIntervalSeconds`
 (default 45 seconds). It can admit an open labeled issue immediately, but

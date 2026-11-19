@@ -53,6 +53,7 @@ _RECONCILER_STEPS = [
     "settle_overdue_cancellations",
     "redrive_question_rounds",
     "readmit_pending",
+    "drain_answer_retries",
     "reconcile_missed_labels",
     "poll_trackers",
     "sync_status_comments",
