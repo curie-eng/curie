@@ -18,7 +18,7 @@ import copy
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import approval_answer_support
@@ -32,6 +32,7 @@ from approval_answer_support import (
 )
 from approval_answer_support import synthetic_provider as synthetic_provider
 from approver_dm_support import (
+    DM_CHANNEL,
     account,
     configured_dm,
     create,
@@ -211,6 +212,25 @@ def test_a_recipient_account_the_directory_does_not_prove_refuses(
 # --- route, receiver and request refusals --------------------------------------------------
 
 
+def test_dm_creation_requires_an_origin_receiver_and_a_server_chosen_card(
+    dm_case: SimpleNamespace,
+) -> None:
+    case = dm_case
+    detached = case.scope["detached"]
+    configured_dm(case, identity=detached["adapter"])
+    request, payload = dm_request(case, [
+        selected(case, APPROVER_A, account(detached, NATIVE_A)),
+    ])
+    refused_creation(case, request, payload, 409, "approver_dm_receiver_missing")
+    configured_dm(case)
+    request, payload = dm_request(case)
+    for channel in (case.scope["address"], DM_CHANNEL, NATIVE_A):
+        wrong = {**request, "approval": {**request["approval"], "card_channel": channel}}
+        refused_creation(case, wrong, payload, 409, "unsupported_approval")
+    dm_created(create(case.client, request), request, expected_delivery(case.scope["main"]))
+    assert nonce_uses(case.scope["agent"], payload["nonce"]) == 1
+
+
 def test_a_route_identity_whose_receiver_is_not_current_refuses(
     dm_case: SimpleNamespace,
 ) -> None:
@@ -334,6 +354,34 @@ def _refused_unavailable(
 def _other_request(case: SimpleNamespace) -> tuple[dict[str, Any], dict[str, Any]]:
     """@spec APPROVER-DM-1: approver A with one account on the second bot's receiver."""
     return dm_request(case, [selected(case, APPROVER_A, account(case.scope["other"], NATIVE_A))])
+
+
+def test_dm_creation_rechecks_receiver_registration_after_recipient_lookup(
+    dm_case: SimpleNamespace,
+) -> None:
+    case = dm_case
+    other = case.scope["other"]
+    configured_dm(case, identity=other["adapter"])
+    state = case.client.app.state
+    runtime = state.http_identity_runtime
+    serving = runtime._receivers
+    remaining = MappingProxyType({
+        key: value for key, value in serving.items() if key[0] != other["receiver_id"]
+    })
+    assert len(remaining) == len(serving) - 1
+
+    def withdraw() -> None:
+        object.__setattr__(runtime, "_receivers", remaining)
+
+    request, payload = _other_request(case)
+    try:
+        response, hook = _during_recipient_lookup(case, request, withdraw)
+    finally:
+        object.__setattr__(runtime, "_receivers", serving)
+    assert hook.fired >= 1
+    _refused_unavailable(case, request, payload, response)
+    dm_created(create(case.client, request), request, expected_delivery(other))
+    assert nonce_uses(case.scope["agent"], payload["nonce"]) == 1
 
 
 def test_an_unchanged_state_during_the_recipient_lookup_creates(

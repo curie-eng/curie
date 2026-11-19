@@ -30,7 +30,7 @@ from apps.api.tests.test_http_approval_answers import (
 )
 from apps.api.tests.test_http_approval_creation import request_for as creation_request
 from apps.api.tests.test_http_approval_legacy_writers import created
-from apps.api.tests.test_http_invocation_membership import ACCOUNT, SENDER
+from apps.api.tests.test_http_invocation_membership import ACCOUNT, GRID_ORG, SENDER
 from apps.api.tests.test_http_invocation_membership import synthetic_provider as synthetic_provider
 from apps.api.tests.test_http_turn_authority import (
     delivery_state,
@@ -143,5 +143,33 @@ def test_partner_invoker_original_association_survives_an_own_answer(
         _, capsule = sealed_actor(case, "approved")
         assert capsule.actor_scope is not None
         assert capsule.actor_scope.namespace.model_dump() == case.scope["namespace"].model_dump()
+
+
+def test_grid_partner_answers_require_the_trusted_workspace_and_action_scope(
+    clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
+) -> None:
+    trusted = partner_entry()
+    with approval_case(
+        synthetic_provider, valkey, runs_stream, grid=True, trusted=(trusted,),
+    ) as case:
+        before = len(case.provider.requests)
+        for changes in (
+            {"delivery": "block_actions", "interaction_user_team_id": PARTNER,
+             "enterprise_ids": []},
+            {"delivery": "view_submission", "interaction_user_team_id": STRANGER,
+             "enterprise_ids": []},
+        ):
+            response = resolve(case, *answered(case, **changes))
+            assert response.status_code == 401, response.text
+            assert response.json() == {"detail": "missing or invalid approval principal"}
+            unchanged(case, before)
+            assert valkey.xrange(runs_stream) == case.stream_before
+        response = resolve(case, *answered(
+            case, delivery="block_actions", interaction_user_team_id=PARTNER,
+            enterprise_ids=[GRID_ORG],
+        ))
+        assert response.status_code == 200, response.text
+        _, capsule = sealed_actor(case, "approved")
+        assert capsule.actor_scope.namespace.model_dump() == trusted.model_dump()
 
 
