@@ -158,12 +158,14 @@ fn forward_command(namespace: &str, fullname: &ReleaseFullname, forward: &Forwar
 }
 
 /// Put `--address localhost` right after the `port-forward` verb, wherever
-/// that sits in the argv.
+/// that sits in the argv. The last match is the verb: only `svc/<name>` and
+/// `<local>:<remote>` follow it, while a context or namespace named
+/// `port-forward` sits before it.
 fn pin_to_loopback(command: &mut OpsCommand) {
     let after_verb = command
         .argv()
         .iter()
-        .position(|token| token == "port-forward")
+        .rposition(|token| token == "port-forward")
         .map_or(command.args.len(), |at| at + 1);
     command.args.splice(
         after_verb..after_verb,
@@ -388,23 +390,30 @@ async fn stop_all(mut running: Vec<(Forward, tokio::process::Child)>) {
             // Already exited; the wait below reaps it.
         }
     }
-    for (forward, mut child) in running {
-        match tokio::time::timeout(STOP_GRACE, child.wait()).await {
+    // Wait for all of them at once, so the whole stop is bounded by one
+    // STOP_GRACE however many forwards there are.
+    let waits = running.iter_mut().map(|(forward, child)| async move {
+        (
+            forward.label,
+            tokio::time::timeout(STOP_GRACE, child.wait()).await,
+        )
+    });
+    for (label, waited) in futures_util::future::join_all(waits).await {
+        match waited {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => crate::ui::ui().warn(&format!(
-                "could not confirm the {} port-forward stopped: {error}",
-                forward.label
+                "could not confirm the {label} port-forward stopped: {error}"
             )),
             Err(_) => crate::ui::ui().warn(&format!(
-                "the {} port-forward did not stop within {STOP_GRACE:?}",
-                forward.label
+                "the {label} port-forward did not stop within {STOP_GRACE:?}"
             )),
         }
     }
 }
 
 /// A receiver that changes when this process gets SIGINT or SIGTERM. The
-/// signal arrives on a helper thread that waits for the first one.
+/// signals arrive on a helper thread: the first starts the orderly stop, and a
+/// second one ends the process at once, so a stop that stalls can be forced.
 #[cfg(unix)]
 fn shutdown_signal() -> Result<tokio::sync::watch::Receiver<bool>> {
     let (sender, receiver) = tokio::sync::watch::channel(false);
@@ -416,8 +425,14 @@ fn shutdown_signal() -> Result<tokio::sync::watch::Receiver<bool>> {
     std::thread::Builder::new()
         .name("curie-cluster-access-signal".to_string())
         .spawn(move || {
-            if signals.forever().next().is_some() && sender.send(true).is_err() {
+            let mut signals = signals.forever();
+            if signals.next().is_some() && sender.send(true).is_err() {
                 // The command already ended.
+            }
+            if signals.next().is_some() {
+                // A second Ctrl-C while the stop is under way. 130 is the
+                // shell's code for a process ended by SIGINT.
+                std::process::exit(130);
             }
         })
         .context("starting the Ctrl-C handler")?;
@@ -494,7 +509,7 @@ mod tests {
 
     /// The forward is the shared port-forward builder, bound to loopback.
     #[test]
-    fn the_forward_command_binds_the_ipv4_loopback_only() {
+    fn the_forward_command_binds_loopback_only() {
         let forward = plan(&SURFACES[0], Some(CLUSTERIP_UI), None).unwrap();
         let command = forward_command("curie", &fullname(), &forward);
         assert_eq!(
@@ -527,6 +542,27 @@ mod tests {
         assert_eq!(
             command.display(),
             "kubectl --context kind-x -n curie port-forward --address localhost svc/curie-ui 18080:80"
+        );
+    }
+
+    #[test]
+    fn a_namespace_named_like_the_verb_does_not_take_the_address_flag() {
+        let mut command = OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("--context"),
+                plain("port-forward"),
+                plain("-n"),
+                plain("port-forward"),
+                plain("port-forward"),
+                plain("svc/curie-ui"),
+                plain("18080:80"),
+            ],
+        );
+        pin_to_loopback(&mut command);
+        assert_eq!(
+            command.display(),
+            "kubectl --context port-forward -n port-forward port-forward --address localhost svc/curie-ui 18080:80"
         );
     }
 
