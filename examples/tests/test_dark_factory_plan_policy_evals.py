@@ -387,7 +387,7 @@ def test_every_case_renders_the_prompt_file_and_the_case(case_id: str, variant: 
     if variant == STRICT:
         assert body == STRICT_SKILL.read_bytes().decode("utf-8").rstrip("\n")
     if variant == REMOVED:
-        assert not any(line.startswith("## 7. Diff review") for line in body.splitlines())
+        assert not any(line.startswith("## 8. Diff review") for line in body.splitlines())
         assert "review_diff" not in body and "diff-reviewer" not in body
         assert any(line.startswith("## Loop cap") for line in body.splitlines())
     assert render_prompt(case_id, variant) == rendered
