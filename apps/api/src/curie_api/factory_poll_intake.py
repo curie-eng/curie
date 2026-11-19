@@ -979,22 +979,26 @@ async def drain_answer_retries(
     return handled
 
 
-def _edited_before(comment: dict[str, Any], threshold: datetime | None) -> bool:
-    """Whether a listed comment is an edit of one an earlier pass already saw.
+def _edited(comment: dict[str, Any], threshold: datetime | None) -> bool:
+    """Whether a listed comment has been edited, so it is never an answer.
 
-    Created before the listing's threshold, it is listed only for a newer
-    ``updated_at``. Created in the threshold's own second, which the inclusive
-    ``since`` lists again, it is an edit only when ``updated_at`` is later than
-    ``created_at``; a reply posted in that second is new.
+    The webhook refuses an edit as ``unsupported_action`` and decides a
+    comment only from its ``created`` delivery, so the poll pass refuses any
+    comment whose listing already shows an ``updated_at`` later than its
+    ``created_at``: one edited before a pass first saw it (a facts request
+    edited into plain text, say) is no more an answer than one edited after.
+    A reply posted in the threshold's own second, never edited, is new. A
+    comment created before the threshold is listed only for a newer
+    ``updated_at`` and is an edit too.
     """
 
     created = parse_time(comment.get("created_at"))
-    if created is None or threshold is None:
+    if created is None:
         return False
-    if created < threshold:
-        return True
     updated = parse_time(comment.get("updated_at"))
-    return created == threshold and updated is not None and updated > created
+    if updated is not None and updated > created:
+        return True
+    return threshold is not None and created < threshold
 
 
 async def _admit_mentions(
@@ -1094,7 +1098,7 @@ async def _admit_mentions(
             and answer_on not in owned_pulls
             and (answer_on in answering or (mentioned and answer_on in factory_issues))
         ):
-            if answer_on in answering and _edited_before(comment, threshold):
+            if answer_on in answering and _edited(comment, threshold):
                 continue
             notice = _answer_notice(
                 comment, tracker, installation_id=installation_id, mention=mentioned

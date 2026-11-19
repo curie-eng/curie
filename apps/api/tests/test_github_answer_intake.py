@@ -423,8 +423,7 @@ def test_refused_edited_comment(world: World, path: str) -> None:
 
     if result is not None:
         assert _code(result) == "unsupported_action", result
-    else:
-        assert _receipts(triage) == {str(edited["id"]): ("not_after_question", None)}
+    assert _receipts(triage) == {}
     assert _ids(triage) == [triage.request_id]
     _admits(world, path, triage, number)
 
@@ -1071,6 +1070,29 @@ def test_refused_edit_at_the_cursor_boundary(
 
     assert _ids(triage) == [triage.request_id]
     assert _receipts(triage) == {}
+
+
+def test_refused_comment_edited_before_the_first_poll(world: World) -> None:
+    """A facts request created after the cursor and edited into plain text
+    before the next pass is first listed already edited. The webhook decides
+    the created delivery as a facts request and refuses the edit, so the poll
+    pass never takes it for an answer either."""
+
+    number = 6211
+    triage = _outstanding(world, number)
+    _poll(world)
+    world.github.tick()
+    facts = world.github.add_comment(number, _facts_body(), user=WRITER)
+    world.github.tick()
+    edited = world.github.edit_comment(facts["id"], ANSWER)
+    assert edited["updated_at"] > edited["created_at"]
+
+    _poll(world)
+
+    assert _ids(triage) == [triage.request_id]
+    assert _receipts(triage) == {}
+    # The question is still open to a new plain answer.
+    _admits(world, "poll", triage, number)
 
 
 def test_boundary_reply_in_the_cursor_second_is_new(world: World) -> None:
