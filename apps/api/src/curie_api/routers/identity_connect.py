@@ -23,7 +23,11 @@ CSRF_COOKIE = "__Host-curie_identity_connect_csrf"
 PROOF_COOKIE = "__Host-curie_identity_connect_proof"
 PRIVATE_HEADERS = {
     "Cache-Control": "private, no-store",
-    "Referrer-Policy": "no-referrer",
+    # Fetch sets a non-GET Origin to the value null under no-referrer, which
+    # the console origin check rejects. strict-origin keeps the real Origin on
+    # a same-scheme POST and sends only the origin, never the token path, as Referer.
+    # https://fetch.spec.whatwg.org/#append-a-request-origin-header
+    "Referrer-Policy": "strict-origin",
     "Content-Security-Policy": (
         "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     ),

@@ -528,7 +528,7 @@ def test_connect_plan_confirmation_names_account_and_redirects(connect_plan_brow
         "Anyone using it will start runs on your Claude plan."
     ) in page.text
     assert "Alice <Example>" not in page.text
-    assert page.headers["referrer-policy"] == "no-referrer"
+    assert page.headers["referrer-policy"] == "strict-origin"
     assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
     csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
     response = client.post(
@@ -798,7 +798,7 @@ def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) ->
     assert page.status_code == 200 and "Sign in with your organization" in page.text
     assert "UALICE001" in page.text and "TEXAMPLE1" in page.text
     assert page.headers["cache-control"] == "private, no-store"
-    assert page.headers["referrer-policy"] == "no-referrer"
+    assert page.headers["referrer-policy"] == "strict-origin"
     for value in page.headers.get_list("set-cookie"):
         assert "Secure" in value and "HttpOnly" in value and "SameSite=lax" in value
     assert browser_links(tenant_id) == []
@@ -815,7 +815,9 @@ def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) ->
     assert client.get(path).status_code == 400
 
 
-@pytest.mark.parametrize("bad", ["origin", "missing_origin", "csrf", "token", "session"])
+@pytest.mark.parametrize(
+    "bad", ["origin", "missing_origin", "null_origin", "csrf", "token", "session"]
+)
 def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str) -> None:
     import re
 
@@ -829,6 +831,8 @@ def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str)
     headers = {"Origin": "https://testserver"}
     if bad == "origin":
         headers["Origin"] = "https://sibling.example.com"
+    elif bad == "null_origin":
+        headers["Origin"] = "null"
     elif bad == "missing_origin":
         headers = {}
     elif bad == "csrf":
@@ -840,6 +844,32 @@ def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str)
     response = client.post(f"{path}/confirm", data={"csrf": csrf}, headers=headers)
     assert response.status_code in {400, 401, 403}
     assert browser_links(tenant_id) == []
+
+
+def test_connect_confirm_page_referrer_policy_is_strict_origin(connect_browser) -> None:
+    """#5836. no-referrer makes a browser send Origin null. strict-origin does not."""
+
+    import re
+
+    from curie_api.routers.identity_connect import PROOF_COOKIE
+
+    client, raw, tenant_id, principal_id, proof, _ = connect_browser
+    client.cookies.set(PROOF_COOKIE, proof)
+    path = f"/identity/connect/{raw}"
+    page = client.get(path)
+    assert page.status_code == 200, page.text
+    assert page.headers["referrer-policy"] == "strict-origin"
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+    rejected = client.post(f"{path}/confirm", data={"csrf": csrf}, headers={"Origin": "null"})
+    assert rejected.status_code == 403
+    assert rejected.json()["detail"] == "console session origin rejected"
+    assert browser_links(tenant_id) == []
+    confirmed = client.post(
+        f"{path}/confirm", data={"csrf": csrf}, headers={"Origin": "https://testserver"}
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert "Account connected" in confirmed.text
+    assert browser_links(tenant_id) == [("UALICE001", principal_id)]
 
 
 def test_oidc_callback_returns_to_confirmation_and_preserves_verified_claim(
@@ -964,7 +994,7 @@ def test_form_parser_errors_are_private_and_do_not_link(connect_browser) -> None
     response = client.post(f"{path}/confirm", data={}, headers={"Origin": "https://testserver"})
     assert response.status_code == 400
     assert response.headers["cache-control"] == "private, no-store"
-    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["referrer-policy"] == "strict-origin"
     assert browser_links(tenant_id) == []
 
 
@@ -1324,7 +1354,7 @@ def test_admission_wire_keeps_real_connect_url_and_private_confirmation(connect_
             page = client.get(url.path)
             assert page.status_code == 200, page.text
             assert page.headers["cache-control"] == "private, no-store"
-            assert page.headers["referrer-policy"] == "no-referrer"
+            assert page.headers["referrer-policy"] == "strict-origin"
             login = client.get("/api/console/oidc/login", follow_redirects=False)
             assert login.status_code == 302, login.text
             with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:
