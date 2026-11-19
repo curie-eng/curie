@@ -119,6 +119,10 @@ class CardRequest:
     pr_number: int | None
     pr_url: str | None
     pr_title: str | None
+    # Whether this personal run's enrollment is still active at its generation.
+    # The card sentence follows the recorded terminal cause, not this flag.
+    plan_still_connected: bool = False
+    personal: bool = False
 
 
 def _view(request: CardRequest) -> PhaseView | None:
@@ -256,7 +260,16 @@ def render_card(subject: CardSubject, request: CardRequest, *, now: datetime) ->
             label = f"View pull request {number}".rstrip()
             links.append(MessageLink(label=label[:_LINK_LABEL_MAX], url=url))
     elif state == "needs a person":
-        sentence = _sentence(cause_text(str(request.terminal_cause or "")))
+        # A recorded personal provider rejection stays the rejection sentence
+        # after the owner reconnects. A recorded enrollment fence stays the
+        # fence sentence. Service mode keeps the shared cause sentence.
+        # The notify reply keeps the shared cause sentence (#5720).
+        if request.terminal_cause == "authentication_required" and request.personal:
+            sentence = "Your Claude plan was rejected. Reconnect it on the Claude plan page."
+        elif request.terminal_cause == "enrollment_fenced":
+            sentence = _sentence(cause_text("enrollment_fenced"))
+        else:
+            sentence = _sentence(cause_text(str(request.terminal_cause or "")))
         body.extend(["", f":raising_hand: *Needs a person.* {escaped(sentence)}"])
         url = _http(subject.issue_url)
         if url is not None:

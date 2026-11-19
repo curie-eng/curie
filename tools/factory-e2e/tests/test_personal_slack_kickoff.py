@@ -4230,6 +4230,123 @@ def test_judge_checks_observed_models_and_rehearsal_ledgers(tmp_path: Path) -> N
         rehearsal.close()
 
 
+def _grant_dm(key: str, *, button: str | None = None, extra_button: str | None = None) -> dict:
+    url = button if button is not None else f"{sks.CONSOLE_ORIGIN}{sks.GRANT_NOTICE_BUTTON_SUFFIX}"
+    elements = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Reconnect your Claude plan"},
+            "url": url,
+        }
+    ]
+    if extra_button is not None:
+        elements.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Again"},
+                "url": extra_button,
+            }
+        )
+    if button == "":
+        elements = []
+    return {
+        "text": (
+            "Your Claude plan was rejected when Curie tried to use it, so your factory "
+            f"run for {key} Fix the greeting stopped. The work is kept."
+        ),
+        "blocks": [{"type": "actions", "elements": elements}],
+        "user": "UBOT",
+        "ts": key,
+    }
+
+
+def test_grant_notice_judge_counts_one_message_per_generation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Each expected issue key matches one DM, and that DM's own button.
+
+    A URL that is not on the button, two URLs on one message, or a second
+    message for the same key does not pass. A notice for another issue is
+    ignored unless that issue is counted. A counted earlier issue adds to the
+    count without having to be present. A second message at the same generation
+    fails the ledger judge. The judge reads no Slack token.
+    """
+
+    button = f"{sks.CONSOLE_ORIGIN}{sks.GRANT_NOTICE_BUTTON_SUFFIX}"
+    first = _grant_dm("#7")
+    second = _grant_dm("#8")
+    assert sks.grant_notice_facts([first, second], expected=["#7", "#8"]) == {
+        "count": 2,
+        "text_ok": True,
+        "button_url_ok": True,
+    }
+    assert sks.grant_notice_facts([{"text": "ping"}], expected=["#7"])["count"] == 0
+    unrelated = _grant_dm("#99")
+    assert sks.grant_notice_facts([first, unrelated], expected=["#7"]) == {
+        "count": 1,
+        "text_ok": True,
+        "button_url_ok": True,
+    }
+    late = sks.grant_notice_facts(
+        [first, second, _grant_dm("#9")],
+        expected=["#7", "#9"],
+        counted=["#8"],
+    )
+    assert late == {"count": 3, "text_ok": True, "button_url_ok": True}
+    pooled = _grant_dm("#7", extra_button=button)
+    bare = _grant_dm("#8", button="")
+    bare["blocks"] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": button},
+        }
+    ]
+    missed = sks.grant_notice_facts([pooled, bare], expected=["#7", "#8"])
+    assert missed["button_url_ok"] is False
+    duplicate = sks.grant_notice_facts([first, dict(first)], expected=["#7"])
+    assert duplicate["count"] == 2
+    assert duplicate["text_ok"] is False
+    assert duplicate["button_url_ok"] is False
+    assert sks.grant_dm_timestamps(
+        [first, {**second, "user": "UHUMAN"}, unrelated],
+        author="UBOT",
+        issue_keys=["#7", "#8"],
+    ) == ["#7"]
+
+    state = _private(tmp_path / "state")
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        ledger.ensure_run(CANDIDATE, phase="rehearse")
+        ledger.mark_live_kind("rehearse")
+        recorded = {
+            "dm_count_after_first": 1,
+            "first_text_ok": True,
+            "first_button_ok": True,
+            "dm_count_after_second": 1,
+            "second_settled": True,
+            "dm_count_after_replace": 2,
+            "replace_text_ok": True,
+            "replace_button_ok": True,
+        }
+        for key, value in recorded.items():
+            ledger.record("grant-notice", key, value)
+    finally:
+        ledger.close()
+
+    argv = ["judge", "--candidate", CANDIDATE, "--state-dir", str(state), "--run-id", RUN_ID]
+    code = psk.main([*argv, "--criterion", "grant-notice"], environ={"PATH": "/usr/bin"})
+    payload = _output(capsys)[0]
+    assert (code, payload["verdict"]) == (sks.EXIT_PASS, "pass")
+    assert payload["counts"]["grant-notice.direct_messages"] == 2
+
+    ledger = sks.Ledger.open(state, RUN_ID, scrubber=sks.Scrubber())
+    try:
+        ledger.record("grant-notice", "dm_count_after_second", 2)
+        assert sks.judge(ledger, "grant-notice")["verdict"] == "fail"
+    finally:
+        ledger.close()
+
+
 def test_judge_reads_only_the_ledger_through_main(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -5295,6 +5412,9 @@ def test_install_values_and_oidc_split_horizon() -> None:
     assert values["personalClaude"] == {"grantNamespace": f"{NAMESPACE}-grants"}
     personal = {"name": "FACTORY_MODEL_AUTH_MODE", "value": sks.PERSONAL_MODE}
     assert personal in values["api"]["extraEnv"] and personal in values["worker"]["extraEnv"]
+    origin = {"name": "CURIE_CONSOLE_ORIGIN", "value": sks.CONSOLE_ORIGIN}
+    assert origin in values["worker"]["extraEnv"]
+    assert origin not in values["api"]["extraEnv"]
     egress = values["security"]["networkPolicy"]["allowedEgress"]
     assert [item["cidr"] for item in egress] == ["192.0.2.10/32", "192.0.2.11/32"]
     assert client_marker not in json.dumps(values)

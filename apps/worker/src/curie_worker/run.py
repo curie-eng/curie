@@ -1814,6 +1814,7 @@ def _build_factory_slack_progress(
             engine,
             schema=config.db_schema,
             lease_owner=config.consumer_name,
+            console_origin=config.console_origin,
         ),
         replies=ObservedReplySink(sink),
         interval_seconds=config.factory_slack_interval_s,

@@ -123,7 +123,8 @@ def graph_payload() -> dict[str, Any]:
         ("0178", False),
         ("0179", False),
         ("0180", False),
-        ("0182", True),
+        ("0182", False),
+        ("0183", True),
         ("0000", True),
         ("future-expand", True),
     ],
@@ -173,10 +174,11 @@ def test_candidate_window_raises_the_floor_to_0174() -> None:
     GitHub account link states and display labels require 0179.
     Slack account display labels require 0180.
     Guarded automatic retry dispatch times require 0182.
+    Grant notices require 0183.
     """
     window = shared().load_metadata().window
-    assert window.schema_min == "0182"
-    assert window.schema_head == "0182"
+    assert window.schema_min == "0183"
+    assert window.schema_head == "0183"
 
 
 @pytest.mark.parametrize("mutation", ["bounds", "parent", "cycle", "duplicate", "type"])
