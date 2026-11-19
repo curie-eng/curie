@@ -558,6 +558,8 @@ def test_terminate_wakes_cover_fenced_and_unconfirmed_terminal_rows_but_not_a_li
     # The fenced running requests stop; the stopping sibling still blocks the
     # teardown of the run before it.
     assert _request(started_sibling)["terminal_cause"] == "enrollment_fenced"
+    # A terminal row's wake waits out its finisher's live lease (#5840).
+    _expire_lease(lone.request_id)
     assert _wakes() == sorted((running.request_id, lone.request_id, started_sibling))
     for request_id in (acquiring.request_id, started.request_id):
         _expire_lease(request_id)
@@ -585,6 +587,7 @@ def test_waiting_sibling_without_acquire_lease_does_not_block_terminal_teardown(
     assert _request(sibling)["enrollment_generation"] == old
 
     # A waiting sibling nobody is acquiring owns no sandbox.
+    _expire_lease(first.request_id)  # The wake waits out the finisher's live lease (#5840).
     assert _wakes() == [first.request_id]
     claim = _claimed(api, first.request_id)
     assert claim["runtime_epoch"] == epoch
@@ -1121,6 +1124,8 @@ def test_fence_and_pending_teardown_survive_an_api_restart(
         beat = _heartbeat(restarted, running.request_id, epoch)
         assert beat.status_code == 200, beat.text
         assert beat.json()["terminal_cause"] == "enrollment_fenced"
+        # The terminal row's wake waits out its finisher's live lease (#5840).
+        _expire_lease(terminal.request_id)
         assert _wakes() == sorted((running.request_id, terminal.request_id))
         _conflict(_revalidate(restarted, world, agent_id, terminal.work_item_id), "runtime_live")
         claim = _claimed(restarted, terminal.request_id)

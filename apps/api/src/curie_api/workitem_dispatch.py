@@ -2408,6 +2408,14 @@ async def redispatch_lapsed_acquisitions(session: AsyncSession) -> int:
 async def claim_terminate_publishes(
     session: AsyncSession, *, retry_seconds: int, limit: int
 ) -> list[TerminatePublish]:
+    """Claim the terminate wakes that are due and stamp each as published.
+
+    A wake is due for a stopping request, for a settled cancellation still
+    owing its sandbox teardown, and for a started terminal request owing its
+    runtime teardown once that request's runtime lease has lapsed (#5840).
+    A published wake is republished after ``retry_seconds``.
+    """
+
     due = (
         select(ExecutionRequest.id)
         .where(
@@ -2427,9 +2435,23 @@ async def claim_terminate_publishes(
                     ),
                 ),
                 # A forced settle still owes the sandbox a teardown, and so
-                # does a terminal request an enrollment fence marked.
+                # does a started terminal request its own terminal write or
+                # an enrollment fence marked.
                 _unconfirmed_settle_teardown(),
-                _unconfirmed_terminal_teardown(),
+                and_(
+                    _unconfirmed_terminal_teardown(),
+                    # Wait out a live runtime lease. A worker's own finish
+                    # leaves its short lease live, and that worker may still
+                    # claim the termination; a wake taking the thread lock
+                    # first would delete the claim before its ADR 0251
+                    # recovery capture runs (#5840). The heartbeat refuses
+                    # terminal rows, so the lease lapses within its TTL.
+                    or_(
+                        ExecutionRequest.runtime_owner.is_(None),
+                        ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
+                        ExecutionRequest.runtime_heartbeat_expires_at <= func.clock_timestamp(),
+                    ),
+                ),
             ),
             or_(
                 ExecutionRequest.terminate_published_at.is_(None),

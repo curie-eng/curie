@@ -8,7 +8,9 @@ CI gate then completes, used to leave that claim behind for a day. Now
 ``teardown_unconfirmed_at`` in the same UPDATE that settles it ``completed`` or
 ``failed``, and releases a lease parked at the execution deadline, so terminate
 wakes go out at once and any worker can claim the teardown; recording it
-clears the flag and keeps the outcome.
+clears the flag and keeps the outcome. After a worker's own finish, the wake
+waits for that worker's short live lease to lapse, so its ADR 0251 recovery
+capture runs before the claim is deleted.
 
 What does not change: an ``expired`` request already ends with a worker
 termination observation, a request parked for CI or an approval stays
@@ -172,6 +174,17 @@ def _request(request_id: UUID) -> dict[str, Any]:
     return row
 
 
+def _expire_lease(request_id: UUID) -> None:
+    """Lapse the runtime lease, as the finisher's TTL does once heartbeats stop."""
+
+    support.rows(
+        "UPDATE curie.execution_requests "
+        "SET runtime_heartbeat_expires_at = clock_timestamp() - interval '1 second' "
+        "WHERE id = :id",
+        {"id": request_id},
+    )
+
+
 def _wakes() -> list[UUID]:
     published = support.with_session(
         lambda session: workitem_dispatch.claim_terminate_publishes(
@@ -272,7 +285,11 @@ def test_completed_personal_request_owes_its_teardown(
 def test_worker_completed_personal_request_owes_its_teardown_to_its_live_owner(
     api: TestClient, world: support.World
 ) -> None:
-    """A worker finish keeps its short live lease, so only the finisher claims at once."""
+    """A worker finish keeps its short live lease, so only the finisher claims at once.
+
+    No wake goes out while that lease is live: the finisher's own ADR 0251
+    recovery capture must take the thread lock before a terminate wake does.
+    """
 
     admitted, epoch = _started(api, world, 58402)
     _open_pull_request(admitted, pr=58402)
@@ -284,7 +301,7 @@ def test_worker_completed_personal_request_owes_its_teardown_to_its_live_owner(
     assert (row["status"], row["terminal_cause"]) == ("completed", "completed")
     assert row["teardown_unconfirmed_at"] is not None
     assert (row["runtime_heartbeat_expires_at"], row["lease_lapsed"]) == (lease, False)
-    assert _wakes() == [admitted.request_id]
+    assert _wakes() == []
     _conflict(_claim(api, admitted.request_id, support.OTHER_RUNTIME_OWNER), "duplicate")
     _tear_down(
         api,
@@ -308,11 +325,44 @@ def test_failed_personal_request_owes_its_teardown(api: TestClient, world: suppo
         None,
     )
     assert row["teardown_unconfirmed_at"] is not None
+    # The finisher's lease is still live, so the wake waits for it to lapse.
+    assert row["lease_lapsed"] is False
+    assert admitted.request_id not in _wakes()
+    _expire_lease(admitted.request_id)
     assert admitted.request_id in _wakes()
     _tear_down(
         api,
         admitted.request_id,
         support.RUNTIME_OWNER,
+        status="failed",
+        cause="model_error",
+        epoch=epoch,
+    )
+
+
+def test_failed_personal_wake_waits_for_the_finishers_lease(
+    api: TestClient, world: support.World
+) -> None:
+    """The finisher's recovery capture runs first; any worker tears down once its lease lapses."""
+
+    admitted, epoch = _started(api, world, 58409)
+
+    support.finish_failed(admitted.request_id, epoch, cause="model_error")
+
+    row = _request(admitted.request_id)
+    assert (row["status"], row["runtime_owner"]) == ("failed", support.RUNTIME_OWNER)
+    assert row["teardown_unconfirmed_at"] is not None
+    assert row["lease_lapsed"] is False
+    assert _wakes() == []
+    _conflict(_claim(api, admitted.request_id, support.OTHER_RUNTIME_OWNER), "duplicate")
+
+    _expire_lease(admitted.request_id)
+
+    assert _wakes() == [admitted.request_id]
+    _tear_down(
+        api,
+        admitted.request_id,
+        support.OTHER_RUNTIME_OWNER,
         status="failed",
         cause="model_error",
         epoch=epoch,
