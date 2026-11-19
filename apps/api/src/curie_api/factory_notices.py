@@ -54,7 +54,14 @@ from .factory_comment_text import (
     status_marker,
 )
 from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, pill_for
-from .factory_questions import QUESTIONS_ASKED, QUESTIONS_LABEL, ROUND_LIMIT, asked_round
+from .factory_questions import (
+    ANSWER_RECEIVED_LINE,
+    ANSWER_STARTED_OUTCOMES,
+    QUESTIONS_ASKED,
+    QUESTIONS_LABEL,
+    ROUND_LIMIT,
+    asked_round,
+)
 from .factory_reply_target import stored_reply_target
 from .factory_retry_policy import condition_text
 from .factory_triage_status import (
@@ -88,6 +95,7 @@ from .github_review_truth import VerifiedRepository
 from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
+    FactoryAnswerReceipt,
     FactoryBaseTransition,
     FactoryCiObservation,
     FactoryStatusComment,
@@ -1419,6 +1427,23 @@ def github_status_mention(settings: Settings, tracker_kind: str) -> str | None:
     return mention
 
 
+async def _answer_started(
+    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
+) -> bool:
+    """Whether an answer comment created ``request_id`` (#5786 decision 5)."""
+
+    found = await session.scalar(
+        select(FactoryAnswerReceipt.comment_key)
+        .where(
+            FactoryAnswerReceipt.work_item_id == work_item_id,
+            FactoryAnswerReceipt.request_id == request_id,
+            FactoryAnswerReceipt.outcome.in_(ANSWER_STARTED_OUTCOMES),
+        )
+        .limit(1)
+    )
+    return found is not None
+
+
 async def _render(
     session: AsyncSession,
     settings: Settings,
@@ -1665,6 +1690,19 @@ async def _render(
         )
         is not None
     )
+    # An answer-started request says the answer was received (#5786), first,
+    # even when it continues on an existing pull request or has already
+    # settled by its first status sync.
+    answer_started = False
+    lead_line: str | None = None
+    if (
+        target.kind == "issue"
+        and not is_tracker_result(request)
+        and request.execution_kind != "publication_recovery"
+    ):
+        answer_started = await _answer_started(session, work_item.id, request.id)
+        if request.terminal_at is None and not continuing:
+            lead_line = ANSWER_RECEIVED_LINE if answer_started else INVESTIGATING_LINE
     body = status_body(
         request_id=row.execution_request_id,
         card_url=card_url,
@@ -1675,20 +1713,16 @@ async def _render(
         waiting_line=waiting_line,
         base_line=render_base_line(work_item, transition),
         progress_line=progress_line,
-        lead_line=(
-            INVESTIGATING_LINE
-            if request.terminal_at is None
-            and not continuing
-            and target.kind == "issue"
-            and not is_tracker_result(request)
-            and request.execution_kind != "publication_recovery"
-            else None
-        ),
+        lead_line=lead_line,
     )
     if continuing:
-        body = redact_factory_comment(
-            f"Continuing on the existing pull request: {pr_url}\n\n{body}"
-        )
+        body = f"Continuing on the existing pull request: {pr_url}\n\n{body}"
+        if answer_started:
+            body = f"{ANSWER_RECEIVED_LINE}\n\n{body}"
+        body = redact_factory_comment(body)
+    elif answer_started and (lead_line is None or result is not None):
+        # A final body carries no lead line.
+        body = redact_factory_comment(f"{ANSWER_RECEIVED_LINE}\n\n{body}")
     observation = await session.get(FactoryCiObservation, request.id)
     if observation is not None:
         until = observation.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
