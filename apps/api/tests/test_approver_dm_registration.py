@@ -20,7 +20,8 @@ import uuid
 from types import SimpleNamespace
 from typing import Any
 
-from approval_answer_support import NATIVE_A, NATIVE_B, ordinary
+from _migration_support import sql_rows
+from approval_answer_support import NATIVE_A, NATIVE_B, audit_rows, ordinary
 from approval_answer_support import synthetic_provider as synthetic_provider
 from approver_dm_support import (
     CARD_EVIDENCE_KEYS,
@@ -85,6 +86,25 @@ def _unregistered(
     assert row["card_channel"] is None, row
     assert len(card_audits(row["id"])) == audits
     assert owner_verifies(case, str(row["id"]))
+
+
+def test_card_registration_cannot_reseal_a_tampered_record(dm_case: SimpleNamespace) -> None:
+    case = dm_case
+    row, request, identity = _pending(case)
+    registration = card_body(request, row["id"], card_identity=identity)
+    audits = audit_rows(row["id"])
+    query = "UPDATE curie.approvals SET summary = :summary WHERE id = :id"
+    change = {"id": row["id"], "summary": "Synthetic changed summary"}
+    sql_rows(query, change)
+    tampered = _row(request)
+    assert tampered == {**row, "summary": change["summary"]}
+    refused_exactly(post_card(case.client, row["id"], registration), 409,
+                    "approval_provenance_conflict")
+    assert _row(request) == tampered
+    assert audit_rows(row["id"]) == audits
+    sql_rows(query, {**change, "summary": row["summary"]})
+    card_registered(post_card(case.client, row["id"], registration), registration)
+    assert len(card_audits(row["id"])) == 1
 
 
 # --- the first registration and its continuity ---------------------------------------------

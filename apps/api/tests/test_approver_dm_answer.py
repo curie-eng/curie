@@ -22,6 +22,8 @@ from typing import Any
 
 from approval_answer_support import (
     NATIVE_A,
+    NATIVE_B,
+    NATIVE_OUTSIDER,
     OPERATOR,
     OPERATOR_REFUSED,
     actions,
@@ -37,6 +39,7 @@ from approver_dm_support import (
     configured_dm,
     dm_answer,
     dm_row,
+    email_answer,
     no_effect,
     register_dm_card,
     unauthenticated,
@@ -105,6 +108,37 @@ def test_a_copied_card_in_another_channel_supplies_no_authority(
         response = dm_answer(case, row["id"], NATIVE_A, channel=channel)
         unauthenticated(case, row["id"], response, card_channel=DM_CHANNEL)
     _approved(case, row)
+
+
+def test_registered_dm_refuses_other_actors_receivers_and_email(
+    dm_case: SimpleNamespace,
+) -> None:
+    case = dm_case
+    row = _registered(case)
+    for native in (NATIVE_B, NATIVE_OUTSIDER):
+        response = dm_answer(case, row["id"], native, channel=DM_CHANNEL)
+        unauthenticated(case, row["id"], response, card_channel=DM_CHANNEL)
+    for receiver in ("other", "foreign"):
+        response = dm_answer(case, row["id"], NATIVE_A, channel=DM_CHANNEL, receiver=receiver)
+        unauthenticated(case, row["id"], response, card_channel=DM_CHANNEL)
+    email = email_answer(case, row["id"])
+    assert (email.status_code, email.json()) == (404, {"detail": "approval not found"})
+    no_effect(case, row["id"], card_channel=DM_CHANNEL)
+    assert actions(row["id"], "resolved") == []
+    _approved(case, row)
+
+
+def test_dm_answer_requires_committed_card_registration(dm_case: SimpleNamespace) -> None:
+    case = dm_case
+    configured_dm(case)
+    row, request = dm_row(case)
+    for channel in (case.scope["address"], DM_CHANNEL):
+        response = dm_answer(case, row["id"], NATIVE_A, channel=channel)
+        unauthenticated(case, row["id"], response, card_channel=None)
+    email = email_answer(case, row["id"])
+    assert (email.status_code, email.json()) == (404, {"detail": "approval not found"})
+    no_effect(case, row["id"], card_channel=None)
+    _approved(case, register_dm_card(case, row, request))
 
 
 def test_an_operator_principal_is_refused_even_when_the_route_lists_it(

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ssl
 import time
 import uuid
 from collections.abc import Iterator
@@ -26,7 +27,7 @@ from curie_api.config import get_settings
 from curie_api.identity.http_credential_registry import build_provider_credential_registry
 from curie_api.identity.http_transport import HttpIdentityClient, ProviderBearer
 from curie_api.main import create_app
-from curie_api.models import AgentChannel, ChannelIdentity
+from curie_api.models import Agent, AgentChannel, ChannelIdentity
 from curie_api.resumequeue import resume_event_id
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
@@ -36,7 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.api.tests import test_http_email_receivers as email_receivers
 from apps.api.tests import test_http_invocation_membership as membership
-from apps.api.tests.test_http_approval_answers import approver_role, resolve, unchanged
+from apps.api.tests.test_http_approval_answers import answer, approver_role, resolve, unchanged
 from apps.api.tests.test_http_approval_creation import opened, request_for, rows
 from apps.api.tests.test_http_approval_grants import resume_check, resume_token
 from apps.api.tests.test_http_approval_legacy_writers import audits, created
@@ -47,6 +48,26 @@ from apps.api.tests.test_http_turn_authority import assert_response, post_check
 EMAIL_SENDER = email_receivers.SENDER
 PROOF_HEADER = "X-Curie-Approval-Receiver-Proof"
 ROUTE = "synthetic-email-card-route"
+SECOND_KEY = b"s" * 32
+
+
+def _second_mailbox(email: dict[str, Any]) -> dict[str, Any]:
+    other = {
+        **email, "address": "acme-second@example.com", "adapter": "acme-mail-second",
+        "receiver_id": str(uuid.uuid4()), "identity": str(uuid.uuid4()),
+        "installation": str(uuid.uuid4()), "binding": str(uuid.uuid4()),
+    }
+
+    async def persist(factory: async_sessionmaker[AsyncSession]) -> None:
+        async with factory() as session, session.begin():
+            session.add(AgentChannel(
+                id=uuid.UUID(other["binding"]), tenant_id=uuid.UUID(other["tenant"]),
+                agent_id=uuid.UUID(other["agent"]), kind="email", address=other["address"],
+                adapter=other["adapter"], endpoint="https://mail.example.com/reply",
+            ))
+
+    run(persist)
+    return other
 
 
 def _default_identity(slack: dict[str, Any]) -> None:
@@ -86,6 +107,7 @@ def _runtime(module: ModuleType, email: dict[str, Any]) -> Any:
         signing_key=("synthetic-context", 1),
         email_receivers=(
             (email_receivers._registration(module, email), email_receivers.EMAIL_KEY),
+            (email_receivers._registration(module, email["second"]), SECOND_KEY),
         ),
     )
 
@@ -98,6 +120,7 @@ def email_case(
     """@spec HTTP-INVOCATION-EXECUTION-29: one email turn queued through the actual ingress."""
     provider = synthetic_provider
     email = email_receivers._email_scope(provider.url)
+    email["second"] = _second_mailbox(email)
     slack = email["slack"]
     _default_identity(slack)
     try:
@@ -239,6 +262,89 @@ def test_email_answer_by_a_sender_outside_the_approver_group_is_refused(
     assert response.status_code == 403, response.text
     assert response.json() == {"detail": "caller_not_allowed"}
     unchanged(case, before + 2)
+
+
+def test_email_answer_binds_the_mailbox_actor_decision_and_purpose(
+    email_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
+) -> None:
+    case = email_case
+    case.row = created(case)
+    approver_role(case)
+    before = len(case.provider.requests)
+    stream = valkey.xrange(runs_stream)
+    valid = email_answer(case)
+    second = SimpleNamespace(email=case.email["second"], row=case.row)
+    _, sibling = email_answer(second, key=SECOND_KEY, binding_id=case.email["binding"])
+    for changes in (
+        {"key": b"f" * 32}, {"approval_id": str(uuid.uuid4())},
+        {"signed_body": b'{"decision":"rejected"}'}, {"sender": email_receivers.OTHER_SENDER},
+        {"binding_id": case.scope["binding"]}, {"proof": "invocation"}, {"proof": None},
+    ):
+        response = resolve(case, *email_answer(case, **changes))
+        expected = (403, "unsupported_approval") if changes == {"proof": None} else (
+            401, "missing or invalid approval principal",
+        )
+        assert (response.status_code, response.json()) == (expected[0], {"detail": expected[1]})
+        unchanged(case, before)
+        assert valkey.xrange(runs_stream) == stream
+
+    headers = {**valid[1], PROOF_HEADER: sibling[PROOF_HEADER]}
+    response = resolve(case, valid[0], headers)
+    assert (response.status_code, response.json()) == (
+        401, {"detail": "missing or invalid approval principal"},
+    )
+    unchanged(case, before)
+    assert valkey.xrange(runs_stream) == stream
+
+    state = case.client.app.state
+    trusted = state.http_identity_client
+    try:
+        state.http_identity_client = HttpIdentityClient(tls_context=ssl.create_default_context())
+        response = resolve(case, *valid)
+        assert (response.status_code, response.json()) == (503, {"detail": "authority_unavailable"})
+        unchanged(case, before)
+        assert valkey.xrange(runs_stream) == stream
+    finally:
+        state.http_identity_client = trusted
+    response = resolve(case, *valid)
+    assert (response.status_code, response.json()["resolved_by"]) == (200, EMAIL_SENDER)
+    added = valkey.xrange(runs_stream)[len(stream):]
+    assert len(added) == 1
+    valkey.xdel(runs_stream, added[0][0])
+
+
+def test_email_reply_cannot_resolve_the_fixed_slack_card(
+    email_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
+) -> None:
+    case = email_case
+    channel = case.scope["address"]
+
+    async def route(factory: async_sessionmaker[AsyncSession]) -> None:
+        async with factory() as session, session.begin():
+            agent = await session.get(Agent, uuid.UUID(case.scope["agent"]))
+            assert agent is not None
+            agent.approval_routes = {ROUTE: {
+                "resolution": {"kind": "slack", "address": channel},
+                "approvers": {"users": [SENDER]},
+            }}
+
+    run(route)
+    case.request["approval"].update(route=ROUTE, card_channel=channel)
+    case.row = created(case)
+    approver_role(case)
+    stream = valkey.xrange(runs_stream)
+    lookups = len(case.provider.requests)
+    response = resolve(case, *email_answer(case))
+    assert (response.status_code, response.json()) == (404, {"detail": "approval not found"})
+    unchanged(case, lookups)
+    assert valkey.xrange(runs_stream) == stream
+    response = resolve(case, *answer(case))
+    assert (response.status_code, response.json()["resolved_by"]) == (200, SENDER)
+    added = valkey.xrange(runs_stream)[len(stream):]
+    assert len(added) == 1
+    resumed = QueuedTurn.model_validate_json(added[0][1]["payload"])
+    assert resumed.reply_handle is not None and resumed.reply_handle.kind == "email"
+    valkey.xdel(runs_stream, added[0][0])
 
 
 def test_email_approval_answer_proofs_are_purpose_separated() -> None:
