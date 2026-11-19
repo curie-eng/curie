@@ -70,11 +70,6 @@ pub const DEFAULT_BUDGET_USD: f64 = 5.0;
 pub const DEFAULT_OUTPUT_TOKENS_PER_RUN: u64 = 250_000;
 pub const DEFAULT_AGENT: &str = "dark-factory";
 pub const GVISOR_OFF_SET: &str = "security.gvisor.mode=off";
-/// Host ports published for the console UI and Langfuse. A kind node publishes
-/// none of its NodePorts to the host unless the cluster is created with
-/// `extraPortMappings`.
-pub const KIND_UI_PORT: u16 = 30080;
-pub const KIND_LANGFUSE_PORT: u16 = 30000;
 pub const POLL_INTAKE: &str = "poll";
 /// Display model matching the dark-factory bundle's `progress/phases.json`.
 /// The runner resolves the reviewers' `opus` alias from the credential and override.
@@ -564,10 +559,6 @@ pub enum Action {
         program: String,
         args: Vec<String>,
     },
-    /// `kind create cluster` with the console ports published to the host.
-    KindCluster {
-        name: String,
-    },
     Cluster {
         args: Vec<String>,
     },
@@ -621,14 +612,6 @@ pub enum Action {
         /// lets it resolve its default chart.
         chart: Option<String>,
     },
-}
-
-impl Action {
-    /// Whether this step creates the kind cluster, so no release can be read
-    /// from it yet.
-    pub fn creates_kind_cluster(&self) -> bool {
-        matches!(self, Action::KindCluster { .. })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -846,6 +829,9 @@ impl crate::ui::CliOutput for QuickstartOutput {
                     "Reviewers run {REVIEWER_MODEL}. Plan on {} USD of OpenRouter credit per run.{credit_left}",
                     budget_display(RUN_CREDIT_USD)
                 ));
+                if let Some(hint) = console_access_hint(context) {
+                    ui.payload(&hint);
+                }
             }
             Self::AgentAdded {
                 context,
@@ -996,6 +982,17 @@ pub fn kind_context_name(kind_name: &str) -> String {
 /// the gVisor-off path, so confirmation uses it too.
 fn is_kind_context(name: &str) -> bool {
     name.starts_with("kind-")
+}
+
+/// How to reach the Console and Langfuse on a kind context, whose services
+/// quickstart leaves ClusterIP. `None` on any other context, which keeps the
+/// exposure `cluster up` defaults to.
+fn console_access_hint(context: &str) -> Option<String> {
+    is_kind_context(context).then(|| {
+        format!(
+            "The Console and Langfuse are not published on this host. Run `curie cluster access --context {context}` to open them on localhost while it runs."
+        )
+    })
 }
 
 fn unconfirmed_remote_context<'a>(
@@ -1308,7 +1305,15 @@ pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
     let mut actions = Vec::new();
     if let Some(name) = &kind_cluster {
         if create_kind {
-            actions.push(Action::KindCluster { name: name.clone() });
+            actions.push(Action::External {
+                program: "kind".into(),
+                args: vec![
+                    "create".into(),
+                    "cluster".into(),
+                    "--name".into(),
+                    name.clone(),
+                ],
+            });
         }
         actions.push(Action::External {
             program: "kubectl".into(),
@@ -1339,6 +1344,11 @@ pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
         target.chart.to_string(),
     ];
     if kind_target {
+        // A kind node publishes none of its NodePorts to the host, so the
+        // console and Langfuse stay ClusterIP and are reached on demand with
+        // `curie cluster access`, which holds loopback port-forwards only
+        // while it runs.
+        up.push("--no-expose".into());
         up.push("--set".into());
         up.push(GVISOR_OFF_SET.into());
     }
@@ -1616,7 +1626,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
     }
     for action in &planned.actions {
         match action {
-            Action::External { .. } | Action::KindCluster { .. } | Action::Cluster { .. } => {
+            Action::External { .. } | Action::Cluster { .. } => {
                 lines.extend(install_action_lines(
                     action,
                     planned.cluster_up,
@@ -1969,9 +1979,6 @@ fn install_action_lines(
 ) -> Vec<String> {
     match action {
         Action::External { program, args } => vec![format!("{program} {}", args.join(" "))],
-        Action::KindCluster { name } => vec![format!(
-            "kind create cluster --name {name} --config <kind config: 127.0.0.1:{KIND_UI_PORT} for the UI, 127.0.0.1:{KIND_LANGFUSE_PORT} for Langfuse>"
-        )],
         Action::Cluster { args } => match cluster_up {
             ClusterUpStep::UnlessAtTarget {
                 recorded_model_kept,
@@ -2009,8 +2016,14 @@ async fn run_install_action(
     mark: Option<&instance::ReleaseWriteMark>,
 ) -> Result<()> {
     match action {
-        Action::External { program, args } => run_program(program, args, "Scaling CoreDNS").await,
-        Action::KindCluster { name } => create_kind_cluster(name).await,
+        Action::External { program, args } => {
+            let step = if program == "kind" {
+                "Creating kind cluster"
+            } else {
+                "Scaling CoreDNS"
+            };
+            run_program(program, args, step).await
+        }
         Action::Cluster { args } => {
             // Prompted credentials become available only immediately before
             // this action. Resolve again so an omitted model follows that key.
@@ -2484,74 +2497,6 @@ async fn run_self(
     })
 }
 
-/// The kind cluster config that publishes the console NodePorts on the
-/// loopback only.
-pub fn kind_cluster_config() -> String {
-    let mut config = String::from(
-        "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n  - role: control-plane\n    extraPortMappings:\n",
-    );
-    for port in [KIND_UI_PORT, KIND_LANGFUSE_PORT] {
-        config.push_str(&format!(
-            "      - containerPort: {port}\n        hostPort: {port}\n        listenAddress: \"127.0.0.1\"\n        protocol: TCP\n"
-        ));
-    }
-    config
-}
-
-/// kind's refusal when Docker cannot publish a requested host port. Docker
-/// capitalises the first word on some versions, so the match ignores case.
-fn is_port_conflict(failure: &str) -> bool {
-    let failure = failure.to_lowercase();
-    ["ports are not available", "port is already allocated"]
-        .iter()
-        .any(|needle| failure.contains(needle))
-}
-
-/// Create the kind cluster with the console ports published. A host port that
-/// is already in use makes kind refuse the config, and the cluster used to be
-/// created without it, so only that refusal is retried without the mappings.
-/// Any other failure is returned as it came.
-async fn create_kind_cluster(name: &str) -> Result<()> {
-    require_on_path("kind")?;
-    let step = "Creating kind cluster";
-    let mut config_file = tempfile::NamedTempFile::new()?;
-    std::io::Write::write_all(&mut config_file, kind_cluster_config().as_bytes())?;
-    let with_ports = kind_create_args(name, Some(config_file.path()));
-    let refused = match run_command(Path::new("kind"), &with_ports, step, None, None).await {
-        Ok(_) => return Ok(()),
-        Err(error) => error,
-    };
-    if !is_port_conflict(&format!("{refused:#}")) {
-        return Err(refused);
-    }
-    crate::ui::ui().note(&format!(
-        "host port {KIND_UI_PORT} or {KIND_LANGFUSE_PORT} is in use, so kind is retried without publishing the console and Langfuse; reach them with kubectl -n <namespace> port-forward"
-    ));
-    run_command(
-        Path::new("kind"),
-        &kind_create_args(name, None),
-        step,
-        None,
-        None,
-    )
-    .await?;
-    Ok(())
-}
-
-fn kind_create_args(name: &str, config: Option<&Path>) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "create".into(),
-        "cluster".into(),
-        "--name".into(),
-        name.into(),
-    ];
-    if let Some(config) = config {
-        args.push("--config".into());
-        args.push(config.display().to_string());
-    }
-    args
-}
-
 async fn run_program(program: &str, args: &[String], step: &str) -> Result<()> {
     require_on_path(program)?;
     run_command(Path::new(program), args, step, None, None).await?;
@@ -2953,87 +2898,34 @@ mod tests {
         assert!(plan_touches_forbidden_tool(&lines).is_none(), "{text}");
     }
 
+    /// A kind node publishes none of its NodePorts, so the kind path keeps the
+    /// console and Langfuse ClusterIP; a targeted non-kind context keeps what
+    /// `cluster up` does by default.
     #[test]
-    fn the_kind_config_publishes_each_console_port_on_loopback_only() {
-        let config = kind_cluster_config();
-        for port in [KIND_UI_PORT, KIND_LANGFUSE_PORT] {
-            assert!(
-                config.contains(&format!(
-                    "containerPort: {port}\n        hostPort: {port}\n        listenAddress: \"127.0.0.1\""
-                )),
-                "{config}"
-            );
-        }
-        assert_eq!(config.matches("listenAddress").count(), 2, "{config}");
-        assert!(!config.contains("0.0.0.0"), "{config}");
-    }
-
-    /// The published ports are the NodePorts the chart pins, so the URLs
-    /// `cluster status` prints are the ones that open.
-    #[test]
-    fn the_published_ports_are_the_chart_pinned_nodeports() {
-        let values = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../charts/curie/values.yaml"),
-        )
-        .unwrap();
-        for port in [KIND_UI_PORT, KIND_LANGFUSE_PORT] {
-            assert!(values.contains(&format!("nodePort: {port}")), "{port}");
-        }
-    }
-
-    /// Every forge path decides from this whether the cluster exists yet, so
-    /// a plan that creates kind must say so and a plan that reuses one must not.
-    #[test]
-    fn only_a_plan_that_creates_kind_reports_creating_it() {
-        let created = quickstart_plan(&base()).unwrap();
-        assert!(created.actions.iter().any(Action::creates_kind_cluster));
-        let mut input = base();
-        input.existing_kind_clusters = vec!["curie-factory".into()];
-        let reused = quickstart_plan(&input).unwrap();
-        assert!(!reused.actions.iter().any(Action::creates_kind_cluster));
-    }
-
-    /// The text is what kind prints when Docker cannot bind a requested host
-    /// port; an unrelated failure must not read as one.
-    #[test]
-    fn only_a_host_port_conflict_is_retried_without_the_mappings() {
-        assert!(is_port_conflict(
-            "docker: Error response from daemon: ports are not available: exposing port TCP 127.0.0.1:30080 -> 127.0.0.1:0: listen tcp4 127.0.0.1:30080: bind: address already in use"
-        ));
-        assert!(is_port_conflict(
-            "Bind for 0.0.0.0:30080 failed: port is already allocated"
-        ));
-        assert!(is_port_conflict(
-            "Error response from daemon: Ports are not available: exposing port"
-        ));
-        assert!(!is_port_conflict(
-            "listen tcp 127.0.0.1:43211: bind: address already in use"
-        ));
-        assert!(!is_port_conflict(
-            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
-        ));
-        assert!(!is_port_conflict(
-            "failed to pull image: context deadline exceeded"
-        ));
-    }
-
-    #[test]
-    fn kind_create_args_pass_the_config_only_when_there_is_one() {
-        assert_eq!(
-            kind_create_args("curie-factory", None),
-            ["create", "cluster", "--name", "curie-factory"]
+    fn only_the_kind_path_installs_with_no_expose() {
+        let text = describe(&quickstart_plan(&base()).unwrap()).join("\n");
+        assert!(
+            text.contains("--chart charts/curie --no-expose --set security.gvisor.mode=off"),
+            "{text}"
         );
-        assert_eq!(
-            kind_create_args("curie-factory", Some(Path::new("/tmp/kind.yaml"))),
-            [
-                "create",
-                "cluster",
-                "--name",
-                "curie-factory",
-                "--config",
-                "/tmp/kind.yaml"
-            ]
+        let mut remote = base();
+        remote.explicit_context = Some("remote-cluster".into());
+        let text = describe(&quickstart_plan(&remote).unwrap()).join("\n");
+        assert!(!text.contains("--no-expose"), "{text}");
+        let mut existing_kind = base();
+        existing_kind.explicit_context = Some(KIND_CONTEXT.into());
+        let text = describe(&quickstart_plan(&existing_kind).unwrap()).join("\n");
+        assert!(text.contains("--no-expose"), "{text}");
+    }
+
+    #[test]
+    fn the_access_hint_names_the_context_and_only_a_kind_context_gets_it() {
+        let hint = console_access_hint(KIND_CONTEXT).unwrap();
+        assert!(
+            hint.contains(&format!("curie cluster access --context {KIND_CONTEXT}")),
+            "{hint}"
         );
+        assert_eq!(console_access_hint("remote-cluster"), None);
     }
 
     #[test]
@@ -3292,7 +3184,7 @@ mod tests {
             format!("Kubernetes context: {KIND_CONTEXT} because --context was passed"),
             "model credential: use CURIE_CREDENTIALS (no prompt)".to_string(),
             format!("kubectl --context {KIND_CONTEXT} -n kube-system scale deployment/coredns --replicas=1"),
-            format!("curie cluster up --context {KIND_CONTEXT} --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off"),
+            format!("curie cluster up --context {KIND_CONTEXT} --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --no-expose --set security.gvisor.mode=off"),
             "configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
             "configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
@@ -3676,7 +3568,6 @@ mod tests {
         assert!(!planned.actions.iter().any(|action| matches!(
             action,
             Action::External { .. }
-                | Action::KindCluster { .. }
                 | Action::Cluster { .. }
                 | Action::Register { .. }
                 | Action::Intake(_)

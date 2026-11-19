@@ -723,10 +723,7 @@ async fn execute(
             }
         }
         match action {
-            Action::External { .. }
-            | Action::KindCluster { .. }
-            | Action::JiraTracker(_)
-            | Action::Register { .. } => {}
+            Action::External { .. } | Action::JiraTracker(_) | Action::Register { .. } => {}
             Action::Cluster { .. } | Action::Intake(_) => {
                 if let Some(observation) = &jira_fence {
                     observation.recheck().await?;
@@ -742,7 +739,7 @@ async fn execute(
             }
         }
         match action {
-            Action::External { .. } | Action::KindCluster { .. } => {
+            Action::External { .. } => {
                 run_install_action(action, prompted_model.as_ref(), None).await?;
             }
             Action::Cluster { .. } => {

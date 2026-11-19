@@ -11,6 +11,7 @@
 
 #![deny(clippy::let_underscore_must_use, clippy::let_underscore_untyped)]
 
+mod access;
 pub(crate) mod capacity;
 mod command;
 mod convergence;
@@ -21,6 +22,7 @@ mod up;
 mod upgrade;
 mod verbs;
 
+pub use access::*;
 pub use command::*;
 pub use lint_values::*;
 pub use providers::*;

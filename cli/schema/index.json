@@ -94,6 +94,12 @@
       "version": "1.0"
     },
     {
+      "result": "ClusterAccessOutput",
+      "kind": "CliOutput",
+      "schema": "cluster-access.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ClusterDownOutput",
       "kind": "CliOutput",
       "schema": "cluster-down.schema.json",

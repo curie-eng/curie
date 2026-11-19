@@ -5113,6 +5113,64 @@ export const commandManifest = {
           "name": "status"
         },
         {
+          "about": "Open loopback port-forwards to the Console and Langfuse of a release whose services are ClusterIP (`cluster up --no-expose`, and what `factory quickstart` installs on kind). Runs in the foreground; the forwards exist only while it runs. Press Ctrl-C to stop them",
+          "args": [
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Local port for the Console. Default: derived from the service port the way `cluster status` names it (18080 for the default UI port)",
+              "id": "ui_port",
+              "long": "ui-port",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Local port for Langfuse. Default: the Langfuse service port (3000)",
+              "id": "langfuse_port",
+              "long": "langfuse-port",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the commands that would run and exit without executing",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "access"
+        },
+        {
           "about": "Show the release's observability surfaces (Curie Console + Langfuse traces/cost + API base)",
           "args": [
             {

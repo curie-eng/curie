@@ -113,11 +113,11 @@ user with Developer access or higher in a file outside the repository. It needs
 ## Start the factory
 
 Run **one** of these paths with the repository and cluster variables above.
-When quickstart creates the kind cluster, it publishes the console (port 30080)
-and Langfuse (port 30000) on the host's `127.0.0.1`. If either host port is in
-use, quickstart says so and creates the cluster without those mappings. Use
-`kubectl port-forward` to reach the console in that case. An existing kind
-cluster keeps the ports it was created with.
+On the kind cluster that quickstart creates, the Console and Langfuse stay
+`ClusterIP` and nothing is published on the host. When you want to open them,
+run `curie cluster access --context "$CURIE_CONTEXT"`. It forwards them to
+`localhost` (loopback only), prints the URLs, and stops them when you press
+Ctrl-C.
 
 ### GitHub issues and GitHub PRs
 
