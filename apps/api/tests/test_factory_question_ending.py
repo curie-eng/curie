@@ -762,8 +762,8 @@ def test_cancel_during_the_comment_write_waits_for_the_round_then_deletes_it(
         # The cancellation takes the WorkItem lock and then waits for the
         # question row, which the round being recorded holds.
         pending.append(asyncio.create_task(_cancel_now(triage)))
-        await asyncio.sleep(0.5)
-        assert not pending[0].done()
+        finished, _ = await asyncio.wait({pending[0]}, timeout=0.5)
+        assert not finished
         return comment_id
 
     monkeypatch.setattr(factory_questions, "post_round", cancelled_meanwhile)

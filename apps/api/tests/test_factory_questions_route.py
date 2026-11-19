@@ -17,6 +17,7 @@ composes it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -471,15 +472,16 @@ def test_concurrent_replays_of_one_ask_post_one_comment(
     marked = triage.tracker.marked_comments
     original_find = marked.find_marked
     lookups: list[str] = []
+    second_lookup = asyncio.Event()
 
     async def racing_find(target: Any, marker: str) -> Any:
         # Hold each marker lookup until a second one starts, as two racing
         # writers would interleave; a lone writer waits out the window.
         lookups.append(marker)
-        for _ in range(30):
-            if len(lookups) >= 2:
-                break
-            await asyncio.sleep(0.1)
+        if len(lookups) >= 2:
+            second_lookup.set()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(second_lookup.wait(), timeout=3)
         return await original_find(target, marker)
 
     monkeypatch.setattr(marked, "find_marked", racing_find)
