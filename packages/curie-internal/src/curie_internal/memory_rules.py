@@ -33,7 +33,11 @@ SECTION_OPEN = "<<<curie-learned-rules"
 SECTION_CLOSE = "<<<end-curie-learned-rules"
 AGENT_SCOPE_KEY = ""
 
-_FORBIDDEN_CHARS = ("\r", "\n", "\x00")
+# Every character ``str.splitlines`` treats as a line boundary, plus NUL. LF and CR
+# are the ones decision 8.2 names; the rest are refused too because other readers
+# of the canonical text split on them, and an embedded boundary would let one rule
+# forge a second numbered line.
+_FORBIDDEN_CHARS = frozenset("\r\n\x00\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
 _RESERVED_FRAGMENTS = (*RESERVED_PREFIXES, SECTION_OPEN, SECTION_CLOSE)
 
 
@@ -171,8 +175,11 @@ def canonical_text(rules: Sequence[tuple[int, str]]) -> str:
     if len(rules) == 0:
         raise InvalidRule("invalid_text")
     lines: list[str] = []
+    seen: set[int] = set()
     for number, text in rules:
-        _rule_number(number)
+        if _rule_number(number) in seen:
+            raise InvalidRule("invalid_text")
+        seen.add(number)
         if validate_rule_text(text) != text:
             raise InvalidRule("invalid_text")
         lines.append(f"R{number}: {text}")
