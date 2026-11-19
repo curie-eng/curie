@@ -435,6 +435,55 @@ async def test_jira_comments_only_issue_targets_live_on_the_tracker() -> None:
         await tracker.marked_comments.upsert_marked(pull, MARKER, "Status: WORKING\n")
 
 
+# Ticket reads (#5789 decision 7) ---------------------------------------------------
+
+EARLIER = "_Earlier comments were not read._"
+
+
+def _busy(count: int) -> tuple[JiraFake, Any, Any]:
+    fake = JiraFake(page_cap=2)
+    reader = fake.add_user("712020:00000000-0000-4000-8000-000000000101", "Human 1")
+    issue = fake.seed_issue("Busy ticket", "Body.")
+    for n in range(count):
+        fake.add_comment(issue.id, reader, f"Comment number {n:03d}")
+    return fake, jira_tracker(fake), fake.ref(issue)
+
+
+def _read_bodies(markdown: str) -> list[str]:
+    return [line for line in markdown.splitlines() if line.startswith("Comment number ")]
+
+
+@pytest.mark.anyio
+async def test_jira_comments_read_ticket_keeps_the_newest_100_of_130_in_order() -> None:
+    """Jira REST v3 "Get comments" lists ``orderBy=-created`` newest first, paged
+    by ``startAt`` and ``maxResults`` under ``total``
+    (https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/#api-rest-api-3-issue-issueidorkey-comment-get).
+    The read takes the newest 100 and renders them oldest first, after a line
+    saying the earlier ones were not read."""
+
+    fake, tracker, ref = _busy(130)
+
+    markdown = await tracker.read_ticket(ref)
+
+    assert _read_bodies(markdown) == [f"Comment number {n:03d}" for n in range(30, 130)]
+    assert markdown.startswith(f"# Busy ticket\n\nBody.\n\n{EARLIER}\n\n## Comment by Human 1")
+    assert markdown.count(EARLIER) == 1
+    listings = fake.requests_of("comments")
+    assert listings and all(r.params.get("orderBy") == "-created" for r in listings)
+    assert fake.writes == 0
+
+
+@pytest.mark.anyio
+async def test_jira_comments_read_ticket_with_exactly_100_has_no_earlier_line() -> None:
+    fake, tracker, ref = _busy(100)
+
+    markdown = await tracker.read_ticket(ref)
+
+    assert _read_bodies(markdown) == [f"Comment number {n:03d}" for n in range(100)]
+    assert EARLIER not in markdown
+    assert markdown.startswith("# Busy ticket\n\nBody.\n\n## Comment by Human 1")
+
+
 # State labels (decision 16) --------------------------------------------------------
 
 

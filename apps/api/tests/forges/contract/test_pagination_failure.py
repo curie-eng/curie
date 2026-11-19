@@ -12,18 +12,18 @@ from forge_fakes.contract_harness import AdapterHarness, open_pull
 async def test_a_failing_second_page_of_the_poll_yields_no_cursor(
     harness: AdapterHarness,
 ) -> None:
-    start = await harness.tracker.poll_marked(None, running=())
+    start = await harness.tracker.poll_marked(None, running=(), answering=())
     issues = [harness.seed_issue(f"Ticket {n}", "Do the thing.") for n in range(3)]
     for issue in issues:
         harness.apply_label(issue, harness.writer)
 
     harness.fail_next_page(after=1)
     with pytest.raises(Unavailable):
-        await harness.tracker.poll_marked(start.cursor, running=())
+        await harness.tracker.poll_marked(start.cursor, running=(), answering=())
 
     # The caller kept start.cursor; the retry sees every marking, including
     # the ones on the page that was read before the failure.
-    retry = await harness.tracker.poll_marked(start.cursor, running=())
+    retry = await harness.tracker.poll_marked(start.cursor, running=(), answering=())
     admitted = {n.issue for n in retry.notices if n.disposition is Disposition.ADMIT}
     assert admitted == set(issues)
     assert retry.cursor != start.cursor
@@ -37,8 +37,8 @@ async def test_a_failing_first_page_of_the_poll_is_unavailable_too(
     harness.apply_label(issue, harness.writer)
     harness.fail_next_page()
     with pytest.raises(Unavailable):
-        await harness.tracker.poll_marked(None, running=())
-    page = await harness.tracker.poll_marked(None, running=())
+        await harness.tracker.poll_marked(None, running=(), answering=())
+    page = await harness.tracker.poll_marked(None, running=(), answering=())
     assert [n.issue for n in page.notices] == [issue]
 
 

@@ -12,7 +12,7 @@ async def test_an_actor_without_authority_may_not_start(harness: AdapterHarness)
     issue = harness.seed_issue("Ticket", "Do the thing.")
     harness.apply_label(issue, harness.outsider)
 
-    page = await harness.tracker.poll_marked(None, running=())
+    page = await harness.tracker.poll_marked(None, running=(), answering=())
     (notice,) = [n for n in page.notices if n.issue == issue]
     assert notice.actor == harness.outsider
     assert await harness.tracker.marking_actor(issue, harness.label) == harness.outsider

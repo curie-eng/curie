@@ -557,7 +557,7 @@ class BitbucketPair:
         agent_id = _agent_id()
 
         async def go() -> uuid.UUID | None:
-            page = await self.tracker.poll_marked(self.cursor, running=())
+            page = await self.tracker.poll_marked(self.cursor, running=(), answering=())
             notices = [n for n in page.notices if n.disposition is Disposition.ADMIT]
             assert len(notices) == 1, page
             notice = notices[0]
@@ -595,7 +595,7 @@ class BitbucketPair:
         self.tracker.remove_label(self.issue, self.tracker.label, actor)
 
         async def go() -> list[Any]:
-            page = await self.tracker.poll_marked(self.cursor, running=running)
+            page = await self.tracker.poll_marked(self.cursor, running=running, answering=())
             self.cursor = page.cursor
             cancels = [n for n in page.notices if n.disposition is Disposition.CANCEL]
             for notice in cancels:

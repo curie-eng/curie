@@ -417,9 +417,7 @@ async def _hold(
         else _HOLD_BODY
     )
     try:
-        await tracker.marked_comments.upsert_marked(
-            ReplyTarget.on_issue(issue), HOLD_MARKER, body
-        )
+        await tracker.marked_comments.upsert_marked(ReplyTarget.on_issue(issue), HOLD_MARKER, body)
     except ForgeError as failed:
         # The retained cursor is the retry authority; the hold is a courtesy.
         logger.info(
@@ -447,7 +445,7 @@ async def _poll_label(
     key = f"marked:{label}"
     stored = await _load_cursor(sessionmaker, scope, key)
     try:
-        page = await tracker.poll_marked(stored, running=tuple(running))
+        page = await tracker.poll_marked(stored, running=tuple(running), answering=())
     except _DEFERRED as exc:
         _deferred(scope, label, "poll", exc)
         return False
@@ -489,7 +487,7 @@ async def _sweep_label(
     """
 
     try:
-        page = await tracker.poll_marked(None, running=())
+        page = await tracker.poll_marked(None, running=(), answering=())
     except _DEFERRED as exc:
         _deferred(scope, label, "sweep", exc)
         return

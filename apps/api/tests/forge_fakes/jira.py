@@ -501,6 +501,15 @@ class JiraFake:
         issue.updated_ms = max(issue.updated_ms, stamp)
         return str(comment.id)
 
+    def delete_comment(self, comment_id: str | int) -> None:
+        """A person deletes the comment; it is gone from every listing and read.
+
+        https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/#api-rest-api-3-issue-issueidorkey-comment-id-delete
+        """
+
+        comment = self.comment(comment_id)
+        self.issues[comment.issue_id].comments.remove(comment)
+
     def move_issue(self, ref: TrackerIssueRef | int, new_key: str) -> None:
         """Move the issue to another project: a new key, the same id."""
 

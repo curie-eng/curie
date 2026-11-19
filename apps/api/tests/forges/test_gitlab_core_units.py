@@ -10,6 +10,11 @@ GitHub (or Jira) answer that must keep holding.
    follow-up; GitHub and Jira keep their prefixes.
 3. The worker's publication snapshot (`schemas.publications.PublicationCreate`)
    accepts a nested GitLab project path and still refuses a malformed one.
+4. The tracker's answers (#5789 decisions 1 to 3 and 6): on an ``answering``
+   issue every note by a person is a `Disposition.ANSWER` notice, mention or
+   not; elsewhere a plain note is nothing; a system note, the token's own note
+   and a bot's note never are; an answer is current only while its note stands
+   on the open, labelled issue.
 """
 
 from __future__ import annotations
@@ -23,9 +28,11 @@ from curie_api.factory_reply_target import is_issue_follow_up
 from curie_api.forges import types
 from curie_api.forges.errors import NotFound
 from curie_api.forges.hosts import resolve_stored
-from curie_api.forges.trackers import comment_prefix, mention_objective
-from curie_api.forges.types import RepositoryRef
+from curie_api.forges.trackers import comment_prefix, mention_comment_id, mention_objective
+from curie_api.forges.types import Actor, Disposition, MarkedNotice, NoticePage, RepositoryRef
 from curie_api.schemas.publications import PublicationCreate
+from forge_fakes.contract_harness import OUTSIDER, WRITER
+from forge_fakes.gitlab import BOT, LABEL, GitLabAPI, gitlab_tracker
 from pydantic import ValidationError
 
 GITLAB_HOST = "gitlab.example"
@@ -146,3 +153,128 @@ def test_gitlab_core_a_publication_snapshot_still_accepts_a_github_name() -> Non
         {**_publication("acme-corp/api"), "reply_kind": "github", "reply_channel": "acme-corp/api"}
     )
     assert created.repo_full_name == "acme-corp/api"
+
+
+# 4. Answers -------------------------------------------------------------------------------
+#
+# https://docs.gitlab.com/api/notes/#list-project-issue-notes: a note carries
+# ``system`` (true for a note GitLab writes about a change) and its ``author``;
+# a project or group access token's user is ``bot: true`` on
+# https://docs.gitlab.com/api/users/#get-a-single-user.
+
+# A project access token's user: GitLab marks it ``bot: true``.
+TOKEN_BOT = Actor(id="950", login="project_4242_bot_0a1b2c")
+
+
+def _gitlab() -> GitLabAPI:
+    fake = GitLabAPI()
+    for actor in (WRITER, OUTSIDER):
+        fake.add_user(actor)
+        fake.set_member(actor, 30)
+    fake.add_user(TOKEN_BOT, bot=True)
+    fake.set_member(TOKEN_BOT, 30)
+    return fake
+
+
+def _answers(page: NoticePage) -> list[MarkedNotice]:
+    return [n for n in page.notices if n.disposition is Disposition.ANSWER]
+
+
+def _labelled(fake: GitLabAPI, title: str) -> int:
+    iid = fake.add_issue(title, author=WRITER)
+    fake.label(iid, LABEL, WRITER)
+    return iid
+
+
+def test_gitlab_core_answer_a_plain_note_on_an_answering_issue_is_an_answer() -> None:
+    async def scenario() -> None:
+        fake = _gitlab()
+        tracker = gitlab_tracker(fake)
+        asked, quiet = _labelled(fake, "Asked"), _labelled(fake, "Not asked")
+        start = await tracker.poll_marked(None, running=(), answering=())
+        note = fake.issue_note(asked, OUTSIDER, "Use the blue one.")
+        fake.issue_note(quiet, OUTSIDER, "A plain note elsewhere.")
+        mention = fake.issue_note(asked, WRITER, f"@{BOT.login} the blue one, please")
+
+        page = await tracker.poll_marked(
+            start.cursor, running=(), answering=(fake.issue_ref(asked),)
+        )
+
+        assert [(n.issue, n.event_id, n.actor, n.marker) for n in page.notices] == [
+            (fake.issue_ref(asked), f"note:{note}", OUTSIDER, LABEL),
+            (fake.issue_ref(asked), f"note:{mention}", WRITER, LABEL),
+        ]
+        assert all(n.disposition is Disposition.ANSWER for n in page.notices)
+        first = page.notices[0]
+        assert first.occurred_at == fake.notes[note].created_at
+        assert mention_comment_id(types.GITLAB, first.event_id) == str(note)
+        assert await tracker.verify_current(first) is True
+        again = await tracker.poll_marked(
+            page.cursor, running=(), answering=(fake.issue_ref(asked),)
+        )
+        assert again.notices == ()
+
+    asyncio.run(scenario())
+
+
+def test_gitlab_core_answer_a_plain_note_on_a_non_answering_issue_is_nothing() -> None:
+    async def scenario() -> None:
+        fake = _gitlab()
+        tracker = gitlab_tracker(fake)
+        iid = _labelled(fake, "Ticket")
+        start = await tracker.poll_marked(None, running=(), answering=())
+        fake.issue_note(iid, OUTSIDER, "Use the blue one.")
+        mention = fake.issue_note(iid, WRITER, f"@{BOT.login} please look")
+
+        page = await tracker.poll_marked(start.cursor, running=(), answering=())
+
+        assert [(n.event_id, n.disposition) for n in page.notices] == [
+            (f"note:{mention}", Disposition.MENTION)
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_gitlab_core_answer_system_own_and_bot_notes_are_never_answers() -> None:
+    async def scenario() -> None:
+        fake = _gitlab()
+        tracker = gitlab_tracker(fake)
+        iid = _labelled(fake, "Ticket")
+        start = await tracker.poll_marked(None, running=(), answering=())
+        fake.issue_note(iid, WRITER, "changed the description", system=True)
+        fake.issue_note(iid, BOT, "Status: WORKING")
+        fake.issue_note(iid, TOKEN_BOT, "A token says hello.")
+        person = fake.issue_note(iid, OUTSIDER, "Use the blue one.")
+
+        page = await tracker.poll_marked(start.cursor, running=(), answering=(fake.issue_ref(iid),))
+
+        assert [(n.event_id, n.actor) for n in _answers(page)] == [(f"note:{person}", OUTSIDER)]
+        assert len(page.notices) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["closed", "unlabelled", "note_deleted"])
+def test_gitlab_core_answer_is_current_only_while_open_labelled_and_standing(
+    change: str,
+) -> None:
+    async def scenario() -> None:
+        fake = _gitlab()
+        tracker = gitlab_tracker(fake)
+        iid = _labelled(fake, "Ticket")
+        start = await tracker.poll_marked(None, running=(), answering=())
+        note = fake.issue_note(iid, OUTSIDER, "Use the blue one.")
+        page = await tracker.poll_marked(start.cursor, running=(), answering=(fake.issue_ref(iid),))
+        (answer,) = _answers(page)
+        assert await tracker.verify_current(answer) is True
+
+        if change == "closed":
+            fake.set_issue_state(iid, "closed", WRITER)
+        elif change == "unlabelled":
+            fake.label(iid, LABEL, WRITER, add=False)
+        else:
+            fake.delete_note(note)
+
+        assert await tracker.verify_current(answer) is False
+
+    asyncio.run(scenario())

@@ -136,6 +136,9 @@ class BitbucketDcHarness:
     def close_pull_request(self, pull_request: PullRequestRef, *, merged: bool) -> None:
         self.fake.set_state(int(pull_request.number), "MERGED" if merged else "DECLINED")
 
+    def add_comment(self, issue: TrackerIssueRef, actor: Actor, body: str) -> str:
+        return self._tracker.comment(issue, actor, body)
+
     def add_foreign_comment(
         self, target: ReplyTarget, author: Actor, marker: str, body: str
     ) -> None:
