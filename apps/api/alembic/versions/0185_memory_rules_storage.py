@@ -117,6 +117,7 @@ def upgrade() -> None:
             ["source_lineage_id"],
             [f"{S}.thread_publication_lineages.id"],
             name=f"{RULES}_source_lineage_fkey",
+            ondelete="SET NULL",
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id", "accepted_by"],

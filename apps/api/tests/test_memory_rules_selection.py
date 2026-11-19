@@ -262,3 +262,53 @@ def test_deleting_an_agent_removes_its_rules_even_when_a_candidate_names_a_reque
     assert survivors == []
     assert pe.rows("SELECT id FROM curie.agents WHERE id = :id", {"id": agent}) == []
     assert pe.rows("SELECT id FROM curie.memory_rule_events") == []
+
+
+def test_deleting_an_agent_removes_a_promoted_rule_linked_to_a_publication_lineage(
+    clean_db: None,
+) -> None:
+    # A deployment's delete cascades to its lineage before the agent's own cascade
+    # can remove the rule, so the lineage link must not block that delete.
+    agent, person = _agent(), _principal()
+    version, deployment, lineage = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    pe.rows(
+        "INSERT INTO curie.agent_versions (id, agent_id, version_label, created_by) "
+        "VALUES (:id, :agent, 'v1', 'fixture')",
+        {"id": version, "agent": agent},
+    )
+    pe.rows(
+        "INSERT INTO curie.deployments (id, agent_id, version_id, environment, status) "
+        "VALUES (:id, :agent, :version, CAST('dev' AS curie.environment), 'active')",
+        {"id": deployment, "agent": agent, "version": version},
+    )
+    pe.rows(
+        "INSERT INTO curie.thread_publication_lineages "
+        "(id, agent_id, deployment_id, conversation_id, repo_full_name, base_sha, branch) "
+        "VALUES (:id, :agent, :deployment, 'selection-lineage', 'acme-corp/acme-bot', "
+        ":sha, :branch)",
+        {
+            "id": lineage,
+            "agent": agent,
+            "deployment": deployment,
+            "sha": "a" * 40,
+            "branch": f"curie/publication-{lineage.hex}",
+        },
+    )
+    request = _work_item_request(agent)
+    rule = _accepted(agent, person, 1, "Promoted rule.", source_lineage_id=lineage)
+    _rule(
+        agent,
+        None,
+        "hidden candidate",
+        state="candidate",
+        source_request_id=request,
+        source_lineage_id=lineage,
+    )
+
+    async def run(session: AsyncSession) -> None:
+        await delete_agent(session, agent)
+
+    pe.with_session(run)
+
+    assert pe.rows("SELECT id FROM curie.memory_rules WHERE id = :id", {"id": rule}) == []
+    assert pe.rows("SELECT id FROM curie.agents WHERE id = :id", {"id": agent}) == []

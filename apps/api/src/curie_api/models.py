@@ -1426,7 +1426,9 @@ class MemoryRule(Base):
     source_turn: Mapped[str | None] = mapped_column(Text, default=None)
     source_lineage_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey(
-            f"{SCHEMA}.thread_publication_lineages.id", name="memory_rules_source_lineage_fkey"
+            f"{SCHEMA}.thread_publication_lineages.id",
+            name="memory_rules_source_lineage_fkey",
+            ondelete="SET NULL",
         ),
         default=None,
     )

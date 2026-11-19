@@ -539,7 +539,8 @@ def test_the_candidate_trigger_goes_with_the_downgrade(
         return int(
             sql_rows(
                 "SELECT count(*) FROM pg_trigger "
-                "WHERE tgname = 'memory_rules_drop_request_candidates'"
+                "WHERE tgrelid = 'curie.execution_requests'::regclass "
+                "AND tgname = 'memory_rules_drop_request_candidates'"
             )[0][0]
         )
 
@@ -547,7 +548,8 @@ def test_the_candidate_trigger_goes_with_the_downgrade(
     command.downgrade(alembic_config(), "-1")
     assert triggers() == 0
     assert not sql_rows(
-        "SELECT 1 FROM pg_proc WHERE proname = 'memory_rules_drop_request_candidates'"
+        "SELECT 1 FROM pg_proc WHERE pronamespace = 'curie'::regnamespace "
+        "AND proname = 'memory_rules_drop_request_candidates'"
     )
 
 
