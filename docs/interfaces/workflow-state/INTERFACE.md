@@ -58,6 +58,22 @@ Each of those six has a binding-scoped twin on
 - `append_state_for_binding` (`apps/api/src/curie_api/routers/state.py::append_state_for_binding`)
 - `list_namespaces_for_binding` (`apps/api/src/curie_api/routers/state.py::list_namespaces_for_binding`)
 
+The `{address}` segment carries the address with only `%` and `/` escaped (`%` as
+`%25` first, then `/` as `%2F`), encoded once more as a path segment, and each route
+decodes the segment once more
+(`apps/api/src/curie_api/routers/state.py::_binding_address`). The callers are
+`apps/worker/src/curie_worker/binding.py::binding_state_path` and
+`cli/src/api.rs` (its `binding_address_segment` function). The server decodes the request path before
+it routes, so an address encoded only once loses its escapes there, and one holding a
+`/`, such as a GitHub `owner/name`, splits into two segments.
+
+An address holding neither `%` nor `/` (a Slack channel, a mail address) is the same
+on the wire as before this encoding, and the extra decode leaves it unchanged, so it
+works across any mix of API, worker and CLI versions. An address holding a `/` never
+reached an API without the extra decode. Only an address holding a literal `%` reads
+differently across versions, in both directions. Upgrade the API before the workers
+and CLIs that call it.
+
 Identity is `(agent_id, binding_scope, namespace, key)` with
 `postgresql_nulls_not_distinct=True`
 (`apps/api/src/curie_api/models.py::WorkflowStateEntry`). A NULL `binding_scope` is

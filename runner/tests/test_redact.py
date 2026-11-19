@@ -77,7 +77,7 @@ FAKE_SECRET_ASSIGNMENT = "secret=" + "0000FAKEFAKEFAKEVALUE"
 FAKE_JSON_FIELD_SECRET = "0000FAKEJSONFIELDSECRET"
 FAKE_DICT_FIELD_SECRET = "0000FAKEDICTFIELDSECRET"
 FAKE_COLON_FIELD_SECRET = "0000FAKECOLONFIELDSECRET"
-FAKE_HOME_PATH = "/home/theconnman/.config/curie/settings.json"
+FAKE_HOME_PATH = "/home/example-user/.config/curie/settings.json"
 FAKE_CHANNEL_TOKEN = "chn." + "ZXhhbXBsZWNoYW5uZWxwYXlsb2Fk." + "FAKEFAKEFAKESIG0000"
 # The local token minters use base64url payload and signature segments.
 # See curie_internal.sandbox_token.mint and curie_worker.caller_token.mint.
@@ -592,6 +592,64 @@ def test_boot_http_scrubs_held_secrets_from_replies_and_tool_results(
     assert frames[-1]["status"] == "done"
     assert frames[-1]["input_tokens"] == 20
     assert frames[-1]["output_tokens"] == 8
+
+
+@pytest.mark.parametrize("source", ["process", "sdk"])
+def test_boot_http_redacts_upload_file_tokens_from_tool_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    tokens = {
+        "reviewer": "ccu.FAKEUPLOADPAYLOAD0000.FAKESIGNATURE0000",
+        "uploads": "ccu.SECONDUPLOADPAYLOAD0000.FAKESIGNATURE0000",
+    }
+    path = tmp_path / "upload-tokens.json"
+    path.write_text(json.dumps(tokens))
+    path.chmod(0o400)
+    env = {"CURIE_CONNECTOR_UPLOAD_TOKENS_FILE": str(path)}
+    if source == "process":
+        monkeypatch.setenv("CURIE_CONNECTOR_UPLOAD_TOKENS_FILE", str(path))
+    runner = _boot_reply_runner(
+        tmp_path,
+        monkeypatch,
+        _reply_script(
+            "Upload complete.",
+            {
+                "bearers": list(tokens.values()),
+                "count": 2,
+                "cat": path.read_text(),
+                "header": f"Bearer {tokens['reviewer']}",
+            },
+        ),
+        sdk_env=env if source == "sdk" else None,
+    )
+    raw, frames = _http_reply(runner)
+    assert all(token not in raw for token in tokens.values())
+    result = next(frame["result"] for frame in frames if frame.get("result") is not None)
+    assert result == {
+        "bearers": ["[REDACTED:held_secret]", "[REDACTED:held_secret]"],
+        "count": 2,
+        "cat": json.dumps(dict.fromkeys(tokens, "[REDACTED:held_secret]")),
+        "header": "Bearer [REDACTED:held_secret]",
+    }
+    assert frames[-1]["status"] == "done"
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing", "directory", "malformed", "nonmap", "nonstring", "unicode"]
+)
+def test_boot_refuses_an_unreadable_or_invalid_upload_token_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    path = tmp_path / "upload-tokens.json"
+    if failure == "directory":
+        path.mkdir()
+    elif failure == "unicode":
+        path.write_bytes(b"\xff")
+    elif failure != "missing":
+        path.write_text({"malformed": "{", "nonmap": "[]", "nonstring": '{"reviewer": 3}'}[failure])
+    monkeypatch.setenv("CURIE_CONNECTOR_UPLOAD_TOKENS_FILE", str(path))
+    with pytest.raises(ValueError, match="CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"):
+        _boot_reply_runner(tmp_path, monkeypatch, _reply_script("must not start"))
 
 
 @pytest.mark.parametrize("source", ["process", "sdk"])

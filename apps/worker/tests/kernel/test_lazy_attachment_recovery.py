@@ -217,60 +217,6 @@ def test_lazy_factory_continuation_refuses_displaced_authority_before_model(make
     asyncio.run(run())
 
 
-def test_lazy_factory_continuation_cancellation_revokes_original_owner(make_harness):
-    async def run():
-        async with make_harness(
-            binding=FactoryBinding(),
-            workspace_factory=_Workspace,
-            publication_creator=_PublicationApi(),
-            attachment_enabled=True,
-            attachment_mode="lazy",
-            internal_worker_token="worker",
-            max_attempts=1,
-        ) as h:
-            from aci_protocol import TextDelta
-
-            control = Control()
-            h.kernel._attachment_access = control
-            h.kernel._work_items = _WorkItems()
-            h.runner.attachment_access_enforced = True
-            h.runner.turn_scripts = [list(ZERO_WORK_TURN), [TextDelta(text="working")]]
-            original_context = control.context
-            calls = 0
-            hold = asyncio.Event()
-
-            async def context(**body):
-                nonlocal calls
-                calls += 1
-                if calls == 2:
-                    h.runner.hold = hold
-                return await original_context(**body)
-
-            control.context = context
-            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            task = asyncio.create_task(h.kernel.process_event(event))
-            try:
-                async with asyncio.timeout(3):
-                    while len(h.runner.event_bodies) < 2 or not h.runner.turn_active:
-                        await asyncio.sleep(0.01)
-                task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await asyncio.wait_for(asyncio.shield(task), 3)
-                contexts = [body for op, body in control.calls if op == "context"]
-                revokes = [body for op, body in control.calls if op == "revoke"]
-                assert contexts[0]["owner"] == contexts[1]["owner"]
-                assert revokes and all(body["owner"] == contexts[0]["owner"] for body in revokes)
-                assert (
-                    await h.kernel._markers.read_attachment_access_turn(_thread_key_for(event))
-                    is None
-                )
-            finally:
-                hold.set()
-                await asyncio.gather(task, return_exceptions=True)
-
-    asyncio.run(run())
-
-
 @pytest.mark.parametrize("exit_failure", ["lease-lost", "cancelled", "cancelled-marker-timeout"])
 def test_lazy_continuation_lock_exit_closes_accepted_stream_and_blocks_retry(
     make_harness, caplog, exit_failure

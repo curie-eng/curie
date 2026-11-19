@@ -83,7 +83,7 @@ generic endpoints as a plugin API:
   settling it would drop real traffic for good. The code is frozen in
   `tests/vectors/channel-port-refusal.json`. An adapter that retries every error
   retries the refusal forever;
-  `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.post_turn`
+  `packages/channel-gateway/src/curie_channel_gateway/mail/adapter.py::MailAdapter.post_turn`
   is the worked example of settling on the code and only on it.
   The [common API admission extraction contract](../../superpowers/specs/2026-10-23-common-admission-extraction.md)
   preserves this marker and pre-claim refusal boundary while sharing the existing
@@ -200,7 +200,7 @@ service is material:
   re-sent reply content to the default transport. `HttpReplyAdapter` now uses a
   per-adapter secret selected by the route's `adapter` slug, with no transport
   fallback; `SlackReplyAdapter`
-  (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) refuses an
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/slack_sink.py::SlackReplyAdapter`) refuses an
   endpoint outside the worker's configured trusted Slack origin rather than
   handing it the platform bot token.
 - **Fixed (#1459, ADR-0096) — authenticated ingress and the binding surface.**

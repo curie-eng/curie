@@ -2,7 +2,9 @@
 
 Resume contexts and exact approval grants share the same boundary.
 @spec HTTP-APPROVAL-CONTINUITY-12. The worker asks its per-identity binding
-classification here too. @spec HTTP-INVOCATION-EXECUTION-22.
+classification here too. @spec HTTP-INVOCATION-EXECUTION-22. The current check
+answers version 2 with the verified requester only for a continue on an
+opted-in agent. @spec CONNECTOR-REQUESTER-1.
 """
 
 import uuid
@@ -18,6 +20,7 @@ from curie_internal.identity_authority import (
     BindingClassificationResponseV1,
     TurnAuthorityRequestV1,
     TurnAuthorityResponseV1,
+    TurnAuthorityResponseV2,
 )
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -89,11 +92,11 @@ router = APIRouter(
 )
 
 
-@router.post("/check", response_model=TurnAuthorityResponseV1)
+@router.post("/check", response_model=TurnAuthorityResponseV1 | TurnAuthorityResponseV2)
 async def check_turn_authority(
     request: Request, body: TurnAuthorityRequestV1,
-) -> TurnAuthorityResponseV1:
-    """@spec HTTP-INVOCATION-EXECUTION-8/16."""
+) -> TurnAuthorityResponseV1 | TurnAuthorityResponseV2:
+    """@spec HTTP-INVOCATION-EXECUTION-8/16 CONNECTOR-REQUESTER-1."""
     return await check_current_turn_authority(request, body)
 
 

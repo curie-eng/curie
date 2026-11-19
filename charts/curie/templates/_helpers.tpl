@@ -176,14 +176,14 @@ affinity:
      define's body and fails CI if the two lists drift.
 
      IMPORTANT: the pin scans this body for env-name-shaped uppercase tokens, so
-     the body must contain EXACTLY these eight keys and no other stray ones (this
+     the body must contain EXACTLY the enumerated keys and no other stray ones (this
      comment lives OUTSIDE the define so it is never scanned): the four runner
-     credential keys plus the four redirect/capture-capable keys (#487). The whole
+     credential keys plus the transport-control keys. The whole
      CURIE_ namespace is fenced separately by the hasPrefix rule in the
      connector-secret guard, so it is intentionally absent here. Emitted
      space-separated for consumption via `splitList " "`. */}}
 {{- define "curie.reservedConnectorSecretNames" -}}
-ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS ANTHROPIC_CUSTOM_HEADERS
+ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY ALL_PROXY SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED NODE_OPTIONS ANTHROPIC_CUSTOM_HEADERS https_proxy http_proxy all_proxy ssl_cert_file ssl_cert_dir node_extra_ca_certs node_tls_reject_unauthorized node_options anthropic_custom_headers
 {{- end -}}
 
 {{/* @spec ACTION-EXECUTOR-16: the reserved snapshot sealing key names. The
@@ -611,7 +611,7 @@ http
 {{- if hasKey .Values.otelCollector "extraTracePipelineProcessors" -}}
 {{- $traceProcessors = get .Values.otelCollector "extraTracePipelineProcessors" -}}
 {{- end -}}
-{{- $builtInProcessors := dict "memory_limiter" true "batch" true "transform/runner_identity" true -}}
+{{- $builtInProcessors := dict "memory_limiter" true "batch" true "transform/runner_identity" true "filter/langfuse_platform_noise" true -}}
 {{- $componentIDPattern := "^[a-z][a-z0-9_]*(/[A-Za-z0-9_-]+)?$" -}}
 {{- if not (kindIs "map" $extraProcessors) -}}
 {{- fail "otelCollector.extraProcessors must be a map of Collector processor IDs to configuration maps." -}}
@@ -669,6 +669,15 @@ http
 {{- if and $eventsEnabled (not $debugEnabled) (eq (len .Values.otelCollector.extraLogPipelineExporters) 0) -}}
 {{- fail "otelCollector.kubernetesEvents.enabled routes Kubernetes Events into the logs pipeline, which exports only to nop by default. Set otelCollector.extraLogPipelineExporters to a durable log exporter (or enable debugExporter) so the events are recorded." -}}
 {{- end -}}
+{{- /* traces/langfuse always exports the filtered stream to Langfuse. The
+     unfiltered traces pipeline exists only for debug and extra trace exporters,
+     which still want platform spans (#5496). */ -}}
+{{- $extraTraceExporters := .Values.otelCollector.extraPipelineExporters | default list -}}
+{{- $unfilteredTraceExporters := list -}}
+{{- if $debugEnabled -}}
+{{- $unfilteredTraceExporters = append $unfilteredTraceExporters "debug" -}}
+{{- end -}}
+{{- $unfilteredTraceExporters = concat $unfilteredTraceExporters $extraTraceExporters -}}
 {{- /* @spec charts/curie/README.md: Collector exporters without exporterhelper.
      Keep each exemption explicit, documented, and attached to a configured exporter. */ -}}
 {{- $noHelper := .Values.otelCollector.exportersWithoutExporterHelper | default dict -}}
@@ -741,9 +750,12 @@ http
 {{- end -}}
 {{- end -}}
 # Receives OTLP traces, logs, and metrics over gRPC (4317) and HTTP (4318).
-# Traces go to Langfuse over HTTP; logs and metrics retain explicit nop defaults
-# until #1765 supplies their backends. Langfuse OTLP ingest is HTTP-only (gRPC
-# is silently unsupported), so the collector adapts trace traffic to otlphttp.
+# traces/langfuse drops platform noise and exports only to Langfuse over HTTP.
+# The traces pipeline, when debug or an extra trace exporter is configured,
+# keeps those spans for that backend. Logs and metrics retain explicit nop
+# defaults until #1765 supplies their backends. Langfuse OTLP ingest is
+# HTTP-only (gRPC is silently unsupported), so the collector adapts trace
+# traffic to otlphttp.
 receivers:
   otlp:
     protocols:
@@ -768,6 +780,30 @@ processors:
     limit_percentage: {{ .Values.otelCollector.memoryLimiter.limitPercentage }}
     spike_limit_percentage: {{ .Values.otelCollector.memoryLimiter.spikeLimitPercentage }}
   batch: {}
+  filter/langfuse_platform_noise:
+    error_mode: ignore
+    traces:
+      span:
+        - >-
+          name == "http.server.request" and
+          attributes["service.name"] == "curie-api" and
+          attributes["curie.source"] == "GET" and
+          (attributes["curie.operation"] == "/health" or
+          attributes["curie.operation"] == "/ready" or
+          attributes["curie.operation"] == "/agents" or
+          attributes["curie.operation"] == "/agents/{agent_id}" or
+          attributes["curie.operation"] == "/approvals" or
+          attributes["curie.operation"] == "/approvals/{approval_id}" or
+          attributes["curie.operation"] == "/approvals/{approval_id}/audit" or
+          attributes["curie.operation"] == "/langfuse/traces" or
+          attributes["curie.operation"] == "/langfuse/traces/{trace_id}" or
+          attributes["curie.operation"] == "/observability/metrics/summary" or
+          attributes["curie.operation"] == "/observability/metrics/series" or
+          attributes["curie.operation"] == "/observability/runners" or
+          attributes["curie.operation"] == "/cluster-message-replies/{reply_ref}" or
+          attributes["curie.operation"] == "/v1/internal/work-items/runtime-owners")
+        - 'IsMatch(name, "^curie\\.background\\.")'
+        - 'name == "curie.sandbox.cleanup"'
   transform/runner_identity:
     error_mode: ignore
     metric_statements:
@@ -821,10 +857,16 @@ service:
       level: normal
       address: 0.0.0.0:{{ .Values.otelCollector.service.metricsPort }}
   pipelines:
+    traces/langfuse:
+      receivers: [otlp]
+      processors: [memory_limiter{{- range $traceProcessors }}, {{ . }}{{- end }}, filter/langfuse_platform_noise, batch]
+      exporters: [otlphttp/langfuse]
+{{- if $unfilteredTraceExporters }}
     traces:
       receivers: [otlp]
       processors: [memory_limiter{{- range $traceProcessors }}, {{ . }}{{- end }}, batch]
-      exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
+      exporters: [{{ join ", " $unfilteredTraceExporters }}]
+{{- end }}
     logs:
       receivers: [otlp{{- if $eventsEnabled }}, k8sobjects/events{{- end }}]
       processors: [memory_limiter, batch]
@@ -1223,6 +1265,12 @@ credentials and the derived collector header cannot disagree. */}}
 {{- $langfuseInitProjectSecretKey := include "curie.managedSecret" (dict "root" . "key" "langfuseInitProjectSecretKey" "value" .Values.langfuse.init.projectSecretKey "default" "sk-lf-curie-dev" "hex" false "existingData" $existingSecretData) -}}
 {{- $langfuseInitUserPassword := include "curie.managedSecret" (dict "root" . "key" "langfuseInitUserPassword" "value" .Values.langfuse.init.userPassword "default" "curie-dev-password" "hex" false "existingData" $existingSecretData) -}}
 {{- $content := dict -}}
+{{- $gateway := .Values.channelGateway | default dict -}}
+{{- range $caller := list "api" "worker" -}}
+{{- $key := printf "channelGateway%sToken" (title $caller) -}}
+{{- $_ := set $content $key (include "curie.managedSecret" (dict "root" $ "key" $key "value" (index $gateway (printf "%sToken" $caller)) "default" (printf "curie-dev-gateway-%s" $caller) "hex" false "existingData" $existingSecretData)) -}}
+{{- end -}}
+
 {{- $_ := set $content "installationId" ((include "curie.installationId" .) | toString) -}}
 {{- $_ := set $content "postgresPassword" ((include "curie.managedSecret" (dict "root" . "key" "postgresPassword" "value" .Values.postgres.auth.password "default" "postgres" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "valkeyPassword" ((include "curie.managedSecret" (dict "root" . "key" "valkeyPassword" "value" .Values.valkey.password "default" "valkeypass" "hex" false "existingData" $existingSecretData)) | toString) -}}

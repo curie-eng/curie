@@ -534,7 +534,7 @@ egress() {
   render "$@" | python3 "$EGRESS_CHECK" "$label" "$spec" "$BUILTIN"
 }
 
-# Publication without the factory still targets the install's GitHub (remote-dev).
+# Publication without the factory still targets the install's GitHub.
 egress "no factory block" '{"publication": "builtin"}'
 egress "factory key absent (--reuse-values)" '{"publication": "builtin"}' --set-json 'factory=null'
 # A github code host with no egress gets the built-in set; the tracker too.

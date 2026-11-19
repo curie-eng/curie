@@ -100,7 +100,7 @@ def test_undeclared_producer_is_rejected(tmp_path: Path, relative: str, source: 
 
 
 def test_duplicate_producer_in_an_inventoried_scope_is_rejected(tmp_path: Path) -> None:
-    relative = "apps/dispatcher/src/curie_dispatcher/queue.py"
+    relative = "packages/curie-internal/src/curie_internal/turn_queue.py"
     source = (ROOT / relative).read_text(encoding="utf-8")
     statement = "            stream_id = redis_client.xadd(config.stream, fields)\n"
     assert source.count(statement) == 1

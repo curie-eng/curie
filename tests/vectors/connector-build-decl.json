@@ -589,6 +589,48 @@
       },
       "expect": "reject",
       "codes": ["connectors.invalid"]
+    },
+    {
+      "name": "a_hosted_connector_may_declare_scratch",
+      "why": "An optional hosted-form field: a bounded writable volume for the server container. A reader that refused it would block a bundle the platform renders.",
+      "document": {
+        "connectors": {
+          "files": {
+            "build": { "context": "connectors/files", "platforms": ["linux/amd64"] },
+            "scratch": { "path": "/scratch", "size_limit": "2Gi" }
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": []
+    },
+    {
+      "name": "an_unknown_scratch_key_is_rejected",
+      "why": "The scratch block is strict like the rest of connectors.yaml: an unsupported key (here a memory medium) must be refused, not silently rendered as a disk volume.",
+      "document": {
+        "connectors": {
+          "files": {
+            "image": "ghcr.io/example/files-mcp:1",
+            "scratch": { "path": "/scratch", "size_limit": "2Gi", "medium": "Memory" }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.invalid"]
+    },
+    {
+      "name": "a_scratch_without_a_size_limit_is_rejected",
+      "why": "Both scratch keys are required: an unbounded scratch volume could fill the node's disk.",
+      "document": {
+        "connectors": {
+          "files": {
+            "image": "ghcr.io/example/files-mcp:1",
+            "scratch": { "path": "/scratch" }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.invalid"]
     }
   ]
 }

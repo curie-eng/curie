@@ -54,7 +54,7 @@ An adapter for a surface must meet three requirements:
 
 Slack is the first adapter:
 - Bolt's `IgnoringSelfEvents` drops a bot's own posts
-  (`apps/dispatcher/src/curie_dispatcher/relevance.py:20`, `next` at
+  (`packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py:20`, `next` at
   `ad0bc067`).
 - A bot-authored mention is refused only inside a thread without an
   operator-listed pair (`relevance.py:217-228`), so a root mention needs no

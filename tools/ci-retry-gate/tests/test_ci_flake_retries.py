@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import textwrap
@@ -48,6 +49,160 @@ REQUIRED_ACTIONS = frozenset(
 MIRROR_HOST = "mirror.gcr.io"
 BACKOFF_PREFIX = "Back off before retrying "
 RETRY_SUFFIX = " (retry)"
+
+DIAGNOSTIC_UPLOADS = {
+    "Upload pytest durations",
+    "Upload the OIDC evidence",
+    "Upload the admitted agent failure digests",
+    "Retain safe namespace cleanup evidence",
+    "Upload upgrade matrix evidence",
+    "Upload scripted factory evidence",
+}
+
+
+def test_only_diagnostic_upload_failures_are_nonfatal() -> None:
+    # GitHub documents step continue-on-error as permitting a failed step:
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+    seen = set()
+    for _job, steps in _jobs("ci.yaml"):
+        for step in steps:
+            if _action(step) != "actions/upload-artifact":
+                continue
+            name = step.get("name")
+            if name in DIAGNOSTIC_UPLOADS:
+                assert step.get("continue-on-error") is True, name
+                seen.add(name)
+            else:
+                assert not step.get("continue-on-error"), name
+    assert seen == DIAGNOSTIC_UPLOADS
+
+
+@pytest.mark.parametrize("name", ["Upload curie binary", "Upload runtime assertion receipts"])
+def test_gate_refuses_to_ignore_a_required_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    document = _load("ci.yaml")
+    for job in document["jobs"].values():
+        for step in job.get("steps", []):
+            if step.get("name") == name:
+                step["continue-on-error"] = True
+    (tmp_path / "ci.yaml").write_text(yaml.safe_dump(document))
+    monkeypatch.setitem(globals(), "WORKFLOWS", tmp_path)
+    with pytest.raises(AssertionError, match=name):
+        test_only_diagnostic_upload_failures_are_nonfatal()
+
+
+def _setup_commands(tmp_path: Path, **controls: object) -> tuple[dict[str, str], Path]:
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    state = tmp_path / "commands.json"
+    state.write_text(json.dumps({"calls": [], "creates": 0, "pulls": 0, **controls}))
+    driver = binaries / "driver"
+    driver.write_text(textwrap.dedent("""\
+        #!/usr/bin/env python3
+        import json, os, pathlib, sys
+        state = pathlib.Path(os.environ["SETUP_COMMAND_STATE"])
+        data = json.loads(state.read_text())
+        tool = pathlib.Path(sys.argv[0]).name
+        args = sys.argv[1:]
+        data["calls"].append([tool, *args])
+        status = 0
+        if tool == "kind":
+            if args[:2] == ["get", "clusters"] and data.get("existing"):
+                print("ci-fixture")
+            if args[:2] == ["create", "cluster"]:
+                data["creates"] += 1
+                if data.get("create_failure"):
+                    status = 1
+        elif tool == "kubectl":
+            assert args[:2] == ["--context", "kind-ci-fixture"]
+            if "rollout" in args:
+                mode = data.get("readiness")
+                if mode == "never" or mode == "second" and data["creates"] == 1:
+                    status = 1
+        elif tool == "curl":
+            pathlib.Path(args[args.index("-o") + 1]).write_text("recorded manifest")
+        elif tool == "docker":
+            assert args[0] == "pull"
+            data["pulls"] += 1
+            if data["pulls"] <= data.get("pull_failures", 0):
+                print(data.get("pull_error", "502 Bad Gateway"), file=sys.stderr)
+                status = 1
+        state.write_text(json.dumps(data))
+        sys.exit(status)
+        """))
+    driver.chmod(0o755)
+    for command in ("kind", "kubectl", "curl", "sha256sum", "docker", "sleep"):
+        (binaries / command).symlink_to(driver)
+    return {
+        **os.environ,
+        "PATH": f"{binaries}:{os.environ['PATH']}",
+        "SETUP_COMMAND_STATE": str(state),
+    }, state
+
+
+@pytest.mark.parametrize(
+    ("controls", "status", "creates", "deletes"),
+    [({}, 0, 1, 0), ({"readiness": "second"}, 0, 2, 1),
+     ({"readiness": "never"}, 1, 2, 2), ({"create_failure": True}, 1, 2, 2),
+     ({"existing": True}, 1, 0, 0)],
+)
+def test_kind_setup_has_one_owned_recreate_and_preserves_foreign_clusters(
+    tmp_path: Path, controls: dict[str, object], status: int, creates: int, deletes: int
+) -> None:
+    env, state = _setup_commands(tmp_path, **controls)
+    output = tmp_path / "output"
+    env["GITHUB_OUTPUT"] = str(output)
+    config = tmp_path / "kind.yaml"
+    config.write_text("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n")
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / ".github/scripts/prepare-kind.sh"), "ci-fixture", str(config)],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == status, result.stdout + result.stderr
+    assert (output.read_text() if output.exists() else "") == (
+        "owned_cluster=ci-fixture\n" if status == 0 else ""
+    )
+    observed = json.loads(state.read_text())
+    assert observed["creates"] == creates
+    assert sum(call[:3] == ["kind", "delete", "cluster"] for call in observed["calls"]) == deletes
+    assert all("--name" in call and call[call.index("--name") + 1] == "ci-fixture"
+               for call in observed["calls"] if call[:3] == ["kind", "delete", "cluster"])
+
+
+@pytest.mark.parametrize(
+    ("failures", "error", "status", "pulls"),
+    [(0, "", 0, 1), (2, "502 Bad Gateway", 0, 3),
+     (3, "502 Bad Gateway", 1, 3), (3, "401 Unauthorized", 1, 1)],
+)
+def test_image_pull_retries_only_bounded_gateway_failures(
+    tmp_path: Path, failures: int, error: str, status: int, pulls: int
+) -> None:
+    env, state = _setup_commands(tmp_path, pull_failures=failures, pull_error=error)
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / ".github/scripts/pull-image.sh"), "example.com/acme/image:test"],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == status, result.stdout + result.stderr
+    assert json.loads(state.read_text())["pulls"] == pulls
+
+
+def test_kind_setup_refuses_a_corrupt_manifest_before_creating_a_cluster(tmp_path: Path) -> None:
+    checksum = shutil.which("sha256sum")
+    assert checksum is not None
+    env, state = _setup_commands(tmp_path)
+    executable = tmp_path / "bin/sha256sum"
+    executable.unlink()
+    executable.symlink_to(checksum)
+    config = tmp_path / "kind.yaml"
+    config.write_text("kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n")
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / ".github/scripts/prepare-kind.sh"), "ci-fixture", str(config)],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "FAILED" in result.stdout
+    assert json.loads(state.read_text())["creates"] == 0
 
 
 def _load(name: str) -> dict:

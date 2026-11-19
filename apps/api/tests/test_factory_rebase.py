@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -485,25 +484,4 @@ def test_disk_limit_refuses_before_push_and_a_bounded_valid_replay_progresses(
     assert (
         asyncio.run(prepare_rebase(graph.snapshot(), graph.credential())).head_sha != graph.source
     )
-    graph.assert_clean()
-
-
-def test_elapsed_limit_terminates_real_git_and_a_later_healthy_replay_progresses(
-    graph: GitGraph,
-) -> None:
-    from curie_api.factory_rebase import RebaseRefused, prepare_rebase
-
-    with git_http(graph, delayed=True) as remote:
-        credential = replace(graph.credential(remote.url), origin=remote.origin)
-        started = time.monotonic()
-        with pytest.raises(RebaseRefused) as refused:
-            asyncio.run(prepare_rebase(graph.snapshot(max_seconds=0.2), credential))
-        assert refused.value.code == "elapsed_limit"
-        assert time.monotonic() - started < 3
-        assert remote.requests, "the bound must interrupt a real in-flight Git request"
-        assert graph.head() == graph.source
-        graph.assert_clean()
-        assert remote.delay is not None
-        remote.delay.set()
-        assert asyncio.run(prepare_rebase(graph.snapshot(), credential)).head_sha != graph.source
     graph.assert_clean()

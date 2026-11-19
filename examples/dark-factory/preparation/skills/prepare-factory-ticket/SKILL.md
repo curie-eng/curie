@@ -125,6 +125,15 @@ and explicitly present this boundary for developer approval in the full-spec
 review; approval can cover the whole boundary without another question round.
 Never silently replace a required live outcome with a mocked assertion.
 
+Apply the same review to broad integration or end-to-end checks that need an
+environment the factory cannot use before publication, even when the check is
+scripted and needs no live service. Ask the developer whether a check that can
+run on the resulting PR should be assigned to human evaluation before merge.
+Keep meaningful focused tests of the implementation as factory acceptance;
+record the exact deferred check, owner, PR-head evidence and failure disposition
+in the published issue. Do not label the unavailable check as sandbox-verifiable,
+claim it passed, or silently waive a repository-required merge gate.
+
 A developer-approved external qualification step does not block factory selection
 when the agreed implementation has meaningful automated verification. Block only
 when an unresolved decision or missing capability prevents testing the agreed

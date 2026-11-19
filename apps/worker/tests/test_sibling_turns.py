@@ -18,6 +18,7 @@ import pytest
 import redis
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_channel_gateway.slack.senders import SlackSenderIdentities
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.config import WorkerConfig
 from curie_worker.sibling_turns import (
@@ -26,7 +27,6 @@ from curie_worker.sibling_turns import (
     SIBLING_WINDOW_SECONDS,
     SiblingLimitReason,
     SiblingTurnLimit,
-    SlackSenderIdentities,
     build_sibling_limit,
 )
 from redis.asyncio import Redis as AsyncRedis
@@ -396,9 +396,7 @@ def test_a_stock_install_builds_no_limit() -> None:
                 WorkerConfig(slack_identities=json.dumps(_DECLARED[:1])),
             ]
             for config in stock:
-                built = build_sibling_limit(
-                    config, client, slack_tokens={"default": "xoxb-x"}, channel=lookup
-                )
+                built = build_sibling_limit(config, client, slack=_KnownSenders({}), channel=lookup)
                 assert built is None, config
             assert lookup.calls == []
         finally:
@@ -414,7 +412,7 @@ def test_two_slack_identities_build_a_limit_over_both_tokens() -> None:
             built = build_sibling_limit(
                 WorkerConfig(slack_identities=json.dumps(_DECLARED)),
                 client,
-                slack_tokens={"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN},
+                slack=SlackSenderIdentities({"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN}),
                 channel=_BoundAddresses({}),
             )
             assert built is not None
@@ -435,7 +433,7 @@ def test_two_adapters_build_a_limit_that_reads_bound_addresses() -> None:
             built = build_sibling_limit(
                 WorkerConfig(adapter_credentials={"mail-a": "sa", "mail-b": "sb"}),
                 client,
-                slack_tokens={"default": ""},
+                slack=None,
                 channel=lookup,
             )
             assert built is not None

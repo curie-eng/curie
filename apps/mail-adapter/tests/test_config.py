@@ -14,8 +14,8 @@ import re
 from pathlib import Path
 
 import pytest
-from curie_mail_adapter.config import MailAdapterConfig
-from pydantic import AliasChoices
+from curie_channel_gateway.mail.config import MailAdapterConfig
+from pydantic import AliasChoices, ValidationError
 
 README = Path(__file__).resolve().parent.parent / "README.md"
 
@@ -36,6 +36,10 @@ _OVERRIDES: dict[str, tuple[str, str, object]] = {
     "CURIE_CHANNEL_TOKEN": ("channel_token", "chn-sentinel", "chn-sentinel"),
     "CURIE_EGRESS_SECRET": ("egress_secret", "egress-sentinel", "egress-sentinel"),
     "CURIE_ADAPTER_PRINCIPAL": ("adapter_principal", "adp-sentinel", "adp-sentinel"),
+    "CURIE_MAIL_SELF_ROTATE": ("self_rotate", "true", True),
+    "CURIE_MAIL_CHANNEL_TOKEN_TTL_SECONDS": ("channel_token_ttl_seconds", "120", 120),
+    "CURIE_MAIL_PRINCIPAL_TTL_SECONDS": ("principal_ttl_seconds", "180", 180),
+    "CURIE_MAIL_CHANNEL_ADAPTER": ("channel_adapter", "acme-mail", "acme-mail"),
     "ADAPTER_INGRESS_ENABLED": ("ingress_enabled", "false", False),
     "CURIE_MAIL_POLL_INTERVAL_SECONDS": ("poll_interval_seconds", "12.5", 12.5),
     "CURIE_MAIL_INGRESS_ATTEMPTS": ("ingress_attempts", "7", 7),
@@ -46,6 +50,7 @@ _OVERRIDES: dict[str, tuple[str, str, object]] = {
         "/tmp/sentinel-mail-state.sqlite3",
         "/tmp/sentinel-mail-state.sqlite3",
     ),
+    "CURIE_MAIL_EXCLUSIVE_WAL": ("exclusive_wal", "true", True),
     "CURIE_MAIL_MAX_PENDING_DELIVERIES": ("max_pending_deliveries", "17", 17),
     "CURIE_MAIL_MAX_BODY_BYTES": ("max_body_bytes", "4096", 4096),
     "CURIE_MAIL_MAX_REPLY_BYTES": ("max_reply_bytes", "8192", 8192),
@@ -79,12 +84,17 @@ _DEFAULTS: dict[str, object] = {
     "channel_token": "",
     "egress_secret": "",
     "adapter_principal": "",
+    "self_rotate": False,
+    "channel_token_ttl_seconds": 3600,
+    "principal_ttl_seconds": 86400,
+    "channel_adapter": "",
     "ingress_enabled": True,
     "poll_interval_seconds": 5.0,
     "ingress_attempts": 3,
     "ingress_retry_delay_seconds": 2.0,
     "port": 8080,
     "state_path": "/var/lib/curie-mail/state.sqlite3",
+    "exclusive_wal": False,
     "max_pending_deliveries": 1000,
     "max_body_bytes": 1048576,
     "max_reply_bytes": 1048576,
@@ -216,3 +226,29 @@ def test_the_readme_config_table_matches_the_code() -> None:
         assert documented.intersection(names), f"{name} is read from {names} but undocumented"
 
     assert documented <= readable, f"documented but never read: {sorted(documented - readable)}"
+
+
+@pytest.mark.parametrize(
+    "env_name,field",
+    [
+        ("CURIE_MAIL_CHANNEL_TOKEN_TTL_SECONDS", "channel_token_ttl_seconds"),
+        ("CURIE_MAIL_PRINCIPAL_TTL_SECONDS", "principal_ttl_seconds"),
+    ],
+)
+@pytest.mark.parametrize(
+    "raw,valid", [("0", False), ("1", True), ("604800", True), ("604801", False)]
+)
+def test_rotation_ttls_are_bounded_at_config_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    field: str,
+    raw: str,
+    valid: bool,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv(env_name, raw)
+    if valid:
+        assert getattr(MailAdapterConfig(), field) == int(raw)
+    else:
+        with pytest.raises(ValidationError):
+            MailAdapterConfig()

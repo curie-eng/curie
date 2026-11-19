@@ -172,7 +172,7 @@ the frame stream returned by `apps/worker/src/curie_worker/runner_client.py::Run
 sees only rendered text with the receipt appended. No post-turn callback carries
 the final text. The runner, not the worker, appends the conversation transcript
 (`runner/src/curie_runner/history.py`, addressed by `CURIE_HISTORY_REF`). The one precedent for a structured block in model output is the
-`curie-reply` fence parsed by `apps/worker/src/curie_worker/blocks.py::parse_reply`.
+`curie-reply` fence parsed by `packages/channel-gateway/src/curie_channel_gateway/slack/blocks.py::parse_reply`.
 (Inspected.)
 
 **Read-only turns.** `packages/aci-protocol/src/aci_protocol/events.py::ToolAccess`

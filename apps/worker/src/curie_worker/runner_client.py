@@ -21,11 +21,12 @@ import binascii
 import hashlib
 import json
 import logging
+import ssl
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Literal, TypeVar
+from typing import IO, Any, Literal, TypeVar
 
 import aiohttp
 from aci_protocol import Event, Final, Interrupt, OutboundEvent, parse_ndjson_line
@@ -252,6 +253,10 @@ _CHECKPOINT_BODY_MAX_BYTES = (
 # deadline answer when the caller hands no remaining budget.
 _CHECKPOINT_GRACE_S = 5.0
 
+# The runner's UI evidence index answer (one entry per manifest image) is read
+# bounded to this many bytes.
+UI_EVIDENCE_INDEX_MAX_BYTES = 8 * 1024 * 1024
+
 
 def _checkpoint_bytes(body: dict[str, Any], name: str, cap: int) -> bytes:
     encoded = body[f"{name}_base64"]
@@ -312,6 +317,9 @@ class TurnStream:
         self._response = response
         self.turn_epoch = turn_epoch
         self.verbatim_answer = verbatim_answer
+        # ADR 0270 decision 3: set by the kernel when the requester token
+        # window, not the configured bound, set this stream's deadline.
+        self.requester_window_bound = False
         self._saw_final = False
         # The streaming budget this stream is running under, carried from the
         # client so the stream can NAME the budget it blew (#2011).
@@ -482,9 +490,17 @@ class RunnerClient:
         interrupt_timeout_s: float = _DEFAULT_INTERRUPT_TIMEOUT_S,
         snapshot_patch_max_bytes: int = 900_000,
         session: aiohttp.ClientSession | None = None,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
+        """``ssl_context`` is the trust an ``https`` runner endpoint is verified
+        against (a static-pool shell's CA bundle); certificate and host name
+        are always checked. ``None`` keeps the platform default trust."""
         if snapshot_patch_max_bytes <= 0:
             raise ValueError("snapshot patch byte limit must be positive")
+        if ssl_context is not None and (
+            not ssl_context.check_hostname or ssl_context.verify_mode != ssl.CERT_REQUIRED
+        ):
+            raise ValueError("a runner TLS context must verify the certificate and host name")
         self._total_timeout_s = total_timeout_s
         self._own_session = session is None
         self._connect_timeout_s = connect_timeout_s
@@ -496,7 +512,10 @@ class RunnerClient:
         self._session = session or aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=total_timeout_s, connect=connect_timeout_s, sock_read=total_timeout_s
-            )
+            ),
+            connector=(
+                None if ssl_context is None else aiohttp.TCPConnector(ssl=ssl_context)
+            ),
         )
         # A per-request override, not folded into the session default above: it
         # replaces (not merges with) the session timeout for this one call, so
@@ -876,6 +895,105 @@ class RunnerClient:
                     "/v1/snapshot returned an invalid bounded payload "
                     f"after {len(raw)} bytes: {type(exc).__name__}: {str(exc)[:160]}"
                 ) from exc
+
+    async def _ui_evidence_post(
+        self,
+        route: str,
+        base_url: str,
+        token: str | None,
+        payload: dict[str, object],
+        remaining_s: float | None,
+        on_chunk: Callable[[bytes], object],
+        sha256: str | None = None,
+    ) -> None:
+        """Feed a token-authenticated evidence route's body to ``on_chunk``.
+
+        Every failure raises ``RunnerError`` naming a status or class, never the body.
+        """
+
+        if not token:
+            raise RunnerError(f"{route} requires a runner token")
+        try:
+            async with self._session.post(
+                f"{base_url}{route}",
+                json=payload,
+                headers=_auth_headers(token),
+                timeout=self._request_timeout(remaining_s),
+            ) as resp:
+                if resp.status != 200:
+                    raise RunnerError(f"{route} -> {resp.status}")
+                if sha256 is not None and resp.headers.get("X-Curie-Evidence-Sha256") != sha256:
+                    raise RunnerError(f"{route} answered for another digest")
+                async for chunk in resp.content.iter_chunked(65_536):
+                    on_chunk(chunk)
+        except aiohttp.ClientError as exc:
+            if isinstance(exc, TimeoutError):
+                raise
+            raise RunnerError(f"{route} transport failed: {type(exc).__name__}") from None
+
+    async def ui_evidence_index(
+        self,
+        base_url: str,
+        token: str | None,
+        *,
+        base_sha: str,
+        budget_s: float,
+        remaining_s: float | None = None,
+    ) -> dict[str, object]:
+        """The runner's UI evidence index for ``base_sha``: a bounded JSON object."""
+
+        route = "/v1/ui-evidence/index"
+        raw = bytearray()
+
+        def take(chunk: bytes) -> None:
+            raw.extend(chunk)
+            if len(raw) > UI_EVIDENCE_INDEX_MAX_BYTES:
+                raise RunnerError(f"{route} answer exceeds its byte limit")
+
+        payload: dict[str, object] = {"base_sha": base_sha, "budget_seconds": budget_s}
+        await self._ui_evidence_post(route, base_url, token, payload, remaining_s, take)
+        try:
+            body = json.loads(raw)
+        except (ValueError, RecursionError):
+            raise RunnerError(f"{route} returned malformed JSON") from None
+        if not isinstance(body, dict):
+            raise RunnerError(f"{route} returned a non-object body")
+        return body
+
+    async def ui_evidence_image(
+        self,
+        base_url: str,
+        token: str | None,
+        *,
+        index: int,
+        sha256: str,
+        size: int,
+        sink: IO[bytes],
+        remaining_s: float | None = None,
+    ) -> None:
+        """Stream one image into ``sink``, refusing any size or sha256 mismatch.
+
+        ``sink`` may hold a partial image after a refusal; the caller discards it.
+        """
+
+        route = "/v1/ui-evidence/image"
+        digest = hashlib.sha256()
+        received = 0
+
+        def take(chunk: bytes) -> None:
+            nonlocal received
+            received += len(chunk)
+            if received > size:
+                raise RunnerError(f"{route} sent more than its size")
+            digest.update(chunk)
+            sink.write(chunk)
+
+        payload: dict[str, object] = {"index": index, "sha256": sha256}
+        await self._ui_evidence_post(route, base_url, token, payload, remaining_s, take, sha256)
+        if received != size:
+            raise RunnerError(f"{route} sent {received} of {size} bytes")
+        if digest.hexdigest() != sha256:
+            raise RunnerError(f"{route} bytes do not match their digest")
 
     async def checkpoint(
         self,

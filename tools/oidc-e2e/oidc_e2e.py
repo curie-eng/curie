@@ -195,6 +195,10 @@ class Settings:
     workdir: Path
 
     @property
+    def gateway_image(self) -> str:
+        return f"ghcr.io/curie-eng/curie-dispatcher:{self.image_tag}"
+
+    @property
     def api(self) -> str:
         return f"http://localhost:{self.api_port}"
 
@@ -254,6 +258,7 @@ class Stack:
             {
                 "CURIE_BASE_TAG": self.s.image_tag,
                 "CURIE_UI_IMAGE": self.s.ui_image,
+                "CURIE_DISPATCHER_IMAGE": self.s.gateway_image,
                 "CURIE_LOCAL_API_KEY": API_KEY,
                 "OIDC_E2E_API_PORT": str(self.s.api_port),
                 "OIDC_E2E_UI_PORT": str(self.s.ui_port),
@@ -758,6 +763,7 @@ def ensure_images(s: Settings, build: bool) -> None:
     for ref, dockerfile in (
         (f"ghcr.io/curie-eng/curie-api:{s.image_tag}", "apps/api/Dockerfile"),
         (s.ui_image, "apps/ui/Dockerfile"),
+        (s.gateway_image, "apps/dispatcher/Dockerfile"),
     ):
         if build or not image_present(ref):
             print(f"building {ref} from {dockerfile}", flush=True)
@@ -796,7 +802,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Generic OIDC console login, end to end against a real Dex.",
     )
     parser.add_argument(
-        "--build", action="store_true", help="build the API and UI images even when present"
+        "--build",
+        action="store_true",
+        help="build the API, UI and gateway images even when present",
     )
     parser.add_argument(
         "--keep", action="store_true", help="leave the stack running after the checks"

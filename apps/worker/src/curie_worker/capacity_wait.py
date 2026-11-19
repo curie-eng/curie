@@ -30,12 +30,57 @@ _NOTICE_SEND_TIMEOUT_S = 30.0
 _BATCH = 64
 
 
+WAIT_REASON_ADMISSION = "sandbox_admission"
+WAIT_REASON_PREDECESSOR = "thread_predecessor"
+WAIT_REASON_DEPENDENCY = "workspace_dependency"
+_DURABLE_WAIT_NOTICES = {
+    WAIT_REASON_ADMISSION: "Your request is queued while sandbox admission is pending.",
+    WAIT_REASON_PREDECESSOR: (
+        "Your request is queued while an earlier message on this thread finishes."
+    ),
+    WAIT_REASON_DEPENDENCY: (
+        "Your request is queued while workspace dependency recovery finishes."
+    ),
+}
+
+
+def durable_wait_notice(wait_reason: str) -> str:
+    try:
+        return _DURABLE_WAIT_NOTICES[wait_reason]
+    except KeyError:
+        raise CapacityWaitRefused("unknown durable wait reason") from None
+
+
 class CapacityWaitRequested(Exception):
     """The kernel could not start an interactive turn because capacity is absent."""
+
+    def __init__(self, wait_reason: str = WAIT_REASON_ADMISSION) -> None:
+        super().__init__(wait_reason)
+        self.wait_reason = wait_reason
 
 
 class ThreadOrderWaitRequested(CapacityWaitRequested):
     """An earlier delivery must start or report its failure first."""
+
+    def __init__(self) -> None:
+        super().__init__(WAIT_REASON_PREDECESSOR)
+
+
+# ADR 0270 decision 3: the wait record ``reason`` of a different requester's
+# deferred delivery. Sticky across re-parks, and it keeps the delivery out of
+# the thread order (see ``_PARK_LUA``).
+REQUESTER_HANDOFF_REASON = "requester_handoff"
+
+
+class RequesterHandoffWaitRequested(CapacityWaitRequested):
+    """A different requester met a live turn, and its delivery can park.
+
+    ADR 0270 decision 3: another requester never steers a live turn; it waits
+    durably for a subsequent execution. The consumer parks this delivery with
+    reason ``requester_handoff`` and without a thread order entry, so the live
+    turn's own requester keeps steering it. A delivery that cannot park keeps
+    the pending ``failures.RequesterHandoffPending`` deferral instead.
+    """
 
 
 class CapacityWaitRefused(RuntimeError):
@@ -64,6 +109,11 @@ class CapacityWaitRecord:
     grant_epoch: str | None
     grant_confirmed: bool
     grant_unknown: bool
+    wait_reason: str
+    # ADR 0270 decision 3: why the delivery waits. ``REQUESTER_HANDOFF_REASON``
+    # for a different requester's deferral, "" for capacity and for a record
+    # written before the field existed.
+    reason: str = ""
 
 
 _CURRENT_WAIT: ContextVar[tuple[CapacityWaitStore, str, int, DeliveryLease] | None] = ContextVar(
@@ -147,7 +197,10 @@ if #pending == 0 or pending[1][2] ~= ARGV[6] then return {0} end
 if (redis.call('HGET', KEYS[2], 'order_scan_after') or '') ~= ARGV[11] then return {0} end
 local rank = redis.call('HGET', KEYS[2], 'order_token') or ARGV[8]
 local member = rank .. '|' .. ARGV[7]
-if redis.call('HGET', KEYS[2], 'order_started') ~= '1' then
+-- ADR 0270 decision 3: a requester handoff wait (ARGV[14]) never joins the
+-- thread order, neither as this delivery nor as an earlier pending one.
+if redis.call('HGET', KEYS[2], 'order_started') ~= '1' and
+   redis.call('HGET', KEYS[2], 'reason') ~= ARGV[14] then
   redis.call('ZADD', KEYS[1], 0, member)
   redis.call('HSET', KEYS[2], 'order_token', rank,
     'order_stream', ARGV[3], 'order_group', ARGV[4], 'order_entry', ARGV[5])
@@ -157,7 +210,8 @@ for i, candidate in ipairs(candidates) do
   local record = KEYS[4 + i]
   local earlier = redis.call('XPENDING', ARGV[3], ARGV[4],
     'IDLE', 0, candidate[1], candidate[1], 1)
-  if #earlier > 0 and redis.call('HGET', record, 'order_started') ~= '1' then
+  if #earlier > 0 and redis.call('HGET', record, 'order_started') ~= '1' and
+     redis.call('HGET', record, 'reason') ~= ARGV[14] then
     local earlier_rank = redis.call('HGET', record, 'order_token') or candidate[3]
     redis.call('ZADD', KEYS[1], 0, earlier_rank .. '|' .. candidate[2])
     redis.call('HSET', record, 'order_token', earlier_rank,
@@ -242,7 +296,12 @@ local deferrals = tonumber(redis.call('HGET', record, 'deferrals')) or 0
 deferrals = deferrals + 1
 local retry_ms = tonumber(ARGV[12])
 local next_due = math.min(deadline, now + retry_ms)
-if ARGV[13] ~= '' then
+-- ADR 0270 decision 3: the wait's reason is sticky. A re-park that names
+-- none keeps the stored one, and a requester handoff wait never joins the
+-- thread order, so the live turn's requester keeps steering it.
+local reason = ARGV[16]
+if reason == '' then reason = redis.call('HGET', record, 'reason') or '' end
+if ARGV[13] ~= '' and reason ~= ARGV[17] then
   local rank = redis.call('HGET', record, 'order_token') or ARGV[14]
   redis.call('HSET', record, 'order_token', rank)
   redis.call('ZADD', KEYS[11], 0, rank .. '|' .. ARGV[11])
@@ -253,7 +312,11 @@ local retained_until = deadline + retention_ms
 local grant_confirmed = redis.call('HGET', record, 'grant_confirmed') == '1'
 local grant_unknown = redis.call('HGET', record, 'grant_unknown') == '1'
 local notice_delivered = redis.call('HGET', record, 'notice_pending') == '0'
-local suppress_notice = state and notice_delivered and (not grant_confirmed) and (not grant_unknown)
+local previous_reason = redis.call('GET', KEYS[12]) or ''
+local next_reason = ARGV[15]
+local reason_changed = previous_reason ~= next_reason
+local suppress_notice = state and notice_delivered and (not grant_confirmed)
+  and (not grant_unknown) and (not reason_changed)
 local notice_flag = '0'
 if not suppress_notice then notice_flag = '1' end
 if not state then redis.call('HSET', record, 'fields', payload) end
@@ -261,6 +324,10 @@ redis.call('HSET', record,
   'state', 'waiting', 'generation', generation, 'first_wait_ms', first,
   'deadline_ms', deadline, 'due_ms', next_due, 'deferrals', deferrals,
   'cause', '', 'notice_pending', notice_flag)
+-- Only a named reason is stored: a capacity or order wait keeps the field set
+-- it always had, which the protected wait store admits before any wake.
+if reason ~= '' then redis.call('HSET', record, 'reason', reason) end
+redis.call('SET', KEYS[12], next_reason, 'PXAT', retained_until)
 redis.call('PEXPIREAT', record, retained_until)
 redis.call('ZADD', due, next_due, ARGV[11])
 redis.call('ZADD', waiting, retained_until, ARGV[11])
@@ -273,6 +340,22 @@ redis.call('ZREM', active, ARGV[11])
 redis.call('ZREM', flight, ARGV[11])
 redis.call('XACK', stream, group, entry)
 return {1, generation, first, deadline, next_due, deferrals}
+"""
+
+
+_REMEMBER_WAIT_REASON_LUA = """
+if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1] then return 0 end
+local state = redis.call('HGET', KEYS[1], 'state')
+if state ~= 'waiting' and state ~= 'woken' and state ~= 'active' then return 0 end
+if redis.call('HGET', KEYS[1], 'terminal_only') == '1' then return 0 end
+if redis.call('EXISTS', KEYS[2]) == 1 or redis.call('HGET', KEYS[3], 'done') == '1' then
+  return 0
+end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl <= 0 then return 0 end
+redis.call('SET', KEYS[4], ARGV[2], 'PX', ttl)
+if ARGV[3] ~= '' then redis.call('HSET', KEYS[1], 'reply_ref', ARGV[3]) end
+return 1
 """
 
 
@@ -679,6 +762,9 @@ class CapacityWaitStore:
     def _record(self, event_id: str) -> str:
         return f"{self._prefix}:record:{event_id}"
 
+    def _reason(self, event_id: str) -> str:
+        return f"{self._prefix}:reason:{event_id}"
+
     def _notice_lock(self, event_id: str) -> str:
         return f"{self._prefix}:notice_lock:{event_id}"
 
@@ -711,6 +797,7 @@ class CapacityWaitStore:
 
         if not val("state"):
             return None
+        reason = await self._redis.get(self._reason(event_id))
         return CapacityWaitRecord(
             event_id=event_id,
             fields=json.loads(val("fields", "{}")),
@@ -728,6 +815,8 @@ class CapacityWaitStore:
             grant_epoch=val("grant_epoch") or None,
             grant_confirmed=val("grant_confirmed") == "1",
             grant_unknown=val("grant_unknown") == "1",
+            wait_reason=reason.decode() if isinstance(reason, bytes) else str(reason or ""),
+            reason=val("reason"),
         )
 
     def _thread_order(self, thread_key: str) -> str:
@@ -795,6 +884,7 @@ class CapacityWaitStore:
             page[0],
             page[1],
             str(int(page[2])),
+            REQUESTER_HANDOFF_REASON,
         )
         if int(raw[0]) != 1:
             raise CapacityWaitRefused("thread order registration lost its delivery or scan")
@@ -903,13 +993,28 @@ class CapacityWaitStore:
         lease: DeliveryLease,
         *,
         thread_key: str | None = None,
+        wait_reason: str = WAIT_REASON_ADMISSION,
+        reason: str = "",
     ) -> CapacityWaitRecord:
+        """Park one owned delivery, acking its entry.
+
+        ``thread_key`` registers the wait in that thread's order.
+        ``wait_reason`` is the durable notice cause, validated against the
+        known notices and stored outside the record hash. ``reason`` names why
+        the delivery waits for thread ordering (ADR 0270 decision 3); "" keeps
+        a stored reason, and a ``REQUESTER_HANDOFF_REASON`` wait is never
+        registered in the thread order, on this park or any re-park. The park
+        script reads them as ARGV[15], ARGV[16] and, for the handoff
+        constant, ARGV[17].
+        """
+        if wait_reason not in _DURABLE_WAIT_NOTICES:
+            raise CapacityWaitRefused("unknown durable wait reason")
         if not lease.owner or not lease.stream or not lease.group:
             raise CapacityWaitRefused("a real delivery lease is required")
         lease.raise_if_lost()
         raw = await self._redis.eval(
             _PARK_LUA,
-            11,
+            12,
             self._record(event_id),
             self._due,
             self._waiting,
@@ -921,6 +1026,7 @@ class CapacityWaitStore:
             self._config.delivery_state_key(lease.stream, lease.group, entry_id),
             self._flight,
             self._thread_order(thread_key or ""),
+            self._reason(event_id),
             lease.stream,
             lease.group,
             entry_id,
@@ -935,13 +1041,37 @@ class CapacityWaitStore:
             str(_PARK_RETRY_MS),
             thread_key or "",
             delivery_order_token(entry_id),
+            wait_reason,
+            reason,
+            REQUESTER_HANDOFF_REASON,
         )
         if int(raw[0]) != 1:
             raise CapacityWaitRefused(str(raw[1]))
-        logger.info("capacity wait parked event_id=%s cause=capacity", event_id)
         record = await self.get(event_id)
         assert record is not None
+        logger.info(
+            "capacity wait parked event_id=%s cause=%s", event_id, record.reason or "capacity"
+        )
         return record
+
+    async def remember_wait_reason(
+        self, event_id: str, generation: int, wait_reason: str, *, reply_ref: str | None = None
+    ) -> bool:
+        """Record the current waiting reason without parking again."""
+        if wait_reason not in _DURABLE_WAIT_NOTICES:
+            raise CapacityWaitRefused("unknown durable wait reason")
+        changed = await self._redis.eval(
+            _REMEMBER_WAIT_REASON_LUA,
+            4,
+            self._record(event_id),
+            self._config.done_key(event_id),
+            self._config.completion_key(event_id),
+            self._reason(event_id),
+            str(generation),
+            wait_reason,
+            reply_ref or "",
+        )
+        return int(changed) == 1
 
     async def wake_due(self, limit: int = _BATCH) -> int:
         due = await self._redis.zrangebyscore(

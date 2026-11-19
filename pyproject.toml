@@ -7,9 +7,11 @@ dependencies = [
     "aci-protocol",
     "curie-internal",
     "curie-channel-protocol",
+    "curie-channel-gateway",
     "curie-protected-hooks",
     "curie-telemetry-schema",
     "curie-upgrade-pause",
+    "curie-shell-supervisor",
     "plugin-format",
     "curie-api",
     "curie-dispatcher",
@@ -29,10 +31,12 @@ members = [
     "packages/aci-protocol",
     "packages/curie-internal",
     "packages/channel-protocol",
+    "packages/channel-gateway",
     "packages/protected-hooks",
     "packages/plugin-format",
     "packages/telemetry-schema",
     "packages/upgrade-pause",
+    "packages/shell-supervisor",
     "packages/test-support",
     "packages/telemetry",
     "apps/api",
@@ -50,9 +54,11 @@ members = [
 aci-protocol = { workspace = true }
 curie-internal = { workspace = true }
 curie-channel-protocol = { workspace = true }
+curie-channel-gateway = { workspace = true }
 curie-protected-hooks = { workspace = true }
 curie-telemetry-schema = { workspace = true }
 curie-upgrade-pause = { workspace = true }
+curie-shell-supervisor = { workspace = true }
 plugin-format = { workspace = true }
 curie-test-support = { workspace = true }
 curie-api = { workspace = true }
@@ -95,6 +101,7 @@ root_packages = [
     "curie_connector_proxy",
     "curie_commissioning_ingress",
     "curie_commissioning_worker",
+    "curie_channel_gateway",
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_mail_adapter",
@@ -102,6 +109,7 @@ root_packages = [
     "curie_runner",
     "curie_telemetry_schema",
     "curie_upgrade_pause",
+    "curie_shell_supervisor",
     # The frozen contract packages (#961). Outside the graph, no contract could
     # ever fire on them, which left the worst possible place for an SDK import
     # ungated. Clean today; the contract below keeps them that way.
@@ -112,6 +120,44 @@ root_packages = [
 # Required for the contracts below: `claude_agent_sdk` is an EXTERNAL package, and
 # import-linter only tracks imports that leave the root packages when told to.
 include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "API and worker never import the Slack SDK"
+type = "forbidden"
+source_modules = ["curie_api", "curie_worker"]
+forbidden_modules = ["slack_sdk", "slack_bolt"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Channel gateway ports stay provider and application independent"
+type = "forbidden"
+source_modules = ["curie_channel_gateway.ports"]
+forbidden_modules = ["slack_sdk", "curie_api", "curie_worker"]
+
+[[tool.importlinter.contracts]]
+name = "Gateway mail stays independent of Slack and dispatcher"
+type = "forbidden"
+source_modules = ["curie_channel_gateway.mail"]
+forbidden_modules = ["curie_channel_gateway.slack", "curie_dispatcher"]
+
+[[tool.importlinter.contracts]]
+name = "Channel gateway and dispatcher stay independent"
+type = "independence"
+modules = ["curie_channel_gateway", "curie_dispatcher"]
+
+[[tool.importlinter.contracts]]
+name = "Channel gateway implementations stay independent of API and worker"
+type = "forbidden"
+source_modules = ["curie_channel_gateway"]
+forbidden_modules = ["curie_api", "curie_worker"]
+
+# The static-pool shell supervisor is the trusted half of a shell: it never
+# imports the untrusted runner it supervises, the worker, or a model SDK.
+[[tool.importlinter.contracts]]
+name = "The shell supervisor stays independent of the runner, worker and harnesses"
+type = "forbidden"
+source_modules = ["curie_shell_supervisor"]
+forbidden_modules = ["curie_runner", "curie_worker", "curie_api", "claude_agent_sdk"]
 
 # @spec PROTECTED-HOOK-LANE-1: internal transport has no application/SDK authority.
 [[tool.importlinter.contracts]]
@@ -133,6 +179,7 @@ source_modules = [
     "curie_api",
     "curie_worker",
     "curie_dispatcher",
+    "curie_channel_gateway",
     "curie_runner",
     "curie_internal",
     "curie_upgrade_pause",
@@ -404,6 +451,7 @@ source_modules = [
     "curie_api",
     "curie_worker",
     "curie_dispatcher",
+    "curie_channel_gateway",
     "curie_runner",
     "curie_internal",
     "curie_protected_hooks",
@@ -429,6 +477,7 @@ forbidden_modules = [
     "curie_api",
     "curie_worker",
     "curie_dispatcher",
+    "curie_channel_gateway",
     "curie_runner",
     "aci_protocol",
     "channel_protocol",
@@ -452,7 +501,7 @@ forbidden_modules = ["curie_worker", "kubernetes", "sqlalchemy", "redis", "boto3
 # direction that is hardest to see in review.
 name = "The platform never imports a harness SDK"
 type = "forbidden"
-source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_discord_adapter", "curie_mail_adapter", "curie_e2e_connector"]
+source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_channel_gateway", "curie_discord_adapter", "curie_mail_adapter", "curie_e2e_connector"]
 forbidden_modules = ["claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]
@@ -526,16 +575,20 @@ forbidden_modules = ["claude_agent_sdk"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
+pythonpath = ["."]
 norecursedirs = [
     "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}",
     "runner/tests/fixtures",
 ]
 testpaths = [
     "packages/aci-protocol/tests",
+    "packages/curie-internal/tests",
     "packages/channel-protocol/tests",
+    "packages/channel-gateway/tests",
     "packages/plugin-format/tests",
     "packages/test-support/tests",
     "packages/upgrade-pause/tests",
+    "packages/shell-supervisor/tests",
     "packages/telemetry/tests",
     "apps/api/tests",
     "apps/dispatcher/tests",
@@ -587,6 +640,7 @@ testpaths = [
     "tools/sre-contract/tests",
     "tools/factory-e2e/tests",
     "tools/github-stub/tests",
+    "tools/identity-e2e/tests",
     "tools/model-script/tests",
     "tools/sandbox-admission-observer/tests",
     "tools/runtime-assertion-gate/tests",
@@ -629,10 +683,12 @@ mypy_path = [
     "packages/aci-protocol/src",
     "packages/curie-internal/src",
     "packages/channel-protocol/src",
+    "packages/channel-gateway/src",
     "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
     "packages/upgrade-pause/src",
+    "packages/shell-supervisor/src",
     "packages/test-support/src",
     "packages/telemetry/src",
     "apps/api/src",
@@ -649,10 +705,12 @@ files = [
     "packages/aci-protocol/src",
     "packages/curie-internal/src",
     "packages/channel-protocol/src",
+    "packages/channel-gateway/src",
     "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
     "packages/upgrade-pause/src",
+    "packages/shell-supervisor/src",
     "packages/test-support/src",
     "packages/telemetry/src",
     "apps/api/src",

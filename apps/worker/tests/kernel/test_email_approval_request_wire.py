@@ -18,10 +18,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from curie_mail_adapter.adapter import MailAdapter
-from curie_mail_adapter.config import MailAdapterConfig
-from curie_mail_adapter.egress import make_server
-from curie_worker.reply_sink import HttpReplyAdapter
+from curie_channel_gateway.mail.adapter import MailAdapter
+from curie_channel_gateway.mail.config import MailAdapterConfig
+from curie_channel_gateway.mail.egress import make_server
+from curie_channel_gateway.reply_transport import HttpReplyAdapter
 
 from .test_approval_lifecycle import (
     _REQUESTING_SURFACE,

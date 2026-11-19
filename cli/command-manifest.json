@@ -59,6 +59,29 @@
   "name": "curie",
   "subcommands": [
     {
+      "about": "Migrate a protected worker process.json from v1 to v2 offline",
+      "args": [
+        {
+          "global": false,
+          "help": "Directory containing the stopped worker's process.json",
+          "id": "runtime_dir",
+          "long": "runtime-dir",
+          "positional": false,
+          "required": true
+        },
+        {
+          "global": false,
+          "help": "Private v2 channel_gateway JSON object",
+          "id": "gateway_config",
+          "long": "gateway-config",
+          "positional": false,
+          "required": true
+        }
+      ],
+      "hidden": false,
+      "name": "migrate-protected-process"
+    },
+    {
       "about": "Scaffold a keyless first reply, using a saved or environment model credential when available",
       "args": [
         {
@@ -851,6 +874,36 @@
               "about": "Not available at this tier: there is no hook run record",
               "hidden": false,
               "name": "record"
+            },
+            {
+              "about": "Not available at this tier: there is no durable wake key",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trigger name",
+                  "id": "name",
+                  "positional": true,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "wake-key",
+              "subcommands": [
+                {
+                  "about": "Not available at this tier: there is no durable wake key",
+                  "args": [
+                    {
+                      "global": false,
+                      "help": "Trigger name",
+                      "id": "name",
+                      "positional": true,
+                      "required": true
+                    }
+                  ],
+                  "hidden": false,
+                  "name": "rotate"
+                }
+              ]
             }
           ]
         },
@@ -3199,6 +3252,35 @@
               "long": "recovery-key",
               "positional": false,
               "required": false
+            },
+            {
+              "global": false,
+              "help": "The connector requester identity version a route write compares against, as `--requester-identity show` reports it. Omit to use the version read from the agent in the same command. Only valid with --route-resolution, --route-approvers, --routes-from or --clear-routes",
+              "id": "routes_expected_version",
+              "long": "routes-expected-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show or set whether this agent's hosted connector calls carry the verified human requester. `on` requires the tenant's HTTP identity selection and an operator receiver registration listing one of the agent's bindings. Experimental in this release: keep it off outside test installs. When on, the agent's hosted connector caller tokens carry the verified human requester. On a cluster install the connector proxy verifies it and passes it to hosted connectors as `X-Curie-Principal`; the local tier runs no caller proxy, so its connectors never receive the requester. The worker replaces a sandbox before serving a different requester, and a different person's message that arrives during a live turn waits for that turn to end, for up to the capacity wait budget (24 hours by default); a message still waiting then ends without running. A person's turn runs for at most the one-hour life of their connector credential, less the boot grace and the sandbox claim time; a turn still working then is stopped and reported as `requester-window`. Precondition: the api, the worker and the agent's connector proxies must all run this release (redeploy the agent if its connector proxies predate it); a partial rollout refuses the agent's HTTP turns or connector calls",
+              "id": "requester_identity",
+              "long": "requester-identity",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off",
+                "show"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The connector requester identity version an on/off write compares against, as `--requester-identity show` reports it. Omit to use the version read from the agent just before the write",
+              "id": "expected_version",
+              "long": "expected-version",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -4329,6 +4411,84 @@
               ],
               "hidden": false,
               "name": "record"
+            },
+            {
+              "about": "Read or rotate the targetless wake key for one named webhook",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": true,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": true,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": true,
+                  "help": "Print the route and the word redacted, and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "wake-key",
+              "subcommands": [
+                {
+                  "about": "Rotate the wake key. The new secret is not printed",
+                  "args": [
+                    {
+                      "global": false,
+                      "help": "Agent name or id",
+                      "id": "agent",
+                      "positional": true,
+                      "required": true
+                    },
+                    {
+                      "global": false,
+                      "help": "Trigger name on the in-force bundle",
+                      "id": "name",
+                      "positional": true,
+                      "required": true
+                    }
+                  ],
+                  "hidden": false,
+                  "name": "rotate"
+                }
+              ]
             }
           ]
         },
@@ -7073,6 +7233,203 @@
           "name": "access-policy"
         },
         {
+          "about": "Adopt, inspect, replace or retire a tenant HTTP identity authority",
+          "args": [
+            {
+              "global": false,
+              "id": "action",
+              "positional": true,
+              "possible_values": [
+                "list",
+                "get",
+                "adopt",
+                "replace",
+                "retire"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "tenant",
+              "long": "tenant",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Mutation JSON with request_id and expected versions. Never a literal bearer",
+              "id": "apply",
+              "long": "apply",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "after",
+              "long": "after",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "identity-authority"
+        },
+        {
+          "about": "Set, inspect or remove issuer group filters for an agent role",
+          "args": [
+            {
+              "global": false,
+              "id": "action",
+              "positional": true,
+              "possible_values": [
+                "list",
+                "set",
+                "remove"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "tenant",
+              "long": "tenant",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "role",
+              "long": "role",
+              "positional": false,
+              "possible_values": [
+                "invocation",
+                "approver"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Mutation JSON with request_id, expected_version and groups for set",
+              "id": "apply",
+              "long": "apply",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "role-filter"
+        },
+        {
           "about": "Inspect tenant identities or apply IdP configuration, namespace or team JSON. Writes use the API's expected-version contract; links and people are read-only",
           "args": [
             {
@@ -7814,6 +8171,62 @@
               ],
               "hidden": false,
               "name": "record"
+            },
+            {
+              "about": "Read or rotate the targetless wake key for one named webhook",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "global": true,
+                  "help": "Print the route and the word redacted, and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "wake-key",
+              "subcommands": [
+                {
+                  "about": "Rotate the wake key. The new secret is not printed",
+                  "args": [
+                    {
+                      "global": false,
+                      "help": "Agent name or id",
+                      "id": "agent",
+                      "positional": true,
+                      "required": true
+                    },
+                    {
+                      "global": false,
+                      "help": "Trigger name on the in-force bundle",
+                      "id": "name",
+                      "positional": true,
+                      "required": true
+                    }
+                  ],
+                  "hidden": false,
+                  "name": "rotate"
+                }
+              ]
             }
           ]
         },
@@ -9615,6 +10028,35 @@
               "long": "recovery-key",
               "positional": false,
               "required": false
+            },
+            {
+              "global": false,
+              "help": "The connector requester identity version a route write compares against, as `--requester-identity show` reports it. Omit to use the version read from the agent in the same command. Only valid with --route-resolution, --route-approvers, --routes-from or --clear-routes",
+              "id": "routes_expected_version",
+              "long": "routes-expected-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show or set whether this agent's hosted connector calls carry the verified human requester. `on` requires the tenant's HTTP identity selection and an operator receiver registration listing one of the agent's bindings. Experimental in this release: keep it off outside test installs. When on, the agent's hosted connector caller tokens carry the verified human requester. On a cluster install the connector proxy verifies it and passes it to hosted connectors as `X-Curie-Principal`; the local tier runs no caller proxy, so its connectors never receive the requester. The worker replaces a sandbox before serving a different requester, and a different person's message that arrives during a live turn waits for that turn to end, for up to the capacity wait budget (24 hours by default); a message still waiting then ends without running. A person's turn runs for at most the one-hour life of their connector credential, less the boot grace and the sandbox claim time; a turn still working then is stopped and reported as `requester-window`. Precondition: the api, the worker and the agent's connector proxies must all run this release (redeploy the agent if its connector proxies predate it); a partial rollout refuses the agent's HTTP turns or connector calls",
+              "id": "requester_identity",
+              "long": "requester-identity",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off",
+                "show"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The connector requester identity version an on/off write compares against, as `--requester-identity show` reports it. Omit to use the version read from the agent just before the write",
+              "id": "expected_version",
+              "long": "expected-version",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
@@ -10860,6 +11302,41 @@
           "name": "oidc-e2e"
         },
         {
+          "about": "Verify approval deadlines and reference retention in a disposable install",
+          "args": [
+            {
+              "global": false,
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709551615,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "approval-schedule-e2e"
+        },
+        {
+          "about": "Drive real HTTP identity turns against a disposable install (`python3 tools/identity-e2e/identity_e2e.py`). `up` overlays a TLS test identity provider, the API's HTTP identity runtime and one email binding per agent onto an existing release; `send` posts a signed email turn; `observe` decodes the turn's connector caller token with the signature redacted; `prove --scenario <name>` runs a scripted scenario and writes JSON evidence; `down` removes it all. Every action takes an explicit --context, --namespace, --release and --state-dir",
+          "args": [
+            {
+              "global": false,
+              "help": "`up`, `send`, `observe`, `prove` or `down`, then driver flags; see `curie dev identity-e2e -- --help`",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709551615,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "identity-e2e"
+        },
+        {
           "about": "Serve a TLS GitHub fixture or capture public check lifecycle recordings",
           "args": [
             {
@@ -10924,8 +11401,17 @@
           "about": "Runtime E2E the Helm chart on a local cluster: install a trimmed slice, seed a bundle into RustFS, run the sandbox bundle-fetch init pair, and exec-assert the runner's view -- the one-command way to satisfy a chart/sandbox runtime acceptance criterion static checks cannot (#199, `bash scripts/chart-runtime-e2e.sh`)",
           "args": [
             {
+              "env": "CURIE_E2E_KUBE_CONTEXT",
               "global": false,
-              "help": "Allow running against a kube context other than `k8scratch`",
+              "help": "Explicit disposable cluster context",
+              "id": "context",
+              "long": "context",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Confirm use of a context outside the disposable-cluster patterns",
               "id": "force",
               "long": "force",
               "positional": false,
@@ -10938,6 +11424,25 @@
           ],
           "hidden": false,
           "name": "chart-runtime-e2e"
+        },
+        {
+          "about": "Reject hardcoded kube-context flag values in the context-policy sources",
+          "args": [
+            {
+              "global": false,
+              "help": "Exercise rejecting literals and accepting caller variables",
+              "id": "self_test",
+              "long": "self-test",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "kube-context-check"
         },
         {
           "about": "Lint the interface catalog docs (`bash scripts/check-docs.sh`)",
@@ -11016,8 +11521,17 @@
               "required": false
             },
             {
+              "env": "CURIE_E2E_KUBE_CONTEXT",
               "global": false,
-              "help": "Allow a kube context other than `k8scratch` (cluster surface only)",
+              "help": "Explicit context for the cluster surface",
+              "id": "context",
+              "long": "context",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Confirm use of a context outside the disposable-cluster patterns",
               "id": "force",
               "long": "force",
               "positional": false,

@@ -1338,6 +1338,7 @@ fn deploy_output_validates() {
         deployment_environment: "prod".to_string(),
         deployment_status: "active".to_string(),
         cron_triggers: Vec::new(),
+        wake_triggers: Vec::new(),
         warnings: Vec::new(),
     };
     assert_valid("deploy.schema.json", &out.to_json());
@@ -1365,6 +1366,7 @@ fn deploy_result_for_target(target: &str) -> serde_json::Value {
         deployment_environment: environment.to_string(),
         deployment_status: "active".to_string(),
         cron_triggers: Vec::new(),
+        wake_triggers: Vec::new(),
         warnings: Vec::new(),
     }
     .to_json()
@@ -1419,7 +1421,7 @@ fn deploy_v1_1_payload_without_cron_receipts_remains_valid() {
     let schema = load_schema("deploy.schema.json");
     assert_eq!(
         schema["$id"],
-        serde_json::json!("https://schemas.curietech.ai/cli/deploy/v1.2.json")
+        serde_json::json!("https://schemas.curietech.ai/cli/deploy/v1.3.json")
     );
     let mut value = deploy_result_for_target("dev");
     let object = value.as_object_mut().expect("deploy result object");
@@ -1427,7 +1429,7 @@ fn deploy_v1_1_payload_without_cron_receipts_remains_valid() {
     object.remove("warnings");
     assert!(
         validator(&schema).is_valid(&value),
-        "v1.2 must continue accepting v1.1 receipts without the optional fields: {value}"
+        "v1.3 must continue accepting v1.1 receipts without the optional fields: {value}"
     );
 }
 

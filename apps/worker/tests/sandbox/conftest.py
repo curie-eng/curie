@@ -4,7 +4,7 @@ Affinity tests run against the REAL Valkey from the compose stack (repo test
 discipline: never mock Valkey). The Kubernetes control plane is an external
 service, so substrate-logic tests use ``FakeSandboxClient`` (an in-memory model
 of the agent-sandbox claim/pool behavior observed in PT-1/PT-D); the real
-client is exercised by the env-gated k8scratch e2e in ``test_e2e_k8scratch.py``.
+client is exercised by the env-gated cluster e2e tests.
 """
 
 from __future__ import annotations

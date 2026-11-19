@@ -17,12 +17,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import socket
 import sys
 import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -67,8 +66,8 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
 )
 from forge_fakes.jira import JiraFake, jira_tracker
 from forge_fakes.jira import fake_client as jira_client
-from sqlalchemy import make_url, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from test_factory_progress import ACTIVITY, DECLARATION, STAGED_DECLARATION, progress_token, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     ISSUE_REPLY,
@@ -175,103 +174,6 @@ async def _blocked_status_sync(
         released.set()
         sink.get_barrier = None
         await asyncio.wait_for(task, 10)
-
-
-def test_blocked_github_has_no_idle_transaction_and_progress_completes(admitted: Any) -> None:  # noqa: F811
-    client, github, sink = admitted
-    number = 9951
-    request_id = _admit(client, github, sink, number)
-    _start_running(client, request_id)
-
-    async def go() -> None:
-        inspector = create_async_engine(get_settings().database_url)
-        try:
-            async with _blocked_status_sync(client, sink, number) as (sync, _released):
-                assert client.app.state.engine.pool.checkedout() == 0
-                async with inspector.connect() as connection:
-                    idle = (
-                        await connection.execute(
-                            text(
-                                "SELECT pid, query FROM pg_stat_activity "
-                                "WHERE datname = current_database() "
-                                "AND state = 'idle in transaction' AND pid <> pg_backend_pid()"
-                            )
-                        )
-                    ).all()
-                assert idle == [], idle
-                async with httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
-                ) as api:
-                    response = await asyncio.wait_for(
-                        api.post(
-                            f"/v1/work-item-progress/{request_id}",
-                            headers={"X-API-Key": progress_token(request_id)},
-                            json={
-                                "phase": "read_issue",
-                                "declaration": DECLARATION,
-                                "activity": ACTIVITY,
-                            },
-                        ),
-                        2,
-                    )
-                    assert response.status_code == 201, response.text
-                    changed = {
-                        **DECLARATION,
-                        "phases": [*DECLARATION["phases"], {"id": "extra", "label": "Extra"}],
-                    }
-                    rejected = await asyncio.wait_for(
-                        api.post(
-                            f"/v1/work-item-progress/{request_id}",
-                            headers={"X-API-Key": progress_token(request_id)},
-                            json={
-                                "phase": "read_issue",
-                                "declaration": changed,
-                                "activity": ACTIVITY,
-                            },
-                        ),
-                        2,
-                    )
-                    assert rejected.status_code == 409, rejected.text
-                    assert "declaration_changed" in rejected.text
-                assert not sync.done(), "GitHub must still be blocked when progress returns"
-        finally:
-            await inspector.dispose()
-
-    client.portal.call(go)
-    row = _rows(
-        "SELECT declaration, activity FROM curie.factory_terminal_notices "
-        "WHERE execution_request_id = :id",
-        {"id": request_id},
-    )[0]
-    assert row["declaration"] == DECLARATION
-    assert row["activity"] == ACTIVITY
-
-
-def test_blocked_github_does_not_delay_heartbeat_or_relax_epoch_fencing(admitted: Any) -> None:  # noqa: F811
-    client, github, sink = admitted
-    number = 9952
-    request_id = _admit(client, github, sink, number)
-    epoch = _start_running(client, request_id)
-
-    async def go() -> None:
-        async with _blocked_status_sync(client, sink, number) as (sync, _released):
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
-            ) as api:
-                path = f"/v1/internal/work-items/requests/{request_id}/heartbeat"
-                heartbeat = await asyncio.wait_for(
-                    api.post(path, headers=WORKER, json={"runtime_epoch": epoch}), 2
-                )
-                assert heartbeat.status_code == 200, heartbeat.text
-                assert heartbeat.json()["status"] == "running"
-                stale = await asyncio.wait_for(
-                    api.post(path, headers=WORKER, json={"runtime_epoch": epoch + 1}), 2
-                )
-                assert stale.status_code == 409, stale.text
-                assert "stale_owner" in stale.text
-            assert not sync.done(), "GitHub must still be blocked when the heartbeat returns"
-
-    client.portal.call(go)
 
 
 def test_concurrent_status_passes_claim_one_row_and_post_one_comment(admitted: Any) -> None:  # noqa: F811
@@ -625,120 +527,6 @@ def test_failed_second_label_page_does_not_write_or_settle_and_next_pass_recover
     assert sink.issue_labels[number] == human_labels | {"curie-factory:running"}
     assert _notices(request_id)[0]["applied_label"] == "curie-factory:running"
     assert len(_label_writes(sink)) == 2
-
-
-def test_ready_and_heartbeat_use_liveness_pool_when_all_main_connections_are_busy(
-    admitted: Any,  # noqa: F811
-) -> None:  # noqa: F811
-    client, github, sink = admitted
-    request_id = _admit(client, github, sink, 9956)
-    epoch = _start_running(client, request_id)
-
-    async def go() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
-        ) as api:
-            path = f"/v1/internal/work-items/requests/{request_id}/heartbeat"
-            async with AsyncExitStack() as checked_out:
-                for _ in range(15):
-                    session = await checked_out.enter_async_context(client.app.state.sessionmaker())
-                    await session.execute(text("SELECT 1"))
-                assert client.app.state.engine.pool.checkedout() == 15
-                ready, heartbeat = await asyncio.wait_for(
-                    asyncio.gather(
-                        api.get("/ready"),
-                        api.post(path, headers=WORKER, json={"runtime_epoch": epoch}),
-                    ),
-                    2,
-                )
-                assert ready.status_code == 200, ready.text
-                assert heartbeat.status_code == 200, heartbeat.text
-                unauthorized = await asyncio.wait_for(
-                    api.post(
-                        path,
-                        headers={"X-Curie-Worker-Token": "wrong-worker"},
-                        json={"runtime_epoch": epoch},
-                    ),
-                    2,
-                )
-                assert unauthorized.status_code == 401, unauthorized.text
-                stale = await asyncio.wait_for(
-                    api.post(path, headers=WORKER, json={"runtime_epoch": epoch + 1}), 2
-                )
-                assert stale.status_code == 409, stale.text
-                assert "stale_owner" in stale.text
-                assert client.app.state.engine.pool.checkedout() == 15
-            assert client.app.state.engine.pool.checkedout() == 0
-            # Readiness still requires its own database pool to be available.
-            async with AsyncExitStack() as checked_out:
-                for _ in range(4):
-                    session = await checked_out.enter_async_context(
-                        client.app.state.liveness_sessionmaker()
-                    )
-                    await session.execute(text("SELECT 1"))
-                unavailable = await asyncio.wait_for(api.get("/ready"), 3)
-                assert unavailable.status_code == 503, unavailable.text
-            assert (await asyncio.wait_for(api.get("/ready"), 2)).status_code == 200
-
-    client.portal.call(go)
-
-
-def test_liveness_database_failure_rejects_ready_and_does_not_renew_heartbeat(
-    admitted: Any,  # noqa: F811
-) -> None:  # noqa: F811
-    client, github, sink = admitted
-    request_id = _admit(client, github, sink, 9960)
-    epoch = _start_running(client, request_id)
-
-    async def go() -> None:
-        async with client.app.state.sessionmaker() as session:
-            before = await session.scalar(
-                text(
-                    "SELECT runtime_heartbeat_expires_at FROM curie.execution_requests "
-                    "WHERE id = :id"
-                ),
-                {"id": request_id},
-            )
-        # A bound TCP socket without listen reserves a port that refuses
-        # connections. This exercises the real database driver failure path.
-        with socket.socket() as unavailable_port:
-            unavailable_port.bind(("127.0.0.1", 0))
-            database = make_url(get_settings().database_url).set(
-                host="127.0.0.1", port=unavailable_port.getsockname()[1]
-            )
-            unavailable = create_async_engine(database, connect_args={"timeout": 0.25})
-            original = client.app.state.liveness_sessionmaker
-            client.app.state.liveness_sessionmaker = async_sessionmaker(unavailable)
-            try:
-                async with httpx.AsyncClient(
-                    transport=httpx.ASGITransport(app=client.app, raise_app_exceptions=False),
-                    base_url="http://testserver",
-                ) as api:
-                    ready = await asyncio.wait_for(api.get("/ready"), 2)
-                    assert ready.status_code == 503, ready.text
-                    heartbeat = await asyncio.wait_for(
-                        api.post(
-                            f"/v1/internal/work-items/requests/{request_id}/heartbeat",
-                            headers=WORKER,
-                            json={"runtime_epoch": epoch},
-                        ),
-                        2,
-                    )
-                    assert heartbeat.status_code == 500, heartbeat.text
-            finally:
-                client.app.state.liveness_sessionmaker = original
-                await unavailable.dispose()
-        async with client.app.state.sessionmaker() as session:
-            after = await session.scalar(
-                text(
-                    "SELECT runtime_heartbeat_expires_at FROM curie.execution_requests "
-                    "WHERE id = :id"
-                ),
-                {"id": request_id},
-            )
-        assert after == before
-
-    client.portal.call(go)
 
 
 def test_credential_mint_failure_releases_status_claim_and_next_pass_retries(

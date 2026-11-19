@@ -145,18 +145,18 @@ def test_unavailable_credential_check_refuses_without_logging_secrets(
     unavailable = Redis(
         unix_socket_path=str(socket_path), socket_connect_timeout=1, socket_timeout=1
     )
-    original_valkey = client.app.state.valkey
+    original_valkey = client.app.state.credential_valkey
     try:
         assert client.portal is not None
         with pytest.raises(RedisConnectionError) as connection_error:
             client.portal.call(unavailable.ping)
         assert cred in str(connection_error.value)
-        client.app.state.valkey = unavailable
+        client.app.state.credential_valkey = unavailable
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger=STATE_LOGGER):
             resp = client.get(path, headers=headers)
     finally:
-        client.app.state.valkey = original_valkey
+        client.app.state.credential_valkey = original_valkey
         assert client.portal is not None
         client.portal.call(unavailable.aclose)
 

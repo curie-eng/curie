@@ -306,7 +306,7 @@ os.environ["CURIE_REMEDIATION_AUTHORITY_KEY"] = "example-remediation-authority"
 os.environ["CURIE_INTERNAL_WORKER_TOKEN"] = "example-worker-token"
 
 from curie_api.config import Settings
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
 from pydantic import ValidationError
 
 

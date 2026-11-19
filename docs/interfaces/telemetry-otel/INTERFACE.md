@@ -115,15 +115,19 @@ than an open bag of `gen_ai.*` names.
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, or
   deployment identifiers. Three bounded identifier dimensions are declared:
-  `curie.agent.turn.completed`, whose
-  `agent` label admits at most 32 distinct slugs per process and folds the rest,
+  `curie.agent.turn.completed` and `curie.agent.turn.duration`, whose
+  `agent` label admits at most 32 distinct slugs per process and per instrument
+  and folds the rest,
   plus any name that is not a 1 to 63 character slug, into `other`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`).
   Admission is first-come and resets when the process restarts, so the same slug
   can be named on one worker and counted as `other` on another. A rising
   `agent="other"` series means the ceiling or the slug rule is hiding a name.
   `unbound` is only a turn that never resolved an agent. A real agent named
-  `other` or `unbound` shares `other`. Every other instrument refuses an
+  `other` or `unbound` shares `other`. The worker records
+  `curie.agent.turn.duration` with the same seconds and outcome as the
+  unlabeled `curie.turn.duration`, so per-agent time to complete is its
+  `outcome="done"` series. Every other instrument refuses an
   agent identifier. `curie.action_executor.execution` admits at most 16 distinct connector
   slugs per process through its `connector` dimension, folding invalid names and
   overflow into `other` (`packages/telemetry/src/curie_telemetry/metrics.py`).
@@ -208,9 +212,16 @@ keys:
   `[tool_use NAME]` markers. The text of an assistant message reporting a provider
   error is never recorded. Tool arguments and tool results are never recorded.
   `curie.usage.scope` marks the ResultMessage usage fallback: when no generation in the
-  turn received nonzero per-message usage, the turn total is stamped on the final generation
-  with scope `turn`, earlier generations receive none of that total, and if no generation is active
-  at the result the root gets scope `unrecorded`. Per-message usage sets no scope key.
+  turn received nonzero implementer per-message usage, the turn total is stamped on the final
+  generation with scope `turn`, earlier generations receive none of that total, and if no
+  generation is active at the result the root gets scope `unrecorded`. Nested reviewer
+  counts never suppress the fallback: `ResultMessage.usage` is a main-loop-only total (the
+  bundled CLI's turn accumulator skips nested assistant messages carrying
+  `parent_tool_use_id`, and the Python SDK forwards the stamped accumulator unchanged), so
+  the stamped total is the ResultMessage total unchanged — no subtraction, no clamp — and
+  the reviewer's counts ride their own nested generation spans. The inclusive field is
+  `ResultMessage.model_usage`, which `runner/src/curie_runner/usage_report.py` splits per
+  model; it is not used here. Implementer per-message usage sets no scope key.
   `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
   value type: the four usage counts, generation TTFT, generation round, bounded tool
@@ -255,23 +266,38 @@ keys:
   is also a direct child of `agent.run`, never a generation child, so provider and tool
   phases are root siblings rather than a legacy monolithic generation containing
   zero-duration tool markers.
+- **Nested reviewer generations export inside the tool interval (#5206).** A nested
+  `AssistantMessage` (`parent_tool_use_id` set) that arrives while a tool interval is
+  active exports as its own `llm.generation` direct child of `agent.run`: it carries the
+  reviewer model and that message's own token counts, opens and closes inside the
+  surrounding `execute_tool` interval, and never becomes the implementer's active
+  generation. It carries no `curie.generation.round`, no implementer provider wait opens
+  while the tool runs, and its counts never suppress the `curie.usage.scope` fallback:
+  they are already exported on the nested span, and the fallback stamps its main-loop-only
+  total unchanged, so reviewer tokens appear exactly once, on their own span. Tool call
+  IDs, the `parent_tool_use_id`, and the message text are never exported.
 8. **Generation data belongs to its round.** The configured model, or the first non-empty
   model reported by an `AssistantMessage`, stamps `gen_ai.request.model` and the bare
   `model` once on that generation. The four usage attributes accumulate only the
   non-negative integer increments on `AssistantMessage` objects in that round;
-  `ResultMessage.usage` is a whole-turn total. When no generation received any nonzero
-  per-message count, `record_result_usage` stamps that total on the active final
+  `ResultMessage.usage` is a whole-turn, main-loop-only total (it excludes nested subagent
+  messages). When no generation received any nonzero
+  implementer per-message count, `record_result_usage` stamps that total on the active final
   generation with `curie.usage.scope=turn`, or marks the root `unrecorded` if no
-  generation is active. Zero per-message placeholders do not disable this fallback;
-  any nonzero count does, preventing double counting. When the real SDK supplies an allowlisted `message_start` or
+  generation is active. Nested reviewer counts never disable this fallback; they are not
+  part of the main-loop total, so the stamp is the total unchanged, with no subtraction
+  and no clamp, and the reviewer's counts stay on their own nested spans. Zero per-message
+  placeholders do not disable this fallback; any nonzero implementer count does, preventing
+  double counting. When the real SDK supplies an allowlisted `message_start` or
   `content_block_start` partial boundary, the adapter strips it to payload-free evidence
   and the active generation records `curie.generation.ttft_ms` once. TTFT is omitted when
   no such boundary is available: direct compatibility setters may populate model or
   usage attributes, but never claim TTFT without that allowlisted partial boundary.
   Partial bodies, arguments, provider identifiers, and results never enter telemetry.
-- **Boundary confidence is explicit.** Generation start kinds are `query_observed` or
-  `tool_result_inferred`; end kinds are `tool_use_observed`, `result_observed`, or
-  `terminal_inferred`. An `execute_tool` span starts when the adapter observes either a
+- **Boundary confidence is explicit.** Generation start kinds are `query_observed`,
+  `tool_result_inferred`, or `nested_assistant_observed`; end kinds are
+  `tool_use_observed`, `result_observed`, `terminal_inferred`, or
+  `nested_assistant_observed`. An `execute_tool` span starts when the adapter observes either a
   streamed SDK tool-use boundary or an SDK tool-use block, with
   `curie.phase.start_kind=tool_use_inferred`. A streamed boundary still produces this
   payload-free observation when no final `AssistantMessage` tool-use block arrives: tool

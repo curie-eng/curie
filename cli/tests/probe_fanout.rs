@@ -33,34 +33,8 @@
 //! label-selector read; `ops::release_fullname` memoizes per process, so that
 //! line must now appear exactly once.
 //!
-//! # Where doctor's floor is
-//!
-//! Five stages, and each boundary is a real data dependency rather than a
-//! missed fan-out:
-//!
-//! 1. the fullname discovery, the kubeconfig host read and the chart-Secret
-//!    name listing -- nothing any of them needs is known only after another;
-//! 2. the `curie-ui` and `curie-api` Service reads (both need the fullname; one
-//!    resolver reads them together, #1130) alongside `helm list -n curie --all`
-//!    (issued only because the Secret listing came back empty);
-//! 3. the four `gather` probes -- docker, the kube context, the helm version
-//!    and `helm list -n curie -o json`;
-//! 4. the two `helm get values` reads, computed and operator-supplied, plus
-//!    the deploy/sts ready-replica listing and the exact-label worker pod
-//!    selection;
-//! 5. the api Service NodePort read, which needs the fullname (a cache hit, so
-//!    no second discovery), alongside the worker claim-status exec and the
-//!    completion-outbox exec, which need the selected Running pod. The NodePort
-//!    read only happens because the values carry no ingress.
-//!
-//! Step 2's helm hop is the second rung of `ops::discover_api_key`'s ladder:
-//! the Secret name listing answers empty, so the key is looked for in Helm's
-//! record instead, which reports the release deployed and ends the ladder with
-//! "its chart Secret API key could not be read". That is what makes the API
-//! leg observable here without an HTTP round trip. Baseline was 13 calls in 12
-//! stages, including the duplicated label-selector read; the joined
-//! implementation is 15 calls in 5, including the deploy/sts serving-set
-//! listing and the two-call bounded worker claim observation.
+//! Doctor's byte pins stay in `doctor_output_is_golden`. This file no longer
+//! times doctor's probe fan-out.
 //!
 //! # Why the scenario makes no HTTP call
 //!
@@ -429,23 +403,6 @@ fn stdout_of(output: &Output) -> String {
 
 fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-/// `curie doctor` must join its independent docker/kubectl/helm reads and
-/// resolve the release fullname once. The new two-call claim observation fits
-/// into the same 5 dependency stages (see the module doc).
-#[test]
-fn doctor_fans_out_independent_probes() {
-    let fixture = fixture();
-    let (output, wall_ms) = fixture.run(&["--color=never", "--json", "doctor"]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "doctor reports rather than fails: stdout {}\nstderr {}",
-        stdout_of(&output),
-        stderr_of(&output)
-    );
-    assert_fanout("doctor", &fixture, 5, 17, wall_ms);
 }
 
 /// `curie cluster status` must issue helm status, the pod list, convergence,

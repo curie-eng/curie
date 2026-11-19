@@ -9,8 +9,10 @@ has none of these keys and must still rehydrate with conservative defaults.
 
 from __future__ import annotations
 
+import hashlib
 import json
 
+import pytest
 from curie_worker.sandbox.types import RouteRecord, SandboxHandle
 
 
@@ -95,3 +97,70 @@ def test_a_route_record_keeps_the_run_its_caller_token_names() -> None:
     run = "11111111-1111-4111-8111-111111111111"
     record = RouteRecord(handle=_handle(caller_run=run))
     assert RouteRecord.from_json(record.to_json()).handle.caller_run == run
+
+
+def _requester_digest(seed: bytes) -> str:
+    """A digest-shaped fact computed at runtime. @spec CONNECTOR-REQUESTER-3."""
+    return "sha256:" + hashlib.sha256(seed).hexdigest()
+
+
+# @spec CONNECTOR-REQUESTER-3
+@pytest.mark.parametrize(
+    ("requester", "exp"),
+    [
+        (_requester_digest(b"alice"), 1_900_003_600),
+        ("none", 1_900_086_400),
+        ("absent", None),
+    ],
+    ids=["digest", "none", "absent"],
+)
+def test_route_record_round_trips_caller_requester_and_expiry(
+    requester: str, exp: int | None
+) -> None:
+    """The durable route record carries the booted requester fact and cct expiry.
+
+    Every adopt decision reads the affinity record, so both facts must survive
+    the Valkey JSON round trip unchanged, and the stored JSON must carry them
+    under their own names. @spec CONNECTOR-REQUESTER-3.
+    """
+    handle = _handle(
+        carries_caller_token=requester != "absent",
+        caller_requester=requester,
+        caller_token_exp=exp,
+    )
+    raw = RouteRecord(handle=handle).to_json()
+    stored = json.loads(raw)
+    assert stored["caller_requester"] == requester
+    assert stored["caller_token_exp"] == exp
+    restored = RouteRecord.from_json(raw).handle
+    assert restored.caller_requester == requester
+    assert restored.caller_token_exp == exp
+    assert type(restored.caller_token_exp) is type(exp)
+    assert restored == handle
+
+
+# @spec CONNECTOR-REQUESTER-3
+def test_a_legacy_route_rehydrates_requester_unrecorded() -> None:
+    """A route written before the fields existed reads as unrecorded, never as a match.
+
+    None is the only state that cannot prove a requester match: it must not
+    rehydrate as ``"none"`` or ``"absent"``. @spec CONNECTOR-REQUESTER-3.
+    """
+    legacy = {
+        "thread_key": "t",
+        "claim_name": "c",
+        "sandbox_name": "s",
+        "namespace": "n",
+        "service_fqdn": "s.n.svc.cluster.local",
+        "port": 8080,
+        "session_id": "sess",
+        "carries_caller_token": True,
+        "state": "live",
+    }
+    loaded = RouteRecord.from_json(json.dumps(legacy)).handle
+    assert loaded.caller_requester is None
+    assert loaded.caller_token_exp is None
+    # A freshly built handle defaults the same way.
+    fresh = _handle()
+    assert fresh.caller_requester is None
+    assert fresh.caller_token_exp is None

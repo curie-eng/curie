@@ -157,6 +157,69 @@
       },
       "canonical": "{\"expected_version\":\"rv-1041\",\"prior_state\":{\"ciphertext\":\"ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=\",\"kid\":\"example-key-2026-10\",\"sealed\":\"curie.snapshot.v1\"},\"target\":{\"kind\":\"Deployment\",\"name\":\"example-web\",\"namespace\":\"example-ns\"}}",
       "sha256": "3e60bb4686f7193c573ce160cee6f29623f76106a1108b871e44dcccb69c065d"
+    },
+    {
+      "name": "ticket_metadata_is_preserved",
+      "arguments": {
+        "approval_ticket": "cat1.example.signature",
+        "nested": {
+          "approval_ticket": "execution data"
+        },
+        "number": 1.0,
+        "note": "café"
+      },
+      "canonical": "{\"approval_ticket\":\"cat1.example.signature\",\"nested\":{\"approval_ticket\":\"execution data\"},\"note\":\"café\",\"number\":1.0}",
+      "sha256": "0456365d60a673999724da6a632e09e3e922264d802119c0f13665093bdc018c"
+    },
+    {
+      "name": "numeric_and_unicode",
+      "arguments": {
+        "integer": 1,
+        "decimal": 1.0,
+        "negative_zero": -0.0,
+        "scientific": 1e-07,
+        "composed": "é",
+        "decomposed": "é",
+        "astral": "𝄞"
+      },
+      "canonical": "{\"astral\":\"𝄞\",\"composed\":\"é\",\"decimal\":1.0,\"decomposed\":\"é\",\"integer\":1,\"negative_zero\":-0.0,\"scientific\":1e-07}",
+      "sha256": "d142c1b6819fa64e4307231abda8a64ebb84e6ba6d5f864d6c856b5944f7a45c"
+    },
+    {
+      "name": "json_escaping_and_format_characters",
+      "arguments": {
+        "value": "/<>&\"\\\b\t\n\f\r\u0000﻿​ 𝄞"
+      },
+      "canonical": "{\"value\":\"/<>&\\\"\\\\\\b\\t\\n\\f\\r\\u0000﻿​ 𝄞\"}",
+      "sha256": "440567ed73b4ee0dbe667a6e844e3dc76d948f31459e7ae955cdbb1ad7337e4e"
+    },
+    {
+      "name": "code_point_key_sort",
+      "arguments": {
+        "𝄞": 1,
+        "": 2,
+        "é": 3,
+        "é": 4
+      },
+      "canonical": "{\"é\":4,\"é\":3,\"\":2,\"𝄞\":1}",
+      "sha256": "3c5921e90f9bd75099d05bdf0e3d1f771f2f1358ba54f6e395fc441f2f8a0399"
+    },
+    {
+      "name": "binary64_spelling_boundaries",
+      "arguments": {
+        "fixed_low": 0.0001,
+        "exponent_low": 1e-05,
+        "fixed_high": 1000000000000000.0,
+        "exponent_high": 1e+16,
+        "positive_exponent": 1e+20,
+        "small_exponent": 1e-07,
+        "negative_zero": -0.0,
+        "subnormal": 5e-324,
+        "max_finite": 1.7976931348623157e+308,
+        "fraction": 0.30000000000000004
+      },
+      "canonical": "{\"exponent_high\":1e+16,\"exponent_low\":1e-05,\"fixed_high\":1000000000000000.0,\"fixed_low\":0.0001,\"fraction\":0.30000000000000004,\"max_finite\":1.7976931348623157e+308,\"negative_zero\":-0.0,\"positive_exponent\":1e+20,\"small_exponent\":1e-07,\"subnormal\":5e-324}",
+      "sha256": "28207b81a46d083078174d529654f41d6bce04c0be28867cb9f8c1d74f095d49"
     }
   ],
   "restore": [

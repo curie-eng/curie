@@ -24,10 +24,12 @@ from channel_protocol.reply import (
     ReplyUpdate,
     TurnCompleted,
 )
+from curie_channel_gateway.reply_errors import (
+    MissingAdapterCredentialError,
+)
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
     TRACKER_KINDS,
-    MissingAdapterCredentialError,
     TargetRoute,
     TrackerReplySink,
     build_reply_sink,
@@ -58,7 +60,7 @@ def _update(kind: str, address: str, text: str = "the answer") -> ReplyUpdate:
 
 
 def _config() -> WorkerConfig:
-    return WorkerConfig(slack_bot_token=SLACK_TOKEN)  # type: ignore[arg-type]
+    return WorkerConfig()
 
 
 class _NoNetworkSession:

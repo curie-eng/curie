@@ -126,17 +126,40 @@ impl Fixture {
             self.root.join("tools/preflight/preflight.py"),
         )
         .unwrap();
-        fs::write(
-            self.root.join("pyproject.toml"),
-            concat!(
-                "[tool.uv.workspace]\nmembers = [\"packages/test-support\"]\n",
-                "[dependency-groups]\ndev = [\"curie-test-support\"]\n",
-                "[tool.uv.sources]\ncurie-test-support = {workspace = true}\n",
-            ),
-        )
-        .unwrap();
+        let members = [
+            ("packages/test-support", "curie-test-support"),
+            ("packages/channel-gateway", "curie-channel-gateway"),
+            ("packages/channel-protocol", "curie-channel-protocol"),
+            ("packages/aci-protocol", "aci-protocol"),
+            ("packages/curie-internal", "curie-internal"),
+            ("packages/telemetry", "curie-telemetry"),
+            ("packages/upgrade-pause", "curie-upgrade-pause"),
+        ];
+        let mut manifest = format!(
+            "[tool.uv.workspace]\nmembers = {}\n\
+             [dependency-groups]\ndev = [\"curie-test-support\"]\n\
+             [tool.uv.sources]\n",
+            serde_json::to_string(&members.map(|(path, _)| path)).unwrap()
+        );
+        for (member, name) in members {
+            manifest.push_str(&format!("{name} = {{workspace = true}}\n"));
+            let destination = self.root.join(member);
+            fs::create_dir_all(&destination).unwrap();
+            fs::copy(
+                source.join(member).join("pyproject.toml"),
+                destination.join("pyproject.toml"),
+            )
+            .unwrap();
+            for relative in git(source, &["ls-files", "--", &format!("{member}/src")]).lines() {
+                let target = self.root.join(relative);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::copy(source.join(relative), target).unwrap();
+            }
+        }
+        fs::write(self.root.join("pyproject.toml"), manifest).unwrap();
         fs::write(self.root.join("tools/preflight/always.txt"), "").unwrap();
         for relative in [
+            "tools/preflight/scan_history.py",
             "tools/test-env/test_env.py",
             "tools/e2e-ci-selection/select_tiers.py",
             "tools/e2e-ci-selection/pytest_impact.py",
@@ -144,9 +167,6 @@ impl Fixture {
             ".github/e2e-selection.yaml",
             "release/atlas.py",
             "cli/Cargo.toml",
-            "packages/test-support/pyproject.toml",
-            "packages/test-support/src/curie_test_support/__init__.py",
-            "packages/test-support/src/curie_test_support/ratchets.py",
             "tests/baselines/test-time.json",
         ] {
             let destination = self.root.join(relative);

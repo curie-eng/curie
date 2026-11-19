@@ -4,10 +4,14 @@ version = "0.0.0"
 description = "Curie shared test-support helpers (dev/test only)"
 requires-python = ">=3.13"
 dependencies = [
+    "curie-channel-gateway",
     "redis>=8.1.0",
     "pytest>=8.3",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.30",
+    # Throwaway TLS material for the static-pool shell tests.
+    "cryptography>=50.0.2",
+    "aiohttp>=3.11",
 ]
 
 [build-system]

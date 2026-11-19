@@ -1,0 +1,14 @@
+{{- $gateway := include "curie.channelGateway.values" . | fromYaml }}
+{{- if and (eq (include "curie.channelGateway.deploy" .) "true") (not $gateway.tlsSecret) (not $gateway.allowInsecure) }}
+{{- $name := include "curie.channelGateway.tlsSecret" . }}
+{{- $data := include "curie.channelGateway.tlsData" . | fromYaml }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  {{- toYaml $data | nindent 2 }}
+{{- end }}

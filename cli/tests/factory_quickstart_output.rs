@@ -456,7 +456,7 @@ impl Fixture {
             fs::write(&path, TOOL_DRIVER).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        fs::write(dir.path().join("kubeconfig"), "apiVersion: v1\nkind: Config\ncurrent-context: \"\"\ncontexts:\n  - name: kind-curie-factory\n    context:\n      cluster: fixture\n  - name: acme-cluster\n    context:\n      cluster: fixture\n").unwrap();
+        fs::write(dir.path().join("kubeconfig"), "apiVersion: v1\nkind: Config\ncurrent-context: \"\"\ncontexts:\n  - name: kind-curie-factory\n    context:\n      cluster: fixture\n  - name: scratch-cluster\n    context:\n      cluster: fixture\n").unwrap();
         let output = Command::new("openssl")
             .args(["genrsa", "2048"])
             .output()
@@ -794,7 +794,7 @@ fn candidate_missing_images_refuse_before_helm_kubectl_and_github_including_dry_
     for dry_run in [false, true] {
         let mut fixture = Fixture::new();
         fixture.registry = candidate_registry(&["mail-adapter", "runner"]);
-        let mut extra = vec!["--candidate", CANDIDATE, "--context", "acme-cluster"];
+        let mut extra = vec!["--candidate", CANDIDATE, "--context", "scratch-cluster"];
         if dry_run {
             extra.push("--dry-run");
         }
@@ -832,7 +832,7 @@ fn candidate_missing_tag_on_release_build_precedes_an_uncached_default_chart() {
     fs::remove_dir_all(&chart_cache).unwrap();
     let original = fixture.command(
         true,
-        &["--candidate", CANDIDATE, "--context", "acme-cluster"],
+        &["--candidate", CANDIDATE, "--context", "scratch-cluster"],
     );
     let mut command = Command::new(original.get_program());
     let mut args = original.get_args();
@@ -894,7 +894,7 @@ fn candidate_source_build_installs_and_records_the_resolved_runner_lock() {
                 "--candidate",
                 CANDIDATE,
                 "--context",
-                "acme-cluster",
+                "scratch-cluster",
                 "--json",
             ],
         )
@@ -1002,7 +1002,7 @@ fn candidate_rerun_skips_matching_tags_with_explicit_empty_or_resolved_runner_di
                 "--candidate",
                 CANDIDATE,
                 "--context",
-                "acme-cluster",
+                "scratch-cluster",
                 "--color",
                 "never",
             ],
@@ -1066,7 +1066,7 @@ fn candidate_rerun_installs_when_a_tag_or_effective_digest_differs() {
                 "--candidate",
                 CANDIDATE,
                 "--context",
-                "acme-cluster",
+                "scratch-cluster",
                 "--color",
                 "never",
             ],
@@ -1127,7 +1127,7 @@ fn candidate_release_build_clears_six_prefilled_digests_and_resolves_the_runner_
                 "--candidate",
                 CANDIDATE,
                 "--context",
-                "acme-cluster",
+                "scratch-cluster",
                 "--json",
             ],
         )
@@ -1434,7 +1434,7 @@ fn quickstart_foreign_labels_refusal_names_only_foreign_keys_and_their_removal()
             false,
             &[
                 "--context",
-                "acme-cluster",
+                "scratch-cluster",
                 "--namespace",
                 "acme-dev",
                 "--color",
@@ -1456,7 +1456,7 @@ fn quickstart_foreign_labels_refusal_names_only_foreign_keys_and_their_removal()
     assert!(!output.status.success(), "{shown}");
     assert!(shown.contains("foreign labels (foo)"), "{shown}");
     assert!(
-        shown.contains("kubectl --context acme-cluster label namespace acme-dev foo-"),
+        shown.contains("kubectl --context scratch-cluster label namespace acme-dev foo-"),
         "{shown}"
     );
     assert!(shown.contains("--namespace"), "{shown}");
@@ -1485,7 +1485,7 @@ fn quickstart_ownership_and_contents_refusals_suggest_another_namespace() {
     ] {
         let fixture = Fixture::new();
         let output = fixture
-            .command(false, &["--context", "acme-cluster", "--color", "never"])
+            .command(false, &["--context", "scratch-cluster", "--color", "never"])
             .env("QUICKSTART_NAMESPACE_LABELS", labels.to_string())
             .env(
                 "QUICKSTART_NON_DEFAULT_OBJECTS",
@@ -1515,7 +1515,7 @@ fn quickstart_ownership_and_contents_refusals_suggest_another_namespace() {
 fn quickstart_adopts_an_empty_namespace_with_only_its_metadata_name_label() {
     let fixture = Fixture::new();
     let output = fixture
-        .command(false, &["--context", "acme-cluster", "--color", "never"])
+        .command(false, &["--context", "scratch-cluster", "--color", "never"])
         .env(
             "QUICKSTART_NAMESPACE_LABELS",
             json!({"kubernetes.io/metadata.name":"curie"}).to_string(),
@@ -2522,7 +2522,7 @@ fn poll_quickstart_ignores_an_exported_webhook_secret() {
 fn gvisor_admission_inference_remains_visible_in_default_output() {
     let fixture = Fixture::new();
     let output = fixture
-        .command(false, &["--context", "acme-cluster", "--color", "never"])
+        .command(false, &["--context", "scratch-cluster", "--color", "never"])
         .env("QUICKSTART_GVISOR_RETRY", "1")
         .output()
         .unwrap();
@@ -2725,7 +2725,7 @@ fn factory_quickstart_invalid_model_credential_never_installs_or_checks_credit()
     for key in ["invalid-credential", "sk-or-", "sk-ant-"] {
         let fixture = Fixture::new();
         let output = fixture
-            .command(false, &["--context", "acme-cluster", "--json"])
+            .command(false, &["--context", "scratch-cluster", "--json"])
             .env("CURIE_CREDENTIALS", key)
             .stdin(Stdio::null())
             .output()
@@ -2864,7 +2864,7 @@ fn factory_quickstart_rerun_preserves_the_recorded_native_model_without_a_local_
     fixture.record_values(values);
 
     let output = fixture
-        .command(true, &["--context", "acme-cluster", "--json"])
+        .command(true, &["--context", "scratch-cluster", "--json"])
         .env_remove("CURIE_CREDENTIALS")
         .env_remove("CURIE_MODEL_CREDENTIALS")
         .env("CURIE_CONFIG_DIR", fixture.dir.path().join("cfg"))

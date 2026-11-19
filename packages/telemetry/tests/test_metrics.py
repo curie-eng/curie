@@ -1009,6 +1009,49 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
     assert manifest["cardinality_bound"] == 10 * (32 + 2)
 
 
+def test_agent_turn_duration_matches_the_agent_counter_contract(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    """#5814: per-agent time to complete, under the counter's bounded label.
+
+    Red if the histogram is missing, gains or loses a dimension, or its agent
+    label stops folding a non-slug and the 33rd distinct slug into ``other``.
+    The fleet ``curie.turn.duration`` must stay free of an agent label.
+    """
+
+    provider, reader = metrics
+    reset_bounded_labels()
+    manifest = _read(_MANIFEST)["metrics"]
+    duration = manifest["curie.agent.turn.duration"]
+    counter = manifest["curie.agent.turn.completed"]
+    assert duration["type"] == "histogram"
+    assert duration["unit"] == "s"
+    assert duration["monotonic"] is False
+    assert duration["attributes"] == counter["attributes"]
+    assert duration["cardinality_bound"] == counter["cardinality_bound"]
+    assert "agent" not in manifest["curie.turn.duration"]["attributes"]
+
+    base = {"service.name": "curie-worker", "source": "worker", "outcome": "done"}
+    record_metric("curie.agent.turn.duration", 1.5, attributes={**base, "agent": "not a slug"})
+    for index in range(32):
+        record_metric(
+            "curie.agent.turn.duration", 2.0, attributes={**base, "agent": f"acme-{index}"}
+        )
+    record_metric("curie.agent.turn.duration", 4.0, attributes={**base, "agent": "acme-overflow"})
+    assert provider.force_flush(timeout_millis=5000)
+    labels = {
+        dict(point)["agent"] for point in _exported_series(reader)["curie.agent.turn.duration"]
+    }
+    assert "acme-0" in labels and "acme-31" in labels
+    assert "acme-overflow" not in labels
+    assert "not a slug" not in labels
+    assert "other" in labels
+    with pytest.raises(ValueError, match="missing declared attribute"):
+        record_metric("curie.agent.turn.duration", 1.0, attributes=base)
+    with pytest.raises(ValueError, match="undeclared attribute"):
+        record_metric("curie.turn.duration", 1.0, attributes={**base, "agent": "acme-0"})
+
+
 def test_record_metric_still_rejects_unknown_turn_outcome(
     metrics: tuple[MeterProvider, InMemoryMetricReader],
 ) -> None:

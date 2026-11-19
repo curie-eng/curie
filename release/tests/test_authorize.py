@@ -2242,7 +2242,7 @@ class TestHelmCiWorkflowTriggers:
         doc = yaml.safe_load(HELM_CI_YAML.read_text())
         triggers = doc[True]
 
-        assert triggers["push"]["branches"] == ["main", "next"]
+        assert triggers["push"]["branches"] == ["main", "next", "backport/**"]
         assert "paths" not in triggers["push"]
         assert "paths-ignore" not in triggers["push"]
         assert triggers["pull_request"]["branches"] == ["main", "next"]

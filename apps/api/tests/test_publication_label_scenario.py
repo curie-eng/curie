@@ -158,7 +158,18 @@ def test_publication_label_scenario(
         )
     )
     assert isinstance(branch, str)
+    repository_ids = with_session(
+        lambda session: session.scalars(
+            text(
+                "SELECT DISTINCT repository_project_id FROM curie.work_items WHERE agent_id = :id"
+            ),
+            {"id": uuid.UUID(agent["agent_id"])},
+        )
+    )
     github = GitHubRepositoryFake()
+    # GitHub reports the WorkItem's captured repository id on both pull
+    # request sides, as for the repository the run was admitted for.
+    (github.repository_id,) = (int(value) for value in repository_ids)
     github.branches.update({"main": BASE_SHA, branch: HEAD_SHA})
     github.commits.update(
         {

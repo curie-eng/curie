@@ -151,8 +151,10 @@ stackless Playwright suite; run `pnpm test`/`pnpm e2e` locally to match it.
 allowlist (currently `ARCHITECTURE.md`) carries a line-number citation, that every cited
 path and Python symbol resolves, that each graded seam's `grade:` agrees with the row its
 `vision_row:` names in `docs/architecture-vision.md`, that no two ADRs under
-`docs/adr/` claim the same number prefix, and that every `curie ...` command named in
-`docs/agents.md` resolves against `cli/command-manifest.json`. Run it after editing any interface-catalog doc
+`docs/adr/` claim the same number prefix across the working tree, `origin/main`,
+`origin/next`, and open PR additions (failing closed if that remote scan cannot
+run), and that every `curie ...` command named in `docs/agents.md` resolves
+against `cli/command-manifest.json`. Run it after editing any interface-catalog doc
 and commit the regenerated files; CI runs the same check (`scripts/check-docs.sh`) in the
 `python-static` job. To exempt a genuinely illustrative example path, put
 `<!-- doclint:ignore-line -->` on that line (or the line before it).
@@ -624,8 +626,9 @@ required live surface outside that run still needs a run URL or waiver. Run
   referencing AI.** This applies to the PR body as much as to the commits: many
   assistants append a "Generated with" footer to a PR description by default, and
   that footer is a claim of authorship on the artifact a reviewer reads first.
-  Strip it. CI enforces both surfaces on every PR (issue #962); check before
-  pushing with:
+  Strip it. CI runs both checks on every PR and reports the result, but
+  neither is a required status check, so a red result does not block a merge.
+  Check before pushing with:
 
   ```bash
   scripts/check-commit-messages.sh origin/<base>..HEAD
@@ -642,11 +645,10 @@ required live surface outside that run still needs a run URL or waiver. Run
   assistant, the robot-emoji "Generated with" footer, or an attribution phrase next
   to a bare assistant name. Technical references (`CLAUDE.md`, `claude_agent_sdk`,
   `claude-sonnet-5`, `harness.claude`) are deliberately fine, and the script's
-  `--self-test` pins both halves so the distinction cannot silently rot. Scanning
-  the last 150 merged PR bodies flags exactly one, and it is a real footer, so the
-  body half is not a broad net either. A commit range the script cannot resolve is
-  a hard failure naming the range, not a silent pass. It checks only the PR's own
-  commits, so pre-gate history is not retroactively enforced.
+  `--self-test` pins both halves so the distinction cannot silently rot. A commit
+  range the script cannot resolve is a hard failure naming the range, not a
+  silent pass. It checks only the PR's own commits, so pre-gate history is not
+  retroactively enforced.
 2. No dashes/emdashes in prose content; no emojis in code or docs.
 
 ## Ticket implementation

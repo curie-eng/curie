@@ -156,6 +156,37 @@ def test_channel_bound_fake_session_runs_other_tools_and_refuses_send_message(
     assert _tool_names(refused) == ["SendMessage"]
 
 
+def _assert_channel_catalogue(control: set[str], channel: set[str]) -> None:
+    # SendMessage is the nonvacuous control. The bundled CLI exposes it in an
+    # ordinary session. PushNotification is optional and may be feature-gated
+    # off, so its absence must not skip this check or stand in for the control
+    # (#4654). A bare disallowed_tools name removes that tool's definition
+    # (https://code.claude.com/docs/en/agent-sdk/permissions). Both hidden
+    # names stay out of the channel catalogue. Bash and Read stay available.
+    assert "SendMessage" in control
+    exposed = sorted(set(_HIDDEN) & channel)
+    assert not exposed, f"channel catalogue still exposes {exposed}"
+    assert {"Bash", "Read"} <= channel
+
+
+def test_optional_hidden_tool_absence_is_not_the_control() -> None:
+    ordinary = {"Bash", "Read", "SendMessage"}
+    _assert_channel_catalogue(ordinary, {"Bash", "Read"})
+
+    with pytest.raises(AssertionError, match="SendMessage") as missing_control:
+        _assert_channel_catalogue({"Bash", "Read", "PushNotification"}, {"Bash", "Read"})
+    assert "still exposes" not in str(missing_control.value)
+
+    with pytest.raises(AssertionError, match="SendMessage") as both_absent:
+        _assert_channel_catalogue({"Bash", "Read"}, {"Bash", "Read"})
+    assert "still exposes" not in str(both_absent.value)
+
+    with pytest.raises(AssertionError, match="SendMessage"):
+        _assert_channel_catalogue(ordinary, {"Bash", "Read", "SendMessage"})
+    with pytest.raises(AssertionError, match="PushNotification"):
+        _assert_channel_catalogue(ordinary, {"Bash", "Read", "PushNotification"})
+
+
 @pytest.mark.skipif(
     not _HAS_CLAUDE_CLI,
     reason="claude CLI is required for real SDK catalogue evidence",
@@ -187,8 +218,4 @@ def test_loopback_sdk_catalogue_drops_both_only_when_channel_bound(
         assert len(catalogs) == index + 1, f"{label} boot emitted no SDK init catalogue"
 
     control, channel = set(catalogs[0]), set(catalogs[1])
-    # Control proves the CLI offers both by default, so the channel assertion
-    # cannot pass with the feature inert.
-    assert set(_HIDDEN) <= control
-    assert not set(_HIDDEN) & channel
-    assert {"Bash", "Read"} <= channel
+    _assert_channel_catalogue(control, channel)

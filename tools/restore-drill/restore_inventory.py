@@ -272,7 +272,7 @@ def check_backup(backup_dir: Path, supplied_config: Mapping[str, str]) -> dict[s
 
 def seed_mail(path: Path) -> dict[str, list[str]]:
     """Write synthetic pending and known delivery rows using MailState."""
-    from curie_mail_adapter.state import MailState
+    from curie_channel_gateway.mail.state import MailState
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -297,7 +297,7 @@ def seed_mail(path: Path) -> dict[str, list[str]]:
 
 def verify_mail(path: Path) -> dict[str, list[str]]:
     """Re-open restored SQLite and assert pending/dedup invariants."""
-    from curie_mail_adapter.state import MailState
+    from curie_channel_gateway.mail.state import MailState
 
     if not path.is_file() or path.stat().st_size == 0:
         _refuse("mail-adapter-state", "restored file is absent or empty")

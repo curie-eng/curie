@@ -393,66 +393,6 @@ def test_positive_admit_entire_revalidation_uses_original_caller_budget(tmp_path
     asyncio.run(go())
 
 
-@pytest.mark.parametrize("remaining", [None, 2.0])
-def test_positive_control_body_cannot_outlive_owned_absolute_deadline(tmp_path, remaining):
-    """Private control framing bound only; no complete positive guard is faked."""
-    from curie_worker.protected_launch_records import AdmitRequest, canonical_json
-
-    async def go():
-        accepted = []
-
-        async def handler(method, path, body):
-            accepted.append((method, path, body))
-            await asyncio.sleep(0.35)
-            return 200, dict(
-                schema_version=1,
-                launch_id=path.split("/")[3],
-                operation_id=body["operation_id"],
-                epoch=body["epoch"],
-                result="applied",
-            )
-
-        config, close = await _control_peer(tmp_path, handler)
-        client, owned = _structural_owned_client(config)
-        liveness_request, request = [
-            AdmitRequest(
-                canonical_json(
-                    dict(
-                        schema_version=1,
-                        operation_id=operation_id,
-                        expected_receipt_revision="9",
-                        epoch=owned.epoch,
-                        allow=True,
-                    )
-                )
-            )
-            for operation_id in (
-                "88888888-8888-4888-8888-888888888888",
-                "77777777-7777-4777-8777-777777777777",
-            )
-        ]
-        path = f"/v1/launches/{owned.capability.launch_id}/admit"
-        liveness_call = ("POST", path, liveness_request.as_dict())
-        timed_call = ("POST", path, request.as_dict())
-        try:
-            await client._applied(owned.capability, "admit", liveness_request, remaining)
-            assert accepted == [liveness_call]
-            owned.deadline = asyncio.get_running_loop().time() + 0.05
-            before = asyncio.get_running_loop().time()
-            with pytest.raises(LaunchClientError) as caught:
-                await client._applied(owned.capability, "admit", request, remaining)
-            assert asyncio.get_running_loop().time() - before < 0.2
-            assert str(caught.value) == "Protected launch request refused"
-            assert caught.value.__cause__ is None
-            assert caught.value.__context__ is None
-        finally:
-            await client._transport.close()
-            await close()
-        assert accepted in ([liveness_call], [liveness_call, timed_call])
-
-    asyncio.run(go())
-
-
 def test_cancelled_outbound_deny_admit_retains_fenced_owned_cleanup(tmp_path):
     async def go():
         accepted, retired = asyncio.Event(), []

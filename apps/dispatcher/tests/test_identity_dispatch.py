@@ -14,18 +14,18 @@ from unittest.mock import MagicMock
 
 import pytest
 import redis
-from curie_dispatcher import app as app_module
-from curie_dispatcher import handlers as handlers_module
-from curie_dispatcher.app import build_app, build_web_client
-from curie_dispatcher.approval_actions import (
+from curie_channel_gateway.slack import app as app_module
+from curie_channel_gateway.slack import handlers as handlers_module
+from curie_channel_gateway.slack.app import build_app, build_web_client
+from curie_channel_gateway.slack.approval_actions import (
     APPROVE_ACTION_ID,
     APPROVE_NOTE_ACTION_ID,
     ResolveOutcome,
 )
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.handlers import process_action, process_event
-from curie_dispatcher.identities import SlackIdentityCredentials
-from curie_dispatcher.queue import from_stream_fields
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.handlers import process_action, process_event
+from curie_channel_gateway.slack.identities import SlackIdentityCredentials
+from curie_internal.turn_queue import from_stream_fields
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_bolt.authorization import AuthorizeResult
@@ -439,6 +439,7 @@ def test_bolt_and_the_web_client_are_built_from_the_identity_given(
     assert client_calls == [{"token": "xoxb-ops", "timeout": 2}]
     assert app_calls == [
         {
+            "process_before_response": False,
             "signing_secret": "signing-ops",
             "token": "xoxb-ops",
             "token_verification_enabled": False,
@@ -449,8 +450,6 @@ def test_bolt_and_the_web_client_are_built_from_the_identity_given(
 def test_a_stock_config_builds_bolt_and_the_web_client_as_it_always_did(
     redis_client: redis.Redis, config: DispatcherConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Passes before and after this change: it pins the stock construction."""
-
     app_calls: list[dict[str, Any]] = []
     client_calls: list[dict[str, Any]] = []
 
@@ -471,6 +470,7 @@ def test_a_stock_config_builds_bolt_and_the_web_client_as_it_always_did(
     assert client_calls == [{"token": "xoxb-test", "timeout": 2}]
     assert app_calls == [
         {
+            "process_before_response": False,
             "signing_secret": "unused-in-socket-mode",
             "token": "xoxb-test",
             "token_verification_enabled": False,

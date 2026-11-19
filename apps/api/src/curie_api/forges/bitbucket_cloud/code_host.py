@@ -46,6 +46,7 @@ from curie_api.forges.types import (
     Commit,
     Credential,
     CredentialScope,
+    EvidenceFile,
     FactoryPublication,
     FeedbackKind,
     FeedbackPage,
@@ -58,6 +59,7 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    StoredEvidence,
     publication_body,
     publication_url,
     status_key,
@@ -71,7 +73,12 @@ CAPABILITIES: Mapping[Operation, Support] = {
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
+    # Account ids map to logins only on GitHub (ADR 0198, #5414).
+    Operation.ACCOUNT_LOGIN: Support.UNSUPPORTED,
     Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
+    # UI evidence hosting is GitHub only (ADR 0197).
+    Operation.STORE_EVIDENCE: Support.UNSUPPORTED,
+    Operation.DELETE_EVIDENCE: Support.UNSUPPORTED,
 }
 # A feedback listing re-reads this far behind its cursor and drops what it
 # already returned, so a comment stamped late is still listed once (decision 10.5).
@@ -639,6 +646,20 @@ class BitbucketCloudCodeHost:
     async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
         raise Unsupported(Operation.REQUIRED_CHECKS)
 
+    async def store_evidence(
+        self,
+        repository: RepositoryRef,
+        *,
+        key: str,
+        files: Sequence[EvidenceFile],
+        message: str,
+        stamp: datetime,
+    ) -> StoredEvidence:
+        raise Unsupported(Operation.STORE_EVIDENCE)
+
+    async def delete_evidence(self, repository: RepositoryRef, *, key: str) -> bool:
+        raise Unsupported(Operation.DELETE_EVIDENCE)
+
     async def ci_diagnostics(
         self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None
     ) -> CiReport:
@@ -658,6 +679,9 @@ class BitbucketCloudCodeHost:
         # A write-scoped access token cannot read the repository's permission
         # configuration; that needs repository:admin (decision 11).
         raise Unsupported(Operation.USER_CAN_WRITE)
+
+    async def account_login(self, repository: RepositoryRef, account_id: str) -> str | None:
+        raise Unsupported(Operation.ACCOUNT_LOGIN)
 
     # Comments and review feedback ---------------------------------------------
 

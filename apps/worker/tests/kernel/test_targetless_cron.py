@@ -214,11 +214,12 @@ async def _has_outbox_record(h: object, event_id: str) -> bool:
 # --- 1. executes on the intended active deployment ---------------------------
 
 
+@pytest.mark.parametrize("source", ["schedule", "manual", "webhook"])
 def test_targetless_cron_runs_on_the_hook_agents_winning_deployment(
-    make_harness, make_hook_run
+    make_harness, make_hook_run, source: str
 ) -> None:
     async def go() -> None:
-        async with make_hook_run() as run, _seed_deployments(
+        async with make_hook_run(source=source) as run, _seed_deployments(
             run.engine, run.agent_id
         ) as seeded, make_harness(
             hook_runs=run.recorder(),

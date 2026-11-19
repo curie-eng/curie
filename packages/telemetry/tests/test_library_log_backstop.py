@@ -36,7 +36,7 @@ WARNING_CARRIER = "library warning probe 2535"
 INFO_CARRIER = "library info probe 2535"
 SERVICE_CARRIER = "service logger probe 2535"
 
-_ENTRYPOINTS = ("mail", "dispatcher", "worker", "runner")
+_ENTRYPOINTS = ("mail", "dispatcher", "gateway-slack", "worker", "runner")
 
 
 def wait_until(predicate: object, timeout: float, message: str) -> None:

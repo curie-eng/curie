@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 import redis
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
 from slack_sdk.errors import SlackApiError
 
 ROOT_TS = "1700000000.000100"
@@ -92,7 +92,7 @@ def _resolve(
     logger: logging.Logger | None = None,
 ) -> str:
     # Imported per call so this module collects before the resolver exists.
-    from curie_dispatcher.thread_context import SlackThreadContext
+    from curie_channel_gateway.slack.thread_context import SlackThreadContext
 
     return SlackThreadContext(redis_client, web_client, config, logger=logger).resolve(
         event=event or _reply(),
@@ -565,7 +565,7 @@ def test_out_of_scope_events_are_unchanged_and_ask_nothing(
 # @spec slack-alert-followup-context: Repository selection
 # @spec slack-alert-followup-context: Prompt shape
 def test_platform_wording_and_quoted_root_name_no_lexical_repository() -> None:
-    from curie_dispatcher.thread_context import (
+    from curie_channel_gateway.slack.thread_context import (
         render_prior_reply,
         render_unavailable_notice,
     )

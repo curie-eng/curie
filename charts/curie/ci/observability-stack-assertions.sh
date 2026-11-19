@@ -973,13 +973,24 @@ for label, docs in (("install", curie_install_docs), ("upgrade", curie_upgrade_d
     assert queue.get("enabled") is True
     assert queue.get("storage") == "file_storage"
     assert isinstance(queue.get("queue_size"), int) and 0 < queue["queue_size"] <= 100000
+    langfuse_exporters = at(config, "service", "pipelines", "traces/langfuse", "exporters")
     trace_exporters = at(config, "service", "pipelines", "traces", "exporters")
     assert "debug" not in config.get("exporters", {}), (
         f"{label} production render must omit the debug exporter"
     )
-    assert trace_exporters == ["otlphttp/langfuse", "otlphttp/tempo"], (
-        f"{label} production render must export traces to Langfuse and Tempo without debug"
+    assert langfuse_exporters == ["otlphttp/langfuse"], (
+        f"{label} production Langfuse pipeline must export only to Langfuse, got {langfuse_exporters!r}"
     )
+    assert trace_exporters == ["otlphttp/tempo"], (
+        f"{label} production unfiltered traces pipeline must export only to Tempo, got {trace_exporters!r}"
+    )
+    langfuse_processors = at(config, "service", "pipelines", "traces/langfuse", "processors")
+    assert "filter/langfuse_platform_noise" in langfuse_processors, (
+        f"{label} Langfuse pipeline must drop platform noise"
+    )
+    assert "filter/langfuse_platform_noise" not in at(
+        config, "service", "pipelines", "traces", "processors"
+    ), f"{label} Tempo pipeline must keep platform spans"
     soak_exporter = at(config, "exporters", "prometheusremotewrite/soak")
     assert soak_exporter.get("endpoint") == (
         "http://prometheus-server.observability.svc.cluster.local/api/v1/write"

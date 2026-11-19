@@ -16,7 +16,7 @@ import time
 from typing import Any
 
 import pytest
-from curie_dispatcher.inbound_text import _MAX_CHARS, _MAX_DEPTH, _MAX_NODES, derive_text
+from curie_channel_gateway.slack.inbound_text import _MAX_CHARS, _MAX_DEPTH, _MAX_NODES, derive_text
 
 
 def _wrap_in_depth(inner: Any, levels: int) -> Any:

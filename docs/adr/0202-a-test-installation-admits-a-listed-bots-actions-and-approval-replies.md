@@ -58,7 +58,7 @@ them:
   installation's own identities
   ([ADR 0168](0168-one-installation-hosts-several-bot-identities.md)) or an exact
   `(channel, bot)` pair is in `dispatcher.threadedBotAllowlist`. That check is
-  in `apps/dispatcher/src/curie_dispatcher/relevance.py`. The bot-authorship rule
+  in `packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py`. The bot-authorship rule
   does not refuse a bot-authored root mention, though
   [ADR 0175](0175-a-bot-may-limit-who-can-talk-to-it.md)'s caller list still
   applies.
@@ -295,12 +295,12 @@ Nothing implements this yet. One issue tracks each path, in order: #4133, #4134,
    - `charts/curie/values.schema.json`;
    - a template `fail` for the render refusals;
    - `apps/api/src/curie_api/config.py`;
-   - `apps/dispatcher/src/curie_dispatcher/config.py`;
+   - `packages/channel-gateway/src/curie_channel_gateway/slack/config.py`;
    - the boot-time default-secret refusal in both;
    - the dispatcher's preflight identity check, including the agent binding of
      a sibling driver.
 2. **Admission and refusal:**
-   - `apps/dispatcher/src/curie_dispatcher/relevance.py` (`TEST_ACTION_REFUSED`
+   - `packages/channel-gateway/src/curie_channel_gateway/slack/relevance.py` (`TEST_ACTION_REFUSED`
      and the driver admission);
    - `handlers.py` (ordering after the caller check, the ping reply and the
      per-thread cap).

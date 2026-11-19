@@ -8,6 +8,7 @@ from dataclasses import replace
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import approver_dm
 from .approval_auth import AuthenticatedApprovalPrincipal
 from .approvers import shown_off_slack
 from .crud import approvals as crud_approvals
@@ -32,6 +33,13 @@ async def approval_team_decision(
     # This is the authenticated actor's receiving context, never inserted as
     # an agent binding. A fixed Slack card can belong to an email-originated
     # request; its Slack installation is approval_token_identity, not mail's.
+    # A registered approver-DM card's installation is the one its record names
+    # (@spec APPROVER-DM-3); only a dynamic row can carry one.
+    dm = (
+        await approver_dm.card(session, approval)
+        if principal.kind != "adapter" and approval.selection_mode == "dynamic"
+        else None
+    )
     context = AgentChannel(
         agent_id=agent.id,
         tenant_id=agent.tenant_id,
@@ -39,7 +47,7 @@ async def approval_team_decision(
         adapter=(
             approval.reply_adapter
             if principal.kind == "adapter"
-            else approval_token_identity(approval)
+            else approval_token_identity(approval, dm)
         ),
         address=principal.actor_channel or approval.reply_channel,
     )

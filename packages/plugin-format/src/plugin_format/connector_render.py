@@ -40,6 +40,7 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from .connectors import ADMITS_SELF, ConnectorSpec
 
@@ -188,6 +189,48 @@ class ConnectorProxy:
                     f"a caller public key decodes to {len(raw)} bytes; an Ed25519 public "
                     f"key is {_PUBLIC_KEY_BYTES}"
                 )
+
+
+_GRANT_STORE_SCHEMES = frozenset({"redis", "rediss"})
+
+
+@dataclass(frozen=True)
+class GrantStore:
+    """Where the caller proxy spends one-shot grants, and how it authenticates.
+
+    ``address`` is a credential-free ``redis://`` or ``rediss://`` URL, and the
+    proxy container gets it as a literal. The password never enters the
+    rendered objects: the proxy reads it from ``secret_key`` of the Secret
+    ``secret_name`` by ``secretKeyRef``. A username, a port and a database path
+    are allowed in the address. No message here echoes the address, since a
+    refused one may be refused for carrying a password.
+    """
+
+    address: str
+    secret_name: str
+    secret_key: str
+
+    def __post_init__(self) -> None:
+        try:
+            parts = urlsplit(self.address)
+            _ = parts.port  # parsing the port is the check
+        except ValueError:
+            raise ValueError("the grant store address is not a parsable URL") from None
+        if parts.scheme not in _GRANT_STORE_SCHEMES:
+            raise ValueError("the grant store address scheme is not redis or rediss")
+        if not parts.hostname:
+            raise ValueError("the grant store address has no host")
+        if parts.password is not None:
+            raise ValueError(
+                "the grant store address carries a password; the password belongs in a Secret"
+            )
+        if parts.query or parts.fragment or "?" in self.address or "#" in self.address:
+            raise ValueError("the grant store address carries a query or a fragment")
+        name = self.secret_name
+        if len(name) > _SECRET_NAME_MAX or not _SECRET_NAME.fullmatch(name):
+            raise ValueError(f"the grant store Secret {name!r} is not a Secret name")
+        if not self.secret_key:
+            raise ValueError("the grant store Secret key is empty")
 
 
 def caller_proxy_port(spec: ConnectorSpec) -> int:
@@ -529,7 +572,7 @@ def render_deployment(
     secret_name: str,
     proxy: ConnectorProxy | None = None,
     gated_tools: tuple[str, ...] = (),
-    grant_store_url: str = "",
+    grant_store: GrantStore | None = None,
 ) -> dict[str, Any]:
     name = object_name(release, agent, connector)
     subs = substitutions(release, agent, connector, namespace, spec.port)
@@ -627,6 +670,14 @@ def render_deployment(
             }
         )
 
+    # A declared scratch volume (#5415): disk-backed, so it never counts
+    # against the memory limit, bounded by its sizeLimit, and writable on the
+    # server container alone. An emptyDir is world-writable, so the non-root
+    # user writes it without the fsGroup that secret files need.
+    if spec.scratch is not None:
+        volumes.append({"name": "scratch", "emptyDir": {"sizeLimit": spec.scratch.size_limit}})
+        volume_mounts.append({"name": "scratch", "mountPath": spec.scratch.path})
+
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -681,7 +732,7 @@ def render_deployment(
                                     spec,
                                     proxy,
                                     gated_tools=gated_tools,
-                                    grant_store_url=grant_store_url,
+                                    grant_store=grant_store,
                                 )
                             ]
                             if proxy is not None
@@ -707,17 +758,20 @@ def _proxy_container(
     proxy: ConnectorProxy,
     *,
     gated_tools: tuple[str, ...] = (),
-    grant_store_url: str = "",
+    grant_store: GrantStore | None = None,
 ) -> dict[str, Any]:
     """The caller proxy: it checks each request's token and forwards to the server.
 
-    Every value is a literal. The public keys are public, and the proxy holds no
-    key that can mint. The hardening and the bounds match the server's; 128Mi
-    is roughly three times the proxy's measured peak.
+    Every value is a literal except the grant store password, which arrives by
+    ``secretKeyRef`` so no credential is written into the Deployment, its
+    ReplicaSets or its Pods. The public keys are public, the grant store
+    address carries no password, and the proxy holds no key that can mint. The
+    hardening and the bounds match the server's; 128Mi is roughly three times
+    the proxy's measured peak.
     """
 
     port = caller_proxy_port(spec)
-    env: list[dict[str, str]] = [
+    env: list[dict[str, Any]] = [
         {"name": "CURIE_CALLER_PROXY_PORT", "value": str(port)},
         {"name": "CURIE_CALLER_PROXY_UPSTREAM_PORT", "value": str(spec.port)},
         {"name": "CURIE_CALLER_PROXY_PUBLIC_KEYS", "value": ",".join(proxy.public_keys)},
@@ -734,8 +788,22 @@ def _proxy_container(
                 "value": json.dumps(list(gated_tools), separators=(",", ":")),
             }
         )
-    if grant_store_url:
-        env.append({"name": "CURIE_CALLER_PROXY_GRANT_STORE", "value": grant_store_url})
+    if grant_store is not None:
+        # The address stays a `value` entry, as it always was, so a live
+        # Deployment never flips one entry between `value` and `valueFrom`.
+        env.append({"name": "CURIE_CALLER_PROXY_GRANT_STORE", "value": grant_store.address})
+        env.append(
+            {
+                "name": "CURIE_CALLER_PROXY_GRANT_STORE_PASSWORD",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": grant_store.secret_name,
+                        "key": grant_store.secret_key,
+                        "optional": False,
+                    }
+                },
+            }
+        )
     # ADR 0229: the Host presented on admitted requests only. The server
     # and both Services render unchanged, so a direct caller keeps its Host.
     if spec.proxy_upstream_host is not None:
@@ -914,7 +982,7 @@ def render(
     secret_name: str,
     proxy: ConnectorProxy | None = None,
     gated_tools: tuple[str, ...] = (),
-    grant_store_url: str = "",
+    grant_store: GrantStore | None = None,
 ) -> list[dict[str, Any]]:
     """Every object needed to run one hosted connector. Empty for a remote one.
 
@@ -964,7 +1032,7 @@ def render(
             secret_name,
             proxy,
             gated_tools=gated_tools,
-            grant_store_url=grant_store_url,
+            grant_store=grant_store,
         ),
         render_networkpolicy(release, agent, app_name, connector, spec, proxy),
         render_ingress_networkpolicy(release, agent, app_name, connector, spec, proxy),

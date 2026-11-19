@@ -144,21 +144,70 @@ def _run_gate(repo_root: Path | None = None) -> subprocess.CompletedProcess[str]
     return run_script(CHECKER, *args)
 
 
+def _git_in(repo_root: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-c", "user.name=Schema Window Test",
+            "-c", "user.email=schema-window@example.invalid",
+            "-c", "commit.gpgsign=false",
+            "-c", "tag.gpgsign=false",
+            "-c", "core.hooksPath=/dev/null",
+            "-C", str(repo_root),
+            *args,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _init_fixture_repo(repo_root: Path) -> None:
+    subprocess.run(
+        ["git", "init", "-q", str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _commit_fixture(repo_root: Path, message: str) -> None:
+    _git_in(repo_root, "add", "-A")
+    _git_in(repo_root, "commit", "-q", "-m", message)
+
+
+def _write_window_tree(
+    repo_root: Path,
+    *,
+    app_version: str,
+    revisions: list[str],
+    window_min: str,
+    window_head: str,
+    candidate_min: str | None = None,
+    candidate_head: str | None = None,
+) -> None:
+    """Write a chart, catalog, atlas entry, and a linear migration chain."""
+    _write_chart(repo_root, app_version=app_version)
+    _write_catalog(
+        repo_root,
+        revisions=revisions,
+        window_heads={app_version: window_head},
+        window_mins={app_version: window_min},
+        candidate_min=candidate_min or window_min,
+        candidate_head=candidate_head or window_head,
+        published_versions=(app_version,),
+    )
+    parent: str | None = None
+    for revision in revisions:
+        _write_revision(repo_root, f"{revision}_rev.py", revision, parent)
+        parent = revision
+
+
 def _commit_and_tag(repo_root: Path, version: str) -> None:
     """Turn a fixture tree into a git repository whose HEAD is tagged ``v<version>``."""
-    git = [
-        "git",
-        "-c", "user.name=Schema Window Test",
-        "-c", "user.email=schema-window@example.invalid",
-        "-c", "commit.gpgsign=false",
-        "-c", "tag.gpgsign=false",
-        "-c", "core.hooksPath=/dev/null",
-        "-C", str(repo_root),
-    ]
-    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
-    subprocess.run([*git, "add", "-A"], check=True)
-    subprocess.run([*git, "commit", "-q", "-m", f"release {version}"], check=True)
-    subprocess.run([*git, "tag", f"v{version}"], check=True)
+    _init_fixture_repo(repo_root)
+    _commit_fixture(repo_root, f"release {version}")
+    _git_in(repo_root, "tag", f"v{version}")
 
 
 def _released_fixture_tagged_at_0001(repo_root: Path) -> None:
@@ -435,6 +484,168 @@ def test_adding_a_key_to_a_tagged_released_window_is_refused(tmp_path: Path) -> 
     assert result.returncode == 1, result.stdout
     assert "0.10.1" in result.stderr
     assert "immutable" in result.stderr
+
+
+def test_registered_untagged_candidate_can_advance(tmp_path: Path) -> None:
+    """Before the tag is pushed, the window stays at registration and the candidate moves.
+
+    This is the v0.16.0 interval: the atlas already names the release, migration
+    0160 is added, and only the candidate advances past 0159.
+    """
+    _write_window_tree(
+        tmp_path,
+        app_version="0.16.0",
+        revisions=["0159"],
+        window_min="0159",
+        window_head="0159",
+    )
+    _init_fixture_repo(tmp_path)
+    _commit_fixture(tmp_path, "Register v0.16.0")
+    _write_window_tree(
+        tmp_path,
+        app_version="0.16.0",
+        revisions=["0159", "0160"],
+        window_min="0159",
+        window_head="0159",
+        candidate_min="0159",
+        candidate_head="0160",
+    )
+    _commit_fixture(tmp_path, "Advance the candidate to 0160")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "candidate schema_head 0160" in result.stdout
+
+
+def test_registered_untagged_window_edit_is_refused(tmp_path: Path) -> None:
+    """A registered window cannot be edited to follow the candidate before the tag exists."""
+    _write_window_tree(
+        tmp_path,
+        app_version="0.10.1",
+        revisions=["0001"],
+        window_min="0001",
+        window_head="0001",
+    )
+    _init_fixture_repo(tmp_path)
+    _commit_fixture(tmp_path, "Register v0.10.1")
+    _write_window_tree(
+        tmp_path,
+        app_version="0.10.1",
+        revisions=["0001", "0002"],
+        window_min="0001",
+        window_head="0002",
+        candidate_min="0001",
+        candidate_head="0002",
+    )
+    _commit_fixture(tmp_path, "Move the released window with the candidate")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert "0.10.1" in result.stderr
+    assert "registered" in result.stderr
+    assert "immutable" in result.stderr
+
+
+def test_readable_release_tag_wins_over_registration(tmp_path: Path) -> None:
+    """The tag remains the authority after it exists, including against the registration window."""
+    _write_window_tree(
+        tmp_path,
+        app_version="0.10.1",
+        revisions=["0001"],
+        window_min="0001",
+        window_head="0001",
+    )
+    _init_fixture_repo(tmp_path)
+    _commit_fixture(tmp_path, "Register v0.10.1")
+    _write_window_tree(
+        tmp_path,
+        app_version="0.10.1",
+        revisions=["0001", "0002"],
+        window_min="0001",
+        window_head="0002",
+    )
+    _commit_fixture(tmp_path, "Record the tagged window")
+    _git_in(tmp_path, "tag", "v0.10.1")
+    _write_window_tree(
+        tmp_path,
+        app_version="0.10.1",
+        revisions=["0001", "0002", "0003"],
+        window_min="0001",
+        window_head="0002",
+        candidate_min="0001",
+        candidate_head="0003",
+    )
+    _commit_fixture(tmp_path, "Advance the candidate past the tag")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "candidate schema_head 0003" in result.stdout
+
+    _write_window_tree(
+        tmp_path,
+        app_version="0.10.1",
+        revisions=["0001", "0002", "0003"],
+        window_min="0001",
+        window_head="0001",
+        candidate_min="0001",
+        candidate_head="0003",
+    )
+    refused = _run_gate(tmp_path)
+
+    assert refused.returncode == 1, refused.stdout
+    assert "release tag" in refused.stderr
+    assert "immutable" in refused.stderr
+
+
+def test_shallow_history_keeps_the_candidate_equality_rule(tmp_path: Path) -> None:
+    """A shallow clone cannot read the registration commit, so the old refusal stands."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_window_tree(
+        source,
+        app_version="0.16.0",
+        revisions=["0159"],
+        window_min="0159",
+        window_head="0159",
+    )
+    _init_fixture_repo(source)
+    _commit_fixture(source, "Register v0.16.0")
+    _write_window_tree(
+        source,
+        app_version="0.16.0",
+        revisions=["0159", "0160"],
+        window_min="0159",
+        window_head="0159",
+        candidate_min="0159",
+        candidate_head="0160",
+    )
+    _commit_fixture(source, "Advance the candidate to 0160")
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--no-local",
+            source.as_uri(),
+            str(shallow),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = _run_gate(shallow)
+
+    assert result.returncode == 1, result.stdout
+    assert "differs from candidate" in result.stderr
+    assert "v0.16.0" in result.stderr
+    assert "release tag is not readable" in result.stderr
+    assert "git fetch --tags origin" in result.stderr
 
 
 def test_current_chart_minimum_mismatch_refuses_even_when_heads_match(

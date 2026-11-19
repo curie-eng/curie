@@ -129,6 +129,10 @@ def test_bash_env_omits_platform_credentials_while_the_model_call_keeps_its_key(
     monkeypatch.setenv("ANTHROPIC_API_KEY", _MODEL_KEY)
     monkeypatch.setenv("CURIE_MODEL", "claude-sonnet-5")
     monkeypatch.setenv("STDIO_TOKEN", "connector-sentinel")
+    upload_tokens = tmp_path / "upload-tokens.json"
+    upload_tokens.write_text('{"reviewer":"bundle-upload-readable"}')
+    upload_tokens.chmod(0o400)
+    monkeypatch.setenv("CURIE_CONNECTOR_UPLOAD_TOKENS_FILE", str(upload_tokens))
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     cwd = tmp_path / "workspace"
     cwd.mkdir()
@@ -147,7 +151,11 @@ def test_bash_env_omits_platform_credentials_while_the_model_call_keeps_its_key(
         app = web.Application()
         app["bodies"] = []
         app["api_keys"] = []
-        app["command"] = f"source {startup}; env; bash -c env"
+        app["command"] = (
+            f"source {startup}; env; bash -c env; "
+            'cat "$CURIE_CONNECTOR_UPLOAD_TOKENS_FILE"; '
+            "bash -c 'cat \"$CURIE_CONNECTOR_UPLOAD_TOKENS_FILE\"'"
+        )
         app.router.add_post("/v1/messages", _messages)
         app.router.add_route("*", "/{tail:.*}", _anything_else)
         async with TestServer(app, host="127.0.0.1") as server:
@@ -200,6 +208,7 @@ def test_bash_env_omits_platform_credentials_while_the_model_call_keeps_its_key(
     assert "CURIE_MODEL=claude-sonnet-5" in rendered
     assert "STDIO_TOKEN=connector-sentinel" in rendered
     assert "CURIE_TEST_SHELL=boundary-kept" in rendered
+    assert rendered.count("bundle-upload-readable") >= 2
     assert not capture.exists(), "startup observed a model credential before command cleanup"
     assert not untrusted_capture.exists(), "SDK options replaced the trusted shell launcher"
     assert rendered.count("CURIE_MODEL=claude-sonnet-5") >= 2

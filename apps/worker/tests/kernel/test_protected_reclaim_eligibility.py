@@ -17,9 +17,9 @@ from typing import Any, cast
 
 import pytest
 from aci_protocol import Final, SessionStatus
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker import stream_consumer as stream_consumer_module
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.stream_consumer import DeliverySpec
 
@@ -69,6 +69,7 @@ def test_deferred_over_cap_entry_is_left_untouched_until_eligible(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             consumer._delivery = replace(
                 cast(DeliverySpec, consumer._delivery),
@@ -155,6 +156,7 @@ def test_default_consumer_still_applies_the_existing_over_cap_rule(make_harness)
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             event = _qevent("ordinary retry", thread="tOrdinary", event_id="ordinary")
@@ -213,6 +215,7 @@ def test_compare_and_claim_defers_one_entry_without_blocking_eligible_sibling(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             consumer._delivery = replace(
                 cast(DeliverySpec, consumer._delivery),
@@ -313,6 +316,7 @@ def test_eligible_entry_is_reclaimed_and_committed_after_waiting(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             consumer._delivery = replace(
                 cast(DeliverySpec, consumer._delivery),
@@ -375,6 +379,7 @@ def test_slow_eligibility_refreshes_delivery_cap_before_claim(make_harness) -> N
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(

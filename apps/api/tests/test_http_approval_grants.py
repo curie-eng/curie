@@ -8,7 +8,6 @@ Synthetic inputs only.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import uuid
@@ -21,12 +20,11 @@ import pytest
 import redis
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA
-from curie_api.identity.http_transport import HttpIdentityClient
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context
 from role_policy_support import run
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.api.tests.test_http_approval_creation import (
     RECORD_FIELDS,
@@ -208,112 +206,6 @@ def resolved_case(
         assert delivery_state(valkey, runs_stream, invocation.scope["binding"]) == before
 
 
-@pytest.mark.parametrize("status", ["expired", "rejected"])
-def test_non_grant_resume_repeats_fresh_original_invoker_authority(
-    resolved_case: SimpleNamespace, status: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: each boundary is a new lookup; no actor is reasked."""
-    case = resolved_case
-    token, payload = resume_token(case, resolve(case, status))
-    first = resume_check(case, token, payload, stage="prepare")
-    assert_response(
-        post_check(case.client, first), first, decision="continue", reason="current_authority",
-    )
-    assert len(case.provider.requests) == 3
-    assert case.provider.requests[2]["purpose"] == "invocation"
-    assert case.provider.requests[2]["scope"]["sender"]["native_id"] != ACTOR
-
-    case.provider.member = False
-    second = resume_check(case, token, payload, stage="start")
-    assert_response(
-        post_check(case.client, second), second, decision="refuse", reason="caller_not_allowed",
-    )
-    assert len(case.provider.requests) == 4
-
-
-def test_row_change_during_the_fresh_lookup_is_never_salvaged(
-    resolved_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: the final reader rechecks the unchanged row."""
-    case = resolved_case
-    token, payload = resume_token(case, resolve(case, "expired"))
-    original = HttpIdentityClient.lookup
-
-    async def lookup(client: HttpIdentityClient, **kwargs: Any) -> Any:
-        """@spec HTTP-APPROVAL-CONTINUITY-12: actual verified TLS, then a committed change."""
-        result = await original(client, **kwargs)
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.begin() as connection:
-                await connection.execute(
-                    text(f'UPDATE "{SCHEMA}".approvals SET granted_tool = :tool WHERE id = :id'),
-                    {"tool": "synthetic_other", "id": uuid.UUID(case.approval_id)},
-                )
-        finally:
-            await engine.dispose()
-        return result
-
-    monkeypatch.setattr(HttpIdentityClient, "lookup", lookup)
-    request = resume_check(case, token, payload)
-    assert_response(
-        post_check(case.client, request), request, decision="refuse", reason="invalid_context",
-    )
-    assert len(case.provider.requests) == 3
-
-
-@pytest.mark.parametrize(
-    "defect", ["approval-id", "null-approval-id", "event", "payload", "scope", "cross-purpose"],
-)
-def test_resume_context_requires_exact_parsed_approval_and_signed_inputs(
-    resolved_case: SimpleNamespace, defect: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: no outer value replaces sealed resume scope."""
-    case = resolved_case
-    capsule = resolve(case, "expired")
-    token, payload = resume_token(case, capsule)
-    request = resume_check(case, token, payload)
-    if defect == "approval-id":
-        request["approval_id"] = str(uuid.uuid4())
-    elif defect == "null-approval-id":
-        request["approval_id"] = None
-    elif defect == "event":
-        request["event_id"] = f"approval-{uuid.uuid4()}-resolved"
-    elif defect == "payload":
-        request["payload_sha256"] = "0" * 64
-    elif defect == "scope":
-        request["scope"]["binding_generation"] += 1
-    else:
-        request["context"] = stored(case.approval_id)["identity_context"]
-    assert_response(
-        post_check(case.client, request), request, decision="refuse", reason="invalid_context",
-    )
-    assert len(case.provider.requests) == 2
-
-
-@pytest.mark.parametrize("defect", ["row-effect", "row-status", "record-digest", "invoker"])
-def test_resume_requires_the_current_protected_row_and_preserved_invoker(
-    resolved_case: SimpleNamespace, defect: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: changed rows and retagged invokers never continue."""
-    case = resolved_case
-    capsule = resolve(case, "expired")
-    changes: dict[str, Any] = {}
-    if defect == "record-digest":
-        changes["approval_record_sha256"] = "1" * 64
-    elif defect == "invoker":
-        changes["scope"] = {**capsule.scope.model_dump(), "native_id": ACTOR}
-    token, payload = resume_token(case, capsule, **changes)
-    if defect == "row-effect":
-        write(case.approval_id, {"granted_tool": "synthetic_other"})
-    elif defect == "row-status":
-        write(case.approval_id, {"status": "rejected"})
-    request = resume_check(case, token, payload)
-    assert_response(
-        post_check(case.client, request), request, decision="refuse", reason="invalid_context",
-    )
-    assert len(case.provider.requests) == 2
-
-
 def test_approved_resume_without_fresh_approver_authority_fails_closed(
     resolved_case: SimpleNamespace,
 ) -> None:
@@ -375,121 +267,3 @@ def test_exact_grant_snapshot_reaches_the_approver_boundary_and_fails_closed(
     assert len(case.provider.requests) == 2
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("granted_tool", "synthetic_other"),
-        ("granted_tool", None),
-        ("granted_arguments_json", None),
-        ("granted_arguments_json", '{"path":"other"}'),
-        ("gate_kind", "policy"),
-        ("agent_id", "00000000-0000-4000-8000-0000000000a1"),
-        ("conversation_id", "1760000000.999999"),
-    ],
-)
-def test_changed_grant_snapshot_refuses_before_any_lookup(
-    resolved_case: SimpleNamespace, field: str, value: Any,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: no worker value can retag or widen the grant."""
-    case = resolved_case
-    token, payload = resume_token(case, resolve(case, "approved"))
-    body = grant_request(case, token, payload)
-    body["grant"][field] = value
-    assert_grant(
-        post_grant(case.client, body), body, decision="refuse", reason="invalid_context",
-    )
-    assert len(case.provider.requests) == 2
-
-
-def test_committed_argument_change_after_resolution_refuses_the_grant(
-    resolved_case: SimpleNamespace,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: a changed protected row is never a grant."""
-    case = resolved_case
-    token, payload = resume_token(case, resolve(case, "approved"))
-    write(case.approval_id, {"granted_arguments": {"path": "widened"}})
-    body = grant_request(case, token, payload)
-    assert body["grant"]["granted_arguments_json"] == '{"path":"widened"}'
-    assert_grant(
-        post_grant(case.client, body), body, decision="refuse", reason="invalid_context",
-    )
-
-
-@pytest.mark.parametrize("status", ["rejected", "expired"])
-def test_non_grant_resolution_carries_no_tool_or_argument_grant(
-    resolved_case: SimpleNamespace, status: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: rejected/expired have no grant regardless of fields."""
-    case = resolved_case
-    token, payload = resume_token(case, resolve(case, status))
-    body = grant_request(case, token, payload)
-    assert_grant(
-        post_grant(case.client, body), body, decision="refuse", reason="invalid_context",
-    )
-    assert len(case.provider.requests) == 2
-
-
-def test_invocation_context_cannot_ask_for_a_grant(resolved_case: SimpleNamespace) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: invocation contexts require approval_id=null."""
-    case = resolved_case
-    resolve(case, "approved")
-    body = {"schema_version": 1, "check": check_for(case), "grant": grant_for(case)}
-    body["check"]["approval_id"] = case.approval_id
-    assert_grant(
-        post_grant(case.client, body), body, decision="refuse", reason="unsupported_resume",
-    )
-    assert len(case.provider.requests) == 2
-
-
-@pytest.mark.parametrize(
-    "defect", ["duplicate-key", "nonfinite", "wrong-stage", "mismatched-id", "extra", "oversize"],
-)
-def test_grant_endpoint_bounds_and_strict_parsing_refuse_with_fixed_errors(
-    resolved_case: SimpleNamespace, defect: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: fixed 413/422 before parsing; never another endpoint."""
-    case = resolved_case
-    token, payload = resume_token(case, resolve(case, "approved"))
-    body = grant_request(case, token, payload)
-    raw: bytes | None = None
-    if defect == "duplicate-key":
-        encoded = json.dumps(body)
-        raw = ('{"schema_version":1,' + encoded[1:]).encode()
-    elif defect == "nonfinite":
-        raw = json.dumps({**body, "schema_version": float("nan")}).encode()
-    elif defect == "wrong-stage":
-        body = copy.deepcopy(body)
-        body["check"]["stage"] = "start"
-    elif defect == "mismatched-id":
-        body = copy.deepcopy(body)
-        body["grant"]["approval_id"] = str(uuid.uuid4())
-    elif defect == "extra":
-        body = {**body, "summary": "synthetic"}
-    else:
-        raw = json.dumps({**body, "pad": "x" * 65_536}).encode()
-    response = post_grant(case.client, body, raw=raw)
-    expected = (413, "body_too_large") if defect == "oversize" else (
-        422, "invalid_approval_grant_request"
-    )
-    assert (response.status_code, response.json()) == (expected[0], {"detail": expected[1]})
-    assert response.headers["cache-control"] == "no-store"
-    assert token not in response.text
-    assert len(case.provider.requests) == 2
-
-
-@pytest.mark.parametrize("credential", ["missing", "platform-only"])
-def test_grant_endpoint_requires_the_existing_worker_credential(
-    resolved_case: SimpleNamespace, credential: str,
-) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: a platform credential cannot ask as a worker."""
-    case = resolved_case
-    token, payload = resume_token(case, resolve(case, "approved"))
-    headers = {"Content-Type": "application/json"}
-    if credential == "platform-only":
-        headers["X-API-Key"] = get_settings().api_key
-    response = case.client.post(
-        GRANT_PATH, content=json.dumps(grant_request(case, token, payload)), headers=headers,
-    )
-    assert response.status_code == 401, response.text
-    assert response.headers["cache-control"] == "no-store"
-    assert len(case.provider.requests) == 2

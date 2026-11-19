@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from curie_worker.mrkdwn import to_mrkdwn
+from curie_channel_gateway.slack.mrkdwn import to_mrkdwn
 
 
 @pytest.mark.parametrize(

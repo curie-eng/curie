@@ -4,6 +4,17 @@ Date: 2026-08-25
 
 Status: Accepted
 
+**Partially amended by [ADR 0273](0273-approval-routes-own-expiry-and-reminders.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0273 makes the route deadline an explicit choice, including none, while
+preserving missing-binding refusal and recovery by rejection.
+
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 amends the no-snapshot clause for per-request selection. It stores
+selected people for dynamic routes while preserving current authority and
+missing-route refusal.
+
 Raised by [#1081](https://github.com/curie-eng/curie/issues/1081).
 
 Supersedes the one consequence [ADR 0034](0034-approval-authorizers-resolve-membership-in-the-api.md)

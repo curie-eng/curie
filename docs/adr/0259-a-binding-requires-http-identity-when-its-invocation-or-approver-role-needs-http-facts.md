@@ -4,6 +4,11 @@ Date: 2026-11-02
 
 Status: Accepted
 
+**Partially amended by [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0271 amends decision 1 by adding route policy to HTTP-required
+classification.
+
 Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
 approval by Junwon Jung (jw3329), including merging alongside its realizing
 code path in one combined pull request. The realizing code path is

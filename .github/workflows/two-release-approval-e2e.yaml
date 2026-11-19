@@ -8,8 +8,8 @@ on:
   pull_request:
     branches: [next]
     paths:
-      - "apps/dispatcher/src/curie_dispatcher/approval_actions.py"
-      - "apps/dispatcher/src/curie_dispatcher/handlers.py"
+      - "packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py"
+      - "packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py"
       - "apps/dispatcher/tests/test_approval_actions.py"
       - "cli/scripts/two-release-approval-e2e.sh"
       - "cli/tests/two_release_approval_e2e.rs"
@@ -56,8 +56,10 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
+      - name: Restore kind and kubectl from the Actions cache
+        uses: ./.github/actions/kind-tool-cache
       - name: Install kind and kubectl
-        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30

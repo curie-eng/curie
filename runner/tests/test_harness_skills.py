@@ -311,3 +311,89 @@ def test_the_local_skill_name_rule_matches_the_sdk(name: str) -> None:
     assert _accepts(_local_validate_skill_name, name) is _accepts(sdk_validator, name), (
         f"the local skill-name rule and the SDK's disagree on {name!r}"
     )
+
+
+# --- personal mode keeps the settings loading (#5373, ADR 0268) -------------------------
+#
+# Personal mode changes who authenticates, not what the CLI loads: the same
+# explicit setting sources (ADR 0189), the same bundle skill list and strict MCP
+# config, and never ``--bare`` (bare mode skips CLAUDE_CODE_OAUTH_TOKEN:
+# https://code.claude.com/docs/en/authentication, "Generate a long-lived token").
+# The reviewer alias resolves from the explicit reviewer model alone.
+
+_REVIEWER_ENV = "ANTHROPIC_DEFAULT_OPUS_MODEL"
+_CREDENTIAL_ENVS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CURIE_MODEL_AUTH_MODE")
+
+
+def _clear_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (*_CREDENTIAL_ENVS, _REVIEWER_ENV):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("ambient_credential", "reviewer"),
+    [
+        # The service prefix rule would pick openai/gpt-6.1-sol for these.
+        ("sk-or-PLACEHOLDER", "claude-opus-5-5"),
+        ("PLACEHOLDER-non-anthropic", "claude-fable-5-1"),
+        # And claude-opus-5-5 for this one.
+        ("sk-ant-oat01-PLACEHOLDER-owner", "claude-sonnet-5-5[1m]"),
+    ],
+)
+def test_personal_options_keep_settings_loading_and_take_the_explicit_reviewer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ambient_credential: str,
+    reviewer: str,
+) -> None:
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+    from curie_runner.personal_auth import AUTH_MODE_ENV
+    from curie_runner.plugin import bundle_skill_names
+
+    _clear_credentials(monkeypatch)
+    monkeypatch.setenv(AUTH_MODE_ENV, "personal")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", ambient_credential)
+    monkeypatch.setenv(_REVIEWER_ENV, "claude-opus-4-1-20250805")
+    plugin_dir = _bundle(tmp_path, {"greet": "greet", "hello": "hello"})
+
+    options = _options(plugin_dir, skills=bundle_skill_names(plugin_dir), reviewer_model=reviewer)
+
+    assert options.env[_REVIEWER_ENV] == reviewer
+    assert options.setting_sources == _SETTING_SOURCES
+    assert options.skills == ["probe:greet", "probe:hello"]
+    assert options.strict_mcp_config is True
+    command = SubprocessCLITransport(
+        prompt="", options=replace(options, cli_path="claude")
+    )._build_command()  # noqa: SLF001 -- the argv the CLI is spawned with
+    assert "--bare" not in command
+    assert "--setting-sources=user,project,local" in command
+    assert "--strict-mcp-config" in command
+
+
+@pytest.mark.parametrize(
+    ("credential_env", "credential", "default"),
+    [
+        ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-PLACEHOLDER", "claude-opus-5-5"),
+        ("ANTHROPIC_API_KEY", "sk-ant-api03-PLACEHOLDER", "claude-opus-5-5"),
+        ("ANTHROPIC_API_KEY", "sk-or-PLACEHOLDER", "openai/gpt-6.1-sol"),
+    ],
+)
+@pytest.mark.parametrize("mode", [None, "service"], ids=["mode-absent", "mode-service"])
+def test_service_options_keep_the_credential_prefix_reviewer_default(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str | None,
+    credential_env: str,
+    credential: str,
+    default: str,
+) -> None:
+    _clear_credentials(monkeypatch)
+    if mode is not None:
+        monkeypatch.setenv("CURIE_MODEL_AUTH_MODE", mode)
+    monkeypatch.setenv(credential_env, credential)
+
+    assert _options(None).env[_REVIEWER_ENV] == default
+    # An explicit service reviewer is passed through as it is, Claude or not.
+    assert _options(None, reviewer_model="openai/gpt-6.1-sol").env[_REVIEWER_ENV] == (
+        "openai/gpt-6.1-sol"
+    )
+    assert _options(None).setting_sources == _SETTING_SOURCES

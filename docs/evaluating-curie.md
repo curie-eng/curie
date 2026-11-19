@@ -38,7 +38,7 @@ Release/main source boundaries:
 | Kubernetes Secrets | Store, model, API, webhook and Slack credentials; per-agent connector secrets | [Secret template](../charts/curie/templates/secrets.yaml), [credential path](../ARCHITECTURE.md#the-credential-path) |
 | Configured model provider | Prompts, model output, provider authentication | [Provider seam](interfaces/model-provider/INTERFACE.md) |
 | Code host and tracker | Branches, PRs, issues, comments, labels | [Publication API](../apps/api/src/curie_api/routers/publication_code_host.py) |
-| Slack (when connected) | Conversation messages and replies | [Dispatcher](../apps/dispatcher/src/curie_dispatcher/handlers.py) |
+| Slack (when connected) | Conversation messages and replies | [Dispatcher](../packages/channel-gateway/src/curie_channel_gateway/slack/handlers.py) |
 
 Local connector secret values can reside in agent JSONB; cluster values use per-agent Secrets ([Agent model](../apps/api/src/curie_api/models.py), [ADR-0009](adr/0009-per-agent-connector-auth.md), Accepted). [Approvals](approvals.md) are authorized in the API from authenticated resolver identity; publication has its own policy.
 

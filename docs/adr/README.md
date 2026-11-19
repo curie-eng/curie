@@ -11,14 +11,17 @@ current state.
 
 ## Claiming a number
 
-**The next free number is one past the last row of the table below.** Read it
-from this index, not from an `ls` of your branch: a branch that has not been
-rebased shows a stale tail, and every number collision this repo has had came
-from exactly that. Check open PRs for a number already reserved off-main before
-claiming one.
-
-The number-prefix uniqueness of `docs/adr/` is gated in CI (`scripts/check-docs.sh`),
-so a collision fails the build rather than reaching main.
+**The next free number is one past the highest number allocated across the
+working tree, `origin/main`, `origin/next`, and open PRs that add an ADR.**
+Do not trust an `ls` of your branch alone: a branch that has not been rebased
+shows a stale tail, and every number collision this repo has had came from
+exactly that. The docs gate (`scripts/check-docs.sh` → `curie_doclint
+--require-remote-adr-scan`) fetches both trains, lists open PR additions, and
+reports the full allocation union. A collision this PR **adds or renames into**
+fails the required check; collisions only among other open PRs or already on
+the trains are logged as warnings so an unrelated or repairing PR is not
+blocked. When this PR adds or renames an ADR, a failed remote scan still fails
+closed; otherwise a scan failure is a warning.
 
 ## The index
 
@@ -208,6 +211,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0181 | [Every mean tester probe only reads or asks](0181-every-mean-tester-probe-only-reads-or-asks.md) | Accepted |
 | 0182 | [A signed hook may complete a preposted reply](0182-a-signed-hook-may-complete-a-preposted-reply.md) | Accepted |
 | 0184 | [Settled stream entries are trimmed; receipts live in Postgres; backlog is counted, not rated](0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md) | Draft |
+| 0185 | [Enterprise plugins are licensed services behind open ports](0185-enterprise-plugins-are-licensed-services-behind-open-ports.md) | Draft |
 | 0186 | [A factory ticket declares its base branch and keeps it](0186-a-factory-ticket-declares-its-base-and-keeps-it.md) | Accepted |
 | 0187 | [The factory polls GitHub for its work, and the platform reads the issue](0187-the-factory-polls-github-and-the-platform-reads-the-issue.md) | Accepted |
 | 0188 | [The sandbox memory credential is scoped to its own channel](0188-the-sandbox-memory-credential-is-scoped-to-its-own-channel.md) | Accepted |
@@ -286,4 +290,15 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0264 | [A selected delivery's reply slot is authenticated but outside its delivery intent](0264-a-selected-deliverys-reply-slot-is-authenticated-but-outside-its-delivery-intent.md) | Accepted |
 | 0265 | [A file-bearing Slack message's sender team may come from the sender's own files](0265-a-file-bearing-slack-messages-sender-team-may-come-from-the-senders-own-files.md) | Accepted |
 | 0266 | [Email receivers share a trusted sender domain under one namespace](0266-email-receivers-share-a-trusted-sender-domain-under-one-namespace.md) | Accepted |
+| 0267 | [An email reply answers an approval under the HTTP approver role](0267-an-email-reply-answers-an-approval-under-the-http-approver-role.md) | Accepted |
+| 0268 | [Personal subscription execution and its acceptance contract](0268-personal-subscription-execution-and-acceptance-contract.md) | Accepted |
+| 0269 | [Factory failure retries share a bounded fresh request allowance](0269-factory-failure-retries-share-a-bounded-fresh-request-allowance.md) | Accepted |
+| 0270 | [Hosted connectors receive the verified requester as a signed caller claim](0270-hosted-connectors-receive-the-verified-requester-as-a-signed-caller-claim.md) | Accepted |
+| 0271 | [Per-request approver sets and separation of duties](0271-per-request-approver-sets-and-separation-of-duties.md) | Accepted |
+| 0272 | [Approver DM delivery uses one selected recipient](0272-approver-dm-delivery-uses-one-selected-recipient.md) | Accepted |
+| 0273 | [Approval routes own expiry and reminders](0273-approval-routes-own-expiry-and-reminders.md) | Accepted |
+| 0274 | [A declared webhook wake skips overlap until the next poll](0274-a-declared-webhook-wake-skips-overlap-until-the-next-poll.md) | Accepted |
+| 0275 | [A channel gateway owns provider authentication and I/O](0275-channel-gateway-provider-boundary.md) | Accepted |
+| 0276 | [Static shells share capacity and receive agent inputs per claim](0276-static-shells-share-capacity-and-receive-agent-inputs-per-claim.md) | Accepted |
+| 0278 | [Requester coding instructions are pinned preferences below repository rules](0278-requester-coding-instructions.md) | Draft |
 <!-- END GENERATED: adr-index -->

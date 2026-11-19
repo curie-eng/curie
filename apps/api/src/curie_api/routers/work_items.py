@@ -12,11 +12,12 @@ from pydantic import BaseModel, Field, StrictBool, model_validator
 
 from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
 
-from .. import workitem_dispatch
+from .. import personal_execution, workitem_dispatch
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import LivenessSessionDep, SessionDep
 from ..forges.types import RepositoryRef, TrackerIssueRef
+from ..personal_execution import ModelAuthMode, OwnerContext
 from ..workitem_dispatch import DispatchConflict
 
 router = APIRouter(
@@ -45,6 +46,18 @@ class RepositoryIn(BaseModel):
     path: str = Field(min_length=1)
 
 
+class OwnerContextIn(BaseModel):
+    """The verified owner a personal execution runs as (#5376, ADR 0268).
+
+    Accepted only here, from the trusted worker: a principal of the agent's
+    tenant and the enrollment generation it is bound to.
+    """
+
+    tenant_id: uuid.UUID
+    principal_id: uuid.UUID
+    enrollment_generation: int = Field(ge=1)
+
+
 class AdmissionFacts(BaseModel):
     agent_id: uuid.UUID
     kind: str = Field(min_length=1)
@@ -56,9 +69,11 @@ class AdmissionFacts(BaseModel):
     objective: str = Field(min_length=1, max_length=65536)
     requester: str = Field(min_length=1)
     request_id: uuid.UUID
+    model_auth_mode: ModelAuthMode = "service"
+    owner: OwnerContextIn | None = None
 
     def admission(self) -> workitem_dispatch.Admission:
-        tracker, repository = self.tracker, self.repository
+        tracker, repository, owner = self.tracker, self.repository, self.owner
         return workitem_dispatch.Admission(
             agent_id=self.agent_id,
             kind=self.kind,
@@ -78,6 +93,16 @@ class AdmissionFacts(BaseModel):
             objective=self.objective,
             requester=self.requester,
             request_id=self.request_id,
+            model_auth_mode=self.model_auth_mode,
+            owner=(
+                OwnerContext(
+                    tenant_id=owner.tenant_id,
+                    principal_id=owner.principal_id,
+                    enrollment_generation=owner.enrollment_generation,
+                )
+                if owner is not None
+                else None
+            ),
         )
 
 
@@ -163,6 +188,70 @@ class RunningWorkItemRequest(BaseModel):
     repository_path: str
     context: workitem_dispatch.FactoryContext | None
     refusal: workitem_dispatch.RefusalCode | None
+
+
+class PersonalContextRequestOut(BaseModel):
+    """The WorkItem's latest request and the generation it snapshotted."""
+
+    id: uuid.UUID
+    sequence: int
+    status: str
+    version: int
+    enrollment_generation: int | None
+
+
+class PersonalContextEnrollmentOut(BaseModel):
+    """The owner's enrollment header: its generation, state and CAS version."""
+
+    generation: int
+    active: bool
+    version: int
+
+
+class PersonalContextOut(BaseModel):
+    """A personal WorkItem's owner, bound generation and versions (#5376).
+
+    Token free: identifiers, generations and versions only. ``enrollment`` is
+    null when the owner has no enrollment row.
+    """
+
+    work_item_id: uuid.UUID
+    agent_id: uuid.UUID
+    tenant_id: uuid.UUID
+    model_auth_mode: ModelAuthMode
+    owner_principal_id: uuid.UUID
+    enrollment_generation: int
+    work_item_version: int
+    request: PersonalContextRequestOut | None
+    enrollment: PersonalContextEnrollmentOut | None
+
+
+class RevalidationBody(BaseModel):
+    """The versions the caller read, compared and set in one transaction."""
+
+    tenant_id: uuid.UUID
+    agent_id: uuid.UUID
+    owner_principal_id: uuid.UUID
+    request_id: uuid.UUID
+    expected_work_item_version: int = Field(ge=1)
+    expected_request_version: int = Field(ge=1)
+    expected_enrollment_version: int = Field(ge=1)
+
+
+class RevalidationOut(BaseModel):
+    """The generation the WorkItem is now bound to and the versions it moved to."""
+
+    work_item_id: uuid.UUID
+    request_id: uuid.UUID
+    previous_generation: int
+    enrollment_generation: int
+    work_item_version: int
+    request_version: int
+    enrollment_version: int
+
+
+# One body for a missing, other-tenant, other-agent, other-owner or service item.
+_NOT_FOUND = {"code": "not_found"}
 
 
 def _raise_conflict(result: object) -> None:
@@ -283,6 +372,57 @@ async def cancel_work_item(
             else None
         ),
     }
+
+
+@router.get("/{work_item_id}/personal-context", response_model=PersonalContextOut)
+async def read_personal_context(
+    work_item_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    owner_principal_id: uuid.UUID,
+    session: SessionDep,
+) -> PersonalContextOut:
+    """The token-free facts a worker revalidates a personal WorkItem from (#5376)."""
+
+    context = await personal_execution.read_context(
+        session,
+        work_item_id=work_item_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        owner_principal_id=owner_principal_id,
+    )
+    if context is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
+    return PersonalContextOut.model_validate(context, from_attributes=True)
+
+
+@router.post("/{work_item_id}/personal-context/revalidate", response_model=RevalidationOut)
+async def revalidate_personal_context(
+    work_item_id: uuid.UUID, body: RevalidationBody, session: SessionDep
+) -> RevalidationOut:
+    """Bind a personal WorkItem to its owner's current enrollment generation.
+
+    Compare-and-set on the WorkItem, request and enrollment versions; a stale
+    version, another owner, an inactive enrollment, a live runtime or an
+    unchanged generation is 409 with its code (#5376).
+    """
+
+    result = await personal_execution.revalidate(
+        session,
+        work_item_id=work_item_id,
+        tenant_id=body.tenant_id,
+        agent_id=body.agent_id,
+        owner_principal_id=body.owner_principal_id,
+        request_id=body.request_id,
+        expected_work_item_version=body.expected_work_item_version,
+        expected_request_version=body.expected_request_version,
+        expected_enrollment_version=body.expected_enrollment_version,
+    )
+    if isinstance(result, personal_execution.ContextConflict):
+        if result.code == "not_found":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
+        raise HTTPException(status.HTTP_409_CONFLICT, {"code": result.code})
+    return RevalidationOut.model_validate(result, from_attributes=True)
 
 
 @router.post("/requests/{request_id}/acquire")

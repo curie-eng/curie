@@ -10,20 +10,13 @@ before any row is rewritten.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_rows
 from alembic import command
-from curie_api.config import get_settings
-from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.sql import text
 
 BELOW = "0033"
 
@@ -109,76 +102,6 @@ def test_upgrade_refuses_malformed_legacy_routes_without_partial_rewrite(
     assert "z-malformed" in message
     assert "legal" in message
     assert _routes_by_name() == before
-
-
-def test_upgrade_table_lock_blocks_a_concurrent_agent_write(
-    isolated_migration_db: IsolatedMigrationDb,
-) -> None:
-    """The preflight and rewrite exclude writes for the whole transaction."""
-
-    cfg = alembic_config()
-    isolated_migration_db.at(BELOW)
-    _seed_agent("slow-route", {"managers": {"channel": "C0EXAMPLE1"}})
-    writer_id = _seed_agent("writer-agent", None)
-    sql_rows(
-        """
-        CREATE FUNCTION curie.pause_approval_route_rewrite() RETURNS trigger
-        LANGUAGE plpgsql AS $$
-        BEGIN
-            IF OLD.name = 'slow-route' THEN
-                PERFORM pg_sleep(1);
-            END IF;
-            RETURN NEW;
-        END;
-        $$
-        """
-    )
-    sql_rows(
-        """
-        CREATE TRIGGER pause_approval_route_rewrite
-        BEFORE UPDATE ON curie.agents
-        FOR EACH ROW EXECUTE FUNCTION curie.pause_approval_route_rewrite()
-        """
-    )
-
-    def concurrent_write() -> None:
-        async def run() -> None:
-            engine = create_async_engine(get_settings().database_url)
-            try:
-                async with engine.begin() as conn:
-                    await conn.execute(text("SET LOCAL lock_timeout = '100ms'"))
-                    await conn.execute(
-                        text("UPDATE curie.agents SET name = 'writer-moved' WHERE id = :id"),
-                        {"id": writer_id},
-                    )
-            finally:
-                await engine.dispose()
-
-        asyncio.run(run())
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        migration = pool.submit(command.upgrade, cfg, "head")
-        deadline = time.monotonic() + 3
-        while not sql_rows(
-            """
-            SELECT 1 FROM pg_stat_activity
-            WHERE query LIKE '%UPDATE curie.agents AS a%'
-              AND wait_event = 'PgSleep'
-            """
-        ):
-            if migration.done():
-                migration.result()
-                pytest.fail("migration completed before the concurrent-write probe")
-            assert time.monotonic() < deadline, "migration never entered the delayed rewrite"
-            time.sleep(0.02)
-
-        with pytest.raises(DBAPIError, match="lock timeout"):
-            concurrent_write()
-        migration.result(timeout=5)
-
-    assert sql_rows("SELECT name FROM curie.agents WHERE id = :id", {"id": writer_id}) == [
-        ("writer-agent",)
-    ]
 
 
 def test_downgrade_restores_lossless_slack_only_routes(

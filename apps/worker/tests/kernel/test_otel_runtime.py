@@ -39,7 +39,7 @@ from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.attachments import AttachmentResolutionError
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import HttpIdentityBinding
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel import constants as kernel_constants
 from curie_worker.kernel import log as kernel_log
@@ -145,6 +145,7 @@ def test_missing_or_malformed_carrier_runs_and_acks_under_a_safe_root(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             fields = {"payload": _qevent("safe root").model_dump_json()}
@@ -270,6 +271,8 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
 
     No binding leaves ``unbound``. A binding's agent name is the label. The
     fleet ``curie.turn.completed`` point never gains an agent attribute.
+    #5814: ``curie.agent.turn.duration`` carries the fleet duration's value
+    under the same agent and outcome, and the fleet duration stays unlabeled.
     """
 
     class _Resolved:
@@ -324,6 +327,10 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
             agent_points = _metrics(probe, "curie.agent.turn.completed")
             assert agent_points[-1].attributes["agent"] == "unbound"
             assert agent_points[-1].attributes["outcome"] == "done"
+            durations = _metrics(probe, "curie.agent.turn.duration")
+            assert len(durations) == 1
+            assert durations[-1].attributes["agent"] == "unbound"
+            assert "agent" not in _metrics(probe, "curie.turn.duration")[-1].attributes
 
         probe.metrics.clear()
         async with make_harness(binding=_Binding()) as named:
@@ -341,6 +348,18 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
             validate_record_metric(
                 "curie.turn.completed",
                 attributes=fleet[-1].attributes,
+            )
+            # #5814: the same seconds as the fleet histogram, under the agent.
+            fleet_duration = _metrics(probe, "curie.turn.duration")
+            agent_duration = _metrics(probe, "curie.agent.turn.duration")
+            assert len(fleet_duration) == len(agent_duration) == 1
+            assert "agent" not in fleet_duration[-1].attributes
+            assert agent_duration[-1].value == fleet_duration[-1].value
+            assert agent_duration[-1].attributes == named_points[-1].attributes
+            validate_record_metric(
+                "curie.agent.turn.duration",
+                agent_duration[-1].value,
+                attributes=agent_duration[-1].attributes,
             )
             token = kernel_constants._TURN_AGENT.set("unbound")
             try:
@@ -491,6 +510,7 @@ def test_worker_process_parent_flows_to_exact_runner_http_client_boundary(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             event = _qevent("trace me", event_id="Ev0EXAMPLETRACE1")
@@ -538,6 +558,7 @@ def test_queue_success_retry_and_dead_letter_emit_bounded_outcomes_and_keep_carr
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -998,6 +1019,7 @@ def test_every_named_request_path_span_carries_the_delivered_event_id(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             event = _qevent("stamp me", event_id="Ev0EXAMPLEKNOWN1")
@@ -1033,6 +1055,7 @@ def test_failed_processing_keeps_the_event_id_on_the_span_and_off_the_metrics(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1077,6 +1100,7 @@ def test_lease_loss_pending_path_keeps_the_event_id_on_the_span(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1198,6 +1222,7 @@ def test_twelve_overlapping_turns_keep_their_event_ids_on_their_own_subtrees(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             assert consumer._max_concurrency >= turns, (
@@ -1305,6 +1330,7 @@ def test_no_event_id_survives_a_turn_or_crosses_into_the_next_one(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             first = _qevent("first", thread="thread-leak-a", event_id="Ev0EXAMPLELEAKA1")
@@ -1359,6 +1385,7 @@ def test_thread_reset_drain_spans_are_not_stamped_with_the_turns_event_id(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             # A DIFFERENT thread than the turn's: the drain tears down thread B

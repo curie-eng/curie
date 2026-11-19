@@ -7,8 +7,8 @@ Status: Accepted
 Accepted 2026-11-02 under ADR 0102 coordinated acceptance with explicit
 approval by Junwon Jung (jw3329), including merging alongside its realizing
 code path in one combined pull request. The realizing code path is
-`curie_dispatcher.http_receiver.HttpReceiverRuntime.prepare` and `send`,
-`curie_dispatcher.handlers._selected_delivery`,
+`curie_channel_gateway.slack.http_receiver.HttpReceiverRuntime.prepare` and `send`,
+`curie_channel_gateway.slack.handlers._selected_delivery`,
 `curie_api.identity.http_invocation.delivery_intent_digest`, and
 `curie_api.delivery.read_identity_delivery_receipt_with_slot`. The CODEOWNERS approving review by TheConnMan was
 not obtained before merge.

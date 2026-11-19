@@ -888,3 +888,53 @@ def test_resolve_refuses_adapter_plus_operator_and_adapter_plus_console(
 
     assert _status(adapter_client, auth_headers, approval["id"]) == "pending"
     assert _audit(adapter_client, auth_headers, approval["id"]) == []
+
+
+@pytest.mark.parametrize(
+    "change", [{"subject": "another-adapter"}, {"binding_ids": [str(uuid.uuid4())]}]
+)
+def test_rotation_refuses_subject_or_binding_override(
+    adapter_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    change: dict[str, Any],
+) -> None:
+    _agent, binding = _email_agent(adapter_client, auth_headers, f"rotate-{_uid()}@example.test")
+    response = adapter_client.post(
+        "/approvals/principals/adapter/rotate",
+        json={"ttl_s": 60, **change},
+        headers=_adp(_adapter_token([binding])),
+    )
+    assert response.status_code == 422
+
+
+def test_rotation_is_capped_preserves_predecessor_and_audits_subject(
+    adapter_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    _agent, binding = _email_agent(adapter_client, auth_headers, f"audit-{_uid()}@example.test")
+    current = _adapter_token([binding])
+    with caplog.at_level(logging.INFO, logger="curie_api.routers.approvals"):
+        rotated = adapter_client.post(
+            "/approvals/principals/adapter/rotate",
+            json={"ttl_s": 604800},
+            headers=_adp(current),
+        )
+    assert rotated.status_code == 201
+    assert rotated.headers["cache-control"] == "no-store"
+    assert rotated.json()["subject"] == ADAPTER_SUBJECT
+    assert rotated.json()["binding_ids"] == [binding]
+    assert "adapter principal rotated principal_kind=adapter" in caplog.text
+    assert f"subject={ADAPTER_SUBJECT}" in caplog.text
+    assert current not in caplog.text and rotated.json()["token"] not in caplog.text
+    assert adapter_client.get("/approvals", headers=_adp(current)).status_code == 200
+    rejected = adapter_client.post(
+        "/approvals/principals/adapter/rotate",
+        json={"ttl_s": 604801},
+        headers=_adp(current),
+    )
+    assert rejected.status_code == 422

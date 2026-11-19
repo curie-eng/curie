@@ -214,7 +214,8 @@ def main():
     require({"dispatcher", "mail-adapter"} <= components(enabled_workloads, enabled_workloads), "enabled render must contain dispatcher and mail-adapter")
     print("OK: dispatcher and mail adapter sealed checksums match their consumed keys")
 
-    dev = {"security": {"allowDevDefaults": True}}
+    dev = {"security": {"allowDevDefaults": True},
+           "channelGateway": {"deploy": True, "tlsSecret": "acme-gateway-tls"}}
     dev_docs = render("dev", dev)
     base = audit(dev_docs, "dev")
     null_passthrough = merge(dev, {
@@ -259,7 +260,7 @@ def main():
             require(bool(expected), f"{label}: the key has no audited consumer")
             require(changed == expected, f"{label}: changed workloads differ from rendered key consumers")
             if profile == "default" and secret_key == "slackBotToken":
-                require(components(baseline, changed) == {"api", "worker"}, "Slack bot token rotation must change only API and worker")
+                require(components(baseline, changed) == {"channel-gateway"}, "Slack bot token rotation must change only the gateway")
             if secret_key == "valkeyPassword":
                 require(any(identity[0] == "StatefulSet" and baseline[identity]["component"] == "valkey" for identity in changed), "Valkey password rotation must change the Valkey StatefulSet")
             print(f"OK: {label} changes exactly its {len(expected)} rendered consumer(s)")

@@ -8,6 +8,7 @@ tenant with one registered identity; synthetic inputs only.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 import uuid
@@ -17,10 +18,12 @@ from typing import Any
 
 import pytest
 import redis
+from _migration_support import sql_rows
 from curie_api import agent_role_policy
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA
 from curie_api.identity.http_approval import approval_is_selected
+from curie_api.identity.http_invocation import binding_requires_http_identity
 from curie_api.identity.http_transport import HttpIdentityClient
 from curie_api.main import create_app
 from curie_api.models import Agent, AgentChannel, Approval
@@ -28,6 +31,7 @@ from curie_api.resumequeue import ResumeQueue
 from curie_api.sweeper import sweep_expired_approvals
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from principal_adoption_support import ISSUER
 from redis import asyncio as redis_async
 from role_policy_support import change, run
 from sqlalchemy import text
@@ -135,6 +139,7 @@ def _insert(
 
 def _route(binding: dict[str, Any], approvers: list[str]) -> None:
     """@spec HTTP-APPROVAL-CONTINUITY-14: a legacy approval route with an explicit user list."""
+    address = binding["address"] if binding["kind"] == "slack" else "C0EXAMPLE1"
 
     async def write(factory: async_sessionmaker[AsyncSession]) -> None:
         """@spec HTTP-APPROVAL-CONTINUITY-14."""
@@ -142,7 +147,7 @@ def _route(binding: dict[str, Any], approvers: list[str]) -> None:
             agent = await session.get(Agent, uuid.UUID(binding["agent"]))
             assert agent is not None
             agent.approval_routes = {ROUTE: {
-                "resolution": {"kind": binding["kind"], "address": binding["address"]},
+                "resolution": {"kind": "slack", "address": address},
                 "approvers": {"users": approvers},
             }}
 
@@ -181,7 +186,10 @@ def test_legacy_binding_in_an_adopted_tenant_keeps_the_legacy_approval_path(
     sibling = _sibling(scope, kind=kind)
     _route(sibling, ["U0EXAMPLEOTHER"])
     with TestClient(_app(scope, synthetic_provider, initialized=initialized)) as client:
-        body = _body(sibling, route=ROUTE)
+        body = _body(
+            sibling, route=ROUTE,
+            card_channel=sibling["address"] if kind == "slack" else "C0EXAMPLE1",
+        )
         response = _create(client, body)
         assert response.status_code == 201, response.text
         stored = _stored(body["dedupe_key"])
@@ -556,3 +564,159 @@ def test_ambiguous_route_of_the_agents_own_legacy_bindings_is_refused_strictly(
         assert _status(approval_id) == "pending"
         assert audits(approval_id) == []
     assert synthetic_provider.requests == []
+
+
+# --- ADR 0271: route policy makes every binding of the agent HTTP-required ------
+#
+# ADR 0259 decision 1 as amended by ADR 0271 decision 5: in a selecting tenant,
+# an agent with a selector route, an enabled requester exclusion or exemption,
+# or a separation the platform cannot read has every binding classified as
+# requiring HTTP identity, registered or not. The sibling agent below has no
+# role policy and an unregistered identity, so only its route map can move it.
+
+POLICY_ROUTE = "synthetic-policy-route"
+_EXEMPT = {"issuer": ISSUER, "id": "SyntheticExemptGroup"}
+_TICKET = {"connector": "access", "tool": "execute", "key_id": "selector-example-1"}
+
+
+def _route_policy(binding: dict[str, Any], policy: Any) -> None:
+    """@spec REQUEST-APPROVAL-5: stored route policy, as an operator write would leave it.
+
+    A selector registration needs the requester flag in storage, so it is set
+    beside one.
+    """
+    selector = isinstance(policy, dict) and "approver_ticket" in policy
+    if isinstance(policy, dict):
+        policy = {"resolution": {"kind": "slack", "address": binding["address"]}, **policy}
+    sql_rows(
+        f'UPDATE "{SCHEMA}".agents SET approval_routes = CAST(:routes AS jsonb), '
+        "connector_requester_identity = :flag WHERE id = :id",
+        {"routes": json.dumps({POLICY_ROUTE: policy}), "flag": selector,
+         "id": uuid.UUID(binding["agent"])},
+    )
+
+
+def _classified(binding_id: str, runtime: Any) -> bool:
+    """@spec REQUEST-APPROVAL-5: the one per-binding HTTP classification."""
+    result: list[bool] = []
+
+    async def check(factory: async_sessionmaker[AsyncSession]) -> None:
+        """@spec REQUEST-APPROVAL-5."""
+        async with factory() as session:
+            binding = await session.get(AgentChannel, uuid.UUID(binding_id))
+            assert binding is not None
+            result.append(await binding_requires_http_identity(session, runtime, binding))
+
+    run(check)
+    return result[0]
+
+
+@pytest.mark.parametrize(
+    ("policy", "required"),
+    [
+        pytest.param({}, False, id="ordinary"),
+        pytest.param({"approvers": {"users": ["U0EXAMPLE1"]}}, False, id="approver-list"),
+        pytest.param({"separation": {"exclude_requester": False}}, False, id="exclusion-off"),
+        pytest.param({"separation": {"exclude_requester": True}}, True, id="static-exclusion"),
+        pytest.param(
+            {"separation": {"exclude_requester": True, "exempt_group": _EXEMPT}}, True,
+            id="exemption",
+        ),
+        pytest.param({"approver_ticket": _TICKET}, True, id="selector"),
+        pytest.param(
+            {"approver_ticket": _TICKET, "separation": {"exclude_requester": False}}, True,
+            id="selector-opted-out",
+        ),
+        pytest.param({"separation": "on"}, True, id="malformed-separation"),
+        pytest.param({"separation": {"exclude_requester": "yes"}}, True, id="malformed-flag"),
+        pytest.param(
+            {"separation": {"exclude_requester": False, "exempt_group": _EXEMPT}}, True,
+            id="exemption-without-exclusion",
+        ),
+        pytest.param("C0EXAMPLEROUTE", True, id="unreadable-route"),
+    ],
+)
+def test_route_policy_decides_the_http_classification_of_every_binding(
+    synthetic_provider: SimpleNamespace,  # noqa: F811 - the reused fixture.
+    policy: Any,
+    required: bool,
+) -> None:
+    """@spec REQUEST-APPROVAL-5 REQUEST-APPROVAL-6: selector or exclusion routes need HTTP facts.
+
+    A malformed separation fails closed to required; an ordinary route, an
+    approver list and an explicit opt-out keep the binding legacy.
+    """
+    scope = _scope(synthetic_provider.url)
+    sibling = _sibling(scope)
+    runtime = _runtime(_runtime_api(), scope)
+    assert _classified(sibling["binding"], runtime) is False
+    _route_policy(sibling, policy)
+    assert _classified(sibling["binding"], runtime) is required
+    assert _classified(sibling["binding"], None) is required
+    # The registered binding of the adopted agent stays required either way.
+    assert _classified(scope["binding"], runtime) is True
+    assert synthetic_provider.requests == []
+
+
+def test_route_policy_moves_legacy_creation_to_the_selected_path(
+    synthetic_provider: SimpleNamespace,  # noqa: F811 - the reused fixture.
+) -> None:
+    """@spec REQUEST-APPROVAL-6: a static exclusion route cannot be answered on the legacy path.
+
+    Approval continuity asks the same classification, so a provenance-free
+    public creation on the sibling's exclusion route is refused, while the same
+    request on an ordinary route still creates.
+    """
+    scope = _scope(synthetic_provider.url)
+    sibling = _sibling(scope)
+    with TestClient(_app(scope, synthetic_provider, initialized=True)) as client:
+        _route_policy(sibling, {})
+        ordinary = _body(sibling, route=POLICY_ROUTE)
+        assert _create(client, ordinary).status_code == 201
+        _route_policy(sibling, {"separation": {"exclude_requester": True}})
+        excluded = _body(sibling, route=POLICY_ROUTE)
+        refused = _create(client, excluded)
+        assert refused.status_code == 409, refused.text
+        assert refused.json() == {"detail": "unsupported_approval"}
+        assert _stored(excluded["dedupe_key"]) == []
+    assert synthetic_provider.requests == []
+
+
+def test_disabled_authority_does_not_make_an_exclusion_route_legacy(
+    synthetic_provider: SimpleNamespace,  # noqa: F811 - the reused fixture.
+) -> None:
+    scope = _scope(synthetic_provider.url)
+    sibling = _sibling(scope)
+    _route_policy(sibling, {"separation": {"exclude_requester": True}})
+    sql_rows(
+        f'UPDATE "{SCHEMA}".tenant_identity_providers '
+        "SET http_selection = CAST(:selection AS jsonb) WHERE tenant_id = :tenant",
+        {"selection": json.dumps({"mode": "disabled"}), "tenant": uuid.UUID(scope["tenant"])},
+    )
+    assert _classified(sibling["binding"], None) is True
+    with TestClient(_app(scope, synthetic_provider, initialized=False)) as client:
+        body = _body(sibling, route=POLICY_ROUTE)
+        refused = _create(client, body)
+        assert refused.status_code == 409, refused.text
+        assert refused.json() == {"detail": "unsupported_approval"}
+        assert _stored(body["dedupe_key"]) == []
+    assert synthetic_provider.requests == []
+
+
+def test_route_policy_classifies_only_in_a_selecting_tenant(
+    synthetic_provider: SimpleNamespace,  # noqa: F811 - the reused fixture.
+) -> None:
+    """@spec REQUEST-APPROVAL-6: a tenant on its local authority keeps every binding legacy."""
+    scope = _scope(synthetic_provider.url)
+    sibling = _sibling(scope)
+    runtime = _runtime(_runtime_api(), scope)
+    _route_policy(sibling, {"separation": {"exclude_requester": True}})
+    assert _classified(sibling["binding"], runtime) is True
+    sql_rows(
+        f'UPDATE "{SCHEMA}".tenant_identity_providers SET http_selection = NULL, '
+        "governed_domains = CAST(:domains AS jsonb), managed_by = 'synthetic-directory' "
+        "WHERE tenant_id = :tenant",
+        {"domains": json.dumps(["example.test"]), "tenant": uuid.UUID(scope["tenant"])},
+    )
+    assert _classified(sibling["binding"], runtime) is False
+    assert _classified(sibling["binding"], None) is False

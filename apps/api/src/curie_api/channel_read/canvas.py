@@ -23,11 +23,27 @@ from typing import TypeVar
 import httpx
 from aci_protocol.turn import SLACK_KIND
 from channel_protocol import ChannelCapability
+from curie_channel_gateway.read_errors import ChannelReadRefused
+from curie_channel_gateway.read_models import (
+    BindingRoute,
+    CanvasCellRecord,
+    CanvasDocument,
+    CanvasFile,
+)
+from curie_channel_gateway.read_transport import RemoteCanvasReader
+from curie_channel_gateway.slack.canvas import (
+    CANVASES_EDIT,
+    CONVERSATIONS_INFO,
+    FILES_DOWNLOAD,
+    FILES_INFO,
+    FILES_LIST,
+    cell_text_problem,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings
-from ..identities import slack_bot_tokens
+from ..identities import gateway_client
 from ..models import AgentChannel, ChannelCanvasEdit
 from ..schemas.channel_read import (
     CanvasCell,
@@ -39,27 +55,10 @@ from ..schemas.channel_read import (
     ChannelSelector,
 )
 from .canvas_sections import CanvasSections
-from .errors import ChannelReadRefused
 from .ledger import ChannelReadLedger
 from .provider_guard import ProviderGuard
-from .readers import (
-    BindingRoute,
-    CanvasCellRecord,
-    CanvasDocument,
-    CanvasFile,
-    CanvasReader,
-    canvas_reader_for,
-)
+from .readers import CanvasReader, canvas_reader_for
 from .service import authorized_binding, check_authority, reserve_page
-from .slack_canvas import (
-    CANVASES_EDIT,
-    CONVERSATIONS_INFO,
-    FILES_DOWNLOAD,
-    FILES_INFO,
-    FILES_LIST,
-    SlackCanvasReader,
-    cell_text_problem,
-)
 from .token import ChannelReadClaims
 
 T = TypeVar("T")
@@ -77,7 +76,8 @@ _OPTIONAL = frozenset({"channel", "kind"})
 def canvas_readers(settings: Settings, http: httpx.AsyncClient) -> Mapping[str, CanvasReader]:
     """Every surface with canvases, keyed by binding kind."""
 
-    return {SLACK_KIND: SlackCanvasReader(http, slack_bot_tokens(settings))}
+    client = gateway_client(settings, http)
+    return {SLACK_KIND: RemoteCanvasReader(client)}
 
 
 def _invalid_identifier(message: str) -> ChannelReadRefused:

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND
 from channel_protocol.reply import ReplyTarget
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -17,6 +18,38 @@ from .publication_loop import PublicationWork
 from .reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute
 
 _SAFE_SCHEMA = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _policy_card_target(
+    *,
+    card_channel: str,
+    reply_kind: str,
+    reply_adapter: str | None,
+    reply_identity: str | None,
+) -> tuple[ReplyTarget, TargetRoute]:
+    """Where a card on its route's fixed Slack channel posts (ADR 0177, #5542).
+
+    The kernel's rule (``kernel/approval.py`` ``_pause_for_approval``) for a
+    card that is not in the requesting channel: it posts top level in a fixed
+    policy channel, so it belongs to no conversation, mints its own ref, and
+    has no endpoint. A Slack reply lends its bot identity, selected as
+    ``binding.binding_adapter_for_handle`` does (the relay's stored identity,
+    else the default); any other reply kind gets the worker's default Slack
+    identity. It does no lookups and has no refusal of its own, so the only
+    failures are model validation of values the API already validated. A
+    failure here happens after the claim committed.
+    """
+
+    if reply_kind != SLACK_KIND:
+        adapter = None
+    elif reply_adapter == CLUSTER_MESSAGE_ADAPTER:
+        adapter = reply_identity or DEFAULT_IDENTITY
+    else:
+        adapter = reply_adapter
+    return (
+        ReplyTarget(kind=SLACK_KIND, address=card_channel, conversation_id=None, reply_ref=None),
+        TargetRoute(endpoint=None, adapter=adapter),
+    )
 
 
 class PublicationStoreError(RuntimeError):
@@ -108,10 +141,11 @@ class PostgresPublicationStore:
             f"""
             SELECT p.id, p.approval_id, p.reply_kind, p.reply_channel,
                    p.reply_placeholder, p.reply_endpoint, p.reply_adapter,
+                   p.reply_identity,
                    p.approval_card_delivery_attempts,
                    p.approval_card_version,
                    p.approval_card_delivery_started_at,
-                   a.conversation_id, a.summary, a.author
+                   a.conversation_id, a.summary, a.author, a.card_channel
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
              WHERE (
@@ -176,12 +210,16 @@ class PostgresPublicationStore:
             publication_id = uuid.UUID(str(row["id"]))
             version = int(updated["approval_card_version"])
             self._card_versions[publication_id] = version
-        return PublicationCardWork(
-            publication_id=publication_id,
-            approval_id=uuid.UUID(str(row["approval_id"])),
-            summary=str(row["summary"]),
-            requested_by=str(row["author"]),
-            target=ReplyTarget(
+        card_channel = row["card_channel"]
+        if card_channel is not None and str(card_channel) != str(row["reply_channel"]):
+            target, route = _policy_card_target(
+                card_channel=str(card_channel),
+                reply_kind=str(row["reply_kind"]),
+                reply_adapter=row["reply_adapter"],
+                reply_identity=row["reply_identity"],
+            )
+        else:
+            target = ReplyTarget(
                 kind=str(row["reply_kind"]),
                 address=str(row["reply_channel"]),
                 conversation_id=str(row["conversation_id"]),
@@ -192,8 +230,15 @@ class PostgresPublicationStore:
                     if row["reply_adapter"] == CLUSTER_MESSAGE_ADAPTER
                     else None
                 ),
-            ),
-            route=TargetRoute(endpoint=row["reply_endpoint"], adapter=row["reply_adapter"]),
+            )
+            route = TargetRoute(endpoint=row["reply_endpoint"], adapter=row["reply_adapter"])
+        return PublicationCardWork(
+            publication_id=publication_id,
+            approval_id=uuid.UUID(str(row["approval_id"])),
+            summary=str(row["summary"]),
+            requested_by=str(row["author"]),
+            target=target,
+            route=route,
             attempt=int(updated["approval_card_delivery_attempts"]),
             version=version,
         )

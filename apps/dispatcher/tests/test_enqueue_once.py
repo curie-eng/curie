@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import io
+import json
+import os
+import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import redis
 from aci_protocol import QueuedTurn, ReplyHandle
-from curie_dispatcher import enqueue_once
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.queue import from_stream_fields
+from curie_channel_gateway.slack import enqueue_once
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_internal.turn_queue import from_stream_fields
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 from curie_telemetry.tracing import configure_tracer_provider
 from opentelemetry import context as otel_context
@@ -129,7 +133,6 @@ def test_main_without_otlp_endpoint_prints_only_the_stream_id(
     redis_client: redis.Redis,
     config: DispatcherConfig,
     monkeypatch,
-    capsys,
 ) -> None:
     """No-endpoint mode keeps the real Valkey producer functional and quiet."""
     turn = _turn()
@@ -141,12 +144,18 @@ def test_main_without_otlp_endpoint_prints_only_the_stream_id(
     monkeypatch.setenv(
         "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "dispatcher-attester-test-secret"
     )
-    monkeypatch.setattr(enqueue_once.sys, "stdin", io.StringIO(turn.model_dump_json()))
-
-    assert enqueue_once.main() == 0
-
-    captured = capsys.readouterr()
-    stream_id = captured.out.strip()
+    result = subprocess.run(
+        [sys.executable, "-m", "curie_channel_gateway.slack.enqueue_once"],
+        input=turn.model_dump_json(), env=dict(os.environ),
+        capture_output=True, text=True, check=False, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    records = [json.loads(line) for line in result.stderr.splitlines() if line.startswith("{")]
+    assert any(
+        record.get("severity") == "INFO" and record.get("service.name") == "curie-dispatcher"
+        for record in records
+    )
+    stream_id = result.stdout.strip()
     milliseconds, sequence = stream_id.split("-", maxsplit=1)
     assert milliseconds.isdigit()
     assert sequence.isdigit()

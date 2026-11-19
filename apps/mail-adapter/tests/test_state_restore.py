@@ -10,7 +10,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from curie_mail_adapter.state import MailState
+from curie_channel_gateway.mail.state import MailState
 
 
 def test_copied_sqlite_file_keeps_pending_work_and_refuses_duplicate_ids(

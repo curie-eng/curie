@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -431,6 +432,98 @@ def test_exception_keeps_redacted_stderr_traceback_but_closes_otlp_fields() -> N
         logger.setLevel(original_level)
         logger.propagate = original_propagate
         logger_provider.shutdown()
+
+
+def test_stderr_json_records_exception_type() -> None:
+    redaction_probe = "sk-" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE5555"
+    sql_probe = "SELECT id FROM agents"
+    stderr = io.StringIO()
+    logger = logging.getLogger("curie.telemetry.stderr-exception-type")
+    original_handlers = list(logger.handlers)
+    original_level = logger.level
+    original_propagate = logger.propagate
+    had_preserve_marker = hasattr(logger, "_curie_preserve_propagated_handlers")
+    original_preserve_marker = getattr(
+        logger, "_curie_preserve_propagated_handlers", None
+    )
+
+    try:
+        configure_service_logging(logger, service_name="curie-api", stream=stderr)
+        logger.error("plain diagnostic without exc_info")
+        try:
+            raise RuntimeError(
+                f"agent listing failed sql={sql_probe} credential={redaction_probe}"
+            )
+        except RuntimeError:
+            logger.exception("agent listing request failed")
+        try:
+            raise asyncio.CancelledError
+        except asyncio.CancelledError:
+            logger.exception("request cancelled")
+
+        plain, runtime_error, cancelled = [
+            json.loads(line) for line in stderr.getvalue().splitlines()
+        ]
+
+        assert "exception.type" not in plain
+        assert "exception" not in plain
+
+        assert runtime_error["exception.type"] == "RuntimeError"
+        assert sql_probe not in runtime_error["exception.type"]
+        assert redaction_probe not in runtime_error["exception.type"]
+        assert "Traceback" not in runtime_error["exception.type"]
+        assert "Traceback (most recent call last)" in runtime_error["exception"]
+        assert "RuntimeError" in runtime_error["exception"]
+        assert redaction_probe not in runtime_error["message"]
+        assert redaction_probe not in runtime_error["exception"]
+        assert "[REDACTED:" in runtime_error["exception"]
+
+        assert cancelled["exception.type"] == "CancelledError"
+        assert cancelled["exception.type"] == asyncio.CancelledError.__name__
+        assert "asyncio" not in cancelled["exception.type"]
+    finally:
+        logger.handlers[:] = original_handlers
+        logger.setLevel(original_level)
+        logger.propagate = original_propagate
+        if had_preserve_marker:
+            logger._curie_preserve_propagated_handlers = original_preserve_marker  # type: ignore[attr-defined]
+        else:
+            del logger._curie_preserve_propagated_handlers  # type: ignore[attr-defined]
+
+    # The recovery parser reads the stderr line uvicorn's own logger emits, so
+    # the field must survive on a logger named ``uvicorn.error`` too.
+    uvicorn_error = logging.getLogger("uvicorn.error")
+    uvicorn_stderr = io.StringIO()
+    original_uvicorn_handlers = list(uvicorn_error.handlers)
+    original_uvicorn_level = uvicorn_error.level
+    original_uvicorn_propagate = uvicorn_error.propagate
+    had_uvicorn_marker = hasattr(uvicorn_error, "_curie_preserve_propagated_handlers")
+    original_uvicorn_marker = getattr(
+        uvicorn_error, "_curie_preserve_propagated_handlers", None
+    )
+    try:
+        configure_service_logging(
+            uvicorn_error, service_name="curie-api", stream=uvicorn_stderr
+        )
+        try:
+            raise RuntimeError("agent listing failed after database restart")
+        except RuntimeError:
+            uvicorn_error.exception("agent listing request failed")
+
+        (uvicorn_record,) = [
+            json.loads(line) for line in uvicorn_stderr.getvalue().splitlines()
+        ]
+        assert uvicorn_record["logger"] == "uvicorn.error"
+        assert uvicorn_record["exception.type"] == "RuntimeError"
+        assert "Traceback (most recent call last)" in uvicorn_record["exception"]
+    finally:
+        uvicorn_error.handlers[:] = original_uvicorn_handlers
+        uvicorn_error.setLevel(original_uvicorn_level)
+        uvicorn_error.propagate = original_uvicorn_propagate
+        if had_uvicorn_marker:
+            uvicorn_error._curie_preserve_propagated_handlers = original_uvicorn_marker  # type: ignore[attr-defined]
+        else:
+            del uvicorn_error._curie_preserve_propagated_handlers  # type: ignore[attr-defined]
 
 
 def test_curie_credential_in_exception_is_redacted_on_the_service_logger() -> None:

@@ -10,6 +10,7 @@ reconcile loop, and stops with the worker's shutdown.
 from __future__ import annotations
 
 import asyncio
+import base64
 import types
 from collections.abc import Callable
 from pathlib import Path
@@ -21,7 +22,7 @@ from curie_worker.action_executor_loop import ActionExecutorLoop
 from curie_worker.config import WorkerConfig
 from curie_worker.worker_lifecycle import WorkerResources
 
-SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+SEED = base64.b64encode(bytes(range(32))).decode()
 
 
 def _config(**fields: Any) -> WorkerConfig:

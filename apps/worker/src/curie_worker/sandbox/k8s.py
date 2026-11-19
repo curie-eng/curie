@@ -6,11 +6,12 @@
 ``extensions.agents.x-k8s.io`` for ``SandboxClaim``) via the official client's
 CustomObjectsApi. Unit tests use an in-memory fake of the protocol (the K8s
 control plane is an external service); the real implementation is exercised by
-the k8scratch e2e test.
+the env-gated cluster e2e tests.
 """
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import json
 import logging
@@ -18,7 +19,8 @@ import re
 import socket
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -40,10 +42,12 @@ from ..workspace import (
 )
 from .claim_tokens import (
     CLAIM_LABEL,
+    MODEL_AUTH_MODE_ENV,
     ClaimObjectNames,
     claim_object_names,
     claim_template_spec,
     executor_withheld_names,
+    personal_withheld_names,
     split_claim_tokens,
 )
 from .quota import ADMISSION_DIMENSIONS, quota_has_live_headroom, quota_rejection_is_valid
@@ -177,6 +181,28 @@ def _resource_map(raw: str) -> dict[str, str] | None:
     return values or None
 
 
+def _transient_read[T](plural: str, name: str, read: Callable[[], T]) -> T:
+    """A typed single-object read with ``_get``'s transient classification.
+
+    The runtime-class and quota reads sit on the same footprint observation
+    path as ``_get`` but call the typed APIs directly (#5406), so they share
+    its classification instead of letting a 5xx or transport fault escape as
+    ``ApiException``/``MaxRetryError`` past the admission-wait handler. A
+    ``MaxRetryError`` is a urllib3 ``HTTPError``, so the transport branch also
+    covers it when its reason is not a timeout. 403/404 stay ``ApiException``.
+    """
+    try:
+        return read()
+    except k8s_client.ApiException as exc:
+        if exc.status in _TRANSIENT_STATUSES:
+            raise KubeTransientError(f"kube API {exc.status} reading {plural}/{name}") from exc
+        raise
+    except Urllib3HTTPError as exc:
+        raise KubeTransientError(
+            f"kube API transport error reading {plural}/{name}: {type(exc).__name__}"
+        ) from exc
+
+
 def _quota_rejection(status: dict[str, Any]) -> QuotaRejection | None:
     conditions = status.get("conditions")
     if not isinstance(conditions, list):
@@ -286,6 +312,8 @@ def _sandbox_view(obj: dict[str, Any]) -> SandboxView:
         ready=_conditions_ready(status),
         service_fqdn=status.get("serviceFQDN") or None,
         operating_mode=str((obj.get("spec") or {}).get("operatingMode", "Running")),
+        # The in-cluster headless Service: plain HTTP at the root.
+        transport="http",
     )
 
 
@@ -593,6 +621,19 @@ def _daemon_view(kind: DaemonObjectKind, obj: Any) -> DaemonObjectView:
 # threads behind repeated pings (each one fails closed instead).
 _PORT_FORWARDS = threading.BoundedSemaphore(8)
 
+# The capacity inventory's three LISTs run here (#5630): three for each of up to
+# 16 inventories in flight at once, the default per-worker turn concurrency
+# (CURIE_WORKER_MAX_CONCURRENCY). One bounded pool for the process, not one per
+# call: threads start lazily and are reused, so ticks do not grow them. A LIST
+# still queued when its call ends is cancelled and never issues a request. A
+# LIST already reading cannot be interrupted; it finishes in the background on
+# its pool thread within the SDK's own timeouts, its result or error is
+# discarded, and nothing retries it.
+_INVENTORY_LIST_THREADS = 48
+_INVENTORY_POOL = ThreadPoolExecutor(
+    max_workers=_INVENTORY_LIST_THREADS, thread_name_prefix="capacity-inventory"
+)
+
 
 def _owner_ref(api_version: str, kind: str, name: str, uid: str) -> dict[str, str]:
     """An ownerReference with no ``controller`` or ``blockOwnerDeletion``."""
@@ -713,8 +754,9 @@ class KubernetesSandboxClient:
         executor_secret_names: frozenset[str] | None = None,
         executor_withheld: frozenset[str] = frozenset(),
         tool_daemon: ToolDaemonMount | None = None,
-    ) -> ClaimObjectNames:
-        """Write the per-claim template, token Secret and pool; return their names.
+        personal_mode: bool = False,
+    ) -> tuple[ClaimObjectNames, frozenset[str]]:
+        """Write the claim objects; return names and personal credential names.
 
         The source template is the one ``pool``'s ``sandboxTemplateRef`` names,
         so per-agent connector ``secretKeyRef`` entries (#1488) survive the copy.
@@ -731,6 +773,9 @@ class KubernetesSandboxClient:
         source_spec = self._source_template_spec(
             source_name, request_timeout_seconds=_claim_timeout(deadline)
         )
+        personal_withheld = (
+            personal_withheld_names(source_spec) if personal_mode else frozenset()
+        )
         spec = claim_template_spec(
             source_spec,
             secret_name=names.secret,
@@ -740,6 +785,7 @@ class KubernetesSandboxClient:
             executor_secret_names=executor_secret_names,
             executor_withheld=executor_withheld,
             tool_daemon=tool_daemon,
+            personal_mode=personal_mode,
         )
         labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: claim}
         try:
@@ -802,7 +848,7 @@ class KubernetesSandboxClient:
         except Exception:
             self._rollback_delete("sandboxtemplates", names.template)
             raise
-        return names
+        return names, personal_withheld
 
     def _pool_template_name(self, pool: str, *, request_timeout_seconds: float) -> str:
         """The template ``pool``'s ``sandboxTemplateRef`` names; a missing pool refuses."""
@@ -848,8 +894,12 @@ class KubernetesSandboxClient:
         runtime_class = pod.get("runtimeClassName")
         if runtime_class and not pod.get("overhead"):
             if runtime_class not in runtime_class_overheads:
-                runtime = self._node_api.read_runtime_class(
-                    runtime_class, _request_timeout=request_timeout_seconds
+                runtime = _transient_read(
+                    "runtimeclasses",
+                    runtime_class,
+                    lambda: self._node_api.read_runtime_class(
+                        runtime_class, _request_timeout=request_timeout_seconds
+                    ),
                 )
                 overhead = getattr(runtime, "overhead", None)
                 runtime_class_overheads[runtime_class] = (
@@ -897,23 +947,81 @@ class KubernetesSandboxClient:
                 raise TimeoutError("sandbox capacity inventory deadline expired")
             return remaining
 
-        claims = cast(
-            dict[str, Any],
-            self._api.list_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
-                _request_timeout=budget(),
-            ),
-        )["items"]
-        sandboxes = cast(
-            dict[str, Any],
-            self._api.list_namespaced_custom_object(
-                CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
-                _request_timeout=budget(),
-            ),
-        )["items"]
-        pods = self._core_api.list_namespaced_pod(
-            self._namespace, _request_timeout=budget()
-        ).items
+        def list_claims() -> list[dict[str, Any]]:
+            return cast(
+                dict[str, list[dict[str, Any]]],
+                self._api.list_namespaced_custom_object(
+                    EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims",
+                    _request_timeout=budget(),
+                ),
+            )["items"]
+
+        def list_sandboxes() -> list[dict[str, Any]]:
+            return cast(
+                dict[str, list[dict[str, Any]]],
+                self._api.list_namespaced_custom_object(
+                    CORE_GROUP, CORE_VERSION, self._namespace, "sandboxes",
+                    _request_timeout=budget(),
+                ),
+            )["items"]
+
+        def list_pods() -> list[k8s_client.V1Pod]:
+            try:
+                return self._core_api.list_namespaced_pod(
+                    self._namespace, _request_timeout=budget()
+                ).items
+            except k8s_client.ApiException as exc:
+                if exc.status in _TRANSIENT_STATUSES:
+                    raise KubeTransientError(f"kube API {exc.status} listing pods") from exc
+                raise
+
+        # The three LISTs run concurrently (#5630): issued one after another,
+        # three healthy reads were summed against the one total budget, so
+        # ordinary API latency failed admission and maintenance. The bound is
+        # unchanged (#5296 Decision 3): each LIST still gets the budget
+        # remaining when it is issued, and an expired budget raises before any
+        # request. The call returns or raises at the first deciding outcome or
+        # the deadline, whichever comes first, never later than the sequential
+        # code would for the same fault. Results are taken in the fixed order
+        # claims, sandboxes, Pods: the first failure whose earlier siblings all
+        # succeeded is raised as-is, and a later LIST's failure never preempts
+        # an earlier one still in flight. Past the deadline the call raises the
+        # same TimeoutError an exhausted budget always has. There is no partial
+        # inventory and no retry. On the way out every LIST is cancelled, so
+        # one still queued never issues a request; one already reading cannot
+        # be interrupted, finishes in the background on its pool thread within
+        # the SDK's own timeouts, and its result or error is discarded. Each
+        # LIST runs in its own copy of the caller's context, as
+        # ``asyncio.to_thread`` would, so context variables set by the caller
+        # (the delivery lease, the active span) stay visible to it.
+        claims_listed = _INVENTORY_POOL.submit(contextvars.copy_context().run, list_claims)
+        sandboxes_listed = _INVENTORY_POOL.submit(
+            contextvars.copy_context().run, list_sandboxes
+        )
+        pods_listed = _INVENTORY_POOL.submit(contextvars.copy_context().run, list_pods)
+        listed: tuple[Future[Any], ...] = (claims_listed, sandboxes_listed, pods_listed)
+        try:
+            while True:
+                for future in listed:
+                    if not future.done():
+                        break
+                    future.result()
+                else:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("sandbox capacity inventory deadline expired")
+                wait(
+                    [future for future in listed if not future.done()],
+                    timeout=remaining,
+                    return_when=FIRST_COMPLETED,
+                )
+        finally:
+            for future in listed:
+                future.cancel()
+        claims = claims_listed.result()
+        sandboxes = sandboxes_listed.result()
+        pods = pods_listed.result()
         footprints: dict[str, dict[str, str]] = {}
         claim_names: set[str] = set()
         runtime_class_overheads: dict[str, dict[str, str]] = {}
@@ -1026,8 +1134,12 @@ class KubernetesSandboxClient:
     def read_quota(
         self, quota_name: str, *, request_timeout_seconds: float
     ) -> QuotaStatus:
-        quota = self._core_api.read_namespaced_resource_quota(
-            quota_name, self._namespace, _request_timeout=request_timeout_seconds
+        quota = _transient_read(
+            "resourcequotas",
+            quota_name,
+            lambda: self._core_api.read_namespaced_resource_quota(
+                quota_name, self._namespace, _request_timeout=request_timeout_seconds
+            ),
         )
         metadata = cast(k8s_client.V1ObjectMeta, quota.metadata)
         spec = cast(k8s_client.V1ResourceQuotaSpec, quota.spec)
@@ -1082,25 +1194,33 @@ class KubernetesSandboxClient:
         _claim_timeout(deadline)  # a spent deadline refuses before any write
         env = filter_agent_child_env(env)
         executor = executor_secret_names is not None
+        personal_mode = not executor and env.get(MODEL_AUTH_MODE_ENV) == "personal"
         withheld: frozenset[str] = frozenset()
+        if executor or personal_mode:
+            withheld = executor_withheld_names(env)
+        tokens, env = split_claim_tokens(env)
         if executor:
+            tokens = {k: v for k, v in tokens.items() if k not in withheld}
+        if executor or personal_mode:
             # @spec ACTION-EXECUTOR-5: no model credential, its env-key
             # declaration, or a name that declaration points at reaches an
             # executor runner, by claim or template.
-            withheld = executor_withheld_names(env)
             env = {k: v for k, v in env.items() if k not in withheld}
+        if personal_mode:
+            env.pop(MODEL_AUTH_MODE_ENV, None)
         # Scoped tokens never ride the value-only claim (#3842): they go to a
         # per-claim Secret read by a per-claim template copy, which also
         # carries any runner resources override. A token-free claim keeps the
         # chart pool or the per-agent resources pool. An executor claim always
         # takes the per-claim path: claim env cannot remove what the pool
         # template carries, so only its own stripped copy can (ACTION-EXECUTOR-5).
+        # Personal mode always takes a stripped copy, even without a grant, so
+        # the runner cannot inherit the installation's model credential.
         # A Docker-enabled claim takes it too: its daemon client files ride the
         # per-claim Secret, mounted read-only on the runner (ADR 0217).
-        tokens, env = split_claim_tokens(env)
         claim_template: str | None = None
-        if tokens or executor or tool_daemon is not None:
-            claim_names = self._claim_scoped_pool(
+        if tokens or executor or personal_mode or tool_daemon is not None:
+            claim_names, personal_withheld = self._claim_scoped_pool(
                 name,
                 pool,
                 tokens,
@@ -1109,7 +1229,10 @@ class KubernetesSandboxClient:
                 executor_secret_names,
                 withheld,
                 tool_daemon,
+                personal_mode=personal_mode,
             )
+            if personal_mode:
+                env = {k: v for k, v in env.items() if k not in personal_withheld}
             pool = claim_names.pool
             claim_template = claim_names.template
         elif runner_resources is not None:

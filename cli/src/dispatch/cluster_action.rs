@@ -1262,6 +1262,46 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .await?,
             )
         }
+        ClusterAction::IdentityAuthority {
+            action,
+            tenant,
+            apply,
+            after,
+            conn,
+            dry_run,
+        } => {
+            let (method, path) = commands::authority_target(&action, tenant, after)?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run && !matches!(action.as_str(), "adopt" | "replace"),
+            )
+            .await?;
+            emit(commands::identity_operator(api_url, api_key, method, path, apply, dry_run).await?)
+        }
+        ClusterAction::RoleFilter {
+            action,
+            tenant,
+            agent,
+            role,
+            apply,
+            conn,
+            dry_run,
+        } => {
+            let (method, path) =
+                commands::role_filter_target(&action, tenant, agent, role.as_deref())?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(commands::identity_operator(api_url, api_key, method, path, apply, dry_run).await?)
+        }
         ClusterAction::Directory {
             tenant,
             resource,
@@ -1521,7 +1561,8 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         ClusterAction::Hook { action, conn } => {
             let dry_run = match &action {
                 ClusterHookAction::Fire { dry_run, .. }
-                | ClusterHookAction::Record { dry_run, .. } => *dry_run,
+                | ClusterHookAction::Record { dry_run, .. }
+                | ClusterHookAction::WakeKey { dry_run, .. } => *dry_run,
             };
             let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
                 conn.api_url,
@@ -1565,6 +1606,31 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     })
                     .await?,
                 ),
+                ClusterHookAction::WakeKey {
+                    command,
+                    agent,
+                    name,
+                    dry_run,
+                } => {
+                    let (agent, name, rotate) = match command {
+                        Some(ClusterWakeKeyCommand::Rotate { agent, name }) => (agent, name, true),
+                        None => {
+                            let (agent, name) = commands::require_wake_key_target(agent, name)?;
+                            (agent, name, false)
+                        }
+                    };
+                    emit(
+                        commands::hook_wake_key(commands::HookWakeKeyOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            name,
+                            rotate,
+                            dry_run,
+                        })
+                        .await?,
+                    )
+                }
             }
         }
         ClusterAction::Delete {
@@ -1817,6 +1883,15 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     reason,
                     recovery_key,
                 },
+            routes_version:
+                ApprovalRoutesVersionArgs {
+                    routes_expected_version,
+                },
+            requester:
+                RequesterIdentityArgs {
+                    requester_identity,
+                    expected_version,
+                },
         } => {
             let ClusterAgentTarget {
                 agent,
@@ -1831,6 +1906,23 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 dry_run,
             )
             .await?;
+            // ADR 0270 decision 1: its own object, so clap has already refused
+            // every gate, route, pending-record and recovery flag beside it.
+            if let Some(mode) = requester_identity {
+                return emit_boxed(
+                    commands::approvals_requester_identity(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        mode,
+                        expected_version,
+                    )
+                    .await?,
+                );
+            }
             emit(
                 commands::approvals(
                     AgentActionOpts {
@@ -1854,6 +1946,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         routes_from,
                         list_routes,
                         clear_routes,
+                        routes_expected_version,
                         report_identity,
                         recover,
                         reason,

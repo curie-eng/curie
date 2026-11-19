@@ -27,6 +27,7 @@ import uuid
 from typing import cast
 
 import httpx
+from curie_channel_gateway.tls import gateway_http_mounts
 from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import String, and_, select
@@ -35,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .approval_auth import AuthenticatedApprovalPrincipal, AuthenticatedPrincipalKind
 from .approvers import ApproverSetSelector
-from .config import get_settings
+from .config import Settings, get_settings
 from .identity.slack import SlackEvidence
 from .models import (
     ActionAuditEntry,
@@ -142,6 +143,13 @@ async def _owed(session: AsyncSession, limit: int) -> list[uuid.UUID]:
     return list(rows)
 
 
+def recovery_http_client(settings: Settings) -> httpx.AsyncClient:
+    """The recovery pass uses the same origin-scoped trust as request handling."""
+    return httpx.AsyncClient(
+        timeout=_HTTP_TIMEOUT_S, mounts=gateway_http_mounts(settings.channel_gateway_url)
+    )
+
+
 async def reconcile_undo_approvals(
     session: AsyncSession,
     *,
@@ -158,8 +166,9 @@ async def reconcile_undo_approvals(
     owed = await _owed(session, limit)
     if not owed:
         return 0
-    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S) as http:
-        selector = approver_sets or build_approver_set_selector(http, get_settings())
+    settings = get_settings()
+    async with recovery_http_client(settings) as http:
+        selector = approver_sets or build_approver_set_selector(http, settings)
         decided = 0
         for approval_id in owed:
             decided += await _rerun(session, approval_id, selector)

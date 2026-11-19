@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from forge_fakes.github import (
     INSTALLATION_ID,
     REPO,
+    REPO_ID,
     GitHubAPI,
     factory_env,
     fake_installation_tokens,
@@ -225,18 +226,24 @@ class _GitHubComments(BaseHTTPRequestHandler):
                 "number": number, "title": server.titles.get(number, f"Issue {number}")
             }
             if "/pulls/" in path:
-                # GitHub computes mergeability asynchronously and returns null:
+                # GitHub computes mergeability asynchronously and returns null.
+                # head.repo.id and base.repo.id are the repository's integer id:
                 # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
                 index = min(len(server.pull_observations), len(server.pull_script) - 1)
                 server.pull_observations.append(number)
                 html_base = get_settings().github_html_base.rstrip("/")
+                repo = {"id": REPO_ID, "full_name": REPO}
                 payload.update(
                     {
                         "html_url": f"{html_base}/{REPO}/pull/{number}",
                         "state": "open",
                         "merged_at": None,
-                        "head": {"ref": f"curie/pr-{number}", "sha": HEAD_A},
-                        "base": {"ref": "main"},
+                        "head": {
+                            "ref": f"curie/pr-{number}",
+                            "sha": HEAD_A,
+                            "repo": dict(repo),
+                        },
+                        "base": {"ref": "main", "repo": dict(repo)},
                     }
                 )
                 payload.update(server.pull_script[index])

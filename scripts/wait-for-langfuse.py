@@ -39,6 +39,31 @@ WORKER_PROBE = (
     ".catch(() => process.exit(1))"
 )
 FAILURE_CAUSES = (
+    ("disk", (
+        "no space left on device",
+    )),
+    ("registry-unavailable", (
+        r"unexpected (?:http )?status[^\n]*\b5\d\d\b",
+        "500 internal server error",
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+    )),
+    ("network-timeout", (
+        "context deadline exceeded",
+        "tls handshake timeout",
+        "i/o timeout",
+        r"client\.timeout exceeded",
+        "request canceled while waiting for connection",
+    )),
+    ("network-connection", (
+        "connection reset by peer",
+        "connection refused",
+        "no such host",
+    )),
+    ("image-transfer", (
+        "unexpected eof",
+    )),
     ("image-pull", (
         "pull access denied",
         "manifest unknown",
@@ -57,13 +82,28 @@ FAILURE_CAUSES = (
         "dependency failed to start",
         "is unhealthy",
     )),
+    ("container-exited", (
+        r"container [^\n]+ exited \(\d+\)",
+        r"service [^\n]+ didn't complete successfully",
+    )),
+    ("healthcheck-timeout", (
+        "application not healthy after",
+    )),
+    ("configuration", (
+        "is required but is disabled",
+        "no such service",
+        r"required variable [^\n]+ is missing a value",
+        "invalid interpolation format",
+        "depends on undefined service",
+        "has no healthcheck configured",
+    )),
+    ("daemon-unavailable", (
+        "cannot connect to the docker daemon",
+    )),
     ("network", (
         "failed to create network",
         "could not find an available",
         "non-overlapping",
-    )),
-    ("disk", (
-        "no space left on device",
     )),
 )
 
@@ -146,14 +186,21 @@ class Readiness:
                 f"(phase={phase}, exit code unavailable)"
             ) from None
         if check and result.returncode != 0:
-            combined = (result.stdout + result.stderr).lower()
+            lines = (result.stdout + "\n" + result.stderr).lower().splitlines()
             cause = "unclassified"
+            failure_lines: list[str] = []
             for category, patterns in FAILURE_CAUSES:
-                if any(pattern in combined for pattern in patterns):
+                failure_lines = [
+                    line for line in lines if any(re.search(pattern, line) for pattern in patterns)
+                ]
+                if failure_lines:
                     cause = category
                     break
             detail = f"phase={phase}, exit code={result.returncode}, cause={cause}"
-            matched = [name for name in self.services if name.lower() in combined]
+            matched = [
+                name for name in self.services
+                if any(name.lower() in line for line in failure_lines)
+            ]
             if len(matched) == 1:
                 detail = f"{detail}, service={matched[0]}"
             raise RuntimeError(

@@ -40,11 +40,13 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from datetime import UTC, datetime
 
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
-from curie_dispatcher.queue import from_stream_fields
+from curie_internal.approval_reminder import APPROVAL_REMINDER_FIELD, ApprovalReminderV1
+from curie_internal.turn_queue import from_stream_fields
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     channel_event_id_scope,
@@ -58,7 +60,9 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from . import capacity_wait as capacity_wait_module
+from .boot_grace import BootGrace
 from .capacity_wait import (
+    REQUESTER_HANDOFF_REASON,
     WAIT_GENERATION_FIELD,
     WAIT_REPLY_REF_FIELD,
     WAIT_TERMINAL_ONLY_FIELD,
@@ -67,6 +71,7 @@ from .capacity_wait import (
     CapacityWaitRefused,
     CapacityWaitRequested,
     CapacityWaitStore,
+    RequesterHandoffWaitRequested,
     ThreadOrderWaitRequested,
     order_delivery_scope,
     wait_delivery_scope,
@@ -185,6 +190,11 @@ return claimed
 _THREAD_RESET_DRAIN_BUDGET_S = 30.0
 
 
+async def refuse_unconfigured_reminder(_reminder: ApprovalReminderV1) -> None:
+    """Fail closed for a lane that has no card delivery."""
+    raise RuntimeError("approval reminder delivery is not configured")
+
+
 class Consumer(StreamConsumer):
     """Runs the read loop and the periodic reclaim/reap maintenance loop."""
 
@@ -195,8 +205,10 @@ class Consumer(StreamConsumer):
         kernel: Kernel,
         config: WorkerConfig,
         leases: DeliveryLeaseStore,
+        reminders: Callable[[ApprovalReminderV1], Awaitable[None]],
         max_concurrency: int | None = None,
         drain: UpgradeDrainGate | None = None,
+        boot_grace: BootGrace | None = None,
     ) -> None:
         # Capacity parking requires a real delivery fence, so every runs
         # consumer supplies the same lease store the production entry point uses.
@@ -217,7 +229,13 @@ class Consumer(StreamConsumer):
         # rather than widening StreamBroker for one unrelated feature.
         self._valkey: Redis = redis
         self._kernel = kernel
+        self._reminders = reminders
         self._config = config
+        # The #3079 startup window for maintenance step failures. The Consumer
+        # is built once at worker boot (run.py build()), and a supervisor
+        # restart re-enters run() on this same instance, so the window is
+        # anchored at boot and never reopened.
+        self._boot_grace = boot_grace if boot_grace is not None else BootGrace.starting_now()
         self._waits = CapacityWaitStore(redis, config)
         # None, which the production entry point passes, sizes the lane from
         # CURIE_WORKER_MAX_CONCURRENCY; an explicit value is for tests.
@@ -370,7 +388,9 @@ class Consumer(StreamConsumer):
                 )
             async with asyncio.timeout(capacity_wait_module._NOTICE_SEND_TIMEOUT_S):
                 ack = await self._kernel.notify_capacity_queued(
-                    qevent, wait_reply_ref=record.reply_ref
+                    qevent,
+                    wait_reply_ref=record.reply_ref,
+                    wait_reason=record.wait_reason or capacity_wait_module.WAIT_REASON_ADMISSION,
                 )
             reply_ref = ack.ref
             delivered = True
@@ -550,6 +570,18 @@ class Consumer(StreamConsumer):
                         # race.
                         return
                     try:
+                        if APPROVAL_REMINDER_FIELD in fields:
+                            if (
+                                STREAM_PAYLOAD_FIELD in fields
+                                or "curie_identity_context_v1" in fields
+                            ):
+                                raise ValueError("reminder entries cannot carry a turn")
+                            raw_reminder = fields[APPROVAL_REMINDER_FIELD]
+                            if not isinstance(raw_reminder, str) or len(raw_reminder) > 1024:
+                                raise ValueError("invalid approval reminder size")
+                            reminder = ApprovalReminderV1.model_validate_json(raw_reminder)
+                        else:
+                            reminder = None
                         # @spec HTTP-INVOCATION-EXECUTION-18: hash before any wire rewrite.
                         identity_arguments: dict[str, str] = {}
                         if "curie_identity_context_v1" in fields:
@@ -563,7 +595,8 @@ class Consumer(StreamConsumer):
                                 # @spec HTTP-APPROVAL-CONTINUITY-4: exact bytes for creation.
                                 "original_payload": raw_payload,
                             }
-                        qevent = from_stream_fields(fields)
+                        if reminder is None:
+                            qevent = from_stream_fields(fields)
                     except Exception as exc:
                         if hasattr(span, "set_status"):
                             span.set_status(StatusCode.ERROR)
@@ -582,6 +615,15 @@ class Consumer(StreamConsumer):
                             reason="unparseable",
                             delivery_count=await self._pending_delivery_count(entry_id),
                         )
+                        return
+
+                    if reminder is not None:
+                        lease.raise_if_lost()
+                        await self._reminders(reminder)
+                        lease.raise_if_lost()
+                        await self._ack(entry_id)
+                        await self._settle_delivery_best_effort(entry_id)
+                        process_outcome = "success"
                         return
 
                     # The ``curie.queue.process`` span opened before the parse,
@@ -614,12 +656,7 @@ class Consumer(StreamConsumer):
                                 lease,
                                 identify=identify_predecessor,
                             )
-                            local_order = self._kernel._order_locks.get(thread_key)
-                            if (
-                                order_blocked
-                                and local_order is not None
-                                and local_order.lock.locked()
-                            ):
+                            if order_blocked:
                                 local_order = self._kernel._acquire_order_entry(thread_key)
                                 try:
                                     async with local_order.lock:
@@ -843,12 +880,13 @@ class Consumer(StreamConsumer):
                                         qevent, recovered_wait.grant_epoch
                                     )
                                 await self._kernel.process_event(
-                                    qevent, lease=lease, **identity_arguments,
+                                    qevent,
+                                    lease=lease,
+                                    **identity_arguments,
                                 )
-                                if (
-                                    self._kernel._can_park(qevent)
-                                    and await self._kernel._markers.is_terminal(qevent.event_id)
-                                ):
+                                if self._kernel._can_park(
+                                    qevent
+                                ) and await self._kernel._markers.is_terminal(qevent.event_id):
                                     try:
                                         await self._waits.finish_order(
                                             _thread_key_for(qevent),
@@ -877,8 +915,23 @@ class Consumer(StreamConsumer):
                                 entry_id, qevent, wait_generation, lease
                             )
                             return
-                        except CapacityWaitRequested:
+                        except CapacityWaitRequested as requested:
+                            # ADR 0270 decision 3: a different requester's
+                            # deferral waits outside the thread order, so the
+                            # live turn's requester keeps steering it. Its
+                            # order slot, registered before the kernel ran, is
+                            # released first, and the record's sticky reason
+                            # keeps every wake and re-park out of the order.
+                            handoff = isinstance(requested, RequesterHandoffWaitRequested)
+                            parkable = self._kernel._can_park(qevent)
                             try:
+                                if handoff and parkable:
+                                    await self._waits.finish_order(
+                                        _thread_key_for(qevent),
+                                        qevent.event_id,
+                                        lease,
+                                        started=True,
+                                    )
                                 record = await self._waits.park(
                                     entry_id,
                                     fields,
@@ -886,9 +939,11 @@ class Consumer(StreamConsumer):
                                     lease,
                                     thread_key=(
                                         _thread_key_for(qevent)
-                                        if self._kernel._can_park(qevent)
+                                        if parkable and not handoff
                                         else None
                                     ),
+                                    wait_reason=requested.wait_reason,
+                                    reason=REQUESTER_HANDOFF_REASON if handoff else "",
                                 )
                             except Exception:
                                 logger.exception(
@@ -1020,23 +1075,35 @@ class Consumer(StreamConsumer):
 
         A capacity wake may have started no turn, or a later message may now
         own the thread. Its recorded epoch is the only runner turn this callback
-        may stop. Other deliveries keep the existing thread interrupt path.
+        may stop.
+
+        Every other delivery stops only what this lease acquisition opened or
+        steered into, at the sandbox it recorded (ADR 0270 decision 3). One
+        that opened or steered nothing (it lost its lease waiting on the order
+        lock, the authority answer or a liveness probe) stops nothing, so it
+        never ends another delivery's turn, another person's included.
 
         Every failure is logged and swallowed. Failing to interrupt must not mask
         the lease loss itself, which ``lease.lost`` has already recorded and which
         the pre-ack fence enforces on its own; and the replacement's preflight is
         the second, independent guard against a turn that keeps running here.
         """
+        if APPROVAL_REMINDER_FIELD in fields:
+            return
         try:
-            qevent = from_stream_fields(fields)
+            # Read before any await: the loss task drops ``_notice_lease``.
+            lease = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)
             if WAIT_GENERATION_FIELD in fields:
+                qevent = from_stream_fields(fields)
                 generation = int(fields[WAIT_GENERATION_FIELD])
                 record = await self._waits.get(qevent.event_id)
                 if record is None or record.generation != generation or record.grant_epoch is None:
                     return
                 await self._kernel.resolve_capacity_grant(qevent, record.grant_epoch)
                 return
-            await self._kernel.interrupt_thread(_thread_key_for(qevent), "delivery lease lost")
+            if lease is None:
+                return
+            await self._kernel.stop_owned_execution(lease.owner, "delivery lease lost")
         except Exception:
             logger.exception(
                 "could not interrupt the runner for entry %s after its delivery "
@@ -1046,6 +1113,8 @@ class Consumer(StreamConsumer):
 
     async def _notice_vanished_entry(self, entry_id: str, fields: dict[str, str]) -> None:
         """Post the not-started edit when the broker entry itself is gone."""
+        if APPROVAL_REMINDER_FIELD in fields:
+            return
         try:
             qevent = from_stream_fields(fields)
             lease = self._held_leases.get(entry_id) or self._notice_lease.get(entry_id)
@@ -1142,25 +1211,31 @@ class Consumer(StreamConsumer):
 
     async def _maintenance_loop(self) -> None:
         while not self._should_stop():
-            try:
-                # A reclaim is a NEW claim: it moves a peer's pending entry into
-                # this consumer and dispatches it. During an upgrade drain
-                # (#2010) that is exactly the theft the gate exists to stop --
-                # a replacement pod coming up mid-roll would otherwise take the
-                # delivery a still-draining replica is settling, see the
-                # side-effect marker, and escalate work that was about to
-                # complete. The rest of the tick is unaffected: reaping orphans
-                # and sweeping owed completions create no claims and stay
-                # useful while a drain is in progress.
-                if not await self._claims_paused():
-                    await self._reclaim_once()
-                await self._kernel.reap_orphans()
-                await self._kernel.sweep_pending_completions()
-                await self._sweep_pending_progress()
-                await self._drain_pending_progress_inboxes()
-                await self._drain_thread_reset_requests()
-            except Exception:
-                logger.exception("maintenance tick failed")
+            # Each step runs in its own try (#5630): the steps are independent,
+            # so a Kubernetes outage that fails the orphan reap must not stall
+            # owed completion recovery or the thread-reset drain behind it.
+            #
+            # A reclaim is a NEW claim: it moves a peer's pending entry into
+            # this consumer and dispatches it. During an upgrade drain
+            # (#2010) that is exactly the theft the gate exists to stop --
+            # a replacement pod coming up mid-roll would otherwise take the
+            # delivery a still-draining replica is settling, see the
+            # side-effect marker, and escalate work that was about to
+            # complete. The rest of the tick is unaffected: reaping orphans
+            # and sweeping owed completions create no claims and stay
+            # useful while a drain is in progress.
+            await self._maintenance_step("reclaim", self._reclaim_unless_paused)
+            await self._maintenance_step("reap_orphans", self._kernel.reap_orphans)
+            await self._maintenance_step(
+                "sweep_pending_completions", self._kernel.sweep_pending_completions
+            )
+            await self._maintenance_step("progress_sweep", self._sweep_pending_progress)
+            await self._maintenance_step(
+                "progress_inbox_drain", self._drain_pending_progress_inboxes
+            )
+            await self._maintenance_step(
+                "thread_reset_drain", self._drain_thread_reset_requests
+            )
             # Queue inventory is operational sampling, not message settlement.
             # Keep its three Valkey reads on the bounded maintenance cadence so
             # a slow telemetry read cannot retain a per-message concurrency slot
@@ -1171,6 +1246,34 @@ class Consumer(StreamConsumer):
             await self._observe_completion_outbox()
             await self._observe_capacity_waits()
             await self._sleep_or_stop(self._config.reclaim_interval_s)
+
+    async def _reclaim_unless_paused(self) -> None:
+        if not await self._claims_paused():
+            await self._reclaim_once()
+
+    async def _maintenance_step(self, name: str, step: Callable[[], Awaitable[object]]) -> None:
+        """Run one maintenance step, logging its failure without skipping the rest.
+
+        Inside the boot window a failure caused by a dependency that is not
+        ready yet, such as the object-store bucket a post-install Job creates
+        after the worker starts, is expected (#3079) and logs a one-line
+        warning; any other failure, or any failure after the window, logs the
+        traceback.
+        """
+        try:
+            await step()
+        except Exception as exc:
+            if self._boot_grace.excuses(exc):
+                logger.warning(
+                    "maintenance step %s deferred: a dependency is not ready yet "
+                    "(expected during startup) cause=%s: %s",
+                    name,
+                    type(exc).__name__,
+                    " ".join(str(exc).split()),
+                    extra={"maintenance_step": name},
+                )
+            else:
+                logger.exception("maintenance tick failed", extra={"maintenance_step": name})
 
     async def _sweep_pending_progress(self) -> None:
         """Sweep the progress outbox (ADR 0130) with no deliverer.

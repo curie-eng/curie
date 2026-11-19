@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -88,6 +89,8 @@ def repo(tmp_path: Path) -> Path:
     (root / "scripts").mkdir()
     shutil.copy2(ROOT / "scripts/check-commit-messages.sh", root / "scripts")
     shutil.copy2(ROOT / ".gitleaks.toml", root)
+    (root / "tools/preflight").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "tools/preflight/scan_history.py", root / "tools/preflight")
     git(root, "init", "-q", "-b", "main")
     git(root, "config", "user.name", "Example")
     git(root, "config", "user.email", "test@example.com")
@@ -135,13 +138,15 @@ def test_selection_follows_changed_path_rules(
         assert check["cwd"]
         assert check["group"]
         assert "cargo test" not in check["command"]
-        # The gitleaks mount can include pytest's temporary-directory name.
+        # A generated command can include pytest's temporary-directory name.
         # Match executable tokens, including an absolute pytest executable.
         assert not re.search(r"(?:^|[\s;&|])(?:[^\s;&|]*/)?pytest(?:$|[\s;&|])", check["command"])
     scan = next(check for check in plan["checks"] if check["job"] == "gitleaks")
     workflow = yaml.safe_load((ROOT / ".github/workflows/gitleaks.yaml").read_text())
     assert workflow["jobs"]["gitleaks"]["env"]["GITLEAKS_IMAGE"] in scan["command"]
-    assert "origin/main..HEAD" in scan["command"]
+    scan_args = shlex.split(scan["command"])
+    assert scan_args[scan_args.index("--base") + 1] == "main"
+    assert scan_args[scan_args.index("--head") + 1] == "HEAD"
     for check in plan["checks"]:
         if check["job"] == "contracts-ts":
             assert "${{ github.workspace }}" not in check["command"]
@@ -357,7 +362,7 @@ def test_fast_accepts_legitimate_assistant_identifier_in_commit_message(repo: Pa
 
 @pytest.fixture
 def manual_repo(repo: Path) -> Path:
-    (repo / "tools/preflight").mkdir(parents=True)
+    (repo / "tools/preflight").mkdir(parents=True, exist_ok=True)
     shutil.copy2(TOOL, repo / "tools/preflight/preflight.py")
     (repo / "tools/test-env").mkdir(parents=True)
     shutil.copy2(TEST_ENV, repo / "tools/test-env/test_env.py")
@@ -459,7 +464,7 @@ def test_manual_execution_runs_checks_from_the_explicit_head(manual_repo: Path) 
 def prepare_hook(repo: Path, tmp_path: Path) -> tuple[Path, Path]:
     (repo / ".githooks").mkdir()
     shutil.copy2(ROOT / ".githooks/pre-push", repo / ".githooks/pre-push")
-    (repo / "tools/preflight").mkdir(parents=True)
+    (repo / "tools/preflight").mkdir(parents=True, exist_ok=True)
     shutil.copy2(TOOL, repo / "tools/preflight/preflight.py")
     (repo / "tools/test-env").mkdir(parents=True)
     shutil.copy2(TEST_ENV, repo / "tools/test-env/test_env.py")

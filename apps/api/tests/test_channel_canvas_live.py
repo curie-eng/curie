@@ -1,7 +1,7 @@
 """Canvas list, read and cell edit against a real Slack workspace (ADR 0200, #3819).
 
 Opt in with CURIE_LIVE_CHANNEL_CANVAS=1. CI never sets it. Once opted in, the
-setup is required, never skipped: SLACK_BOT_TOKEN (an app reinstalled with
+setup is required, never skipped: CURIE_LIVE_CREDENTIAL_FILE (an app reinstalled with
 `canvases:read` and `canvases:write`) and SLACK_TEST_CHANNEL (a channel the bot
 is in). Postgres, Valkey and the object store are the compose services, as in
 the rest of this suite. Nothing is faked: the API's own HTTP client talks to
@@ -34,12 +34,14 @@ import time
 import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from curie_api.config import get_settings
 from curie_api.main import create_app
+from curie_test_support.channel_gateway import API_TOKEN, slack_gateway
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -58,7 +60,7 @@ pytestmark = pytest.mark.skipif(
     reason="live Slack canvases run only with CURIE_LIVE_CHANNEL_CANVAS=1",
 )
 
-REQUIRED = ("SLACK_BOT_TOKEN", "SLACK_TEST_CHANNEL")
+REQUIRED = ("CURIE_LIVE_CREDENTIAL_FILE", "SLACK_TEST_CHANNEL")
 CANVAS_URL = "/channel-canvas"
 BASELINE = "sentinel-baseline"
 CANVAS_GRANTS: Mapping[str, Any] = {"canvasList": True, "canvasRead": True, "canvasEdit": True}
@@ -129,7 +131,7 @@ def _channel_canvas_id(token: str, channel: str) -> str | None:
 
 def _download(token: str, canvas_id: str) -> Any:
     """The canvas as the API parses it, fetched directly with the bot token."""
-    from curie_api.channel_read.slack_canvas import parse_canvas_html
+    from curie_channel_gateway.slack.canvas import parse_canvas_html
 
     info = _slack("files.info", token, file=canvas_id)
     if not info.get("ok"):
@@ -179,11 +181,11 @@ def live_canvas() -> LiveCanvas:
         pytest.fail(
             "CURIE_LIVE_CHANNEL_CANVAS=1 needs " + ", ".join(missing) + "; this is a setup failure"
         )
-    token = os.environ["SLACK_BOT_TOKEN"]
+    token = Path(os.environ["CURIE_LIVE_CREDENTIAL_FILE"]).read_text().strip()
     channel = os.environ["SLACK_TEST_CHANNEL"]
     identity = _slack("auth.test", token)
     if not identity.get("ok"):
-        pytest.fail(f"SLACK_BOT_TOKEN is not usable: {identity.get('error', 'unknown')}")
+        pytest.fail(f"CURIE_LIVE_CREDENTIAL_FILE is not usable: {identity.get('error', 'unknown')}")
     canvas_id = _channel_canvas_id(token, channel)
     if canvas_id is None:
         created = _slack_json(
@@ -272,14 +274,20 @@ def live_api(
     live_canvas: LiveCanvas,
 ) -> Iterator[LiveApi]:
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
-    monkeypatch.setenv("SLACK_BOT_TOKEN", live_canvas.token)
+    gateway = slack_gateway(None, {"default": live_canvas.token})
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_URL", gateway.__enter__())
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_TOKEN", API_TOKEN)
+    monkeypatch.setenv("CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE", "true")
     monkeypatch.setenv("RUNS_STREAM", f"test:curie:channel-canvas-live:{uuid.uuid4().hex}")
     monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
     monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
     monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
     get_settings.cache_clear()
-    with TestClient(create_app()) as client:
-        yield LiveApi(client, auth_headers)
+    try:
+        with TestClient(create_app()) as client:
+            yield LiveApi(client, auth_headers)
+    finally:
+        gateway.__exit__(None, None, None)
     get_settings.cache_clear()
 
 

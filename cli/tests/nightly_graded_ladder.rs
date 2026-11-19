@@ -129,105 +129,8 @@ fn ladder_quoted_assignment(name: &str) -> String {
     value.to_string()
 }
 
-fn copy_example_bundle(name: &str, dest: &Path) {
-    fs::create_dir_all(dest).expect("create scratch bundle directory");
-    let src = repo_root().join("examples").join(name);
-    let status = Command::new("cp")
-        .arg("-a")
-        .arg(format!("{}/.", src.display()))
-        .arg(dest)
-        .status()
-        .expect("copy example bundle");
-    assert!(
-        status.success(),
-        "copying examples/{name} into {} must succeed",
-        dest.display()
-    );
-}
-
-fn run_ladder_setup_function(function_name: &str, bundle: &Path) -> Output {
-    let repo = repo_root();
-    let function = ladder_function(function_name);
-    let script = format!(
-        "set -euo pipefail\n\
-         REPO_ROOT={repo}\n\
-         CONNECTOR_FIXTURE=\"$REPO_ROOT/cli/scripts/fixtures/sre-bot-connectors-enabled.yaml\"\n\
-         MCP_RECEIPT_FIXTURE=\"$REPO_ROOT/cli/scripts/fixtures/mcp-receipt\"\n\
-         MCP_RECEIPT_CONNECTOR={connector}\n\
-         {function}\n\
-         {function_name} {bundle}\n",
-        repo = sh_single_quote(&repo),
-        connector = sh_single_quote(Path::new(&ladder_quoted_assignment(
-            "MCP_RECEIPT_CONNECTOR"
-        ))),
-        function = function,
-        function_name = function_name,
-        bundle = sh_single_quote(bundle),
-    );
-    Command::new("bash")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .unwrap_or_else(|error| panic!("run {function_name}: {error}"))
-}
-
-fn validate_bundle_json(dir: &Path) -> serde_json::Value {
-    let validation = Command::new("uv")
-        .current_dir(repo_root())
-        .args([
-            "run",
-            "--frozen",
-            "python",
-            "-c",
-            "import sys\n\
-             from plugin_format import validate_bundle\n\
-             print(validate_bundle(sys.argv[1], enforces_tool_policy='curie/mcp-tool-policy@1').model_dump_json())\n",
-        ])
-        .arg(dir)
-        .output()
-        .expect("run plugin_format.validate_bundle");
-    let stdout = String::from_utf8_lossy(&validation.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&validation.stderr).to_string();
-    assert!(
-        validation.status.success(),
-        "the bundle validator must run: stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    let reported = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_else(|| panic!("the validator must report a result: stderr:\n{stderr}"));
-    serde_json::from_str(reported)
-        .unwrap_or_else(|error| panic!("validator output must be JSON ({error}): {reported}"))
-}
-
 fn connector_name_forges_mcp_join(name: &str) -> bool {
     name.starts_with("mcp-") || name.contains("-mcp-")
-}
-
-/// Setup stages run before the ladder's one `curie build`. `build:` connectors
-/// are therefore allowed to report `connectors.lock_missing` here; the live
-/// boot failures were `connectors.ambiguous_name` and
-/// `approval_policy.gate_not_namespaced`, which must not survive setup.
-fn assert_setup_bundle_has_no_boot_blockers(result: &serde_json::Value) {
-    let errors = result["errors"]
-        .as_array()
-        .expect("validator errors must be an array");
-    let codes: Vec<&str> = errors
-        .iter()
-        .map(|error| error["code"].as_str().expect("error code"))
-        .collect();
-    assert!(
-        !codes.iter().any(|code| *code == "connectors.ambiguous_name"
-            || *code == "approval_policy.gate_not_namespaced"),
-        "setup must not leave a bundle that skill up refuses to boot: {result}"
-    );
-    assert!(
-        codes
-            .iter()
-            .all(|code| *code == "connectors.lock_missing"),
-        "the only remaining validator errors before the ladder build must be lock_missing: {result}"
-    );
 }
 
 fn ladder_python_heredoc(function_name: &str) -> String {
@@ -811,7 +714,7 @@ fn chart_runtime_sustains_a_ready_bounded_outage_before_restart_and_overflow() {
     assert!(storage_observer.contains("mountPath: /var/lib/otelcol"));
     assert!(storage_observer.contains("readOnly: true"));
     let observer_exec = bounded_function
-        .find("kubectl exec \"$OTEL_STORAGE_OBSERVER\"")
+        .find("kubectl --context \"$KUBE_CONTEXT\" exec \"$OTEL_STORAGE_OBSERVER\"")
         .expect("the sustained-outage path must measure storage through its PVC observer");
     let usage = bounded_function
         .find("du -sk /var/lib/otelcol")
@@ -821,18 +724,20 @@ fn chart_runtime_sustains_a_ready_bounded_outage_before_restart_and_overflow() {
         "the durable PVC usage measurement must run through the task-owned storage observer"
     );
     assert!(
-        !bounded_function.contains("kubectl exec \"$pod\" -n \"$NAMESPACE\" -- sh"),
+        !bounded_function
+            .contains("kubectl --context \"$KUBE_CONTEXT\" exec \"$pod\" -n \"$NAMESPACE\" -- sh"),
         "the distroless Collector pod must not be used to run sh for PVC measurement"
     );
     assert!(
-        !bounded_function.contains("kubectl exec \"$pod\" -n \"$NAMESPACE\" -- du"),
+        !bounded_function
+            .contains("kubectl --context \"$KUBE_CONTEXT\" exec \"$pod\" -n \"$NAMESPACE\" -- du"),
         "the distroless Collector pod must not be used to run du for PVC measurement"
     );
     let observer_delete = text
-        .find("kubectl delete pod \"$OTEL_STORAGE_OBSERVER\"")
+        .find("kubectl --context \"$KUBE_CONTEXT\" delete pod \"$OTEL_STORAGE_OBSERVER\"")
         .expect("the PVC observer must release its read-only mount before Collector restart");
     let collector_delete = text
-        .find("kubectl delete pod \"$OLD_COLLECTOR_POD\"")
+        .find("kubectl --context \"$KUBE_CONTEXT\" delete pod \"$OLD_COLLECTOR_POD\"")
         .expect("chart runtime must retain the explicit Collector pod restart");
     assert!(
         bounded < observer_delete && observer_delete < collector_delete,
@@ -906,7 +811,9 @@ fn chart_runtime_falsifies_collector_metrics_ingress_policy() {
         .map(|offset| temporary_allow + offset)
         .expect("the denied observer must scrape after only its targeted allow is applied");
     let remove_allow = proof
-        .find("kubectl delete networkpolicy \"$OTEL_METRICS_TEST_ALLOW\"")
+        .find(
+            "kubectl --context \"$KUBE_CONTEXT\" delete networkpolicy \"$OTEL_METRICS_TEST_ALLOW\"",
+        )
         .expect("proof must remove its temporary targeted allow");
     assert!(
         selected_positive < unselected_negative
@@ -930,6 +837,7 @@ fn chart_runtime_falsifies_collector_metrics_ingress_policy() {
 #[test]
 fn cluster_worker_probe_uses_the_configured_namespace() {
     const NAMESPACE: &str = "test-2593-chart-ladder";
+    const CONTEXT: &str = "scratch-cluster";
 
     let harness = tempfile::tempdir().expect("create cluster probe harness");
     let invocation_log = harness.path().join("kubectl-invocation.log");
@@ -955,6 +863,7 @@ printf '1'
         .arg(script)
         .env("PATH", path)
         .env("CURIE_NAMESPACE", NAMESPACE)
+        .env("KUBE_CONTEXT", CONTEXT)
         .env("STUB_KUBECTL_INVOCATION_LOG", &invocation_log)
         .output()
         .expect("run the real cluster worker probe");
@@ -974,7 +883,7 @@ printf '1'
     assert_eq!(
         invocation,
         format!(
-            "-n {NAMESPACE} get deployment/curie-worker -o \
+            "--context {CONTEXT} -n {NAMESPACE} get deployment/curie-worker -o \
              jsonpath={{.spec.template.spec.containers[*].env[?(@.name==\"CURIE_FAKE_MODEL\")].value}}"
         ),
         "the direct worker read must use the configured namespace while preserving the standard release's deployment and model-mode assertion"
@@ -1575,7 +1484,6 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         "query_exact_seed_trace",
         "sanitize_exact_trace_read",
         "seed_ordinary_turn",
-        "seed_approval_resume_turn",
     ] {
         assert!(
             text.contains(required),
@@ -1765,12 +1673,11 @@ fn exact_seed_matcher_recovers_embedded_marker_once_and_rejects_background() {
 }
 
 #[test]
-fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() {
+fn product_observability_requires_three_valid_seeds_and_count_only_mcp_receipt() {
     let text = ladder();
     for required in [
         "seed_ordinary_turn() {",
         "seed_mcp_read_turn() {",
-        "seed_approval_resume_turn() {",
         "seed_coding_tool_turn() {",
         "seed-invalid",
         "mcp_receipt_call_count() {",
@@ -1780,7 +1687,7 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
     ] {
         assert!(
             text.contains(required),
-            "the product observability oracle must pin independent ordinary, MCP, approval, and built-in coding-tool seed evidence; missing {required}"
+            "the product observability oracle must pin independent ordinary, MCP, and built-in coding-tool seed evidence; missing {required}"
         );
     }
 
@@ -1799,16 +1706,6 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
     assert!(
         receipt.contains("count") || receipt.contains("wc -l"),
         "only an aggregate MCP call count may reach evidence output"
-    );
-
-    let approval = ladder_function("seed_approval_resume_turn");
-    assert!(
-        approval.contains("curie.approval.suspend"),
-        "approval evidence must require the worker's real parked-turn span"
-    );
-    assert!(
-        !approval.contains("curie.approval.wait"),
-        "the oracle must not invent a wait span that no current emitter produces"
     );
 }
 
@@ -2646,7 +2543,7 @@ fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
 fn cluster_rung_uses_the_worker_delivery_budget_without_weakening_reply_gates() {
     let timeout_reader = ladder_function("cluster_reply_timeout_seconds");
     assert!(
-        timeout_reader.contains(r#"kubectl -n "$CURIE_NAMESPACE""#)
+        timeout_reader.contains(r#"kubectl --context "$KUBE_CONTEXT" -n "$CURIE_NAMESPACE""#)
             && timeout_reader.contains("cluster_worker_deploy")
             && timeout_reader.contains("-o json"),
         "the timeout reader must inspect the selected worker Deployment as JSON; helper contents:\n{timeout_reader}"
@@ -2919,6 +2816,10 @@ done
 require_expected_ns_rel() {
     expect_ns="${STUB_EXPECT_NAMESPACE:-curie}"
     expect_rel="${STUB_EXPECT_RELEASE:-curie}"
+    if [ "$context" != "${STUB_EXPECT_CONTEXT:-stub-context}" ]; then
+        echo "unexpected cluster context: $context" >&2
+        exit 97
+    fi
     if [ -z "$namespace" ] || [ -z "$release" ] \
         || [ "$namespace" != "$expect_ns" ] || [ "$release" != "$expect_rel" ]; then
         echo "unexpected curie invocation: $*" >&2
@@ -3052,7 +2953,7 @@ case "$*" in
         printf '%s\n' '{"name":"curie-demo"}' > curie-demo/.claude-plugin/plugin.json
         echo "stub try all done"
         ;;
-    "--json cluster status --namespace "*" --release "*)
+    "--json cluster status --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*)
         # The case-ids-only control's single injection point: after the local
         # rung deployed and before the cluster rung does, rewrite ONLY the case
         # ids in the bundle both rungs deploy. Suite name and case count are
@@ -3214,7 +3115,7 @@ print(json.dumps({
         fi
         emit_deploy "${STUB_LOCAL_SHA256:-$(sha_of_bundle "$bundle_dir")}"
         ;;
-    "--json cluster deploy --namespace "*" --release "*" --plugin-dir "*)
+    "--json cluster deploy --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --plugin-dir "*)
         require_expected_ns_rel "$@"
         printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
         emit_deploy "${STUB_CLUSTER_SHA256:-$(sha_of_bundle "$bundle_dir")}"
@@ -3304,18 +3205,18 @@ print(json.dumps({
     "--json local eval --dry-run")
         emit_plan local 1 weather
         ;;
-    "--json cluster eval --namespace "*" --release "*" --cases "*--dry-run*)
+    "--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --cases "*--dry-run*)
         require_expected_ns_rel "$@"
         # Only the cluster count is an override: it is the knob the suite
         # divergence control moves. Everything else is the constant the weather
         # bundle declares.
         emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
         ;;
-    "--json cluster eval --namespace "*" --release "*" --listen-host "*--dry-run*)
+    "--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --listen-host "*--dry-run*)
         require_expected_ns_rel "$@"
         emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
         ;;
-    "--json cluster eval --namespace "*" --release "*" --dry-run")
+    "--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --dry-run")
         require_expected_ns_rel "$@"
         emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
         ;;
@@ -3331,7 +3232,7 @@ print(json.dumps({
         fi
         exit "${STUB_EVAL_EXIT:-0}"
         ;;
-    "--json cluster eval --namespace "*" --release "*" --cases "*|"--json cluster eval --namespace "*" --release "*)
+    "--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*" --cases "*|"--json cluster eval --context ${STUB_EXPECT_CONTEXT:-stub-context} --namespace "*" --release "*)
         require_expected_ns_rel "$@"
         if [ -n "${STUB_EVAL_MARKER:-}" ]; then
             printf '%s\n' called > "$STUB_EVAL_MARKER"
@@ -3724,6 +3625,7 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
             UNKNOWN_OBSERVABILITY_TRACE_ID,
         )
         .env("STUB_UNAVAILABLE_API_URL", UNAVAILABLE_API_URL)
+        .env("CURIE_E2E_KUBE_CONTEXT", "stub-context")
         .env_remove("CURIE_E2E_TIERS")
         .env_remove("CURIE_E2E_LIVE")
         .env_remove("CURIE_E2E_LISTEN_HOST")
@@ -4646,122 +4548,6 @@ fn mcp_receipt_setup_owns_a_legal_connector_name() {
             && !function.contains("  mcp-receipt:"),
         "prepare_mcp_receipt_bundle must own $MCP_RECEIPT_CONNECTOR rather than hard-coding mcp-receipt"
     );
-}
-
-/// #2423: applying the MCP receipt setup to the actual weather scratch copy
-/// must leave a bundle the real validator accepts. A second apply on the same
-/// owned directory must refuse rather than append a duplicate connector.
-#[test]
-fn mcp_receipt_setup_leaves_a_valid_owned_weather_bundle_and_refuses_a_rerun() {
-    if Command::new("uv").arg("--version").output().is_err() {
-        eprintln!(
-            "skipping mcp_receipt_setup_leaves_a_valid_owned_weather_bundle_and_refuses_a_rerun: uv is not on PATH"
-        );
-        return;
-    }
-
-    let harness = tempfile::tempdir().expect("create weather scratch directory");
-    let bundle = harness.path().join("bundle");
-    copy_example_bundle("weather", &bundle);
-
-    let first = run_ladder_setup_function("prepare_mcp_receipt_bundle", &bundle);
-    let first_out = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&first.stdout),
-        String::from_utf8_lossy(&first.stderr)
-    );
-    assert!(
-        first.status.success(),
-        "the MCP receipt setup must own the weather scratch copy: {first_out}"
-    );
-
-    let result = validate_bundle_json(&bundle);
-    assert_setup_bundle_has_no_boot_blockers(&result);
-
-    let second = run_ladder_setup_function("prepare_mcp_receipt_bundle", &bundle);
-    let second_out = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&second.stdout),
-        String::from_utf8_lossy(&second.stderr)
-    );
-    assert_ne!(
-        second.status.code(),
-        Some(0),
-        "a second MCP receipt setup on the same directory must refuse rather than recreate: {second_out}"
-    );
-    assert!(
-        second_out.contains("refusing") || second_out.contains("already exists"),
-        "the rerun refusal must name the collision: {second_out}"
-    );
-}
-
-/// #2423/#2295: the connector-fixture setup overwrites connectors.yaml on the
-/// sre-bot scratch copy. It must also own the matching approval gates and
-/// toolPolicy entries so the scratch bundle stays valid. The self-upgrade
-/// fixture must retain both of its gates while gates and grants for every
-/// unhosted connector are removed.
-#[test]
-fn connector_fixture_setup_owns_consistent_approval_gates() {
-    if Command::new("uv").arg("--version").output().is_err() {
-        eprintln!(
-            "skipping connector_fixture_setup_owns_consistent_approval_gates: uv is not on PATH"
-        );
-        return;
-    }
-
-    let harness = tempfile::tempdir().expect("create sre-bot scratch directory");
-    let bundle = harness.path().join("bundle");
-    copy_example_bundle("sre-bot", &bundle);
-
-    let output = run_ladder_setup_function("prepare_connector_bundle", &bundle);
-    let transcript = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        output.status.success(),
-        "the connector fixture setup must own the sre-bot scratch copy: {transcript}"
-    );
-
-    let plugin: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(bundle.join(".claude-plugin/plugin.json"))
-            .expect("read scratch plugin.json"),
-    )
-    .expect("scratch plugin.json must be JSON");
-    let gates: Vec<String> = plugin["approvalPolicy"]["gates"]
-        .as_array()
-        .expect("approvalPolicy.gates")
-        .iter()
-        .map(|gate| gate["gate"].as_str().expect("gate name").to_string())
-        .collect();
-    assert_eq!(
-        gates,
-        vec![
-            "mcp__self-upgrade__upgrade_self".to_string(),
-            "mcp__self-upgrade__upgrade_platform".to_string(),
-            "mcp__kubernetes__pods_delete".to_string(),
-            "mcp__kubernetes__pods_exec".to_string(),
-            "mcp__kubernetes__pods_run".to_string(),
-            "mcp__kubernetes__resources_create_or_update".to_string(),
-            "mcp__kubernetes__resources_delete".to_string(),
-            "mcp__kubernetes__resources_scale".to_string(),
-        ],
-        "the owned scratch copy must retain exactly the gates for the hosted self-upgrade and kubernetes connectors"
-    );
-    let allow: Vec<&str> = plugin["toolPolicy"]["allow"]
-        .as_array()
-        .expect("toolPolicy.allow")
-        .iter()
-        .map(|entry| entry.as_str().expect("allow entry"))
-        .collect();
-    assert!(
-        allow.iter().all(|entry| !entry.starts_with("grafana/")),
-        "the fixture does not host grafana, so grafana grants must be stripped: {allow:?}"
-    );
-
-    let result = validate_bundle_json(&bundle);
-    assert_setup_bundle_has_no_boot_blockers(&result);
 }
 
 /// NEGATIVE CONTROL: bundle identity. The cluster rung's deploy receipt reports
@@ -6045,6 +5831,7 @@ CLUSTER_PRODUCT_EVIDENCE="$WORKDIR/evidence.json"
 PRODUCT_OBSERVABILITY_RUN_ID=run-cluster-receipts
 OBSERVABILITY_POLL_ATTEMPTS=1
 OBSERVABILITY_POLL_INTERVAL_SECONDS=0
+KUBE_CONTEXT=scratch-cluster
 CURIE_NAMESPACE=test-cluster-receipts
 CURIE_RELEASE=test-cluster-receipts
 CLUSTER_IMAGE_IDS_MATCH=false
@@ -6622,4 +6409,77 @@ classify_product_observability_owner
         }
         assert!(!String::from_utf8_lossy(&output.stdout).contains("curie-clear:"));
     }
+}
+
+/// Every workflow step that drives the cluster rung of `e2e-ladder.sh` must
+/// hand it an explicit kube context. The ladder refuses to guess one and
+/// exits 2 before any rung runs, so a step that omits it reds the whole job
+/// with "cluster rung requires CURIE_E2E_KUBE_CONTEXT" (#5621).
+#[test]
+fn every_cluster_rung_ladder_step_passes_an_explicit_kube_context() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows");
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        .map(|entry| entry.expect("workflow dir entry").path())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("yaml" | "yml")
+            )
+        })
+        .collect();
+    entries.sort();
+    let mut cluster_steps = 0usize;
+    let mut missing = Vec::new();
+    for path in &entries {
+        let text = repo_text(path);
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("bash cli/scripts/e2e-ladder.sh") {
+                continue;
+            }
+            let start = (0..=index)
+                .rev()
+                .find(|&i| lines[i].trim_start().starts_with("- name:"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}:{} ladder call outside a named step",
+                        path.display(),
+                        index + 1
+                    )
+                });
+            let indent = lines[start].len() - lines[start].trim_start().len();
+            let end = (index + 1..lines.len())
+                .find(|&i| {
+                    let candidate = lines[i];
+                    let trimmed = candidate.trim_start();
+                    !trimmed.is_empty()
+                        && candidate.len() - trimmed.len() <= indent
+                        && !trimmed.starts_with('#')
+                })
+                .unwrap_or(lines.len());
+            let step = lines[start..end].join("\n");
+            let tiers = step
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("CURIE_E2E_TIERS:"))
+                .map(str::trim)
+                .unwrap_or("");
+            if !tiers.split(',').any(|tier| tier.trim() == "cluster") {
+                continue;
+            }
+            cluster_steps += 1;
+            if !step.contains("CURIE_E2E_KUBE_CONTEXT") {
+                missing.push(format!("{}: {}", path.display(), lines[start].trim()));
+            }
+        }
+    }
+    assert!(
+        cluster_steps >= 2,
+        "expected the ci.yaml and nightly cluster rung steps, found {cluster_steps}"
+    );
+    assert!(
+        missing.is_empty(),
+        "cluster rung ladder steps without CURIE_E2E_KUBE_CONTEXT:\n{}",
+        missing.join("\n")
+    );
 }

@@ -20,6 +20,32 @@ processors:
     limit_percentage: 75
     spike_limit_percentage: 20
   batch: {}
+  # Drops known childless API reads and platform loops before Langfuse.
+  # Unknown routes are kept. Compose debug sees the same filtered stream.
+  filter/langfuse_platform_noise:
+    error_mode: ignore
+    traces:
+      span:
+        - >-
+          name == "http.server.request" and
+          attributes["service.name"] == "curie-api" and
+          attributes["curie.source"] == "GET" and
+          (attributes["curie.operation"] == "/health" or
+          attributes["curie.operation"] == "/ready" or
+          attributes["curie.operation"] == "/agents" or
+          attributes["curie.operation"] == "/agents/{agent_id}" or
+          attributes["curie.operation"] == "/approvals" or
+          attributes["curie.operation"] == "/approvals/{approval_id}" or
+          attributes["curie.operation"] == "/approvals/{approval_id}/audit" or
+          attributes["curie.operation"] == "/langfuse/traces" or
+          attributes["curie.operation"] == "/langfuse/traces/{trace_id}" or
+          attributes["curie.operation"] == "/observability/metrics/summary" or
+          attributes["curie.operation"] == "/observability/metrics/series" or
+          attributes["curie.operation"] == "/observability/runners" or
+          attributes["curie.operation"] == "/cluster-message-replies/{reply_ref}" or
+          attributes["curie.operation"] == "/v1/internal/work-items/runtime-owners")
+        - 'IsMatch(name, "^curie\\.background\\.")'
+        - 'name == "curie.sandbox.cleanup"'
 
 exporters:
   otlphttp/langfuse:
@@ -64,7 +90,7 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, filter/langfuse_platform_noise, batch]
       exporters: [otlphttp/langfuse, debug]
     logs:
       receivers: [otlp]

@@ -99,12 +99,15 @@ fn selected_channel_listing_preserves_equals_and_encodes_transport_characters() 
             selected.contains("inbox") && selected.contains("operator"),
             "{selected}"
         );
+        // Only `%` and `/` are escaped before the address is pushed as a
+        // segment: the API decodes the path once before routing and the
+        // address once more, so a literal `%` is escaped twice.
         assert!(
             selected.contains("%3Fview") && selected.contains("%23retained"),
             "{selected}"
         );
         assert!(
-            selected.contains("%2525"),
+            selected.contains("%252525"),
             "literal percent must be encoded: {selected}"
         );
         assert!(

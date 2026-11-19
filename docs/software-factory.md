@@ -1,5 +1,9 @@
 # Software Factory
 
+Start with the [user guide](guides/factory-user-guide.md) for a complete issue
+to PR walkthrough or the [administrator guide](guides/factory-admin-guide.md)
+for setup and improvement. This page explains the workflow and its limits.
+
 Delegate an issue to a Curie co-worker and get a pull request or merge request to review,
 or a stated reason it could not complete. You can leave the work running
 asynchronously, inspect progress on the issue, and request revisions on the
@@ -35,7 +39,7 @@ their limits.
 | Before setup | What to expect |
 |---|---|
 | Host | Released CLI assets support Linux x86_64, Linux arm64, and Apple silicon macOS. The quickstart has no Intel macOS asset. |
-| Cluster | Kubernetes with `kubectl` and Helm; Docker and kind v0.24+ are needed only if quickstart must create a local cluster. Review the selected context before installing. For a local kind trial, allocate at least 16 GiB to Docker Desktop; larger repositories may need more. See [local capacity and recovery](guides/dark-factory-quickstart.md#local-kind-capacity-and-recovery). |
+| Cluster | Kubernetes with `kubectl` and Helm; Docker and kind v0.24+ are needed only if quickstart must create a local cluster. Review the selected context before installing. For a local kind trial, allocate at least 16 GiB to Docker Desktop; larger repositories may need more. See [local capacity and recovery](guides/factory-quickstart-reference.md#local-kind-capacity-and-recovery). |
 | Model | An Anthropic or OpenRouter credential, with available provider credit. Implementation and review use separately configured models. |
 | Repository | A small repository with an initial commit and a bounded issue. GitHub and Jira Cloud with GitHub need a GitHub App installed on the repository. GitLab needs an active token with `api` and `write_repository` scopes and Developer access or higher. |
 | Tracker authority | GitHub requires a permitted user with repository write or admin access; GitLab requires Developer access or higher. Jira Cloud requires an explicit account or group allowed to start work, plus the factory account's project permissions. |
@@ -241,6 +245,12 @@ That result carries a no-CI note; it is not evidence that tests passed.
 Required repository policies can impose stricter evidence. The detailed
 [factory operations reference](operations.md#admitting-a-labelled-github-issue)
 is authoritative for base-branch failures, required Python checks, and timeouts.
+
+## Follow a run's progress in Slack
+
+A factory agent can name one Slack channel for run progress. Set it with `PATCH /agents/{agent_id}` and `{"factory_slack_channel": "C0EXAMPLE1"}`; `null` clears it. The agent must already have exactly one Slack channel binding for that channel, and that binding's app identity posts. Otherwise the API answers 409 `factory_slack_channel_unbound`. Runs that are live at or after that moment get one Slack root message per WorkItem, kept across revisions, with phase reports, the pull request link and each run's terminal outcome posted in its thread. A WorkItem keeps its thread when the channel changes: later revisions still post in the channel its root went to, and only WorkItems that start afterwards root in the new channel. Tracker status comments are unchanged. Delivery is at least once, a rejected post stays owed and retries, and a late-committed phase report can arrive out of order.
+
+A person steers by explicitly mentioning the app in that run thread, which asks for a revision of the same pull request on its existing branch. Plain thread replies do not steer. The API resolves the Slack sender in the receiving app's workspace, requires one active operator-managed GitHub account link for that person on the pull request's host, reads the account's current login and the pull request (open, on the run's branch), applies the existing pull request write authority, and admits the revision through the existing revision queue; a running request queues it behind. The full reply is kept as JSON in the revision objective, and no approval is added. Every other case is refused and the refusal code is posted in the thread. Nothing in a mapped root starts ordinary chat. GitHub is the only code host with account links today, so other hosts refuse. Worker settings are in the [operations reference](operations.md#factory-slack-progress), and account links in [factory Slack steering](operations.md#factory-slack-steering).
 
 ## Operate and evaluate
 

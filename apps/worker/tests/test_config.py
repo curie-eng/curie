@@ -23,7 +23,7 @@ import pytest
 import yaml
 from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel.core import Kernel
 from nacl.signing import SigningKey
@@ -41,7 +41,8 @@ def test_default_ownership_clocks_share_a_thirty_five_second_failure_deadline(
         redis=None,
         kernel=None,
         config=config,
-        leases=store,  # type: ignore[arg-type]
+        leases=store,  # type: ignore[arg-type],
+        reminders=refuse_unconfigured_reminder,
     )
     assert config.consumer_heartbeat_ttl_ms == 45000
     assert config.delivery_lease_ttl_s == 45.0
@@ -55,7 +56,8 @@ def test_default_ownership_clocks_share_a_thirty_five_second_failure_deadline(
         redis=None,
         kernel=None,
         config=shorter,
-        leases=None,  # type: ignore[arg-type]
+        leases=None,  # type: ignore[arg-type],
+        reminders=refuse_unconfigured_reminder,
     )
     assert short_consumer._liveness_refresh_interval_s() == 3.0
     assert (
@@ -117,9 +119,19 @@ _ENV_TABLE: list[_Row] = [
     _Row("valkey_port", "VALKEY_PORT", "6380", 6380, 6379),
     _Row("valkey_password", "VALKEY_PASSWORD", "vk-pass", "vk-pass", ""),
     _Row("valkey_db", "VALKEY_DB", "7", 7, 0),
-    _Row("slack_bot_token", "SLACK_BOT_TOKEN", "xoxb-sentinel", "xoxb-sentinel", ""),
     _Row(
-        "slack_api_base_url", "SLACK_API_BASE_URL", "http://slack.stub:9", "http://slack.stub:9", ""
+        "channel_gateway_url",
+        "CURIE_CHANNEL_GATEWAY_URL",
+        "https://gateway.example.com",
+        "https://gateway.example.com",
+        "",
+    ),
+    _Row(
+        "channel_gateway_token",
+        "CURIE_CHANNEL_GATEWAY_TOKEN",
+        "caller-sentinel",
+        "caller-sentinel",
+        "",
     ),
     _Row(
         "database_url",
@@ -604,8 +616,9 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.valkey_password == ""
     assert config.valkey_db == 0
     # Slack
-    assert config.slack_bot_token == ""
-    assert config.slack_api_base_url == ""
+    assert "slack_bot_token" not in WorkerConfig.model_fields
+    assert config.channel_gateway_url == ""
+    assert config.channel_gateway_token == ""
     assert config.slack_identities == ()
     # Postgres
     assert config.database_url == "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
@@ -845,6 +858,7 @@ def test_explicit_consumer_concurrency_still_wins_over_config(
         config=config,
         leases=DeliveryLeaseStore(redis, config),
         max_concurrency=1,
+        reminders=refuse_unconfigured_reminder,
     )
 
     assert consumer._max_concurrency == 1

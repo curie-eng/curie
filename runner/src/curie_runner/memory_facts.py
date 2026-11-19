@@ -7,7 +7,10 @@ Two memories, each a namespace on the durable state API reached with the broad
   in every channel the agent works in;
 - channel memory at ``CURIE_CHANNEL_MEMORY_REF``
   (``.../agents/<id>/state/bindings/<kind>/<address>/memory``), kept for one
-  channel binding only.
+  channel binding only. ``<address>`` is not the raw address: the worker
+  escapes its ``%`` and ``/`` and then encodes it as a path segment
+  (``curie_worker.binding.binding_state_path``), and the runner uses the ref
+  exactly as given.
 
 A fact is one key ``fact-<32 hex>`` whose value is
 ``{"statement", "author", "stated_at", "session_id"}``. Agent memory also holds

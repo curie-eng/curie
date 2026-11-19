@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -10,6 +11,7 @@ from aci_protocol import (
     TurnSource,
 )
 from aci_protocol.turn import DEFAULT_IDENTITY
+from curie_channel_gateway.slack.tokens import token_identity
 from curie_telemetry.redact import redact_text
 
 from ..approvals import (
@@ -28,7 +30,6 @@ from ..sandbox.types import (
     RouteChangedError,
     SandboxHandle,
 )
-from ..slack_tokens import token_identity
 from ..workspace import (
     WORKSPACES_DISABLED_REFUSAL,
     WorkspaceSelectionRefused,
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
     from .core import Kernel
 
 from ..ledger_client import LedgerNotDeployed
-from . import clock, constants, failures, log, routing, workspace
+from . import claim, clock, constants, failures, log, routing, workspace
 from .log import logger
 
 
@@ -76,6 +77,17 @@ async def _route_attachment_and_start(
         return max(
             0.0,
             min(constants._ATTACHMENT_HANDOFF_PROBE_TIMEOUT_S, probe_remaining_s - elapsed),
+        )
+
+    async def handoff_readiness(handle: SandboxHandle, budget: float) -> str:
+        watched = await self._markers.watched_turn(handle.claim_name)
+        predecessor_event_id = None
+        if watched is not None:
+            event_id = json.loads(watched)["event_id"]
+            if not await self._markers.is_terminal(event_id):
+                predecessor_event_id = event_id
+        return await self._cold_handoff_readiness(
+            handle, remaining_s=budget, predecessor_event_id=predecessor_event_id
         )
 
     async def settle_shielded(task: asyncio.Task[Any]) -> None:
@@ -145,10 +157,7 @@ async def _route_attachment_and_start(
             probe_budget = current_probe_budget()
             if probe_budget <= 0:
                 raise TimeoutError("attachment handoff probe budget is exhausted")
-            readiness = await self._cold_handoff_readiness(
-                expected_handle,
-                remaining_s=probe_budget,
-            )
+            readiness = await handoff_readiness(expected_handle, probe_budget)
             if readiness != "ready":
                 logger.info(
                     "retained attachment handoff refused for agent=%s "
@@ -208,10 +217,7 @@ async def _route_attachment_and_start(
                     probe_budget = current_probe_budget()
                     if probe_budget <= 0:
                         raise TimeoutError("attachment handoff probe budget is exhausted")
-                    readiness = await self._cold_handoff_readiness(
-                        current_handle,
-                        remaining_s=probe_budget,
-                    )
+                    readiness = await handoff_readiness(current_handle, probe_budget)
                     if readiness != "ready":
                         logger.info(
                             "retained attachment handoff refused for agent=%s "
@@ -297,6 +303,9 @@ async def _route_attachment_and_start(
                             handle=handle,
                             run=self._run_for_event(qevent.event_id),
                             remaining_s=remaining_s,
+                        )
+                        await claim._watch_turn_before_start(
+                            self, thread_key, handle, qevent.event_id, remaining_s
                         )
                         turn = await self._start_turn_under_hook_control(handle, event, remaining_s)
                     except BaseException:  # noqa: BLE001 - broad catch kept at a failure boundary

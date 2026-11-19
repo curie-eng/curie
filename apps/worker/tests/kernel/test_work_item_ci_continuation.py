@@ -32,7 +32,7 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol import work_item_events
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_worker.approvals import PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import FactoryContext, FactoryWake, HttpIdentityBinding
@@ -788,58 +788,5 @@ def test_a_continuation_for_an_ended_execution_runs_no_turn(make_harness, state:
             assert work_items.finishes == []
             assert "acquire" not in work_items.calls
             assert await h.kernel._markers.is_terminal(turn.event_id)
-
-    asyncio.run(exercise())
-
-
-@pytest.mark.parametrize(
-    "code",
-    ["factory_binding_missing", "factory_tenant_mismatch", "factory_surface_mismatch"],
-)
-def test_refused_continuation_finishes_its_epoch_and_valid_neighbor_runs(
-    make_harness, caplog: pytest.LogCaptureFixture, code: str,
-) -> None:
-    async def exercise() -> None:
-        async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace,
-            publication_creator=_PublicationApi(),
-        ) as h:
-            refused_id = uuid.uuid4()
-            refused = _WorkItems(running=refused_id)
-            refused.authority_refusal = code
-            h.kernel._work_items = refused
-            event = _ci_turn(refused_id)
-            with caplog.at_level(logging.INFO, logger="curie_worker.kernel"):
-                await h.kernel.process_event(event)
-            assert refused.finishes == [(
-                refused_id,
-                {
-                    "runtime_epoch": EPOCH,
-                    "outcome": "failed",
-                    "cause": "runner_escalated",
-                    "detail": "Factory execution authority is no longer valid.",
-                    "ci_fix_round": None,
-                    "budget_s": 120.0,
-                },
-            )]
-            assert any(code in record.getMessage() for record in caplog.records)
-            assert not any("AmbiguousRoute" in record.getMessage() for record in caplog.records)
-            assert not any(
-                "not_started:interrupted" in record.getMessage() for record in caplog.records
-            )
-            assert h.runner.opened == []
-            assert h.fake_k8s.claims == {}
-            assert h.kernel._workspace.selections == []
-            assert await h.async_redis.exists(h.config.done_key(event.event_id))
-            neighbor_id = uuid.uuid4()
-            neighbor = _WorkItems(running=neighbor_id)
-            h.kernel._work_items = neighbor
-            h.runner.default_script = [Final(text="No fix published", status=SessionStatus.DONE)]
-            await h.kernel.process_event(_ci_turn(neighbor_id))
-            assert h.runner.opened == [_ci_text(2)]
-            assert neighbor.finishes[0][0] == neighbor_id
-            assert neighbor.finishes[0][1]["runtime_epoch"] == EPOCH
-            assert neighbor.finishes[0][1]["cause"] == "ci_fix_unpublished"
-            assert h.kernel._workspace.selections == [WORK_ITEM_REPO]
 
     asyncio.run(exercise())

@@ -774,6 +774,7 @@ class Install:
             return str(publication["id"])
 
     async def _reconcile(self) -> None:
+        from curie_channel_gateway.reply_transport import HttpReplyAdapter
         from curie_worker.publication_clients import (
             PublicationCodeHostClient,
             PublicationCredentialClient,
@@ -785,7 +786,6 @@ class Install:
         from curie_worker.publication_store import PostgresPublicationStore
         from curie_worker.reply_sink import (
             TRACKER_KINDS,
-            HttpReplyAdapter,
             ReplySinkRouter,
             TrackerReplySink,
         )

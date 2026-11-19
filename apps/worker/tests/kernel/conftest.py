@@ -139,7 +139,9 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
     """Seed one migrated hook run and clean only rows owned by that seed."""
 
     @contextlib.asynccontextmanager
-    async def seed(*, outcome: str | None = None) -> AsyncIterator[HookRunSeed]:
+    async def seed(
+        *, outcome: str | None = None, source: str = "schedule"
+    ) -> AsyncIterator[HookRunSeed]:
         engine = create_async_engine(_DB_URL)
         token = uuid.uuid4().hex
         agent_id = uuid.uuid4()
@@ -174,9 +176,9 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
                     text(
                         "INSERT INTO curie.hook_runs "
                         "(id, agent_id, name, slot_utc, version_id, outcome, "
-                        "started_at, ended_at) VALUES "
+                        "source, started_at, ended_at) VALUES "
                         "(:id, :agent_id, :name, :slot_utc, :version_id, :outcome, "
-                        "now(), :ended_at)"
+                        ":source, now(), :ended_at)"
                     ),
                     {
                         "id": run_id,
@@ -185,6 +187,7 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
                         "slot_utc": slot,
                         "version_id": version_id,
                         "outcome": outcome,
+                        "source": source,
                         "ended_at": datetime.now(UTC) if outcome is not None else None,
                     },
                 )
@@ -775,6 +778,7 @@ class FakeRunner:
         self.turn_ready = False
         self.admission_timeout_s = 5.0
         self.history_durable = True
+        self.side_effect_emitted = False
         self.session_status = "idle-awaiting-input"
         # When set, /status answers 500 so a test can drive the fail-closed
         # liveness read (an unreadable session must count as busy).
@@ -840,6 +844,7 @@ class FakeRunner:
             "status": self.session_status,
             "turn_active": self.turn_active,
             "history_durable": self.history_durable,
+            "side_effect_emitted": self.side_effect_emitted,
         }
         if self.tool_access_enforced is not None:
             body["tool_access"] = list(self.tool_access_enforced)
@@ -1170,6 +1175,7 @@ async def kernel_harness(
     pod_termination_wait_s: float = 0.0,
     attachment_access: object | None = None,
     recovery_factory: Callable[[object | None], object] | None = None,
+    factory_steering: object | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel. @spec HTTP-INVOCATION-EXECUTION-18."""
@@ -1298,6 +1304,9 @@ async def kernel_harness(
         # The terminal recovery capture (#5143) is built over the same workspace
         # coordinator the kernel releases through; omitted, the kernel has none.
         **({"recovery": recovery_factory(workspace)} if recovery_factory is not None else {}),
+        # The factory Slack steering diversion (#5414); omitted, the kernel has
+        # none and every Slack turn takes the ordinary path.
+        **({"factory_steering": factory_steering} if factory_steering is not None else {}),
     )
     killswitch = None
     if with_killswitch:

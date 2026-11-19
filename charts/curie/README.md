@@ -355,14 +355,42 @@ chart's OTLP write path.
 
 `otelCollector.extraProcessors` defines additional Collector processors by
 component ID. `otelCollector.extraTracePipelineProcessors` selects their IDs in
-execution order for the traces pipeline. Selected processors run after
-`memory_limiter` and before `batch`; with both values empty, the rendered
-Collector configuration and all three pipelines retain their existing defaults.
-An upgrade using `--reuse-values` from a release whose values predate these
-keys also treats the omitted keys as empty. An explicitly supplied non-map
-`extraProcessors` or non-list `extraTracePipelineProcessors` is rejected.
-For example, an operator can suppress routine spans before batching and export
-while retaining user, state, and action spans:
+execution order. Selected processors run after `memory_limiter` and before
+`batch` on every trace pipeline. With both values empty, logs and metrics keep
+their processor lists, and `traces/langfuse` runs `memory_limiter`,
+`filter/langfuse_platform_noise`, then `batch`.
+
+The chart always renders `traces/langfuse`. It receives OTLP, runs
+`memory_limiter`, any selected extra processors, the built-in
+`filter/langfuse_platform_noise`, and `batch`, and exports only to
+`otlphttp/langfuse`. The filter uses `error_mode: ignore` and drops spans
+named `curie.sandbox.cleanup` and spans whose names start with `curie.background.`.
+It drops `http.server.request` only when `service.name` is `curie-api`, `curie.source`
+is `GET`, and `curie.operation` is one of: `/health`, `/ready`, `/agents`,
+`/agents/{agent_id}`, `/approvals`, `/approvals/{approval_id}`,
+`/approvals/{approval_id}/audit`, `/langfuse/traces`, `/langfuse/traces/{trace_id}`,
+`/observability/metrics/summary`, `/observability/metrics/series`, or
+`/observability/runners`, `/cluster-message-replies/{reply_ref}`, or
+`/v1/internal/work-items/runtime-owners`. These probe and polling handlers read state without
+emitting child spans. The API middleware exports the route template in `curie.operation`
+and the method in `curie.source`. Unknown routes, missing attributes, other services,
+and write requests stay, preserving HTTP parents of ingress, approvals, and webhooks.
+
+A second pipeline named `traces` renders only when `debugExporter.enabled` is
+true or `extraPipelineExporters` is non-empty. It runs `memory_limiter`, the
+selected extra processors, and `batch`, and exports to the debug exporter and
+`extraPipelineExporters`. It does not export to Langfuse and it does not run
+the platform noise filter, so an operator backend still receives the spans
+Langfuse drops.
+
+`filter/langfuse_platform_noise` is a built-in processor name. An
+`extraProcessors` entry with that name is refused, as is selecting it from
+`extraTracePipelineProcessors`. An upgrade using `--reuse-values` from a
+release whose values predate the extra processor keys still renders the
+built-in filter. An explicitly supplied non-map `extraProcessors` or non-list
+`extraTracePipelineProcessors` is rejected. For example, an operator can
+suppress further routine spans before batching and export while retaining
+user, state, and action spans:
 
 ```yaml
 otelCollector:
@@ -378,7 +406,8 @@ otelCollector:
 The chart refuses an extra processor that replaces a built-in processor, a
 malformed component ID or non-map configuration, an undefined pipeline
 reference, a duplicate selected ID, or a selected built-in ID. The selection
-affects traces only; logs and metrics keep their existing processor order.
+affects trace pipelines only; logs and metrics keep their existing processor
+order. The built-in platform noise filter is not part of that selection.
 The operator owns the filter expression and must validate it against the
 pinned Collector image and representative spans before applying it. On
 Collector contrib 0.119.0, `otelcol-contrib validate --config=...` accepted
@@ -2335,12 +2364,12 @@ dispatcher:
         botTokenExistingSecret: slack-sales      # key defaults to slackBotToken
 ```
 
-With no entries the chart renders exactly the objects it rendered before the
-key existed. With entries, the dispatcher, worker and API each receive
-`CURIE_SLACK_IDENTITIES`, which names every identity and the env vars holding
-its tokens, from one helper (`templates/_slack-identities.tpl`). Entry `n`'s bot
-token is `CURIE_SLACK_BOT_TOKEN__<n>` in all three, and the dispatcher also
-gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set, `CURIE_SLACK_SIGNING_SECRET__<n>`.
+With entries, the dispatcher, gateway, worker and API each receive
+`CURIE_SLACK_IDENTITIES` from `templates/_slack-identities.tpl`. This declares
+identity names and token environment names; the API and worker receive no token
+values. Entry `n`'s bot token is `CURIE_SLACK_BOT_TOKEN__<n>` in the dispatcher
+and gateway. Only the dispatcher gets `CURIE_SLACK_APP_TOKEN__<n>` and, when set,
+`CURIE_SLACK_SIGNING_SECRET__<n>`.
 `default` always keeps the `SLACK_*` names. The render refuses a duplicate
 name, a name that is not lowercase letters and digits in runs joined by single
 hyphens (at most 40 characters, so every name is one a binding's `adapter` can
@@ -2348,6 +2377,63 @@ carry), a name of `curie-cluster-message` (reserved for the platform's
 built-in cluster-message reply adapter), a missing token reference, `default`
 configured twice or not at all, and an `extraEnv` entry naming any of these
 variables. `charts/curie/ci/slack-identities-assertions.sh` pins all of it.
+
+### Channel gateway upgrade
+
+An existing Slack install upgrades with the same values file and Secret objects.
+`channelGateway.deploy: null` automatically deploys the gateway when Slack is
+configured and `channelGateway.url` is empty. Setting `deploy: false` explicitly
+requires an external URL; the render refuses otherwise and names both fixes.
+Installs without Slack do not deploy a gateway automatically. The gateway adds
+one Deployment and a 1Gi replay PVC by default; its storage class follows
+`global.storageClass` unless `channelGateway.replayStorageClass` is configured.
+
+The chart moves Slack bot-token references from the API and worker into the
+gateway, preserving their Secret names and keys. The dispatcher retains its
+intake credentials. The API and worker receive distinct caller credentials,
+generated and persisted in the chart Secret, and use verified internal TLS.
+No operator token changes are needed for a chart-managed install. Custom launchers
+must remove raw Slack tokens from API and worker environments because both
+applications now reject them. This is a runtime credential-custody change.
+
+With no `channelGateway.tlsSecret`, Helm creates
+`<fullname>-channel-gateway-tls` containing `ca.crt`, `tls.crt` and `tls.key`.
+The server certificate covers this release's service DNS names. Both it and the
+signing CA last ten years. Helm `lookup` preserves the complete
+Secret across upgrades. Use a Helm client with Kubernetes API access; offline
+renderers cannot persist generated certificates and must instead provide a
+managed `channelGateway.tlsSecret` containing the certificate and key, plus
+`ca.crt` for a private CA. Publicly trusted certificates may omit `ca.crt`; callers
+then use their system trust roots. API and worker
+mount only `ca.crt`; the gateway alone mounts the server key. The added CA is
+trusted by the API request and undo recovery clients, worker shared client,
+reply sink and file-download transports, scoped to the configured gateway origin.
+The protected worker receives its CA path from its launcher environment.
+
+Rotate before the server certificate expires. For operator-managed certificates,
+replace the named Secret's certificate and key, and CA when private.
+For chart-managed certificates, schedule a brief Slack delivery maintenance
+window, delete only this release's gateway TLS Secret, and run `helm upgrade`
+with the unchanged values file so Helm generates a new CA and certificate.
+TLS data checksums roll the gateway, API and worker together during the upgrade
+so all use the new certificate and trust bundle; then verify delivery.
+After changing an operator-managed Secret, run `helm upgrade` with API access
+to refresh those checksums. Rotation is explicit;
+ordinary upgrades never silently rotate the certificate. Do not delete the
+replay PVC during rotation.
+
+An external gateway uses `channelGateway.url`; configure separate
+`channelGateway.apiToken` and `channelGateway.workerToken`. For a private CA,
+`channelGateway.tlsSecret` supplies `ca.crt` to callers. For a chart-deployed
+gateway it also supplies `tls.crt` and `tls.key`. Explicit
+`channelGateway.allowInsecure: true` permits HTTP on a development network.
+A supplied TLS Secret always selects HTTPS. Its single replica and Recreate
+strategy keep the persistent SQLite replay ledger under one owner.
+
+Protected-worker provisioners must migrate `process.json` v1 once before
+starting the upgraded image; see the
+[one-shot process migration](../../packages/channel-gateway/README.md#protected-worker-process-files).
+The runtime continues rejecting v1; there is no dual-version startup path.
 
 A plain `curie cluster up` re-supplies a recorded list along with the
 `dispatcher.slack` token fields, so an operator does not need to pass it again
@@ -2360,13 +2446,12 @@ stores it on the binding, so a declared identity can be bound to any channel,
 including one another identity already answers in (ADR-0168 decision 3).
 
 Each identity's bot token is also the one its turns are answered with. The
-worker sets the assistant status, edits the reply, posts and settles approval
-cards and downloads attached files with the token of the identity a turn
-arrived on, and the API resolves an approval's Slack user-group approvers with
-it, so each Slack app needs its own `files:read` and `usergroups:read` scopes.
-A worker holding no token for the identity a turn names drops the turn before
-it runs, logs the identity, and leaves the placeholder as the dispatcher posted
-it: it never answers as another bot.
+worker delegates assistant status, replies, approval cards and attached-file
+fetches to that identity's gateway ports. The API asks the same identity's
+membership source for approval authorization. Each Slack app therefore needs
+its own `files:read` and `usergroups:read` scopes. An undeclared identity is
+refused before a turn runs; missing provider credentials refuse at the gateway.
+Neither application borrows another bot's identity.
 
 A second identity also puts a rate limit on fan-out between siblings (ADR-0168
 decision 6): 5 sibling-written turns per session key, and 5 conversations
@@ -2469,6 +2554,27 @@ release can clear the pause while a worker pod from before the upgrade is
 still running, and that pod can take turns until it is replaced. Upgrading
 first with no key and generating one later does not remove this: the second
 upgrade rolls workers that do not yet hold the key in the same way.
+
+Each caller proxy spends approval grants in this release's Valkey. The API is
+given `CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME`, the name of the Secret its
+own `VALKEY_PASSWORD` reads (`valkey.existingSecret`, else the release
+Secret), and renders the proxy with a credential-free Valkey address plus a
+`secretKeyRef` to key `valkeyPassword` of that Secret. The password is never
+written into a connector Deployment, ReplicaSet or Pod. A `VALKEY_URL` whose
+password differs from `VALKEY_PASSWORD` is refused at render
+(`grant_store_password_not_in_secret`). Earlier releases wrote the whole Valkey
+URL, password included, into each proxy's environment as a literal, and the
+superseded ReplicaSets of a connector Deployment keep that value until their
+history is pruned. After upgrading from such a release and letting the
+connector Deployments roll (the next `cluster deploy` of each agent, or the
+next pass of `worker.connectorReconciler`), rotate the Valkey password. Then
+restart the connector Deployments, for example `kubectl rollout restart
+deployment -n <namespace> -l
+app.kubernetes.io/component=mcp-connector,app.kubernetes.io/part-of=<release>`:
+each caller proxy reads the password from the Secret only when its container
+starts, so a running proxy keeps the old password and cannot spend grants until
+it restarts. The same restart applies after any later rotation of the Valkey
+password.
 
 ### HTTP identity operator files
 
@@ -2577,3 +2683,19 @@ and teardown. The local runner receives a claim-owned writable named tmpfs cache
 `536870912`, or `512Mi`). Its contents consume effective memory resources, so
 a file below the volume capacity can still fail when the runner's memory limit
 is exhausted. Claim deletion removes only that claim's volume.
+
+
+## Declared Slack test drivers
+
+`testInstallation.enabled` defaults to `false`. The existing
+`testInstallation.drivers` entries name `channel_id`, `bot_id` and
+`bot_user_id`, plus `agent` for a sibling driver; `testInstallation.threadTurnLimit`
+bounds driver turns per thread in ten minutes. The chart passes the same values
+to the dispatcher for legacy and selected HTTP intake. Existing production,
+published-secret and driver-identity checks apply to both paths.
+
+Selected HTTP intake admits only listed, marked bot mentions, attributes them
+to the configured driver user, and applies normal API identity admission.
+Root pings reply without a turn; bot direct messages and test-driver approval
+replies remain refused. See the
+[gateway implementation notes](../../packages/channel-gateway/README.md#adr-0202-implementation-declared-http-test-drivers).

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 
 
@@ -295,8 +297,36 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
 
 REDACTION_BOUNDARIES: tuple[str, ...] = ("stdout", "gen_ai_span")
 
+_held_values: frozenset[str] = frozenset()
+_held_literals: tuple[str, ...] = ()
+
+
+def held_secret_literals(values: Collection[str]) -> tuple[str, ...]:
+    literals = {value for value in values if value}
+    for value in tuple(literals):
+        for encoded in (
+            base64.standard_b64encode(value.encode()).decode(),
+            base64.urlsafe_b64encode(value.encode()).decode(),
+        ):
+            literals.update(form for form in (encoded, encoded.rstrip("=")) if len(form) >= 8)
+    return tuple(sorted(literals, key=lambda item: (-len(item), item)))
+
+
+def register_held_secrets(values: Collection[str]) -> None:
+    """Keep held credentials redacted throughout this process, including exporters."""
+
+    global _held_values, _held_literals
+    _held_values = _held_values | frozenset(value for value in values if value)
+    _held_literals = held_secret_literals(_held_values)
+
+
+def registered_held_secrets() -> frozenset[str]:
+    return _held_values
+
 
 def redact_text(text: str) -> str:
+    for literal in _held_literals:
+        text = text.replace(literal, "[REDACTED:held_secret]")
     for rule in REDACTION_RULES:
         text = rule.pattern.sub(rule.placeholder, text)
     return text
@@ -318,6 +348,10 @@ class RedactingLogFilter(logging.Filter):
         if redacted != message:
             record.msg = redacted
             record.args = ()
+        if record.exc_info:
+            record.exc_text = redact_text(logging.Formatter().formatException(record.exc_info))
+        if record.stack_info:
+            record.stack_info = redact_text(record.stack_info)
         return True
 
 

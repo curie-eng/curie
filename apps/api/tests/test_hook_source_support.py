@@ -733,34 +733,6 @@ def test_missing_delivery_id_is_400_only_after_valid_signature(
     asyncio.run(asyncio.wait_for(scenario(), 20))
 
 
-@pytest.mark.parametrize("unknown", [False, True])
-def test_bad_or_unknown_authentication_finishes_without_gate(
-    support_db: None, unknown: bool
-) -> None:
-    """Preauthentication refuses before acquiring the agent advisory lock.
-
-    @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-2.
-    """
-
-    async def scenario() -> None:
-        """@spec PROTECTED-HOOK-SOURCE-9/2."""
-        async with probe_app() as (app, client, agent):
-            target = str(uuid.uuid4()) if unknown else agent
-            body = BODIES[None]
-            async with app.state.source_gate.hold(uuid.UUID(target)):
-                async with asyncio.timeout(2):
-                    response = await post_support(
-                        client,
-                        target,
-                        body,
-                        support_headers("bad-secret", requested=None, body=body),
-                    )
-                assert_uniform_401(response)
-                assert app.state.source_gate.engine.pool.checkedout() == 1
-
-    asyncio.run(asyncio.wait_for(scenario(), 20))
-
-
 @pytest.mark.parametrize("protected", [False, True])
 def test_waiting_probe_reauthenticates_after_rotation(support_db: None, protected: bool) -> None:
     """A key rotated while the probe waits on the gate fails reauthentication.

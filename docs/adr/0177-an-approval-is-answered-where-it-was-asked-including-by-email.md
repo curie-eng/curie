@@ -4,6 +4,16 @@ Date: 2026-09-25
 
 Status: Accepted
 
+**Partially amended by [ADR 0273](0273-approval-routes-own-expiry-and-reminders.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0273 extends decision 5 with non-interactive reminder replies and decision 6
+with pending-lifetime reference retention and bounded terminal retention.
+
+**Partially amended by [ADR 0272](0272-approver-dm-delivery-uses-one-selected-recipient.md)**
+(back link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+ADR 0272 adds `approver_dm` to the opening location rule and decisions 1 and 2,
+and extends decision 6's single-card lifecycle to that surface.
+
 **Superseded in part by [ADR 0220](0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 for an agent that names an approver team, approver-team membership replaces
@@ -189,7 +199,7 @@ sets, without waiting for this ADR.
    `apps/api/src/curie_api/approvers.py`: the requester-only set.
 4. `apps/worker/src/curie_worker/kernel.py`: `_parse_approval_targets` accepts
    the mode, and the escalation in decision 3.
-5. `apps/mail-adapter/src/curie_mail_adapter/`: render the intent, keep
+5. `packages/channel-gateway/src/curie_channel_gateway/mail/`: render the intent, keep
    references, read replies, send the follow-up.
 6. `cli/src/commands.rs` and `cli/src/api.rs`: route validation.
 7. `docs/interfaces/approval/INTERFACE.md` and

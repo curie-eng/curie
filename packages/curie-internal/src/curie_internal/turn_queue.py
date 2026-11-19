@@ -1,0 +1,192 @@
+"""The queue seam between the dispatcher and the worker (F1).
+
+``QueuedTurn`` (from ``aci_protocol``) is the normalized job the dispatcher
+enqueues onto the Valkey Stream and the worker consumes. The model was promoted
+into the frozen ACI package (issue #7) so the contract is shared across three
+languages and guarded by the schema-compat gate rather than hand-mirrored. This
+module owns only the Valkey Stream *transport* of that model (a transport detail
+that stays out of the frozen package): the single-``payload`` wire encoding plus
+the dedupe guard.
+
+Wire encoding: a Stream entry carries the model as a single ``payload`` field
+holding ``model_dump_json()``. A one-field JSON blob keeps the seam explicit and
+versionable (add fields without reshaping the Stream schema) and lets the worker
+reconstruct the model with ``from_stream_fields``.
+
+Dedupe (idempotency, detailed-architecture 2b rule 5): the idempotency key is the
+delivery's ``event_id`` (the Slack event id for the Slack adapter). A retried
+delivery must not enqueue twice. We guard with a Valkey ``SET <dedupe_key> 1 NX
+EX <ttl>`` before enqueuing: the first delivery claims the key and enqueues; a
+retry finds the key present and is dropped. This is chosen over stream-side
+dedupe because it is O(1), TTL-bounded (no unbounded dedupe set to prune), and
+does not require scanning the Stream.
+
+The claim also has a release path, ``release_event`` (``DEL <dedupe_key>``,
+#2006). The Slack mint path no longer calls it on a failed placeholder: a
+failed placeholder now still enqueues the turn with no placeholder, so the
+claim must be held against a redelivery (``handlers._post_placeholder``). A
+failure between a *successful* placeholder post and the ``XADD`` must not
+release either: the placeholder is already visible in the channel, and a
+redelivery that re-claims would post a second one.
+"""
+
+import logging
+from typing import Any, Protocol, cast, runtime_checkable
+
+from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, parse_queued_turn
+from curie_telemetry import inject_trace_context, operation_span, record_metric
+from opentelemetry.trace import SpanKind, StatusCode
+
+logger = logging.getLogger("curie_dispatcher.queue")
+
+
+class QueueConfig(Protocol):
+    """Settings consumed by the channel-neutral stream producer."""
+
+    @property
+    def stream(self) -> str: ...
+
+    @property
+    def dedupe_ttl_seconds(self) -> int: ...
+
+    def dedupe_key(self, event_id: str) -> str: ...
+
+
+@runtime_checkable
+class StreamPublisher(Protocol):
+    """The stream-broker port (producer side): append an entry + dedupe-claim.
+
+    Issue #284 / ADR-0027, widened by #2006. The producer's whole coupling to
+    the broker is these three verbs: ``xadd`` (append the one-``payload`` entry
+    to the stream), a ``SET NX EX`` dedupe-claim (``set``), and its release
+    (``delete``). Typing the producer against this Protocol makes a future
+    non-redis broker a drop-in on the write side. The consumer side has its own
+    port (``StreamBroker`` in the worker). ``redis.Redis`` already has
+    ``delete``, so it structurally satisfies this widened port too, same as
+    before -- the one backing today with no adapter. The verbs are typed
+    permissively to match redis-py's signatures.
+    """
+
+    def xadd(self, name: Any, fields: Any) -> Any:
+        """Append an entry to ``name``; returns the assigned stream id."""
+        ...
+
+    def set(self, name: Any, value: Any, *, nx: bool = ..., ex: Any = ...) -> Any:
+        """``SET`` with ``NX``/``EX`` — the dedupe-claim beside the stream."""
+        ...
+
+    def delete(self, *names: Any) -> Any:
+        """``DEL`` — releases a dedupe claim (see ``release_event``)."""
+        ...
+
+
+def to_stream_fields(turn: QueuedTurn) -> dict[str, str]:
+    """Render the byte-identical payload plus optional transport trace context."""
+    fields = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+    inject_trace_context(fields)
+    return fields
+
+
+def from_stream_fields(fields: dict[str, str]) -> QueuedTurn:
+    """Reconstruct a turn from a Stream entry's field map (the worker's entry point)."""
+    return parse_queued_turn(fields[STREAM_PAYLOAD_FIELD])
+
+
+def claim_event(redis_client: "StreamPublisher", config: "QueueConfig", event_id: str) -> bool:
+    """Claim a Slack event id for processing, returning True on the first claim.
+
+    Uses ``SET NX EX`` so exactly one delivery of a given event id wins; retries
+    see the key already set and get False, which the caller treats as a duplicate
+    to drop.
+    """
+    attributes = {"service.name": "curie-dispatcher", "source": "dispatcher"}
+    with operation_span(
+        "curie.queue.dedupe",
+        kind=SpanKind.INTERNAL,
+        attributes=attributes,
+    ) as span:
+        try:
+            claimed = redis_client.set(
+                config.dedupe_key(event_id),
+                "1",
+                nx=True,
+                ex=config.dedupe_ttl_seconds,
+            )
+        except Exception:
+            span.set_status(StatusCode.ERROR)
+            span.add_event("queue.dedupe.failed", {"outcome": "failure"})
+            logger.error("queue dedupe decision failed")
+            raise
+        outcome = "claimed" if claimed else "duplicate"
+        span.add_event("queue.dedupe.decided", {"outcome": outcome})
+        logger.info("queue dedupe decision: %s", outcome)
+    return bool(claimed)
+
+
+def release_event(
+    redis_client: "StreamPublisher", config: "QueueConfig", event_id: str
+) -> None:
+    """Release the dedupe claim on ``event_id`` so a Slack redelivery can retry.
+
+    The Slack mint path no longer calls this: a failed placeholder still
+    enqueues the turn, so its claim must be held (see the module docstring's
+    Dedupe paragraph). It stays part of the documented queue seam
+    (docs/interfaces/queue-stream). Legitimate to call only when nothing
+    user-visible has happened and nothing has been enqueued for the event; a
+    redelivery after a posted placeholder or a queued turn would duplicate it.
+
+    Caveat: under Socket Mode, Bolt acks the envelope before running the
+    listener body, so a Slack redelivery triggered by a failure inside the
+    listener is rare -- there is often no retry for the release to enable.
+    Calling this restores idempotency *correctness* (the claim no longer lies
+    about an event having gone through) rather than guaranteeing recovery of
+    every failure.
+    """
+    redis_client.delete(config.dedupe_key(event_id))
+
+
+def enqueue(redis_client: "StreamPublisher", config: "QueueConfig", turn: QueuedTurn) -> str:
+    """Append the normalized turn to the Valkey Stream, returning its Stream id."""
+    attributes = {"service.name": "curie-dispatcher", "source": "dispatcher"}
+    error: Exception | None = None
+    stream_id: object | None = None
+    outcome = "failure"
+    with operation_span(
+        "curie.queue.enqueue",
+        kind=SpanKind.PRODUCER,
+        attributes=attributes,
+    ) as span:
+        try:
+            # Build inside the producer span so the carrier names this exact
+            # async handoff while leaving QueuedTurn's JSON bytes untouched.
+            fields = cast("dict[Any, Any]", to_stream_fields(turn))
+            stream_id = redis_client.xadd(config.stream, fields)
+        except Exception as exc:  # noqa: BLE001 - preserve the queue's original exception shape
+            error = exc
+            span.set_status(StatusCode.ERROR)
+            span.add_event("queue.enqueue.failed", {"outcome": "failure"})
+        else:
+            outcome = "success"
+            span.add_event("queue.enqueued", {"outcome": "success"})
+            logger.info("turn enqueued")
+
+    metric_attributes = {**attributes, "outcome": outcome}
+    record_metric("curie.queue.enqueue", attributes=metric_attributes)
+    if error is not None:
+        raise error
+    assert stream_id is not None
+    record_metric(
+        "curie.turn.accepted",
+        attributes={
+            "service.name": "curie-dispatcher",
+            "source": "dispatcher",
+            "outcome": "accepted",
+        },
+    )
+    return _as_str(stream_id)
+
+
+def _as_str(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value)

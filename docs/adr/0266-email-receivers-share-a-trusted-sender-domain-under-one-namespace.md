@@ -9,8 +9,8 @@ approval by Junwon Jung (jw3329), including merging alongside its realizing
 code path in one combined pull request. The realizing code path is
 `curie_api.identity.http_invocation._email_registrations`, reached through
 `curie_api.identity.http_initializer.load_http_identity_runtime`, and the
-mail adapter's signing path `curie_mail_adapter.adapter.MailAdapter.post_turn`
-with `curie_mail_adapter.config.MailAdapterConfig`. The CODEOWNERS approving
+mail adapter's signing path `curie_channel_gateway.mail.adapter.MailAdapter.post_turn`
+with `curie_channel_gateway.mail.config.MailAdapterConfig`. The CODEOWNERS approving
 review by TheConnMan was not obtained before merge.
 
 Amends [ADR 0260](0260-http-identity-admits-an-email-sender-only-on-a-signed-email-receiver-proof.md)

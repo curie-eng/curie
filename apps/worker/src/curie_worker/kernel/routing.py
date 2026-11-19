@@ -20,6 +20,7 @@ from channel_protocol.reply import (
     ReplyAck,
     ReplyTarget,
     ReplyUpdate,
+    TurnCompleted,
 )
 
 from ..api_retry import DEFAULT_BUDGET_S
@@ -50,7 +51,7 @@ from ..workitem_dispatch import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import approval_key, constants, log
+from . import approval_key, constants, failures, log
 from .log import logger
 
 
@@ -339,6 +340,59 @@ async def _drop_with_message(
     drop for an unmapped channel or a paused agent, never a crash)."""
     await self._reply_for(qevent, route, message)
     await self._complete(qevent, route, "dropped", telemetry_outcome="interrupted", lease=lease)
+
+
+async def _settle_relay_after_refusal(self: Kernel, qevent: QueuedTurn) -> None:
+    """Tell a cluster message relay waiter that its turn was refused (#5518).
+
+    HTTP-INVOCATION-EXECUTION-31. A definitive identity refusal otherwise
+    posts nothing (criterion 18), which left ``curie cluster message`` and
+    ``curie cluster eval`` polling their relay bucket until the deadline.
+    Only a turn whose replies go to the platform-owned relay adapter gets
+    this notice: that adapter posts to the platform's own API, which only an
+    operator holding the API key can read, never to Slack or any other
+    surface a person sees. Every other refused turn stays silent.
+
+    Called after the done marker, and best effort: a lost notice leaves the
+    waiter on its deadline as before and never changes the terminal outcome.
+
+    Args:
+        qevent: The refused turn.
+    """
+    handle = qevent.reply_handle
+    if handle is None or handle.adapter != CLUSTER_MESSAGE_ADAPTER:
+        return
+    route = _route_from_handle(qevent)
+    target = _target_for(qevent)
+    try:
+        await self._reply(
+            target,
+            route,
+            failures.turn_failure_reply(
+                constants.IDENTITY_REFUSED_FAILURE_CLASS,
+                constants.IDENTITY_REFUSED_RELAY_NOTICE,
+            ),
+            best_effort_unreachable=True,
+        )
+        await self._sink.emit(
+            TurnCompleted(
+                version=REPLY_WIRE_VERSION,
+                event="turn.completed",
+                target=target,
+                event_id=qevent.event_id,
+                outcome="dropped",
+            ),
+            route=route,
+            best_effort_unreachable=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a best-effort notice after the terminal marker
+        logger.warning(
+            "the identity refusal notice for event %s could not reach its relay: %s",
+            qevent.event_id,
+            type(exc).__name__,
+        )
 
 
 async def _drop_ambiguous_route(

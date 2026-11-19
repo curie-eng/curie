@@ -895,7 +895,7 @@ def _deliver_cards(times: int = 1) -> tuple[list[dict[str, Any]], _CardMemory, l
     """
 
     cards = importlib.import_module("curie_worker.remediation_cards")
-    from curie_worker.slack_sink import SlackReplyAdapter
+    from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 
     posts: list[dict[str, Any]] = []
 
@@ -1328,7 +1328,7 @@ def test_a_card_post_retried_after_a_failure_posts_one_card(
     """
 
     cards = importlib.import_module("curie_worker.remediation_cards")
-    from curie_worker.slack_sink import SlackReplyAdapter
+    from curie_channel_gateway.slack.slack_sink import SlackReplyAdapter
 
     agent_id = _setup(client, auth_headers, tmp_path)
     approval_id = str(_request(agent_id, _nominate(agent_id)).approval_id)

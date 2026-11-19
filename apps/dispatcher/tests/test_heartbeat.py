@@ -11,8 +11,8 @@ import threading
 import time
 
 import pytest
-from curie_dispatcher.config import DispatcherConfig
-from curie_dispatcher.heartbeat import start_heartbeat
+from curie_channel_gateway.slack.config import DispatcherConfig
+from curie_channel_gateway.slack.heartbeat import start_heartbeat
 
 
 def _wait_for(predicate, timeout: float) -> bool:

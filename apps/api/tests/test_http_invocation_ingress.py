@@ -22,7 +22,7 @@ from curie_api.models import (
     Principal,
     ProviderInstallation,
 )
-from curie_dispatcher import admission as dispatcher_admission
+from curie_channel_gateway.slack import admission as dispatcher_admission
 from curie_internal.keyspace import CHANNEL_KEY_PREFIX
 from fastapi.testclient import TestClient
 from principal_adoption_support import ISSUER, adopt

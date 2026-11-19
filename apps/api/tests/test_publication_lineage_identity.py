@@ -47,7 +47,7 @@ from apps.api.tests.test_github_factory_base import (
 from apps.api.tests.test_workitem_outcomes import with_session
 
 REPO = "acme-corp/acme-bot"
-WORKER_TOKEN = "remote-dev-publication-worker-token"
+WORKER_TOKEN = "example-publication-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
 FIRST_REVISION_SHA = "1123456789abcdef0123456789abcdef01234567"

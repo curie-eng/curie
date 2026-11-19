@@ -34,14 +34,14 @@ impl Fixture {
         let kubeconfig = temp.path().join("kubeconfig");
         fs::write(
             &kubeconfig,
-            "apiVersion: v1\nkind: Config\ncurrent-context: test-ctx\ncontexts:\n- name: test-ctx\n  context:\n    cluster: test-cluster\n    user: test-user\nclusters: []\nusers: []\n",
+            "apiVersion: v1\nkind: Config\ncurrent-context: test-context\ncontexts:\n- name: test-context\n  context:\n    cluster: test-cluster\n    user: test-user\nclusters: []\nusers: []\n",
         )
         .expect("write kubeconfig");
         write_executable(
             &bin_dir.join("helm"),
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CURIE_TEST_HELM_LOG"
-if [ "$HELM_KUBECONTEXT" != test-ctx ]; then
+if [ "$HELM_KUBECONTEXT" != test-context ]; then
     printf 'Helm did not use the selected context\n' >&2
     exit 64
 fi
@@ -136,7 +136,7 @@ esac
             .args([
                 "cluster",
                 "--context",
-                "test-ctx",
+                "test-context",
                 "lint-values",
                 "--namespace",
                 "target-namespace",

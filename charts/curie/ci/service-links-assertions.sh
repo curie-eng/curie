@@ -36,6 +36,7 @@ helm template curie "$CHART" --is-upgrade \
   --set-string agentSandbox.runner.credentials=example \
   --set inference.deploy=true \
   --set inference.pullModel=false \
+  --set channelGateway.deploy=true \
   --set mailAdapter.deploy=true \
   --set 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24' \
   --set-string dispatcher.slack.appToken=xapp-example \

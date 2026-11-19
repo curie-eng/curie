@@ -567,9 +567,43 @@ def collector_config(path, label):
 
 def assert_pipeline_graph(config, label, expect_debug):
     pipelines = config.get("service", {}).get("pipelines", {})
-    assert set(pipelines) == {"traces", "logs", "metrics"}, (
-        f"{label}: expected traces/logs/metrics pipelines, got {sorted(pipelines)}"
+    names = set(pipelines)
+    assert {"traces/langfuse", "logs", "metrics"} <= names, (
+        f"{label}: missing a required pipeline, got {sorted(names)}"
     )
+    assert names <= {"traces/langfuse", "traces", "logs", "metrics"}, (
+        f"{label}: unexpected pipelines {sorted(names)}"
+    )
+    langfuse = pipelines["traces/langfuse"]
+    assert langfuse.get("exporters") == ["otlphttp/langfuse"], (
+        f"{label}: Langfuse trace export must stay on traces/langfuse only, "
+        f"got {langfuse.get('exporters')!r}"
+    )
+    langfuse_processors = langfuse.get("processors", [])
+    assert "filter/langfuse_platform_noise" in langfuse_processors, (
+        f"{label}: traces/langfuse is missing the platform noise filter"
+    )
+    assert (
+        langfuse_processors.index("memory_limiter")
+        < langfuse_processors.index("filter/langfuse_platform_noise")
+        < langfuse_processors.index("batch")
+    ), f"{label}: platform noise filter is outside memory_limiter..batch"
+    if "traces" in pipelines:
+        unfiltered = pipelines["traces"]
+        assert "otlphttp/langfuse" not in unfiltered.get("exporters", []), (
+            f"{label}: unfiltered traces pipeline exports to Langfuse"
+        )
+        assert "filter/langfuse_platform_noise" not in unfiltered.get("processors", []), (
+            f"{label}: unfiltered traces pipeline drops platform noise"
+        )
+        assert ("debug" in unfiltered.get("exporters", [])) is expect_debug, (
+            f"{label}: traces debug exporter opt-in mismatch: {unfiltered.get('exporters')!r}"
+        )
+        assert unfiltered.get("exporters"), f"{label}: unfiltered traces pipeline has no exporter"
+    elif expect_debug:
+        raise AssertionError(
+            f"{label}: debugExporter is on but the unfiltered traces pipeline is absent"
+        )
     component_sets = {
         key: set(config.get(key, {})) for key in ("receivers", "processors", "exporters")
     }
@@ -587,10 +621,11 @@ def assert_pipeline_graph(config, label, expect_debug):
         assert processors.index("memory_limiter") < processors.index("batch"), (
             f"{label}: {signal} batches before memory limiting: {processors!r}"
         )
-        exporters = pipeline.get("exporters", [])
-        assert ("debug" in exporters) is expect_debug, (
-            f"{label}: {signal} debug exporter opt-in mismatch: {exporters!r}"
-        )
+        if signal in ("logs", "metrics"):
+            exporters = pipeline.get("exporters", [])
+            assert ("debug" in exporters) is expect_debug, (
+                f"{label}: {signal} debug exporter opt-in mismatch: {exporters!r}"
+            )
 
     assert ("debug" in config.get("exporters", {})) is expect_debug, (
         f"{label}: debug exporter declaration opt-in mismatch"
@@ -910,8 +945,12 @@ assert len(metric_transforms) == 1, (
     f"default: expected one runner identity metrics transform, got {metric_transforms!r}"
 )
 transform_name = metric_transforms[0]
+assert "traces" not in pipelines, (
+    "default: unfiltered traces pipeline renders without debug or an extra exporter"
+)
 assert all(
-    transform_name not in pipelines[signal]["processors"] for signal in ("traces", "logs")
+    transform_name not in pipelines[signal]["processors"]
+    for signal in ("traces/langfuse", "logs")
 ), "default: runner metric identity transform must not affect traces or logs"
 metric_statements = default_config["processors"][transform_name]["metric_statements"]
 assert len(metric_statements) == 1 and metric_statements[0]["context"] == "datapoint", (
@@ -936,6 +975,9 @@ for signal in ("traces", "logs", "metrics"):
         f"safe extra exporter: {signal} must include otlphttp/acme-sink exactly once, "
         f"got {exporters!r}"
     )
+assert extra_config["service"]["pipelines"]["traces/langfuse"]["exporters"] == [
+    "otlphttp/langfuse"
+], "safe extra exporter: Langfuse pipeline must not gain the operator sink"
 
 secret_config = collector_config(
     secret_backed_extra_exporter_path, "secret-backed extra exporter"

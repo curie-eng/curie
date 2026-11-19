@@ -14,6 +14,10 @@ from uuid import uuid4
 import pytest
 from aiohttp import web
 from channel_protocol.reply import REPLY_WIRE_VERSION, TurnCompleted
+from curie_channel_gateway.reply_transport import (
+    ADAPTER_SECRET_HEADER,
+    HttpReplyAdapter,
+)
 from curie_protected_hooks.admission_records import DeliveryIdentity, delivery_digest
 from curie_protected_hooks.atomic_admission import AtomicAdmission
 from curie_protected_hooks.execution_namespace import derive_lane_namespace
@@ -27,7 +31,7 @@ from curie_worker.protected_launch_records import canonical_json
 from curie_worker.protected_markers import ProtectedMarkers
 from curie_worker.protected_runner import ProtectedRunnerClient
 from curie_worker.protected_substrate import ProtectedSandboxSubstrate
-from curie_worker.reply_sink import ADAPTER_SECRET_HEADER, HttpReplyAdapter, TargetRoute
+from curie_worker.reply_sink import TargetRoute
 
 from ..test_protected_retirement_server import actual_pair, wb
 

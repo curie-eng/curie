@@ -261,3 +261,10 @@ manage yourself, so it never passes through helm values or release history:
 
   Create any of them with kubectl, External Secrets, or Sealed Secrets.
 ─────────────────────────────────────────────────────────────────────────────
+
+{{- $gateway := include "curie.channelGateway.values" . | fromYaml }}
+{{- if and (eq (include "curie.channelGateway.deploy" .) "true") (not $gateway.tlsSecret) (not $gateway.allowInsecure) }}
+WARNING: Offline renderers (helm template, Argo, --dry-run=client) cannot reuse
+chart-managed gateway certificates through lookup. Set channelGateway.tlsSecret
+to a managed TLS Secret, or the CA and key rotate on every render.
+{{- end }}

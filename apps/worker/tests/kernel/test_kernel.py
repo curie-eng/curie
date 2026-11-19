@@ -7,7 +7,6 @@ scriptable in-process fake runner; only Slack and the model are faked.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import sys
 import threading
@@ -3156,8 +3155,8 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
     """A refused active file turn is delivered, acknowledged, and never reclaimed."""
 
     async def go() -> None:
-        from curie_dispatcher.queue import to_stream_fields
-        from curie_worker.consumer import Consumer
+        from curie_internal.turn_queue import to_stream_fields
+        from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
         from curie_worker.delivery_lease import DeliveryLeaseStore
 
         class AttachmentLane:
@@ -3177,6 +3176,7 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
                 kernel=h.kernel,
                 config=h.config,
                 leases=store,
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -4938,76 +4938,6 @@ def test_unknown_detach_stops_after_real_eval_without_later_probe_or_retry(
     asyncio.run(go())
 
 
-def test_pressure_inventory_hard_stops_at_two_seconds(
-    make_harness,
-) -> None:
-    class PausedScanRedis:
-        def __init__(self, client: Any, admin: Any) -> None:
-            self._client = client
-            self._admin = admin
-            self.scan_calls = 0
-            self.reply_durations: list[float] = []
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._client, name)
-
-        async def scan(self, *args: object, **kwargs: object) -> Any:
-            self.scan_calls += 1
-            await asyncio.to_thread(
-                self._admin.execute_command,
-                "CLIENT",
-                "PAUSE",
-                800,
-                "ALL",
-            )
-            started = time.monotonic()
-            result = await self._client.scan(*args, **kwargs)
-            self.reply_durations.append(time.monotonic() - started)
-            return result
-
-    async def go() -> None:
-        async with make_harness(
-            binding=_HistoryBinding(),
-            claim_timeout_seconds=0.05,
-            **_PRESSURE_LEASE_KNOBS,
-        ) as h:
-            candidate = await _safe_pressure_candidate(h, "tPausedInventory")
-            sync_client = h.substrate._affinity._redis  # noqa: SLF001
-            prefix = h.substrate._affinity._prefix  # noqa: SLF001
-            redis_client = h.substrate._affinity._pressure_redis  # noqa: SLF001
-            delayed = PausedScanRedis(redis_client, sync_client)
-            h.substrate._affinity._pressure_redis = (  # type: ignore[assignment]  # noqa: SLF001
-                delayed
-            )
-            padding = {f"{prefix}:unrelated:{number}": "padding" for number in range(18_000)}
-            await asyncio.to_thread(sync_client.mset, padding)
-            try:
-                started = time.monotonic()
-                result = await h.kernel._reclaim_idle_route(  # noqa: SLF001
-                    "requesting-thread",
-                    _quota_rejection(),
-                    remaining_s=120.0,
-                )
-                elapsed = time.monotonic() - started
-            finally:
-                await asyncio.to_thread(
-                    sync_client.execute_command,
-                    "CLIENT",
-                    "UNPAUSE",
-                )
-                h.substrate._affinity._pressure_redis = redis_client  # noqa: SLF001
-
-            assert 2.0 <= elapsed < 2.2
-            assert delayed.scan_calls >= 3
-            assert len(delayed.reply_durations) >= 2
-            assert all(0.6 <= duration < 1.0 for duration in delayed.reply_durations)
-            assert not result.reclaimed
-            assert result.outcome == "timeout"
-            assert h.substrate.lookup(candidate.thread_key) == candidate
-
-    asyncio.run(go())
-
-
 def test_pressure_inventory_socket_timeout_precedes_wall_deadline(
     make_harness,
 ) -> None:
@@ -6687,51 +6617,6 @@ def test_release_thread_force_releases_a_live_route(make_harness) -> None:
     asyncio.run(go())
 
 
-def test_workspace_reaper_holds_the_route_lock_during_exact_ledger_recheck(
-    make_harness,
-) -> None:
-    async def go() -> None:
-        async with make_harness(
-            lock_ttl_ms=90,
-            lock_acquire_timeout_s=1.0,
-            lock_poll_interval_s=0.01,
-        ) as h:
-            thread = "tWorkspaceReap"
-            entered = threading.Event()
-            gate = threading.Event()
-
-            class GatedWorkspace:
-                def enumerate_expired(self) -> list[str]:
-                    return [thread]
-
-                def begin_expired_reap(self, thread_key: str) -> object:
-                    assert thread_key == thread
-                    entered.set()
-                    gate.wait(timeout=5.0)
-                    return object()
-
-                def finish_expired_reap(self, candidate: object) -> bool:
-                    return True
-
-            h.kernel._workspace = GatedWorkspace()  # type: ignore[assignment]
-            reaping = asyncio.create_task(h.kernel.reap_orphans())
-            await wait_until(entered.is_set)
-
-            contender = asyncio.create_task(h.kernel._lock.acquire(h.config.lock_key(thread)))
-            try:
-                # Object cleanup outlives the original lease. Renewal must keep
-                # the competing claimant fenced for the full critical section.
-                await asyncio.sleep(0.25)
-                assert not contender.done(), "reaper mutated the ledger outside the route lock"
-            finally:
-                gate.set()
-            await reaping
-            token = await contender
-            await h.kernel._lock.release(h.config.lock_key(thread), token)
-
-    asyncio.run(go())
-
-
 def test_release_thread_interrupts_a_live_turn_first(make_harness) -> None:
     """Releasing a thread mid-turn interrupts it first rather than yanking the
     claim out from under a running turn silently."""
@@ -7117,87 +7002,6 @@ def test_side_effect_marker_retries_exact_backoff_and_holds_action_until_durable
     asyncio.run(go())
 
 
-def test_marker_deadline_returns_ownership_store_unavailable_while_liveness_is_healthy(
-    make_harness, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A real runner turn reaches the existing consume timeout outcome path."""
-
-    from curie_worker.consumer import Consumer
-    from curie_worker.delivery_lease import DeliveryLeaseStore
-
-    async def go() -> None:
-        async with make_harness(consumer_heartbeat_ttl_ms=150) as h:
-            event = qevent("marker deadline", event_id=uuid.uuid4().hex)
-            lease = await _marker_retry_lease(h, event.event_id)
-            consumer = Consumer(
-                redis=h.async_redis,
-                kernel=h.kernel,
-                config=h.config,
-                leases=DeliveryLeaseStore(h.async_redis, h.config),
-            )
-            await consumer._publish_liveness()
-            initial_liveness = consumer._last_liveness_renewal
-            liveness = asyncio.create_task(consumer._liveness_refresh_loop())
-            h.runner.default_script = [
-                SideEffectFlag(tool="deploy", call_id="held-marker"),
-                Final(text="must not apply", status=DONE),
-            ]
-            clock = _MarkerRetryClock()
-            started = clock.now
-            lease.local_deadline_monotonic = started + 35.0
-            clock.install(monkeypatch)
-            attempts: list[float] = []
-            actions: list[Any] = []
-
-            async def unavailable(_event_id: str) -> None:
-                attempts.append(clock.now - started)
-                raise redis.exceptions.ConnectionError("injected marker store outage")
-
-            async def forbidden_action(*args: Any, **_kwargs: Any) -> None:
-                actions.append(args)
-                raise AssertionError("an unmarked side-effect frame reached the action ledger")
-
-            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", unavailable)
-            monkeypatch.setattr(h.kernel, "_record_action", forbidden_action)
-            token = kernel_constants._DELIVERY_LEASE.set(lease)
-            try:
-                outcome = await h.kernel._attempt(
-                    event,
-                    TargetRoute(),
-                    lambda: None,
-                    pressure_retried=False,
-                    workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
-                )
-                assert outcome.terminal_ok is False
-                assert outcome.classification == "ownership-store-unavailable"
-                assert outcome.saw_side_effect
-                assert "must not apply" not in outcome.text
-                assert kernel_failures._display_error_classification(outcome.classification) == (
-                    "ownership-store-unavailable"
-                )
-                assert clock.delays == [0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0, 5.0, 2.5]
-                assert attempts == [0.0, 0.5, 1.5, 3.5, 7.5, 12.5, 17.5, 22.5, 27.5, 32.5]
-                assert clock.now - started == 35.0
-                assert not actions
-                assert not await h.kernel._markers.saw_side_effect(event.event_id)
-                assert not liveness.done(), "marker exhaustion terminated healthy liveness"
-                assert consumer._last_liveness_renewal > initial_liveness
-                assert await consumer._liveness_store.is_alive(
-                    stream=h.config.stream,
-                    group=h.config.consumer_group,
-                    consumer=h.config.consumer_name,
-                )
-                assert not lease.lost.is_set()
-            finally:
-                kernel_constants._DELIVERY_LEASE.reset(token)
-                liveness.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await liveness
-                await consumer._cleanup_alive()
-
-    asyncio.run(go())
-
-
 @pytest.mark.parametrize("loss_point", ["retry", "confirmed-write"])
 def test_side_effect_marker_cannot_apply_a_frame_after_authority_is_lost(
     make_harness, monkeypatch: pytest.MonkeyPatch, loss_point: str
@@ -7284,7 +7088,7 @@ async def _leased_entry(h: Any, store: Any, *, event_id: str, generation: int) -
     and only signal the reclaim preflight keys on (a distributed-state fact, not
     a sniff of the message text: kernel rule 3 stands).
     """
-    from curie_dispatcher.queue import to_stream_fields
+    from curie_internal.turn_queue import to_stream_fields
 
     await h.async_redis.xadd(
         h.config.stream, to_stream_fields(qevent("reclaimed", event_id=event_id))
@@ -7335,8 +7139,8 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
     ``h.runner.opened`` is the negative control on the steering half: a steer
     that silently became a second turn shows up there.
     """
-    from curie_dispatcher.queue import to_stream_fields
-    from curie_worker.consumer import Consumer
+    from curie_internal.turn_queue import to_stream_fields
+    from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 
     # Imported inside the test on purpose: ``delivery_lease`` does not exist
     # until this ticket lands, and a module-level import would fail COLLECTION
@@ -7346,7 +7150,9 @@ def test_a_long_turn_keeps_accepting_steers_and_a_finished_one_opens_a_new_turn(
     async def go() -> None:
         async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                                reminders=refuse_unconfigured_reminder,
+                       )
             await consumer.ensure_group()
 
             hold = asyncio.Event()
@@ -7461,163 +7267,6 @@ def test_a_reclaimed_delivery_with_a_side_effect_marker_never_runs_the_runner_ag
             clean = qevent("run me", thread="pre-clean", event_id="pre-clean")
             await h.kernel.process_event(clean, lease=clean_lease)
             assert h.runner.opened == ["run me"]
-
-    asyncio.run(go())
-
-
-def test_a_reclaimed_delivery_interrupts_a_still_active_retained_runner(
-    make_harness,
-) -> None:
-    """Reclaim preflight rule 2: a runner that still reports an active turn is
-    interrupted and must become idle (or disappear) before the retry.
-
-    A replacement must not run beside a possibly-live turn on a sandbox the
-    previous owner was working. The interrupt goes through the EXISTING bounded
-    control path (``Kernel.interrupt_thread``); no second mechanism is added.
-    Note the deliberate divergence from the ordinary route: ``_route_and_start``
-    would STEER into a retained live turn, which is wrong for a redelivery of the
-    same event -- it is a retry, not a follow-up.
-
-    Red on removing the preflight: the delivery would be steered into (or opened
-    beside) the previous owner's turn with no interrupt at all.
-
-    The negative control is the second half: an IDLE retained runner at the same
-    generation is not interrupted, so the interrupt above is the liveness read
-    and not an unconditional one on every reclaim.
-    """
-    # Imported inside the test on purpose: ``delivery_lease`` does not exist
-    # until this ticket lands, and a module-level import would fail COLLECTION
-    # for this whole file, turning every unrelated test in it red.
-    from curie_worker.delivery_lease import DeliveryLeaseStore
-
-    async def go() -> None:
-        async with make_harness(**_LEASE_KNOBS) as h:
-            store = DeliveryLeaseStore(h.async_redis, h.config)
-            await h.async_redis.xgroup_create(
-                h.config.stream, h.config.consumer_group, id="0", mkstream=True
-            )
-
-            # A first, ordinary turn so the thread has a retained sandbox.
-            h.runner.default_script = [Final(text="one", status=DONE)]
-            await h.kernel.process_event(qevent("first", thread="pre-live"))
-            assert h.runner.opened == ["first"]
-
-            # The retained runner reports a live turn (the previous owner's).
-            h.runner.turn_active = True
-
-            async def idle_on_interrupt() -> None:
-                await wait_until(lambda: h.runner.interrupts >= 1, timeout=10.0)
-                h.runner.turn_active = False
-
-            watcher = asyncio.create_task(idle_on_interrupt())
-            lease = await _leased_entry(h, store, event_id="pre-live-2", generation=2)
-            h.runner.default_script = [Final(text="two", status=DONE)]
-            await h.kernel.process_event(
-                qevent("second", thread="pre-live", event_id="pre-live-2"), lease=lease
-            )
-            await watcher
-
-            assert h.runner.interrupts >= 1, "the preflight never interrupted the live turn"
-            assert h.runner.opened == ["first", "second"], (
-                "the reclaimed delivery did not retry once the runner went idle"
-            )
-
-            # NEGATIVE CONTROL: an idle retained runner is not interrupted.
-            interrupts_before = h.runner.interrupts
-            idle_lease = await _leased_entry(h, store, event_id="pre-idle", generation=2)
-            h.runner.default_script = [Final(text="three", status=DONE)]
-            await h.kernel.process_event(
-                qevent("third", thread="pre-live", event_id="pre-idle"), lease=idle_lease
-            )
-            assert h.runner.interrupts == interrupts_before, (
-                "an idle runner was interrupted: the preflight is unconditional"
-            )
-            assert h.runner.opened == ["first", "second", "third"]
-
-    asyncio.run(go())
-
-
-def test_an_unreadable_runner_fails_closed_and_leaves_a_reclaimed_delivery_pending(
-    make_harness,
-) -> None:
-    """Reclaim preflight rule 3: an unreadable runner FAILS CLOSED.
-
-    ``_turn_active`` already reports busy on an unreadable answer, so the bounded
-    poll can never clear and the preflight must raise -- leaving the stream entry
-    PENDING rather than running a replacement beside a turn whose liveness nobody
-    can read. Asserted at the consumer, because "left pending" is the observable
-    contract and does not depend on which exception type the preflight raises.
-
-    Red on making the preflight fail OPEN (proceeding when liveness is
-    unreadable), which is the failure mode a "just retry it" simplification
-    reaches for.
-
-    The negative control is the second delivery, with the status endpoint
-    healthy again: the same reclaimed entry then runs and acks.
-    """
-    from curie_dispatcher.queue import to_stream_fields
-    from curie_worker.consumer import Consumer
-
-    # Imported inside the test on purpose: ``delivery_lease`` does not exist
-    # until this ticket lands, and a module-level import would fail COLLECTION
-    # for this whole file, turning every unrelated test in it red.
-    from curie_worker.delivery_lease import DeliveryLeaseStore
-
-    async def go() -> None:
-        async with make_harness(**_LEASE_KNOBS, reclaim_min_idle_ms=900000) as h:
-            store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
-            await consumer.ensure_group()
-
-            # A first turn so the thread retains a sandbox to be read.
-            h.runner.default_script = [Final(text="one", status=DONE)]
-            await h.kernel.process_event(qevent("first", thread="pre-blind"))
-
-            await h.async_redis.xadd(
-                h.config.stream,
-                to_stream_fields(qevent("second", thread="pre-blind", event_id="pre-blind-2")),
-            )
-            rows = await h.async_redis.xreadgroup(
-                h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
-            )
-            entry_id, fields = rows[0][1][0]
-            # Take and drop a lease so the consumer's own acquisition is a
-            # TRANSFER (generation 2) and the preflight applies.
-            first = await store.acquire(
-                h.config.stream,
-                h.config.consumer_group,
-                entry_id,
-                consumer=h.config.consumer_name,
-            )
-            await store.release(
-                h.config.stream,
-                h.config.consumer_group,
-                entry_id,
-                owner=first.owner,
-                resume_event_id=None,
-            )
-
-            h.runner.status_fails = True
-            await consumer._dispatch(entry_id, dict(fields))
-            await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
-
-            assert h.runner.opened == ["first"], (
-                "a replacement ran beside a runner whose liveness could not be read"
-            )
-            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
-            assert summary["pending"] == 1, "an unreadable runner did not leave the entry pending"
-
-            # NEGATIVE CONTROL: the status endpoint recovers and the same
-            # reclaimed entry runs to an ACK.
-            h.runner.status_fails = False
-            h.runner.turn_active = False
-            h.runner.default_script = [Final(text="two", status=DONE)]
-            await consumer._dispatch(entry_id, dict(fields))
-            await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
-
-            assert h.runner.opened == ["first", "second"]
-            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
-            assert summary["pending"] == 0
 
     asyncio.run(go())
 

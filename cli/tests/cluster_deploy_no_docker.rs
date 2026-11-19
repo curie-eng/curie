@@ -204,18 +204,18 @@ fn write_layered_bundle(plugin: &Path, registry_host: &str, base: &str) -> Strin
     layer
 }
 
-struct Run {
+pub(crate) struct Run {
     output: Output,
     api: MockServer,
     helm_log: String,
 }
 
 impl Run {
-    fn stdout(&self) -> String {
+    pub(crate) fn stdout(&self) -> String {
         String::from_utf8_lossy(&self.output.stdout).into_owned()
     }
 
-    fn stderr(&self) -> String {
+    pub(crate) fn stderr(&self) -> String {
         String::from_utf8_lossy(&self.output.stderr).into_owned()
     }
 
@@ -384,7 +384,7 @@ fn an_unresolvable_runner_is_refused_naming_the_digest_chart_value() {
 }
 
 const CRON_AGENT: &str = "acme-deployed";
-const CRON_AGENT_ID: &str = "00000000-0000-4000-8000-000000000001";
+pub(crate) const CRON_AGENT_ID: &str = "00000000-0000-4000-8000-000000000001";
 
 /// AgentOut and ChannelBindingOut fixtures follow apps/api/openapi.json:
 /// nullable required fields are present, and adapter is part of the read shape.
@@ -407,7 +407,7 @@ fn cron_agent(channels: Value) -> Value {
     })
 }
 
-fn cron(name: &str, schedule: &str, zone: Option<&str>, target: Option<&str>) -> Value {
+pub(crate) fn cron(name: &str, schedule: &str, zone: Option<&str>, target: Option<&str>) -> Value {
     let mut trigger = json!({
         "type": "cron",
         "name": name,
@@ -440,7 +440,7 @@ fn write_triggers(plugin: &Path, triggers: Value) -> Value {
     manifest
 }
 
-struct CronDeployFixture {
+pub(crate) struct CronDeployFixture {
     triggers: Value,
     channels: Value,
     added_channels: Option<Value>,
@@ -449,7 +449,7 @@ struct CronDeployFixture {
 }
 
 impl CronDeployFixture {
-    fn new(triggers: Value, json: bool) -> Self {
+    pub(crate) fn new(triggers: Value, json: bool) -> Self {
         Self {
             triggers,
             channels: json!([{"kind": "slack", "address": "C0EXAMPLE1"}]),
@@ -462,7 +462,10 @@ impl CronDeployFixture {
 
 /// Invoke the real cluster deploy command with an external API peer and no
 /// Docker. Configuration and shell stubs belong only to this invocation.
-fn deploy_cron_fixture(fixture: CronDeployFixture, configure: impl FnOnce(&Path)) -> Run {
+pub(crate) fn deploy_cron_fixture(
+    fixture: CronDeployFixture,
+    configure: impl FnOnce(&Path),
+) -> Run {
     let plugin = tempfile::tempdir().expect("cron plugin tempdir");
     scaffold(plugin.path(), "acme-bot").expect("scaffold cron bundle");
     write_triggers(plugin.path(), fixture.triggers);
@@ -560,7 +563,7 @@ fn cron_json(run: &Run) -> Value {
         .expect("deploy schema JSON");
     assert_eq!(
         schema["$id"],
-        json!("https://schemas.curietech.ai/cli/deploy/v1.2.json")
+        json!("https://schemas.curietech.ai/cli/deploy/v1.3.json")
     );
     let validator = jsonschema::validator_for(&schema).expect("deploy schema compiles");
     assert!(

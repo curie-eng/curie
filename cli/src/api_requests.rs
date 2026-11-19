@@ -30,6 +30,64 @@ use serde::Serialize;
 
 use crate::api::{ApprovalRouteBindingWrite, HookPartitionInput, SourceBindingInput};
 
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritySelectionMutation {
+    pub expected_lifecycle_generation: u64,
+    pub expected_version: u64,
+    pub request_id: uuid::Uuid,
+    pub selection: HttpSelectionV1,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpSelectionV1 {
+    pub credential_ref: CredentialReferenceV1,
+    pub issuer: String,
+    pub lookup_url: String,
+    pub max_clock_skew_ms: u64,
+    pub max_identity_age_ms: u64,
+    pub max_membership_age_ms: u64,
+    pub mode: String,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialReferenceV1 {
+    pub generation: u64,
+    pub id: String,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupV1 {
+    pub id: String,
+    pub issuer: String,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityMutation {
+    pub expected_lifecycle_generation: u64,
+    pub expected_version: u64,
+    pub request_id: uuid::Uuid,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorMutation {
+    pub expected_version: u64,
+    pub request_id: uuid::Uuid,
+}
+
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupFilterMutation {
+    pub expected_version: u64,
+    pub groups: Vec<GroupV1>,
+    pub request_id: uuid::Uuid,
+}
+
 /// `PUT /directory/config/{tenant_id}` (`DirectoryConfigIn`).
 #[derive(Clone, serde::Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +170,16 @@ pub struct AgentUpdate {
     pub approval_required_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_routes: Option<BTreeMap<String, ApprovalRouteBindingWrite>>,
+    /// ADR 0271: the agent's `connector_requester_identity_version` the route
+    /// write was composed against. Sent only beside `approval_routes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_routes_expected_version: Option<u64>,
+    /// ADR 0270 decision 1. Sent only with the expected version below and
+    /// nothing else: the API refuses a flag write sharing its PATCH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_requester_identity: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_requester_identity_expected_version: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_deadline_seconds: Option<Option<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

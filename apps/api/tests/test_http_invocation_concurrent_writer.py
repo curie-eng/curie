@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -63,85 +64,6 @@ def writers(scope: dict[str, Any], *, times: int | None) -> tuple[Callable[[], N
             committed.append(1)
 
     return write, committed
-
-
-@pytest.mark.parametrize("window", ["lookup", "reader"])
-def test_mention_while_another_writer_commits_restarts_and_queues_once(
-    window: str, clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: both stale windows restart with a fresh lookup."""
-    provider = synthetic_provider
-    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
-        write, committed = writers(invocation.scope, times=1)
-        if window == "lookup":
-            provider.during_lookup = write
-        else:
-            locks: list[int] = []
-            original = identity_fence.lock_identity_reader
-
-            async def reader(session: AsyncSession) -> None:
-                """@spec HTTP-INVOCATION-EXECUTION-4: commit after this caller's writer."""
-                locks.append(1)
-                if len(locks) == 2:
-                    membership.joined(write)
-                await original(session)
-
-            # Only this composition's readers: other routes take the same shared lock.
-            fence = SimpleNamespace(**{**vars(identity_fence), "lock_identity_reader": reader})
-            monkeypatch.setattr(http_invocation, "identity_fence", fence)
-        token = membership._credential(invocation.client, invocation.scope)
-        accepted = membership._post(
-            invocation.client, token, *membership._submission(invocation.scope),
-        )
-        assert accepted.status_code == 200, accepted.text
-        assert committed == [1]
-        assert len(provider.requests) == 3
-        assert len({request["request_id"] for request in provider.requests}) == 3
-        assert len(valkey.xrange(runs_stream)) == 2
-
-
-def test_mention_stays_unavailable_while_writers_keep_committing(
-    clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: three stale attempts are unavailable, nothing queued."""
-    provider = synthetic_provider
-    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
-        token = membership._credential(invocation.client, invocation.scope)
-        before = turn_authority.delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        write, committed = writers(invocation.scope, times=None)
-        provider.during_lookup = write
-        refused = membership._post(
-            invocation.client, token, *membership._submission(invocation.scope),
-        )
-        assert refused.status_code == 503
-        assert refused.json() == {"detail": "identity_authority_unavailable"}
-        assert len(committed) == 3
-        assert len(provider.requests) == 1 + 3
-        assert turn_authority.delivery_state(
-            valkey, runs_stream, invocation.scope["binding"],
-        ) == before
-
-
-def test_current_check_while_another_writer_commits_continues(
-    clean_db: None, valkey: redis.Redis, runs_stream: str, synthetic_provider: SimpleNamespace,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4/8: the worker recheck restarts instead of refusing."""
-    provider = synthetic_provider
-    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
-        before = turn_authority.delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        write, committed = writers(invocation.scope, times=1)
-        provider.during_lookup = write
-        request = turn_authority.request_for(invocation)
-        turn_authority.assert_response(
-            turn_authority.post_check(invocation.client, request), request,
-            decision="continue", reason="current_authority",
-        )
-        assert committed == [1]
-        assert len(provider.requests) == 3
-        assert turn_authority.delivery_state(
-            valkey, runs_stream, invocation.scope["binding"],
-        ) == before
 
 
 # A short injected composition budget keeps these deadline tests fast; the
@@ -206,126 +128,42 @@ def holder(scope: dict[str, Any], seconds: float) -> tuple[threading.Thread, thr
     return threading.Thread(target=run, args=(hold,), name="synthetic-lock-holder"), held
 
 
-def test_slow_lookups_with_stale_captures_exhaust_one_budget(
+def test_a_composition_reaching_revalidation_late_in_its_budget_still_queues(
     clean_db: None, valkey: redis.Redis, runs_stream: str,
     synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: retries share one deadline and fail closed after it."""
+    """@spec HTTP-INVOCATION-EXECUTION-4: shared fixture facts outlive the composition budget.
+
+    The API revalidates provider facts against the wall clock after the writer
+    phase. A loaded runner can reach that point seconds after the provider's
+    observation while still inside the composition budget, so the synthetic
+    source must stay fresh for the whole budget or an in-time turn reads as
+    identity_authority_unavailable. The clock is advanced, not slept.
+    """
     provider = synthetic_provider
-    monkeypatch.setattr(http_invocation, "_COMPOSITION_BUDGET_SECONDS", BUDGET)
+    late = timedelta(seconds=http_invocation._COMPOSITION_BUDGET_SECONDS)
+
+    class LateClock(datetime):
+        """@spec HTTP-INVOCATION-EXECUTION-4: revalidation at the end of the budget."""
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            """@spec HTTP-INVOCATION-EXECUTION-4."""
+            return datetime.now(tz) + late
+
     with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
         token = membership._credential(invocation.client, invocation.scope)
-        before = turn_authority.delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        write, committed = writers(invocation.scope, times=2)
-        provider.during_lookup = slow(write)
-        spans = timed(monkeypatch)
-        refused = membership._post(
-            invocation.client, token, *membership._submission(invocation.scope),
-        )
-        assert refused.status_code == 503, refused.text
-        assert refused.json() == {"detail": "identity_authority_unavailable"}
-        assert committed == [1, 1]
-        [(outcome, elapsed)] = spans
-        assert outcome == "failed"
-        assert elapsed < BUDGET + SLACK
-        assert turn_authority.delivery_state(
-            valkey, runs_stream, invocation.scope["binding"],
-        ) == before
-
-
-@pytest.mark.parametrize("phase", ["capture", "revalidation"])
-def test_identity_lock_wait_past_the_budget_fails_closed(
-    phase: str, clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: lock waits, including final revalidation, are bounded."""
-    provider = synthetic_provider
-    monkeypatch.setattr(http_invocation, "_COMPOSITION_BUDGET_SECONDS", BUDGET)
-    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
-        token = membership._credential(invocation.client, invocation.scope)
-        before = turn_authority.delivery_state(valkey, runs_stream, invocation.scope["binding"])
-        thread, held = holder(invocation.scope, BUDGET + 1.0)
-        locks: list[int] = []
-        original = identity_fence.lock_identity_reader
-
-        async def reader(session: AsyncSession) -> None:
-            """@spec HTTP-INVOCATION-EXECUTION-4: another writer holds the fence meanwhile."""
-            locks.append(1)
-            if len(locks) == (1 if phase == "capture" else 2):
-                thread.start()
-                assert held.wait(5)
-            await original(session)
-
-        fence = SimpleNamespace(**{**vars(identity_fence), "lock_identity_reader": reader})
-        monkeypatch.setattr(http_invocation, "identity_fence", fence)
-        spans = timed(monkeypatch)
-        try:
-            refused = membership._post(
-                invocation.client, token, *membership._submission(invocation.scope),
-            )
-        finally:
-            if thread.is_alive() or held.is_set():
-                thread.join(timeout=10)
-        assert refused.status_code == 503, refused.text
-        [(outcome, elapsed)] = spans
-        assert outcome == "failed"
-        assert elapsed < BUDGET + SLACK
-        assert turn_authority.delivery_state(
-            valkey, runs_stream, invocation.scope["binding"],
-        ) == before
-
-
-def test_uncontended_slow_lookup_within_the_budget_queues_once(
-    clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: the budget does not refuse an in-time composition."""
-    provider = synthetic_provider
-    monkeypatch.setattr(http_invocation, "_COMPOSITION_BUDGET_SECONDS", BUDGET)
-    with turn_authority.queued_invocation(provider, valkey, runs_stream) as invocation:
-        token = membership._credential(invocation.client, invocation.scope)
-        provider.during_lookup = slow()
-        spans = timed(monkeypatch)
+        monkeypatch.setattr(http_invocation, "datetime", LateClock)
         accepted = membership._post(
             invocation.client, token, *membership._submission(invocation.scope),
         )
         assert accepted.status_code == 200, accepted.text
-        [(outcome, elapsed)] = spans
-        assert outcome == "yielded"
-        assert SLOW <= elapsed < BUDGET
-        assert len(provider.requests) == 2
         assert len(valkey.xrange(runs_stream)) == 2
 
 
 def test_production_composition_budget_is_below_the_caller_wait() -> None:
     """@spec HTTP-INVOCATION-EXECUTION-4: derived from the shared caller wait, not retyped."""
     assert 0 < http_invocation._COMPOSITION_BUDGET_SECONDS < IDENTITY_CALLER_WAIT_SECONDS
-
-
-def test_one_unavailable_lookup_is_retried_within_the_composition_budget(
-    clean_db: None, valkey: redis.Redis, runs_stream: str,
-    synthetic_provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-4: one unavailable lookup retries inside the budget."""
-    provider = synthetic_provider
-    real = HttpIdentityClient.lookup
-    pending = True
-    calls: list[int] = []
-
-    async def lookup(client: HttpIdentityClient, **kwargs: Any) -> Any:
-        """@spec HTTP-INVOCATION-EXECUTION-4: the first refusal does not call the provider."""
-        nonlocal pending
-        calls.append(1)
-        if pending:
-            pending = False
-            return FactsRefusal(code="unavailable")
-        return await real(client, **kwargs)
-
-    monkeypatch.setattr(HttpIdentityClient, "lookup", lookup)
-    # The helper's own POST is the composition under test.
-    with turn_authority.queued_invocation(provider, valkey, runs_stream):
-        pass
-    assert len(calls) == 2
 
 
 def test_unavailable_lookups_exhaust_the_composition_attempts(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from typing import TYPE_CHECKING
 
 from ..actions import ActionRecorder
 from ..approval_cards import ApprovalCardStore
@@ -53,6 +54,7 @@ from . import (
     channel_read,
     claim,
     completion,
+    constants,
     delivery,
     hooks,
     lifecycle,
@@ -65,6 +67,9 @@ from . import (
     workspace,
 )
 from .work_items import _SettlingWorkItem
+
+if TYPE_CHECKING:
+    from ..factory_steering import FactorySteeringClient
 
 
 class Kernel:
@@ -105,6 +110,7 @@ class Kernel:
         progress: ProgressStore | None = None,
         bundles: BundleReader | None = None,
         recovery: WorkspaceRecoveryCapture | None = None,
+        factory_steering: FactorySteeringClient | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -188,6 +194,10 @@ class Kernel:
         self._sibling_limit = sibling_limit
         # Deliberate progress (ADR 0130). None sends no capability to any turn.
         self._progress = progress
+        # Factory run steering (#5414). None leaves every Slack turn on the
+        # ordinary path; wired, a mention in a factory run's Slack root is
+        # answered by the API's steering decision and never claims a sandbox.
+        self._factory_steering = factory_steering
         # ADR 0100: where a turn's channel read grant is read from (the stored
         # bundle's manifest). None means the grant is never known locally.
         self._bundles = bundles
@@ -256,6 +266,11 @@ class Kernel:
         # cancelled turn clears its own entry in ``process_event``'s finally, and
         # a FAILED one is cleared by the notice that reads it.
         self._terminal_reply_attempted: set[str] = set()
+        # ADR 0270 decision 3 [D2]: what each fenced lease acquisition opened or
+        # steered into, by its owner token, for exactly the life of its
+        # ``process_event``. A lost lease stops only these turns. Process
+        # memory only: an entry holds a turn's private epoch.
+        self._owned_executions: dict[str, constants.OwnedExecutions] = {}
 
     _finalize_settled_card = approval._finalize_settled_card
     _settle_remembered_card = approval._settle_remembered_card
@@ -265,6 +280,7 @@ class Kernel:
     _adopt_remembered_notice_ref = approval._adopt_remembered_notice_ref
     _approval_run_abandoned = approval._approval_run_abandoned
     _pause_for_approval = approval._pause_for_approval
+    _deliver_approver_dm_card = approval._deliver_approver_dm_card
     _escalate_unanswerable_email_approval = approval._escalate_unanswerable_email_approval
     _is_approval_resume = staticmethod(approval_key._is_approval_resume)
     _route_attachment_and_start = attachments._route_attachment_and_start
@@ -300,6 +316,10 @@ class Kernel:
     _log_claim_latency = staticmethod(claim._log_claim_latency)
     _turn_active = claim._turn_active
     _cap_caller_token_to_deadline = claim._cap_caller_token_to_deadline
+    _requester_turn_cap_s = claim._requester_turn_cap_s
+    _requester_turn_budget = claim._requester_turn_budget
+    _bound_requester_turn = claim._bound_requester_turn
+    _requester_needed_exp = claim._requester_needed_exp
     _claim_or_resume = claim._claim_or_resume
     _keep_route_alive = claim._keep_route_alive
     _complete = completion._complete
@@ -313,8 +333,11 @@ class Kernel:
     _emit_status = completion._emit_status
     forget_delivery = delivery.forget_delivery
     notify_turn_not_started = delivery.notify_turn_not_started
+    _steering_may_have_admitted = delivery._steering_may_have_admitted
     notify_broker_entry_vanished = delivery.notify_broker_entry_vanished
     interrupt_thread = delivery.interrupt_thread
+    stop_owned_execution = delivery.stop_owned_execution
+    _own_execution = delivery._own_execution
     release_thread = delivery.release_thread
     interrupt_agent = delivery.interrupt_agent
     _close_hook_run_after_error = hooks._close_hook_run_after_error
@@ -347,6 +370,7 @@ class Kernel:
     _adopt_ref = routing._adopt_ref
     _reply_for = routing._reply_for
     _drop_with_message = routing._drop_with_message
+    _settle_relay_after_refusal = routing._settle_relay_after_refusal
     _drop_ambiguous_route = routing._drop_ambiguous_route
     _drop_sibling_turn = routing._drop_sibling_turn
     _reply = routing._reply
@@ -363,6 +387,7 @@ class Kernel:
     _run_for_event = work_items._run_for_event
     _is_factory_work_item_turn = work_items._is_factory_work_item_turn
     _work_item_repository = work_items._work_item_repository
+    _execution_deadline_for = work_items._execution_deadline_for
     _adopt_resumed_work_item = work_items._adopt_resumed_work_item
     reap_orphans = work_items.reap_orphans
     _preflight_reclaimed_delivery = work_items._preflight_reclaimed_delivery

@@ -198,6 +198,7 @@ CHART_SHARED_INPUTS = (
     ".github/workflows/ci.yaml",
     ".github/e2e-selection.yaml",
     ".github/actions/load-ci-images",
+    ".github/scripts",
     "tools/runtime-assertion-gate/run.sh",
     "cli/scripts/configure-docker-hub-mirror.sh",
     "cli/scripts/ensure-kind-registry.sh",
@@ -281,6 +282,15 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         ],
         "leg": "chart",
     },
+    "metrics-alerts": {
+        "step": "Retained metrics and absent-data runtime",
+        "inputs": [
+            "charts/curie/ci/runtime/metrics-alerts-runtime.sh",
+            "examples/sre-bot/observability/curie-values.yaml",
+            "examples/sre-bot/observability/prometheus-values.yaml",
+        ],
+        "leg": "chart",
+    },
     "connector-apply-race": {
         "step": "Connector apply survives a concurrent reconciler create",
         "inputs": [
@@ -293,7 +303,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "pyproject.toml",
             "uv.lock",
         ],
-        "leg": "workload",
+        "leg": "workload-2",
     },
     "connector-secret-rotation": {
         "step": "Hosted connector credential rotation rolls only that connector",
@@ -307,7 +317,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "pyproject.toml",
             "uv.lock",
         ],
-        "leg": "workload",
+        "leg": "workload-2",
     },
     "runner-template-admission": {
         "step": "Runner template admission refuses host escapes, token mounts, and unlisted images",
@@ -335,7 +345,7 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
             *CHART_IMAGE_INPUTS,
         ],
-        "leg": "workload",
+        "leg": "workload-1",
     },
     "factory-resource-profile": {
         "step": "Factory resource profile runtime (#4889)",
@@ -349,13 +359,13 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
             "charts/curie/templates/_helpers.tpl",
             *CHART_IMAGE_INPUTS,
         ],
-        "leg": "workload",
+        "leg": "workload-1",
     },
 }
 CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 
 
-CHART_LEGS = ("chart", "upgrade", "workload")
+CHART_LEGS = ("chart", "upgrade", "workload-1", "workload-2")
 WORKLOAD_SCENARIOS = frozenset(
     {
         "quota-progress",
@@ -497,7 +507,29 @@ def _path_needs_images(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
     if path in {"uv.lock", "pyproject.toml"} or name in {"uv.lock", "pyproject.toml"}:
         return True
+    if path.startswith((
+        "packages/shell-supervisor/",
+        "runner/src/curie_runner/",
+        "apps/worker/src/curie_worker/kernel/",
+        "apps/worker/src/curie_worker/sandbox/",
+    )) or path in {
+        "apps/worker/src/curie_worker/markers.py",
+        "apps/worker/src/curie_worker/delivery_lease.py",
+        "apps/worker/src/curie_worker/stream_consumer.py",
+        "apps/worker/src/curie_worker/runner_client.py",
+        "apps/worker/src/curie_worker/threadlock.py",
+    }:
+        return True
     return "Dockerfile" in name or name.endswith(".dockerfile")
+
+
+def test_a_shell_supervisor_change_runs_the_image_proofs() -> None:
+    # The shell container proof runs only in the image job, so a supervisor
+    # source change must select it even with no Dockerfile in the diff.
+    assert _SELECTOR_MODULE._needs_images(
+        ["packages/shell-supervisor/src/curie_shell_supervisor/isolation.py"]
+    )
+    assert not _SELECTOR_MODULE._needs_images(["packages/telemetry/src/x.py"])
 
 
 def _path_needs_cli_release(path: str) -> bool:
@@ -1897,7 +1929,8 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
     [
         ("apps/ui/package.json", True),
         ("apps/ui/pnpm-lock.yaml", True),
-        ("apps/dispatcher/src/curie_dispatcher/app.py", True),
+        ("packages/channel-gateway/src/curie_channel_gateway/slack/valkey.py", True),
+        ("packages/channel-gateway/src/curie_channel_gateway/slack/app.py", True),
         # Rule-ignored paths still run their impact readers on a pull request.
         ("scripts/README.md", True),
         ("scripts/check-docs.sh", True),
@@ -2915,6 +2948,14 @@ IMAGE_PROOF_GROUPS = {
         "Tag the runner image as the harness default (curie-runner)",
         "Repository toolchain proof",
     ),
+    # The static-pool shell image, layered on the runner image the toolchain
+    # group loaded, proven as a root container.
+    "Shell: ": (
+        "Load the API image for the crash proof",
+        "Build the shell image on the runner image",
+        "Absent image fails in required mode (negative control)",
+        "Recycled shells hold nothing from the previous claim",
+    ),
 }
 
 
@@ -2936,10 +2977,14 @@ def _assert_image_proofs(workflow: dict[str, Any]) -> None:
     assert job["runs-on"] == "ubuntu-24.04"
     assert job["needs"] == ["changes", "ci-images"]
     assert job["if"] == IMAGE_PROOFS_IF
-    assert job["env"] == {"CURIE_REPO_TOOLCHAIN_PROOF": "required"}
+    assert job["env"] == {
+        "CURIE_REPO_TOOLCHAIN_PROOF": "required",
+        "CI_REQUIRE_VALKEY_TESTS": "1",
+        "TEST_VALKEY_PW": "",
+    }
     assert not {"defaults", "continue-on-error", "timeout-minutes"} & job.keys()
     steps = job["steps"]
-    assert len(steps) == 40
+    assert len(steps) == 44
     assert [step["name"] for step in steps] == [
         prefix + name for prefix, names in IMAGE_PROOF_GROUPS.items() for name in names
     ], "all former steps must retain group order, with UI before Toolchain"
@@ -2956,8 +3001,11 @@ def _assert_image_proofs(workflow: dict[str, Any]) -> None:
             ("UI: ", "ui"),
             ("Toolchain: ", "runner"),
         )
-    ]
+    ] + [("Shell: Load the API image for the crash proof", "api")]
     for prefix in IMAGE_PROOF_GROUPS:
+        if prefix == "Shell: ":
+            # Runs in the toolchain group's checkout.
+            continue
         checkout = by_name[prefix + "Checkout"]
         assert checkout["uses"].startswith("actions/checkout@")
         assert checkout["with"] == (
@@ -3418,7 +3466,9 @@ def test_upgrade_matrix_workflow_runs_one_job_per_shard() -> None:
     assert evidence["with"]["name"] == "upgrade-matrix-evidence-${{ matrix.shard }}"
     assert evidence["with"]["path"] == ".projects/2590-evidence"
     teardown = named_steps["Tear down the owned upgrade matrix cluster"]
-    assert teardown["if"] == "always()"
+    assert teardown["if"] == (
+        "always() && steps.prepare_kind.outputs.owned_cluster == 'curie-upgrade-matrix'"
+    )
     assert "kind delete cluster --name curie-upgrade-matrix" in teardown["run"]
     assert "kind delete cluster --name curie-upgrade " not in teardown["run"]
 
@@ -3589,13 +3639,21 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     disk_name = "Free disk for the disposable released upgrade cluster"
     for shared in (
         "Install Helm",
-        "Install Calico so NetworkPolicy is enforced",
         "Download and verify the exact public v0.8.2 chart",
         "Write the legacy retained values fixture",
         "Write the managed attester verifier",
         disk_name,
     ):
         assert negative_steps[shared] == named_steps[shared], shared
+    setup_name = "Install Calico so NetworkPolicy is enforced"
+    for owner_steps, cluster in (
+        (named_steps, "curie-upgrade"),
+        (negative_steps, "curie-upgrade-negative"),
+    ):
+        config = f"kind-{cluster.removeprefix('curie-')}-config.yaml"
+        assert owner_steps[setup_name]["run"] == (
+            f"bash .github/scripts/prepare-kind.sh {cluster} {config}"
+        )
     matrix_disk = next(
         step["run"]
         for step in jobs["e2e-cluster-upgrade-matrix"]["steps"]
@@ -3679,10 +3737,15 @@ fi"""
     existing_smoke = [
         step
         for step in existing_cluster_steps
-        if step.get("run") == "bash cli/scripts/e2e-ladder.sh"
+        if "bash cli/scripts/e2e-ladder.sh" in step.get("run", "").splitlines()
     ]
     assert len(existing_smoke) == 1
     assert existing_smoke[0]["env"]["CURIE_E2E_TIERS"] == "cluster"
+    for cluster_smoke in (smoke, existing_smoke[0]):
+        assert (
+            'export CURIE_E2E_KUBE_CONTEXT="$(kubectl config current-context)"'
+            in cluster_smoke["run"]
+        )
 
     assert named_steps["Tear down the disposable upgrade cluster"]["if"] == "always()"
 
@@ -4503,7 +4566,7 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
 
 
 CHART_CANDIDATE_STAGING_IF = (
-    "${{ (matrix.leg == 'workload' && "
+    "${{ (startsWith(matrix.leg, 'workload-') && "
     "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') "
@@ -5721,6 +5784,7 @@ MAIN_TEMPLATE_CHART_SCENARIOS = [
     "factory-resource-profile",
     "failed-first-install-retry",
     "installation-identity",
+    "metrics-alerts",
     "platform-runner-upgrade",
     "quota-progress",
     "runner-byo-egress",
@@ -5741,7 +5805,7 @@ def test_platform_runner_upgrade_script_selects_the_upgrade_leg(tmp_path: Path) 
     ]
     legs = json.loads(selected["chart_legs"])
     assert "upgrade" in legs
-    assert "workload" not in legs
+    assert not any(leg.startswith("workload-") for leg in legs)
 
 
 def test_template_change_selects_upgrade_and_workload_with_the_main_scenario_list(
@@ -5756,7 +5820,20 @@ def test_template_change_selects_upgrade_and_workload_with_the_main_scenario_lis
     assert json.loads(selected["chart_scenarios"]) == MAIN_TEMPLATE_CHART_SCENARIOS
     legs = json.loads(selected["chart_legs"])
     assert "upgrade" in legs
-    assert "workload" in legs
+    assert {"workload-1", "workload-2"} <= set(legs)
+
+
+@pytest.mark.parametrize("name", ["prepare-kind.sh", "pull-image.sh"])
+def test_setup_helper_changes_select_every_chart_leg_and_released_upgrade(
+    tmp_path: Path, name: str
+) -> None:
+    completed, output = _invoke_selector(tmp_path, f".github/scripts/{name}")
+    assert completed.returncode == 0, completed.stderr
+    selected = _outputs_of(output)
+    assert selected["released_upgrade"] == "true"
+    assert selected["approval_resume"] == "true"
+    assert json.loads(selected["chart_scenarios"]) == list(CHART_IDS)
+    assert json.loads(selected["chart_legs"]) == list(CHART_LEGS)
 
 
 @pytest.mark.parametrize(
@@ -5920,7 +5997,9 @@ def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
     for scenario, entry in scenarios.items():
         assert isinstance(entry.get("leg"), str), scenario
         assert entry["leg"] in CHART_LEGS, scenario
-    workload = {scenario for scenario, entry in scenarios.items() if entry["leg"] == "workload"}
+    workload = {
+        scenario for scenario, entry in scenarios.items() if entry["leg"].startswith("workload-")
+    }
     upgrade = {scenario for scenario, entry in scenarios.items() if entry["leg"] == "upgrade"}
     assert workload == WORKLOAD_SCENARIOS
     assert upgrade == UPGRADE_SCENARIOS
@@ -5937,7 +6016,7 @@ def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
             ("charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",),
             False,
             ["failed-first-install-retry", "quota-progress"],
-            ["upgrade", "workload"],
+            ["upgrade", "workload-1"],
         ),
         (
             ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
@@ -5945,7 +6024,7 @@ def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
             ["connector-readiness", "failed-first-install-retry"],
             ["chart", "upgrade"],
         ),
-        ((), True, list(CHART_IDS), ["chart", "upgrade", "workload"]),
+        ((), True, list(CHART_IDS), ["chart", "upgrade", "workload-1", "workload-2"]),
         (("docs/adr/AGENTS.md",), False, [], []),
     ],
     ids=("quota-only", "chart-only", "push", "docs"),
@@ -6023,7 +6102,10 @@ def test_chart_job_runs_one_leg_per_runner_from_the_selected_legs() -> None:
             continue
         legs = {CHART_SCENARIOS[scenario]["leg"] for scenario in named}
         if name in WORKLOAD_STAGING_STEPS:
-            assert legs == {"upgrade", "workload"}, name
+            assert legs == {"upgrade", "workload-1", "workload-2"}, name
+            continue
+        if name == "Install the shared workload platform":
+            assert legs == {"workload-1", "workload-2"}, name
             continue
         assert len(legs) == 1, name
         assert condition.startswith("${{ " + _chart_leg_clause(legs.pop()) + " && "), name
@@ -6189,7 +6271,7 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
     # An unregistered step has no leg condition, so it must run in every leg.
-    assert json.loads(_outputs_of(output)["chart_legs"]) == ["chart", "upgrade", "workload"]
+    assert json.loads(_outputs_of(output)["chart_legs"]) == list(CHART_LEGS)
     docs, docs_output = _invoke_selector(tmp_path, "docs/example.md", cwd=repository)
     assert docs.returncode == 0, docs.stderr
     assert _outputs_of(docs_output)["chart_scenarios"] == "[]"
@@ -6344,7 +6426,7 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
     shared = [
         step for step in steps
         if step.get("name") in scenario_names
-        and step.get("if", "").startswith("${{ matrix.leg == 'workload' && ")
+        and step.get("if", "").startswith("${{ matrix.leg == 'workload-")
     ]
     chart = [
         step for step in steps
@@ -6379,7 +6461,7 @@ def test_chart_shared_workload_order_preserves_scenario_isolation() -> None:
         assert "get pods -A -o wide" in diagnostics["run"]
         assert "get events -A --sort-by=.lastTimestamp" in diagnostics["run"]
     cleanup = steps[remove]
-    assert cleanup["if"] == "${{ always() && matrix.leg == 'workload' }}"
+    assert cleanup["if"] == "${{ always() && startsWith(matrix.leg, 'workload-') }}"
     assert "steps." not in cleanup["if"]
     assert shlex.split(cleanup["run"]) == CHART_SETUP_FIXTURES[cleanup["name"]]
     setup = steps[install]
@@ -6409,3 +6491,36 @@ def test_platform_runner_upgrade_stages_candidate_artifacts_before_own_lifecycle
         "Stage the candidate chart runtime images in kind",
     ):
         assert steps[positions[staging]]["if"] == CHART_CANDIDATE_STAGING_IF
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "runner/src/curie_runner/session.py",
+        "runner/src/curie_runner/server.py",
+        "runner/src/curie_runner/history.py",
+        "runner/src/curie_runner/preflight/check.py",
+        "packages/shell-supervisor/src/curie_shell_supervisor/server.py",
+        "apps/worker/src/curie_worker/kernel/claim.py",
+        "apps/worker/src/curie_worker/kernel/completion.py",
+        "apps/worker/src/curie_worker/kernel/work_items.py",
+        "apps/worker/src/curie_worker/kernel/recovery/check.py",
+        "apps/worker/src/curie_worker/sandbox/static.py",
+        "apps/worker/src/curie_worker/sandbox/substrate.py",
+        "apps/worker/src/curie_worker/threadlock.py",
+        "apps/worker/src/curie_worker/markers.py",
+        "apps/worker/src/curie_worker/delivery_lease.py",
+        "apps/worker/src/curie_worker/stream_consumer.py",
+        "apps/worker/src/curie_worker/runner_client.py",
+    ],
+)
+def test_runner_recovery_changes_select_image_proofs(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    assert "images=true" in output.splitlines()
+
+
+def test_unrelated_source_does_not_select_image_proofs(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, "packages/telemetry/src/x.py")
+    assert completed.returncode == 0, completed.stderr
+    assert "images=false" in output.splitlines()

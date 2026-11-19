@@ -80,21 +80,32 @@ default_parsed = yaml.safe_load(default_config)
 dev_parsed = yaml.safe_load(dev_config)
 tempo_parsed = yaml.safe_load(tempo_config)
 default_exporters = default_parsed["exporters"]
-default_trace_exporters = default_parsed["service"]["pipelines"]["traces"]["exporters"]
+default_pipelines = default_parsed["service"]["pipelines"]
+default_trace_exporters = default_pipelines["traces/langfuse"]["exporters"]
 dev_exporters = dev_parsed["exporters"]
 tempo_exporters = tempo_parsed["exporters"]
+tempo_langfuse_exporters = tempo_parsed["service"]["pipelines"]["traces/langfuse"]["exporters"]
 tempo_trace_exporters = tempo_parsed["service"]["pipelines"]["traces"]["exporters"]
 
 assert set(default_exporters) == {"otlphttp/langfuse", "nop/logs", "nop/metrics"}, (
     "Production-default collector exporters changed, unexpectedly include debug, or include Tempo"
 )
+assert "traces" not in default_pipelines, (
+    "Production-default render included the unfiltered traces pipeline"
+)
 assert default_trace_exporters == ["otlphttp/langfuse"], (
-    "Production-default traces pipeline changed, unexpectedly includes debug, or includes Tempo"
+    "Production-default Langfuse trace pipeline changed, unexpectedly includes debug, or includes Tempo"
 )
 assert set(dev_exporters) == {
     "otlphttp/langfuse", "nop/logs", "nop/metrics", "debug"
 }, "Development overlay must explicitly opt into debug"
-for signal in ("traces", "logs", "metrics"):
+assert "debug" not in dev_parsed["service"]["pipelines"]["traces/langfuse"]["exporters"], (
+    "Development Langfuse trace pipeline must stay free of the debug exporter"
+)
+assert "debug" in dev_parsed["service"]["pipelines"]["traces"]["exporters"], (
+    "Development unfiltered traces pipeline did not opt into debug"
+)
+for signal in ("logs", "metrics"):
     assert "debug" in dev_parsed["service"]["pipelines"][signal]["exporters"], (
         f"Development {signal} pipeline did not opt into debug"
     )
@@ -116,8 +127,11 @@ assert tempo_exporters.get("otlphttp/tempo") == {
 }, (
     "Tempo exporter configuration was not rendered exactly"
 )
-assert tempo_trace_exporters == ["otlphttp/langfuse", "otlphttp/tempo"], (
-    "Tempo exporter was not appended to the traces pipeline"
+assert tempo_langfuse_exporters == ["otlphttp/langfuse"], (
+    "Tempo exporter leaked onto the Langfuse trace pipeline"
+)
+assert tempo_trace_exporters == ["otlphttp/tempo"], (
+    "Tempo exporter was not placed on the unfiltered traces pipeline"
 )
 assert default_config != tempo_config, "Tempo values did not change the collector ConfigMap body"
 assert default_checksum != tempo_checksum, (

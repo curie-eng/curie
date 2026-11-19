@@ -30,6 +30,7 @@ from channel_protocol.reply import (
     ReplyUpdate,
     TurnCompleted,
 )
+from curie_test_support.channel_gateway import reply_gateway
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
@@ -110,6 +111,18 @@ class StubBinding:
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         return BehaviorPacks.from_config(resolved.behavior_packs)
+
+
+_reply_gateways = []
+
+
+@pytest.fixture(autouse=True)
+def owned_reply_gateways():
+    try:
+        yield
+    finally:
+        while _reply_gateways:
+            _reply_gateways.pop().__exit__(None, None, None)
 
 
 def _resolved(
@@ -212,12 +225,10 @@ def test_the_same_turn_through_the_slack_adapter_edits_exactly_one_message(
         try:
             port = server.port
             assert port is not None
-            sink = build_reply_sink(
-                WorkerConfig(
-                    slack_bot_token="xoxb-test",
-                    slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
-                )
-            )
+            gateway = reply_gateway({"default": "xoxb-test"}, f"http://127.0.0.1:{port}/slack/api/")
+            values = gateway.__enter__()
+            _reply_gateways.append(gateway)
+            sink = build_reply_sink(WorkerConfig(**values))
             binding = StubBinding({("slack", "C1"): _resolved()})
             async with make_harness(binding=binding, sink=sink, shimmer=False) as h:
                 h.runner.default_script = [
@@ -348,12 +359,10 @@ def test_the_slack_adapter_renders_the_hub_button_from_the_affordance() -> None:
         try:
             port = server.port
             assert port is not None
-            sink = build_reply_sink(
-                WorkerConfig(
-                    slack_bot_token="xoxb-test",
-                    slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
-                )
-            )
+            gateway = reply_gateway({"default": "xoxb-test"}, f"http://127.0.0.1:{port}/slack/api/")
+            values = gateway.__enter__()
+            _reply_gateways.append(gateway)
+            sink = build_reply_sink(WorkerConfig(**values))
             from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget
 
             structured = (

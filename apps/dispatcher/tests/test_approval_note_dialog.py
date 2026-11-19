@@ -27,8 +27,8 @@ from unittest.mock import MagicMock
 
 import httpx
 import redis
-from curie_dispatcher.app import build_app, build_web_client
-from curie_dispatcher.approval_actions import (
+from curie_channel_gateway.slack.app import build_app, build_web_client
+from curie_channel_gateway.slack.approval_actions import (
     _VERDICT_LINE_MAX,
     APPROVE_NOTE_ACTION_ID,
     NOTE_MODAL_CALLBACK_ID,
@@ -37,7 +37,7 @@ from curie_dispatcher.approval_actions import (
     ResolveOutcome,
     _refusal_text,
 )
-from curie_dispatcher.config import DispatcherConfig
+from curie_channel_gateway.slack.config import DispatcherConfig
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
@@ -300,8 +300,8 @@ def test_submitting_the_dialog_resolves_with_the_typed_note(
         {
             "approval_id": APPROVAL_ID,
             "decision": "approved",
-            "attested_user": "U_MANAGER",
-            "attested_channel": CARD_CHANNEL,
+            "actor": "U_MANAGER",
+            "actor_channel": CARD_CHANNEL,
             "note": "approved for Q3",
         }
     ]
@@ -947,8 +947,8 @@ def test_a_real_api_conflict_carries_no_resolver_id_and_names_the_approver_in_it
         outcome = client.resolve(
             APPROVAL_ID,
             decision="approved",
-            attested_user="U_MANAGER",
-            attested_channel=CARD_CHANNEL,
+            actor="U_MANAGER",
+            actor_channel=CARD_CHANNEL,
             note="mine",
         )
     finally:
@@ -1024,8 +1024,8 @@ def test_the_resolver_gives_up_inside_the_ack_budget() -> None:
             outcome = client.resolve(
                 APPROVAL_ID,
                 decision="approved",
-                attested_user="U_MANAGER",
-                attested_channel=CARD_CHANNEL,
+                actor="U_MANAGER",
+                actor_channel=CARD_CHANNEL,
             )
             elapsed = time.monotonic() - started
         finally:
@@ -1075,7 +1075,7 @@ def test_an_over_long_note_cannot_break_the_card_stamp(
     # The note is what gets cut, never the attribution.
     assert verdict.startswith("Approved by <@U_MANAGER>")
     # A single U+2026, not three periods: the marker is shared with the worker's
-    # ``_truncate`` in ``curie_worker.blocks``, so the same Slack card surface
+    # ``_truncate`` in ``curie_channel_gateway.slack.blocks``, so the same Slack card surface
     # does not end truncated text two ways depending on which service stamped it.
     assert verdict.endswith("…")
 

@@ -221,9 +221,16 @@ def test_missing_stream_is_named() -> None:
     assert "curie:runs" in messages[0]
 
 
+# Langfuse queues seen on a live shared install. trace-upsert's event stream
+# first appears when ingestion enqueues a job, which can land after a reset.
 @pytest.mark.parametrize(
     "backend_stream",
-    ["bull:ingestion-queue:events", "bull:otel-ingestion-queue:events"],
+    [
+        "bull:ingestion-queue:events",
+        "bull:otel-ingestion-queue:events",
+        "bull:trace-upsert:events",
+        "bull:posthog-integration-queue:events",
+    ],
 )
 def test_langfuse_stream_lifecycle_does_not_change_case_inventory(backend_stream: str) -> None:
     baseline = clean_baseline()
@@ -235,7 +242,7 @@ def test_langfuse_stream_lifecycle_does_not_change_case_inventory(backend_stream
 
 @pytest.mark.parametrize(
     "case_stream",
-    ["curie:runs:c4-owner", "bull:curie:events", "bull:ingestion-queue:events:curie"],
+    ["curie:runs:c4-owner", "curie:bull:events", "c4:ingestion-queue:events"],
 )
 def test_case_stream_is_still_detected_beside_langfuse_streams(case_stream: str) -> None:
     baseline = clean_baseline()
@@ -244,6 +251,7 @@ def test_case_stream_is_still_detected_beside_langfuse_streams(case_stream: str)
             *baseline.streams,
             "bull:ingestion-queue:events",
             "bull:otel-ingestion-queue:events",
+            "bull:trace-upsert:events",
             case_stream,
         }
     )

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
 from forge_fakes import factory_wake
-from forge_fakes.github import LABEL, REPO, _issue_event, _post
+from forge_fakes.github import LABEL, REPO, REPO_ID, _issue_event, _post
 from forge_fakes.github_comments import (  # noqa: F401
     HEAD_A,
     HEAD_B,
@@ -149,13 +149,16 @@ def _applied_move(
     branch = asyncio.run(seed())
     epoch = _start_running(client, row["id"]) if start_running else None
     sink.branches["next"] = NEXT_SHA
+    # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    # head.repo.id and base.repo.id are this repository's integer id.
+    repo = {"id": REPO_ID, "full_name": REPO}
     sink.pull_script = [
         {
             "mergeable": True,
             "mergeable_state": "clean",
             "merged": False,
-            "head": {"ref": branch, "sha": HEAD_B},
-            "base": {"ref": "next"},
+            "head": {"ref": branch, "sha": HEAD_B, "repo": dict(repo)},
+            "base": {"ref": "next", "repo": dict(repo)},
         }
     ]
     sink.ci_scripts = {HEAD_C: [ci_green()], HEAD_B: [ci_pending()]}

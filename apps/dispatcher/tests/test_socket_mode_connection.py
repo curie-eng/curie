@@ -15,10 +15,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from curie_dispatcher import app as app_module
-from curie_dispatcher.app import SocketModeConnection
-from curie_dispatcher.socket_presence import SocketPresence
-from curie_dispatcher.supervisor import Supervisor
+from curie_channel_gateway.slack import app as app_module
+from curie_channel_gateway.slack.app import SocketModeConnection
+from curie_channel_gateway.slack.socket_presence import SocketPresence
+from curie_channel_gateway.slack.supervisor import Supervisor
 from slack_bolt import App
 from slack_sdk.socket_mode.builtin import client as sdk_client
 from slack_sdk.socket_mode.builtin.client import SocketModeClient

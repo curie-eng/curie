@@ -1,7 +1,7 @@
 """The channel ingress API (ADR-0096 phase 2, #1459).
 
-Three endpoints, and every request/response model they use lives here rather
-than in ``schemas.channels``:
+Channel endpoints and their request/response models live here rather than
+in ``schemas.channels``:
 
 - ``POST /channels/token`` (platform key, or an adapter principal serving the
   binding, ADR-0154) mints a ``chn`` token over a binding ROW's id plus a
@@ -13,6 +13,10 @@ than in ``schemas.channels``:
   list (ADR 0175) admits the turn's author; a refused author is a 403.
 - ``POST /channels/admission`` (platform key only) answers the same admission
   question for the Slack dispatcher, which has no database of its own.
+
+``POST /channels/turns/admission`` checks a receiver-signed turn using the same
+channel credential and HTTP identity admission as enqueue, without claiming or
+enqueueing it. Declared test drivers use it before their ping or turn budget.
 
 **Kind and address ride in the BODY, not the path.** An address is an opaque
 routing key matched on equality; it may contain ``@``, ``.``, ``/``, ``?`` or
@@ -622,6 +626,34 @@ def _duplicate(
             event_id=event_id, stream_id=stream_id, duplicate=True, reply_ref=reply_ref
         )
     return TurnAccepted(event_id=event_id, stream_id=stream_id, duplicate=True)
+
+
+@router.post("/turns/admission", status_code=204, response_class=Response)
+async def check_receiver_admission(
+    request: Request,
+    x_api_key: Annotated[str | None, Header()] = None,
+    x_curie_receiver_proof: Annotated[str | None, Header()] = None,
+) -> Response:
+    """Apply the turn's authenticated HTTP identity admission without claiming a delivery.
+
+    ADR 0202 pings and bounded driver turns ask before any reply or budget write.
+    The same receiver proof, channel credential and live authority checks as
+    enqueue apply; no caller or directory decision is made by the gateway.
+    """
+    raw = await read_bounded_body(
+        request, get_settings().channel_turn_max_body_bytes, subject="channel turn body",
+    )
+    body = _parse_turn(raw)
+    if not x_api_key or not x_curie_receiver_proof:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_http_receiver")
+    try:
+        async with current_http_invocation(
+            request, body=body, submitted_bytes=raw,
+            channel_credential=x_api_key, receiver_proof=x_curie_receiver_proof,
+        ):
+            return Response(status_code=204, headers={"Cache-Control": "private, no-store"})
+    except DeliveryGuardRefusal:
+        raise HTTPException(503, "identity_authority_unavailable") from None
 
 
 # @spec COMMON-ADMISSION-EXTRACTION-1

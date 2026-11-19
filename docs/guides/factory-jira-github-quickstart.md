@@ -26,22 +26,30 @@ a unittest under `tests/` checking `greet("Ada")`. Run
 command if you want the trial to produce CI evidence; the factory cannot
 publish changes under `.github/`.
 
-Create a dedicated Atlassian factory account and an
-[API token](https://id.atlassian.com/manage-profile/security/api-tokens).
-Give it Browse Projects only on trial projects, Add Comments, Edit Own
-Comments, Edit Issues and Link Issues. This account sees every labelled issue
-it can browse; there is no separate project allowlist. Save its token in a
-local file outside the repository using your editor. Keep the token out of
-command arguments, commits and chat. Quickstart stores it in the API's
-Kubernetes Secret.
+Create a dedicated Atlassian factory account. A regular account uses a
+[personal API token](https://id.atlassian.com/manage-profile/security/api-tokens).
+A [service account](https://support.atlassian.com/user-management/docs/manage-api-tokens-for-service-accounts/)
+uses its service-account email and a scoped token. Give the service account
+Jira app access and select the `read:jira-user`, `read:jira-work`, and
+`write:jira-work` token scopes.
+
+Give the account Browse Projects only on trial projects, Add Comments, Edit
+Own Comments, Edit Issues, and Link Issues. Jira Free cannot customize project
+permissions. On a shared Free site, check that no other visible issue has the
+trigger label and reserve that label for this trial. The factory sees every
+labelled issue it can browse; there is no separate project allowlist.
+
+Save the token in a local file outside the repository using your editor. Keep
+it out of command arguments, commits, and chat. Quickstart stores it in the
+API's Kubernetes Secret.
 Curie never mints or rotates this token; to replace it, follow
-[Replace a static token](dark-factory-quickstart.md#replace-a-static-token).
+[Replace a static token](factory-quickstart-reference.md#replace-a-static-token).
 
 Choose a separate human who can authorize trial work. Get that person's
 immutable Jira `accountId` from your Jira administrator; an email address is
 not a substitute. The recipe uses an explicit account allowlist. A group is
 also supported, but requires Browse users and groups for the factory account;
-see [start authority](dark-factory-quickstart.md#who-may-start-work).
+see [start authority](factory-quickstart-reference.md#who-may-start-work).
 An app, customer account or the factory account itself cannot start a run.
 
 Use the correct Jira API URL for the token: a classic token uses the site root,
@@ -49,7 +57,7 @@ such as `https://example.atlassian.net`; a scoped token uses
 `https://api.atlassian.com/ex/jira/` followed by the site's cloud id. Obtain the
 cloud id from your site's `/_edge/tenant_info` endpoint. A scoped token on the
 site root receives a 401. See the
-[Jira credential reference](dark-factory-quickstart.md#the-factory-account).
+[Jira credential reference](factory-quickstart-reference.md#the-factory-account).
 
 ## Select an isolated local trial
 
@@ -192,7 +200,7 @@ curie cluster status --context "$CURIE_CONTEXT" \
 Ready pods prove setup, not a completed task. The one repository in this recipe
 is the binding's default. Multi-repository routing uses a `repo:` label followed
 by the configured alias; see the
-[binding reference](dark-factory-quickstart.md#the-chart-values-it-writes).
+[binding reference](factory-quickstart-reference.md#the-chart-values-it-writes).
 
 ## Delegate a bounded Jira ticket
 

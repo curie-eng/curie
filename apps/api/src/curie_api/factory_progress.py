@@ -98,6 +98,17 @@ class Declaration(_Strict):
                 return loop
         return None
 
+    def round_cap_for(self, phase: str) -> int | None:
+        """The largest cap among the loops naming ``phase``, or None when none does.
+
+        Two loops may share a phase with different caps, so a reported round
+        is valid up to the largest. ``loop_for`` stays first-match because the
+        card rendering reads it.
+        """
+
+        caps = [loop.cap for loop in self.loops if phase in (loop.start, loop.review)]
+        return max(caps) if caps else None
+
 
 class Activity(_Strict):
     model: str | None = Field(default=None, max_length=120)
@@ -137,10 +148,10 @@ class ProgressReport(_Strict):
         if self.phase not in {phase.id for phase in self.declaration.phases}:
             raise ValueError("phase is not declared")
         if self.round is not None:
-            loop = self.declaration.loop_for(self.phase)
-            if loop is None:
+            cap = self.declaration.round_cap_for(self.phase)
+            if cap is None:
                 raise ValueError("round is only valid on a looped phase")
-            if not 1 <= self.round <= loop.cap:
+            if not 1 <= self.round <= cap:
                 raise ValueError("round must be between 1 and the loop cap")
         return self
 

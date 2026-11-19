@@ -123,6 +123,19 @@ def _active_match(role: RoleConfigurationV1 | None, facts: ValidatedFacts) -> Ro
     return RoleFilterLayerResult(status="no_match", reason="no_selector_match")
 
 
+def role_admits(role: RoleConfigurationV1 | None, facts: ValidatedFacts) -> bool:
+    """Whether a resolved, coherent observation matches ``role``'s filter exactly.
+
+    The selector match of the approver role, applied to a role the caller
+    holds itself, such as a registration's pinned ceiling (ADR 0271 decision
+    5). Anything but a resolved, coherent fact set never matches; a match is
+    never a permission on its own. @spec REQUEST-APPROVAL-5.
+    """
+    if facts.outcome != "resolved" or not _coherent(facts):
+        return False
+    return _active_match(role, facts).status == "match"
+
+
 def evaluate_role_filter_layer(
     policy: AgentRolePolicyV1 | RoleFilterRefusal | None,
     facts: ValidatedFacts | FactsRefusal,

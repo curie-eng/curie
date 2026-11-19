@@ -14,6 +14,12 @@ from channel_protocol.reply import (
     ReplyAck,
 )
 
+from ..capacity_wait import (
+    WAIT_REASON_ADMISSION,
+    WAIT_REASON_DEPENDENCY,
+    current_wait,
+    durable_wait_notice,
+)
 from ..delivery_lease import DeliveryLease
 from ..sandbox.types import (
     CapacityRejection,
@@ -65,7 +71,11 @@ def _capacity_expiry_reply(approval_resume: bool, cause: str) -> str:
 
 
 async def notify_capacity_queued(
-    self: Kernel, qevent: QueuedTurn, *, wait_reply_ref: str | None
+    self: Kernel,
+    qevent: QueuedTurn,
+    *,
+    wait_reply_ref: str | None,
+    wait_reason: str = WAIT_REASON_ADMISSION,
 ) -> ReplyAck:
     # A queued edit that starts after the answer must not replace it. An
     # edit already inside the sink is a different window: the notice lock
@@ -86,11 +96,99 @@ async def notify_capacity_queued(
         return await self._reply_for(
             qevent,
             routing._route_from_handle(qevent),
-            "Your request is queued while sandbox admission is pending.",
+            durable_wait_notice(wait_reason),
             terminal=False,
         )
     finally:
         self._minted_refs.pop(qevent.event_id, None)
+
+
+async def refresh_dependency_wait_notice(self: Kernel, qevent: QueuedTurn) -> None:
+    """Edit an existing durable notice when recovery is the current cause.
+
+    Dependency recovery stays inside the parked deadline. It does not park
+    again, so the deadline, deferral count and retry policy stay as they are.
+    """
+    scope = current_wait()
+    if scope is None:
+        return
+    store, event_id, generation, _lease = scope
+    if event_id != qevent.event_id:
+        return
+    try:
+        record = await store.get(event_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a failed lookup must not abort recovery
+        logger.warning(
+            "dependency wait notice lookup failed for event %s",
+            qevent.event_id,
+            exc_info=True,
+        )
+        return
+    if (
+        record is None
+        or record.wait_reason == WAIT_REASON_DEPENDENCY
+        or record.state not in {"waiting", "woken", "active"}
+    ):
+        return
+    if await _wait_is_terminal(self, qevent):
+        return
+    notice_event = qevent
+    if record.reply_ref is not None and qevent.reply_handle is not None:
+        notice_event = qevent.model_copy(
+            update={
+                "reply_handle": qevent.reply_handle.model_copy(
+                    update={"placeholder": record.reply_ref}
+                )
+            }
+        )
+    try:
+        ack = await self.notify_capacity_queued(
+            notice_event,
+            wait_reply_ref=record.reply_ref,
+            wait_reason=WAIT_REASON_DEPENDENCY,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a failed notice must not abort recovery
+        logger.warning(
+            "dependency wait notice failed for event %s",
+            qevent.event_id,
+            exc_info=True,
+        )
+        return
+    self._adopt_ref(qevent, ack)
+    if await _wait_is_terminal(self, qevent):
+        return
+    try:
+        await store.remember_wait_reason(
+            event_id, generation, WAIT_REASON_DEPENDENCY, reply_ref=ack.ref
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a failed remember retries on the next loop
+        logger.warning(
+            "dependency wait reason was not stored for event %s",
+            qevent.event_id,
+            exc_info=True,
+        )
+
+
+async def _wait_is_terminal(self: Kernel, qevent: QueuedTurn) -> bool:
+    if qevent.event_id in self._terminal_reply_attempted:
+        return True
+    try:
+        return await self._markers.is_terminal(qevent.event_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - an unreadable terminal check skips the edit
+        logger.warning(
+            "dependency wait notice terminal check failed for event %s",
+            qevent.event_id,
+            exc_info=True,
+        )
+        return True
 
 
 async def expire_capacity_wait(

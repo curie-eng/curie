@@ -21,11 +21,13 @@ from curie_internal.identity_authority import TurnAuthorityRequestV1, TurnAuthor
 from curie_worker import workspace as workspace_module
 from curie_worker.binding import HttpIdentityBinding
 from curie_worker.capacity_wait import WAIT_REPLY_REF_FIELD
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.hook_runs import HookRunRecorderError
 from curie_worker.identity_authority import HttpTurnAuthorityClient, TurnAuthorityUnavailable
 from curie_worker.kernel.core import Kernel
+from curie_worker.kernel.failures import failure_class_from_reply
+from curie_worker.reply_sink import CLUSTER_MESSAGE_ADAPTER, TargetRoute
 from curie_worker.sandbox import SuspendedThreadError
 from sqlalchemy import text
 
@@ -184,6 +186,65 @@ def test_adopted_binding_without_context_is_terminal_before_preparation(make_har
             assert h.runner.opened == []
             assert h.fake_k8s.claim_envs == [] and binding.boots == [] and binding.mints == []
             assert h.sink.events == []
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+    asyncio.run(run())
+
+
+# A cluster message or cluster eval turn's relay bucket: a canonical UUIDv4.
+RELAY_REF = "123e4567-e89b-42d3-a456-426614174000"
+# The class frozen as identity_refused_class in tests/vectors/turn-failure-reply.json.
+IDENTITY_REFUSED_CLASS = "identity-refused"
+
+
+def test_refused_cluster_message_turn_settles_its_relay_and_nothing_else(make_harness):
+    """@spec HTTP-INVOCATION-EXECUTION-31: the relay waiter learns of the refusal (#5518).
+
+    Before the fix the refusal wrote nothing, so the CLI polled the relay
+    until its deadline. The refusal still starts nothing, and the only events
+    go over the platform-owned relay route, never a Slack one.
+    """
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-31."""
+        binding = Binding()
+        async with make_harness(binding=binding) as h:
+            event = qevent(
+                "cluster eval case", thread="eval:case-1", placeholder=RELAY_REF,
+                adapter=CLUSTER_MESSAGE_ADAPTER,
+            )
+            await h.kernel.process_event(event)
+            assert h.runner.opened == []
+            assert h.fake_k8s.claim_envs == [] and binding.boots == [] and binding.mints == []
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert [sent.event for sent, _route, _ in h.sink.events] == [
+                "reply.update", "turn.completed",
+            ]
+            relay = TargetRoute(endpoint=None, adapter=CLUSTER_MESSAGE_ADAPTER)
+            assert {route for _sent, route, _ in h.sink.events} == {relay}
+            update, completed = (sent for sent, _route, _ in h.sink.events)
+            assert update.target.reply_ref == RELAY_REF
+            assert completed.target.reply_ref == RELAY_REF
+            assert failure_class_from_reply(update.text) == IDENTITY_REFUSED_CLASS
+            assert completed.outcome == "dropped"
+            assert completed.event_id == event.event_id
+    asyncio.run(run())
+
+
+def test_undeliverable_relay_refusal_notice_keeps_the_turn_terminal(make_harness):
+    """@spec HTTP-INVOCATION-EXECUTION-31: the notice is best effort after the marker."""
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-31."""
+        binding = Binding()
+        async with make_harness(binding=binding) as h:
+            async def unreachable(*_args: Any, **_kwargs: Any) -> Any:
+                raise RuntimeError("synthetic relay outage")
+
+            h.sink.emit = unreachable
+            event = qevent(
+                "cluster eval case", thread="eval:case-2", placeholder=RELAY_REF,
+                adapter=CLUSTER_MESSAGE_ADAPTER,
+            )
+            await h.kernel.process_event(event)
+            assert h.runner.opened == [] and binding.boots == []
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
     asyncio.run(run())
 
@@ -540,6 +601,7 @@ def test_consumer_keeps_original_hash_and_all_fields_across_capacity_placeholder
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             entry_id, observed = await pending_entry(h, consumer, fields)
             lease = await leases.acquire(
@@ -601,6 +663,7 @@ def test_unavailable_http_delivery_stays_pending_until_the_existing_cap_dead_let
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             raw = qevent("unavailable current authority").model_dump_json()
             fields = {"payload": raw, "curie_identity_context_v1": CAPSULE}
@@ -835,6 +898,7 @@ def test_capacity_queued_notice_suppresses_unverified_http_without_faking_delive
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             legacy = qevent("legacy courtesy", thread="legacy-courtesy")
             _, legacy_record = await park_notice_record(
@@ -864,6 +928,7 @@ def test_capacity_expiry_repair_suppresses_unverified_http_and_keeps_original_fi
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             event = qevent("unverified repaired expiry", thread="http-expiry-repair")
             fields, _ = await park_notice_record(h, consumer, leases, event, recognized=True)
@@ -890,6 +955,7 @@ def test_expired_http_wait_delivery_settles_without_an_unverified_reply(make_har
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             event = qevent("unverified expired delivery", thread="http-expired-wait")
             fields, _ = await park_notice_record(h, consumer, leases, event, recognized=True)
@@ -965,6 +1031,7 @@ def test_completed_workspace_failure_retries_with_current_authority_in_the_same_
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
                 redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+                reminders=refuse_unconfigured_reminder,
             )
             event = qevent("Use https://github.com/acme-corp/acme-bot", thread="retry-workspace")
             fields = {"payload": event.model_dump_json(), "curie_identity_context_v1": CAPSULE}

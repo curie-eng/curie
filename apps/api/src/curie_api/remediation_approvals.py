@@ -50,6 +50,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_forward import ForwardCreated, ForwardRefused, arguments_sha256
+from .approver_dm import dm_route
 from .config import get_settings
 from .identity.http_invocation import HttpInvocationRuntime
 from .identity.writer_selection import http_selected_scope
@@ -143,7 +144,11 @@ def approval_ttl_seconds(document: Mapping[str, Any]) -> int:
 
 
 def route_card_channel(agent: Agent | None, route: str | None) -> str | None:
-    """The route's fixed resolution address, or None for the requesting surface."""
+    """The route's fixed resolution address, or None for the requesting surface.
+
+    An ``approver_dm`` route has neither: ``request_remediation_approval``
+    refuses it before reading this. @spec APPROVER-DM-3.
+    """
 
     routes = agent.approval_routes if agent is not None else None
     binding = routes.get(route) if route and isinstance(routes, Mapping) else None
@@ -321,6 +326,15 @@ async def request_remediation_approval(
         await session.rollback()
         raise RemediationApprovalUnavailable("the approval scope is selected for HTTP identity")
 
+    route = document.get("route") if isinstance(document.get("route"), str) else None
+    agent = await session.get(Agent, nomination.agent_id)
+    routes = agent.approval_routes if agent is not None else None
+    if route and isinstance(routes, Mapping) and dm_route(routes.get(route)) is not None:
+        # ADR 0272: an approver-DM route delivers only one selected approver's
+        # card, which a remediation approval never has; it is neither a fixed
+        # target nor the requesting surface. @spec APPROVER-DM-3.
+        await session.rollback()
+        raise RemediationApprovalUnavailable("the route delivers only to a selected approver's DM")
     tune_reads = (
         await tune_read_rows(
             session,
@@ -334,8 +348,6 @@ async def request_remediation_approval(
         else []
     )
     connector, tool = bound
-    route = document.get("route") if isinstance(document.get("route"), str) else None
-    agent = await session.get(Agent, nomination.agent_id)
     approval_id = uuid.uuid4()
     inserted = await session.scalar(
         insert(Approval)

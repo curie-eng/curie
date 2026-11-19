@@ -627,8 +627,8 @@ _REPLY_WITH_BUTTONS = (
 
 def test_bound_agent_with_enabled_nav_gets_hub_button_on_final_reply(make_harness) -> None:
     from channel_protocol.reply import NavAffordance
+    from curie_channel_gateway.slack.blocks import render
     from curie_worker.behaviorpacks import NavPack
-    from curie_worker.blocks import render
 
     async def go() -> None:
         packs = {"nav": {"enabled": True, "hub_label": "Help", "hub_command": "help"}}
@@ -695,7 +695,7 @@ def test_malformed_packs_blob_still_completes_the_turn(make_harness) -> None:
 
 
 def test_bound_agent_without_nav_gets_no_hub_button(make_harness) -> None:
-    from curie_worker.blocks import render
+    from curie_channel_gateway.slack.blocks import render
 
     async def go() -> None:
         binding = StubBinding({("slack", "C-bound"): _resolved_with_packs({})})  # nav absent

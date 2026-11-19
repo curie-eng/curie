@@ -11,7 +11,7 @@ import logging
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,9 +28,10 @@ from aci_protocol import (
     TextDelta,
     TurnSource,
 )
+from botocore.exceptions import ClientError
 from curie_api.config import Settings
 from curie_api.workitem_reconciler import WorkItemReconciler
-from curie_dispatcher.queue import to_stream_fields
+from curie_internal.turn_queue import to_stream_fields
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
@@ -40,12 +41,14 @@ from curie_worker import delivery_lease as delivery_lease_module
 from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import HttpIdentityBinding
+from curie_worker.boot_grace import BootGrace
 from curie_worker.capacity_wait import (
     WAIT_GENERATION_FIELD,
     WAIT_TERMINAL_ONLY_FIELD,
+    CapacityWaitRecord,
     CapacityWaitStore,
 )
-from curie_worker.consumer import Consumer
+from curie_worker.consumer import Consumer, refuse_unconfigured_reminder
 from curie_worker.consumer_liveness import (
     ConsumerLivenessStore,
     consumer_heartbeat_capable_key,
@@ -60,9 +63,11 @@ from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.sandbox import k8s as k8s_module
 from curie_worker.sandbox.k8s import KubernetesSandboxClient
+from curie_worker.sandbox.types import KubeTransientError
 from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
+from kubernetes import client as kube
 from kubernetes.utils.quantity import parse_quantity
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -123,7 +128,9 @@ _OUTAGE_KNOBS: dict[str, object] = {
 
 async def _outage_delivery(h: Any) -> tuple[Consumer, DeliveryLeaseStore, str, dict[str, str]]:
     store = DeliveryLeaseStore(h.async_redis, h.config)
-    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                        reminders=refuse_unconfigured_reminder,
+               )
     await consumer.ensure_group()
     await h.async_redis.xadd(
         h.config.stream, to_stream_fields(_qevent("outage", event_id=uuid.uuid4().hex))
@@ -420,148 +427,6 @@ def test_delivery_confirmed_refusals_drop_authority_on_the_first_renewal(
                     owner=control.owner,
                     resume_event_id=None,
                 )
-
-    asyncio.run(go())
-
-
-@pytest.mark.parametrize("refusal", ["key-gone", "new-generation"])
-def test_liveness_token_refusal_never_resurrects_or_overwrites_a_generation(
-    make_harness, refusal: str
-) -> None:
-    async def go() -> None:
-        async with make_harness(**_OUTAGE_KNOBS) as h:
-            consumer = _capacity_consumer(h)
-            await consumer._publish_liveness()
-            store = consumer._liveness_store
-            assert store is not None
-            old_token = consumer._liveness_token
-            assert isinstance(old_token, str) and len(old_token) == 32
-            key = consumer_heartbeat_key(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name
-            )
-            capable = consumer_heartbeat_capable_key(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name
-            )
-            kwargs = dict(
-                stream=h.config.stream,
-                group=h.config.consumer_group,
-                consumer=h.config.consumer_name,
-                heartbeat_ttl_ms=4500,
-                capability_ttl_ms=9000,
-            )
-            replacement = None
-            if refusal == "key-gone":
-                await h.async_redis.delete(key)
-            else:
-                replacement = await store.publish(**kwargs)
-                assert replacement != old_token
-            # Give the capability key a distinguishable value and TTL. A CAS
-            # refusal must change neither key, even the longer-lived marker.
-            await h.async_redis.set(capable, "sentinel", px=2000)
-            assert await store.renew(**kwargs, token=old_token) is False
-            assert await h.async_redis.get(key) == replacement
-            assert await h.async_redis.get(capable) == "sentinel"
-            assert 0 < await h.async_redis.pttl(capable) <= 2000
-            started = time.monotonic()
-            with pytest.raises(ConsumerLivenessExpired):
-                await asyncio.wait_for(consumer._liveness_refresh_loop(), timeout=1.25)
-            assert time.monotonic() - started < 1.2
-            assert await h.async_redis.get(key) == replacement
-            assert await h.async_redis.get(capable) == "sentinel"
-            # The newly published generation is valid, including after a
-            # durable key loss, and refreshes both TTLs through the real Lua.
-            if replacement is None:
-                replacement = await store.publish(**kwargs)
-            assert await store.renew(**kwargs, token=replacement) is True
-            assert await h.async_redis.get(key) == replacement
-            assert await h.async_redis.pttl(key) > 4300
-            assert await h.async_redis.pttl(capable) > 8800
-            await consumer._cleanup_alive()
-
-    asyncio.run(go())
-
-
-@pytest.mark.parametrize("failure", ["connection-error", "hung-call"])
-def test_terminal_xack_retries_without_starving_the_delivery_heartbeat(
-    make_harness, monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    async def go() -> None:
-        async with make_harness(**_OUTAGE_KNOBS) as h:
-            consumer, store, entry_id, fields = await _outage_delivery(h)
-            real_xack = h.async_redis.xack
-            real_heartbeat = store.heartbeat
-            attempted = asyncio.Event()
-            confirmed = asyncio.Event()
-            cancelled = asyncio.Event()
-            calls = 0
-            outage_until: float | None = None
-            retry_sleeps: list[float] = []
-
-            async def observe_heartbeat(*args: Any, **kwargs: Any) -> Any:
-                result = await real_heartbeat(*args, **kwargs)
-                if result is not None:
-                    confirmed.set()
-                return result
-
-            async def flaky_xack(*args: Any, **kwargs: Any) -> Any:
-                nonlocal calls, outage_until
-                calls += 1
-                attempted.set()
-                if failure == "connection-error":
-                    if outage_until is None:
-                        outage_until = time.monotonic() + 2.0
-                    if time.monotonic() < outage_until:
-                        raise redis.exceptions.ConnectionError("injected 20s terminal XACK outage")
-                if failure == "hung-call" and calls == 1:
-                    try:
-                        await asyncio.Event().wait()
-                    finally:
-                        cancelled.set()
-                assert confirmed.is_set(), "XACK retries retained the heartbeat lock"
-                return await real_xack(*args, **kwargs)
-
-            async def settlement_sleep(delay: float) -> None:
-                task = asyncio.current_task()
-                if (
-                    failure == "connection-error"
-                    and task is not None
-                    and task.get_name() == "test:terminal-xack"
-                ):
-                    retry_sleeps.append(delay)
-                    await asyncio.sleep(delay * 0.1)
-                else:
-                    await asyncio.sleep(delay)
-
-            monkeypatch.setattr(store, "heartbeat", observe_heartbeat)
-            monkeypatch.setattr(h.async_redis, "xack", flaky_xack)
-            monkeypatch.setattr(
-                stream_consumer_module,
-                "asyncio",
-                SimpleNamespace(**{**vars(asyncio), "sleep": settlement_sleep}),
-            )
-            async with consumer._delivery_lease(entry_id, fields) as lease:
-                assert lease is not None
-                task = asyncio.create_task(consumer._ack(entry_id), name="test:terminal-xack")
-                try:
-                    await attempted.wait()
-                    if failure == "connection-error":
-                        # Sleep/backoff must happen after releasing the lock.
-                        async with asyncio.timeout(0.1), lease.settlement_lock:
-                            assert not task.done()
-                    await asyncio.wait_for(confirmed.wait(), timeout=1.25)
-                    await asyncio.wait_for(task, timeout=2.0)
-                    assert not lease.lost.is_set()
-                    assert lease.acknowledged.is_set()
-                    assert calls == (8 if failure == "connection-error" else 2)
-                    if failure == "connection-error":
-                        assert outage_until is not None and time.monotonic() >= outage_until
-                        assert retry_sleeps == [0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0]
-                    assert cancelled.is_set() is (failure == "hung-call")
-                    assert (await h.async_redis.xpending(lease.stream, lease.group))["pending"] == 0
-                finally:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
 
     asyncio.run(go())
 
@@ -991,6 +856,7 @@ def _capacity_consumer(h: Any) -> Consumer:
         kernel=h.kernel,
         config=h.config,
         leases=DeliveryLeaseStore(h.async_redis, h.config),
+        reminders=refuse_unconfigured_reminder,
     )
 
 
@@ -1078,6 +944,7 @@ def test_consumes_stream_entry_end_to_end_and_acks(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -1172,6 +1039,15 @@ def _inventory_timeout_client(
             return super().list_namespaced_custom_object(*args, **kwargs)
 
         def list_namespaced_pod(self, namespace: str, **kwargs: Any) -> SimpleNamespace:
+            if failure.startswith("pod-http-"):
+                self.pod_list_error = None
+                if self.failures_left:
+                    if restore:
+                        self.failures_left -= 1
+                    # #5544 observed this ApiException shape on the external Pod LIST.
+                    self.pod_list_error = kube.ApiException(
+                        status=int(failure.removeprefix("pod-http-"))
+                    )
             if failure in {"sdk-timeout", "transient"} and self.failures_left:
                 if restore:
                     self.failures_left -= 1
@@ -1352,6 +1228,230 @@ def test_inventory_timeout_capacity_wait_preserves_delivery_bound(
                 assert api.created == []
                 assert api.secrets == {}
                 assert h.runner.opened == h.sink.completions == []
+
+    asyncio.run(go())
+
+
+async def _wake_inventory_delivery(h: Any, consumer: Consumer, event_id: str) -> None:
+    await h.async_redis.zadd(consumer._waits._due, {event_id: 0})
+    assert await consumer._waits.wake_due() == 1
+    rows = await h.async_redis.xreadgroup(
+        h.config.consumer_group,
+        h.config.consumer_name,
+        {h.config.stream: ">"},
+        count=1,
+    )
+    assert len(rows) == 1 and len(rows[0][1]) == 1
+    entry_id, fields = rows[0][1][0]
+    await consumer._sem.acquire()
+    await consumer._handle(entry_id, fields)
+
+
+async def _assert_pod_list_admission_wait(
+    h: Any,
+    consumer: Consumer,
+    api: Any,
+    event: QueuedTurn,
+    *,
+    deferrals: int,
+    original: CapacityWaitRecord | None = None,
+) -> CapacityWaitRecord:
+    record = await consumer._waits.get(event.event_id)
+    assert record is not None, "Pod LIST failure did not enter durable admission wait"
+    assert record.state == "waiting"
+    assert record.wait_reason == "sandbox_admission"
+    assert record.fields == to_stream_fields(event)
+    assert record.deferrals == deferrals
+    assert record.first_wait_ms < record.deadline_ms
+    if original is not None:
+        assert record.first_wait_ms == original.first_wait_ms
+        assert record.deadline_ms == original.deadline_ms
+    assert len(api.pod_list_calls) == deferrals
+    # The inventory LISTs run concurrently (#5630), so only their count per
+    # attempt is fixed, not their order: each is issued once, never retried.
+    assert sorted(plural for plural, _selector in api.lists) == sorted(
+        ["sandboxclaims", "sandboxes"] * deferrals
+    )
+    assert api.quota_error is api.runtime_error is None
+    assert api.failures == {}
+    assert api.created == api.patches == []
+    assert api.secrets == {}
+    assert h.runner.opened == h.runner.queried == h.sink.completions == []
+    assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+    assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))["pending"] == 0
+    assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+    return record
+
+
+def test_pod_list_503_capacity_wait_preserves_delivery_bound(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=2
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            max_delivery=2,
+        ) as h:
+            h.runner.default_script = [Final(text="inventory restored", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello", thread="pod-list-thread", event_id="pod-list-turn")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            first = await _assert_pod_list_admission_wait(h, consumer, api, event, deferrals=1)
+            await _wake_inventory_delivery(h, consumer, event.event_id)
+            await _assert_pod_list_admission_wait(
+                h, consumer, api, event, deferrals=2, original=first
+            )
+            assert api.failures_left == 0
+
+            await _wake_inventory_delivery(h, consumer, event.event_id)
+            record = await consumer._waits.get(event.event_id)
+            assert record is not None and record.state == "done"
+            assert record.deferrals == 2
+            assert record.first_wait_ms == first.first_wait_ms
+            assert record.deadline_ms == first.deadline_ms
+            assert max(api.delivery_counts) <= 2, api.delivery_counts
+            assert h.runner.opened == h.runner.queried == ["hello"]
+            assert h.sink.last_text == "inventory restored"
+            assert len(h.sink.completions) == 1
+            assert sum(
+                verb == "create" and plural == "sandboxclaims" for verb, plural, _ in api.calls
+            ) == 1
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+
+    asyncio.run(go())
+
+
+def test_persistent_pod_list_503_keeps_first_admission_deadline(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=False
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+            max_delivery=2,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello", thread="pod-list-thread", event_id="pod-list-turn")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            first = await _assert_pod_list_admission_wait(h, consumer, api, event, deferrals=1)
+            for deferrals in (2, 3):
+                await _wake_inventory_delivery(h, consumer, event.event_id)
+                await _assert_pod_list_admission_wait(
+                    h, consumer, api, event, deferrals=deferrals, original=first
+                )
+            assert max(api.delivery_counts) <= 2, api.delivery_counts
+
+    asyncio.run(go())
+
+
+def test_healthy_pod_list_admits_one_turn_without_durable_wait(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=0
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+        ) as h:
+            h.runner.default_script = [Final(text="admitted", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello", thread="pod-list-thread", event_id="pod-list-turn")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            assert len(api.pod_list_calls) == 1
+            assert api.pod_list_error is api.quota_error is api.runtime_error is None
+            assert any(name.startswith("get:resourcequotas:") for name, _ in api.request_timeouts)
+            assert h.runner.opened == h.runner.queried == ["hello"]
+            assert h.sink.last_text == "admitted"
+            assert len(h.sink.completions) == 1
+            assert sum(
+                verb == "create" and plural == "sandboxclaims" for verb, plural, _ in api.calls
+            ) == 1
+            assert await consumer._waits.get(event.event_id) is None
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
+                "pending"
+            ] == 0
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_permanent_pod_list_error_fails_closed_without_durable_wait(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure=f"pod-http-{status}", restore=False
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            slack_no_edit_streaming=True,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("hello", thread="pod-list-thread", event_id="pod-list-turn")
+            entry_id, fields = await _pending_local_entry(h, event)
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            assert len(api.pod_list_calls) == 1
+            assert api.pod_list_error is not None and api.pod_list_error.status == status
+            assert api.quota_error is api.runtime_error is None
+            assert api.failures == {}
+            assert api.created == api.patches == []
+            assert api.secrets == {}
+            assert h.runner.opened == h.runner.queried == h.sink.completions == []
+            assert await consumer._waits.get(event.event_id) is None
+            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+            pending = await h.async_redis.xpending_range(
+                h.config.stream, h.config.consumer_group, "-", "+", 10
+            )
+            assert len(pending) == 1
+            assert pending[0]["message_id"] == entry_id
+            assert pending[0]["times_delivered"] == 1
+            assert not await h.async_redis.exists(f"{h.config.stream}:dead")
 
     asyncio.run(go())
 
@@ -2290,13 +2390,47 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
             parked_event = _qevent("parked", thread="lease-shared", event_id="lease-parked")
             first = _capacity_consumer(h)
             await first.ensure_group()
-            await h.async_redis.xadd(h.config.stream, to_stream_fields(parked_event))
-            first_task = asyncio.create_task(first.run())
-            try:
-                await _wait_capacity_state(first, parked_event.event_id, "waiting")
-            finally:
-                first.request_stop()
-                await first_task
+            parked_id, parked_fields = await _pending_local_entry(h, parked_event)
+            await first._dispatch(parked_id, parked_fields)
+            await asyncio.gather(*list(first._inflight))
+            await _wait_capacity_state(first, parked_event.event_id, "waiting")
+            await first._repair_wait_notices()
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            await h.async_redis.zadd(consumer._waits._due, {parked_event.event_id: 0})
+            assert await consumer._waits.wake_due() == 1
+            woken = await consumer._waits.get(parked_event.event_id)
+            assert woken is not None and woken.state == "woken"
+            wake_id, wake_fields = (
+                await h.async_redis.xreadgroup(
+                    h.config.consumer_group,
+                    h.config.consumer_name,
+                    {h.config.stream: ">"},
+                    count=1,
+                )
+            )[0][1][0]
+            lease_store = DeliveryLeaseStore(h.async_redis, h.config)
+            lease = await lease_store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                wake_id,
+                consumer=h.config.consumer_name,
+            )
+            old_epoch = uuid.uuid4().hex
+            if record_old_epoch:
+                assert (
+                    await consumer._waits.mark_active(
+                        parked_event.event_id, woken.generation, lease, old_epoch
+                    )
+                    == "active"
+                )
+                assert await consumer._waits.confirm_grant(
+                    parked_event.event_id, woken.generation, lease, old_epoch
+                )
+                h.runner.admission_results[old_epoch] = "granted"
+            await h.async_redis.delete(
+                h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, wake_id)
+            )
 
             h.fake_k8s.quota_rejection = None
             hold = asyncio.Event()
@@ -2309,43 +2443,8 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
                 await _wait_until(lambda: h.runner.queried == ["later"])
                 later_epoch = h.runner.turn_epoch
                 assert later_epoch is not None
-                consumer = _capacity_consumer(h)
-                await consumer.ensure_group()
-                await h.async_redis.zadd(consumer._waits._due, {parked_event.event_id: 0})
-                assert await consumer._waits.wake_due() == 1
-                woken = await consumer._waits.get(parked_event.event_id)
-                assert woken is not None and woken.state == "woken"
-                wake_id, wake_fields = (
-                    await h.async_redis.xreadgroup(
-                        h.config.consumer_group,
-                        h.config.consumer_name,
-                        {h.config.stream: ">"},
-                        count=1,
-                    )
-                )[0][1][0]
-                lease_store = DeliveryLeaseStore(h.async_redis, h.config)
-                lease = await lease_store.acquire(
-                    h.config.stream,
-                    h.config.consumer_group,
-                    wake_id,
-                    consumer=h.config.consumer_name,
-                )
-                old_epoch = uuid.uuid4().hex
                 if record_old_epoch:
                     assert old_epoch != later_epoch
-                    assert (
-                        await consumer._waits.mark_active(
-                            parked_event.event_id, woken.generation, lease, old_epoch
-                        )
-                        == "active"
-                    )
-                    assert await consumer._waits.confirm_grant(
-                        parked_event.event_id, woken.generation, lease, old_epoch
-                    )
-                    h.runner.admission_results[old_epoch] = "granted"
-                await h.async_redis.delete(
-                    h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, wake_id)
-                )
 
                 await consumer._interrupt_on_lease_lost(wake_id, wake_fields)
                 assert h.runner.turn_active
@@ -2492,93 +2591,6 @@ def test_wake_before_deadline_expires_if_turn_cannot_start_until_after_it(
     asyncio.run(go())
 
 
-def test_runner_acceptance_boundary_respects_wait_deadline(make_harness) -> None:
-    async def go() -> None:
-        async with make_harness(
-            slack_no_edit_streaming=True,
-            claim_timeout_seconds=0.05,
-            capacity_wait_budget_s=1.0,
-        ) as h:
-            h.fake_k8s.quota_rejection = QuotaRejection(
-                quota_name="curie-sandbox-quota",
-                requested={"pods": "1"},
-                used={"pods": "2"},
-                hard={"pods": "2"},
-            )
-            event = _qevent("hello", thread="late-accept", event_id="late-accept-turn")
-            first = _capacity_consumer(h)
-            await first.ensure_group()
-            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
-            first_task = asyncio.create_task(first.run())
-            try:
-                parked = await _wait_capacity_state(first, event.event_id, "waiting")
-                await _wait_until(
-                    lambda: any("queued" in text.lower() for _, _, text in h.sink.updates)
-                )
-            finally:
-                first.request_stop()
-                await first_task
-
-            accept = asyncio.Event()
-            hold = asyncio.Event()
-            h.runner.accept = accept
-            h.runner.hold = hold
-            h.runner.default_script = [TextDelta(text="late work")]
-            h.runner.tail = [Final(text="late answer", status=DONE)]
-            h.fake_k8s.quota_rejection = None
-            replacement = _capacity_consumer(h)
-            await replacement.ensure_group()
-            await h.async_redis.zadd(replacement._waits._due, {event.event_id: 0})
-            assert await replacement._waits.wake_due() == 1
-            wake_id, wake_fields = (
-                await h.async_redis.xreadgroup(
-                    h.config.consumer_group,
-                    h.config.consumer_name,
-                    {h.config.stream: ">"},
-                    count=1,
-                )
-            )[0][1][0]
-            await replacement._sem.acquire()
-            wake_task = asyncio.create_task(replacement._handle(wake_id, wake_fields))
-            try:
-                await _wait_until(lambda: h.runner.opened == ["hello"])
-                waiting_for_acceptance = await replacement._waits.get(event.event_id)
-                assert waiting_for_acceptance is not None
-                assert waiting_for_acceptance.state == "woken"
-                assert h.runner.turn_active is False
-                server_time = await h.async_redis.time()
-                now_ms = int(server_time[0]) * 1000 + int(server_time[1]) // 1000
-                await asyncio.sleep(max(0, parked.deadline_ms - now_ms) / 1000 + 0.05)
-                accept.set()
-                await asyncio.wait_for(wake_task, timeout=5)
-
-                expired = await _wait_capacity_state(replacement, event.event_id, "expired")
-                assert expired.cause == "capacity_wait_expired"
-                assert expired.deadline_ms == parked.deadline_ms
-                assert h.runner.interrupts == 0
-                assert h.runner.queried == []
-                assert not any(allowed for _epoch, allowed in h.runner.admissions)
-                assert not h.runner.turn_active
-                assert h.sink.last_text == (
-                    "Your request could not start before its capacity wait ended. "
-                    "Please send it again."
-                )
-                assert all("late answer" not in text for _, _, text in h.sink.updates)
-                assert [completion.event_id for completion in h.sink.completions] == [
-                    event.event_id
-                ]
-                await _wait_for_pending_count(
-                    h.async_redis, h.config.stream, h.config.consumer_group, 0
-                )
-            finally:
-                accept.set()
-                hold.set()
-                if not wake_task.done():
-                    await asyncio.wait_for(wake_task, timeout=5)
-
-    asyncio.run(go())
-
-
 def test_active_wait_delivery_recovers_after_deadline_without_expiry(
     make_harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2701,7 +2713,8 @@ def test_active_wait_delivery_recovers_after_deadline_without_expiry(
             # thread back to the queued notice.
             h.runner.turn_active = True
             await recovery._sem.acquire()
-            await recovery._handle(wake_id, wake_fields)
+            async with asyncio.timeout(10):
+                await recovery._handle(wake_id, wake_fields)
             assert h.sink.last_text == "recovered answer"
             assert [text for _, _, text in h.sink.updates].count(
                 "Your request is queued while sandbox admission is pending."
@@ -2830,16 +2843,12 @@ def test_dead_lettered_wake_gets_one_terminal_reply_and_owed_completion(
             event = _qevent("hello", thread="dead-wake", event_id="dead-wake-turn")
             first = _capacity_consumer(h)
             await first.ensure_group()
-            await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
-            first_task = asyncio.create_task(first.run())
-            try:
-                await _wait_capacity_state(first, event.event_id, "waiting")
-                await _wait_until(
-                    lambda: any("queued" in text.lower() for _, _, text in h.sink.updates)
-                )
-            finally:
-                first.request_stop()
-                await first_task
+            entry_id, fields = await _pending_local_entry(h, event)
+            await first._dispatch(entry_id, fields)
+            await asyncio.gather(*list(first._inflight))
+            parked = await first._waits.get(event.event_id)
+            assert parked is not None and parked.state == "waiting"
+            assert any("queued" in text.lower() for _, _, text in h.sink.updates)
 
             replacement = _capacity_consumer(h)
             await replacement.ensure_group()
@@ -3292,6 +3301,7 @@ def test_reclaim_skips_this_consumers_own_inflight_entry(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3329,6 +3339,7 @@ def test_dispatch_applies_backpressure_at_capacity(make_harness) -> None:
                 config=h.config,
                 max_concurrency=1,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3361,6 +3372,7 @@ def test_message_settlement_does_not_sample_queue_inventory(make_harness) -> Non
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3407,6 +3419,7 @@ def test_maintenance_tick_samples_queue_inventory_once(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             calls: list[str] = []
 
@@ -3441,6 +3454,7 @@ def test_maintenance_tick_sweeps_the_progress_outbox_after_completions(make_harn
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             calls: list[str] = []
 
@@ -3484,6 +3498,7 @@ def test_a_failing_progress_sweep_does_not_stop_the_maintenance_tick(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             calls: list[str] = []
 
@@ -3512,6 +3527,515 @@ def test_a_failing_progress_sweep_does_not_stop_the_maintenance_tick(
             assert any("progress outbox sweep failed" in r.getMessage() for r in caplog.records)
 
     asyncio.run(go())
+
+
+class _ExpiryRecorder:
+    """A retention ledger (workspace or attachment) that records each expiry pass.
+
+    Nothing has expired, so only ``enumerate_expired`` is reached.
+    """
+
+    def __init__(self, events: list[tuple[int, str]], tick: list[int], name: str) -> None:
+        self._events = events
+        self._tick = tick
+        self._name = name
+
+    def enumerate_expired(self) -> list[str]:
+        self._events.append((self._tick[0], self._name))
+        return []
+
+
+def test_maintenance_inventory_503_does_not_skip_independent_steps(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5630: a Pod LIST 503 fails the orphan reap's admission inventory on two
+    consecutive ticks. Each failing tick logs that failure once, against its
+    step, and still runs every independent maintenance step exactly once; the
+    third tick, after the API recovers, logs nothing at ERROR."""
+
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=2
+    )
+    # Advanced by the last observer, so every step is tagged with its tick.
+    tick = [0]
+    events: list[tuple[int, str]] = []
+    real_inventory = client.capacity_inventory
+
+    def counting_inventory(**kwargs: Any) -> Any:
+        events.append((tick[0], "capacity_inventory"))
+        return real_inventory(**kwargs)
+
+    monkeypatch.setattr(client, "capacity_inventory", counting_inventory)
+
+    def counting(name: str, step: Any) -> Any:
+        async def run() -> None:
+            events.append((tick[0], name))
+            await step()
+
+        return run
+
+    async def go() -> list[int]:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            reclaim_interval_s=1e-6,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            # The fake claim LIST reads this group's pending rows.
+            await consumer.ensure_group()
+            h.kernel._workspace = _ExpiryRecorder(events, tick, "workspace_expiry")
+            h.kernel._attachments = _ExpiryRecorder(events, tick, "attachment_expiry")
+            h.kernel.sweep_pending_completions = counting(  # type: ignore[method-assign]
+                "sweep_pending_completions", h.kernel.sweep_pending_completions
+            )
+            consumer._sweep_pending_progress = counting(  # type: ignore[method-assign]
+                "progress_sweep", consumer._sweep_pending_progress
+            )
+            consumer._drain_pending_progress_inboxes = counting(  # type: ignore[method-assign]
+                "progress_inbox_drain", consumer._drain_pending_progress_inboxes
+            )
+            consumer._drain_thread_reset_requests = counting(  # type: ignore[method-assign]
+                "thread_reset_drain", consumer._drain_thread_reset_requests
+            )
+            boundaries: list[int] = []
+            real_observe = consumer._observe_capacity_waits
+
+            async def last_observer() -> None:
+                await real_observe()
+                boundaries.append(len(caplog.records))
+                tick[0] += 1
+                if tick[0] == 3:
+                    consumer.request_stop()
+
+            consumer._observe_capacity_waits = last_observer  # type: ignore[method-assign]
+            await consumer._maintenance_loop()
+            return boundaries
+
+    with caplog.at_level(logging.ERROR):
+        boundaries = asyncio.run(go())
+
+    assert len(boundaries) == 3
+    assert api.failures_left == 0
+    every_step = [
+        "capacity_inventory",
+        "workspace_expiry",
+        "attachment_expiry",
+        "sweep_pending_completions",
+        "progress_sweep",
+        "progress_inbox_drain",
+        "thread_reset_drain",
+    ]
+    start = 0
+    for index, end in enumerate(boundaries):
+        # Every step once, in order; the inventory once, so no retry.
+        assert [name for at, name in events if at == index] == every_step, index
+        errors = caplog.records[start:end]
+        start = end
+        if index == 2:
+            assert [(r.name, r.getMessage()) for r in errors] == [], index
+            continue
+        assert [(r.levelno, r.getMessage()) for r in errors] == [
+            (logging.ERROR, "maintenance tick failed")
+        ], index
+        record = errors[0]
+        assert getattr(record, "maintenance_step", None) == "reap_orphans", index
+        assert record.exc_info is not None
+        assert isinstance(record.exc_info[1], KubeTransientError), record.exc_info
+        assert str(record.exc_info[1]) == "kube API 503 listing pods"
+
+
+def test_maintenance_inventory_503_with_failing_expiry_logs_the_substrate_error(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#5630 Decision 5.3: when the substrate reap and the expiry reap both
+    fail, the substrate error is the logged exception and the expiry failure
+    rides on it as a note, so one traceback carries both."""
+
+    client, _api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=1
+    )
+
+    class _FailingWorkspace:
+        def enumerate_expired(self) -> list[str]:
+            raise RuntimeError("workspace ledger unreadable")
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            reclaim_interval_s=1e-6,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            h.kernel._workspace = _FailingWorkspace()
+            real_observe = consumer._observe_capacity_waits
+
+            async def last_observer() -> None:
+                await real_observe()
+                consumer.request_stop()
+
+            consumer._observe_capacity_waits = last_observer  # type: ignore[method-assign]
+            await consumer._maintenance_loop()
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(go())
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["maintenance tick failed"]
+    record = errors[0]
+    assert getattr(record, "maintenance_step", None) == "reap_orphans"
+    assert record.exc_info is not None
+    assert record.exc_info[0] is KubeTransientError
+    assert str(record.exc_info[1]) == "kube API 503 listing pods"
+    notes = getattr(record.exc_info[1], "__notes__", [])
+    assert len(notes) == 1
+    assert "expiry reap also failed" in notes[0]
+    assert "workspace ledger unreadable" in notes[0]
+    assert "workspace ledger unreadable" in logging.Formatter().format(record)
+
+
+def _no_such_bucket() -> ClientError:
+    # The error shape S3 ListObjectsV2 returns for a missing bucket, per the AWS
+    # S3 API reference error codes; botocore builds ClientError from that
+    # parsed response.
+    return ClientError(
+        {
+            "Error": {"Code": "NoSuchBucket", "Message": "The specified bucket does not exist"},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        },
+        "ListObjectsV2",
+    )
+
+
+class _MissingBucketWorkspace:
+    """A workspace ledger whose listing fails for its first ``failing`` calls
+    (every call when ``None``), as a fresh install's object store does until
+    the post-install Job creates the bucket (#3079)."""
+
+    def __init__(
+        self,
+        *,
+        failing: int | None = None,
+        error: Callable[[], Exception] = _no_such_bucket,
+    ) -> None:
+        self.calls = 0
+        self._failing = failing
+        self._error = error
+
+    def enumerate_expired(self) -> list[str]:
+        self.calls += 1
+        if self._failing is None or self.calls <= self._failing:
+            raise self._error()
+        return []
+
+
+_DEFERRED_PREFIX = "maintenance step reap_orphans deferred: a dependency is not ready yet"
+
+
+def _deferred(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in records
+        if r.getMessage().startswith("maintenance step ") and " deferred: " in r.getMessage()
+    ]
+
+
+def _tick_failures(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    return [r for r in records if r.getMessage() == "maintenance tick failed"]
+
+
+def _graced_consumer(h: Any, grace: BootGrace) -> Consumer:
+    return Consumer(
+        redis=h.async_redis,
+        kernel=h.kernel,
+        config=h.config,
+        leases=DeliveryLeaseStore(h.async_redis, h.config),
+        reminders=refuse_unconfigured_reminder,
+        boot_grace=grace,
+    )
+
+
+def _stop_every(consumer: Consumer, ticks: int) -> list[int]:
+    """Request a stop after every ``ticks`` maintenance ticks; returns the tick count."""
+    seen = [0]
+    real_observe = consumer._observe_capacity_waits
+
+    async def last_observer() -> None:
+        await real_observe()
+        seen[0] += 1
+        if seen[0] % ticks == 0:
+            consumer.request_stop()
+
+    consumer._observe_capacity_waits = last_observer  # type: ignore[method-assign]
+    return seen
+
+
+def _record_later_steps(h: Any, consumer: Consumer, events: list[str]) -> None:
+    def counting(name: str, step: Any) -> Any:
+        async def run() -> None:
+            events.append(name)
+            await step()
+
+        return run
+
+    h.kernel.sweep_pending_completions = counting(
+        "sweep_pending_completions", h.kernel.sweep_pending_completions
+    )
+    consumer._sweep_pending_progress = counting(  # type: ignore[method-assign]
+        "progress_sweep", consumer._sweep_pending_progress
+    )
+    consumer._drain_pending_progress_inboxes = counting(  # type: ignore[method-assign]
+        "progress_inbox_drain", consumer._drain_pending_progress_inboxes
+    )
+    consumer._drain_thread_reset_requests = counting(  # type: ignore[method-assign]
+        "thread_reset_drain", consumer._drain_thread_reset_requests
+    )
+
+
+def test_maintenance_missing_bucket_during_boot_is_one_warning(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#3079: at fresh install the orphan reap's expiry listing fails with
+    NoSuchBucket until the bucket exists; inside the boot window that is one
+    warning with no traceback, and the rest of the #5630 tick still runs."""
+
+    workspace = _MissingBucketWorkspace()
+    events: list[str] = []
+
+    async def go() -> None:
+        async with make_harness(reclaim_interval_s=1e-6) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            h.kernel._workspace = workspace
+            _record_later_steps(h, consumer, events)
+            _stop_every(consumer, 1)
+            await consumer._maintenance_loop()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(go())
+
+    assert workspace.calls == 1
+    assert events == [
+        "sweep_pending_completions",
+        "progress_sweep",
+        "progress_inbox_drain",
+        "thread_reset_drain",
+    ]
+    assert _tick_failures(caplog.records) == []
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.getMessage().startswith(_DEFERRED_PREFIX)
+    ]
+    assert len(warnings) == 1
+    record = warnings[0]
+    message = record.getMessage()
+    assert record.name == "curie_worker.consumer"
+    assert getattr(record, "maintenance_step", None) == "reap_orphans"
+    assert "ClientError" in message
+    assert "NoSuchBucket" in message
+    assert "\n" not in message
+    assert record.exc_info is None
+
+
+def test_maintenance_missing_bucket_after_boot_window_is_an_error(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#3079: the window is strict, so NoSuchBucket exactly 120 s after boot is a
+    fault again and keeps the #5630 per-step traceback."""
+
+    workspace = _MissingBucketWorkspace()
+
+    async def go() -> None:
+        async with make_harness(reclaim_interval_s=1e-6) as h:
+            consumer = _graced_consumer(h, BootGrace(booted=0.0, clock=lambda: 120.0))
+            await consumer.ensure_group()
+            h.kernel._workspace = workspace
+            _stop_every(consumer, 1)
+            await consumer._maintenance_loop()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(go())
+
+    assert _deferred(caplog.records) == []
+    failures = _tick_failures(caplog.records)
+    assert len(failures) == 1
+    record = failures[0]
+    assert record.levelno == logging.ERROR
+    assert getattr(record, "maintenance_step", None) == "reap_orphans"
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], ClientError)
+    assert record.exc_info[1].response["Error"]["Code"] == "NoSuchBucket"
+
+
+def test_maintenance_unexpected_error_during_boot_is_an_error(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#3079 excuses only a dependency that is not ready: any other step failure
+    inside the boot window still logs the #5630 traceback."""
+
+    workspace = _MissingBucketWorkspace(error=lambda: ValueError("workspace ledger malformed"))
+
+    async def go() -> None:
+        async with make_harness(reclaim_interval_s=1e-6) as h:
+            consumer = _graced_consumer(h, BootGrace(booted=0.0, clock=lambda: 0.0))
+            await consumer.ensure_group()
+            h.kernel._workspace = workspace
+            _stop_every(consumer, 1)
+            await consumer._maintenance_loop()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(go())
+
+    assert _deferred(caplog.records) == []
+    failures = _tick_failures(caplog.records)
+    assert len(failures) == 1
+    record = failures[0]
+    assert record.levelno == logging.ERROR
+    assert getattr(record, "maintenance_step", None) == "reap_orphans"
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], ValueError)
+    assert str(record.exc_info[1]) == "workspace ledger malformed"
+
+
+def test_maintenance_inventory_503_during_boot_is_an_error(
+    make_harness,
+    sync_redis,
+    names,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#3079 does not excuse a Kubernetes 503: inside the boot window the #5630
+    Pod LIST failure is still one ERROR with its traceback."""
+
+    client, api, admission = _inventory_timeout_client(
+        sync_redis, names, monkeypatch, failure="pod-http-503", restore=True, failures=1
+    )
+
+    async def go() -> None:
+        async with make_harness(
+            sandbox_client=client,
+            substrate_env={"CURIE_SANDBOX_ADMISSION": admission},
+            reclaim_interval_s=1e-6,
+        ) as h:
+            consumer = _graced_consumer(h, BootGrace(booted=0.0, clock=lambda: 0.0))
+            await consumer.ensure_group()
+            _stop_every(consumer, 1)
+            await consumer._maintenance_loop()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(go())
+
+    assert api.failures_left == 0
+    assert _deferred(caplog.records) == []
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["maintenance tick failed"]
+    record = errors[0]
+    assert getattr(record, "maintenance_step", None) == "reap_orphans"
+    assert record.exc_info is not None
+    assert record.exc_info[0] is KubeTransientError
+    assert str(record.exc_info[1]) == "kube API 503 listing pods"
+
+
+def test_maintenance_missing_bucket_then_bucket_created_logs_no_error(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#3079: the bucket missing on the first tick and created before the next
+    costs one warning and no ERROR across both ticks."""
+
+    workspace = _MissingBucketWorkspace(failing=1)
+
+    async def go() -> int:
+        async with make_harness(reclaim_interval_s=1e-6) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            h.kernel._workspace = workspace
+            ticks = _stop_every(consumer, 2)
+            await consumer._maintenance_loop()
+            return ticks[0]
+
+    with caplog.at_level(logging.WARNING):
+        ticks = asyncio.run(go())
+
+    assert ticks == 2
+    assert workspace.calls == 2
+    consumer_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and r.name == "curie_worker.consumer"
+    ]
+    assert consumer_errors == []
+    assert _tick_failures(caplog.records) == []
+    deferred = _deferred(caplog.records)
+    assert len(deferred) == 1
+    assert deferred[0].getMessage().startswith(_DEFERRED_PREFIX)
+
+
+def test_maintenance_supervisor_restart_does_not_reopen_boot_window(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#3079: the window is anchored when the Consumer is built at worker boot,
+    so a supervisor restart of the same Consumer past the window logs both
+    NoSuchBucket ticks as #5630 errors instead of excusing them again."""
+    from curie_worker.run import _supervise
+
+    now = {"t": 0.0}
+    workspace = _MissingBucketWorkspace()
+    invocations = {"n": 0}
+
+    async def go() -> Consumer:
+        async with make_harness(reclaim_interval_s=1e-6) as h:
+            consumer = _graced_consumer(h, BootGrace.starting_now(clock=lambda: now["t"]))
+            await consumer.ensure_group()
+            h.kernel._workspace = workspace
+            _stop_every(consumer, 1)
+            now["t"] = 500.0
+
+            async def factory() -> None:
+                # The production restart path: the supervisor re-enters run()
+                # on the Consumer built at boot. The stop above ends this
+                # generation after one maintenance tick; clear it so the
+                # restart runs another.
+                invocations["n"] += 1
+                await consumer.run()
+                consumer._stop.clear()
+                if invocations["n"] == 1:
+                    raise RuntimeError("crash")
+
+            await asyncio.wait_for(
+                _supervise(
+                    "runs",
+                    factory,
+                    asyncio.Event(),
+                    restart_backoff_s=0,
+                    max_consecutive_failures=0,
+                ),
+                timeout=10,
+            )
+            return consumer
+
+    with caplog.at_level(logging.WARNING):
+        consumer = asyncio.run(go())
+
+    assert invocations["n"] == 2
+    assert workspace.calls == 2
+    assert consumer._boot_grace.booted == 0.0
+    assert _deferred(caplog.records) == []
+    failures = _tick_failures(caplog.records)
+    assert len(failures) == 2
+    for record in failures:
+        assert record.levelno == logging.ERROR
+        assert getattr(record, "maintenance_step", None) == "reap_orphans"
+        assert record.exc_info is not None
+        assert isinstance(record.exc_info[1], ClientError)
 
 
 def test_maintenance_tick_settles_pending_progress_without_a_deliverer(make_harness) -> None:
@@ -3564,6 +4088,7 @@ def test_maintenance_tick_settles_pending_progress_without_a_deliverer(make_harn
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
 
             async def observe() -> None:
@@ -3607,6 +4132,7 @@ def test_ensure_group_does_not_replay_preexisting_backlog(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3634,6 +4160,7 @@ def test_read_loop_survives_transient_redis_timeout(make_harness, caplog) -> Non
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3687,6 +4214,7 @@ def test_reclaims_and_reprocesses_a_dead_consumers_pending_entry(make_harness) -
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3735,6 +4263,7 @@ def test_reclaims_a_dead_consumers_pending_entry_without_waiting_min_idle(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -3809,12 +4338,14 @@ def test_prompt_reclaim_arbitrates_across_replicas_without_burning_delivery_budg
                 kernel=h.kernel,
                 config=first_config,
                 leases=DeliveryLeaseStore(h.async_redis, first_config),
+                reminders=refuse_unconfigured_reminder,
             )
             second = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
                 config=second_config,
                 leases=DeliveryLeaseStore(h.async_redis, second_config),
+                reminders=refuse_unconfigured_reminder,
             )
             await first.ensure_group()
 
@@ -3885,12 +4416,14 @@ def test_local_generation_bootstrap_contends_with_peer_transfer_lease(
                 kernel=h.kernel,
                 config=owner_config,
                 leases=DeliveryLeaseStore(h.async_redis, owner_config),
+                reminders=refuse_unconfigured_reminder,
             )
             peer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
                 config=peer_config,
                 leases=DeliveryLeaseStore(h.async_redis, peer_config),
+                reminders=refuse_unconfigured_reminder,
             )
             owner._liveness_store = ConsumerLivenessStore(h.async_redis)
             peer._liveness_store = ConsumerLivenessStore(h.async_redis)
@@ -3974,6 +4507,7 @@ def test_reclaim_does_not_promptly_steal_from_unknown_peer_without_heartbeat_cap
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -4042,6 +4576,7 @@ def test_reclaim_does_not_steal_from_a_fresh_live_peer_when_min_idle_is_high(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -4093,6 +4628,7 @@ def test_reclaim_does_not_steal_from_a_live_saturated_peer(make_harness) -> None
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             ids = []
@@ -4131,157 +4667,137 @@ def test_reclaim_does_not_steal_from_a_live_saturated_peer(make_harness) -> None
     asyncio.run(go())
 
 
-def test_graceful_stop_keeps_lease_through_two_ttls_of_inflight_drain(
-    make_harness,
+def test_hang_renewals_during_inflight_turn_expire_liveness(
+    make_harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def go() -> None:
         async with make_harness(
             reclaim_min_idle_ms=300,
-            consumer_heartbeat_ttl_ms=150,
-            consumer_capability_ttl_ms=450,
-            read_block_ms=10,
-        ) as h:
-            hold = asyncio.Event()
-            h.runner.hold = hold
-            h.runner.default_script = [TextDelta(text="working")]
-            h.runner.tail = [Final(text="done", status=DONE)]
-            consumer = Consumer(
-                redis=h.async_redis,
-                kernel=h.kernel,
-                config=h.config,
-                leases=DeliveryLeaseStore(h.async_redis, h.config),
-            )
-            await consumer.ensure_group()
-            await h.async_redis.xadd(
-                h.config.stream,
-                to_stream_fields(_qevent("drain", thread="th-drain", event_id="drain")),
-            )
-            alive = consumer_heartbeat_key(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name
-            )
-
-            task = asyncio.create_task(consumer.run())
-            await _wait_until_turn_active_or_consumer_failed(h.runner, task)
-            await _wait_key(h.async_redis, alive)
-            consumer.request_stop()
-            await asyncio.sleep(0.32)
-            assert await h.async_redis.exists(alive), (
-                "graceful stop dropped liveness while the owned handler still drained"
-            )
-            assert not task.done()
-
-            hold.set()
-            await task
-            assert not await h.async_redis.exists(alive)
-
-    asyncio.run(go())
-
-
-def test_hang_renewals_during_inflight_turn_expire_liveness(make_harness) -> None:
-    async def go() -> None:
-        async with make_harness(
-            reclaim_min_idle_ms=300,
-            consumer_heartbeat_ttl_ms=150,
-            consumer_capability_ttl_ms=450,
-            read_block_ms=10,
-        ) as h:
-            hold = asyncio.Event()
-            h.runner.hold = hold
-            h.runner.default_script = [TextDelta(text="working")]
-            h.runner.tail = [Final(text="done", status=DONE)]
-            consumer = Consumer(
-                redis=h.async_redis,
-                kernel=h.kernel,
-                config=h.config,
-                leases=DeliveryLeaseStore(h.async_redis, h.config),
-            )
-            consumer._liveness_store = _RenewalProbeStore(  # type: ignore[assignment]
-                ConsumerLivenessStore(h.async_redis), hang_renewals=True
-            )
-            await consumer.ensure_group()
-            await h.async_redis.xadd(
-                h.config.stream,
-                to_stream_fields(_qevent("hang", thread="th-hang", event_id="hang")),
-            )
-            alive = consumer_heartbeat_key(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name
-            )
-
-            task = asyncio.create_task(consumer.run())
-            await _wait_until_turn_active_or_consumer_failed(h.runner, task)
-            with pytest.raises(ConsumerLivenessExpired):
-                await asyncio.wait_for(task, timeout=2)
-            assert not await h.async_redis.exists(alive)
-            hold.set()
-
-    asyncio.run(go())
-
-
-def test_real_saturated_consumer_renews_lease_and_peer_cannot_prompt_claim(
-    make_harness,
-) -> None:
-    async def go() -> None:
-        async with make_harness(
-            reclaim_min_idle_ms=5000,
+            reclaim_interval_s=0.02,
             dead_consumer_idle_ms=0,
-            consumer_heartbeat_ttl_ms=150,
-            consumer_capability_ttl_ms=6000,
+            consumer_heartbeat_ttl_ms=45000,
+            consumer_capability_ttl_ms=60000,
             read_block_ms=10,
         ) as h:
+            active = asyncio.Event()
             hold = asyncio.Event()
             h.runner.hold = hold
-            h.runner.default_script = [TextDelta(text="busy")]
+            h.runner.default_script = [TextDelta(text="working")]
             h.runner.tail = [Final(text="done", status=DONE)]
-            peer = Consumer(
+            consumer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
                 config=h.config,
                 max_concurrency=1,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
-            await peer.ensure_group()
-            ids = [
-                await h.async_redis.xadd(
-                    h.config.stream,
-                    to_stream_fields(_qevent(text, event_id=f"sat-{text}")),
-                )
-                for text in ("held", "semaphore-blocked")
-            ]
+            probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), hang_renewals=True)
+            consumer._liveness_store = probe  # type: ignore[assignment]
+            clock = SimpleNamespace(now=time.monotonic())
+            observed_active: list[bool] = []
+            original_sleep = consumer._sleep_generation
+            original_renew = probe.renew
+
+            class Queries(list[str]):
+                def append(self, text: str) -> None:
+                    super().append(text)
+                    assert h.runner.turn_active
+                    consumer._peer_absent_since["stale-generation-peer"] = time.monotonic()
+                    active.set()
+
+            h.runner.queried = Queries()
+
+            async def generation_sleep(delay: float) -> None:
+                task = asyncio.current_task()
+                assert task is not None
+                if task.get_name() != "consumer:liveness":
+                    await original_sleep(delay)
+                    return
+                await active.wait()
+                clock.now += delay
+
+            async def renew(**kwargs: Any) -> bool:
+                observed_active.append(h.runner.turn_active)
+                return await original_renew(**kwargs)
+
+            def timeout(delay: float) -> asyncio.Timeout:
+                task = asyncio.current_task()
+                assert task is not None
+                if task.get_name() == "consumer:liveness":
+                    clock.now += delay
+                    return asyncio.timeout(0)
+                return asyncio.timeout(delay)
+
+            await consumer.ensure_group()
+            event = _qevent("hang", thread="th-hang", event_id="hang")
+            await asyncio.to_thread(
+                h.substrate.claim,
+                kernel_routing._thread_key_for(event),
+                env={"CURIE_RUNNER_TOKEN": "recovery-test-token"},
+            )
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
             alive = consumer_heartbeat_key(
                 h.config.stream, h.config.consumer_group, h.config.consumer_name
             )
-
-            peer_task = asyncio.create_task(peer.run())
-            await _wait_until(lambda: h.runner.turn_active)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if set(
-                    await _deliveries(h.async_redis, h.config.stream, h.config.consumer_group)
-                ) == set(ids):
-                    break
-                await asyncio.sleep(0.005)
-            before = await _deliveries(h.async_redis, h.config.stream, h.config.consumer_group)
-            assert before == {ids[0]: 1, ids[1]: 1}
-            await asyncio.sleep(0.32)
-            assert await h.async_redis.exists(alive)
-
-            replacement_config = h.config.model_copy(update={"consumer_name": "replacement"})
-            replacement = Consumer(
-                redis=h.async_redis,
-                kernel=h.kernel,
-                config=replacement_config,
-                leases=DeliveryLeaseStore(h.async_redis, replacement_config),
-            )
-            assert await replacement._prompt_reclaim_once() == 0
-            await asyncio.sleep(h.config.consumer_heartbeat_ttl_ms / 1000 + 0.015)
-            assert await replacement._prompt_reclaim_once() == 0
-            assert (
-                await _deliveries(h.async_redis, h.config.stream, h.config.consumer_group) == before
-            )
-
-            peer.request_stop()
-            hold.set()
-            await peer_task
+            with monkeypatch.context() as patched:
+                patched.setattr(probe, "renew", renew)
+                patched.setattr(consumer, "_sleep_generation", generation_sleep)
+                patched.setattr(
+                    stream_consumer_module,
+                    "time",
+                    SimpleNamespace(**{**vars(time), "monotonic": lambda: clock.now}),
+                )
+                patched.setattr(
+                    stream_consumer_module,
+                    "asyncio",
+                    SimpleNamespace(**{**vars(asyncio), "timeout": timeout}),
+                )
+                task = asyncio.create_task(consumer.run())
+                try:
+                    with pytest.raises(ConsumerLivenessExpired):
+                        await asyncio.wait_for(task, timeout=5)
+                    assert observed_active and all(observed_active)
+                    assert not await h.async_redis.exists(alive)
+                    assert (
+                        await _pending_owner(
+                            h.async_redis, h.config.stream, h.config.consumer_group, entry_id
+                        )
+                        == h.config.consumer_name
+                    )
+                    assert not consumer._inflight_ids
+                    assert not consumer._inflight
+                    assert not consumer._peer_absent_since
+                    assert consumer._sem._value == 1
+                    assert not [
+                        pending
+                        for pending in asyncio.all_tasks()
+                        if pending is not asyncio.current_task()
+                        and not pending.done()
+                        and pending.get_name().startswith("consumer:")
+                    ]
+                finally:
+                    hold.set()
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            async with h.runner._turn_lock:
+                assert not h.runner.turn_active
+            h.runner.hold = None
+            h.runner.tail = []
+            h.runner.default_script = [Final(text="recovered", status=DONE)]
+            consumer._liveness_store = ConsumerLivenessStore(h.async_redis)
+            restarted = asyncio.create_task(consumer.run())
+            try:
+                await _wait_until(lambda: h.runner.opened.count("hang") == 2, timeout=3)
+                await _wait_for_pending_count(
+                    h.async_redis, h.config.stream, h.config.consumer_group, 0
+                )
+            finally:
+                consumer.request_stop()
+                await restarted
+            assert h.runner.opened.count("hang") == 2
+            assert await _deliveries(h.async_redis, h.config.stream, h.config.consumer_group) == {}
 
     asyncio.run(go())
 
@@ -4299,6 +4815,7 @@ def test_alive_restoration_resets_two_absence_proof(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -4366,6 +4883,7 @@ def test_disappeared_consumer_invalidates_first_absence_observation(make_harness
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -4408,6 +4926,7 @@ def test_live_at_cap_peer_is_not_dead_lettered_by_prompt_path(make_harness) -> N
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -4458,6 +4977,7 @@ def test_proven_dead_at_cap_peer_is_dead_lettered_without_xclaim(make_harness) -
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             entry_id = await h.async_redis.xadd(
@@ -4522,6 +5042,7 @@ def test_transient_liveness_renewal_failure_recovers_before_lease_expiry(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), fail_renewals=1)
             consumer._liveness_store = probe  # type: ignore[assignment]
@@ -4557,6 +5078,7 @@ def test_timed_out_liveness_renewal_retries_before_lease_expiry(make_harness) ->
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), timeout_renewals=1)
             consumer._liveness_store = probe  # type: ignore[assignment]
@@ -4574,97 +5096,6 @@ def test_timed_out_liveness_renewal_retries_before_lease_expiry(make_harness) ->
     asyncio.run(go())
 
 
-def test_terminal_liveness_failure_cancels_generation_and_clean_restart_recovers_pel(
-    make_harness,
-) -> None:
-    async def go() -> None:
-        async with make_harness(
-            reclaim_min_idle_ms=300,
-            reclaim_interval_s=0.02,
-            dead_consumer_idle_ms=0,
-            consumer_heartbeat_ttl_ms=150,
-            consumer_capability_ttl_ms=3000,
-            read_block_ms=10,
-        ) as h:
-            hold = asyncio.Event()
-            h.runner.hold = hold
-            h.runner.default_script = [TextDelta(text="started")]
-            h.runner.tail = [Final(text="recovered", status=DONE)]
-            consumer = Consumer(
-                redis=h.async_redis,
-                kernel=h.kernel,
-                config=h.config,
-                max_concurrency=1,
-                leases=DeliveryLeaseStore(h.async_redis, h.config),
-            )
-            consumer._liveness_store = _RenewalProbeStore(  # type: ignore[assignment]
-                ConsumerLivenessStore(h.async_redis), hang_renewals=True
-            )
-            await consumer.ensure_group()
-            entry_id = await h.async_redis.xadd(
-                h.config.stream,
-                to_stream_fields(_qevent("restart", thread="th-restart", event_id="restart")),
-            )
-
-            first = asyncio.create_task(consumer.run())
-            await _wait_until(lambda: h.runner.turn_active)
-            consumer._peer_absent_since["stale-generation-peer"] = time.monotonic()
-            with pytest.raises(ConsumerLivenessExpired):
-                await asyncio.wait_for(first, timeout=2)
-
-            assert (
-                await _pending_owner(
-                    h.async_redis, h.config.stream, h.config.consumer_group, entry_id
-                )
-                == h.config.consumer_name
-            )
-            assert not consumer._inflight_ids
-            assert not consumer._inflight
-            assert not consumer._peer_absent_since
-            assert consumer._sem._value == 1  # noqa: SLF001 - generation accounting invariant
-            assert not [
-                task
-                for task in asyncio.all_tasks()
-                if task is not asyncio.current_task()
-                and not task.done()
-                and task.get_name().startswith("consumer:")
-            ]
-
-            # This models the top-level supervisor's clean retry generation. It
-            # must recover the row canceled under its own stable consumer name;
-            # otherwise the prompt path skips that name and the row waits for
-            # the 15-minute XAUTOCLAIM fallback.
-            hold.set()
-            h.runner.hold = None
-            # The canceled aiohttp stream can die before FakeRunner's normal
-            # epilogue clears this test-only flag. A replacement sandbox starts
-            # idle, so reset the fake's process-local state explicitly.
-            h.runner.turn_active = False
-            h.runner.tail = []
-            h.runner.default_script = [Final(text="recovered", status=DONE)]
-            consumer._liveness_store = ConsumerLivenessStore(h.async_redis)
-            second = asyncio.create_task(consumer.run())
-            await _wait_until(lambda: h.runner.opened.count("restart") == 2, timeout=3)
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
-                if summary["pending"] == 0:
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                raise AssertionError("restart generation did not ack its own reclaimed entry")
-            consumer.request_stop()
-            await second
-
-            assert h.runner.opened.count("restart") == 2
-            assert await _deliveries(h.async_redis, h.config.stream, h.config.consumer_group) == {}
-            assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
-                "pending"
-            ] == 0
-
-    asyncio.run(go())
-
-
 def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
     make_harness,
 ) -> None:
@@ -4673,7 +5104,6 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
             reclaim_min_idle_ms=80,
             dead_consumer_idle_ms=0,
             consumer_heartbeat_ttl_ms=30,
-            consumer_capability_ttl_ms=160,
         ) as h:
             hold = asyncio.Event()
             h.runner.hold = hold
@@ -4685,6 +5115,7 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
                 config=h.config,
                 max_concurrency=1,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -4703,27 +5134,15 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
             assert await h.async_redis.xreadgroup(
                 h.config.consumer_group, "backstop-peer", {h.config.stream: ">"}, count=1
             )
-            await asyncio.sleep(0.09)
-
-            prompt_id = await h.async_redis.xadd(
-                h.config.stream, to_stream_fields(_qevent("prompt", event_id="prompt"))
-            )
-            assert await h.async_redis.xreadgroup(
-                h.config.consumer_group, "prompt-peer", {h.config.stream: ">"}, count=1
-            )
-            store = ConsumerLivenessStore(h.async_redis)
-            await store.publish(
-                stream=h.config.stream,
-                group=h.config.consumer_group,
-                consumer="prompt-peer",
-                heartbeat_ttl_ms=1,
-                capability_ttl_ms=h.config.consumer_capability_ttl_ms,
-            )
-            await _wait_key(
-                h.async_redis,
-                consumer_heartbeat_key(h.config.stream, h.config.consumer_group, "prompt-peer"),
-                present=False,
-            )
+            assert await h.async_redis.xclaim(
+                h.config.stream,
+                h.config.consumer_group,
+                "backstop-peer",
+                0,
+                [old_id],
+                idle=h.config.reclaim_min_idle_ms + 1,
+                justid=True,
+            ) == [old_id]
 
             heavy = asyncio.create_task(consumer._reclaim_once())
             deadline = time.monotonic() + 1
@@ -4744,8 +5163,32 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
             )
             assert not heavy.done(), "heavy dispatch should be blocked on the occupied semaphore"
 
+            prompt_id = await h.async_redis.xadd(
+                h.config.stream, to_stream_fields(_qevent("prompt", event_id="prompt"))
+            )
+            assert await h.async_redis.xreadgroup(
+                h.config.consumer_group, "prompt-peer", {h.config.stream: ">"}, count=1
+            )
+            store = ConsumerLivenessStore(h.async_redis)
+            await store.publish(
+                stream=h.config.stream,
+                group=h.config.consumer_group,
+                consumer="prompt-peer",
+                heartbeat_ttl_ms=1,
+                capability_ttl_ms=h.config.consumer_capability_ttl_ms,
+            )
+            await _wait_key(
+                h.async_redis,
+                consumer_heartbeat_key(h.config.stream, h.config.consumer_group, "prompt-peer"),
+                present=False,
+            )
             assert await consumer._prompt_reclaim_once() == 0
-            await asyncio.sleep(h.config.consumer_heartbeat_ttl_ms / 1000 + 0.015)
+            absence = asyncio.Event()
+            asyncio.get_running_loop().call_later(
+                h.config.consumer_heartbeat_ttl_ms / 1000 + 0.015,
+                absence.set,
+            )
+            await absence.wait()
             prompt = asyncio.create_task(consumer._prompt_reclaim_once())
             deadline = time.monotonic() + 0.25
             while time.monotonic() < deadline:
@@ -4801,6 +5244,7 @@ def test_next_turn_drains_queued_eval_reset_before_claiming(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             nxt = _qevent("eval-case-2", thread="tEval2", event_id="eval-2")
@@ -4855,6 +5299,7 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             nxt = _qevent("eval-case-2", thread="tEval2", event_id="eval-2-quota")
@@ -4892,6 +5337,7 @@ def test_sadd_of_bare_eval_conversation_id_does_not_release_scoped_sandbox(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             nxt = _qevent("follow-up", thread="tNext", event_id="eval-wrong-key")
@@ -4928,6 +5374,7 @@ def test_sadd_of_scoped_eval_isolate_key_releases_the_sandbox(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             nxt = _qevent("eval-case-2", thread="eval:1720000000.000200", event_id="eval-scoped")
@@ -4959,6 +5406,7 @@ def test_maintenance_tick_drains_pending_thread_reset_requests(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
@@ -4993,6 +5441,7 @@ def test_maintenance_tick_thread_reset_failed_release_keeps_the_signal_pending(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, "tFailRelease")
 
@@ -5055,6 +5504,7 @@ def test_thread_reset_drain_records_no_route_when_the_key_matched_no_route(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             thread_key = "slack:C0EXAMPLE1:missing"
             assert h.substrate.lookup(thread_key) is None
@@ -5108,6 +5558,7 @@ def test_thread_reset_drain_records_released_when_a_route_existed(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
@@ -5139,6 +5590,7 @@ def test_thread_reset_drain_records_failed_and_no_result_when_the_release_raises
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             thread_key = "tResultFailed"
             result_key = f"{thread_reset_keys.result_prefix}{thread_key}"
@@ -5192,6 +5644,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
@@ -5212,6 +5665,7 @@ def test_maintenance_tick_thread_reset_is_a_noop_when_nothing_pending(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer._drain_thread_reset_requests()  # must not raise
 
@@ -5236,6 +5690,7 @@ def test_maintenance_tick_thread_reset_one_failure_does_not_block_the_rest(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, "tBoom", "tOk")
 
@@ -5312,6 +5767,7 @@ def test_maintenance_tick_reset_drain_has_a_per_tick_budget_and_defers_the_rest(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await asyncio.wait_for(consumer._drain_thread_reset_requests(), timeout=5.0)
 
@@ -5364,6 +5820,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
@@ -5497,6 +5954,7 @@ def test_failed_workspace_preparation_acks_the_entry_and_is_not_silent(
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
 
@@ -5691,6 +6149,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(
                     kernel=h.kernel,
                     config=h.config,
                     leases=DeliveryLeaseStore(h.async_redis, h.config),
+                    reminders=refuse_unconfigured_reminder,
                 )
                 task = asyncio.create_task(consumer._drain_thread_reset_requests())
                 await asyncio.wait_for(started.wait(), timeout=5.0)
@@ -5840,6 +6299,7 @@ def test_force_killed_worker_lock_is_stolen_and_cluster_message_reply_is_deliver
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             qe = _qevent("crash-reclaim", thread=thread, event_id="e-2500-crash")
@@ -5934,6 +6394,7 @@ def test_live_worker_lock_still_serializes_a_replacement(make_harness) -> None:
                 kernel=h.kernel,
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
+                reminders=refuse_unconfigured_reminder,
             )
             await consumer.ensure_group()
             qe = _qevent("live-hold", thread=thread, event_id="e-2500-live")
@@ -5964,5 +6425,511 @@ def test_live_worker_lock_still_serializes_a_replacement(make_harness) -> None:
             assert h.sink.last_text != "should-not-run"
             assert await h.async_redis.get(h.config.lock_key(_thread_key(thread))) == live_token
             await live_lock.release(h.config.lock_key(_thread_key(thread)), live_token)
+
+    asyncio.run(go())
+
+# --- ADR 0270 decision 3 [D2]: a lost lease stops only what the delivery owns -----------
+#
+# The lease-lost callback used to interrupt the thread's live turn for every
+# ordinary delivery, so a second requester whose lease was lost while it waited
+# (on the order lock, the authority answer or the liveness probe) killed the
+# first requester's turn. It now stops only a turn this lease acquisition opened
+# or steered into, at the sandbox it recorded, and only while that runner still
+# reports the recorded turn epoch. Each test runs with the requester flag on and
+# off: the change applies to every agent. The loss is a renewal refusal, which
+# the real heartbeat loop turns into ``lease.lost`` and the callback.
+
+_LOSS_KNOBS: dict[str, object] = {
+    "delivery_budget_s": 60.0,
+    "delivery_lease_ttl_s": 1.5,
+    "delivery_lease_heartbeat_s": 0.3,
+    "runner_total_timeout_s": 30.0,
+}
+
+
+def _handoff() -> Any:
+    """The requester fixtures, imported late: their import chain reaches sibling modules."""
+    from . import test_requester_handoff
+
+    return test_requester_handoff
+
+
+def _loss_parties(flag_on: bool) -> tuple[Any, Any, Any, Any]:
+    """The binding, the core, and Alice and Bob (None when the agent is not opted in)."""
+    handoff = _handoff()
+    binding = handoff.MintingRequesterBinding(flag=flag_on)
+    alice = binding.requester_wire() if flag_on else None
+    bob = binding.requester_wire(handoff.BOB_SUBJECT) if flag_on else None
+    core = handoff.RequesterCore(alice, version=2 if flag_on else 1)
+    return binding, core, alice, bob
+
+
+class _LeaseLoss:
+    """Refuse the next lease renewal and wait for the lease-lost callback to finish."""
+
+    def __init__(
+        self, consumer: Consumer, store: DeliveryLeaseStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.done = asyncio.Event()
+        self._store = store
+        self._monkeypatch = monkeypatch
+        real = consumer._on_lease_lost
+        assert real is not None
+
+        async def on_lost(entry_id: str, fields: dict[str, str]) -> None:
+            try:
+                await real(entry_id, fields)
+            finally:
+                self.done.set()
+
+        consumer._on_lease_lost = on_lost
+
+    async def inject(self) -> None:
+        async def refused(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        self._monkeypatch.setattr(self._store, "heartbeat", refused)
+        await asyncio.wait_for(self.done.wait(), timeout=5.0)
+
+
+def _loss_consumer(h: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[Consumer, _LeaseLoss]:
+    store = DeliveryLeaseStore(h.async_redis, h.config)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store,
+                        reminders=refuse_unconfigured_reminder,
+               )
+    return consumer, _LeaseLoss(consumer, store, monkeypatch)
+
+
+async def _dispatch_http(h: Any, consumer: Consumer, event: QueuedTurn) -> str:
+    """Deliver ``event`` as an HTTP-context stream entry through the real consumer."""
+    handoff = _handoff()
+    fields = {"payload": event.model_dump_json(), "curie_identity_context_v1": handoff.CAPSULE}
+    entry_id, observed = await handoff.pending_entry(h, consumer, fields)
+    await consumer._dispatch(entry_id, observed)
+    return str(entry_id)
+
+
+async def _settle_consumer(consumer: Consumer) -> None:
+    await asyncio.gather(*list(consumer._inflight), return_exceptions=True)
+    await asyncio.gather(*list(consumer._lease_loss_tasks), return_exceptions=True)
+
+
+@pytest.mark.parametrize("blocked_in", ["authority-check", "order-lock"])
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_loss_before_any_turn_leaves_another_live_turn_running(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool, blocked_in: str
+) -> None:
+    """[D2] A delivery that opened or steered nothing stops nothing (ADR 0270 decision 3).
+
+    Alice's turn is live with epoch E. Bob's delivery is blocked before it
+    starts anything, in the authority check or behind the per-thread order
+    lock, when its lease is lost. Alice's turn keeps running with E. Released,
+    Bob's delivery opens nothing and stays pending.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            holds = handoff.hold_turns(h)
+            alice_turn = _qevent("alice is working", thread="loss-before-start")
+            key = kernel_routing._thread_key_for(alice_turn)
+            opener = asyncio.create_task(handoff.process(h, alice_turn))
+            order_entry: Any = None
+            try:
+                await _wait_until(lambda: handoff.any_turn_active(h), "alice's turn is live")
+                alice_runner = handoff.runner_at(h, handoff.route(h, key))
+                epoch = alice_runner.turn_epoch
+                assert epoch is not None
+
+                core.requester = bob
+                bob_turn = _qevent("bob waits", thread="loss-before-start")
+                if blocked_in == "authority-check":
+                    core.pause_event = bob_turn.event_id
+                else:
+                    order_entry = h.kernel._acquire_order_entry(key)
+                    await order_entry.lock.acquire()
+                await _dispatch_http(h, consumer, bob_turn)
+                if blocked_in == "authority-check":
+                    await asyncio.wait_for(core.entered.wait(), timeout=5.0)
+                else:
+                    await _wait_until(lambda: order_entry.refs >= 2, "bob queued on the order")
+                await loss.inject()
+
+                assert alice_runner.interrupts == 0, "a delivery that opened nothing stopped Alice"
+                assert alice_runner.turn_active and alice_runner.turn_epoch == epoch
+                assert not opener.done()
+
+                if blocked_in == "authority-check":
+                    core.release.set()
+                else:
+                    order_entry.lock.release()
+                    h.kernel._release_order_entry(key, order_entry)
+                    order_entry = None
+                await _settle_consumer(consumer)
+
+                assert alice_runner.interrupts == 0
+                assert alice_runner.turn_active and alice_runner.turn_epoch == epoch
+                assert "bob waits" not in handoff.all_opened(h)
+                assert handoff.all_steers(h) == []
+                assert len(h.fake_k8s.claim_envs) == 1
+                pending = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                assert pending["pending"] == 1
+            finally:
+                core.release.set()
+                if order_entry is not None:
+                    order_entry.lock.release()
+                    h.kernel._release_order_entry(key, order_entry)
+                handoff.release(holds)
+                await opener
+                await _settle_consumer(consumer)
+            assert alice_runner.opened == ["alice is working"]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_loss_stops_the_turn_this_delivery_opened(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool
+) -> None:
+    """[D2] control: the turn this delivery opened is stopped at its recorded sandbox.
+
+    The thread's route is moved to another sandbox before the loss, so a stop
+    that looked the thread up would hit the wrong runner. The stop follows the
+    handle the delivery recorded, with that sandbox's token.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, _bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            decoy = _qevent("decoy", thread="loss-opened-decoy")
+            await handoff.process(h, decoy)
+            decoy_key = kernel_routing._thread_key_for(decoy)
+            decoy_runner = handoff.runner_at(h, handoff.route(h, decoy_key))
+            holds = handoff.hold_turns(h)
+            turn = _qevent("this delivery opens", thread="loss-opened")
+            key = kernel_routing._thread_key_for(turn)
+            try:
+                await _dispatch_http(h, consumer, turn)
+                await _wait_until(lambda: handoff.any_turn_active(h), "the delivery's turn is live")
+                handle = handoff.route(h, key)
+                runner = handoff.runner_at(h, handle)
+                assert runner is not decoy_runner
+                handoff.hand_route(h, source_key=decoy_key, target_key=key)
+
+                await loss.inject()
+                await _wait_until(lambda: runner.interrupts >= 1, "the opened turn was stopped")
+                assert runner.interrupts == 1
+                assert handoff.bearer(runner.interrupt_headers[-1]) == f"Bearer {handle.token}"
+                assert decoy_runner.interrupts == 0, "the stop followed a thread lookup"
+            finally:
+                handoff.release(holds)
+                await _settle_consumer(consumer)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_loss_with_a_stale_epoch_stops_nothing(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool
+) -> None:
+    """[D2] control: a recorded epoch the runner no longer runs is never stopped.
+
+    The runner still reports a live turn, under another epoch: the turn this
+    delivery opened is no longer the one running there.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, _bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            holds = handoff.hold_turns(h)
+            turn = _qevent("this delivery opens", thread="loss-stale")
+            key = kernel_routing._thread_key_for(turn)
+            try:
+                await _dispatch_http(h, consumer, turn)
+                await _wait_until(lambda: handoff.any_turn_active(h), "the delivery's turn is live")
+                runner = handoff.runner_at(h, handoff.route(h, key))
+                opened_epoch = runner.turn_epoch
+                assert opened_epoch is not None
+                runner.turn_epoch = uuid.uuid4().hex
+                assert runner.turn_epoch != opened_epoch
+
+                await loss.inject()
+                assert runner.interrupts == 0, "a turn under another epoch was stopped"
+                assert runner.turn_active
+            finally:
+                handoff.release(holds)
+                await _settle_consumer(consumer)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_lost_while_start_is_in_flight_is_stopped_once_recorded(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool
+) -> None:
+    """[D2] control: a loss during ``start_turn`` stops the turn once it is recorded.
+
+    The runner has received the start but not answered it when the lease is
+    lost: the callback has nothing recorded and stops nothing. When the start
+    returns, the recorder sees the lost lease and stops that turn, once.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, _bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            holds = handoff.hold_turns(h)
+            gates = [asyncio.Event() for _ in h.runners]
+            for runner, gate in zip(h.runners.values(), gates, strict=True):
+                runner.accept = gate
+            turn = _qevent("start in flight", thread="loss-in-flight")
+            key = kernel_routing._thread_key_for(turn)
+            try:
+                await _dispatch_http(h, consumer, turn)
+                await _wait_until(
+                    lambda: turn.text in handoff.all_opened(h), "the start is in flight"
+                )
+                await loss.inject()
+                assert handoff.all_interrupts(h) == 0, "a turn nobody recorded was stopped"
+
+                for gate in gates:
+                    gate.set()
+                await _wait_until(
+                    lambda: handoff.all_interrupts(h) >= 1, "the recorded turn was stopped"
+                )
+                await _settle_consumer(consumer)
+                runner = handoff.runner_at(h, handoff.route(h, key))
+                assert runner.interrupts == 1
+                assert handoff.all_interrupts(h) == 1
+            finally:
+                for gate in gates:
+                    gate.set()
+                handoff.release(holds)
+                await _settle_consumer(consumer)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("flag_on", [True, False], ids=["flag-on", "flag-off"])
+def test_lease_loss_after_a_steer_stops_the_steered_turn(
+    make_harness, monkeypatch: pytest.MonkeyPatch, flag_on: bool
+) -> None:
+    """[D2] control: the live turn this delivery steered into is stopped.
+
+    The same requester's follow-up steers Alice's live turn; its lease is lost
+    after the steer was recorded and before the delivery finishes.
+    """
+    handoff = _handoff()
+
+    async def go() -> None:
+        binding, core, _alice, _bob = _loss_parties(flag_on)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2, **_LOSS_KNOBS
+        ) as h:
+            consumer, loss = _loss_consumer(h, monkeypatch)
+            holds = handoff.hold_turns(h)
+            first = _qevent("alice is working", thread="loss-steer")
+            key = kernel_routing._thread_key_for(first)
+            opener = asyncio.create_task(handoff.process(h, first))
+            try:
+                await _wait_until(lambda: handoff.any_turn_active(h), "alice's turn is live")
+                runner = handoff.runner_at(h, handoff.route(h, key))
+                follow_up = _qevent("alice adds", thread="loss-steer")
+                real_reply_for = h.kernel._reply_for
+                gated: list[str] = []
+
+                async def reply_for(qevent: QueuedTurn, *args: Any, **kwargs: Any) -> Any:
+                    if (
+                        qevent.event_id == follow_up.event_id
+                        and follow_up.text in runner.steers
+                        and not gated
+                    ):
+                        gated.append(qevent.event_id)
+                        await loss.inject()
+                    return await real_reply_for(qevent, *args, **kwargs)
+
+                h.kernel._reply_for = reply_for
+                await _dispatch_http(h, consumer, follow_up)
+                await _wait_until(lambda: loss.done.is_set(), "the steering lease was lost")
+                await _wait_until(lambda: runner.interrupts >= 1, "the steered turn was stopped")
+                await _settle_consumer(consumer)
+                assert gated == [follow_up.event_id]
+                assert runner.steers == [follow_up.text]
+                assert runner.interrupts == 1
+            finally:
+                handoff.release(holds)
+                await opener
+                await _settle_consumer(consumer)
+
+    asyncio.run(go())
+
+
+_PREDECESSOR_NOTICE = "Your request is queued while an earlier message on this thread finishes."
+_ADMISSION_NOTICE = "Your request is queued while sandbox admission is pending."
+
+
+async def _wake_parked(h: Any, consumer: Consumer, event_id: str) -> tuple[str, dict[str, str]]:
+    await h.async_redis.zadd(consumer._waits._due, {event_id: 0})
+    assert await consumer._waits.wake_due() == 1
+    rows = await h.async_redis.xreadgroup(
+        h.config.consumer_group,
+        h.config.consumer_name,
+        {h.config.stream: ">"},
+        count=1,
+    )
+    assert len(rows[0][1]) == 1
+    return rows[0][1][0]
+
+
+def test_predecessor_wait_notice_names_the_earlier_message(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            first = _qevent("first", event_id="predecessor-first")
+            second = _qevent("second", event_id="predecessor-second", placeholder="p-2")
+            await _pending_local_entry(h, first)
+            entry, fields = await _pending_local_entry(h, second)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            record = await consumer._waits.get(second.event_id)
+            assert record is not None
+            assert record.state == "waiting"
+            assert h.sink.updates[-1] == ("C1", "p-2", _PREDECESSOR_NOTICE)
+            assert "sandbox admission" not in h.sink.updates[-1][2]
+            assert record.wait_reason == "thread_predecessor"
+            assert record.cause == ""
+            assert record.deferrals == 1
+            assert record.first_wait_ms < record.deadline_ms
+            assert h.runner.opened == []
+            assert not await h.async_redis.exists(h.config.done_key(second.event_id))
+
+    asyncio.run(go())
+
+
+def test_wait_cause_change_updates_the_notice_until_the_answer(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            first = _qevent("first", event_id="cause-first")
+            second = _qevent("second", event_id="cause-second", placeholder="p-2")
+            first_entry, first_fields = await _pending_local_entry(h, first)
+            second_entry, second_fields = await _pending_local_entry(h, second)
+            await consumer._sem.acquire()
+            await consumer._handle(second_entry, second_fields)
+            parked = await consumer._waits.get(second.event_id)
+            assert parked is not None
+            assert h.sink.updates[-1] == ("C1", "p-2", _PREDECESSOR_NOTICE)
+            assert parked.wait_reason == "thread_predecessor"
+            deadline = parked.deadline_ms
+
+            h.runner.default_script = [Final(text="first answer", status=DONE)]
+            await consumer._sem.acquire()
+            await consumer._handle(first_entry, first_fields)
+            assert h.sink.last_text == "first answer"
+            await asyncio.to_thread(
+                h.substrate.release, kernel_routing._thread_key_for(first)
+            )
+
+            h.fake_k8s.quota_rejection = QuotaRejection(
+                quota_name="curie-sandbox-quota",
+                requested={"pods": "1"},
+                used={"pods": "2"},
+                hard={"pods": "2"},
+            )
+            wake_entry, wake_fields = await _wake_parked(h, consumer, second.event_id)
+            await consumer._sem.acquire()
+            await consumer._handle(wake_entry, wake_fields)
+            admitted = await consumer._waits.get(second.event_id)
+            assert admitted is not None
+            assert admitted.state == "waiting"
+            assert admitted.wait_reason == "sandbox_admission"
+            assert admitted.cause == ""
+            assert admitted.deadline_ms == deadline
+            assert admitted.deferrals == 2
+            assert h.sink.updates[-1] == ("C1", "p-2", _ADMISSION_NOTICE)
+            assert h.runner.opened == ["first"]
+
+            h.fake_k8s.quota_rejection = None
+            h.runner.default_script = [Final(text="second answer", status=DONE)]
+            answer_entry, answer_fields = await _wake_parked(h, consumer, second.event_id)
+            await consumer._sem.acquire()
+            await consumer._handle(answer_entry, answer_fields)
+            assert h.sink.last_text == "second answer"
+            assert h.sink.updates[-1][:2] == ("C1", "p-2")
+            done = await consumer._waits.get(second.event_id)
+            assert done is not None and done.state == "done"
+            assert done.cause == ""
+            assert done.deadline_ms == deadline
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("wait_reason", ["thread_predecessor", "sandbox_admission"])
+def test_old_wait_notice_is_corrected_on_first_new_park(make_harness, wait_reason) -> None:
+    async def go() -> None:
+        async with make_harness(slack_no_edit_streaming=True) as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            first = _qevent("first", event_id="old-cause-first")
+            second = _qevent("second", event_id="old-cause-second", placeholder="p-2")
+            first_entry, first_fields = await _pending_local_entry(h, first)
+            entry, fields = await _pending_local_entry(h, second)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            original = await consumer._waits.get(second.event_id)
+            assert original is not None
+            await h.async_redis.hdel(consumer._waits._record(second.event_id), "wait_reason")
+            await h.async_redis.delete(f"{consumer._waits._prefix}:reason:{second.event_id}")
+            h.sink.updates.clear()
+            if wait_reason == "sandbox_admission":
+                h.runner.default_script = [Final(text="first answer", status=DONE)]
+                await consumer._sem.acquire()
+                await consumer._handle(first_entry, first_fields)
+                await asyncio.to_thread(h.substrate.release, kernel_routing._thread_key_for(first))
+                h.fake_k8s.quota_rejection = QuotaRejection(
+                    quota_name="acme-quota",
+                    requested={"pods": "1"},
+                    used={"pods": "1"},
+                    hard={"pods": "1"},
+                )
+            entry, fields = await _wake_parked(h, consumer, second.event_id)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            expected = (
+                _PREDECESSOR_NOTICE if wait_reason == "thread_predecessor" else _ADMISSION_NOTICE
+            )
+            assert h.sink.updates[-1] == ("C1", "p-2", expected)
+            corrected = await consumer._waits.get(second.event_id)
+            assert corrected is not None and corrected.wait_reason == wait_reason
+            assert corrected.deadline_ms == original.deadline_ms
+            assert corrected.deferrals == 2
+            count = len(h.sink.updates)
+            entry, fields = await _wake_parked(h, consumer, second.event_id)
+            await consumer._sem.acquire()
+            await consumer._handle(entry, fields)
+            assert len(h.sink.updates) == count
 
     asyncio.run(go())

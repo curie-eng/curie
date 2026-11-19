@@ -17,10 +17,11 @@ truth (the committed JSON Schema and generated Rust/TS are derived from them).
 
 ## What "an ACI server" is
 
-An ACI server is an **HTTP process** inside the sandbox that exposes nine POST
-routes and streams NDJSON back: seven every server serves, plus two optional
-runner-private routes described below, the executor route `POST /v1/execute` and
-the checkpoint route `POST /v1/checkpoint`. Those seven plus the bearer-gated
+An ACI server is an **HTTP process** inside the sandbox that exposes 11 POST
+routes and streams NDJSON back: seven every server serves, plus four optional
+runner-private routes described below, the executor route `POST /v1/execute`,
+the checkpoint route `POST /v1/checkpoint`, and the UI evidence routes
+`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image`. Those seven plus the bearer-gated
 `GET /v1/status` are its eight required authenticated control routes:
 
 | Route | Purpose |
@@ -34,6 +35,8 @@ the checkpoint route `POST /v1/checkpoint`. Those seven plus the bearer-gated
 | `POST /v1/turn-admit` | Grant or deny the exact waiting turn epoch. This runner-private control route is authenticated and does not change the ACI wire frames. |
 | `POST /v1/execute` | Optional. Served only by a runner booted with `CURIE_RUNNER_MODE=execute`; runs one connector action's `list`, `observe` and `call` phases for the worker's executor (see below). |
 | `POST /v1/checkpoint` | Optional. Capture the managed workspace against a worker-supplied trusted base commit as a bounded patch plus manifest; runner-private and authenticated (see below). |
+| `POST /v1/ui-evidence/index` | Optional. Return the validated index of the gitignored `.curie/ui-evidence/` manifest and its PNG images, bound to a worker-named base commit; runner-private and authenticated (see below). |
+| `POST /v1/ui-evidence/image` | Optional. Return the raw bytes of one indexed, unchanged PNG; runner-private and authenticated (see below). |
 | `GET /v1/status` | Return session status plus the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`, `cwd`) and `history_durable` for the worker's replacement-authority check. |
 
 Plus two unauthenticated GETs the platform relies on: `GET /healthz` (liveness)
@@ -61,6 +64,17 @@ plus a manifest of the changed paths, bounded at 900000 and 1048576 bytes. It
 stores nothing and conveys no credentials or authority. `run_conformance` does not
 cover it, a server without it answers `404`, and executor mode answers `409`
 naming the mode.
+
+`POST /v1/ui-evidence/index` and `POST /v1/ui-evidence/image` are also optional and
+runner-private. They are bearer-authenticated control routes that carry no ACI
+frame. The index route takes the publication base commit and a budget and returns
+the manifest status, the before and after binding and, per image, its size,
+sha256 or refusal. The image route takes an index entry and its sha256 and returns
+that PNG only if it is unchanged. Only regular PNG files under `.curie/ui-evidence/`
+are read, without following symlinks. Neither route enters the snapshot patch.
+`run_conformance` does not cover them, a server without them answers `404`, which
+the worker records as unavailable evidence, and a session without a managed
+workspace or a runner in executor mode answers `409`.
 
 The eighth required authenticated control route is `GET /v1/status`. It returns session status,
 the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,

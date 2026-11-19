@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from curie_internal.identity_approval import (
         ApprovalAnswerProofV1,
         ApprovalContextV1,
+        EmailApprovalAnswerProofV1,
         ResumeContextV1,
     )
 
@@ -475,11 +476,12 @@ def open_invocation_context(
 def _additional_protocol(kind: str) -> tuple[type[BaseModel], str, str]:
     """Closed protocol dispatch keeps keys here.
 
-    @spec HTTP-APPROVAL-CONTINUITY-6/7 HTTP-INVOCATION-EXECUTION-29.
+    @spec HTTP-APPROVAL-CONTINUITY-6/7/15 HTTP-INVOCATION-EXECUTION-29.
     """
     from curie_internal.identity_approval import (
         ApprovalAnswerProofV1,
         ApprovalContextV1,
+        EmailApprovalAnswerProofV1,
         ResumeContextV1,
     )
 
@@ -491,18 +493,23 @@ def _additional_protocol(kind: str) -> tuple[type[BaseModel], str, str]:
         return ApprovalAnswerProofV1, "curie-approval-receiver-v1", "receiver"
     if kind == "email":
         return EmailReceiverProofV1, "curie-email-receiver-v1", "receiver"
+    if kind == "email_answer":
+        return EmailApprovalAnswerProofV1, "curie-email-approval-answer-v1", "receiver"
     raise ValueError
 
 
 def _additional_reference(value: BaseModel, purpose: str) -> tuple[str, int]:
-    """@spec HTTP-APPROVAL-CONTINUITY-6/7 HTTP-INVOCATION-EXECUTION-29."""
+    """@spec HTTP-APPROVAL-CONTINUITY-6/7/15 HTTP-INVOCATION-EXECUTION-29."""
     from curie_internal.identity_approval import (
         ApprovalAnswerProofV1,
         ApprovalContextV1,
+        EmailApprovalAnswerProofV1,
         ResumeContextV1,
     )
 
-    if purpose == "receiver" and isinstance(value, (ApprovalAnswerProofV1, EmailReceiverProofV1)):
+    if purpose == "receiver" and isinstance(
+        value, (ApprovalAnswerProofV1, EmailReceiverProofV1, EmailApprovalAnswerProofV1),
+    ):
         return value.receiver_id, value.receiver_generation
     if purpose == "context" and isinstance(value, (ApprovalContextV1, ResumeContextV1)):
         return value.key_id, value.key_generation
@@ -613,5 +620,25 @@ def verify_email_receiver_proof(
     """@spec HTTP-INVOCATION-EXECUTION-29: a Slack proof never verifies here."""
     try:
         return cast("EmailReceiverProofV1", _open_additional(token, keyring, "email"))
+    except Exception:  # noqa: BLE001 - verification has one bounded refusal.
+        return ContextRefusal(code="invalid_receiver_proof")
+
+
+def sign_email_approval_answer_proof(
+    value: EmailApprovalAnswerProofV1, keyring: IdentityKeyring,
+) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-15: an email reply answer under its own prefix."""
+    try:
+        return _seal_additional(value, keyring, "email_answer")
+    except Exception:  # noqa: BLE001 - no supplied proof/key/parser content escapes.
+        raise ValueError("invalid_receiver_proof") from None
+
+
+def verify_email_approval_answer_proof(
+    token: str, keyring: IdentityKeyring,
+) -> EmailApprovalAnswerProofV1 | ContextRefusal:
+    """@spec HTTP-APPROVAL-CONTINUITY-15: no invocation or Slack proof verifies here."""
+    try:
+        return cast("EmailApprovalAnswerProofV1", _open_additional(token, keyring, "email_answer"))
     except Exception:  # noqa: BLE001 - verification has one bounded refusal.
         return ContextRefusal(code="invalid_receiver_proof")

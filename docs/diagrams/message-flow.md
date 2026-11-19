@@ -58,7 +58,7 @@ suspension outlive the pod, the worker, and a restart.
 
 The click does **not** go straight from the dispatcher to the queue. The
 dispatcher only forwards the decision to the API
-([`approval_actions.py`](../../apps/dispatcher/src/curie_dispatcher/approval_actions.py)::`ApprovalResolveClient`),
+([`approval_actions.py`](../../packages/channel-gateway/src/curie_channel_gateway/slack/approval_actions.py)::`ApprovalResolveClient`),
 and the API's
 [`approvals.py`](../../apps/api/src/curie_api/routers/approvals.py)::`resolve_approval`
 is what claims the resolution (resolve-once) and enqueues the resume turn. The

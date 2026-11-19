@@ -411,7 +411,7 @@ case "$1" in
   compose)
     case " $* " in
       *" exec "*) printf '%s\n' '{{"state":"claims_enabled","since":null,"revision":null,"ttl_seconds":null}}' ;;
-      *) exec '{}' -m curie_dispatcher.enqueue_once ;;
+      *) exec '{}' -m curie_channel_gateway.slack.enqueue_once ;;
     esac ;;
   *) echo unsupported fake docker command >&2; exit 64 ;;
 esac

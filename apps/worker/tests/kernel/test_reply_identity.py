@@ -17,6 +17,7 @@ from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TurnSour
 from aci_protocol.turn import route_identity
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_test_support.channel_gateway import reply_gateway
 from curie_worker.approvals import CreatedApproval
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
@@ -29,10 +30,30 @@ from curie_worker.binding import (
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.reply_sink import ReplySinkRouter, build_reply_sink
+from curie_worker.reply_sink import ReplySinkRouter
+from curie_worker.reply_sink import build_reply_sink as production_reply_sink
 from curie_worker.workitem_dispatch import WorkItemRunning
 
 from apps.worker.tests.queue_fixtures import factory_context
+
+_gateways = []
+
+
+@pytest.fixture(autouse=True)
+def owned_gateways():
+    try:
+        yield
+    finally:
+        while _gateways:
+            _gateways.pop().__exit__(None, None, None)
+
+
+def build_reply_sink(config, *, provider_tokens, base_url=""):
+    gateway = reply_gateway(provider_tokens, base_url)
+    values = gateway.__enter__()
+    _gateways.append(gateway)
+    return production_reply_sink(config.model_copy(update=values))
+
 
 DONE = SessionStatus.DONE
 AWAITING = SessionStatus.AWAITING_APPROVAL
@@ -159,11 +180,9 @@ def _qevent(text: str, *, adapter: str | None, thread: str) -> QueuedTurn:
 
 def _sink(port: int) -> ReplySinkRouter:
     return build_reply_sink(
-        WorkerConfig(
-            slack_bot_token=_DEFAULT_TOKEN,
-            slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
-        ),
-        slack_tokens={"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN},
+        WorkerConfig(),
+        base_url=f"http://127.0.0.1:{port}/slack/api/",
+        provider_tokens={"default": _DEFAULT_TOKEN, "ops-bot": _OPS_TOKEN},
     )
 
 
@@ -268,7 +287,8 @@ def test_a_turn_on_an_identity_this_worker_cannot_speak_as_is_dropped_before_it_
                 assert await h.async_redis.exists(h.config.done_key(ev.event_id))
             assert capture.requests == []
             text = "\n".join(caplog.messages)
-            assert ev.event_id in text and "'ghost'" in text
+            assert ev.event_id in text and "unconfigured" in text
+            assert "'ghost'" not in text
             assert _DEFAULT_TOKEN not in text and _OPS_TOKEN not in text
         finally:
             await server.close()

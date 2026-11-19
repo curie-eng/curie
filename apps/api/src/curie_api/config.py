@@ -13,7 +13,7 @@ production deployments.
 import json
 from functools import lru_cache
 from typing import Annotated, Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from aci_protocol import (
     DEAD_LETTER_STREAM_ENV,
@@ -24,6 +24,7 @@ from aci_protocol import (
     derive_dead_letter_stream_name,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_channel_gateway.token_custody import refuse_slack_tokens
 from curie_internal.driver_declaration import (
     PUBLISHED_DEFAULT_API_KEY,
     PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET,
@@ -37,7 +38,7 @@ from curie_internal.driver_declaration import (
 )
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT, WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
-from plugin_format.connector_render import ConnectorProxy
+from plugin_format.connector_render import ConnectorProxy, GrantStore
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -54,6 +55,10 @@ _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
 _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN
 _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET
 _DEV_DEFAULT_REMEDIATION_AUTHORITY_KEY = PUBLISHED_DEFAULT_REMEDIATION_AUTHORITY_KEY
+
+# The key of the chart Secret that holds the Valkey password, the same key the
+# API, worker and dispatcher read VALKEY_PASSWORD from (#5550).
+GRANT_STORE_SECRET_KEY = "valkeyPassword"
 
 
 class Settings(BaseSettings):
@@ -331,6 +336,12 @@ class Settings(BaseSettings):
     # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
     # the missed-label backstop. The poll interval is the GitHub tracker's.
     factory_intake: Literal["poll", "webhook"] = "poll"
+    # The model auth mode tracker ingress admits with (#5376, ADR 0268). Tracker
+    # events carry no verified owner, so with "personal" a new issue refuses
+    # personal_owner_required before any WorkItem exists, and only a WorkItem
+    # already bound to an owner accepts a revision or readmission. The default
+    # keeps service admissions.
+    factory_model_auth_mode: Literal["service", "personal"] = "service"
     factory_base_label_settle_s: int = Field(default=60, ge=0)
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with
@@ -344,6 +355,10 @@ class Settings(BaseSettings):
     # lineage, to record one merged or closed outside a publication (#3831).
     # Runs with the work item reconciler and factory ingress; 0 disables it.
     factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
+    # How often the API publishes optional UI evidence a worker uploaded for a
+    # recorded publication, as one marked pull request comment. It reads the
+    # code publication and never changes it; 0 disables it.
+    ui_evidence_reconcile_interval_s: float = Field(default=10, ge=0, allow_inf_nan=False)
     # How long a published factory run waits on its pull request's CI, from the
     # push (#3162). The execution deadline still caps it; the wait stays at most
     # 10800 s, a separate bound from the execution deadline, which ADR 0249
@@ -522,6 +537,9 @@ class Settings(BaseSettings):
     # resumes their stranded sessions. Values <= 0 disable the sweeper (the
     # operator kill lever and the fully-inert-app escape hatch for tests).
     approval_sweep_interval_s: float = 30.0
+    approval_reminders_enabled: bool = Field(
+        default=False, validation_alias="CURIE_APPROVAL_REMINDERS_ENABLED"
+    )
     # Publication patches are private control-plane inputs. The ingress bound
     # and terminal retention are operator-owned, and the periodic approval
     # sweeper also reaps terminal bytes after this retention window.
@@ -677,15 +695,20 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("CURIE_CONSUMER_GROUP", "RUNS_CONSUMER_GROUP"),
     )
 
-    # The Slack bot token the API uses for its OWN user-group lookups (#420),
-    # rather than trusting a caller's claim about who is in a group. The same
-    # token the dispatcher and worker already hold; empty is the normal state
-    # for a Slack-free install. Empty does NOT relax anything: a route that
-    # declares an approvers group then fails closed at resolve time, while
-    # channel and user-list authorizers are unaffected. Left out of the #57 prod
-    # boot gate deliberately -- Slack is optional, and that resolve-time denial
-    # is the enforcement.
-    slack_bot_token: str = ""
+    # Provider credentials stay in the gateway; this is the API caller capability.
+    channel_gateway_url: str = Field(default="", validation_alias="CURIE_CHANNEL_GATEWAY_URL")
+    channel_gateway_token: str = Field(
+        default="", validation_alias="CURIE_CHANNEL_GATEWAY_TOKEN", repr=False
+    )
+    channel_gateway_allow_insecure: bool = Field(
+        default=False, validation_alias="CURIE_CHANNEL_GATEWAY_ALLOW_INSECURE"
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_slack_credentials(cls, values: object) -> object:
+        return refuse_slack_tokens(values)
+
     # The Slack identities the chart declares (ADR-0168 decision 1), which
     # `identities.declared_identities` checks a binding against; see
     # `aci_protocol.slack_identities.declared_slack_identity_names` for what
@@ -891,6 +914,15 @@ class Settings(BaseSettings):
             "CURIE_CONNECTOR_PROXY_IMAGE_PULL_SECRETS", "connector_proxy_image_pull_secrets"
         ),
     )
+    # The Secret holding the Valkey password (#5550). The chart renders the
+    # name it gives VALKEY_PASSWORD's own secretKeyRef, so the caller proxy
+    # reads the password by reference and no rendered object holds it.
+    connector_grant_store_secret_name: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME", "connector_grant_store_secret_name"
+        ),
+    )
     e2e_connector_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("CURIE_E2E_CONNECTOR_ENABLED", "e2e_connector_enabled"),
@@ -990,6 +1022,47 @@ class Settings(BaseSettings):
             ),
         )
 
+    def connector_grant_store(self) -> GrantStore:
+        """Where the caller proxy spends grants: a credential-free address and
+        the Secret reference its password arrives by (#5550).
+
+        The address is ``valkey_dsn()`` without its password. A ``VALKEY_URL``
+        whose password is not ``VALKEY_PASSWORD`` is refused: the proxy reads
+        the password from the chart Secret, so it would authenticate with the
+        wrong one. No message here carries a password or the URL.
+        """
+
+        secret_name = self.connector_grant_store_secret_name.strip()
+        if not secret_name:
+            raise ValueError(
+                "hosted_connector_requires_grant_store_secret: a hosted connector's caller "
+                "proxy reads the Valkey password from a Secret, and no Secret is named; "
+                "the chart sets CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME on the API"
+            )
+        if self.valkey_url:
+            try:
+                parts = urlsplit(self.valkey_url)
+                password = parts.password
+            except ValueError:
+                raise ValueError("VALKEY_URL is not a parsable URL") from None
+            if password and unquote(password) != self.valkey_password:
+                raise ValueError(
+                    "grant_store_password_not_in_secret: VALKEY_URL carries a password "
+                    "that differs from VALKEY_PASSWORD, and the caller proxy reads only "
+                    "the Secret behind VALKEY_PASSWORD"
+                )
+            userinfo, at, hostport = parts.netloc.rpartition("@")
+            username = userinfo.split(":", 1)[0] if at else ""
+            netloc = f"{username}@{hostport}" if username else hostport
+            address = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        else:
+            # The same scheme choice as valkey_dsn(): the scheme carries valkey_tls.
+            scheme = "rediss" if self.valkey_tls else "redis"
+            address = f"{scheme}://{self.valkey_host}:{self.valkey_port}/0"
+        return GrantStore(
+            address=address, secret_name=secret_name, secret_key=GRANT_STORE_SECRET_KEY
+        )
+
     def e2e_install(self) -> E2EInstall:
         return E2EInstall(
             enabled=self.e2e_connector_enabled,
@@ -1020,7 +1093,8 @@ class Settings(BaseSettings):
         # `rediss://` alone, so this one character is what carries valkey_tls
         # through from_url to the pool (#2315).
         scheme = "rediss" if self.valkey_tls else "redis"
-        return f"{scheme}://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
+        password = quote(self.valkey_password, safe="")
+        return f"{scheme}://:{password}@{self.valkey_host}:{self.valkey_port}/0"
 
     def upgrade_quiesce_key(self) -> str:
         return authoritative_key(self.worker_key_prefix, self.installation_id)
@@ -1367,6 +1441,40 @@ class Settings(BaseSettings):
                 "in production."
             )
         return self
+
+    # Cron claim lease. The chart's 10800 budget is a deployment value. Unset
+    # here, the process default matches the worker: 600 seconds. A set lease
+    # must cover that budget. Empty is not a lease.
+    delivery_budget_s: float = Field(
+        default=600.0,
+        ge=60.0,
+        le=43200.0,
+        validation_alias="CURIE_DELIVERY_BUDGET_S",
+    )
+    hook_claim_lease_s: float | None = Field(
+        default=None,
+        gt=0,
+        validation_alias="CURIE_HOOK_CLAIM_LEASE_S",
+    )
+
+    @model_validator(mode="after")
+    def _hook_claim_lease_covers_the_budget(self) -> "Settings":
+        """Fail at construction if a cron claim's lease is shorter than a turn."""
+        lease = self.hook_claim_lease_s
+        if lease is not None and lease < self.delivery_budget_s:
+            raise ValueError(
+                f"CURIE_HOOK_CLAIM_LEASE_S ({lease!r}) must be at least "
+                f"CURIE_DELIVERY_BUDGET_S ({self.delivery_budget_s!r}): a shorter "
+                "lease reclaims a scheduled turn that is still running"
+            )
+        return self
+
+    @property
+    def effective_hook_claim_lease_s(self) -> float:
+        """The cron claim lease; the delivery budget when none is configured."""
+        if self.hook_claim_lease_s is None:
+            return self.delivery_budget_s
+        return self.hook_claim_lease_s
 
 
 @lru_cache

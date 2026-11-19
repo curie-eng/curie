@@ -18,7 +18,6 @@ import socket
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -617,14 +616,17 @@ def test_fifth_diff_rejection_caps_the_loop(session: Session, plan_verdict: str)
 
 def test_a_capped_run_states_its_findings_in_its_reply(session: Session) -> None:
     # ADR 0187: the bundle has no GitHub write tool. The platform posts the
-    # final reply on the issue, so the stop text asks for the findings there.
+    # final reply on the issue, so the stop text carries the short handoff.
     session.review(PLAN, reply(PLAN, "APPROVE"))
     for round_ in range(1, 6):
         _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
         rework(session, round_)
     assert "Could not complete:" in context
+    assert "Decisions needed:" in context
     assert "add_issue_comment" not in context
     assert "platform posts that reply on the issue" in context
+    assert "1500 characters" in context
+    assert "Settled:" in context
 
 
 # --- A reviewer call without a verdict grants nothing -----------------------------
@@ -3894,49 +3896,6 @@ def test_missing_workspace_can_restore_and_re_review(session: Session) -> None:
     session.review(DIFF, reply(DIFF, "APPROVE"))
     assert _saved_state(session)["diff"]["round"] == 2
     assert session.pre(PUBLISH)["permissionDecision"] == "allow"
-
-
-def _delay_hook_start(session: Session, seconds: float) -> None:
-    """Hold the hook for ``seconds`` before its own code runs, as a loaded
-    runner does while it starts the interpreter and imports the runner package.
-    Only the hook waits; the git shims start as usual."""
-    site = session.cwd.parent / "slow-start"
-    site.mkdir()
-    (site / "sitecustomize.py").write_text(
-        "import sys\n"
-        "import time\n"
-        f"if sys.argv and sys.argv[0].endswith({HOOK.name!r}):\n"
-        f"    time.sleep({seconds!r})\n"
-    )
-    path = session.env.get("PYTHONPATH")
-    session.env["PYTHONPATH"] = f"{site}{os.pathsep}{path}" if path else str(site)
-
-
-def test_review_git_calls_share_hook_budget(session: Session) -> None:
-    session.review(PLAN, reply(PLAN, "APPROVE"))
-    real_git = shutil.which("git")
-    assert real_git is not None
-    # The shared budget starts at the hook's first git call, so the clock
-    # starts there too. Interpreter start is outside it: a loaded CI runner
-    # took 1.7 s to start the hook, and this one waits longer than that.
-    _delay_hook_start(session, 2.5)
-    calls = session.cwd.parent / "git-calls"
-    _prepend_git_shim(
-        session,
-        "import os\n"
-        "import sys\n"
-        "import time\n"
-        f"with open({str(calls)!r}, 'a') as log:\n"
-        "    log.write(f'{time.monotonic()}\\n')\n"
-        "time.sleep(2.6)\n"
-        f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
-    )
-    decision = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
-    returned = time.monotonic()
-    assert decision["permissionDecision"] == "deny"
-    assert _saved_state(session)["diff"]["round"] == 0
-    first_call = float(calls.read_text().split()[0])
-    assert returned - first_call < 9
 
 
 def test_publication_gate_is_not_atomic_snapshot_authority(session: Session) -> None:

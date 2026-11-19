@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
+from urllib.parse import quote, unquote
 
 import pytest
 from curie_worker import binding
@@ -65,10 +66,41 @@ def test_writes_on_with_a_binding_passes_the_channel_memory_ref() -> None:
 
 
 def test_kind_and_address_are_url_quoted() -> None:
+    # Only ``%`` and ``/`` are escaped before the address is encoded as a path
+    # segment: the API decodes the path once before routing and the address
+    # once more, and an address sent with one encoding arrived split at its
+    # slash (a GitHub owner/name read as empty).
     env = _boot_env(_resolved(memory_writes=True), kind="mail", address="ops/team@example.com")
     assert env[_KEY] == (
-        f"{_base()}/agents/{_AGENT}/state/bindings/mail/ops%2Fteam%40example.com/memory"
+        f"{_base()}/agents/{_AGENT}/state/bindings/mail/ops%252Fteam%40example.com/memory"
     )
+    github = _boot_env(_resolved(memory_writes=True), kind="github", address="acme-corp/widgets")
+    assert github[_KEY] == (
+        f"{_base()}/agents/{_AGENT}/state/bindings/github/acme-corp%252Fwidgets/memory"
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "address"),
+    [("mail", "ops@example.com"), ("mail", "a+b@x.example"), ("slack", "C0123ABCD")],
+)
+def test_an_address_without_a_slash_or_percent_is_sent_as_before(kind: str, address: str) -> None:
+    # A worker on this encoding still reaches an API that decodes the address
+    # segment only once: the wire path is byte-identical to the single quote
+    # it sent before, and decoding it once more changes nothing.
+    single = f"bindings/{quote(kind, safe='')}/{quote(address, safe='')}"
+    assert binding.binding_state_path(kind, address) == single
+
+
+@pytest.mark.parametrize(
+    "address", ["acme-corp/widgets", "50%off", "a%2Fb/c", "ops/team@example.com"]
+)
+def test_the_address_round_trips_through_the_api_decodes(address: str) -> None:
+    # The server decodes the path once (as uvicorn does) and the address
+    # segment once more (routers/state.py _binding_address).
+    segment = binding.binding_state_path("github", address).split("/", 2)[2]
+    assert "/" not in unquote(segment)
+    assert unquote(unquote(segment)) == address
 
 
 def test_writes_off_still_passes_the_channel_memory_ref() -> None:

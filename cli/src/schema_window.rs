@@ -762,8 +762,17 @@ print(json.dumps(graph))
         // @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
         // Factory ORM reads require the transition table introduced by 0144.
         // The 0145 join also requires the stable deadline backport (0140).
-        assert_eq!(candidate.schema_min, "0147");
-        assert_eq!(candidate.schema_head, "0147");
+        // The UI evidence reconciler reads the tables 0146 introduces, and the
+        // 0148 join also requires the deleted issue cancellation shape (0147).
+        // 0149 stores webhook provenance and a wake-key generation and does not
+        // raise the serving floor. Agent ORM reads require the 0151 connector
+        // requester identity columns, and Approval ORM reads require the 0152 schedule
+        // interval and the 0153 selection columns. Dynamic approval answers require
+        // the 0156 answer gate. The factory Slack progress loop reads the tables
+        // 0157 introduces, and the code host link route writes the github_host
+        // kind 0158 allows. Owner tuple reads require 0159.
+        assert_eq!(candidate.schema_min, "0159");
+        assert_eq!(candidate.schema_head, "0159");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -799,7 +808,19 @@ print(json.dumps(graph))
         assert!(!live_in_window("0141", &current));
         assert!(!live_in_window("0143", &current));
         assert!(!live_in_window("0144", &current));
-        assert!(live_in_window("0147", &current));
+        assert!(!live_in_window("0145", &current));
+        assert!(!live_in_window("0146", &current));
+        assert!(!live_in_window("0147", &current));
+        assert!(!live_in_window("0148", &current));
+        assert!(!live_in_window("0149", &current));
+        assert!(!live_in_window("0151", &current));
+        assert!(!live_in_window("0152", &current));
+        assert!(!live_in_window("0153", &current));
+        assert!(!live_in_window("0154", &current));
+        assert!(!live_in_window("0156", &current));
+        assert!(!live_in_window("0157", &current));
+        assert!(!live_in_window("0158", &current));
+        assert!(live_in_window("0159", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

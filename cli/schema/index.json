@@ -31,7 +31,7 @@
       "result": "AllTargetsDeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "ApplyOutput",
@@ -43,7 +43,13 @@
       "result": "ApprovalsOutput",
       "kind": "CliOutput",
       "schema": "approvals.schema.json",
-      "version": "2.4"
+      "version": "2.6"
+    },
+    {
+      "result": "RequesterIdentityOutput",
+      "kind": "CliOutput",
+      "schema": "approvals.schema.json",
+      "version": "2.6"
     },
     {
       "result": "BudgetOutput",
@@ -145,7 +151,7 @@
       "result": "DeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "DiffOutput",
@@ -266,6 +272,12 @@
       "kind": "CliOutput",
       "schema": "memory.schema.json",
       "version": "2.2"
+    },
+    {
+      "result": "MigrationOutput",
+      "kind": "CliOutput",
+      "schema": "migrate-protected-process.schema.json",
+      "version": "1.0"
     },
     {
       "result": "MemoryOutput",
@@ -445,7 +457,7 @@
       "result": "HookFireOutput",
       "kind": "CliOutput",
       "schema": "hook-fire.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "SreBotRenderOutput",
@@ -460,16 +472,22 @@
       "version": "1.0"
     },
     {
+      "result": "WakeKeyOutput",
+      "kind": "CliOutput",
+      "schema": "wake-key.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "WorkItemsOutput",
       "kind": "CliOutput",
       "schema": "work-items.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "all_targets_deploy_failure_json",
       "kind": "builder",
       "schema": "deploy.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "error_json",

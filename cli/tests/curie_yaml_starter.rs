@@ -117,7 +117,7 @@ fn install_context_in_the_file_is_pinned_and_the_flag_wins() {
     let flag_wins = Command::new(bin())
         .args(["diff", "--file"])
         .arg(&path)
-        .args(["--context", "also-missing", "--json"])
+        .args(["--context", "other-context", "--json"])
         .env("KUBECONFIG", &kube)
         .env("HOME", dir.path())
         .output()
@@ -128,7 +128,7 @@ fn install_context_in_the_file_is_pinned_and_the_flag_wins() {
         "flag context must be pinned: {combined}"
     );
     assert!(
-        combined.contains("also-missing"),
+        combined.contains("other-context"),
         "flag must win over the file: {combined}"
     );
     assert!(
@@ -197,19 +197,19 @@ fn apply_and_diff_refuse_an_unknown_context() {
         let output = Command::new(bin())
             .args([verb, "--file"])
             .arg(&path)
-            .args(["--context", "missing-ctx", "--json"])
+            .args(["--context", "missing-context", "--json"])
             .env("KUBECONFIG", &kube)
             .env("HOME", dir.path())
             .output()
             .expect("run with unknown context");
         assert!(
             !output.status.success(),
-            "{verb} --context missing-ctx must fail\n{}",
+            "{verb} --context missing-context must fail\n{}",
             output_text(&output)
         );
         let combined = output_text(&output);
         assert!(
-            combined.contains("missing-ctx"),
+            combined.contains("missing-context"),
             "{verb} must name the missing context: {combined}"
         );
     }

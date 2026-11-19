@@ -307,6 +307,9 @@ async def prepare(request: Request) -> bool:
     # Starlette's cached Request forwards these bytes to the route parser.
     request._body = body
     key = request.headers.get("X-API-Key")
+    if request.url.path.startswith(("/identity/authorities", "/identity/roles")):
+        await require_platform_key(key)
+        return True
     if request.url.path.startswith("/directory"):
         if verify_platform_key(key):
             return True

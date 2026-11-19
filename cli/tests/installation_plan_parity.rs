@@ -488,8 +488,7 @@ case "$verb $object" in
         unexpected
     fi
     case "$all" in
-        '-n parity rollout restart deployment/parity-curie-worker'|\
-        '-n parity rollout restart deployment/parity-curie-api'|\
+        '-n parity rollout restart deployment/parity-curie-channel-gateway'|\
         '-n parity rollout restart deployment/parity-curie-dispatcher') : ;;
         *) unexpected ;;
     esac
@@ -499,8 +498,7 @@ case "$verb $object" in
         unexpected
     fi
     case "$all" in
-        '-n parity rollout status deployment/parity-curie-worker --timeout=120s'|\
-        '-n parity rollout status deployment/parity-curie-api --timeout=120s'|\
+        '-n parity rollout status deployment/parity-curie-channel-gateway --timeout=120s'|\
         '-n parity rollout status deployment/parity-curie-dispatcher --timeout=120s') : ;;
         *) unexpected ;;
     esac
@@ -2458,7 +2456,7 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
             "the follow-up comms upgrade must consume the declared Slack replacement"
         );
     }
-    for component in ["worker", "api", "dispatcher"] {
+    for component in ["channel-gateway", "dispatcher"] {
         for (action, suffix) in [("restart", ""), ("status", " --timeout=120s")] {
             let expected = format!(
                 "KUBECTL_CALL: -n parity rollout {action} deployment/parity-curie-{component}{suffix}"
@@ -2468,6 +2466,11 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
                 "the follow-up comms apply must {action} the {component} deployment:\n{calls}"
             );
         }
+    }
+    for component in ["worker", "api"] {
+        assert!(!calls.contains(&format!(
+            "rollout restart deployment/parity-curie-{component}"
+        )));
     }
 
     let retained = HelmFixture::new(
@@ -4808,6 +4811,61 @@ fn migrate_store_import_exits_nonzero_when_the_target_listing_fails() {
         fixture.migration_source().as_deref(),
         Some("100 bundle.tar\n"),
         "failed target verification must retain the source proof"
+    );
+}
+
+#[test]
+fn migrate_store_import_refuses_an_empty_persisted_source() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    // The planned target is persisted and the live store matches it, and the
+    // staging pod holds objects, so only the empty source proof can fail.
+    fixture.seed_migration_evidence("rustfs", "");
+    let live = live_rustfs_statefulset();
+
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "import",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_STAGED_LIST", STAGED_OBJECT),
+            ("CURIE_TEST_TARGET_LIST", STAGED_OBJECT),
+        ],
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("/migration/source.list"),
+        "the import must read the persisted source inventory:\n{calls}"
+    );
+    assert!(
+        !output.status.success(),
+        "an empty persisted source inventory must refuse the import; stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        reported.contains("the final source inventory in the staging pod is empty"),
+        "the refusal must name the empty source inventory:\n{reported}"
+    );
+    assert!(
+        !calls.contains("KUBECTL_CALL: delete pod"),
+        "an empty source inventory must retain the staged copy:\n{calls}"
     );
 }
 

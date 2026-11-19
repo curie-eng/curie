@@ -692,6 +692,27 @@ pub async fn dev_script(rel_path: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+pub async fn dev_kube_context_check(self_test: bool) -> Result<()> {
+    let root = find_repo_root().ok_or_else(|| {
+        crate::exit::CliError::usage("Kube-context checks require a Curie source checkout.")
+    })?;
+    let mut command = tokio::process::Command::new("python3");
+    command
+        .current_dir(root)
+        .arg("scripts/check-kube-contexts.py");
+    if self_test {
+        command.arg("--self-test");
+    }
+    let status = command
+        .status()
+        .await
+        .context("Could not run the kube-context policy")?;
+    if !status.success() {
+        bail!("Kube-context policy failed");
+    }
+    Ok(())
+}
+
 pub async fn dev_e2e_ci_selection(
     paths: &[PathBuf],
     base: Option<&str>,

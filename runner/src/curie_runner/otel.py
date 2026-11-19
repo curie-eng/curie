@@ -537,9 +537,20 @@ class _GenerationSpan:
         self,
         model: str | None,
         usage: Mapping[str, Any] | None,
+        *,
+        nested: bool = False,
     ) -> None:
-        """Accumulate one assistant message's model and token usage."""
+        """Accumulate one assistant message's model and token usage.
 
+        A nested (subagent) message arriving while a tool interval is active
+        is a generation of its own: it is exported and closed immediately as
+        its own ``llm.generation`` span (#5206), never folded into -- or
+        promoted to -- the implementer's active generation.
+        """
+
+        if nested and self._active_tools:
+            self._export_nested_generation(model, usage)
+            return
         if self._active_generation is None:
             return
         self._record_model(model)
@@ -591,11 +602,19 @@ class _GenerationSpan:
     def record_result_usage(self, usage: Mapping[str, Any] | None) -> None:
         """Stamp a ResultMessage turn total for result-only providers (#3128).
 
-        Runs only when no generation in the turn received per-message usage, so
-        the turn total is never double counted. The total lands on the final
-        generation (the one active now) with ``curie.usage.scope = "turn"``;
-        earlier generations get nothing fabricated. With no active generation
-        the root is marked ``"unrecorded"`` so the gap stays visible.
+        Runs only when no generation in the turn received nonzero implementer
+        per-message usage, so the turn total is never double counted. Nested
+        reviewer usage never suppresses this fallback, and the total is
+        stamped unchanged: ``ResultMessage.usage`` is a main-loop-only total
+        (the bundled CLI's turn accumulator skips nested assistant messages
+        carrying ``parent_tool_use_id`` before accumulating, and the Python
+        SDK forwards the stamped accumulator unchanged), so the reviewer's
+        counts -- already exported on their own nested spans -- are not part
+        of it; nothing is subtracted and nothing is clamped. The result lands
+        on the final generation (the one active now) with
+        ``curie.usage.scope = "turn"``; earlier generations get nothing
+        fabricated. With no active generation the root is marked
+        ``"unrecorded"`` so the gap stays visible.
         """
 
         if self._turn_usage_observed or not usage:
@@ -891,6 +910,47 @@ class _GenerationSpan:
                 # ResultMessage fallback (adding the total to zeros cannot
                 # double count).
                 self._turn_usage_observed = True
+
+    def _export_nested_generation(
+        self,
+        model: str | None,
+        usage: Mapping[str, Any] | None,
+    ) -> None:
+        """Export one nested (reviewer) assistant message as its own generation.
+
+        The span opens and closes here, before the surrounding tool interval
+        continues: a nested message never becomes the implementer's active
+        generation, so no provider wait is fabricated for the parent while its
+        Agent tool is still running (#5206). Only allowlisted, redacted keys are
+        attached; the SDK's opaque tool/call ids stay off the wire.
+        """
+
+        span = self._tracer.start_span(
+            "llm.generation",
+            context=self._root_context,
+            record_exception=False,
+            set_status_on_exception=False,
+        )
+        _set(span, SpanAttributeKey.PHASE, "provider_wait")
+        _set(span, SpanAttributeKey.PHASE_START_KIND, "nested_assistant_observed")
+        if isinstance(model, str) and model:
+            _set(span, SpanAttributeKey.REQUEST_MODEL, model)
+            _set(span, SpanAttributeKey.MODEL, model)
+        if usage:
+            for usage_field, attribute_key in _USAGE_ATTRIBUTE_KEYS.items():
+                value = usage.get(usage_field)
+                if type(value) is not int or value < 0:
+                    continue
+                # Nested counts are stamped only here, on the reviewer's own
+                # span (#5206 review revision): they never reach the
+                # implementer's per-message usage, so they never suppress the
+                # ResultMessage fallback, and the fallback stamps its
+                # main-loop-only total without subtracting them.
+                _set(span, attribute_key, value)
+        _set(span, SpanAttributeKey.PHASE_END_KIND, "nested_assistant_observed")
+        span.set_status(StatusCode.OK)
+        span.end()
+        self._has_activity = True
 
     def _close_deferred_generation(self) -> None:
         end_time_ns = self._deferred_generation_end_ns

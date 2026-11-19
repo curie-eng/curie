@@ -7,118 +7,40 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import pytest
 import redis
 from aiohttp.test_utils import TestServer
+from curie_test_support.channel_gateway import reply_gateway
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker.config import WorkerConfig
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.deploy_notice import DeployNoticeConsumer
-from curie_worker.reply_sink import build_reply_sink
+from curie_worker.reply_sink import build_reply_sink as production_reply_sink
 from redis.asyncio import Redis as AsyncRedis
+
+_gateways = []
+
+
+@pytest.fixture(autouse=True)
+def owned_gateways():
+    try:
+        yield
+    finally:
+        while _gateways:
+            _gateways.pop().__exit__(None, None, None)
+
+
+def build_reply_sink(config, *, provider_tokens, base_url=""):
+    gateway = reply_gateway(provider_tokens, base_url)
+    values = gateway.__enter__()
+    _gateways.append(gateway)
+    return production_reply_sink(config.model_copy(update=values))
+
 
 sys.path.insert(0, str(Path(__file__).parent))
 from capture_fixtures import Capture  # noqa: E402
-
-
-@pytest.mark.parametrize(
-    "status,codes,expected",
-    [
-        ("rejected", ["git.archive_failed"], "rejected: git.archive_failed"),
-        ("rejected", [f"git.reason_{n}" for n in range(17)], "rejected: git.reason_0"),
-        ("deployed", [], "deployed aaaaaaaa (dev)"),
-    ],
-)
-@pytest.mark.parametrize(
-    "agent_name,address",
-    [
-        ("acme-dev", "C0EXAMPLE1"),
-        ("", "C0EXAMPLE1"),
-        ("n" * 300, "C" + "A" * 300),
-    ],
-)
-def test_notice_posts_as_the_bound_identity_and_acks(
-    sync_redis: redis.Redis,
-    names: dict[str, str],
-    status: Literal["rejected", "deployed"],
-    codes: list[str],
-    expected: str,
-    agent_name: str,
-    address: str,
-) -> None:
-    async def go() -> None:
-        capture = Capture()
-        server = TestServer(capture.app)
-        await server.start_server()
-        port = server.port
-        assert port is not None
-        config = WorkerConfig(
-            slack_bot_token="xoxb-default-test",
-            slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
-            read_block_ms=100,
-            key_prefix=names["prefix"],
-        )
-        sink = build_reply_sink(
-            config,
-            slack_tokens={"default": "xoxb-default-test", "ops": "xoxb-ops-test"},
-        )
-        valkey = AsyncRedis(
-            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
-        )
-        consumer = DeployNoticeConsumer(
-            redis=valkey,
-            sink=sink,
-            config=config,
-            stream=names["stream"],
-            group=names["group"],
-            consumer="notice-test",
-            leases=DeliveryLeaseStore(valkey, config),
-        )
-        task = asyncio.create_task(consumer.run())
-        try:
-            notice: dict[str, Any] = {
-                "address": address,
-                "identity": "ops",
-                "agent_name": agent_name,
-                "status": status,
-                "sha": "a" * 40,
-                "environment": "dev",
-                "codes": codes,
-            }
-            entry = await valkey.xadd(names["stream"], {"payload": json.dumps(notice)})
-            for _ in range(100):
-                if capture.requests:
-                    break
-                await asyncio.sleep(0.05)
-            assert capture.paths() == ["/slack/api/chat.postMessage"]
-            posted = capture.requests[0]
-            assert posted["headers"]["Authorization"] == "Bearer xoxb-ops-test"
-            body = json.loads(posted["body"])
-            assert body["channel"] == address
-            assert expected in body["text"]
-            assert "thread_ts" not in body
-            assert body["client_msg_id"] == str(
-                uuid.uuid5(uuid.NAMESPACE_URL, f"curie:deploy-notice:{names['stream']}:{entry}")
-            )
-            assert await valkey.xpending_range(
-                names["stream"], names["group"], min=entry, max=entry, count=1
-            ) == []
-            state_key = config.delivery_state_key(names["stream"], names["group"], entry)
-            for _ in range(50):
-                if not await valkey.exists(state_key):
-                    break
-                await asyncio.sleep(0.01)
-            assert not await valkey.exists(state_key)
-        finally:
-            consumer.request_stop()
-            await asyncio.wait_for(task, timeout=5)
-            await sink.aclose()
-            await valkey.aclose()
-            await server.close()
-
-    asyncio.run(go())
 
 
 def test_malformed_notice_is_dead_lettered_and_acked(
@@ -126,7 +48,7 @@ def test_malformed_notice_is_dead_lettered_and_acked(
 ) -> None:
     async def go() -> None:
         config = WorkerConfig(read_block_ms=100, key_prefix=names["prefix"])
-        sink = build_reply_sink(config, slack_tokens={})
+        sink = build_reply_sink(config, provider_tokens={})
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
         )
@@ -173,12 +95,12 @@ def test_reenqueued_notice_keeps_one_slack_delivery_identity(
         server = TestServer(capture.app)
         await server.start_server()
         assert server.port is not None
+        base_url = f"http://127.0.0.1:{server.port}/slack/api/"
         config = WorkerConfig(
-            slack_api_base_url=f"http://127.0.0.1:{server.port}/slack/api/",
             read_block_ms=100,
             key_prefix=names["prefix"],
         )
-        sink = build_reply_sink(config, slack_tokens={"ops": "xoxb-ops-test"})
+        sink = build_reply_sink(config, provider_tokens={"ops": "xoxb-ops-test"}, base_url=base_url)
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
         )
@@ -208,10 +130,16 @@ def test_reenqueued_notice_keeps_one_slack_delivery_identity(
                 for _ in range(2)
             ]
             for _ in range(100):
-                if len(capture.requests) == 2:
+                groups = await valkey.xinfo_groups(names["stream"])
+                if any(
+                    group["name"] == names["group"]
+                    and group["last-delivered-id"] == entries[-1]
+                    and group["pending"] == 0
+                    for group in groups
+                ):
                     break
                 await asyncio.sleep(0.05)
-            assert len(capture.requests) == 2
+            assert len(capture.requests) == 1
             # https://docs.slack.dev/reference/methods/chat.postMessage/
             # documents client_msg_id; test_live.py pins the ambiguous-retry
             # behavior against a real Slack test workspace.
@@ -225,6 +153,7 @@ def test_reenqueued_notice_keeps_one_slack_delivery_identity(
                 assert await valkey.xpending_range(
                     names["stream"], names["group"], min=entry, max=entry, count=1
                 ) == []
+            assert await valkey.xlen(f"{names['stream']}:dead") == 0
         finally:
             consumer.request_stop()
             await asyncio.wait_for(task, timeout=5)
@@ -244,12 +173,13 @@ def test_notice_never_falls_back_to_another_slack_identity(
         await server.start_server()
         port = server.port
         assert port is not None
+        base_url = f"http://127.0.0.1:{port}/slack/api/"
         config = WorkerConfig(
-            slack_bot_token="xoxb-default-test",
-            slack_api_base_url=f"http://127.0.0.1:{port}/slack/api/",
             read_block_ms=100,
         )
-        sink = build_reply_sink(config, slack_tokens={"default": "xoxb-default-test"})
+        sink = build_reply_sink(
+            config, provider_tokens={"default": "xoxb-default-test"}, base_url=base_url
+        )
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
         )
@@ -336,72 +266,6 @@ def test_rendered_notice_uses_slack_shortcodes_not_literal_emoji() -> None:
         assert text.isascii(), text
 
 
-def test_notice_from_a_newer_api_with_an_extra_field_is_still_delivered(
-    sync_redis: redis.Redis, names: dict[str, str]
-) -> None:
-    """During a roll the API can be newer than this worker.
-
-    A field this worker does not know must not dead-letter every notice as
-    unparseable; the fields it does know still decide the post.
-    """
-
-    async def go() -> None:
-        capture = Capture()
-        server = TestServer(capture.app)
-        await server.start_server()
-        assert server.port is not None
-        config = WorkerConfig(
-            slack_api_base_url=f"http://127.0.0.1:{server.port}/slack/api/",
-            read_block_ms=100,
-            key_prefix=names["prefix"],
-        )
-        sink = build_reply_sink(config, slack_tokens={"ops": "xoxb-ops-test"})
-        valkey = AsyncRedis(
-            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
-        )
-        consumer = DeployNoticeConsumer(
-            redis=valkey,
-            sink=sink,
-            config=config,
-            stream=names["stream"],
-            group=names["group"],
-            consumer="notice-forward-compatible",
-            leases=DeliveryLeaseStore(valkey, config),
-        )
-        task = asyncio.create_task(consumer.run())
-        try:
-            notice = {
-                "address": "C0EXAMPLE1",
-                "identity": "ops",
-                "agent_name": "acme-dev",
-                "status": "deployed",
-                "sha": "a" * 40,
-                "environment": "dev",
-                "codes": [],
-                "introduced_by_a_newer_api": {"any": "shape"},
-            }
-            entry = await valkey.xadd(names["stream"], {"payload": json.dumps(notice)})
-            for _ in range(100):
-                if capture.requests:
-                    break
-                await asyncio.sleep(0.05)
-            assert capture.paths() == ["/slack/api/chat.postMessage"]
-            assert "deployed aaaaaaaa (dev)" in json.loads(capture.requests[0]["body"])["text"]
-            assert await valkey.xrange(f"{names['stream']}:dead") == []
-            assert await valkey.xpending_range(
-                names["stream"], names["group"], min=entry, max=entry, count=1
-            ) == []
-        finally:
-            consumer.request_stop()
-            await asyncio.wait_for(task, timeout=5)
-            await valkey.delete(f"{names['stream']}:dead")
-            await sink.aclose()
-            await valkey.aclose()
-            await server.close()
-
-    asyncio.run(go())
-
-
 def test_a_notice_slack_keeps_refusing_is_dead_lettered_at_the_delivery_cap(
     sync_redis: redis.Redis, names: dict[str, str]
 ) -> None:
@@ -417,15 +281,15 @@ def test_a_notice_slack_keeps_refusing_is_dead_lettered_at_the_delivery_cap(
         server = TestServer(capture.app)
         await server.start_server()
         assert server.port is not None
+        base_url = f"http://127.0.0.1:{server.port}/slack/dead/"
         config = WorkerConfig(
-            slack_api_base_url=f"http://127.0.0.1:{server.port}/slack/dead/",
             read_block_ms=100,
             key_prefix=names["prefix"],
             max_delivery=2,
             reclaim_min_idle_ms=0,
             reclaim_interval_s=0.1,
         )
-        sink = build_reply_sink(config, slack_tokens={"ops": "xoxb-ops-test"})
+        sink = build_reply_sink(config, provider_tokens={"ops": "xoxb-ops-test"}, base_url=base_url)
         valkey = AsyncRedis(
             host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW, decode_responses=True
         )

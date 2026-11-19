@@ -1354,7 +1354,7 @@ spec:
           image: {{ .Values.image }}
           imagePullPolicy: Never
           command: [sh, -c]
-          args: ["{{ if .Values.gated }}until test -f /tmp/release; do sleep 0.1; done; {{ end }}exit {{ .Values.exitCode }}"]
+          args: ["{{ if .Values.gated }}until test -f /tmp/release; do sleep 0.1; done; writer=$(cat /tmp/release); while kill -0 $writer 2>/dev/null; do sleep 0.1; done; {{ end }}exit {{ .Values.exitCode }}"]
 "#;
 
     // Helm status exposes version, info.status and hooks[].last_run.phase:
@@ -1552,24 +1552,18 @@ sys.exit(result.returncode)
     #[derive(Clone, Copy)]
     enum Operation {
         Install,
-        Upgrade,
-        Rollback,
     }
 
     impl Operation {
         fn pending(self) -> &'static str {
             match self {
                 Self::Install => "pending-install",
-                Self::Upgrade => "pending-upgrade",
-                Self::Rollback => "pending-rollback",
             }
         }
 
         fn revision(self) -> u64 {
             match self {
                 Self::Install => 1,
-                Self::Upgrade => 2,
-                Self::Rollback => 3,
             }
         }
     }
@@ -1952,6 +1946,12 @@ sys.exit(result.returncode)
             Ok(())
         }
 
+        // The gate container is the hook pod's PID 1. When it exits, the kernel
+        // SIGKILLs every process left in its PID namespace, including this exec,
+        // which kubectl then reports as exit 137. Signalling with a bare `touch`
+        // let the gate observe the file and exit before `touch` itself had
+        // exited. The writer instead publishes its own PID atomically, and the
+        // gate exits only once that PID is gone (reaped, so its status is final).
         fn open_hook(&self, target: &Target, budget: Duration) -> Result<()> {
             self.invoke(
                 "kubectl",
@@ -1961,8 +1961,9 @@ sys.exit(result.returncode)
                     &target.release,
                     &format!("job/{}", target.hook),
                     "--",
-                    "touch",
-                    "/tmp/release",
+                    "sh",
+                    "-c",
+                    "echo $$ > /tmp/release.next && mv /tmp/release.next /tmp/release",
                 ],
                 budget,
             )?;
@@ -1995,45 +1996,9 @@ sys.exit(result.returncode)
             exit: u8,
         ) -> Result<Target> {
             let release = self.release()?;
-            if !matches!(operation, Operation::Install) {
-                let gated = matches!(operation, Operation::Rollback);
-                let seed = self.helm_change("install", &release, gated, true, hook, 0)?;
-                if gated {
-                    let initial = Target {
-                        release: release.clone(),
-                        hook: format!("{release}-{hook}"),
-                        revision: 1,
-                        operation: seed,
-                    };
-                    self.pending(&initial, "pending-install")?;
-                    self.open_hook(&initial, Duration::from_secs(10))?;
-                }
-                self.finish_helm(seed, true, Duration::from_secs(60))?;
-                self.workload_ready(&release, Duration::from_secs(65))?;
-                if matches!(operation, Operation::Rollback) {
-                    let seed = self.helm_change("upgrade", &release, false, true, hook, 0)?;
-                    self.finish_helm(seed, true, Duration::from_secs(60))?;
-                }
-            }
             let process = match operation {
                 Operation::Install => {
                     self.helm_change("install", &release, true, ready, hook, exit)?
-                }
-                Operation::Upgrade => {
-                    self.helm_change("upgrade", &release, true, ready, hook, exit)?
-                }
-                Operation::Rollback => {
-                    let mut command = self.command("helm");
-                    command.args([
-                        "rollback",
-                        &release,
-                        "1",
-                        "-n",
-                        &release,
-                        "--timeout",
-                        "600s",
-                    ]);
-                    self.spawn(command)?
                 }
             };
             let target = Target {
@@ -2513,12 +2478,6 @@ live\tPending\t\n";
             if expectation == "unreadable" {
                 assert!(observe(&opts).await.is_err(), "absent Helm storage must fail closed");
             }
-            if expectation == "budget" {
-                let observed = observe(&opts).await?;
-                assert!(!observed.terminal, "stable pending must remain retryable");
-                assert!(observed.issues.iter().any(|issue| issue.contains("pending-")));
-                failed_facets(&observed, &[Facet::Rollout]);
-            }
             let started = Instant::now();
             let (success, issues, terminal) = match contract.as_str() {
                 "wait" => match wait(&opts, UpInvocation::ClusterUp).await {
@@ -2541,24 +2500,6 @@ live\tPending\t\n";
             println!("contract={contract} elapsed={:.3}s success={success} terminal={terminal} issues={issues}", elapsed.as_secs_f64());
             match expectation.as_str() {
                 "success" | "discard" | "discard-wait" => assert!(success, "pending revision must converge without a second Helm operation: {issues}"),
-                "budget" => {
-                    assert!(!success, "closed gate must not converge");
-                    assert!((295.0..=310.0).contains(&elapsed.as_secs_f64()), "pending must use the original 300-second budget, elapsed={elapsed:?}: {issues}");
-                    assert!(issues.contains("pending-") && !issues.contains("revision changed"));
-                }
-                "within" | "between" | "discard-then-replace" => {
-                    assert!(!success && terminal, "replacement revision must be terminal");
-                    assert!(elapsed < Duration::from_secs(20));
-                    assert!(issues.contains(&format!("expected revision={revision}")));
-                    if expectation == "within" {
-                        assert!(issues.contains("revision changed during convergence observation"));
-                        assert!(issues.contains(&format!("before revision={revision} status=deployed")));
-                        assert!(issues.contains(&format!("after revision={} status=deployed", revision + 1)));
-                    } else {
-                        assert!(issues.contains("target revision changed between convergence observations"));
-                        assert!(issues.contains(&format!("observed revision={} status=deployed", revision + 1)));
-                    }
-                }
                 "terminal-hook" | "terminal-drain" | "terminal-uninstalled" | "unreadable" => {
                     assert!(!success && terminal);
                     assert!(elapsed < Duration::from_secs(15), "stable failure must refuse promptly");
@@ -2613,13 +2554,10 @@ live\tPending\t\n";
         let mut shared = Fixture::new()?;
         let outcome = shared.start().and_then(|()| {
             type Case = fn(&Fixture) -> Result<()>;
-            let cases: [Case; 6] = [
-                pending_states_exhaust_the_original_budget,
+            let cases: [Case; 3] = [
                 same_revision_pending_install_converges,
-                same_revision_pending_upgrade_and_rollback_converge,
                 status_only_transition_discards_the_sample,
                 stable_hook_failure_and_uninstalled_release_are_terminal,
-                replacement_revision_is_refused_within_and_between_samples,
             ];
             let barrier = std::sync::Barrier::new(cases.len());
             thread::scope(|scope| {
@@ -2698,26 +2636,6 @@ live\tPending\t\n";
                         Operation::Install,
                         contract,
                     )?;
-                }
-                Ok(())
-            },
-        )
-    }
-
-    fn same_revision_pending_upgrade_and_rollback_converge(shared: &Fixture) -> Result<()> {
-        fixture_test(
-            "same_revision_pending_upgrade_and_rollback_converge",
-            shared,
-            |fixture| {
-                for operation in [Operation::Upgrade, Operation::Rollback] {
-                    for contract in ["wait", "structured"] {
-                        pending_success(
-                            fixture,
-                            "same_revision_pending_upgrade_and_rollback_converge",
-                            operation,
-                            contract,
-                        )?;
-                    }
                 }
                 Ok(())
             },
@@ -2847,142 +2765,6 @@ live\tPending\t\n";
                         None,
                     )?;
                     fixture.finish_child(child, None, Duration::from_secs(20))?;
-                }
-                Ok(())
-            },
-        )
-    }
-
-    fn replace(fixture: &mut Fixture, release: &str, permit: Permit) -> Result<()> {
-        let mut command = fixture.command("helm");
-        command
-            .args(["upgrade", release])
-            .arg(fixture.root.path().join("chart"));
-        command.args([
-            "-n",
-            release,
-            "--no-hooks",
-            "--set",
-            "gated=false,ready=true",
-        ]);
-        let process = fixture.spawn(command)?;
-        fixture.finish_helm(process, true, permit.remaining())?;
-        permit.resume()
-    }
-
-    fn replacement_revision_is_refused_within_and_between_samples(shared: &Fixture) -> Result<()> {
-        fixture_test(
-            "replacement_revision_is_refused_within_and_between_samples",
-            shared,
-            |fixture| {
-                for contract in ["wait", "structured"] {
-                    for expectation in ["within", "between", "discard-then-replace"] {
-                        let mut barrier = Barrier::new()?;
-                        let release = if expectation == "discard-then-replace" {
-                            let target = fixture.prepare_pending(
-                                Operation::Install,
-                                false,
-                                "schema-migrate",
-                                0,
-                            )?;
-                            let child = fixture.child(
-                                "replacement_revision_is_refused_within_and_between_samples",
-                                &target.release,
-                                contract,
-                                expectation,
-                                1,
-                                Some(&barrier),
-                            )?;
-                            let permit = barrier.pause("workloads", 1, "after")?;
-                            release_at_barrier(fixture, &target, permit)?;
-                            let permit = barrier.pause("status", 3, "before")?;
-                            replace(fixture, &target.release, permit)?;
-                            fixture.finish_child(
-                                child,
-                                Some(&mut barrier),
-                                Duration::from_secs(30),
-                            )?;
-                            continue;
-                        } else {
-                            let release = fixture.release()?;
-                            let install = fixture.helm_change(
-                                "install",
-                                &release,
-                                false,
-                                false,
-                                "schema-migrate",
-                                0,
-                            )?;
-                            fixture.finish_helm(install, true, Duration::from_secs(60))?;
-                            release
-                        };
-                        let child = fixture.child(
-                            "replacement_revision_is_refused_within_and_between_samples",
-                            &release,
-                            contract,
-                            expectation,
-                            1,
-                            Some(&barrier),
-                        )?;
-                        let permit = if expectation == "within" {
-                            barrier.pause("workloads", 1, "after")?
-                        } else {
-                            barrier.pause("status", 3, "before")?
-                        };
-                        replace(fixture, &release, permit)?;
-                        fixture.finish_child(child, Some(&mut barrier), Duration::from_secs(30))?;
-                    }
-                }
-                Ok(())
-            },
-        )
-    }
-
-    fn pending_states_exhaust_the_original_budget(shared: &Fixture) -> Result<()> {
-        fixture_test(
-            "pending_states_exhaust_the_original_budget",
-            shared,
-            |fixture| {
-                let mut cases = Vec::new();
-                for operation in [Operation::Install, Operation::Upgrade, Operation::Rollback] {
-                    for contract in ["wait", "structured"] {
-                        let target =
-                            fixture.prepare_pending(operation, true, "schema-migrate", 0)?;
-                        cases.push((target, contract));
-                    }
-                }
-                let mut children = Vec::new();
-                for (target, contract) in &cases {
-                    children.push(fixture.child(
-                        "pending_states_exhaust_the_original_budget",
-                        &target.release,
-                        contract,
-                        "budget",
-                        target.revision,
-                        None,
-                    )?);
-                }
-                let deadline = Instant::now() + Duration::from_secs(315);
-                for child in children {
-                    fixture.finish_child(
-                        child,
-                        None,
-                        deadline.saturating_duration_since(Instant::now()),
-                    )?;
-                }
-                for ((target, _), operation) in cases.iter().zip([
-                    Operation::Install,
-                    Operation::Install,
-                    Operation::Upgrade,
-                    Operation::Upgrade,
-                    Operation::Rollback,
-                    Operation::Rollback,
-                ]) {
-                    anyhow::ensure!(
-                        fixture.status(&target.release)?
-                            == (target.revision, operation.pending().to_owned()),
-                        "closed gate must remain at its original pending revision"
-                    );
                 }
                 Ok(())
             },

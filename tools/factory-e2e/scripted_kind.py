@@ -1061,6 +1061,9 @@ class ScriptedRun:
             "-At",
             "-v",
             "ON_ERROR_STOP=1",
+            # An error report then names its SQLSTATE; the output is unchanged.
+            "-v",
+            "VERBOSITY=verbose",
             "-c",
             "BEGIN READ ONLY; " + query + "; COMMIT;",
         )

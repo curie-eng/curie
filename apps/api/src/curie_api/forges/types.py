@@ -217,6 +217,9 @@ class Commit:
     sha: str
     parents: tuple[str, ...]
     message: str
+    # The commit's tree id. Only the GitHub `read_commit` fills it; every
+    # other adapter, and a GitHub payload without one, leaves it None.
+    tree: str | None = None
 
 
 ReplyKind = Literal["issue", "pull_request", "review_thread"]
@@ -620,6 +623,26 @@ class ReviewFeedback:
 class FeedbackPage:
     items: tuple[ReviewFeedback, ...]
     cursor: str
+
+
+@dataclass(frozen=True)
+class EvidenceFile:
+    """One file `CodeHost.store_evidence` hosts: a relative path, its bytes and
+    their lowercase hex sha256. The bytes never appear in a repr."""
+
+    path: str
+    content: bytes = field(repr=False)
+    sha256: str
+
+
+@dataclass(frozen=True)
+class StoredEvidence:
+    """Where `CodeHost.store_evidence` put the files: the ref it created or
+    moved, the commit it names, and each file path's image URL at that commit."""
+
+    ref: str
+    commit_sha: str
+    urls: Mapping[str, str]
 
 
 @dataclass(frozen=True)
