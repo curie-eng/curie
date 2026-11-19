@@ -31,10 +31,11 @@ mentions the factory can still arrive as a ``MENTION``. Its kind is therefore
 decided at admission, under the WorkItem lock: a comment that already has an
 answer receipt starts nothing more, and a mention on a WorkItem whose question
 row is ``posting``, ``outstanding`` or ``answered`` goes to the answer core
-like an answer, once ``verify_current`` holds it current as an answer under
-the WorkItem's trigger label (the issue still carries that label and is open;
-a mention alone is current while its comment stands). One comment never starts
-both an answer and a mention.
+like an answer. Any mention, answer or revision, acts only once
+``verify_current`` holds it current as an answer under the WorkItem's trigger
+label: the issue still carries that label and is open, and the comment
+stands (a mention's own check reads only its comment on some trackers). One
+comment never starts both an answer and a mention.
 
 The snapshot can also be stale the other way: the round was ``answered`` when
 the poll took it, then the answer's run ended and cleared it before the
@@ -44,7 +45,9 @@ nothing is asked any more, and `admit_answer` would keep a permanent
 delivered answer whose row, read under the WorkItem lock, is no longer
 ``posting``, ``outstanding`` or ``answered`` is held like a ``posting`` one
 below. The next poll's snapshot leaves the issue out, so the replayed comment
-arrives as a mention if it mentions the factory, and as nothing otherwise.
+arrives as a mention if it mentions the factory, and as nothing otherwise; a
+first poll, which a label with a held first page repeats, delivers a running
+issue's mentions since its label was last added for this reason.
 
 A ``posting`` row is in the answering set on purpose. Its question comment may
 already be on the ticket while the row is not yet ``outstanding`` (the tracker
@@ -922,23 +925,26 @@ async def _mention(
             work_item_id,
         )
         return
+    # Whether it answers or revises, a mention acts only on the open issue that
+    # still carries the WorkItem's trigger label, with its comment standing
+    # (#5789 decision 3). The mention's own check, made under whichever
+    # label's poll delivered it, does not say so on every tracker (GitLab's
+    # reads only the note), and a mention replayed after a hold can arrive
+    # before the poll that cancels the WorkItem.
+    trigger_label = existing.trigger_label or scope.tracker.label
+    as_answer = replace(notice, disposition=Disposition.ANSWER, marker=trigger_label)
+    if not await tracker.verify_current(as_answer):
+        logger.info(
+            "tracker intake for binding %s ignored a mention on work item %s whose issue is "
+            "closed or no longer carries its trigger label",
+            binding.name,
+            work_item_id,
+        )
+        return
     state = await session.scalar(
         select(FactoryQuestionRound.state).where(FactoryQuestionRound.work_item_id == work_item_id)
     )
     if state in _ANSWERING_STATES:
-        # An answer must stand on the open issue that still carries the
-        # WorkItem's trigger label (#5789 decision 3); a mention's own check,
-        # under another label's poll, does not say so.
-        trigger_label = existing.trigger_label or scope.tracker.label
-        as_answer = replace(notice, disposition=Disposition.ANSWER, marker=trigger_label)
-        if not await tracker.verify_current(as_answer):
-            logger.info(
-                "tracker intake for binding %s ignored a mention on work item %s that is "
-                "no current answer",
-                binding.name,
-                work_item_id,
-            )
-            return
         await _to_answer_core(session, scope, tracker, notice, work_item_id)
         return
     surface = await agent_binding(session, existing.agent_id, scope.surface_kind, scope.location)

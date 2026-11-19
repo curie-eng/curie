@@ -267,13 +267,8 @@ class GitLabTracker:
         (#5789)."""
 
         start = None if cursor is None else Cursor.parse(cursor)
-        answers = {
-            ref.issue_id
-            for ref in answering
-            if ref.kind == types.GITLAB
-            and ref.host == self.host
-            and ref.scope_id == self._project_id
-        }
+        answers = self._own_ids(answering)
+        live = self._own_ids(running)
         if start is None:
             params: dict[str, str | int] = {
                 "labels": self.label,
@@ -313,7 +308,13 @@ class GitLabTracker:
             if start is None:
                 pending.extend(
                     await self._first_poll(
-                        ref, labels, notes, floor, considered, answering=str(iid) in answers
+                        ref,
+                        labels,
+                        notes,
+                        floor,
+                        considered,
+                        answering=str(iid) in answers,
+                        live=str(iid) in live,
                     )
                 )
                 continue
@@ -352,6 +353,15 @@ class GitLabTracker:
             cursor=page_cursor,
         )
 
+    def _own_ids(self, refs: Sequence[TrackerIssueRef]) -> set[str]:
+        return {
+            ref.issue_id
+            for ref in refs
+            if ref.kind == types.GITLAB
+            and ref.host == self.host
+            and ref.scope_id == self._project_id
+        }
+
     async def _first_poll(
         self,
         ref: TrackerIssueRef,
@@ -361,30 +371,50 @@ class GitLabTracker:
         considered: dict[str, datetime],
         *,
         answering: bool,
+        live: bool,
     ) -> list[_Pending]:
         """No cursor: the latest add of the label is a notice when a person made
-        it, and on an ``answering`` issue every note by a person is an answer.
-        Everything else in the overlap is remembered.
+        it, on an ``answering`` issue every note by a person is an answer, and
+        on a ``live`` (running) issue every mention since that latest add is a
+        mention. Everything else in the overlap is remembered.
 
-        Answers are delivered because a label whose first page held an issue
-        saves no cursor and polls as a first poll again; a note remembered
-        here and never delivered would be lost. The notes are listed in full,
-        the answer core's fence refuses one older than the question, and its
-        receipt makes a replay harmless."""
+        Answers and those mentions are delivered because a label whose first
+        page held an issue saves no cursor and polls as a first poll again; a
+        note remembered here and never delivered would be lost. The notes are
+        listed in full, the answer core's fence refuses one older than the
+        question, its receipt makes a replay harmless, and a replayed mention
+        replays under its request id."""
 
         for event in (*labels, *notes):
             if event.at >= floor:
                 considered[event.token] = event.at
-        answers: list[_Pending] = []
-        if answering:
+        delivered: list[_Pending] = []
+        since = None if answering or not live else self._labelled_at(labels)
+        if answering or since is not None:
+            disposition = Disposition.ANSWER if answering else Disposition.MENTION
             for note in notes:
-                if not isinstance(note.payload.get("body"), str):
+                body = note.payload.get("body")
+                if not isinstance(body, str):
+                    continue
+                if not answering and (
+                    since is None or note.at < since or not self._mention.search(body)
+                ):
                     continue
                 actor = await self._transport.is_person(note.payload.get("author"))
                 if actor is not None:
                     considered[note.token] = note.at
-                    answers.append(_Pending(ref, actor, note.token, Disposition.ANSWER, note.at))
-        return answers + await self._first_admission(ref, labels, considered)
+                    delivered.append(_Pending(ref, actor, note.token, disposition, note.at))
+        return delivered + await self._first_admission(ref, labels, considered)
+
+    def _labelled_at(self, labels: list[_Event]) -> datetime | None:
+        """When the label was last added to the issue, or None."""
+
+        adds = [
+            e
+            for e in labels
+            if e.payload.get("action") == "add" and _label_name(e.payload) == self.label
+        ]
+        return max((e.at for e in adds), default=None)
 
     async def _first_admission(
         self, ref: TrackerIssueRef, labels: list[_Event], considered: dict[str, datetime]

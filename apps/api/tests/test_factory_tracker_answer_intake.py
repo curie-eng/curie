@@ -986,3 +986,190 @@ def test_answer_snapshot_taken_before_the_round_cleared_keeps_a_fresh_mention(
     assert _answer_id(intake.ref(issue), reply) not in ids
     assert _receipts(work_item_id) == {first: ("admitted", answer)}
     assert _cursor() != cursor
+
+
+# --- final review: a held reply on a first poll, and its replay after closure -------------
+
+
+def _mention_reply(intake: Intake, issue: jira_fake.JiraIssue) -> str:
+    # An ADF ``mention`` node naming the bot (the comment body is ADF,
+    # https://developer.atlassian.com/cloud/jira/platform/apis/document/nodes/mention/).
+    return intake.jira.add_comment(
+        issue.id,
+        intake.starter,
+        jira_fake.adf_mention(jira_fake.BOT_ACCOUNT_ID, jira_fake.BOT_NAME, after=" also trim"),
+    )
+
+
+def test_answer_snapshot_stale_on_a_first_poll_delivers_the_held_mention_on_jira(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    """The label's first page holds a ticket (its code host does not answer),
+    so every pass is a first poll. Another ticket is admitted, asked and
+    answered. Its answer's run ends after a pass's snapshot, while the
+    starter's reply mentions the bot: that pass holds the reply. The next pass,
+    still a first poll, delivers it as a mention, which starts exactly one
+    request, and nothing repeats once the outage ends and the cursor is saved."""
+
+    intake = make_intake(_dc_document())
+    _held, issue, _event = _held_tickets(intake)
+    intake.dc_down = True
+    intake.poll()
+    assert _cursor() is None
+    [item] = _work_items(issue)
+    work_item_id = item["id"]
+    [request_id] = _ids(work_item_id)
+    _ask_and_settle(intake, work_item_id, request_id)
+    first = intake.jira.add_comment(issue.id, intake.starter, ANSWER_TEXT)
+    intake.poll()
+    answer = _assert_admitted(work_item_id, intake.ref(issue), first, [request_id])
+    epoch = _start(intake, answer)
+
+    reply = _mention_reply(intake, issue)
+    # The pass's JQL search is its first tracker read, after the snapshot
+    # (https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/#api-rest-api-3-search-jql-post).
+    intake.jira.before_next("search", lambda: _finish(intake.client, answer, epoch))
+    intake.poll()
+
+    assert _cursor() is None
+    assert _round_state(work_item_id) == ("cleared", answer)
+    assert _ids(work_item_id) == [request_id, answer]
+    assert _receipts(work_item_id) == {first: ("admitted", answer)}
+
+    intake.poll()
+
+    ids = _ids(work_item_id)
+    assert ids[:2] == [request_id, answer]
+    assert len(ids) == 3
+    assert _answer_id(intake.ref(issue), reply) not in ids
+    assert _receipts(work_item_id) == {first: ("admitted", answer)}
+
+    intake.dc_down = False
+    intake.poll()
+    assert _cursor() is not None
+    intake.poll()
+    assert _ids(work_item_id) == ids
+
+
+def _gitlab_cursor(install: gl.GitLabInstall) -> str | None:
+    rows = _rows("SELECT etags FROM curie.factory_poll_cursors WHERE tracker_kind = 'gitlab'", {})
+    if not rows:
+        return None
+    value = (rows[0]["etags"] or {}).get(f"marked:{install.label}")
+    return None if value is None else str(value)
+
+
+def _issues_listing(install: gl.GitLabInstall) -> str:
+    """The project's issue listing, the GitLab poll's first read after its
+    snapshot (https://docs.gitlab.com/api/issues/#list-project-issues)."""
+
+    return f"/projects/{install.backend.project_id}/issues"
+
+
+def _answered_on_gitlab(
+    install: gl.GitLabInstall, *, before_pass: Callable[[], None]
+) -> tuple[int, uuid.UUID, uuid.UUID, uuid.UUID, int]:
+    """A developer's issue admitted, asked, settled and answered on GitLab,
+    and the answer's run started; ``before_pass`` runs before every pass.
+    Returns the iid, the WorkItem, its first request, the answer request and
+    the answer's runtime epoch."""
+
+    backend = install.backend
+    before_pass()
+    iid, work_item_id = _gitlab_asked(install)
+    [first_request] = _ids(work_item_id)
+    note_id = backend.issue_note(iid, backend.developer, ANSWER_TEXT)
+    before_pass()
+    gl.reconcile()
+    answer = _assert_admitted(work_item_id, install.issue_ref(iid), str(note_id), [first_request])
+    return iid, work_item_id, first_request, answer, gl.start_request(install.client, answer)
+
+
+def test_answer_snapshot_stale_on_a_first_poll_delivers_the_held_mention_on_gitlab(
+    gitlab: gl.GitLabInstall,
+) -> None:
+    """The GitLab twin of the Jira case: another labelled issue's admission is
+    held on every pass (its issue read answers 503,
+    https://docs.gitlab.com/api/rest/troubleshooting/#status-codes), so every
+    pass is a first poll. The answer's run ends after a pass's snapshot while
+    the developer's reply mentions the bot: that pass holds the reply, and the
+    next first poll delivers it as a mention that starts exactly one request."""
+
+    backend = gitlab.backend
+    blocked = backend.add_issue("Widget exporter drops the header row", author=backend.developer)
+    backend.label_issue(blocked, gitlab.label, backend.developer)
+    blocked_read = f"/projects/{backend.project_id}/issues/{blocked}"
+
+    def hold_blocked() -> None:
+        gitlab.fake.script(503, path=blocked_read, method="GET")
+
+    iid, work_item_id, first_request, answer, epoch = _answered_on_gitlab(
+        gitlab, before_pass=hold_blocked
+    )
+    assert _gitlab_cursor(gitlab) is None
+
+    reply = backend.issue_note(iid, backend.developer, gl.mention_body(gitlab))
+    gitlab.fake.before_next(
+        lambda: _finish(gitlab.client, answer, epoch), method="GET", path=_issues_listing(gitlab)
+    )
+    hold_blocked()
+    gl.reconcile()
+
+    assert _gitlab_cursor(gitlab) is None
+    assert _round_state(work_item_id) == ("cleared", answer)
+    assert _ids(work_item_id) == [first_request, answer]
+
+    hold_blocked()
+    gl.reconcile()
+
+    ids = _ids(work_item_id)
+    assert ids[:2] == [first_request, answer]
+    assert len(ids) == 3
+    assert _answer_id(gitlab.issue_ref(iid), str(reply)) not in ids
+    assert str(reply) not in _receipts(work_item_id)
+
+    gl.reconcile()
+    assert _gitlab_cursor(gitlab) is not None
+    assert len(gl.work_items(blocked)) == 1
+    gl.reconcile()
+    assert _ids(work_item_id) == ids
+
+
+@pytest.mark.parametrize("change", ["closed", "unlabelled", "open"])
+def test_answer_held_reply_replayed_after_the_issue_changed_on_gitlab(
+    gitlab: gl.GitLabInstall, change: str
+) -> None:
+    """The answer's run ends after a pass's snapshot while the developer's
+    reply mentions the bot, so that pass holds the reply. Before the replay
+    the issue is closed or loses the trigger label: the replayed mention, whose
+    own check reads only the note, starts nothing, and the same pass cancels
+    the WorkItem. Left open and labelled, the replay starts one request."""
+
+    backend = gitlab.backend
+    iid, work_item_id, first_request, answer, epoch = _answered_on_gitlab(
+        gitlab, before_pass=lambda: None
+    )
+    reply = backend.issue_note(iid, backend.developer, gl.mention_body(gitlab))
+    gitlab.fake.before_next(
+        lambda: _finish(gitlab.client, answer, epoch), method="GET", path=_issues_listing(gitlab)
+    )
+    gl.reconcile()
+    assert _round_state(work_item_id) == ("cleared", answer)
+    assert _ids(work_item_id) == [first_request, answer]
+
+    if change == "closed":
+        gitlab.fake.set_issue_state(iid, "closed", backend.developer)
+    elif change == "unlabelled":
+        backend.label_issue(iid, gitlab.label, backend.developer, add=False)
+    gl.reconcile()
+
+    ids = _ids(work_item_id)
+    assert str(reply) not in _receipts(work_item_id)
+    [item] = gl.work_items(iid)
+    if change == "open":
+        assert ids[:2] == [first_request, answer]
+        assert len(ids) == 3
+        assert item["cancelled_at"] is None
+        return
+    assert ids == [first_request, answer]
+    assert item["cancelled_at"] is not None

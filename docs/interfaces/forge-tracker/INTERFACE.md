@@ -47,10 +47,13 @@ marked and described:
    cancels. Its required `answering` argument names the issues whose WorkItem
    has a factory question round open; on those, every new comment by a person,
    with or without a mention, is an answer notice, including on a first poll.
-   The shared intake decides each mention again under the WorkItem lock, so a
-   mention on an issue whose round opened after the poll began is admitted as
-   an answer only while the issue is open and keeps the WorkItem's trigger
-   label, and a comment already decided as an answer starts nothing. An
+   A first poll also delivers a running issue's mentions made since its label
+   was last added, because a label whose first page held an issue polls as a
+   first poll again. The shared intake decides each mention again under the
+   WorkItem lock: any mention acts only while the issue is open and keeps the
+   WorkItem's trigger label, one on an issue whose round opened after the
+   poll began is admitted as an answer, and a comment already decided as an
+   answer starts nothing. An
    answer that arrives while the question is still posting, or after its round
    ended since the poll began, is held with the issue's later notices and the
    cursor stays unsaved until a later poll can settle it; on that later poll a

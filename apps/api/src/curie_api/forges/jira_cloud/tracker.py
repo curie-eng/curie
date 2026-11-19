@@ -441,11 +441,8 @@ class JiraTracker:
         """
 
         start = None if cursor is None else Cursor.parse(cursor)
-        answers = {
-            ref.issue_id
-            for ref in answering
-            if ref.kind == JIRA_CLOUD and ref.host == self.host and ref.scope_id == self._scope_id
-        }
+        answers = self._own_ids(answering)
+        live = self._own_ids(running)
         zone = await self._verify_identity()
         found = await self._transport.search_jql(
             self._jql(start, zone), SEARCH_FIELDS, page_size=self._page_size
@@ -468,12 +465,25 @@ class JiraTracker:
         known = frozenset() if start is None else start.ids
         histories = {issue_id: await self._changelog(issue_id) for issue_id in issues}
         read_back = floor if start is None else window
+        # A first poll delivers a running issue's mentions since its label was
+        # last added (see `_mention_notices`).
+        labelled_at = {
+            issue_id: self._labelled_at(ref, fields, histories[issue_id])
+            for issue_id, (ref, _updated, fields) in issues.items()
+            if start is None and issue_id in live and issue_id not in answers
+        }
         comments: dict[str, list[dict[str, Any]]] = {}
         for issue_id in issues:
-            # A first poll reads an answering issue's comments in full: each is
-            # delivered (see `_mention_notices`), since a label whose cursor was
-            # never saved polls as a first poll again.
-            back = None if start is None and issue_id in answers else read_back
+            # A first poll reads an answering issue's comments in full, and a
+            # running issue's back to its label add: they are delivered (see
+            # `_mention_notices`), since a label whose cursor was never saved
+            # polls as a first poll again.
+            if start is None and issue_id in answers:
+                back = None
+            elif labelled_at.get(issue_id) is not None and read_back is not None:
+                back = min(labelled_at[issue_id] or read_back, read_back)
+            else:
+                back = read_back
             comments[issue_id] = await self._recent_comments(issue_id, back)
         considered: dict[str, int] = {}
         pending: list[_Pending] = []
@@ -492,6 +502,7 @@ class JiraTracker:
                     known,
                     considered,
                     answering=issue_id in answers,
+                    since=labelled_at.get(issue_id),
                 )
             )
         for ref in running:
@@ -519,6 +530,28 @@ class JiraTracker:
             ),
             cursor=page_cursor,
         )
+
+    def _own_ids(self, refs: Sequence[TrackerIssueRef]) -> set[str]:
+        return {
+            ref.issue_id
+            for ref in refs
+            if ref.kind == JIRA_CLOUD and ref.host == self.host and ref.scope_id == self._scope_id
+        }
+
+    def _labelled_at(
+        self,
+        ref: TrackerIssueRef,
+        fields: Mapping[str, Any],
+        histories: Sequence[Mapping[str, Any]],
+    ) -> int | None:
+        """When the label was last added to the issue (a changelog add, else
+        the issue's creation with it), or None when neither says."""
+
+        latest = self._latest(histories, lambda h: adds_label(h, self.label))
+        if latest is not None:
+            return jira_ms(latest.get("created"))
+        creation = self._creation_notice(ref, fields, histories, self.label)
+        return None if creation is None else creation.at
 
     async def _recent_comments(self, issue_id: str, floor: int | None) -> list[dict[str, Any]]:
         """The issue's comments newest first, back to ``floor`` (decision 11)."""
@@ -587,16 +620,19 @@ class JiraTracker:
         considered: dict[str, int],
         *,
         answering: bool,
+        since: int | None,
     ) -> list[_Pending]:
         """Mentions, or on an ``answering`` issue every comment by a person as an
         answer (#5789 decision 2): one comment is one notice, never both.
 
-        A first poll delivers no mention, but it does deliver an answering
-        issue's answers: a label whose first page held an issue saves no
-        cursor and polls as a first poll again, so a comment remembered here
-        and never delivered would be lost. The answer core's fence refuses a
-        comment older than the question, and its receipt makes a replay
-        harmless."""
+        A first poll remembers older mentions without delivering them, but it
+        delivers an answering issue's answers and, on a running issue, each
+        mention made at or after ``since`` (when its label was last added): a
+        label whose first page held an issue saves no cursor and polls as a
+        first poll again, so a comment remembered here and never delivered
+        would be lost. The answer core's fence refuses a comment older than
+        the question, its receipt makes a replay harmless, and a replayed
+        mention replays under its request id."""
 
         disposition = Disposition.ANSWER if answering else Disposition.MENTION
         notices: list[_Pending] = []
@@ -614,10 +650,11 @@ class JiraTracker:
                 continue
             token = f"{_COMMENT}{comment_id}"
             if start is None:
-                # A first poll delivers label adds and answers; a mention is
+                # A first poll delivers label adds, answers and a running
+                # issue's mentions since its label add; any other mention is
                 # remembered.
                 considered[token] = created
-                if answering:
+                if answering or (since is not None and created >= since):
                     notices.append(_Pending(ref, actor, str(comment_id), disposition, created))
                 continue
             if window is not None and created < window:
