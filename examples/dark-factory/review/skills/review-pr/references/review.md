@@ -28,22 +28,25 @@ function. Include an alternate branch for a failure or fallback when it
 changes the outcome. Mark what persists after a command exits. Show old and
 new flows when that is needed to see the change. Use prose for a single action.
 Choose the diagram format for the client's actual display. If Mermaid fences
-render, use a concise Mermaid sequence diagram. If they appear as code, draw
-the flow as plain text in the response, for example:
+render, use a concise Mermaid sequence diagram. Claude Code's terminal and
+Desktop Code transcript currently show Mermaid fences as source; treat these
+as unsupported unless the current interface demonstrably renders them. If
+uncertain, use the browser path. Do not mistake a syntax highlighted Mermaid
+block for a rendered diagram.
 
-```text
-User             CLI                Kubernetes
- |-- access ----->|                     |
- |               |-- port forwards ---->|
- |               |<-- ready ------------|
- |<-- URLs -------|                     |
- |-- interrupt -->|-- stop forwards --->|
-```
-
-Label any alternate failure or fallback branch below the main flow. Keep
-actors and branch outcomes legible in an ordinary terminal width. A
-Mermaid source block or optional rendered file may accompany the text diagram,
-but neither replaces it when the current client cannot display the visual.
+For an unsupported client, create a self contained local `.html` file with
+the sequence diagram visibly laid out using HTML and CSS or inline SVG. Include
+actors, ordered messages, material alternate branches and old versus new flows.
+Use no remote renderer, CDN, external script or network dependency. Keep this
+review artifact with the local review record outside the PR diff, and avoid
+modifying tracked source files. Verify the file exists and, when a browser or
+preview is available, that the diagram renders. If no preview is available,
+report that limit and give an exact browser open command. In Claude Code
+Desktop, link the absolute HTML path in the response so the human can open the
+Browser pane. In a terminal session, open the local file in the system browser
+when the host permits, otherwise give the path and exact open command. Keep a
+short explanation and relevant diff links in chat; Mermaid source or a text
+swimlane is not the sole diagram when the client cannot render Mermaid.
 
 Trace significant hunks to the requested outcome. Explain changed inputs,
 outputs, errors, defaults, compatibility, permissions and migrations where

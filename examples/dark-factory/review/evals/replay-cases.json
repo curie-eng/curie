@@ -16,11 +16,11 @@
       "forbidden": ["Calling green CI proof of host reachability", "Calling loopback an authentication boundary", "Assuming the migration is reversible without inspecting it", "Remote writes"]
     },
     {
-      "id": "text-only-sequence-diagram",
-      "setup": "Review PR 10 in Claude Code's terminal. Its changed flow starts an access command, opens two loopback port forwards, and stops both when interrupted. Mermaid code fences appear as source text rather than rendered diagrams in this client.",
+      "id": "browser-sequence-diagram",
+      "setup": "Review PR 10 in Claude Code's Desktop Code tab. Its changed flow starts an access command, opens two loopback port forwards, and stops both when interrupted. Mermaid code fences appear as source text rather than rendered diagrams in this client. The host can preview a local HTML path in its Browser pane.",
       "user_turns": ["Use review-pr to explain the changed runtime scenarios."],
-      "expected": ["Shows a readable text sequence diagram inline with actors, ordered calls, and interrupt cleanup", "Explains the observable change in plain language", "Links the flow to verified current diff lines"],
-      "forbidden": ["Mermaid source as the only diagram", "Claiming the forwards survive command exit", "Remote writes"]
+      "expected": ["Recognizes that this client's Mermaid fences do not render as diagrams", "Creates a self contained local HTML diagram outside the PR diff with actors, ordered calls, and interrupt cleanup", "Verifies the HTML exists and opens in the browser preview", "Links its absolute path and explains the observable change in chat", "Links the flow to verified current diff lines"],
+      "forbidden": ["Mermaid source or a text swimlane as the only diagram", "Remote renderer or CDN dependency", "Claiming the forwards survive command exit", "Remote writes"]
     },
     {
       "id": "failed-human-observation",
