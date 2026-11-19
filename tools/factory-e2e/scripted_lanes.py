@@ -143,7 +143,9 @@ class LaneRouter:
     """Route each model request to its agent's lane on its issue."""
 
     def __init__(self, agent_markers: dict[str, str], default_agent: str = IMPLEMENTATION) -> None:
-        if not agent_markers or default_agent in agent_markers:
+        # No marker at all is a router of one agent: every request is the default
+        # agent's, and the lanes tell its issues apart.
+        if default_agent in agent_markers:
             raise LaneError("name the non-default agents by their bundle system prompts")
         self.agent_markers = dict(agent_markers)
         self.default_agent = default_agent

@@ -31,6 +31,8 @@ from urllib.request import Request, urlopen
 
 import factory_e2e as fe
 import kind_images
+import one_ticket_run
+import one_ticket_scenario
 import scripted_lanes
 import scripted_scenario as scenario
 import triage_run
@@ -384,6 +386,8 @@ class ScriptedRun:
         self.slack: scripted_lanes.SlackRecorder | None = None
         self.triage: triage_run.TriageToPr | None = None
         self.triage_error: str | None = None
+        # The one-ticket scenario runs on every replayed install, before triage.
+        self.one_ticket: one_ticket_run.OneTicket | None = None
         self.forward: subprocess.Popen[str] | None = None
         self.cluster_attempted = False
         self.registry_attempted = False
@@ -745,19 +749,24 @@ class ScriptedRun:
             )
             if self.args.record:
                 self.count_recording_requests(model)
-            elif self.gateway_enabled():
+            else:
                 # Recording captures the issue-to-pull-request transcript only;
-                # triage lanes are scripted and need no provider.
-                self.router = triage_run.build_router(model)
-                self.router.resolvers.append(
-                    triage_run.output_resolver(
-                        self.stub, model.load_transcript(Path(self.args.transcript))
+                # the triage and one-ticket lanes are scripted and need no provider.
+                if self.gateway_enabled():
+                    self.router = triage_run.build_router(model)
+                    self.router.resolvers.append(
+                        triage_run.output_resolver(
+                            self.stub, model.load_transcript(Path(self.args.transcript))
+                        )
                     )
-                )
-                self.router.hooks.append(triage_run.revoke_on_first_turn(self.stub))
+                    self.router.hooks.append(triage_run.revoke_on_first_turn(self.stub))
+                else:
+                    self.router = scripted_lanes.LaneRouter({})
+                self.router.add(one_ticket_run.build_lane(model))
                 self.router.install(self.model, model)
-                self.slack = scripted_lanes.SlackRecorder(host=callback)
-                self.slack.start()
+                if self.gateway_enabled():
+                    self.slack = scripted_lanes.SlackRecorder(host=callback)
+                    self.slack.start()
             self.model.start()
         self.evidence.update(
             stub_port=self.stub.port, model_port=None if self.model is None else self.model.port
@@ -897,8 +906,22 @@ class ScriptedRun:
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
         self.wait_for_final()
         self.observe()
+        if self.router is not None:
+            self.run_one_ticket(github)
         if self.router is not None and self.slack is not None:
             self.run_triage_to_pr(github)
+
+    def run_one_ticket(self, github: Any) -> None:
+        """The one-ticket scenario, on this install, after the first one passed."""
+
+        assert self.router is not None
+        self.one_ticket = one_ticket_run.OneTicket(self, self.router)
+        try:
+            self.one_ticket.execute(github)
+        except (RuntimeError, AssertionError, OSError, ValueError, KeyError) as exc:
+            detail, _ = fe.redact_agent_text(str(exc), self.secrets)
+            self.one_ticket.evidence["error"] = detail or type(exc).__name__
+            raise ScriptedScenarioError(f"one-ticket: {detail or type(exc).__name__}") from None
 
     def run_triage_to_pr(self, github: Any) -> None:
         """The second scenario, on this install, after the first one passed."""
@@ -1863,6 +1886,8 @@ def main(args: argparse.Namespace) -> int:
                 json.dumps(run.triage.evidence, indent=2), run.secrets
             )
             triage_path.write_text((recorded or "{}") + "\n")
+        if run.one_ticket is not None:
+            run.evidence[one_ticket_scenario.EVIDENCE_KEY] = run.one_ticket.evidence
         run.evidence["result"] = "passed" if result == 0 else "failed"
         if run.install_started is not None and "elapsed_seconds" not in run.evidence:
             run.evidence["elapsed_seconds"] = time.monotonic() - run.install_started

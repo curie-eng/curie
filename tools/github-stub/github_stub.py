@@ -566,6 +566,50 @@ class GithubStub:
 
         return self._insert_new("comment", build)
 
+    def append_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        author: dict[str, Any],
+        app: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append a never-edited comment the way a person posts one, as ``_label_event``
+        appends an event.
+
+        Unlike ``add_issue_comment`` the row takes one instant for both
+        timestamps: the factory's poll pass treats a comment whose ``updated_at``
+        is later than its ``created_at`` as edited and never reads it as an answer.
+        """
+
+        issue = self._get("issue", number)
+        if issue is None:
+            raise ValueError(f"issue {number} does not exist")
+
+        def build(identifier: int) -> dict[str, Any]:
+            instant = _utc()
+            return {
+                "id": identifier,
+                "body": body,
+                "issue_number": number,
+                "user": author,
+                "performed_via_github_app": app,
+                "created_at": instant,
+                "updated_at": instant,
+                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
+                "html_url": (
+                    f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}"
+                ),
+            }
+
+        return self._insert_new("comment", build)
+
+    def add_user(self, user: dict[str, Any], permission: str) -> dict[str, Any]:
+        """Add a repository collaborator with ``permission``; returns the user."""
+
+        self.set_permission(str(user["login"]), permission, user=user)
+        return user
+
     # Runtime controls. The scripted driver holds this object in process, so a
     # control is a method call, like ``advance`` and ``add_issue_comment``. Each
     # writes SQLite state the request threads read on every request.
