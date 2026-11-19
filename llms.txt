@@ -28,6 +28,7 @@ status before promising a channel, model runtime, memory behavior, or control.
 - [docs/approvals.md](docs/approvals.md): approval route declaration, binding, authority, and resume.
 - [docs/interfaces/memory/INTERFACE.md](docs/interfaces/memory/INTERFACE.md): memory scopes and credentials.
 - [docs/guides/measuring-factory-outcomes.md](docs/guides/measuring-factory-outcomes.md): accepted outcomes, estimates, and human effort.
+- [docs/guides/factory-coding-standards.md](docs/guides/factory-coding-standards.md): where a factory run reads repository coding standards.
 - [docs/operations.md](docs/operations.md): deployment, egress, credentials, upgrades, and operational limits.
 - [SECURITY.md](SECURITY.md): security posture and reporting process.
 

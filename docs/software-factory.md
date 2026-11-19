@@ -95,6 +95,9 @@ prepare feedback, or use the companion [PR review skill](guides/factory-pr-revie
 Approved feedback can request another factory revision through the configured
 intake. A local review alone does not start implementation.
 
+For where a run reads your repository's coding standards and which files win,
+see [how the factory follows your team's coding standards](guides/factory-coding-standards.md).
+
 ## Install Software Factory skills
 
 Use `prepare-factory-ticket` in your local coding agent as the factory readiness
