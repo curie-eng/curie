@@ -708,8 +708,13 @@ async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UU
         return
     pending = await reload_request(session, pending_id)
     # Only this round's answer: a relabel that superseded an earlier round's
-    # answer leaves that request on the row of the next round.
-    if pending.terminal_at is None or pending.sequence < asker.sequence:
+    # answer leaves that request, ended before this round was posted, on its
+    # row.
+    if (
+        pending.terminal_at is None
+        or row.answer_after is None
+        or pending.terminal_at <= row.answer_after
+    ):
         return
     if answered:
         await factory_questions.settle_round(session, work_item, pending)

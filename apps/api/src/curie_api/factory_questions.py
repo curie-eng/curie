@@ -683,8 +683,8 @@ async def rows_an_older_replica_settled(
     2. a row whose asking request is terminal without the question ending,
        unless an answer it queued is still live (rule 1 keeps it ``answered``,
        and the asker failed with a cause the question ending never converts);
-    3. an ``answered`` row whose queued answer, admitted after the asker,
-       is terminal;
+    3. an ``answered`` row whose queued answer ended after the round was
+       posted;
     4. a ``cleared`` row whose posted round was answered and whose asker an
        older replica failed: the queued answer ran and settled here before
        the re-drive reached the asker, which still lacks the question ending.
@@ -716,13 +716,14 @@ async def rows_an_older_replica_settled(
         ),
     )
     convertible = and_(failed_asker, FactoryQuestionRound.state.in_((OUTSTANDING, ANSWERED)))
-    # The answer to this round: a queued request admitted after the asker.
-    # A relabel that superseded an earlier round's answer leaves that older
-    # request on the row.
+    # The answer to this round: a queued request that ended after the round
+    # was posted. A relabel that superseded an earlier round's answer leaves
+    # that request, ended before, on the next round's row; a queued answer
+    # admitted before a relabel's run can still be the answer to its round.
     answer_ended = and_(
         pending.id.is_not(None),
         pending.terminal_at.is_not(None),
-        pending.sequence > asker.sequence,
+        pending.terminal_at > FactoryQuestionRound.answer_after,
     )
     asker_unsettled = and_(
         asker.terminal_at.is_not(None),

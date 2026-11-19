@@ -631,6 +631,52 @@ def test_a_round_after_a_superseded_answer_keeps_its_question_ending(
     assert _state_labels(sink, 1215) == {QUESTIONS_LABEL}
 
 
+def test_an_answer_queued_before_a_relabel_still_settles_the_next_round(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An answer is queued, then the label is re-added before it is promoted,
+    so the relabel's run comes first. That run asks round 2 and ends with the
+    question; the queued answer, admitted earlier, is round 2's answer. When
+    its finish reaches an older replica, the re-drive clears round 2 as the
+    new settlement would, and the ticket ends as it does with no older
+    replica."""
+
+    _client, github, sink = admitted
+
+    def run(number: int, *, older: bool) -> tr._Triage:
+        triage = _asked(admitted, monkeypatch, number)
+        revision = _queue_revision(triage)
+        _answer(triage.work_item_id, revision)
+        tr._finish(triage, "failed", "no_pull_request")
+        tr._label(triage.client, github, number)
+        relabelled = _requests(triage.work_item_id)[-1]["id"]
+        assert _after_asker(triage) == [(revision, "queued"), (relabelled, "waiting")]
+        fresh = _take_over(triage, relabelled)
+        posted = _ask(fresh, ["Round 2: should a re-run replace the rows?"])
+        assert posted.json() == {"round": 2, "rounds_limit": 3}
+        tr._finish(fresh, "failed", "no_pull_request")
+        assert _request(relabelled) == QUESTION_ENDING
+        row = _round_row(triage.work_item_id)
+        assert row is not None
+        assert (row["state"], row["pending_request_id"]) == ("answered", revision)
+        _reconcile()
+        continuation = _run_continuation(triage, revision)
+        with _older_replica() if older else contextlib.nullcontext():
+            tr._finish(continuation, "failed", "no_pull_request")
+        return triage
+
+    triage = run(1218, older=True)
+    assert _round_row(triage.work_item_id)["state"] == "answered"  # type: ignore[index]
+    _after_the_roll()
+    assert _round_row(triage.work_item_id)["state"] == "cleared"  # type: ignore[index]
+    assert _to_redrive(triage) == []
+
+    baseline = run(1268, older=False)
+    _reconcile()
+    assert _round_row(baseline.work_item_id)["state"] == "cleared"  # type: ignore[index]
+    assert _state_labels(sink, 1218) == _state_labels(sink, 1268)
+
+
 def test_an_answer_that_ran_before_the_redrive_still_gives_the_asker_its_ending(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
