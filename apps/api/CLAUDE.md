@@ -124,8 +124,10 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   candidates in its own transaction through the one shared
   `curie_internal.memory_rules.settle_lineage_candidates`, and the lineage
   reconciler's pass settles any terminal lineage still holding a candidate
-  (one an older replica recorded during a rolling upgrade); with the forge pass
-  off, that settlement sweep runs alone. Every proposal and
+  (one an older replica recorded during a rolling upgrade). Every API process
+  also runs that sweep as its own task (`start_rule_settlement`), whatever
+  `CURIE_WORK_ITEM_RECONCILER_ENABLED`, the factory or the forge pass interval
+  say; `memory_rule_settlement_interval_s` has no off value. Every proposal and
   settlement holds the agent row `FOR KEY SHARE` (or, on the publication
   advance, the WorkItem row) before its request and lineage locks, the order
   agent deletion takes; settlement itself never locks the agent row.

@@ -25,10 +25,10 @@ forge-neutral: it asks only `CodeHost.read_pull_request`.
    settles those once a current replica runs. Each lineage settles in its own
    short transaction, holding its agent row first; the candidate row locks make
    two replicas' sweeps settle a lineage exactly once.
-6. The sweep does not depend on the forge pass. With the pass off (an
-   interval of 0, or the factory switched off) but the WorkItem reconcilers
-   on, the API runs the sweep alone every ``SETTLEMENT_INTERVAL_SECONDS``
-   (`LineageReconciler.run_settlement_forever`): an older replica's
+6. The sweep does not depend on the forge pass or on any switch. Every API
+   replica also runs it as its own task (`start_rule_settlement`), every
+   ``memory_rule_settlement_interval_s``, whether the WorkItem reconcilers,
+   the factory or this forge pass are on or off: an older replica's
    publication advance can record a merge with no forge pass at all, and
    candidates outlive a factory switch-off.
 """
@@ -61,8 +61,6 @@ from .models import MemoryRule, ThreadPublicationLineage, WorkItem
 logger = logging.getLogger(__name__)
 
 RATE_LIMITED = "github_rate_limited"
-# The settlement-only sweep's cadence when the forge pass is off (item 6).
-SETTLEMENT_INTERVAL_SECONDS = 60.0
 _TERMINAL = {PullRequestState.MERGED: "merged", PullRequestState.CLOSED: "closed"}
 
 
@@ -317,19 +315,21 @@ class LineageReconciler:
             await asyncio.sleep(self._interval)
 
     async def run_settlement_forever(self) -> None:
-        """Only the settlement sweep, on this reconciler's interval (item 6).
+        """Only the settlement sweep, every interval (item 6).
 
-        A failed sweep is logged and the loop continues; cancellation ends it.
+        Waits one interval before each sweep, so a process that just started
+        touches nothing at once. A failed sweep is logged and the loop
+        continues; cancellation ends it.
         """
 
         while True:
+            await asyncio.sleep(self._interval)
             try:
                 await self.settle_terminal_lineages()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - a failed sweep must not end the loop
                 logger.exception("lineage rule settlement sweep failed")
-            await asyncio.sleep(self._interval)
 
 
 def start_lineage_reconciler(
@@ -337,25 +337,48 @@ def start_lineage_reconciler(
     settings: Settings,
     client: httpx.AsyncClient,
 ) -> asyncio.Task[None] | None:
-    """Start the reconciler's loop when the WorkItem reconcilers run.
+    """Start the pass when the factory runs and the interval is positive.
 
-    The full pass (forge reads, then the settlement sweep) runs when the
-    factory is on and its interval is positive. Otherwise the settlement
-    sweep runs alone every ``SETTLEMENT_INTERVAL_SECONDS`` (module item 6),
-    whether or not the factory is on. With the WorkItem reconcilers off,
-    nothing starts.
+    The learned rule settlement sweep does not wait on this: it also runs as
+    its own task (`start_rule_settlement`, module item 6).
     """
 
-    if not settings.work_item_reconciler_enabled:
-        return None
     interval = settings.factory_lineage_reconcile_interval_s
-    forge_pass = settings.factory_enabled and interval > 0
+    if not (
+        settings.factory_enabled
+        and settings.work_item_reconciler_enabled
+        and interval > 0
+    ):
+        return None
     reconciler = LineageReconciler(
         sessionmaker,
         settings,
-        lambda repository: code_host_for_repository(forges_registry(settings), client, repository),
-        interval_seconds=interval if forge_pass else SETTLEMENT_INTERVAL_SECONDS,
+        lambda repository: code_host_for_repository(
+            forges_registry(settings), client, repository
+        ),
+        interval_seconds=interval,
     )
-    if forge_pass:
-        return asyncio.create_task(reconciler.run_forever())
+    return asyncio.create_task(reconciler.run_forever())
+
+
+def _no_code_host(_repository: RepositoryRef) -> CodeHost:
+    raise RuntimeError("the rule settlement sweep reads no code host")
+
+
+def start_rule_settlement(
+    sessionmaker: async_sessionmaker[AsyncSession], settings: Settings
+) -> asyncio.Task[None]:
+    """Start the learned rule settlement sweep (module item 6, ADR 0287).
+
+    Always started, whatever ``work_item_reconciler_enabled``, the factory or
+    the forge pass interval say: no switch may strand a candidate whose pull
+    request an older replica recorded merged or closed.
+    """
+
+    reconciler = LineageReconciler(
+        sessionmaker,
+        settings,
+        _no_code_host,
+        interval_seconds=settings.memory_rule_settlement_interval_s,
+    )
     return asyncio.create_task(reconciler.run_settlement_forever())

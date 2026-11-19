@@ -64,7 +64,7 @@ from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
-from .lineage_reconciler import start_lineage_reconciler
+from .lineage_reconciler import start_lineage_reconciler, start_rule_settlement
 from .personal_custody_reconciler import start_personal_custody_reconciler
 from .protected_reconciler import ProtectedAdmissionReconciler
 from .remediation_admission import reconcile_admissions
@@ -290,6 +290,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.lineage_reconciler_task = start_lineage_reconciler(
         app.state.sessionmaker, settings, http_client
     )
+    # ADR 0287 (#5796): runs whatever the reconciler switches say.
+    app.state.rule_settlement_task = start_rule_settlement(app.state.sessionmaker, settings)
     app.state.ui_evidence_reconciler_task = start_ui_evidence_reconciler(
         app.state.sessionmaker, settings, http_client
     )
@@ -474,13 +476,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await evidence_task
                 except asyncio.CancelledError:
                     pass
-            lineage_task = getattr(app.state, "lineage_reconciler_task", None)
-            if lineage_task is not None:
-                lineage_task.cancel()
-                try:
-                    await lineage_task
-                except asyncio.CancelledError:
-                    pass
+            for name in ("lineage_reconciler_task", "rule_settlement_task"):
+                lineage_task = getattr(app.state, name, None)
+                if lineage_task is not None:
+                    lineage_task.cancel()
+                    try:
+                        await lineage_task
+                    except asyncio.CancelledError:
+                        pass
             task = getattr(app.state, "resume_reconciler_task", None)
             if task is not None:
                 task.cancel()
