@@ -813,6 +813,18 @@ def completed_proof() -> Any:
     )
 
 
+def _admitted_before_merge_sql() -> Any:
+    """Whether the request was admitted before its WorkItem's pull request merged.
+
+    The merge is the lineage's last write (``mark_publication_lineage_terminal``
+    stamps ``updated_at``). A run admitted after it (the label added again)
+    keeps the lineage on its WorkItem but is a fresh run of its own, so the
+    merge notice and its label removal are not its.
+    """
+
+    return ExecutionRequest.created_at <= ThreadPublicationLineage.updated_at
+
+
 def _desired_label_sql() -> Any:
     return case(
         *triage_label_sql(),
@@ -820,6 +832,7 @@ def _desired_label_sql() -> Any:
             and_(
                 ExecutionRequest.status.in_(("completed", "failed", "expired")),
                 ThreadPublicationLineage.status == "merged",
+                _admitted_before_merge_sql(),
                 ThreadPublicationLineage.pr_number.is_not(None),
                 ThreadPublicationLineage.pr_url.is_not(None),
             ),
@@ -988,6 +1001,7 @@ async def _claim_next(
                 is_latest.label("is_latest"),
                 triage_delivered_sql().label("result_delivered"),
                 _desired_label_sql().label("desired_label"),
+                _admitted_before_merge_sql().label("admitted_before_merge"),
             )
             .join(WorkItem, WorkItem.id == FactoryStatusComment.work_item_id)
             .join(
@@ -1022,8 +1036,22 @@ async def _claim_next(
     ).one_or_none()
     if selected is None:
         return None
-    row, work_item, request, pr_url, pr_number, pr_state, latest, result_delivered, label = selected
+    (
+        row,
+        work_item,
+        request,
+        pr_url,
+        pr_number,
+        pr_state,
+        latest,
+        result_delivered,
+        label,
+        admitted_before_merge,
+    ) = selected
     if pr_number is None or not pr_url:
+        pr_state = None
+    if pr_state == "merged" and admitted_before_merge is False:
+        # A fresh run after the merge: the merged pull request is not its own.
         pr_state = None
     if pr_state == "merged" and request.status in {"completed", "failed", "expired"}:
         row.finalized_at = None
@@ -1611,6 +1639,7 @@ async def _render(
     )
     # A follow-up on an existing pull request cannot ask (pull_request_open),
     # so it carries the continuing line instead of the investigating line.
+    admitted = aliased(ExecutionRequest)
     continuing = bool(
         request.status in {"queued", "waiting", "running", "cancellation_requested"}
         and work_item.publication_lineage_id is not None
@@ -1618,7 +1647,16 @@ async def _render(
         and await session.scalar(
             select(Publication.id)
             .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
+            .join(ThreadPublicationLineage, ThreadPublicationLineage.id == Publication.lineage_id)
             .where(
+                # A run admitted after the pull request merged is not continuing it.
+                or_(
+                    ThreadPublicationLineage.status != "merged",
+                    ThreadPublicationLineage.updated_at
+                    >= select(admitted.created_at)
+                    .where(admitted.id == request.id)
+                    .scalar_subquery(),
+                ),
                 Publication.lineage_id == work_item.publication_lineage_id,
                 ExecutionRequest.work_item_id == work_item.id,
                 ExecutionRequest.sequence < request.sequence,

@@ -185,3 +185,30 @@ def test_other_tool_input_stays_verbatim_in_both_records(tmp_path) -> None:
 
     exported = _export(tmp_path, [call, _tool_result("toolu_acme_bash", "3 passed")])
     assert exported.entries[0]["message"]["content"][0]["input"] == tool_input
+
+
+def test_other_tool_payloads_holding_a_question_shaped_value_stay_verbatim(tmp_path) -> None:
+    # Only the question call itself is withheld. Another tool's input, result
+    # and structured result keep a value shaped like a question call (a test
+    # fixture written to disk, a log line read back) byte for byte.
+    nested = {
+        "type": "tool_use",
+        "id": "toolu_fixture",
+        "name": QUESTION_TOOL,
+        "input": {"summary": SUMMARY, "questions": QUESTIONS},
+    }
+    tool_input = {"file_path": "tests/fixture.json", "content": nested}
+    call = _assistant_call("Write", "toolu_acme_write", tool_input)
+    result = _tool_result("toolu_acme_write", "written")
+    result["toolUseResult"] = {
+        "type": "create",
+        "filePath": "tests/fixture.json",
+        "content": nested,
+    }
+    result["message"]["content"][0]["content"] = [nested]
+
+    exported = _export(tmp_path, [call, result])
+
+    assert exported.entries[0]["message"]["content"][0]["input"] == tool_input
+    assert exported.entries[1]["toolUseResult"]["content"] == nested
+    assert exported.entries[1]["message"]["content"][0]["content"] == [nested]

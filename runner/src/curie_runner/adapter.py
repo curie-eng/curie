@@ -194,25 +194,33 @@ _SETTING_SOURCES: tuple[SettingSource, ...] = ("user", "project", "local")
 _SDK_DISABLE_TERMINAL_TITLE_ENV = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
-def _withhold_arguments(value: Any) -> Any:
-    """Empty the input of every withheld tool call nested anywhere in ``value``.
+def _withhold_arguments(entries: list[Any]) -> list[Any]:
+    """Empty the input of each withheld tool call in an assistant entry.
 
     The native mirror leaves the runner as the turn's checkpoint, so the input
-    the action frame withholds (ADR 0286 decision 4) is withheld here too. The
-    portable projection writes the same empty input, so native and portable
-    content still correspond exactly on replay. ``value`` is a fresh copy and
-    is changed in place.
+    the action frame withholds (ADR 0286 decision 4) is withheld here too. Only
+    a ``tool_use`` block of an assistant message's own content is a call; any
+    other payload, including another tool's input or result that happens to
+    hold a call-shaped value, is kept verbatim. The portable projection writes
+    the same empty input, so native and portable content still correspond
+    exactly on replay. ``entries`` is a fresh copy and is changed in place.
     """
 
-    if isinstance(value, list):
-        for item in value:
-            _withhold_arguments(item)
-    elif isinstance(value, dict):
-        if value.get("type") == "tool_use" and value.get("name") in ARGUMENTS_WITHHELD_TOOLS:
-            value["input"] = {}
-        for item in value.values():
-            _withhold_arguments(item)
-    return value
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") in ARGUMENTS_WITHHELD_TOOLS
+            ):
+                block["input"] = {}
+    return entries
 
 
 class _SeededSessionStore:

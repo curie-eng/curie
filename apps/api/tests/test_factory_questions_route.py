@@ -392,6 +392,29 @@ def test_jira_keeps_one_ordered_list_when_a_continuation_line_opens_a_block(
     assert "# Is this a heading on the continuation line?" in first
 
 
+# The same block openers, each followed by a Unicode space instead of an
+# ASCII one, which the Jira renderer also reads as a marker.
+_UNICODE_SPACED_QUESTIONS = [
+    "Which export path is meant?\n#\u3000Is this a heading?",
+    "Keep the trailing row?\n-\u00a0a bullet\n2.\u2003a number\n>\u2009a quote",
+    "Which delimiter do callers expect?\n\u3000\u3000-\u00a0indented bullet",
+]
+
+
+def test_jira_keeps_one_ordered_list_when_unicode_spaces_follow_a_block_marker(
+    jira_case: _JiraCase,
+) -> None:
+    summary = "Steps tried:\n1.\u00a0run the export\n2)\u3000count the rows"
+    response = _ask(jira_case, summary=summary, questions=_UNICODE_SPACED_QUESTIONS)
+    assert response.status_code == 200, response.text
+    (comment,) = jira_case.fake.issue(jira_case.issue_id).comments
+    _assert_one_list_and_the_answer_line_last(comment.body, len(_UNICODE_SPACED_QUESTIONS))
+    assert _nodes(comment.body, "bulletList") == []
+    assert _nodes(comment.body, "blockquote") == []
+    (ordered,) = _nodes(comment.body, "orderedList")
+    assert "# Is this a heading?" in jira_fake.flatten(ordered["content"][0])
+
+
 def test_a_continuation_line_that_opens_a_block_keeps_one_commonmark_list(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -574,6 +597,14 @@ def test_refused_a_missing_field_is_invalid_questions_not_a_422(
 
 _SENT = "sent-value-7c1e-never-echoed"
 _SENT_NUMBER = "424242424242"
+
+
+# Valid fields beside a value that is not JSON (RFC 8259), though Python's
+# parser takes NaN and the infinities by default.
+def _with_constant(value: str) -> str:
+    return '{"summary": "' + _SENT + '", "questions": ["Which?"], "x": ' + value + "}"
+
+
 # Every body that is not one JSON object with the two fields in their shapes.
 _MALFORMED_BODIES = {
     "array": json.dumps([_SENT, {"summary": _SENT, "questions": [_SENT]}]),
@@ -589,6 +620,9 @@ _MALFORMED_BODIES = {
     "question object": json.dumps({"summary": _SENT, "questions": [{"text": _SENT}]}),
     "question number": json.dumps({"summary": _SENT, "questions": [int(_SENT_NUMBER)]}),
     "oversized": json.dumps({"summary": _SENT * 20_000, "questions": [_SENT]}),
+    "nan beside the fields": _with_constant("NaN"),
+    "infinity beside the fields": _with_constant("Infinity"),
+    "negative infinity in a list": _with_constant("[-Infinity]"),
 }
 
 

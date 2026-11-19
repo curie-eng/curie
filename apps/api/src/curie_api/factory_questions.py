@@ -78,6 +78,10 @@ RENDERED_MAX_CHARS: Final = 25_000
 # Every line break form a renderer or Python honors, CRLF first so it stays
 # one break. The runner's pre-check normalizes the same set.
 _LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x85\u2028\u2029]")
+# Any other whitespace character (a no-break, ideographic or em space) is a
+# plain space once posted: a tracker renderer reads it as the space after a
+# list, heading or quote marker, so it must not slip past the escapes below.
+_UNICODE_SPACE = re.compile(r"[^\S\n]")
 
 # Refusal codes, each answered 409 with the code only (decision 10).
 NOT_IMPLEMENTATION_CONTRACT: Final = "not_implementation_contract"
@@ -142,9 +146,10 @@ def input_valid(summary: object, questions: object) -> bool:
 
 
 def _visible(text: str) -> str:
-    """The sanitized text as posted, every line break a newline, trimmed."""
+    """The sanitized text as posted, every line break a newline and every
+    other whitespace character a space, trimmed."""
 
-    return _inert(_LINE_BREAK.sub("\n", text)).strip()
+    return _inert(_UNICODE_SPACE.sub(" ", _LINE_BREAK.sub("\n", text))).strip()
 
 
 _FENCE_RUN = re.compile(r"`{3,}|~{3,}")

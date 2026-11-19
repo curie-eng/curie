@@ -14,7 +14,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Annotated, Final
+from typing import Annotated, Final, NoReturn
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from redis.asyncio import Redis
@@ -490,6 +490,10 @@ _QUESTIONS_BODY = {
 }
 
 
+def _refuse_json_constant(name: str) -> NoReturn:
+    raise ValueError(f"not a JSON value: {name}")
+
+
 async def _questions_submission(request: Request) -> QuestionsSubmission:
     """The body as a submission, or 409 ``invalid_questions`` echoing nothing
     for anything that is not one JSON object within the size bound."""
@@ -499,7 +503,9 @@ async def _questions_submission(request: Request) -> QuestionsSubmission:
     except HTTPException:
         raise _question_refused(questions_core.INVALID_QUESTIONS) from None
     try:
-        parsed = json.loads(raw)
+        # NaN and the infinities are not JSON (RFC 8259); refuse them like any
+        # other body outside the shape rather than carry them on.
+        parsed = json.loads(raw, parse_constant=_refuse_json_constant)
     except (ValueError, RecursionError):
         raise _question_refused(questions_core.INVALID_QUESTIONS) from None
     if not isinstance(parsed, dict):
