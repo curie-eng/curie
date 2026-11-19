@@ -687,6 +687,49 @@ def test_selection_model_refuses_extra_fields() -> None:
         SelectedMemoryRules(**{**kwargs, "format_version": 2})
 
 
+@pytest.mark.parametrize("value", [True, 1.0, "1", None], ids=["bool", "float", "str", "none"])
+def test_selection_format_version_refuses_every_non_int_in_python(value: Any) -> None:
+    # Strict ``Literal[1]`` alone accepts True and 1.0 because both equal 1.
+    kwargs = _selected_kwargs(RULES)
+    with pytest.raises(ValidationError):
+        SelectedMemoryRules(**{**kwargs, "format_version": value})
+    with pytest.raises(ValidationError):
+        SelectedMemoryRules.model_validate({**kwargs, "format_version": value})
+    adapter: TypeAdapter[SelectedMemoryRules | AbsentMemoryRules] = TypeAdapter(
+        MemoryRulesSelection
+    )
+    with pytest.raises(ValidationError):
+        adapter.validate_python({**kwargs, "format_version": value})
+    assert SelectedMemoryRules(**{**kwargs, "format_version": 1}).format_version == 1
+
+
+@pytest.mark.parametrize("literal", ["true", "1.0", "1.5", '"1"', "null"])
+def test_selection_format_version_refuses_every_non_int_in_json(literal: str) -> None:
+    selected = selected_from_rules(RULES)
+    document = selected.model_dump_json().replace(
+        '"format_version":1', f'"format_version":{literal}'
+    )
+    assert document != selected.model_dump_json()
+    with pytest.raises(ValidationError):
+        SelectedMemoryRules.model_validate_json(document)
+    adapter: TypeAdapter[SelectedMemoryRules | AbsentMemoryRules] = TypeAdapter(
+        MemoryRulesSelection
+    )
+    with pytest.raises(ValidationError):
+        adapter.validate_json(document)
+    # liveness: the real integer 1 still validates from the same document shape
+    assert SelectedMemoryRules.model_validate_json(selected.model_dump_json()) == selected
+
+
+@pytest.mark.parametrize("field", ["count", "rule_numbers"])
+def test_selection_int_fields_refuse_bool_and_float(field: str) -> None:
+    kwargs = _selected_kwargs([(1, "one")])
+    bad = {"count": [True, 1.0], "rule_numbers": [(True,), (1.0,)]}[field]
+    for value in bad:
+        with pytest.raises(ValidationError):
+            SelectedMemoryRules(**{**kwargs, field: value})
+
+
 def test_selection_model_absent_only_accepts_no_rules() -> None:
     assert AbsentMemoryRules(reason="no_rules").kind == "absent"
     for reason in ("other", "", None):
