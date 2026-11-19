@@ -56,15 +56,15 @@ that makes the result clearer:
    role and change. Identify new components and why they exist, and removed or
    replaced components and why. Distinguish internal helpers from deployable or
    public components. Say when no component was added or deleted.
-4. **Changed scenarios.** Use a compact sequence diagram when actors, order,
-   trust boundaries or fallback paths matter. Show the old and new flow, or
-   branches of the new flow, for each material scenario. Check whether the
-   current client renders Mermaid diagrams. If it does, use Mermaid. If it
-   shows Mermaid as source, create a self contained local HTML diagram that
-   opens in a browser and give its path in the review. Keep the HTML outside
-   the PR diff and verify it opens; see the format guidance in
-   [the inspection procedure](references/review.md). Explain the observable
-   change in plain language. Skip a diagram that would only repeat one action.
+4. **Changed scenarios.** Use a sequence diagram when actors, order, trust
+   boundaries or fallback paths matter. Show old and new flows, or branches of
+   the new flow, for each material scenario. If the current client renders
+   Mermaid, use it. Otherwise show a wider, fixed width swimlane inline in a
+   monospaced block. Align every actor lifeline and arrow endpoint by column;
+   put persistent state notes below the diagram with the relevant step number,
+   never floating inside a lane. See [the inspection procedure](references/review.md).
+   Explain the observable change in plain language. Skip a diagram that would
+   only repeat one action.
 5. **Unit scenarios.** Describe added or changed unit tests by the behavior and
    positive, negative or edge conditions they assert. Name relevant existing
    regression coverage and what the assertions cannot establish.

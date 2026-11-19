@@ -30,23 +30,36 @@ new flows when that is needed to see the change. Use prose for a single action.
 Choose the diagram format for the client's actual display. If Mermaid fences
 render, use a concise Mermaid sequence diagram. Claude Code's terminal and
 Desktop Code transcript currently show Mermaid fences as source; treat these
-as unsupported unless the current interface demonstrably renders them. If
-uncertain, use the browser path. Do not mistake a syntax highlighted Mermaid
-block for a rendered diagram.
+as unsupported unless the current interface demonstrably renders them. Do
+not mistake syntax highlighting for a rendered diagram.
 
-For an unsupported client, create a self contained local `.html` file with
-the sequence diagram visibly laid out using HTML and CSS or inline SVG. Include
-actors, ordered messages, material alternate branches and old versus new flows.
-Use no remote renderer, CDN, external script or network dependency. Keep this
-review artifact with the local review record outside the PR diff, and avoid
-modifying tracked source files. Verify the file exists and, when a browser or
-preview is available, that the diagram renders. If no preview is available,
-report that limit and give an exact browser open command. In Claude Code
-Desktop, link the absolute HTML path in the response so the human can open the
-Browser pane. In a terminal session, open the local file in the system browser
-when the host permits, otherwise give the path and exact open command. Keep a
-short explanation and relevant diff links in chat; Mermaid source or a text
-swimlane is not the sole diagram when the client cannot render Mermaid.
+In an unsupported client, draw the swimlane inline in a monospaced code block.
+Use a wider layout, around 90 to 110 columns when the display permits, with
+short actor names and message labels. Each actor's vertical lifeline must stay
+at the same character position on every row, and each arrowhead must land on
+the receiving lifeline. Number the messages. Put a state note below the block
+and identify the step that establishes it; never place an unlabeled state note
+between lifelines where it could be mistaken for an arrow label. Put a failure
+or fallback in a separate small diagram or a clearly numbered branch. Split
+old and new flows instead of squeezing both into one crowded diagram. Avoid
+colors, emoji and external HTML files for this inline view. Check the alignment
+and line length before replying; shorten labels or split the flow if the host
+will wrap it. For example:
+
+```text
+          User                                 Access CLI                                  Kubernetes
+          |                                    |                                           |
+1.        |---------- start access ------------>                                           |
+2.        |                                    |------------- forward Console ------------->
+3.        |                                    |------------ forward Langfuse ------------->
+4.        <--------- localhost URLs -----------|                                           |
+5.        |------------- Ctrl-C --------------->                                           |
+6.        |                                    |----------- stop both forwards ------------>
+```
+
+State after step 4: both forwards remain active while the command runs.
+State after step 6: neither forward remains active. These state notes describe
+what the arrows accomplished; they are not additional messages.
 
 Trace significant hunks to the requested outcome. Explain changed inputs,
 outputs, errors, defaults, compatibility, permissions and migrations where

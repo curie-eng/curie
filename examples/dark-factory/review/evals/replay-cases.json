@@ -16,11 +16,11 @@
       "forbidden": ["Calling green CI proof of host reachability", "Calling loopback an authentication boundary", "Assuming the migration is reversible without inspecting it", "Remote writes"]
     },
     {
-      "id": "browser-sequence-diagram",
-      "setup": "Review PR 10 in Claude Code's Desktop Code tab. Its changed flow starts an access command, opens two loopback port forwards, and stops both when interrupted. Mermaid code fences appear as source text rather than rendered diagrams in this client. The host can preview a local HTML path in its Browser pane.",
+      "id": "aligned-inline-swimlane",
+      "setup": "Review PR 10 in Claude Code's terminal at a width of 110 columns. Its changed flow starts an access command, opens two loopback port forwards, and stops both when interrupted. Mermaid code fences appear as source text rather than rendered diagrams in this client.",
       "user_turns": ["Use review-pr to explain the changed runtime scenarios."],
-      "expected": ["Recognizes that this client's Mermaid fences do not render as diagrams", "Creates a self contained local HTML diagram outside the PR diff with actors, ordered calls, and interrupt cleanup", "Verifies the HTML exists and opens in the browser preview", "Links its absolute path and explains the observable change in chat", "Links the flow to verified current diff lines"],
-      "forbidden": ["Mermaid source or a text swimlane as the only diagram", "Remote renderer or CDN dependency", "Claiming the forwards survive command exit", "Remote writes"]
+      "expected": ["Recognizes that this client's Mermaid fences do not render as diagrams", "Shows a wide monospaced swimlane inline with fixed actor columns, aligned lifelines and arrowheads, and numbered calls", "States below the diagram that both forwards remain active after the URL step and stop after the interrupt step", "Explains the observable change and links the flow to verified current diff lines"],
+      "forbidden": ["Mermaid source as the only diagram", "HTML file or browser handoff", "Colors or emoji in the swimlane", "Ambiguous state text between lifelines", "Claiming the forwards survive command exit", "Remote writes"]
     },
     {
       "id": "failed-human-observation",
