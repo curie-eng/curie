@@ -33,12 +33,14 @@ from approver_ticket_support import (
     CONNECTOR,
     KEY_ID,
     LIVE,
+    MANAGED_BY,
     OTHER_CONNECTOR,
     OTHER_ROUTE,
     OUTSIDER,
     ROUTE,
     TOOL,
     add_principal,
+    add_team,
     agent_state,
     api_headers,
     approval_audits,
@@ -49,7 +51,9 @@ from approver_ticket_support import (
     dynamic_request,
     enroll,
     exactly,
+    group_entry,
     ingress,
+    join_team,
     legacy,
     now,
     owner_verifies,
@@ -57,6 +61,7 @@ from approver_ticket_support import (
     refused_with,
     selector_key,
     set_approver_role,
+    set_idp_managed_by,
     store_routes,
     stored_version,
     subject_entry,
@@ -363,6 +368,25 @@ def test_ceiling_users_narrow_the_selected_set(ticket_case: SimpleNamespace) -> 
         request = dynamic_request(case, carried(case, ARGS, approvers=approvers))
         refused_creation(case, request, 422, "approval_ticket_outside_ceiling")
     request = dynamic_request(case, carried(case, ARGS, approvers=(APPROVER_A,)))
+    receipt(create(case.client, request), request)
+
+
+def test_ticket_creation_refuses_group_membership_until_the_role_pins_the_subject(
+    ticket_case: SimpleNamespace,
+) -> None:
+    case = ticket_case
+    tenant = case.scope["tenant"]
+    subject, group = "SyntheticGroupMember", "SyntheticTicketGroup"
+    member = add_principal(tenant, subject)
+    set_idp_managed_by(tenant, MANAGED_BY)
+    join_team(tenant, member, add_team(tenant, group, synced=True))
+    set_approver_role(case.scope, {"entries": [group_entry(group)]})
+    enroll(case)
+    request = dynamic_request(case, carried(case, ARGS, approvers=(subject,)))
+    refused_creation(case, request, 422, "approval_ticket_outside_ceiling")
+    set_approver_role(case.scope, {"entries": [subject_entry(subject)]})
+    refused_creation(case, request, 422, "approval_ticket_outside_ceiling")
+    enroll(case)
     receipt(create(case.client, request), request)
 
 
