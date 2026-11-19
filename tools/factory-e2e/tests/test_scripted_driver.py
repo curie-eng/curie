@@ -2936,3 +2936,47 @@ def test_replay_quiet_window_is_bounded_by_the_install_poll_interval(
         run.wait_for_intake_passes(0)
     expected = 4 * triage_run.REPLAY_POLLS * driver.tracker_poll_seconds
     assert expected <= now[0] < expected + driver.tracker_poll_seconds
+
+
+# one-ticket (#5788): the scenario runs on every replayed install, and its
+# verdict is the evidence file's ``one_ticket.result``.
+
+import one_ticket_run  # noqa: E402
+import one_ticket_scenario as ots  # noqa: E402
+
+
+@pytest.mark.parametrize("outcome", ["passed", "failed"])
+def test_the_one_ticket_verdict_reaches_the_evidence_file_and_the_exit_code(
+    outcome: str, candidate_curie: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+
+    def one_ticket_execute(self: one_ticket_run.OneTicket, _github: Any) -> None:
+        if outcome == "failed":
+            raise ots.OneTicketAssertionError("a second request after the bot comment")
+        self.evidence["result"] = "passed"
+
+    def execute(run: sk.ScriptedRun) -> None:
+        run.router = lanes.LaneRouter({})
+        run.run_one_ticket(None)
+
+    monkeypatch.setattr(one_ticket_run.OneTicket, "execute", one_ticket_execute)
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+
+    assert sk.main(_replay_args(tmp_path)) == (0 if outcome == "passed" else fe.EXIT_FAILED)
+    evidence = _evidence(tmp_path)
+    assert evidence["one_ticket"]["result"] == outcome
+    assert evidence["result"] == outcome
+    if outcome == "failed":
+        assert "second request after the bot comment" in evidence["error"]
+        assert evidence["one_ticket"]["error"] == "a second request after the bot comment"
+
+
+def test_the_publication_scenario_installs_the_one_ticket_lane_and_no_gateway() -> None:
+    run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
+    assert not run.gateway_enabled()
+    assert run.one_ticket is None
+    model = sk._module("factory_model_script_one_ticket", MODEL_SCRIPT)
+    lane = one_ticket_run.build_lane(model)
+    assert (lane.agent, lane.issue) == (lanes.IMPLEMENTATION, ots.ISSUE)
+    assert lane.exchanges, "the transcript holds both sessions"
