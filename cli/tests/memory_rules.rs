@@ -32,24 +32,37 @@ fn agent_list() -> Response {
     )
 }
 
-fn rule(state: &str, version: i64) -> Value {
-    json!({
-        "id": RULE_ID, "number": 3, "label": "R3",
-        "scope_kind": "repository", "scope_key": "github:github.com:4401",
-        "scope_label": "acme-corp/acme-bot", "state": state,
-        "text": "run the formatter before committing", "reason": "reviewer asked",
-        "source_url": "https://example.com/pull/1", "proposed_by": "github:6601:octocat",
-        "proposed_at": "2026-11-19T00:00:00Z", "version": version,
-    })
+/// A response recorded from the real API routes (`tests/vectors/memory-rules-responses.json`,
+/// refreshed and drift-checked by `apps/api/tests/test_memory_rule_routes.py`).
+fn vector(key: &str) -> Value {
+    let recorded: Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/memory-rules-responses.json"
+    ))
+    .expect("the memory rules vector is JSON");
+    recorded[key].clone()
 }
 
+/// A recorded rule given this test's id, label and text.
+fn named(mut rule: Value, state: &str, version: i64) -> Value {
+    rule["id"] = json!(RULE_ID);
+    rule["number"] = json!(3);
+    rule["label"] = json!("R3");
+    rule["text"] = json!("run the formatter before committing");
+    rule["state"] = json!(state);
+    rule["version"] = json!(version);
+    rule
+}
+
+/// The recorded accept answer's rule, in `state` at `version`.
+fn rule(state: &str, version: i64) -> Value {
+    named(vector("accept")["rule"].clone(), state, version)
+}
+
+/// The recorded rule list, narrowed to its proposed rule.
 fn rule_list() -> Value {
-    json!({
-        "rules": [rule("proposed", 1)],
-        "scopes": [{"scope_kind": "repository", "scope_key": "github:github.com:4401",
-                    "scope_label": "acme-corp/acme-bot", "in_force_count": 0}],
-        "in_force_limit": 16,
-    })
+    let mut list = vector("list");
+    list["rules"] = json!([named(list["rules"][0].clone(), "proposed", 1)]);
+    list
 }
 
 fn accept_path() -> String {
@@ -502,4 +515,115 @@ fn a_rule_label_or_malformed_id_is_a_usage_error_before_any_request() {
         );
     }
     assert!(server.recorded().is_empty());
+}
+
+#[test]
+fn the_recorded_api_responses_parse_and_print_unchanged() {
+    let list = curie::api::parse_memory_rules(vector("list")).expect("the recorded list parses");
+    assert_eq!(list.rules.len(), 4);
+    assert_eq!(
+        serde_json::to_value(&list).expect("serializes"),
+        vector("list")
+    );
+    let change =
+        curie::api::parse_memory_rule_change(vector("accept")).expect("the recorded accept parses");
+    assert_eq!(change.rule.state, curie::api::MemoryRuleState::Accepted);
+    assert_eq!(
+        serde_json::to_value(&change).expect("serializes"),
+        vector("accept")
+    );
+}
+
+#[test]
+fn a_malformed_rule_response_is_refused_naming_what_differs() {
+    let mut no_version = vector("list");
+    no_version["rules"][0]
+        .as_object_mut()
+        .expect("a rule object")
+        .remove("version");
+    let mut candidate = vector("list");
+    candidate["rules"][0]["state"] = json!("candidate");
+    let mut no_scopes = vector("list");
+    no_scopes
+        .as_object_mut()
+        .expect("a list object")
+        .remove("scopes");
+    for (body, named) in [
+        (no_version, "missing field `version`"),
+        (candidate, "unknown variant `candidate`"),
+        (no_scopes, "missing field `scopes`"),
+    ] {
+        let err = curie::api::parse_memory_rules(body).expect_err("a malformed list is refused");
+        let shown = format!("{err:#}");
+        assert!(shown.contains("not a learned rule list"), "{shown}");
+        assert!(shown.contains(named), "{shown}");
+    }
+    let mut now = vector("accept");
+    now["applies_from"] = json!("now");
+    let err = curie::api::parse_memory_rule_change(now).expect_err("an unknown applies_from");
+    assert!(
+        format!("{err:#}").contains("unknown variant `now`"),
+        "{err:#}"
+    );
+    let mut no_decider_id = vector("accept");
+    no_decider_id["rule"]["accepted_by"]
+        .as_object_mut()
+        .expect("a decider object")
+        .remove("principal_id");
+    let err =
+        curie::api::parse_memory_rule_change(no_decider_id).expect_err("a decider with no id");
+    assert!(
+        format!("{err:#}").contains("missing field `principal_id`"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn an_action_answer_without_a_version_exits_1_and_prints_no_rule() {
+    let fixture = Fixture::new();
+    let session = fixture.session(0o600);
+    let mut answer = json!({"rule": rule("accepted", 2), "applies_from": "next_ticket"});
+    answer["rule"]
+        .as_object_mut()
+        .expect("a rule object")
+        .remove("version");
+    let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("POST", p) if p == accept_path() => Response::json(200, &answer.to_string()),
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let output = fixture.run(&act_args("--accept", &session, &server.base_url));
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let value = object(&output);
+    let error = value["error"].as_str().expect("an error string");
+    assert!(error.contains("not a learned rule change"), "{value}");
+    assert!(error.contains("missing field `version`"), "{value}");
+    assert!(value.get("rule").is_none(), "{value}");
+    assert_no_secrets(&output);
+}
+
+#[test]
+fn a_rule_list_in_another_shape_exits_1() {
+    let fixture = Fixture::new();
+    let server = serve(|req| match req.path.as_str() {
+        "/agents" => agent_list(),
+        _ => Response::json(200, &json!({"rules": [{"id": RULE_ID}]}).to_string()),
+    });
+    let output = fixture.run(&[
+        "--json",
+        "cluster",
+        "memory",
+        "acme-bot",
+        "--rules",
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        "list-key",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let error = object(&output)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(error.contains("not a learned rule list"), "{error}");
 }

@@ -623,15 +623,16 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         "MemoryRulesOutput",
         samples![
             "DryRun" => MemoryRulesOutput::DryRun(plan()),
-            "Rules" => MemoryRulesOutput::Rules(serde_json::json!({
-                "rules": [], "scopes": [], "in_force_limit": 16,
-            })),
+            "Rules" => MemoryRulesOutput::Rules(
+                curie::api::parse_memory_rules(memory_rules_vector("list"))
+                    .expect("the recorded rule list parses"),
+            ),
             "Changed" => MemoryRulesOutput::Changed {
                 verb: curie::commands::MemoryRuleVerb::Accept,
-                change: serde_json::json!({
-                    "rule": {"id": "r", "state": "accepted"},
-                    "applies_from": "next_ticket",
-                }),
+                change: Box::new(
+                    curie::api::parse_memory_rule_change(memory_rules_vector("accept"))
+                        .expect("the recorded accept parses"),
+                ),
             },
         ],
     );
@@ -1334,4 +1335,13 @@ fn every_variant_sample_validates_against_its_mapped_schema() {
         "only {checked} variant samples validated; the registry has shrunk unexpectedly \
          and the gate would pass vacuously"
     );
+}
+
+/// One recorded API response from `tests/vectors/memory-rules-responses.json`.
+fn memory_rules_vector(key: &str) -> serde_json::Value {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/vectors/memory-rules-responses.json"
+    ))
+    .expect("the memory rules vector is JSON");
+    vector[key].clone()
 }

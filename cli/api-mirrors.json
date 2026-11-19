@@ -398,6 +398,31 @@
       "omissions": []
     },
     {
+      "struct": "MemoryRuleDecider",
+      "schema": "MemoryRuleDecider",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRule",
+      "schema": "MemoryRuleOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRuleScope",
+      "schema": "MemoryRuleScopeOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRules",
+      "schema": "MemoryRulesOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRuleChange",
+      "schema": "MemoryRuleDecisionOut",
+      "omissions": []
+    },
+    {
       "struct": "Bundle",
       "schema": "BundleOut",
       "omissions": [

@@ -9,7 +9,9 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::AgentActionOpts;
-use crate::api::{ApiClient, OwnerApiClient};
+use crate::api::{
+    ApiClient, MemoryRule, MemoryRuleChange, MemoryRuleState, MemoryRules, OwnerApiClient,
+};
 use crate::exit::CliError;
 use crate::ui::{CliOutput, DryRunPlan, Ui};
 
@@ -39,16 +41,16 @@ impl MemoryRuleVerb {
     }
 }
 
-/// Output of the learned rule verbs: the API's own objects, as sent, or a plan.
+/// Output of the learned rule verbs: the API's validated objects, or a plan.
 #[derive(Debug)]
 pub enum MemoryRulesOutput {
     DryRun(DryRunPlan),
     /// `--rules`: the API's rule list.
-    Rules(Value),
+    Rules(MemoryRules),
     /// `--accept`, `--reject` or `--remove`: the API's changed rule.
     Changed {
         verb: MemoryRuleVerb,
-        change: Value,
+        change: Box<MemoryRuleChange>,
     },
 }
 
@@ -56,8 +58,8 @@ impl CliOutput for MemoryRulesOutput {
     fn to_json(&self) -> Value {
         match self {
             Self::DryRun(plan) => plan.to_json(),
-            Self::Rules(rules) => rules.clone(),
-            Self::Changed { change, .. } => change.clone(),
+            Self::Rules(rules) => serde_json::to_value(rules).unwrap_or_default(),
+            Self::Changed { change, .. } => serde_json::to_value(change).unwrap_or_default(),
         }
     }
 
@@ -238,7 +240,7 @@ pub async fn memory_rule_act(opts: MemoryRuleActOpts) -> Result<MemoryRulesOutpu
     }?;
     Ok(MemoryRulesOutput::Changed {
         verb: opts.verb,
-        change,
+        change: Box::new(change),
     })
 }
 
@@ -249,27 +251,29 @@ fn plain(text: &str) -> String {
         .collect()
 }
 
-fn field<'a>(rule: &'a Value, key: &str) -> &'a str {
-    rule.get(key).and_then(Value::as_str).unwrap_or("")
+fn state_name(state: MemoryRuleState) -> &'static str {
+    match state {
+        MemoryRuleState::Proposed => "proposed",
+        MemoryRuleState::Accepted => "accepted",
+        MemoryRuleState::Rejected => "rejected",
+        MemoryRuleState::Removed => "removed",
+    }
 }
 
-fn rule_line(rule: &Value) -> String {
+fn rule_line(rule: &MemoryRule) -> String {
     format!(
         "{}  {}  {}  v{}  {}  {}",
-        plain(field(rule, "label")),
-        plain(field(rule, "id")),
-        plain(field(rule, "state")),
-        rule.get("version").and_then(Value::as_i64).unwrap_or(0),
-        plain(field(rule, "scope_label")),
-        plain(field(rule, "text")),
+        plain(&rule.label),
+        rule.id,
+        state_name(rule.state),
+        rule.version,
+        plain(&rule.scope_label),
+        plain(&rule.text),
     )
 }
 
-fn render_rules(ui: &Ui, rules: &Value) {
-    let list = rules
-        .get("rules")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
+fn render_rules(ui: &Ui, rules: &MemoryRules) {
+    let list = &rules.rules;
     if list.is_empty() {
         ui.payload("no learned rules");
         return;
@@ -280,12 +284,12 @@ fn render_rules(ui: &Ui, rules: &Value) {
     }
 }
 
-fn render_change(ui: &Ui, verb: MemoryRuleVerb, change: &Value) {
-    let rule = change.get("rule").unwrap_or(&Value::Null);
+fn render_change(ui: &Ui, verb: MemoryRuleVerb, change: &MemoryRuleChange) {
+    let rule = &change.rule;
     ui.payload(&format!(
         "{} rule {} ({}); applies from the next ticket",
         verb.past_tense(),
-        plain(field(rule, "label")),
-        plain(field(rule, "scope_label")),
+        plain(&rule.label),
+        plain(&rule.scope_label),
     ));
 }

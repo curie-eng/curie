@@ -25,6 +25,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import itertools
+import json
+import os
+import re
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -353,6 +356,76 @@ def _accepts(stack: Stack, rule_id: uuid.UUID, owner: Owner | None = None) -> di
     assert found["rule"]["state"] == "accepted"
     assert _row(rule_id)["state"] == "accepted"
     return found
+
+
+# --- the CLI's recorded responses ---------------------------------------------------
+
+# The real list and accept responses the CLI parses (`cli/tests/memory_rules.rs`),
+# with volatile ids and clocks replaced by stable placeholders.
+CLI_VECTOR = (
+    Path(__file__).resolve().parents[3] / "tests" / "vectors" / "memory-rules-responses.json"
+)
+CLI_VECTOR_NOTE = (
+    "Real responses of GET /agents/{agent_id}/memory/rules and POST "
+    ".../memory/rules/{rule_id}/accept, recorded from the routes by "
+    "apps/api/tests/test_memory_rule_routes.py::"
+    "test_list_and_accept_responses_match_the_cli_vector, which fails when they drift. "
+    "Ids and clocks are placeholders. Refresh: CURIE_WRITE_MEMORY_RULES_VECTOR=1 "
+    "uv run pytest apps/api/tests/test_memory_rule_routes.py -k cli_vector"
+)
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_CLOCK = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?")
+
+
+def _stable(document: Any) -> Any:
+    """``document`` with each distinct id and clock replaced by a numbered placeholder."""
+
+    ids: dict[str, str] = {}
+    clocks: dict[str, str] = {}
+
+    def clock(match: re.Match[str]) -> str:
+        stamp = clocks.setdefault(
+            match.group(0),
+            (STAMP + timedelta(minutes=len(clocks))).strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+        return stamp + (".000000" if match.group(1) else "")
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        if isinstance(value, str):
+            if _UUID.fullmatch(value):
+                return ids.setdefault(value, f"00000000-0000-4000-8000-{len(ids) + 1:012d}")
+            return _CLOCK.sub(clock, value)
+        return value
+
+    return walk(document)
+
+
+def test_list_and_accept_responses_match_the_cli_vector(stack: Stack) -> None:
+    _link(stack, stack.owner)
+    other = enrollment.seed_owner(stack.tenant_id, issuer=stack.issuer)
+    proposed = _rule(stack, minute=1)
+    _rule(stack, state="accepted", decider=other.principal_id, minute=2)
+    _rule(stack, state="rejected", decider=other.principal_id, minute=3)
+    _rule(stack, state="removed", decider=other.principal_id, minute=4)
+    listed = _list(stack)
+    assert listed.status_code == 200, listed.text
+    accepted = _decide(stack, proposed)
+    assert accepted.status_code == 200, accepted.text
+
+    recorded = _stable({"list": listed.json(), "accept": accepted.json()})
+    assert recorded["list"]["rules"], "the vector must carry rules"
+    states = {rule["state"] for rule in recorded["list"]["rules"]}
+    assert states == {"proposed", "accepted", "rejected", "removed"}
+    document = {"_comment": CLI_VECTOR_NOTE} | recorded
+    if os.environ.get("CURIE_WRITE_MEMORY_RULES_VECTOR") == "1":
+        CLI_VECTOR.write_text(json.dumps(document, indent=2) + "\n")
+    assert json.loads(CLI_VECTOR.read_text()) == document, (
+        f"{CLI_VECTOR.name} no longer matches the routes; refresh it as its _comment says"
+    )
 
 
 # --- AC1: the list route -------------------------------------------------------------
