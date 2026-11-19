@@ -10,6 +10,7 @@ durable WorkItem's issue before and after any tracker call.
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -57,6 +58,7 @@ from ..issue_read import (
 )
 from ..issue_read_token import IssueReadClaims, mint, verify_claims
 from ..models import ExecutionRequest
+from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)
 
@@ -475,9 +477,47 @@ def _question_refused(code: str) -> HTTPException:
     return issue_read_error(409, code, _QUESTION_REFUSALS.get(code, "the questions were refused"))
 
 
-@router.post("/questions", response_model=QuestionsOut)
+# Far above any input inside the bounds, even with every character escaped.
+_QUESTIONS_BODY_MAX_BYTES: Final = 256 * 1024
+# Documented, not bound: the handler reads the body itself, after the
+# capability, so no body shape is answered with FastAPI's echoing 422.
+_QUESTIONS_BODY = {
+    key: value
+    for key, value in QuestionsSubmission.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    ).items()
+    if key != "$defs"
+}
+
+
+async def _questions_submission(request: Request) -> QuestionsSubmission:
+    """The body as a submission, or 409 ``invalid_questions`` echoing nothing
+    for anything that is not one JSON object within the size bound."""
+
+    try:
+        raw = await read_bounded_body(request, _QUESTIONS_BODY_MAX_BYTES, subject="questions body")
+    except HTTPException:
+        raise _question_refused(questions_core.INVALID_QUESTIONS) from None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise _question_refused(questions_core.INVALID_QUESTIONS) from None
+    if not isinstance(parsed, dict):
+        raise _question_refused(questions_core.INVALID_QUESTIONS)
+    return QuestionsSubmission.model_validate(parsed)
+
+
+@router.post(
+    "/questions",
+    response_model=QuestionsOut,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": _QUESTIONS_BODY}},
+        }
+    },
+)
 async def post_questions(
-    data: QuestionsSubmission,
     request: Request,
     response: Response,
     session: SessionDep,
@@ -492,10 +532,13 @@ async def post_questions(
     clock then. A replay of the same body by the same request answers the
     first result with no second write. Refusals are 409 with a fixed code and
     nothing echoed; a tracker failure is 503 ``tracker_unavailable`` and
-    leaves the round ``posting``, which settlement treats as not asked.
+    leaves the round ``posting``, which settlement treats as not asked. The
+    body is read only after the capability is verified, and any body that is
+    not a JSON object inside the bounds is 409 ``invalid_questions``.
     """
 
     response.headers["Cache-Control"] = "no-store"
+    data = await _questions_submission(request)
     if not questions_core.input_valid(data.summary, data.questions):
         raise _question_refused(questions_core.INVALID_QUESTIONS)
     try:
@@ -511,7 +554,8 @@ async def post_questions(
         )
         if isinstance(begun, questions_core.Posting):
             try:
-                comment_id = await questions_core.post_round(
+                begun = await questions_core.post_and_record(
+                    session,
                     get_settings(),
                     request.app.state.http_client,
                     request_id=claims.execution_request_id,
@@ -519,13 +563,6 @@ async def post_questions(
                 )
             except questions_core.TrackerUnavailable:
                 raise _tracker_unavailable() from None
-            begun = await questions_core.finish_round(
-                session,
-                work_item_id=begun.work_item.id,
-                request_id=claims.execution_request_id,
-                digest=begun.digest,
-                comment_id=comment_id,
-            )
     except questions_core.QuestionsRefused as refused:
         raise _question_refused(refused.code) from None
     return QuestionsOut(round=begun.round, rounds_limit=questions_core.ROUND_LIMIT)

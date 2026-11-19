@@ -4,9 +4,11 @@ A request whose round is posted and that then ends without a pull request
 completes with ``questions_asked``, admits no retry, and its status comment
 names the round and carries ``curie-factory:questions``. An answer queued
 before the asking request settles keeps its revision request. A fourth ask is
-refused, and the request that was refused fails ``question_rounds_exhausted``,
-which needs a human. Cancelling the WorkItem clears its question and keeps
-the round count, so a relabel does not reset the cap (ADR 0286 decision 8).
+refused, and the request that was refused fails ``question_rounds_exhausted``
+however it fails, owner loss included, which needs a human and admits no
+successor. Cancelling the WorkItem deletes its question row and keeps the
+lifetime round count, so a relabel does not reset the cap (ADR 0286
+decision 8).
 
 Each case admits a labelled issue through a signed webhook, acquires and
 starts its request as the worker does, asks through the route over HTTP with
@@ -20,6 +22,7 @@ queued as ``pending_request_id``.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -93,6 +96,15 @@ def _round_row(work_item_id: uuid.UUID) -> dict[str, Any] | None:
         {"id": work_item_id},
     )
     return rows[0] if rows else None
+
+
+def _round_count(work_item_id: uuid.UUID) -> tuple[int, uuid.UUID | None] | None:
+    rows = _rows(
+        "SELECT rounds_used, last_asking_request_id FROM curie.factory_question_round_counts "
+        "WHERE work_item_id = :id",
+        {"id": work_item_id},
+    )
+    return (int(rows[0]["rounds_used"]), rows[0]["last_asking_request_id"]) if rows else None
 
 
 def _request(request_id: uuid.UUID) -> dict[str, Any]:
@@ -377,6 +389,130 @@ def test_investigating_line_is_absent_for_pull_request_feedback(
 # Criterion 11: three rounds, then the cap ----------------------------------------------
 
 
+def _asked_rounds(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int, rounds: int
+) -> tr._Triage:
+    """``rounds`` real rounds, each answered while its asker ran; the last
+    asker is still running."""
+
+    current = _asked(admitted, monkeypatch, number)
+    for expected_round in range(2, rounds + 1):
+        revision = _queue_revision(current)
+        _answer(current.work_item_id, revision)
+        tr._finish(current, "failed", "no_pull_request")
+        current = _take_over(current, revision)
+        response = _ask(current, [f"Round {expected_round}: which file holds the rows?"])
+        assert response.status_code == 200, response.text
+        assert response.json() == {"round": expected_round, "rounds_limit": 3}
+    return current
+
+
+def _refused_fourth(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Triage:
+    """A running request whose fourth ask got a real 409 for the cap."""
+
+    current = _asked_rounds(admitted, monkeypatch, number, 3)
+    revision = _queue_revision(current)
+    _answer(current.work_item_id, revision)
+    tr._finish(current, "failed", "no_pull_request")
+    current = _take_over(current, revision)
+    refused = _ask(current, ["Round 4: which file holds the rows?"])
+    assert (refused.status_code, refused.json()["detail"]["code"]) == (
+        409,
+        "question_rounds_exhausted",
+    )
+    row = _round_row(current.work_item_id)
+    assert row is not None and (row["state"], row["asking_request_id"]) == (
+        "exhausted",
+        current.request_id,
+    )
+    return current
+
+
+def _versions(triage: tr._Triage, request_id: uuid.UUID) -> tuple[int, int]:
+    (row,) = _rows(
+        "SELECT w.version AS work_item_version, r.version AS request_version "
+        "FROM curie.work_items w JOIN curie.execution_requests r ON r.work_item_id = w.id "
+        "WHERE r.id = :id",
+        {"id": request_id},
+    )
+    return int(row["work_item_version"]), int(row["request_version"])
+
+
+def _lose_owner(triage: tr._Triage) -> None:
+    """The heartbeat lapses past the runtime TTL, the reconciler's owner loss
+    cancellation runs, and the worker records the sandbox's termination."""
+
+    from curie_api.config import get_settings
+
+    ttl = get_settings().work_item_runtime_ttl_seconds
+    tr._exec(
+        "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+        "clock_timestamp() - make_interval(secs => :lapse) WHERE id = :id",
+        {"lapse": ttl + 5, "id": triage.request_id},
+    )
+
+    work_item_version, request_version = _versions(triage, triage.request_id)
+
+    async def cancel() -> Any:
+        async with triage.client.app.state.sessionmaker() as session:
+            result = await lifecycle.request_owner_lost_cancellation(
+                session,
+                work_item_id=triage.work_item_id,
+                request_id=triage.request_id,
+                expected_work_item_version=work_item_version,
+                expected_request_version=request_version,
+            )
+            await session.commit()
+            return result
+
+    assert isinstance(triage.client.portal.call(cancel), lifecycle.WorkItemOutcome)
+    assert _request(triage.request_id) == {
+        "status": "cancellation_requested",
+        "terminal_cause": "owner_lost",
+    }
+
+    work_item_version, request_version = _versions(triage, triage.request_id)
+
+    async def terminate() -> Any:
+        async with triage.client.app.state.sessionmaker() as session:
+            result = await lifecycle.record_runtime_termination(
+                session,
+                work_item_id=triage.work_item_id,
+                request_id=triage.request_id,
+                termination_observation="sandbox gone after the owner stopped heartbeating",
+                expected_work_item_version=work_item_version,
+                expected_request_version=request_version,
+            )
+            await session.commit()
+            return result
+
+    assert isinstance(triage.client.portal.call(terminate), lifecycle.WorkItemOutcome)
+
+
+def _finish_clean(triage: tr._Triage, cause: str) -> Any:
+    """The worker's failed finish with proved ``no_effects``, which lets a
+    retryable cause admit an automatic successor."""
+
+    from curie_api.workitem_dispatch import finish
+
+    async def go() -> Any:
+        async with triage.client.app.state.sessionmaker() as session:
+            return await finish(
+                session,
+                triage.request_id,
+                runtime_epoch=triage.epoch,
+                outcome="failed",
+                cause=cause,
+                detail=None,
+                ci_fix_round=None,
+                retry_safety="no_effects",
+                retry_condition=None,
+                exhausted_volume=None,
+            )
+
+    return triage.client.portal.call(go)
+
+
 def test_cap_refuses_a_fourth_round_and_the_request_needs_a_human(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -422,6 +558,63 @@ def _target(triage: tr._Triage) -> Any:
     return ReplyTarget.on_issue(triage.issue)
 
 
+def test_cap_owner_loss_after_the_refusal_settles_exhausted_without_a_successor(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _client, _github, sink = admitted
+    current = _refused_fourth(admitted, monkeypatch, 943)
+    _lose_owner(current)
+    assert _request(current.request_id) == {
+        "status": "failed",
+        "terminal_cause": "question_rounds_exhausted",
+    }
+    assert _requests(current.work_item_id)[-1]["id"] == current.request_id
+    _reconcile()
+    assert _state_labels(sink, 943) == {"curie-factory:needs-human"}
+
+
+def test_cap_a_retryable_failure_after_the_refusal_settles_exhausted_without_a_successor(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _client, _github, sink = admitted
+    current = _refused_fourth(admitted, monkeypatch, 944)
+    # Outside the unpublished causes, and with proved clean effects the
+    # retry policy would admit a successor for it.
+    _finish_clean(current, "sandbox_node_disrupted")
+    assert _request(current.request_id) == {
+        "status": "failed",
+        "terminal_cause": "question_rounds_exhausted",
+    }
+    assert _requests(current.work_item_id)[-1]["id"] == current.request_id
+    _reconcile()
+    assert _state_labels(sink, 944) == {"curie-factory:needs-human"}
+
+
+def test_cap_owner_loss_below_the_cap_still_admits_its_successor(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _asked(admitted, monkeypatch, 945)
+    _lose_owner(triage)
+    assert _request(triage.request_id) == {"status": "failed", "terminal_cause": "owner_lost"}
+    successor = _requests(triage.work_item_id)[-1]
+    assert successor["id"] != triage.request_id
+    assert successor["status"] == "waiting"
+
+
+def test_cap_a_retryable_failure_below_the_cap_still_admits_its_successor(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _asked(admitted, monkeypatch, 946)
+    _finish_clean(triage, "sandbox_node_disrupted")
+    assert _request(triage.request_id) == {
+        "status": "failed",
+        "terminal_cause": "sandbox_node_disrupted",
+    }
+    successor = _requests(triage.work_item_id)[-1]
+    assert successor["id"] != triage.request_id
+    assert successor["status"] == "waiting"
+
+
 # Criterion 12: cancellation -----------------------------------------------------------
 
 
@@ -439,23 +632,56 @@ def _cancel(triage: tr._Triage) -> None:
     assert isinstance(triage.client.portal.call(go), lifecycle.WorkItemOutcome)
 
 
-def test_cancel_clears_the_question_and_keeps_the_count(
+def test_cancel_deletes_the_question_cancels_the_queued_answer_and_keeps_the_cap(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _asked(admitted, monkeypatch, 951)
-    revision = _queue_revision(triage)
-    _answer(triage.work_item_id, revision)
-    _cancel(triage)
-    row = _round_row(triage.work_item_id)
-    assert row is not None
-    assert (row["state"], row["rounds_used"], row["pending_request_id"]) == ("cleared", 1, None)
+    _client, github, sink = admitted
+    current = _asked_rounds(admitted, monkeypatch, 951, 3)
+    revision = _queue_revision(current)
+    _answer(current.work_item_id, revision)
+    tr._finish(current, "failed", "no_pull_request")
+    row = _round_row(current.work_item_id)
+    assert row is not None and (row["state"], row["pending_request_id"]) == ("answered", revision)
+    assert _request(revision)["status"] == "queued"
+
+    _cancel(current)
+
+    # The row is gone with the cancellation; the lifetime count stays.
+    assert _round_row(current.work_item_id) is None
+    assert _round_count(current.work_item_id) == (3, current.request_id)
     # The cancellation's own sweep cancels the queued answer follow-up.
-    assert _request(revision)["status"] == "cancelled"
-    refused = _ask(triage)
+    assert _request(revision) == {"status": "cancelled", "terminal_cause": "issue_cancelled"}
+    refused = _ask(current)
     assert (refused.status_code, refused.json()["detail"]["code"]) == (
         409,
         "work_item_cancelled",
     )
+
+    # A relabel reuses the WorkItem: its first ask is still past the cap.
+    tr._label(current.client, github, 951)
+    relabelled = _requests(current.work_item_id)[-1]["id"]
+    assert relabelled not in (current.request_id, revision)
+    fresh = _take_over(current, relabelled)
+    again = _ask(fresh)
+    assert (again.status_code, again.json()["detail"]["code"]) == (
+        409,
+        "question_rounds_exhausted",
+    )
+    row = _round_row(fresh.work_item_id)
+    assert row is not None
+    assert (row["state"], row["rounds_used"], row["asking_request_id"]) == (
+        "exhausted",
+        3,
+        fresh.request_id,
+    )
+    tr._finish(fresh, "failed", "no_pull_request")
+    assert _request(fresh.request_id) == {
+        "status": "failed",
+        "terminal_cause": "question_rounds_exhausted",
+    }
+    assert _requests(fresh.work_item_id)[-1]["id"] == fresh.request_id
+    _reconcile()
+    assert _state_labels(sink, 951) == {"curie-factory:needs-human"}
 
 
 def test_cancel_after_the_question_settled_stops_asking_on_the_ticket(
@@ -469,8 +695,8 @@ def test_cancel_after_the_question_settled_stops_asking_on_the_ticket(
 
     _cancel(triage)
     _reconcile()
-    row = _round_row(triage.work_item_id)
-    assert row is not None and (row["state"], row["rounds_used"]) == ("cleared", 1)
+    assert _round_row(triage.work_item_id) is None
+    assert _round_count(triage.work_item_id) == (1, triage.request_id)
     assert _state_labels(sink, 956) == set()
 
 
@@ -488,34 +714,69 @@ def test_a_question_comment_rendered_after_cancel_does_not_ask_for_an_answer(
     assert _state_labels(sink, 957) == set()
 
 
-def test_cancel_while_the_comment_is_written_refuses_the_round(
+async def _cancel_now(triage: tr._Triage) -> Any:
+    async with triage.client.app.state.sessionmaker() as session:
+        version = await session.scalar(
+            text("SELECT version FROM curie.work_items WHERE id = :id"),
+            {"id": triage.work_item_id},
+        )
+        result = await lifecycle.request_cancellation(
+            session, work_item_id=triage.work_item_id, expected_work_item_version=version
+        )
+        await session.commit()
+        return result
+
+
+def test_cancel_before_the_comment_is_written_refuses_with_no_write(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     triage = _running(admitted, monkeypatch, 952)
-    original = factory_questions.post_round
+    original = factory_questions.begin_round
 
-    async def cancelled_meanwhile(*args: Any, **kwargs: Any) -> str:
-        comment_id = await original(*args, **kwargs)
-        async with triage.client.app.state.sessionmaker() as session:
-            version = await session.scalar(
-                text("SELECT version FROM curie.work_items WHERE id = :id"),
-                {"id": triage.work_item_id},
-            )
-            result = await lifecycle.request_cancellation(
-                session, work_item_id=triage.work_item_id, expected_work_item_version=version
-            )
-            await session.commit()
-            assert isinstance(result, lifecycle.WorkItemOutcome), result
-        return comment_id
+    async def cancelled_after_posting(*args: Any, **kwargs: Any) -> Any:
+        begun = await original(*args, **kwargs)
+        assert isinstance(begun, factory_questions.Posting)
+        assert isinstance(await _cancel_now(triage), lifecycle.WorkItemOutcome)
+        return begun
 
-    monkeypatch.setattr(factory_questions, "post_round", cancelled_meanwhile)
+    monkeypatch.setattr(factory_questions, "begin_round", cancelled_after_posting)
     refused = _ask(triage)
     assert (refused.status_code, refused.json()["detail"]["code"]) == (
         409,
         "work_item_cancelled",
     )
-    row = _round_row(triage.work_item_id)
-    assert row is not None and (row["state"], row["rounds_used"]) == ("cleared", 0)
+    assert triage.tracker.ledger.writes == 0
+    assert _round_row(triage.work_item_id) is None
+    assert _round_count(triage.work_item_id) == (0, None)
+
+
+def test_cancel_during_the_comment_write_waits_for_the_round_then_deletes_it(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _running(admitted, monkeypatch, 958)
+    original = factory_questions.post_round
+    pending: list[asyncio.Task[Any]] = []
+
+    async def cancelled_meanwhile(*args: Any, **kwargs: Any) -> str:
+        comment_id = await original(*args, **kwargs)
+        # The cancellation takes the WorkItem lock and then waits for the
+        # question row, which the round being recorded holds.
+        pending.append(asyncio.create_task(_cancel_now(triage)))
+        await asyncio.sleep(0.5)
+        assert not pending[0].done()
+        return comment_id
+
+    monkeypatch.setattr(factory_questions, "post_round", cancelled_meanwhile)
+    posted = _ask(triage)
+    assert posted.status_code == 200, posted.text
+
+    async def cancelled() -> Any:
+        return await asyncio.wait_for(pending[0], timeout=30)
+
+    assert isinstance(triage.client.portal.call(cancelled), lifecycle.WorkItemOutcome)
+    assert triage.tracker.ledger.writes == 1
+    assert _round_row(triage.work_item_id) is None
+    assert _round_count(triage.work_item_id) == (1, triage.request_id)
 
 
 def test_cancel_then_relabel_keeps_the_round_cap(
@@ -526,6 +787,10 @@ def test_cancel_then_relabel_keeps_the_round_cap(
     # Two more rounds were posted by earlier attempts on this WorkItem.
     tr._exec(
         "UPDATE curie.factory_question_rounds SET rounds_used = 3 WHERE work_item_id = :id",
+        {"id": triage.work_item_id},
+    )
+    tr._exec(
+        "UPDATE curie.factory_question_round_counts SET rounds_used = 3 WHERE work_item_id = :id",
         {"id": triage.work_item_id},
     )
     tr._finish(triage, "failed", "no_pull_request")

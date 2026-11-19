@@ -194,6 +194,15 @@ VIOLATIONS: list[tuple[str, dict[str, Any]]] = [
     ("blank line", {"summary": "found it", "questions": ["One\n\nTwo"]}),
     ("blank line with spaces", {"summary": "found it", "questions": ["One\n \t\nTwo"]}),
     ("crlf blank line", {"summary": "found it", "questions": ["One\r\n\r\nTwo"]}),
+    # Every line break form the API normalizes before its blank-line rule, and
+    # a line that only an invisible character keeps from being blank.
+    ("line separator blank line", {"summary": "found it", "questions": ["One\u2028\u2028Two"]}),
+    ("lone cr blank line", {"summary": "found it", "questions": ["One\r\rTwo"]}),
+    ("next line blank line", {"summary": "found it", "questions": ["One\x85\x85Two"]}),
+    ("form feed blank line", {"summary": "found it", "questions": ["One\n\x0c\nTwo"]}),
+    ("vertical tab blank line", {"summary": "found it", "questions": ["One\x0b\x0bTwo"]}),
+    ("zero width blank line", {"summary": "found it", "questions": ["One\n\u200b\nTwo"]}),
+    ("invisible question", {"summary": "found it", "questions": ["\u200b\u2060"]}),
     ("extra key", {"summary": "found it", "questions": ["Which?"], "note": "x"}),
     ("non string question", {"summary": "found it", "questions": ["Which?", 7]}),
     ("missing summary", {"questions": ["Which?"]}),
@@ -218,6 +227,13 @@ EDGES: list[tuple[str, dict[str, Any]]] = [
     ("ten questions", {"summary": "found it", "questions": [f"Question {n}?" for n in range(10)]}),
     ("question at the limit", {"summary": "found it", "questions": ["q" * 1_000]}),
     ("single line break", {"summary": "found it", "questions": ["One\nTwo", "Three\r\nFour"]}),
+    (
+        "single separator line breaks",
+        {
+            "summary": "found it",
+            "questions": ["One\u2028Two", "Three\rFour", "Five\x85Six", "Seven\u2029Eight"],
+        },
+    ),
 ]
 
 
@@ -249,6 +265,16 @@ def test_an_accepted_post_reports_the_round_and_ends_the_session() -> None:
     assert "round 2 of 3" in text
     assert "session ends now" in text
     assert "without opening a pull request" in text
+
+
+def test_a_posted_size_refusal_tells_the_model_to_shorten_the_questions() -> None:
+    # The pre-check passed; the platform refused the comment it would post.
+    api = _QuestionsApi(answer=(409, {"detail": {"code": "invalid_questions"}}))
+    result = _ask(api, _valid())
+    assert result["is_error"] is True
+    text = _text(result)
+    assert "too long" in text and "Shorten" in text
+    assert len(api.question_calls) == 1
 
 
 def test_exhausted_rounds_tell_the_model_to_end_with_could_not_complete() -> None:

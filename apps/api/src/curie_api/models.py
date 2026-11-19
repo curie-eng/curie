@@ -2284,7 +2284,9 @@ class FactoryQuestionRound(Base):
     only the tracker's comment id and a digest of the comment the platform
     wrote. ``rounds_used`` counts rounds whose comment was posted, so it is
     zero while the first round is ``posting`` or after a first post that never
-    landed and settled ``cleared``.
+    landed and settled ``cleared``. Cancelling the WorkItem deletes the row;
+    the lifetime count lives on in ``FactoryQuestionRoundCount``, and a row
+    created after a relabel starts from it.
     """
 
     __tablename__ = "factory_question_rounds"
@@ -2331,6 +2333,37 @@ class FactoryQuestionRound(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class FactoryQuestionRoundCount(Base):
+    """The question rounds a WorkItem posted in its lifetime (#5785, ADR 0286 decision 8).
+
+    Cancelling the WorkItem deletes its ``FactoryQuestionRound``; this count
+    survives, so a relabel, which reuses the WorkItem, does not reset the cap.
+    ``last_asking_request_id`` names the request that posted the latest round,
+    so its status comment keeps its round number after the question row is
+    gone. Incremented in the transaction that records a posted round.
+    """
+
+    __tablename__ = "factory_question_round_counts"
+    __table_args__ = (
+        CheckConstraint(
+            f"rounds_used BETWEEN 0 AND {FACTORY_QUESTION_ROUND_LIMIT}",
+            name="factory_question_round_counts_rounds_used_ck",
+        ),
+    )
+
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    rounds_used: Mapped[int] = mapped_column(Integer, default=0)
+    last_asking_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class FactoryAnswerReceipt(Base):

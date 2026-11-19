@@ -10,12 +10,16 @@ marked-comment write, and the request ends with the question ending:
 This module owns the round record (`FactoryQuestionRound`, one row per
 WorkItem), the comment the platform composes, the route's refusals and its two
 transactions around the tracker write, the question ending the finish path
-applies, the row rules at settlement, and the clear at cancellation. The
+applies, the row rules at settlement, and the delete at cancellation, plus
+the WorkItem's lifetime round count, which outlives the row. The
 round record stores identities, a count, a digest and a fence, never question
 or answer text (ADR 0187, ADR 0199).
 
 Lock order: every write takes the WorkItem row lock first, then the request
-lock where it needs one, as every `workitems/lifecycle.py` transition does.
+lock where it needs one, then the question row, as every
+`workitems/lifecycle.py` transition does. The one exception is the tracker
+write (`post_and_record`), which holds only the question row and the count
+row, so it never waits for a lock a WorkItem lock holder waits behind it for.
 """
 
 from __future__ import annotations
@@ -28,7 +32,8 @@ from dataclasses import dataclass
 from typing import Final
 
 import httpx
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import factory_tracker_result_runtime as runtime
@@ -42,6 +47,7 @@ from .models import (
     FACTORY_QUESTION_ROUND_LIMIT,
     ExecutionRequest,
     FactoryQuestionRound,
+    FactoryQuestionRoundCount,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
@@ -63,8 +69,15 @@ ANSWER_LINE: Final = (
 SUMMARY_MAX_CHARS: Final = 4_000
 QUESTION_MAX_CHARS: Final = 1_000
 QUESTIONS_MAX: Final = 10
-# A CRLF is one line break: the lone ``\r`` alternative may not split it.
-_BLANK_LINE = re.compile(r"(?:\r\n|\r(?!\n)|\n)[ \t]*(?:\r\n|\r(?!\n)|\n)")
+# The composed comment, after sanitization and redaction, is refused above
+# this. Redaction placeholders and the item indentation can grow valid input
+# well past its raw size, and Jira cuts a comment body at 30,000 characters
+# (`forges.jira_cloud.comments.BODY_LIMIT`), which would drop the answer line.
+# The margin covers the marker a code host adds around the body.
+RENDERED_MAX_CHARS: Final = 25_000
+# Every line break form a renderer or Python honors, CRLF first so it stays
+# one break. The runner's pre-check normalizes the same set.
+_LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x85\u2028\u2029]")
 
 # Refusal codes, each answered 409 with the code only (decision 10).
 NOT_IMPLEMENTATION_CONTRACT: Final = "not_implementation_contract"
@@ -102,22 +115,49 @@ class TrackerUnavailable(Exception):
 
 
 def input_valid(summary: object, questions: object) -> bool:
-    """Whether the tool input is inside decision 2's bounds."""
+    """Whether the tool input is inside decision 2's bounds, judged on what
+    would be posted.
 
-    if not isinstance(summary, str) or not summary.strip() or len(summary) > SUMMARY_MAX_CHARS:
+    The character bounds apply to the input as sent. The empty and blank-line
+    rules apply to the sanitized text, so a line holding only a Unicode line
+    separator, a form feed or an invisible character counts as blank, exactly
+    as it renders. The composed comment must also fit `RENDERED_MAX_CHARS`
+    after redaction, so the answer line survives every tracker's cut.
+    """
+
+    if not isinstance(summary, str) or len(summary) > SUMMARY_MAX_CHARS:
+        return False
+    if not _visible(summary):
         return False
     if not isinstance(questions, list) or not 1 <= len(questions) <= QUESTIONS_MAX:
         return False
-    return all(
-        isinstance(question, str)
-        and question.strip()
-        and len(question) <= QUESTION_MAX_CHARS
-        and _BLANK_LINE.search(question) is None
-        for question in questions
-    )
+    for question in questions:
+        if not isinstance(question, str) or len(question) > QUESTION_MAX_CHARS:
+            return False
+        lines = _visible(question).split("\n")
+        if not all(line.strip() for line in lines):
+            return False
+    # The round number is one digit, so every round composes to this length.
+    return len(compose_body(ROUND_LIMIT, summary, questions)) <= RENDERED_MAX_CHARS
+
+
+def _visible(text: str) -> str:
+    """The sanitized text as posted, every line break a newline, trimmed."""
+
+    return _inert(_LINE_BREAK.sub("\n", text)).strip()
 
 
 _FENCE_RUN = re.compile(r"`{3,}|~{3,}")
+# Block syntax that may open a line: an ATX heading, a block quote, a bullet,
+# an HTML block, a table row. Escaped with a backslash, which every tracker
+# renderer here reads as the literal character.
+_BLOCK_OPENER = re.compile(r"#{1,6}(?=[ \t]|$)|>|[-+*](?=[ \t]|$)|<|\|")
+# A thematic break or a setext underline.
+_RULE_LINE = re.compile(r"(?:[-*_][ \t]*){3,}|=+[ \t]*|-+[ \t]*")
+# An ordered list marker; the summary must not open or continue a list that
+# merges with the numbered questions.
+_ORDERED_MARKER = re.compile(r"^([ \t]*\d{1,9})([.)])(?=[ \t]|$)", re.MULTILINE)
+_HTML_OPENER = re.compile(r"^([ \t]*)<", re.MULTILINE)
 
 
 def _inert(text: str) -> str:
@@ -139,18 +179,42 @@ def compose_body(round_number: int, summary: str, questions: list[str]) -> str:
 
     The model supplies only the summary and the questions; the heading, the
     numbering and the answer line are fixed, so the wording is identical on
-    every tracker.
+    every tracker. Each question stays one list item: its continuation lines
+    are indented to the item's content column and none of its lines can open
+    a block. The summary cannot open an ordered list or an HTML block, so the
+    questions are the comment's only ordered list and nothing above them can
+    swallow them.
     """
 
     numbered = "\n".join(
-        f"{index}. {_inert(question.strip())}" for index, question in enumerate(questions, start=1)
+        _list_item(index, question) for index, question in enumerate(questions, start=1)
     )
+    prose = _ORDERED_MARKER.sub(r"\1\\\2", _visible(summary))
+    prose = _HTML_OPENER.sub(r"\1\\<", prose)
     return (
         f"### Questions from the factory (round {round_number} of {ROUND_LIMIT})\n\n"
-        f"{_inert(summary.strip())}\n\n"
+        f"{prose}\n\n"
         f"{numbered}\n\n"
         f"{ANSWER_LINE}\n"
     )
+
+
+def _list_item(index: int, question: str) -> str:
+    marker = f"{index}. "
+    lines = [_inline_line(line) for line in _visible(question).split("\n")]
+    return marker + ("\n" + " " * len(marker)).join(lines)
+
+
+def _inline_line(line: str) -> str:
+    """One question line that can only continue its list item's paragraph."""
+
+    line = line.strip()
+    ordered = _ORDERED_MARKER.match(line)
+    if ordered:
+        return _ORDERED_MARKER.sub(r"\1\\\2", line, count=1)
+    if _BLOCK_OPENER.match(line) or _RULE_LINE.fullmatch(line):
+        return "\\" + line
+    return line
 
 
 def body_sha256(body: str) -> str:
@@ -191,6 +255,17 @@ async def _round_row(session: AsyncSession, work_item_id: uuid.UUID) -> FactoryQ
     return row
 
 
+async def _lifetime_rounds(session: AsyncSession, work_item_id: uuid.UUID) -> int:
+    """Rounds the WorkItem posted in its lifetime; cancellation does not reset it."""
+
+    used = await session.scalar(
+        select(FactoryQuestionRoundCount.rounds_used).where(
+            FactoryQuestionRoundCount.work_item_id == work_item_id
+        )
+    )
+    return int(used or 0)
+
+
 async def _refuse_after_commit(session: AsyncSession, code: str) -> QuestionsRefused:
     await session.commit()
     return QuestionsRefused(code)
@@ -205,9 +280,11 @@ async def begin_round(
 ) -> Posted | Posting:
     """Transaction 1: refuse, replay, or record the round ``posting`` and commit.
 
-    Under the WorkItem and request locks. A replay (this request already
-    posted this exact body) writes nothing. A fourth ask records the row
-    ``exhausted`` before it is refused.
+    Under the WorkItem and request locks, then the question row lock. A
+    replay (this request already posted this exact body) writes nothing. A
+    fourth ask in the WorkItem's lifetime records the row ``exhausted`` before
+    it is refused. The round is numbered from the lifetime count, so a row
+    created again after a cancellation and relabel says the right round.
     """
 
     pair = await runtime.load_pair(session, request_id, lock=True)
@@ -254,30 +331,53 @@ async def begin_round(
             await session.commit()
             return Posted(round=row.rounds_used)
         raise await _refuse_after_commit(session, ALREADY_ASKED)
-    if row is not None and row.rounds_used >= ROUND_LIMIT:
-        # The refused request becomes the row's asker, so its own settlement
-        # finds the exhausted ending and then clears the row; the count stays,
-        # so every later ask is refused too.
-        await session.execute(
-            update(FactoryQuestionRound)
-            .where(FactoryQuestionRound.work_item_id == work_item.id)
-            .values(
-                state=EXHAUSTED,
-                asking_request_id=request.id,
-                version=FactoryQuestionRound.version + 1,
-                updated_at=func.clock_timestamp(),
-            )
-        )
-        raise await _refuse_after_commit(session, QUESTION_ROUNDS_EXHAUSTED)
-
-    round_number = (row.rounds_used if row is not None else 0) + 1
+    # Read under the question row lock: a round being recorded holds it, so
+    # this sees that round's count.
+    lifetime = await _lifetime_rounds(session, work_item.id)
+    round_number = lifetime + 1
     body = compose_body(round_number, summary, questions)
     digest = body_sha256(body)
+    if lifetime >= ROUND_LIMIT:
+        # The refused request becomes the row's asker, so its own settlement
+        # finds the exhausted ending and then clears the row; the lifetime
+        # count stays, so every later ask is refused too.
+        if row is None:
+            session.add(
+                FactoryQuestionRound(
+                    work_item_id=work_item.id,
+                    rounds_used=lifetime,
+                    state=EXHAUSTED,
+                    asking_request_id=request.id,
+                    body_sha256=digest,
+                )
+            )
+        else:
+            await session.execute(
+                update(FactoryQuestionRound)
+                .where(FactoryQuestionRound.work_item_id == work_item.id)
+                .values(
+                    state=EXHAUSTED,
+                    rounds_used=lifetime,
+                    asking_request_id=request.id,
+                    version=FactoryQuestionRound.version + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+            )
+        raise await _refuse_after_commit(session, QUESTION_ROUNDS_EXHAUSTED)
+
+    # The count row exists before the tracker write, so recording the round
+    # updates it without a foreign key check against the WorkItem (which a
+    # cancellation may hold while it waits for the question row).
+    await session.execute(
+        pg_insert(FactoryQuestionRoundCount)
+        .values(work_item_id=work_item.id, rounds_used=lifetime)
+        .on_conflict_do_nothing(index_elements=[FactoryQuestionRoundCount.work_item_id])
+    )
     if row is None:
         session.add(
             FactoryQuestionRound(
                 work_item_id=work_item.id,
-                rounds_used=0,
+                rounds_used=lifetime,
                 state=POSTING,
                 asking_request_id=request.id,
                 body_sha256=digest,
@@ -292,6 +392,7 @@ async def begin_round(
             .where(FactoryQuestionRound.work_item_id == work_item.id)
             .values(
                 state=POSTING,
+                rounds_used=lifetime,
                 asking_request_id=request.id,
                 comment_id=None,
                 body_sha256=digest,
@@ -340,50 +441,76 @@ async def post_round(
     return result.comment.id
 
 
-async def finish_round(
+async def post_and_record(
     session: AsyncSession,
+    settings: Settings,
+    client: httpx.AsyncClient,
     *,
-    work_item_id: uuid.UUID,
     request_id: uuid.UUID,
-    digest: str,
-    comment_id: str,
+    posting: Posting,
 ) -> Posted:
-    """Transaction 2: record the posted round ``outstanding`` and commit.
+    """Transaction 2: write the round's comment under the question row lock and
+    record it ``outstanding``.
 
-    ``answer_after`` is the database clock read here, after the tracker write
-    returned, so no comment written before the question can pass the fence.
+    The row lock serializes concurrent calls of one request: the second waits
+    here, finds the round already ``outstanding`` and answers it with no
+    second tracker write (decision 9). Only the question row and the count
+    row are locked, never the WorkItem, so settlement and cancellation (the
+    WorkItem lock, then the row) wait for at most the capped tracker write and
+    cannot deadlock with it. ``answer_after`` is the database clock read by
+    the UPDATE after the write returned (``clock_timestamp()``, not the
+    transaction start), so no comment written before the question can pass
+    the fence. A tracker failure rolls back and leaves the round ``posting``.
     """
 
-    from .workitems.lifecycle import lock_work_item
-
-    work_item = await lock_work_item(session, work_item_id)
+    work_item_id = posting.work_item.id
     row = await _round_row(session, work_item_id)
-    if work_item is None or work_item.cancelled_at is not None or row is None:
+    cancelled = await session.scalar(
+        select(WorkItem.cancelled_at).where(WorkItem.id == work_item_id)
+    )
+    if row is None or cancelled is not None:
+        # Cancellation deletes the row in its own transaction.
         raise await _refuse_after_commit(session, WORK_ITEM_CANCELLED)
-    if row.asking_request_id == request_id and row.body_sha256 == digest:
+    if row.asking_request_id == request_id and row.body_sha256 == posting.digest:
         if row.state in (OUTSTANDING, ANSWERED):
-            # A concurrent call of the same request finished this round.
+            # A concurrent call of the same request recorded this round.
             await session.commit()
             return Posted(round=row.rounds_used)
         if row.state == POSTING:
             # Read before the UPDATE: the session synchronizes ``row`` with it.
             posted = row.rounds_used + 1
+            try:
+                comment_id = await post_round(
+                    settings, client, request_id=request_id, posting=posting
+                )
+            except TrackerUnavailable:
+                await session.rollback()
+                raise
             await session.execute(
                 update(FactoryQuestionRound)
                 .where(FactoryQuestionRound.work_item_id == work_item_id)
                 .values(
                     state=OUTSTANDING,
                     comment_id=comment_id,
-                    rounds_used=FactoryQuestionRound.rounds_used + 1,
+                    rounds_used=posted,
                     answer_after=func.clock_timestamp(),
                     version=FactoryQuestionRound.version + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+            )
+            await session.execute(
+                update(FactoryQuestionRoundCount)
+                .where(FactoryQuestionRoundCount.work_item_id == work_item_id)
+                .values(
+                    rounds_used=posted,
+                    last_asking_request_id=request_id,
                     updated_at=func.clock_timestamp(),
                 )
             )
             await session.commit()
             return Posted(round=posted)
     # The request settled (the row was cleared) or another body replaced
-    # this one while the tracker write ran.
+    # this one before the write.
     status = await session.scalar(
         select(ExecutionRequest.status).where(ExecutionRequest.id == request_id)
     )
@@ -398,7 +525,7 @@ async def finish_round(
 async def question_ending(
     session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
 ) -> str | None:
-    """The ending for an unpublished failure of ``request_id``, or None.
+    """The question ending ``request_id`` has earned, or None.
 
     ``questions_asked`` when this request's round is posted (``outstanding``,
     or ``answered`` because an answer came before it settled);
@@ -418,6 +545,19 @@ async def question_ending(
     return None
 
 
+async def rounds_exhausted_for(
+    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
+) -> bool:
+    """Whether ``request_id``'s ask was refused for the round cap (decision 14).
+
+    Such a request is terminal however it fails: it settles with cause
+    ``question_rounds_exhausted`` and admits no automatic successor, owner
+    loss included (ADR 0286 decision 8). The caller holds the WorkItem lock.
+    """
+
+    return await question_ending(session, work_item_id, request_id) == QUESTION_ROUNDS_EXHAUSTED
+
+
 async def settle_round(
     session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
 ) -> None:
@@ -434,7 +574,7 @@ async def settle_round(
     3. Otherwise any terminal outcome makes it ``cleared``, a ``posting`` row
        included (its round never counted).
 
-    A cancelled WorkItem's row was cleared with the cancellation.
+    A cancelled WorkItem's row was deleted with the cancellation.
     """
 
     if work_item.cancelled_at is not None:
@@ -466,35 +606,36 @@ async def settle_round(
     )
 
 
-async def clear_for_cancellation(session: AsyncSession, work_item_id: uuid.UUID) -> None:
-    """Clear the WorkItem's question in its cancellation transaction.
+async def delete_for_cancellation(session: AsyncSession, work_item_id: uuid.UUID) -> None:
+    """Delete the WorkItem's question row in its cancellation transaction.
 
     Cancellation is sticky (ADR 0161): after it no comment is an answer, so
-    the row is ``cleared`` and names no pending request. ``rounds_used`` is
-    kept: the cap counts rounds for the WorkItem's lifetime and a relabel,
-    which reuses the WorkItem, does not reset it (ADR 0286 decision 8).
+    the row goes (decision 15), and the cancellation's own sweep cancels any
+    queued answer follow-up. The lifetime round count is a separate row that
+    stays, so a relabel, which reuses the WorkItem, does not reset the cap
+    (ADR 0286 decision 8). The caller holds the WorkItem lock; a round being
+    recorded holds the question row, so this waits for it.
     """
 
     await session.execute(
-        update(FactoryQuestionRound)
-        .where(FactoryQuestionRound.work_item_id == work_item_id)
-        .values(
-            state=CLEARED,
-            pending_request_id=None,
-            version=FactoryQuestionRound.version + 1,
-            updated_at=func.clock_timestamp(),
-        )
+        delete(FactoryQuestionRound).where(FactoryQuestionRound.work_item_id == work_item_id)
     )
 
 
 async def asked_round(
     session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID
 ) -> int | None:
-    """The round ``request_id`` posted, while the row still names it as asker."""
+    """The round ``request_id`` posted, while it is the WorkItem's latest round.
 
-    row = await session.scalar(
-        select(FactoryQuestionRound).where(FactoryQuestionRound.work_item_id == work_item_id)
+    Read from the lifetime count, so the number survives the cancellation
+    that deletes the question row.
+    """
+
+    count = await session.scalar(
+        select(FactoryQuestionRoundCount).where(
+            FactoryQuestionRoundCount.work_item_id == work_item_id
+        )
     )
-    if row is None or row.asking_request_id != request_id or row.rounds_used < 1:
+    if count is None or count.last_asking_request_id != request_id or count.rounds_used < 1:
         return None
-    return int(row.rounds_used)
+    return int(count.rounds_used)

@@ -4982,7 +4982,9 @@ export interface paths {
          *     clock then. A replay of the same body by the same request answers the
          *     first result with no second write. Refusals are 409 with a fixed code and
          *     nothing echoed; a tracker failure is 503 ``tracker_unavailable`` and
-         *     leaves the round ``posting``, which settlement treats as not asked.
+         *     leaves the round ``posting``, which settlement treats as not asked. The
+         *     body is read only after the capability is verified, and any body that is
+         *     not a JSON object inside the bounds is 409 ``invalid_questions``.
          */
         post: operations["post_questions_work_items_questions_post"];
         delete?: never;
@@ -11146,25 +11148,6 @@ export interface components {
             round: number;
             /** Rounds Limit */
             rounds_limit: number;
-        };
-        /**
-         * QuestionsSubmission
-         * @description The runner question tool's call (#5785): what the investigation found and
-         *     the numbered questions. The API checks the bounds and composes the comment;
-         *     input outside them, a missing field included, is refused 409
-         *     ``invalid_questions``.
-         */
-        QuestionsSubmission: {
-            /**
-             * Questions
-             * @description 1 to 10 questions, each 1 to 1,000 characters with no blank line.
-             */
-            questions?: unknown;
-            /**
-             * Summary
-             * @description What the investigation found, 1 to 4,000 characters, including a reproduction result when there is one.
-             */
-            summary?: unknown;
         };
         /**
          * QueuedTurn
@@ -24689,7 +24672,18 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["QuestionsSubmission"];
+                "application/json": {
+                    /**
+                     * Questions
+                     * @description 1 to 10 questions, each 1 to 1,000 characters with no blank line.
+                     */
+                    questions?: unknown;
+                    /**
+                     * Summary
+                     * @description What the investigation found, 1 to 4,000 characters, including a reproduction result when there is one.
+                     */
+                    summary?: unknown;
+                };
             };
         };
         responses: {

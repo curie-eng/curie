@@ -16,24 +16,35 @@ composes it.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
+import os
 import sys
 import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+from markdown_it import MarkdownIt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_factory_tracker_results as tr
 import test_workitems as wi
 from curie_api import factory_questions, factory_tracker_result_runtime
+from curie_api.config import get_settings
 from curie_api.forges.capabilities import Operation
 from curie_api.forges.errors import Unavailable
+from curie_api.forges.jira_cloud.comments import BODY_LIMIT
 from curie_api.forges.types import ReplyTarget
 from curie_api.workitems import lifecycle
 from forge_fakes import jira as jira_fake
+from forge_fakes.github import forges_env_json
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _rows,
     admitted,
@@ -58,7 +69,7 @@ def _frame(round_number: int, summary: str, questions: list[str]) -> str:
     )
 
 
-def _ask(triage: tr._Triage, summary: Any = SUMMARY, questions: Any = None) -> Any:
+def _ask(triage: tr._Triage | _JiraCase, summary: Any = SUMMARY, questions: Any = None) -> Any:
     return triage.client.post(
         QUESTIONS_URL,
         headers={"X-Curie-Issue-Read": triage.capability},
@@ -133,7 +144,8 @@ def test_inputs_at_the_bounds_are_posted(admitted: Any, monkeypatch: pytest.Monk
     response = _ask(triage, summary="s" * 4000, questions=questions)
     assert response.status_code == 200, response.text
     (body,) = _marked(triage)
-    assert "10. first line\nsecond line" in body
+    # The continuation line sits at the item's content column, inside item 10.
+    assert "\n10. first line\n    second line\n\n" in body
 
 
 def test_model_text_cannot_open_an_html_comment(
@@ -191,35 +203,248 @@ def test_github_writes_one_comment_through_the_production_resolver(
     assert row is not None and row["comment_id"] == str(written[0]["id"])
 
 
-def test_jira_writes_one_comment_with_the_marker_as_a_comment_property(
-    admitted: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    triage = _running(admitted, monkeypatch, 812)
+_REAL_TRACKER = factory_tracker_result_runtime.work_item_tracker
+
+
+# The Jira Cloud tracker through the production resolver -------------------------
+
+
+class _ByHost(httpx.AsyncBaseTransport):
+    """The Jira fixture site to the Jira fake, every other host to the GitHub
+    stand-in the app already talks to."""
+
+    def __init__(self, jira: httpx.AsyncBaseTransport, default: httpx.AsyncBaseTransport) -> None:
+        self._jira = jira
+        self._default = default
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        jira_hosts = {jira_fake.SITE_HOST, jira_fake.GATEWAY_HOST}
+        transport = self._jira if request.url.host in jira_hosts else self._default
+        return await transport.handle_async_request(request)
+
+
+@dataclass(frozen=True)
+class _JiraCase:
+    client: Any
+    capability: str
+    request_id: uuid.UUID
+    work_item_id: uuid.UUID
+    fake: jira_fake.JiraFake
+    issue_id: int
+
+
+@pytest.fixture
+def jira_case(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[_JiraCase]:
+    """A running implementation request whose WorkItem is a Jira Cloud issue.
+
+    The install's forge config gains the Jira fixture site and its binding, and
+    the app's HTTP client sends that site to the Jira fake. Nothing replaces the
+    resolver: the route reaches the production Jira adapter through
+    `work_item_tracker` and the binding that serves the issue's site.
+    """
+
+    client, github, _server = admitted
+    document = json.loads(os.environ["CURIE_FORGES"])
+    site = json.loads(forges_env_json(jira_fake.jira_document(), tmp_path / "jira"))
+    document["trackers"].extend(site["trackers"])
+    document["bindings"].extend(site["bindings"])
+    monkeypatch.setenv("CURIE_FORGES", json.dumps(document))
+    get_settings.cache_clear()
     fake = jira_fake.JiraFake()
     issue = fake.seed_issue("Export drops a row", "Three rows in, two out.")
-    ref = fake.ref(issue)
+    (agent,) = _rows("SELECT id FROM curie.agents")
+    work_item_id, request_id = uuid.uuid4(), uuid.uuid4()
+    now = datetime.now(UTC)
+    tr._exec(
+        "INSERT INTO curie.work_items "
+        "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+        "tracker_display_key, code_host_kind, code_host_host, repository_project_id, "
+        "repository_path, code_host_installation_id, agent_id, conversation_id) "
+        "VALUES (:id, 'jira_cloud', :site, :cloud, :issue, :key, 'github', 'github.com', "
+        ":repository, :repo, 77, :agent, :conversation)",
+        {
+            "id": work_item_id,
+            "site": jira_fake.SITE_HOST,
+            "cloud": jira_fake.CLOUD_ID,
+            "issue": str(issue.id),
+            "key": issue.key,
+            "repository": jira_fake.GITHUB_REPO_ID,
+            "repo": jira_fake.GITHUB_REPO,
+            "agent": agent["id"],
+            "conversation": f"questions-{uuid.uuid4().hex}",
+        },
+    )
+    tr._exec(
+        "INSERT INTO curie.execution_requests "
+        "(id, work_item_id, sequence, status, wait_deadline, started_at, "
+        "execution_deadline, execution_attempts, runtime_owner, runtime_epoch, "
+        "runtime_heartbeat_expires_at) "
+        "VALUES (:id, :item, 1, 'running', :wait, :started, :deadline, 1, "
+        "'fixture-runner', 7, :lease)",
+        {
+            "id": request_id,
+            "item": work_item_id,
+            "wait": now + timedelta(minutes=5),
+            "started": now - timedelta(minutes=1),
+            "deadline": now + timedelta(hours=2),
+            "lease": now + timedelta(minutes=5),
+        },
+    )
+    minted = client.post(
+        tr.MINT_URL,
+        headers=tr.WORKER_HEADERS,
+        json={"execution_request_id": str(request_id), "publication_recovery": False},
+    )
+    assert minted.status_code == 200, minted.text
+    original = client.app.state.http_client
+    injected = httpx.AsyncClient(
+        transport=_ByHost(httpx.ASGITransport(app=fake.app), httpx.MockTransport(github.handle))
+    )
+    client.app.state.http_client = injected
+    try:
+        yield _JiraCase(
+            client=client,
+            capability=minted.json()["capability"],
+            request_id=request_id,
+            work_item_id=work_item_id,
+            fake=fake,
+            issue_id=issue.id,
+        )
+    finally:
+        client.app.state.http_client = original
+        client.portal.call(injected.aclose)
 
-    def jira_target(_settings: Any, _client: Any, _work_item: Any) -> Any:
-        tracker = jira_fake.jira_tracker(fake, client=jira_fake.fake_client(fake))
-        return tracker.marked_comments, ref
 
-    monkeypatch.setattr(factory_questions, "question_target", jira_target)
-    writes = fake.writes
-    response = _ask(triage)
+def _nodes(node: Any, kind: str) -> list[dict[str, Any]]:
+    """Every ADF node of ``kind`` in ``node``, at any depth."""
+
+    if isinstance(node, list):
+        return [found for child in node for found in _nodes(child, kind)]
+    if not isinstance(node, dict):
+        return []
+    own = [node] if node.get("type") == kind else []
+    return own + _nodes(node.get("content", []), kind)
+
+
+def _assert_one_list_and_the_answer_line_last(document: dict[str, Any], items: int) -> None:
+    """The rendered Jira comment: one ordered list of ``items`` items, the frame's
+    heading as its only heading, and the answer line as its last block."""
+
+    (ordered,) = _nodes(document, "orderedList")
+    assert len(ordered["content"]) == items
+    assert len(_nodes(document, "heading")) == 1
+    last = document["content"][-1]
+    assert last["type"] == "paragraph"
+    assert jira_fake.flatten(last) == f"{ANSWER_LINE}\n"
+
+
+def test_jira_writes_one_comment_through_the_production_resolver_with_a_property_marker(
+    jira_case: _JiraCase,
+) -> None:
+    case = jira_case
+    writes = case.fake.writes
+    response = _ask(case)
     assert response.status_code == 200, response.text
-    (comment,) = fake.issue(issue.id).comments
-    marker = f"curie-factory-questions:{triage.request_id}"
-    assert comment.properties["curie.factory"]["marker"] == marker
+    assert response.json() == {"round": 1, "rounds_limit": 3}
+    (comment,) = case.fake.issue(case.issue_id).comments
+    marker = f"curie-factory-questions:{case.request_id}"
+    # The marker is the comment entity property, never visible text.
+    assert comment.properties["curie.factory"] == {
+        "marker": marker,
+        "body_sha256": hashlib.sha256(_frame(1, SUMMARY, QUESTIONS).encode()).hexdigest(),
+    }
     text = jira_fake.flatten(comment.body)
-    assert marker not in text
+    assert "curie-factory-questions" not in text
     assert "Questions from the factory (round 1 of 3)" in text
-    assert "Which delimiter do callers expect?" in text
-    assert fake.writes - writes >= 1
-    row = _round_row(triage.work_item_id)
-    assert row is not None and row["comment_id"] == str(comment.id)
+    assert comment.author.account_id == jira_fake.BOT_ACCOUNT_ID
+    _assert_one_list_and_the_answer_line_last(comment.body, len(QUESTIONS))
+    assert case.fake.writes - writes >= 1
+    row = _round_row(case.work_item_id)
+    assert row is not None
+    assert (row["state"], row["rounds_used"], row["comment_id"]) == (
+        "outstanding",
+        1,
+        str(comment.id),
+    )
 
 
-_REAL_TRACKER = factory_tracker_result_runtime.work_item_tracker
+# Questions whose continuation lines open a block on some renderer.
+_BLOCK_QUESTIONS = [
+    "Which export path is meant?\u2028# Is this a heading on the continuation line?",
+    "Keep the trailing row?\n> a quote\n- a bullet\n2. a number\n---\n```\n| a | b |\n<pre>",
+    "Which delimiter do callers expect?\r\n===",
+]
+_LISTED_SUMMARY = "Steps tried:\n1. run the export\n2) count the rows\n<pre>"
+
+
+def test_jira_keeps_one_ordered_list_when_a_continuation_line_opens_a_block(
+    jira_case: _JiraCase,
+) -> None:
+    response = _ask(jira_case, summary=_LISTED_SUMMARY, questions=_BLOCK_QUESTIONS)
+    assert response.status_code == 200, response.text
+    (comment,) = jira_case.fake.issue(jira_case.issue_id).comments
+    _assert_one_list_and_the_answer_line_last(comment.body, len(_BLOCK_QUESTIONS))
+    (ordered,) = _nodes(comment.body, "orderedList")
+    first = jira_fake.flatten(ordered["content"][0])
+    assert "# Is this a heading on the continuation line?" in first
+
+
+def test_a_continuation_line_that_opens_a_block_keeps_one_commonmark_list(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The GitHub surface: CommonMark keeps each question inside its item.
+    triage = _running(admitted, monkeypatch, 813)
+    response = _ask(triage, summary=_LISTED_SUMMARY, questions=_BLOCK_QUESTIONS)
+    assert response.status_code == 200, response.text
+    (body,) = _marked(triage)
+    tokens = MarkdownIt("commonmark").parse(body)
+    kinds = [token.type for token in tokens]
+    assert kinds.count("ordered_list_open") == 1
+    assert kinds.count("list_item_open") == len(_BLOCK_QUESTIONS)
+    assert kinds.count("heading_open") == 1
+    assert kinds.count("blockquote_open") == kinds.count("bullet_list_open") == 0
+    assert kinds.count("html_block") == 1  # the platform's marker, nothing else
+    last = [token for token in tokens if token.type == "inline"][-1]
+    assert last.content == ANSWER_LINE
+
+
+def test_jira_posts_the_largest_ordinary_input_with_the_answer_line_last(
+    jira_case: _JiraCase,
+) -> None:
+    # Liveness: the biggest input inside decision 2's bounds still posts whole.
+    prose = "The export writes two rows for three input rows when the last is blank. "
+    summary = (prose * 60)[:4000].strip()
+    questions = [f"{n}: " + (prose * 15)[: 1000 - 4].strip() + "?" for n in range(10)]
+    questions[-1] = questions[-1][:900] + "\nSecond line?"
+    assert len(summary) <= 4000 and all(len(question) <= 1000 for question in questions)
+    response = _ask(jira_case, summary=summary, questions=questions)
+    assert response.status_code == 200, response.text
+    (comment,) = jira_case.fake.issue(jira_case.issue_id).comments
+    _assert_one_list_and_the_answer_line_last(comment.body, 10)
+    assert "truncated" not in jira_fake.flatten(comment.body)
+
+
+def test_refused_input_that_redaction_grows_past_the_bound_writes_nothing(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each ``token=x`` (7 characters) is redacted to a 33 character
+    # placeholder assignment, so input inside decision 2's bounds composes to
+    # about 61,000 characters, past Jira's 30,000 character cut.
+    summary = ("token=x " * 500).strip()
+    questions = [("token=x " * 125).strip()] * 10
+    assert len(summary) <= 4000 and all(len(question) <= 1000 for question in questions)
+    assert len(factory_questions.compose_body(1, summary, questions)) > BODY_LIMIT
+    triage = _running(admitted, monkeypatch, 814)
+    refused = _ask(triage, summary=summary, questions=questions)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == {
+        "code": "invalid_questions",
+        "message": "the questions are outside the tool's bounds",
+    }
+    assert triage.tracker.ledger.writes == 0
+    assert _round_row(triage.work_item_id) is None
 
 
 # Criterion 3: refusals and replay ------------------------------------------------------
@@ -237,6 +462,58 @@ def test_replay_of_the_same_body_returns_the_first_answer_with_one_write(
     assert len(_marked(triage)) == 1
     row = _round_row(triage.work_item_id)
     assert row is not None and (row["rounds_used"], row["version"]) == (1, 2)
+
+
+def test_concurrent_replays_of_one_ask_post_one_comment(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _running(admitted, monkeypatch, 823)
+    marked = triage.tracker.marked_comments
+    original_find = marked.find_marked
+    lookups: list[str] = []
+
+    async def racing_find(target: Any, marker: str) -> Any:
+        # Hold each marker lookup until a second one starts, as two racing
+        # writers would interleave; a lone writer waits out the window.
+        lookups.append(marker)
+        for _ in range(30):
+            if len(lookups) >= 2:
+                break
+            await asyncio.sleep(0.1)
+        return await original_find(target, marker)
+
+    monkeypatch.setattr(marked, "find_marked", racing_find)
+    original_begin = factory_questions.begin_round
+    entered: list[uuid.UUID] = []
+
+    async def counted_begin(*args: Any, **kwargs: Any) -> Any:
+        entered.append(kwargs["request_id"])
+        return await original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(factory_questions, "begin_round", counted_begin)
+
+    async def both() -> list[httpx.Response]:
+        transport = httpx.ASGITransport(app=triage.client.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
+            calls = [
+                http.post(
+                    QUESTIONS_URL,
+                    headers={"X-Curie-Issue-Read": triage.capability},
+                    json={"summary": SUMMARY, "questions": QUESTIONS},
+                )
+                for _ in range(2)
+            ]
+            return list(await asyncio.gather(*calls))
+
+    first, second = triage.client.portal.call(both)
+    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
+    assert first.json() == second.json() == {"round": 1, "rounds_limit": 3}
+    assert entered == [triage.request_id, triage.request_id]
+    assert len(_marked(triage)) == 1
+    assert triage.tracker.ledger.writes == 1
+    assert len(lookups) == 1
+    row = _round_row(triage.work_item_id)
+    assert row is not None and (row["state"], row["rounds_used"]) == ("outstanding", 1)
 
 
 def test_refused_a_different_body_from_the_same_request_is_already_asked(
@@ -291,6 +568,85 @@ def test_refused_a_missing_field_is_invalid_questions_not_a_422(
     assert refused.status_code == 409
     assert _code(refused) == "invalid_questions"
     assert triage.tracker.ledger.writes == 0
+
+
+_SENT = "sent-value-7c1e-never-echoed"
+_SENT_NUMBER = "424242424242"
+# Every body that is not one JSON object with the two fields in their shapes.
+_MALFORMED_BODIES = {
+    "array": json.dumps([_SENT, {"summary": _SENT, "questions": [_SENT]}]),
+    "string": json.dumps(_SENT),
+    "number": _SENT_NUMBER,
+    "null": "null",
+    "boolean": "true",
+    "invalid json": '{"summary": "' + _SENT,
+    "not json": _SENT,
+    "empty": "",
+    "summary object": json.dumps({"summary": {"text": _SENT}, "questions": [_SENT]}),
+    "questions string": json.dumps({"summary": _SENT, "questions": _SENT}),
+    "question object": json.dumps({"summary": _SENT, "questions": [{"text": _SENT}]}),
+    "question number": json.dumps({"summary": _SENT, "questions": [int(_SENT_NUMBER)]}),
+    "oversized": json.dumps({"summary": _SENT * 20_000, "questions": [_SENT]}),
+}
+
+
+def _post_raw(client: Any, capability: str, raw: str) -> Any:
+    return client.post(
+        QUESTIONS_URL,
+        headers={"X-Curie-Issue-Read": capability, "Content-Type": "application/json"},
+        content=raw.encode(),
+    )
+
+
+@pytest.mark.parametrize("raw", list(_MALFORMED_BODIES.values()), ids=list(_MALFORMED_BODIES))
+def test_refused_a_malformed_body_is_invalid_questions_echoing_nothing(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    triage = _running(admitted, monkeypatch, 831)
+    refused = _post_raw(triage.client, triage.capability, raw)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == {
+        "code": "invalid_questions",
+        "message": "the questions are outside the tool's bounds",
+    }
+    assert _SENT not in refused.text and _SENT_NUMBER not in refused.text
+    assert triage.tracker.ledger.writes == 0
+    assert _round_row(triage.work_item_id) is None
+
+
+@pytest.mark.parametrize("raw", list(_MALFORMED_BODIES.values()), ids=list(_MALFORMED_BODIES))
+def test_refused_a_malformed_body_checks_the_capability_first(admitted: Any, raw: str) -> None:
+    client, _github, _server = admitted
+    refused = _post_raw(client, "wir.not-a-capability", raw)
+    assert refused.status_code == 401, refused.text
+    assert refused.json()["detail"]["code"] == "invalid_capability"
+    assert _SENT not in refused.text and _SENT_NUMBER not in refused.text
+
+
+# A blank line spelled with another line break form, or kept from looking
+# blank only by an invisible character, is a blank line once posted.
+_SEPARATED_BLANK_LINES = {
+    "line separator": "First\u2028\u2028second?",
+    "paragraph separators": "First\u2029 \u2029second?",
+    "next line": "First\x85\x85second?",
+    "lone carriage returns": "First\r\rsecond?",
+    "vertical tabs": "First\x0b\x0bsecond?",
+    "form feed line": "First\n\x0c\nsecond?",
+    "zero width line": "First\n\u200b\nsecond?",
+}
+
+
+@pytest.mark.parametrize(
+    "question", list(_SEPARATED_BLANK_LINES.values()), ids=list(_SEPARATED_BLANK_LINES)
+)
+def test_refused_a_blank_line_of_any_line_break_form(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, question: str
+) -> None:
+    triage = _running(admitted, monkeypatch, 832)
+    refused = _ask(triage, questions=[question])
+    assert (refused.status_code, _code(refused)) == (409, "invalid_questions")
+    assert triage.tracker.ledger.writes == 0
+    assert _round_row(triage.work_item_id) is None
 
 
 def test_a_question_with_one_crlf_line_break_is_accepted(
@@ -412,6 +768,11 @@ def test_refused_past_three_rounds_marks_the_row_exhausted(
         "(work_item_id, rounds_used, state, asking_request_id, body_sha256) "
         "VALUES (:id, 3, 'cleared', :asker, :digest)",
         {"id": triage.work_item_id, "asker": uuid.uuid4(), "digest": "cd" * 32},
+    )
+    tr._exec(
+        "INSERT INTO curie.factory_question_round_counts (work_item_id, rounds_used) "
+        "VALUES (:id, 3)",
+        {"id": triage.work_item_id},
     )
     refused = _ask(triage)
     assert (refused.status_code, _code(refused)) == (409, "question_rounds_exhausted")

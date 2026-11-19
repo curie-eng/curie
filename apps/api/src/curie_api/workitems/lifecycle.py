@@ -2106,18 +2106,15 @@ async def terminalize_execution(
         if await _unchanged_follow_up(session, work_item, request, detail):
             status = "completed"
             cause = "completed"
-        else:
+        elif (
+            await factory_questions.question_ending(session, work_item.id, request.id)
+            == factory_questions.QUESTIONS_ASKED
+        ):
             # The question ending (#5785): a request whose posted questions
             # are this WorkItem's current round settles completed, so it never
             # spends an automatic failure successor and is never needs-human.
-            # A request refused past the round cap fails with its own cause,
-            # which admits no successor.
-            ending = await factory_questions.question_ending(session, work_item.id, request.id)
-            if ending == factory_questions.QUESTIONS_ASKED:
-                status = "completed"
-                cause = ending
-            elif ending is not None:
-                cause = ending
+            status = "completed"
+            cause = factory_questions.QUESTIONS_ASKED
     if status == "failed" and cause.strip() == "approval_create_failed":
         pending = await session.scalar(
             select(Publication.id)
@@ -2131,6 +2128,14 @@ async def terminalize_execution(
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
+    if (
+        status == "failed"
+        and not tracker_result
+        and await factory_questions.rounds_exhausted_for(session, work_item.id, request.id)
+    ):
+        # Refused past the round cap (#5785, decision 14): however this
+        # request fails, it is terminal and needs a human.
+        cause = factory_questions.QUESTION_ROUNDS_EXHAUSTED
     # The Python check above allows a pull request that already opened to
     # complete after the deadline. The UPDATE has to use the same exception,
     # or the deadline predicate rejects the row and the next pass cancels it.
@@ -2556,9 +2561,10 @@ async def request_cancellation(
 
     await _cancel_queued_requests(session, work_item_id, now, cause)
     await _expire_unused_grants(session, work_item_id)
-    # An outstanding question ends with the WorkItem (#5785): after this no
-    # comment is an answer.
-    await factory_questions.clear_for_cancellation(session, work_item_id)
+    # The WorkItem's question ends with it (#5785, decision 15): the row is
+    # deleted, so no comment is an answer; the sweep above cancelled any
+    # queued answer follow-up. The lifetime round count stays.
+    await factory_questions.delete_for_cancellation(session, work_item_id)
     await _revoke_triage_delegations(session, work_item_id, now)
 
     active = await lock_active_request(session, work_item_id)
@@ -3288,6 +3294,13 @@ async def record_runtime_termination_where(
         terminal_status = "failed"
     else:
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
+    terminal_cause = request.terminal_cause
+    if terminal_status == "failed" and await factory_questions.rounds_exhausted_for(
+        session, work_item_id, request_id
+    ):
+        # Refused past the round cap (#5785, decision 14): losing its owner
+        # afterwards does not buy an owner loss successor.
+        terminal_cause = factory_questions.QUESTION_ROUNDS_EXHAUSTED
     now = await database_now(session)
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
@@ -3300,6 +3313,7 @@ async def record_runtime_termination_where(
         )
         .values(
             status=terminal_status,
+            terminal_cause=terminal_cause,
             terminal_at=now,
             termination_observation=termination_observation,
             version=ExecutionRequest.version + 1,
@@ -3359,8 +3373,10 @@ async def admit_automatic_successor(
 
     Every origin refuses a cancelled WorkItem, a pending relabel, a closed
     pull request lineage, a request its publication still owns, a Curie
-    budget refusal, a spent allowance and a tracker result request (it starts
-    exactly one model session, ADR 0277 decision 8). Owner loss keeps its
+    budget refusal, a spent allowance, a tracker result request (it starts
+    exactly one model session, ADR 0277 decision 8) and a request whose ask
+    was refused for the question round cap (ADR 0286 decision 8), whatever
+    its cause, so owner loss cannot outrun the cap. Owner loss keeps its
     teardown based exception: it needs no safety fact and adds no delay. An
     ordinary failure needs the worker's proved ``no_effects``, a policy
     disposition that allows a successor, and no queued newer revision. A
@@ -3384,7 +3400,9 @@ async def admit_automatic_successor(
         or work_item.cancelled_at is not None
         or work_item.readmit_request_id is not None
         or work_item.automatic_retries_used >= AUTOMATIC_RETRY_LIMIT
-        or predecessor.terminal_cause == "budget_exceeded"
+        or predecessor.terminal_cause
+        in ("budget_exceeded", factory_questions.QUESTION_ROUNDS_EXHAUSTED)
+        or await factory_questions.rounds_exhausted_for(session, work_item.id, predecessor.id)
     ):
         return False
     if (

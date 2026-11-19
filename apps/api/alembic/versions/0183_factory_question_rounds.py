@@ -5,11 +5,15 @@
    asking request, the tracker comment id, a digest of the comment the
    platform wrote, the answer fence ``answer_after`` and the newest request an
    answer created. No question or answer text.
-2. ``factory_answer_receipts``: one receipt per answer comment, written by the
+2. ``factory_question_round_counts``: one row per WorkItem holding the number
+   of question rounds posted in the WorkItem's lifetime (0 to 3) and the
+   request that posted the latest one. Cancellation deletes the question row;
+   this count survives it, so a relabel does not reset the cap.
+3. ``factory_answer_receipts``: one receipt per answer comment, written by the
    answer core (#5786), keyed by WorkItem and the tracker's comment id.
-3. ``factory_terminal_notices_applied_label_ck`` also accepts
+4. ``factory_terminal_notices_applied_label_ck`` also accepts
    ``curie-factory:questions``.
-4. ``execution_requests_state_shape_ck`` lets a started ``completed`` request
+5. ``execution_requests_state_shape_ck`` lets a started ``completed`` request
    end with cause ``questions_asked`` as well as ``completed``: a request that
    posted questions and then ends without a pull request completes with that
    cause. Every other branch is the 0172 shape. The upgrade refuses unless the
@@ -19,7 +23,7 @@ Expand only: a release without this revision never reads the new tables and
 never writes the new label or cause. The downgrade refuses while a status
 comment row records the new label or a request records the new cause, either
 of which the restored checks would reject, then restores both checks and drops
-both tables.
+the three tables.
 
 Revision ID: 0183
 Revises: 0182
@@ -40,6 +44,7 @@ S = "curie"
 SHAPE = "execution_requests_state_shape_ck"
 LOCK_TIMEOUT_MS = 15000
 ROUNDS = "factory_question_rounds"
+COUNTS = "factory_question_round_counts"
 RECEIPTS = "factory_answer_receipts"
 NOTICES = "factory_terminal_notices"
 
@@ -232,6 +237,25 @@ def upgrade() -> None:
         schema=S,
     )
     op.create_table(
+        COUNTS,
+        sa.Column(
+            "work_item_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey(f"{S}.work_items.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column("rounds_used", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("last_asking_request_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+        ),
+        sa.CheckConstraint("rounds_used BETWEEN 0 AND 3", name=f"{COUNTS}_rounds_used_ck"),
+        schema=S,
+    )
+    op.create_table(
         RECEIPTS,
         sa.Column(
             "work_item_id",
@@ -277,4 +301,5 @@ def downgrade() -> None:
     _replace_label_check(_LABELS_0167)
     _replace_shape(_SHAPE_0172)
     op.drop_table(RECEIPTS, schema=S)
+    op.drop_table(COUNTS, schema=S)
     op.drop_table(ROUNDS, schema=S)

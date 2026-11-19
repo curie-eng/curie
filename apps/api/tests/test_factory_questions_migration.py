@@ -1,12 +1,13 @@
 """Migration 0183 adds the factory question rounds and answer receipts (#5785).
 
-The upgrade creates ``factory_question_rounds`` and ``factory_answer_receipts``
-and lets ``factory_terminal_notices.applied_label`` hold
+The upgrade creates ``factory_question_rounds``,
+``factory_question_round_counts`` (the lifetime count a cancellation keeps)
+and ``factory_answer_receipts`` and lets ``factory_terminal_notices.applied_label`` hold
 ``curie-factory:questions``. A round whose comment was never posted may have
 zero rounds used only while it is ``posting`` or after it settled ``cleared``.
 A started request may complete with cause ``questions_asked``. The downgrade
 refuses while a status comment row records the new label or a request records
-the new cause, then restores the earlier CHECKs and drops both tables.
+the new cause, then restores the earlier CHECKs and drops the three tables.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ BELOW = "0182"
 STAMP = datetime(2026, 11, 18, 12, 0, tzinfo=UTC)
 DIGEST = "ab" * 32
 QUESTIONS_LABEL = "curie-factory:questions"
+TABLES = {"factory_question_rounds", "factory_question_round_counts", "factory_answer_receipts"}
 
 
 def _tables() -> set[str]:
@@ -36,7 +38,8 @@ def _tables() -> set[str]:
         row[0]
         for row in sql_rows(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'curie' "
-            "AND table_name IN ('factory_question_rounds', 'factory_answer_receipts')"
+            "AND table_name IN ('factory_question_rounds', 'factory_question_round_counts', "
+            "'factory_answer_receipts')"
         )
     }
 
@@ -100,6 +103,14 @@ def _round(item_id: uuid.UUID, request_id: uuid.UUID, *, state: str, rounds: int
     )
 
 
+def _count(item_id: uuid.UUID, rounds: int, last: uuid.UUID | None = None) -> None:
+    sql_rows(
+        "INSERT INTO curie.factory_question_round_counts "
+        "(work_item_id, rounds_used, last_asking_request_id) VALUES (:item, :rounds, :last)",
+        {"item": item_id, "rounds": rounds, "last": last},
+    )
+
+
 def _notice(item_id: uuid.UUID, request_id: uuid.UUID, label: str) -> None:
     sql_rows(
         "INSERT INTO curie.factory_terminal_notices "
@@ -141,7 +152,7 @@ def test_upgrade_creates_both_tables_and_widens_the_label_check(
     command.upgrade(alembic_config(), REVISION)
 
     assert stamped_revision() == REVISION
-    assert _tables() == {"factory_question_rounds", "factory_answer_receipts"}
+    assert _tables() == TABLES
     label_check = _checks("factory_terminal_notices")["factory_terminal_notices_applied_label_ck"]
     assert QUESTIONS_LABEL in label_check
     assert "curie-factory:triaged" in label_check
@@ -153,6 +164,9 @@ def test_upgrade_creates_both_tables_and_widens_the_label_check(
         "factory_question_rounds_body_sha256_ck",
     } <= set(rounds)
     assert "factory_answer_receipts_outcome_ck" in _checks("factory_answer_receipts")
+    assert "factory_question_round_counts_rounds_used_ck" in _checks(
+        "factory_question_round_counts"
+    )
     item_id, request_id = _work_item(10)
     _notice(item_id, request_id, QUESTIONS_LABEL)
 
@@ -183,6 +197,7 @@ def test_rows_go_with_their_work_item(isolated_migration_db: IsolatedMigrationDb
     isolated_migration_db.at(REVISION)
     item_id, request_id = _work_item(40)
     _round(item_id, request_id, state="outstanding", rounds=1)
+    _count(item_id, 1, request_id)
     sql_rows(
         "INSERT INTO curie.factory_answer_receipts (work_item_id, comment_key, outcome) "
         "VALUES (:item, '9001', 'coalesced')",
@@ -196,7 +211,33 @@ def test_rows_go_with_their_work_item(isolated_migration_db: IsolatedMigrationDb
         )
     sql_rows("DELETE FROM curie.work_items WHERE id = :id", {"id": item_id})
     assert sql_rows("SELECT count(*) FROM curie.factory_question_rounds") == [(0,)]
+    assert sql_rows("SELECT count(*) FROM curie.factory_question_round_counts") == [(0,)]
     assert sql_rows("SELECT count(*) FROM curie.factory_answer_receipts") == [(0,)]
+
+
+def test_the_lifetime_count_holds_zero_to_three_rounds_and_outlives_the_question(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    isolated_migration_db.at(REVISION)
+    for number, rounds in enumerate((0, 3), start=45):
+        item_id, _request = _work_item(number)
+        _count(item_id, rounds)
+    for number, rounds in enumerate((-1, 4), start=47):
+        item_id, _request = _work_item(number)
+        with pytest.raises(IntegrityError, match="factory_question_round_counts_rounds_used_ck"):
+            _count(item_id, rounds)
+    item_id, request_id = _work_item(49)
+    _round(item_id, request_id, state="outstanding", rounds=2)
+    _count(item_id, 2, request_id)
+    # A cancellation deletes the question row; the count is its own row.
+    sql_rows(
+        "DELETE FROM curie.factory_question_rounds WHERE work_item_id = :item", {"item": item_id}
+    )
+    assert sql_rows(
+        "SELECT rounds_used, last_asking_request_id FROM curie.factory_question_round_counts "
+        "WHERE work_item_id = :item",
+        {"item": item_id},
+    ) == [(2, request_id)]
 
 
 def test_downgrade_restores_the_earlier_schema(
@@ -205,6 +246,7 @@ def test_downgrade_restores_the_earlier_schema(
     isolated_migration_db.at(REVISION)
     item_id, request_id = _work_item(50)
     _round(item_id, request_id, state="outstanding", rounds=1)
+    _count(item_id, 1, request_id)
     _notice(item_id, request_id, "curie-factory:needs-human")
 
     command.downgrade(alembic_config(), BELOW)
@@ -231,7 +273,7 @@ def test_downgrade_refuses_while_a_notice_carries_the_questions_label(
         command.downgrade(alembic_config(), BELOW)
 
     assert stamped_revision() == REVISION
-    assert _tables() == {"factory_question_rounds", "factory_answer_receipts"}
+    assert _tables() == TABLES
 
 
 def test_a_started_request_completes_with_questions_asked_only_after_the_upgrade(

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import unicodedata
 from typing import Any
 
 import aiohttp
@@ -42,10 +43,13 @@ QUESTIONS_MAX = 10
 QUESTION_MAX_CHARS = 1_000
 ROUNDS_LIMIT = 3
 ROUNDS_EXHAUSTED_CODE = "question_rounds_exhausted"
+INVALID_QUESTIONS_CODE = "invalid_questions"
 
 _QUESTIONS_TIMEOUT_SECONDS = 45
 _QUESTIONS_MAX_BYTES = 65_536
-_BLANK_LINE = re.compile(r"\n[ \t]*\n")
+# Every line break form a renderer or Python honors, CRLF first so it stays
+# one break; the API normalizes the same set before its blank-line rule.
+_LINE_BREAK = re.compile(r"\r\n|[\r\n\v\f\x85\u2028\u2029]")
 
 QUESTIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -82,8 +86,17 @@ QUESTIONS_DESCRIPTION = (
 )
 
 
-def _normalized(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+def _visible(text: str) -> str:
+    """``text`` as the API posts it: each line break a newline, with no control
+    (tab kept) or invisible format character, trimmed. A line holding only a
+    form feed or a zero-width space is blank once posted, so it is blank here."""
+
+    kept = (
+        char
+        for char in _LINE_BREAK.sub("\n", text)
+        if char in "\n\t" or unicodedata.category(char) not in ("Cc", "Cf", "Cs")
+    )
+    return "".join(kept).strip()
 
 
 def question_input_issues(args: Any) -> list[str]:
@@ -98,7 +111,7 @@ def question_input_issues(args: Any) -> list[str]:
     summary = args.get("summary")
     if not isinstance(summary, str):
         issues.append("summary must be a string")
-    elif not summary.strip():
+    elif not _visible(summary):
         issues.append("summary must not be empty or only whitespace")
     elif len(summary) > SUMMARY_MAX_CHARS:
         issues.append(f"summary must be at most {SUMMARY_MAX_CHARS:,} characters")
@@ -113,11 +126,11 @@ def question_input_issues(args: Any) -> list[str]:
     for number, question in enumerate(questions[:QUESTIONS_MAX], start=1):
         if not isinstance(question, str):
             issues.append(f"question {number} must be a string")
-        elif not question.strip():
+        elif not _visible(question):
             issues.append(f"question {number} must not be empty or only whitespace")
         elif len(question) > QUESTION_MAX_CHARS:
             issues.append(f"question {number} must be at most {QUESTION_MAX_CHARS:,} characters")
-        elif _BLANK_LINE.search(_normalized(question)):
+        elif not all(line.strip() for line in _visible(question).split("\n")):
             issues.append(f"question {number} must not contain a blank line")
     return issues
 
@@ -186,6 +199,15 @@ def questions_handler(url: str, token: str) -> ResultHandler:
                     f"This ticket's {ROUNDS_LIMIT} question rounds are used, so no more "
                     "questions can be asked. End now with a final message that starts "
                     "with `Could not complete:` and says what is missing."
+                )
+            if code == INVALID_QUESTIONS_CODE:
+                # The pre-check passed, so the platform's own bound on the
+                # posted comment refused it: redaction or line breaks made it
+                # too long.
+                return _error(
+                    "The questions were refused because the posted comment would be too "
+                    "long. Shorten the summary and the questions, use fewer line breaks, "
+                    "and leave out tokens and credentials, then call again."
                 )
             if code is not None and _CODE_RE.match(code):
                 return _error(f"The questions were refused: {code}.")
