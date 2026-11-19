@@ -223,7 +223,12 @@ def issue_case(
         if request.url.path == f"{issue_path}/comments":
             page = int(request.url.params["page"])
             batch = [COMMENTS[page - 1]] if page <= len(COMMENTS) else []
-            headers = {"link": f'<{request.url}>; rel="next"'} if page < len(COMMENTS) else {}
+            last = request.url.copy_set_param("page", str(len(COMMENTS)))
+            headers = (
+                {"link": f'<{request.url}>; rel="next", <{last}>; rel="last"'}
+                if page < len(COMMENTS)
+                else {}
+            )
             return httpx.Response(200, json=batch, headers=headers)
         return httpx.Response(404, json={"message": "Not Found"})
 

@@ -9,7 +9,7 @@ Slack.
 
 import logging
 import uuid
-from collections.abc import Collection
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -28,7 +28,7 @@ from curie_api.workitems.lifecycle import (
     same_repository,
 )
 
-from . import factory_intake_notices, factory_rediscovery, workitem_dispatch
+from . import factory_intake_notices, factory_questions, factory_rediscovery, workitem_dispatch
 from .config import Settings, get_settings
 from .factory_admission import (
     LABEL_REFUSAL_MARKER,
@@ -41,6 +41,7 @@ from .forges.errors import ForgeError, NotFound, Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND, resolve_binding
 from .forges.github.comments import static_token
 from .forges.github.identity import delivery_uuid
+from .forges.github.review_polling import trailing_id
 from .forges.github.tracker import GitHubTracker, IssueFacts, last_label_event
 from .forges.github.transport import parse_time
 from .forges.hosts import (
@@ -65,10 +66,11 @@ from .github_factory_events import (
     parse_factory_event,
 )
 from .github_review_audit import claim_review_delivery, settle_review_delivery
-from .github_review_events import FeedbackIgnored, FeedbackUnavailable
+from .github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from .models import (
     AgentChannel,
     ExecutionRequest,
+    FactoryQuestionRound,
     FactorySlackThread,
     PersonalClaudeEnrollment,
     WorkItem,
@@ -114,6 +116,16 @@ IGNORED = {
     "work_item_other_agent",
     "label_conflict",
     "publication_exists",
+    # Answer intake (#5787): a comment while a question is open that is not
+    # admitted as an answer, or that the answer rule refuses.
+    "answer_from_bot",
+    "answer_not_authorized",
+    "ticket_closed",
+    "trigger_label_absent",
+    "comment_unavailable",
+    "question_posting",
+    "not_outstanding",
+    "not_after_question",
 }
 
 
@@ -814,6 +826,156 @@ async def cancel_notice(
     return await cancel_work_item(session, item)
 
 
+# Answers to the factory's questions (#5787) -----------------------------------
+
+ANSWER_FROM_BOT = "answer_from_bot"
+ANSWER_NOT_AUTHORIZED = "answer_not_authorized"
+TICKET_CLOSED = "ticket_closed"
+TRIGGER_LABEL_ABSENT = "trigger_label_absent"
+COMMENT_UNAVAILABLE = "comment_unavailable"
+# Rows a comment can answer, or will once the round's tracker write lands.
+_ANSWERABLE = frozenset(
+    {factory_questions.POSTING, factory_questions.OUTSTANDING, factory_questions.ANSWERED}
+)
+_ANSWER_RESULTS = {
+    factory_questions.ADMITTED: "factory_admitted",
+    factory_questions.QUEUED_FOLLOW_UP: "factory_queued",
+    factory_questions.COALESCED: "factory_coalesced",
+}
+
+
+def _refuse_answer(
+    code: str, item: WorkItem, notice: FactoryNotice, actor: int | None = None
+) -> WebhookResult:
+    # Identifiers and the reason only: never the comment's text or a token.
+    logger.info(
+        "factory answer refused reason=%s work_item=%s comment=%s actor=%s",
+        code,
+        item.id,
+        notice.comment_id,
+        actor,
+    )
+    return ignored(code)
+
+
+async def admit_answer_notice(
+    session: AsyncSession,
+    settings: Settings,
+    tracker: GitHubTracker | Callable[[], Awaitable[GitHubTracker]],
+    notice: FactoryNotice,
+    comment: Mapping[str, Any] | None,
+) -> WebhookResult | None:
+    """Recognise one created issue comment as an answer and admit it (#5787).
+
+    The one GitHub recognition rule, shared by the webhook and the poll pass
+    (ADR 0161: both doors admit identically). None when the comment is not an
+    answer: the issue has no WorkItem, or its question row is absent,
+    ``cleared`` or ``exhausted``; the caller then applies its mention or
+    ordinary comment rules unchanged. Otherwise the comment is never also a
+    mention (decision 4), and the result is the answer's.
+
+    ``comment`` is the factory's own authenticated read of the comment (the
+    poll listing); None reads it now through the App, since a webhook payload
+    is not trusted for who wrote it or through which App (decision 2). The
+    actor rule is ADR 0279's for labels: a ``User`` with a valid id, not acting
+    through this factory's own App; a person acting through another App
+    passes. Permission, open state and the trigger label are read fresh
+    (decision 3). A Slack kickoff's WorkItem has no trigger label, so only the
+    open check applies to it. A ``posting`` round is passed to the answer core,
+    which refuses it before writing anything (`factory_questions.QUESTION_POSTING`);
+    that is `FeedbackUnavailable`, retried until the round is ``outstanding``.
+
+    The caller holds the issue lock (`lock_issue`) and commits; the answer
+    core runs in a savepoint of the caller's transaction. ``tracker`` may be a
+    factory, resolved only once the comment needs a GitHub read.
+    """
+
+    registry = forges_registry(settings)
+    issue = notice_issue(notice, registry)
+    item = await work_item_for(session, issue)
+    if item is None:
+        return None
+    row: FactoryQuestionRound | None = await session.scalar(
+        select(FactoryQuestionRound)
+        .where(FactoryQuestionRound.work_item_id == item.id)
+        .execution_options(populate_existing=True)
+    )
+    if row is None or row.state not in _ANSWERABLE:
+        return None
+    if item.cancelled_at is not None:
+        return _refuse_answer(factory_questions.WORK_ITEM_CANCELLED, item, notice)
+    if notice.comment_id is None:
+        raise FactoryRefused("invalid_comment")
+    github = tracker if isinstance(tracker, GitHubTracker) else await tracker()
+    if comment is None:
+        try:
+            comment = await github.issue_comment(notice.comment_id)
+        except NotFound:
+            return _refuse_answer(COMMENT_UNAVAILABLE, item, notice)
+        except ForgeError:
+            raise FeedbackUnavailable(COMMENT_UNAVAILABLE) from None
+    if comment.get("id") != notice.comment_id or (
+        trailing_id(comment.get("issue_url")) != notice.issue_number
+    ):
+        return _refuse_answer("comment_target_mismatch", item, notice)
+    try:
+        actor_id, actor_login = label_actor(
+            {
+                "actor": comment.get("user"),
+                "performed_via_github_app": comment.get("performed_via_github_app"),
+            },
+            app_id=github.app_id,
+        )
+    except FeedbackIgnored as exc:
+        code = (
+            ANSWER_FROM_BOT if exc.code in {"actor_bot", "actor_own_app"} else ANSWER_NOT_AUTHORIZED
+        )
+        return _refuse_answer(code, item, notice)
+    author = replace(notice, sender_id=actor_id, sender_login=actor_login)
+    if await github.label_permission(author) is not None:
+        return _refuse_answer(ANSWER_NOT_AUTHORIZED, item, notice, actor_id)
+    try:
+        state = await github.issue_state(notice.issue_number)
+    except NotFound:
+        return _refuse_answer(TICKET_CLOSED, item, notice, actor_id)
+    except ForgeError:
+        raise FeedbackUnavailable("issue_unavailable") from None
+    if state.state != "open" or state.pull_request:
+        return _refuse_answer(TICKET_CLOSED, item, notice, actor_id)
+    label = admitting_label(
+        registry, item, kickoff_items=await kickoff_work_items(session, [item.id])
+    )
+    if label is not None and label not in state.labels:
+        return _refuse_answer(TRIGGER_LABEL_ABSENT, item, notice, actor_id)
+    facts = factory_questions.AnswerFacts(
+        work_item_id=item.id,
+        issue=issue,
+        comment_id=str(notice.comment_id),
+        created_at=parse_time(comment.get("created_at")),
+        requester=f"github:{actor_id}:{actor_login}",
+    )
+    # The answer core commits and rolls back its own session; in a savepoint
+    # the issue lock and the webhook's delivery audit stay in the caller's
+    # transaction, as admission's dispatch calls do.
+    async with AsyncSession(
+        bind=await session.connection(),
+        join_transaction_mode="create_savepoint",
+        expire_on_commit=False,
+    ) as answering:
+        try:
+            outcome = await factory_questions.admit_answer(answering, facts)
+        except factory_questions.AnswerNotAdmitted as exc:
+            if exc.code == factory_questions.QUESTION_POSTING:
+                raise FeedbackUnavailable(exc.code) from None
+            return _refuse_answer(exc.code, item, notice, actor_id)
+    if outcome.replayed:
+        return WebhookResult(status="factory_duplicate")
+    status = _ANSWER_RESULTS.get(outcome.outcome)
+    if status is None:
+        return ignored(outcome.outcome)
+    return WebhookResult(status=status)
+
+
 async def _with_label_event(
     notice: FactoryNotice,
     *,
@@ -898,17 +1060,34 @@ async def handle_factory_delivery(
             app_slug=await factory_app_slug(registry),
         )
         await lock_issue(session, notice_issue(notice, registry))
-        if notice.disposition == "admit":
-            notice = await _with_label_event(notice, settings=settings, client=client)
-        verified = await verify_current(notice, settings=settings, client=client)
-        if notice.disposition == "cancel":
-            outcome = await cancel_notice(session, notice, settings)
-        elif notice.disposition == "base_label":
-            outcome = await record_base_label_notice(
-                session, notice, verified, settings, client=client
+        answered: WebhookResult | None = None
+        if notice.event == "issue_comment":
+            # A comment is an answer first (#5787 decision 4); only a comment
+            # that is not one goes on to today's mention or comment rules.
+            commented = notice
+            answered = await admit_answer_notice(
+                session,
+                settings,
+                lambda: _tracker(commented, registry=registry, client=client),
+                notice,
+                None,
             )
+            if answered is None and notice.disposition == "comment":
+                raise FactoryRefused(notice.comment_refusal or "ordinary_comment")
+        if answered is not None:
+            outcome = answered
         else:
-            outcome = await admit_notice(session, notice, settings, verified, client=client)
+            if notice.disposition == "admit":
+                notice = await _with_label_event(notice, settings=settings, client=client)
+            verified = await verify_current(notice, settings=settings, client=client)
+            if notice.disposition == "cancel":
+                outcome = await cancel_notice(session, notice, settings)
+            elif notice.disposition == "base_label":
+                outcome = await record_base_label_notice(
+                    session, notice, verified, settings, client=client
+                )
+            else:
+                outcome = await admit_notice(session, notice, settings, verified, client=client)
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()

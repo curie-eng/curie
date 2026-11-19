@@ -56,6 +56,11 @@ class FactoryNotice:
     # (``performed_via_github_app``), kept only as an observation: the triage
     # handoff's delegated output lookup reads it (#5588). It grants nothing.
     own_app_label: bool = False
+    # A created issue comment that is not a mention a human made (disposition
+    # ``comment``, #5787): the code today's mention rules refuse it with. The
+    # answer intake decides first; when the comment is not an answer, this is
+    # the refusal the delivery records.
+    comment_refusal: str | None = None
 
     @property
     def request_id(self) -> uuid.UUID:
@@ -169,7 +174,12 @@ def parse_factory_event(
     mention: str,
     app_slug: str | None,
 ) -> FactoryNotice:
-    """Keep an admission, cancellation, or explicit mention. Refuse everything else.
+    """Keep an admission, cancellation, explicit mention, or created issue comment.
+    Refuse everything else.
+
+    A created issue comment that is not a mention is kept as a ``comment``
+    notice with the refusal it gets when it is not an answer (#5787); an edited
+    or deleted comment stays ``unsupported_action`` and never answers.
 
     ``labels`` are the effective trigger labels bound on the event's repository
     (#4361 decision 15). Adding one of them is an admission. Removing any label
@@ -252,29 +262,86 @@ def parse_factory_event(
         raise FactoryRefused("unsupported_event")
     if action != "created":
         raise FactoryRefused("unsupported_action")
-    sender = payload_object(data.get("sender"), "non_human_sender")
-    comment = payload_object(data.get("comment"), "invalid_comment")
-    _reject_app(sender, comment)
-    comment_user = payload_object(comment.get("user"), "non_human_sender")
-    if comment_user.get("type") == "Bot":
-        raise FactoryRefused("app_authored")
-    sender_id, sender_login = human_sender(sender)
-    author_id, author_login = human_sender(comment_user)
-    if author_id != sender_id or author_login.casefold() != sender_login.casefold():
-        raise FactoryRefused("sender_mismatch")
+    return _comment_notice(
+        data,
+        delivery,
+        installation_id,
+        repository_id,
+        repo,
+        issue_number,
+        mention=mention,
+        app_slug=app_slug,
+    )
+
+
+def _comment_notice(
+    data: dict[str, Any],
+    delivery: uuid.UUID,
+    installation_id: int,
+    repository_id: int,
+    repo: str,
+    issue_number: int,
+    *,
+    mention: str,
+    app_slug: str | None,
+) -> FactoryNotice:
+    """A created issue comment: a ``mention`` notice, or a ``comment`` notice
+    carrying the refusal the mention rules give it (#5787).
+
+    Whether a comment answers the factory's question depends on who GitHub
+    says wrote it, which the answer intake reads through the App, so the
+    payload's author claims no longer end the delivery here. The checks run in
+    today's order and the first author refusal is the one kept; a structural
+    refusal after it still answers with that author refusal, exactly as the
+    parser always did. https://docs.github.com/en/webhooks/webhook-events-and-payloads#issue_comment
+    """
+
+    refusal: str | None = None
+
+    def refuse(code: str) -> None:
+        nonlocal refusal
+        if refusal is None:
+            refusal = code
+
+    def structural(code: str) -> FactoryRefused:
+        return FactoryRefused(refusal or code)
+
+    sender = data.get("sender")
+    comment = data.get("comment")
+    if not isinstance(sender, dict):
+        refuse("non_human_sender")
+    if not isinstance(comment, dict):
+        raise structural("invalid_comment")
+    sender_id, sender_login = 0, ""
+    if isinstance(sender, dict):
+        try:
+            _reject_app(sender, comment)
+            comment_user = payload_object(comment.get("user"), "non_human_sender")
+            if comment_user.get("type") == "Bot":
+                raise FactoryRefused("app_authored")
+            claimed_id, claimed_login = human_sender(sender)
+            author_id, author_login = human_sender(comment_user)
+            if author_id != claimed_id or author_login.casefold() != claimed_login.casefold():
+                raise FactoryRefused("sender_mismatch")
+            sender_id, sender_login = claimed_id, claimed_login
+        except FeedbackIgnored as exc:
+            refuse(exc.code)
     body = comment.get("body")
     if not isinstance(body, str):
-        raise FactoryRefused("invalid_comment")
+        raise structural("invalid_comment")
     if len(body) > _MAX_COMMENT_LENGTH:
-        raise FactoryRefused("comment_too_large")
+        raise structural("comment_too_large")
     if not body.strip() or not mentions_factory(body, mention, app_slug):
-        raise FactoryRefused("ordinary_comment")
-    comment_id = positive_identifier(comment.get("id"), "invalid_comment")
+        refuse("ordinary_comment")
+    try:
+        comment_id = positive_identifier(comment.get("id"), "invalid_comment")
+    except FeedbackIgnored as exc:
+        raise structural(exc.code) from None
     return FactoryNotice(
         delivery,
-        event,
+        "issue_comment",
         "created",
-        "mention",
+        "mention" if refusal is None else "comment",
         installation_id,
         repository_id,
         repo,
@@ -284,4 +351,5 @@ def parse_factory_event(
         label_event_at=None,
         comment_id=comment_id,
         comment_body=body,
+        comment_refusal=refusal,
     )
