@@ -78,6 +78,7 @@ from .personal_auth import (
     require_claude_reviewer_model,
     require_owner_grant,
 )
+from .side_effects import ARGUMENTS_WITHHELD_TOOLS
 from .startup_diagnostics import StderrTail, sdk_initialize_diagnostics
 
 install_mcp_argv_offload()
@@ -193,6 +194,27 @@ _SETTING_SOURCES: tuple[SettingSource, ...] = ("user", "project", "local")
 _SDK_DISABLE_TERMINAL_TITLE_ENV = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
+def _withhold_arguments(value: Any) -> Any:
+    """Empty the input of every withheld tool call nested anywhere in ``value``.
+
+    The native mirror leaves the runner as the turn's checkpoint, so the input
+    the action frame withholds (ADR 0286 decision 4) is withheld here too. The
+    portable projection writes the same empty input, so native and portable
+    content still correspond exactly on replay. ``value`` is a fresh copy and
+    is changed in place.
+    """
+
+    if isinstance(value, list):
+        for item in value:
+            _withhold_arguments(item)
+    elif isinstance(value, dict):
+        if value.get("type") == "tool_use" and value.get("name") in ARGUMENTS_WITHHELD_TOOLS:
+            value["input"] = {}
+        for item in value.values():
+            _withhold_arguments(item)
+    return value
+
+
 class _SeededSessionStore:
     """SDK mirror seeded from portable messages or an optional native checkpoint."""
 
@@ -235,7 +257,7 @@ class _SeededSessionStore:
         return HarnessReplayState(
             harness="claude",
             kind=kind,
-            entries=tuple(json.loads(json.dumps(selected))),
+            entries=tuple(_withhold_arguments(json.loads(json.dumps(selected)))),
         )
 
     def request_full_checkpoint(self) -> None:
@@ -404,7 +426,12 @@ def _content_block_to_dict(block: object) -> dict[str, Any] | None:
     if isinstance(block, ThinkingBlock):
         return {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
     if isinstance(block, ToolUseBlock):
-        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+        return {
+            "type": "tool_use",
+            "id": block.id,
+            "name": block.name,
+            "input": {} if block.name in ARGUMENTS_WITHHELD_TOOLS else block.input,
+        }
     if isinstance(block, ToolResultBlock):
         result: dict[str, Any] = {
             "type": "tool_result",

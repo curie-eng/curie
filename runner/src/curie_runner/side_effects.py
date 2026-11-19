@@ -76,10 +76,11 @@ PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
 # the import time check below keeps the two sets from overlapping.
 PLATFORM_SIDE_EFFECTING_TOOLS: frozenset[str] = frozenset({"mcp__curie__ask_questions"})
 
-# Side-effecting tools whose call arguments never leave the runner on the action
-# frame. ``ask_questions`` carries the question text, which ADR 0286 decision 4
-# keeps on the tracker only: the action ledger records that the call happened,
-# not what it asked.
+# Side-effecting tools whose call arguments never leave the runner, on the action
+# frame or in the turn's transcript record (its portable messages and native
+# checkpoint, see ``adapter``). ``ask_questions`` carries the question text,
+# which ADR 0286 decision 4 keeps on the tracker only: the action ledger and the
+# transcript record that the call happened, not what it asked.
 ARGUMENTS_WITHHELD_TOOLS: frozenset[str] = frozenset({"mcp__curie__ask_questions"})
 
 assert not (PLATFORM_SIDE_EFFECTING_TOOLS & PLATFORM_IDEMPOTENT_TOOLS), (
