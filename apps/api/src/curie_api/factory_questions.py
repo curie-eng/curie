@@ -690,7 +690,8 @@ async def rows_an_older_replica_settled(
        the re-drive reached the asker, which still lacks the question ending.
 
     An asker the re-drive would leave failed (a tracker result, or a request
-    other than its queued answer admitted after it) is selected only once the
+    other than its queued answer admitted after it and not yet ended) is
+    selected only once the
     row can clear, so no row is selected on every pass. ``work_item_id``
     narrows the check to one WorkItem: the re-drive repeats it under the
     WorkItem lock, since a relabel and a new ask can change the row between
@@ -713,6 +714,9 @@ async def rows_an_older_replica_settled(
             later.work_item_id == asker.work_item_id,
             later.sequence > asker.sequence,
             later.id.is_distinct_from(FactoryQuestionRound.pending_request_id),
+            # An admitted request that already ended continues nothing: a
+            # queued mention can run, and ask, after a later relabel ended.
+            later.terminal_at.is_(None),
         ),
     )
     convertible = and_(failed_asker, FactoryQuestionRound.state.in_((OUTSTANDING, ANSWERED)))

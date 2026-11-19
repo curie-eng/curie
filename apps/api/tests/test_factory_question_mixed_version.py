@@ -677,6 +677,46 @@ def test_an_answer_queued_before_a_relabel_still_settles_the_next_round(
     assert _state_labels(sink, 1218) == _state_labels(sink, 1268)
 
 
+def test_a_mention_that_asks_after_a_later_relabel_ended_keeps_its_round(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mention is queued, then the label is re-added, so the relabel's run
+    has the higher sequence but runs first and ends. The mention then runs
+    and asks round 2, and an older replica takes its finish. The relabel
+    already ended, so it continues nothing: the re-drive gives the mention
+    its question ending and leaves round 2 ``outstanding``."""
+
+    _client, github, sink = admitted
+    triage = _asked(admitted, monkeypatch, 1219)
+    mention = _queue_revision(triage)
+    _answer(triage.work_item_id, mention)
+    tr._finish(triage, "failed", "no_pull_request")
+    tr._label(triage.client, github, 1219)
+    relabelled = _requests(triage.work_item_id)[-1]["id"]
+    assert _after_asker(triage) == [(mention, "queued"), (relabelled, "waiting")]
+    relabel_run = _take_over(triage, relabelled)
+    tr._finish(relabel_run, "failed", "no_pull_request")
+    assert _request(relabelled)["status"] == "failed"
+    _reconcile()
+    asking = _run_continuation(triage, mention)
+    posted = _ask(asking, ["Round 2: should a re-run replace the rows?"])
+    assert posted.json() == {"round": 2, "rounds_limit": 3}
+    with _older_replica():
+        tr._finish(asking, "failed", "no_pull_request")
+    assert _request(mention)["status"] == "failed"
+
+    _after_the_roll()
+    assert _request(mention) == QUESTION_ENDING
+    row = _round_row(triage.work_item_id)
+    assert row is not None
+    assert (row["state"], row["asking_request_id"], row["rounds_used"]) == (
+        "outstanding",
+        mention,
+        2,
+    )
+    assert _to_redrive(triage) == []
+
+
 def test_an_answer_that_ran_before_the_redrive_still_gives_the_asker_its_ending(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

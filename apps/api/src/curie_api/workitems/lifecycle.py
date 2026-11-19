@@ -633,9 +633,9 @@ async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UU
        unpublished cause takes the question ending after all: ``completed``
        with ``questions_asked``, and its status comment is reopened to say
        so. Not when a publication owns its terminus, or when a request other
-       than the round's queued answer was admitted after it (a retry the
-       older replica started): the attempt already continued, so converting
-       would start a second one.
+       than the round's queued answer was admitted after it and has not
+       ended (a retry the older replica started): the attempt continues, so
+       converting would start a second one.
        This holds too when the queued answer already ran and settled here,
        which left the row ``cleared``.
     3. ``settle_round`` then runs for the terminal asker, and for the
@@ -743,9 +743,12 @@ async def _older_question_ending(
         return False
     if await _publication_owns_terminus(session, work_item, asker):
         return False
+    # A later request that already ended continued nothing: a queued mention
+    # can run, and ask, after a higher-sequence relabel ended.
     later = select(ExecutionRequest.id).where(
         ExecutionRequest.work_item_id == work_item.id,
         ExecutionRequest.sequence > asker.sequence,
+        ExecutionRequest.terminal_at.is_(None),
     )
     if pending_id is not None:
         later = later.where(ExecutionRequest.id != pending_id)
