@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/overrides/v3.1.json",
+  "$id": "https://schemas.curietech.ai/cli/overrides/v4.json",
   "title": "curie <tier> overrides --json",
-  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking`, `execution_deadline_seconds`, and `runner_resources` are null when the platform default applies; `reviewer_model` is null when the credential's default applies. `memory_writes` is the agent's memory-tools switch, always a boolean. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
+  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking`, `execution_deadline_seconds`, and `runner_resources` are null when the platform default applies; `reviewer_model` is null when the credential's default applies. `memory_writes` is the agent's memory-tools switch, always a boolean. `memory_rule_proposals` is the switch that lets the agent propose memory rules for a person to accept, also always a boolean. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -70,6 +70,9 @@
         "memory_writes": {
           "type": "boolean"
         },
+        "memory_rule_proposals": {
+          "type": "boolean"
+        },
         "changed": {
           "type": "boolean"
         }
@@ -80,6 +83,7 @@
         "reviewer_model",
         "thinking",
         "memory_writes",
+        "memory_rule_proposals",
         "changed"
       ]
     }

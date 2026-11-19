@@ -253,6 +253,7 @@ fn patch_body_json(body: &AgentUpdate) -> Result<serde_json::Value> {
 ///   execution_deadline_seconds: the stored deadline override, same convention.
 ///   runner_resources: the stored runner resources override, same convention.
 ///   memory_writes: whether the agent's memory tools are on (#1461).
+///   memory_rule_proposals: whether the agent may propose memory rules (#5796).
 ///   changed: whether this invocation wrote, as opposed to inspecting.
 ///
 /// Returns:
@@ -266,6 +267,7 @@ pub fn overrides_summary(
     execution_deadline_seconds: &Option<u32>,
     runner_resources: &Option<serde_json::Value>,
     memory_writes: bool,
+    memory_rule_proposals: bool,
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
@@ -281,8 +283,9 @@ pub fn overrides_summary(
     // onto the colon instead of leaving a gap where a word used to be.
     let verb = if changed { " now" } else { "" };
     let writes = if memory_writes { "on" } else { "off" };
+    let proposals = if memory_rule_proposals { "on" } else { "off" };
     format!(
-        "overrides for {agent}{verb}: model {}, reviewer model {reviewer}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}",
+        "overrides for {agent}{verb}: model {}, reviewer model {reviewer}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}, memory rule proposals {proposals}",
         show(model),
         show(thinking)
     )
@@ -309,6 +312,7 @@ pub enum OverridesOutput {
         execution_deadline_seconds: Option<u32>,
         runner_resources: Option<serde_json::Value>,
         memory_writes: bool,
+        memory_rule_proposals: bool,
         changed: bool,
     },
 }
@@ -325,6 +329,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 execution_deadline_seconds,
                 runner_resources,
                 memory_writes,
+                memory_rule_proposals,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
@@ -334,6 +339,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 "execution_deadline_seconds": execution_deadline_seconds,
                 "runner_resources": runner_resources,
                 "memory_writes": memory_writes,
+                "memory_rule_proposals": memory_rule_proposals,
                 "changed": changed,
             }),
         }
@@ -350,6 +356,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 execution_deadline_seconds,
                 runner_resources,
                 memory_writes,
+                memory_rule_proposals,
                 changed,
             } => {
                 ui.payload(&overrides_summary(
@@ -360,6 +367,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                     execution_deadline_seconds,
                     runner_resources,
                     *memory_writes,
+                    *memory_rule_proposals,
                     *changed,
                 ));
             }
@@ -397,13 +405,14 @@ pub async fn overrides(
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
 ) -> Result<OverridesOutput> {
-    overrides_with_memory_writes(
+    overrides_with_memory_flags(
         opts,
         model,
         reviewer_model,
         thinking,
         execution_deadline,
         runner_resources,
+        None,
         None,
     )
     .await
@@ -415,10 +424,11 @@ pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
     value.map(|v| v == "on")
 }
 
-/// [`overrides`] plus the `memory_writes` switch (#1461).
+/// [`overrides`] plus the `memory_writes` (#1461) and `memory_rule_proposals`
+/// (#5796) switches.
 ///
-/// `memory_writes` is a NOT NULL boolean rather than a nullable override, so it
-/// has no clear: `Some(b)` sends a JSON boolean under its own key, `None`
+/// Both are NOT NULL booleans rather than nullable overrides, so they have no
+/// clear: `Some(b)` sends a JSON boolean under its own key, `None`
 /// leaves the key out of the body. The result reports the switch as the API
 /// stored it, like every other field.
 ///
@@ -430,10 +440,12 @@ pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
 ///   execution_deadline: the intent for the execution deadline.
 ///   runner_resources: the intent for the runner resources override.
 ///   memory_writes: the new memory-writes switch, if one was asked for.
+///   memory_rule_proposals: the new rule-proposal switch, if one was asked for.
 ///
 /// Returns:
 ///   The stored overrides, or the dry-run plan.
-pub async fn overrides_with_memory_writes(
+#[allow(clippy::too_many_arguments)] // One argument per override flag, as `overrides_summary`.
+pub async fn overrides_with_memory_flags(
     opts: AgentActionOpts,
     model: OverrideChange,
     reviewer_model: OverrideChange,
@@ -441,6 +453,7 @@ pub async fn overrides_with_memory_writes(
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
     memory_writes: Option<bool>,
+    memory_rule_proposals: Option<bool>,
 ) -> Result<OverridesOutput> {
     let ui = crate::ui::ui();
     let mut body = overrides_patch_body(
@@ -452,6 +465,10 @@ pub async fn overrides_with_memory_writes(
     );
     if let Some(on) = memory_writes {
         body.get_or_insert_with(AgentUpdate::default).memory_writes = Some(on);
+    }
+    if let Some(on) = memory_rule_proposals {
+        body.get_or_insert_with(AgentUpdate::default)
+            .memory_rule_proposals = Some(on);
     }
     if opts.dry_run {
         let plan = match &body {
@@ -483,6 +500,7 @@ pub async fn overrides_with_memory_writes(
             execution_deadline_seconds: agent.execution_deadline_seconds,
             runner_resources: agent.runner_resources,
             memory_writes: agent.memory_writes,
+            memory_rule_proposals: agent.memory_rule_proposals,
             changed: false,
         });
     };
@@ -506,6 +524,7 @@ pub async fn overrides_with_memory_writes(
         execution_deadline_seconds: saved.execution_deadline_seconds,
         runner_resources: saved.runner_resources,
         memory_writes: saved.memory_writes,
+        memory_rule_proposals: saved.memory_rule_proposals,
         changed: true,
     })
 }
@@ -795,11 +814,12 @@ mod overrides_tests {
             &None,
             &None,
             false,
+            true,
             false,
         );
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, reviewer model credential default, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off"
+            "overrides for a: model kimi-k2, reviewer model credential default, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off, memory rule proposals on"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -815,9 +835,10 @@ mod overrides_tests {
                 &Some(90),
                 &None,
                 true,
+                false,
                 true
             ),
-            "overrides for a now: model platform default, reviewer model credential default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on"
+            "overrides for a now: model platform default, reviewer model credential default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on, memory rule proposals off"
         );
     }
 

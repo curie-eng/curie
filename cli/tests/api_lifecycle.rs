@@ -957,7 +957,7 @@ fn agent_list_with_overrides() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":true}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":true,"memory_rule_proposals":true}}]"##
         ),
     )
 }
@@ -989,9 +989,15 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
             execution_deadline_seconds: _,
             runner_resources: _,
             memory_writes,
+            memory_rule_proposals,
             changed,
         } => {
             assert_eq!(agent, "deal-desk");
+            // #5796: the inspect reports the rule-proposal switch as stored.
+            assert!(
+                memory_rule_proposals,
+                "inspect must report memory_rule_proposals as the API stored it"
+            );
             assert_eq!(model.as_deref(), Some("kimi-k2"));
             assert_eq!(thinking.as_deref(), Some("adaptive"));
             // #1461: the inspect reports the memory-writes switch as stored.
@@ -1361,7 +1367,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         ("GET", "/agents") => Response::json(
             200,
             &format!(
-                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":false}}]"##
+                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":false,"memory_rule_proposals":false}}]"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -1386,6 +1392,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         execution_deadline_seconds,
         runner_resources,
         memory_writes,
+        memory_rule_proposals,
         changed,
     } = &out
     else {
@@ -1428,11 +1435,12 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         execution_deadline_seconds,
         runner_resources,
         *memory_writes,
+        *memory_rule_proposals,
         *changed,
     );
     assert_eq!(
         line,
-        "overrides for deal-desk: model kimi-k2, reviewer model credential default, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off"
+        "overrides for deal-desk: model kimi-k2, reviewer model credential default, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off, memory rule proposals off"
     );
 
     let rec = server.recorded();
@@ -1653,6 +1661,100 @@ fn overrides_memory_writes_off_patches_a_json_false() {
     let patch = rec.iter().find(|r| r.method == "PATCH").expect("a PATCH");
     let body: serde_json::Value = serde_json::from_slice(&patch.body).expect("JSON body");
     assert_eq!(body, serde_json::json!({"memory_writes": false}));
+}
+
+fn agent_json_with_memory_rule_proposals(memory_rule_proposals: bool) -> String {
+    format!(
+        r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":false,"memory_rule_proposals":{memory_rule_proposals}}}"##
+    )
+}
+
+fn patch_memory_rule_proposals(value: &str, stored: bool) -> serde_json::Value {
+    let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(
+            200,
+            &format!("[{}]", agent_json_with_memory_rule_proposals(!stored)),
+        ),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            Response::json(200, &agent_json_with_memory_rule_proposals(stored))
+        }
+        _ => not_found(),
+    });
+    let output = curie_against(
+        &server.base_url,
+        &[
+            "cluster",
+            "overrides",
+            "deal-desk",
+            "--memory-rule-proposals",
+            value,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rec = server.recorded();
+    let patches: Vec<_> = rec.iter().filter(|r| r.method == "PATCH").collect();
+    assert_eq!(patches.len(), 1, "exactly one PATCH: {rec:?}");
+    let body: serde_json::Value = serde_json::from_slice(&patches[0].body).expect("JSON body");
+    let printed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--json prints one JSON object");
+    assert_eq!(
+        printed["memory_rule_proposals"],
+        serde_json::json!(stored),
+        "the result reports the field as the API stored it: {printed}"
+    );
+    body
+}
+
+#[test]
+fn overrides_memory_rule_proposals_on_patches_a_json_true() {
+    assert_eq!(
+        patch_memory_rule_proposals("on", true),
+        serde_json::json!({"memory_rule_proposals": true}),
+        "only memory_rule_proposals, as a JSON boolean"
+    );
+}
+
+#[test]
+fn overrides_memory_rule_proposals_off_patches_a_json_false() {
+    assert_eq!(
+        patch_memory_rule_proposals("off", false),
+        serde_json::json!({"memory_rule_proposals": false})
+    );
+}
+
+#[test]
+fn overrides_memory_rule_proposals_dry_run_prints_one_json_object_and_requests_nothing() {
+    let server = serve(|req| panic!("--dry-run must not call the API: {req:?}"));
+    let output = curie_against(
+        &server.base_url,
+        &[
+            "cluster",
+            "overrides",
+            "deal-desk",
+            "--memory-rule-proposals",
+            "on",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let printed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("--dry-run --json prints one JSON object");
+    assert_eq!(printed["dry_run"], serde_json::json!(true));
+    assert!(
+        printed.to_string().contains("memory_rule_proposals"),
+        "the plan names the field: {printed}"
+    );
+    assert!(server.recorded().is_empty(), "no request on --dry-run");
 }
 
 #[test]
