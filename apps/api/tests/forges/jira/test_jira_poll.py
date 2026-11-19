@@ -982,19 +982,39 @@ async def test_jira_poll_answer_only_a_persons_plain_comment_on_an_answering_iss
 
 
 @pytest.mark.anyio
-async def test_jira_poll_answer_the_first_poll_delivers_no_comment() -> None:
+async def test_jira_poll_answer_the_first_poll_delivers_answers_only_on_answering_issues() -> None:
+    """A label whose first page held an issue saves no cursor and polls as a
+    first poll again, so a first poll delivers an answering issue's comments,
+    read in full past the window floor; a plain comment elsewhere stays
+    unread and a mention is only remembered."""
+
     fake = JiraFake()
     human = _human(fake)
-    issue = fake.seed_issue("Ticket")
-    fake.add_label(issue.id, LABEL, human)
-    fake.add_comment(issue.id, human, "An early answer.")
+    asked = fake.seed_issue("Asked")
+    quiet = fake.seed_issue("Not asked")
+    for issue in (asked, quiet):
+        fake.add_label(issue.id, LABEL, human)
+    early = fake.add_comment(asked.id, human, "An early answer.")
+    fake.add_comment(quiet.id, human, "A plain comment.")
+    fake.add_comment(quiet.id, human, adf_mention(BOT_ACCOUNT_ID, BOT_NAME))
+    # Hours later, so the early answer is below the first poll's floor.
+    fake.advance(6 * 3600)
+    late = fake.add_comment(asked.id, human, "The answer.")
+    fake.add_comment(asked.id, fake.bot, "Status: WORKING")
     tracker = jira_tracker(fake)
 
-    first = await tracker.poll_marked(None, running=(), answering=(fake.ref(issue),))
+    first = await tracker.poll_marked(None, running=(), answering=(fake.ref(asked),))
 
-    assert _answers(first) == []
-    assert len(_admits(first)) == 1
-    again = await tracker.poll_marked(first.cursor, running=(), answering=(fake.ref(issue),))
+    assert [(n.issue, n.event_id, n.actor) for n in _answers(first)] == [
+        (fake.ref(asked), early, human.actor),
+        (fake.ref(asked), late, human.actor),
+    ]
+    assert _answers(first)[1].occurred_at == _comment_time(fake, late)
+    assert _mentions(first) == []
+    assert len(_admits(first)) == 2
+    unasked = await tracker.poll_marked(None, running=(), answering=())
+    assert _answers(unasked) == [] and _mentions(unasked) == []
+    again = await tracker.poll_marked(first.cursor, running=(), answering=(fake.ref(asked),))
     assert again.notices == ()
 
 

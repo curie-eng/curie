@@ -995,6 +995,7 @@ _EXPECTED_USES = {
         "ANSWERED",
         "AnswerFacts",
         "AnswerNotAdmitted",
+        "FactoryAnswerReceipt",
         "FactoryQuestionRound",
         "OUTSTANDING",
         "POSTING",

@@ -470,7 +470,11 @@ class JiraTracker:
         read_back = floor if start is None else window
         comments: dict[str, list[dict[str, Any]]] = {}
         for issue_id in issues:
-            comments[issue_id] = await self._recent_comments(issue_id, read_back)
+            # A first poll reads an answering issue's comments in full: each is
+            # delivered (see `_mention_notices`), since a label whose cursor was
+            # never saved polls as a first poll again.
+            back = None if start is None and issue_id in answers else read_back
+            comments[issue_id] = await self._recent_comments(issue_id, back)
         considered: dict[str, int] = {}
         pending: list[_Pending] = []
         for issue_id, (ref, _updated, fields) in issues.items():
@@ -585,7 +589,14 @@ class JiraTracker:
         answering: bool,
     ) -> list[_Pending]:
         """Mentions, or on an ``answering`` issue every comment by a person as an
-        answer (#5789 decision 2): one comment is one notice, never both."""
+        answer (#5789 decision 2): one comment is one notice, never both.
+
+        A first poll delivers no mention, but it does deliver an answering
+        issue's answers: a label whose first page held an issue saves no
+        cursor and polls as a first poll again, so a comment remembered here
+        and never delivered would be lost. The answer core's fence refuses a
+        comment older than the question, and its receipt makes a replay
+        harmless."""
 
         disposition = Disposition.ANSWER if answering else Disposition.MENTION
         notices: list[_Pending] = []
@@ -603,8 +614,11 @@ class JiraTracker:
                 continue
             token = f"{_COMMENT}{comment_id}"
             if start is None:
-                # A first poll delivers label adds only; the comment is remembered.
+                # A first poll delivers label adds and answers; a mention is
+                # remembered.
                 considered[token] = created
+                if answering:
+                    notices.append(_Pending(ref, actor, str(comment_id), disposition, created))
                 continue
             if window is not None and created < window:
                 continue

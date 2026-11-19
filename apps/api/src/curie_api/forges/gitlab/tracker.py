@@ -311,7 +311,11 @@ class GitLabTracker:
             notes = _events(_NOTE, await self._notes(path))
             ref = self._ref(iid)
             if start is None:
-                pending.extend(await self._first_poll(ref, labels, notes, floor, considered))
+                pending.extend(
+                    await self._first_poll(
+                        ref, labels, notes, floor, considered, answering=str(iid) in answers
+                    )
+                )
                 continue
             window = start.time - OVERLAP
             pending.extend(await self._label_notices(ref, labels, window, known, considered))
@@ -355,13 +359,38 @@ class GitLabTracker:
         notes: list[_Event],
         floor: datetime,
         considered: dict[str, datetime],
+        *,
+        answering: bool,
     ) -> list[_Pending]:
-        """No cursor: only the latest add of the label is a notice, and only when
-        a person made it. Everything else in the overlap is remembered."""
+        """No cursor: the latest add of the label is a notice when a person made
+        it, and on an ``answering`` issue every note by a person is an answer.
+        Everything else in the overlap is remembered.
+
+        Answers are delivered because a label whose first page held an issue
+        saves no cursor and polls as a first poll again; a note remembered
+        here and never delivered would be lost. The notes are listed in full,
+        the answer core's fence refuses one older than the question, and its
+        receipt makes a replay harmless."""
 
         for event in (*labels, *notes):
             if event.at >= floor:
                 considered[event.token] = event.at
+        answers: list[_Pending] = []
+        if answering:
+            for note in notes:
+                if not isinstance(note.payload.get("body"), str):
+                    continue
+                actor = await self._transport.is_person(note.payload.get("author"))
+                if actor is not None:
+                    considered[note.token] = note.at
+                    answers.append(_Pending(ref, actor, note.token, Disposition.ANSWER, note.at))
+        return answers + await self._first_admission(ref, labels, considered)
+
+    async def _first_admission(
+        self, ref: TrackerIssueRef, labels: list[_Event], considered: dict[str, datetime]
+    ) -> list[_Pending]:
+        """The latest add of the label, when a person made it."""
+
         adds = [
             e.payload
             for e in labels

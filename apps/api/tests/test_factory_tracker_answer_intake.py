@@ -54,7 +54,9 @@ from test_factory_tracker_intake import (  # noqa: F401  (fixtures)
     Intake,
     _ByHost,
     _cursor,
+    _dc_document,
     _document,
+    _held_tickets,
     _jira_binding,
     _marker,
     _requests,
@@ -745,3 +747,139 @@ def test_fence_a_gitlab_note_in_the_question_notes_second_is_admitted(
     gl.reconcile()
 
     _assert_admitted(work_item_id, gitlab.issue_ref(iid), str(note_id), before)
+
+
+# --- review round 1: one comment, one decision -------------------------------------------
+
+
+@pytest.fixture
+def gitlab_two_labels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[gl.GitLabInstall]:
+    """Two surfaces on one binding: the tracker's own label and ``FAST``."""
+
+    yield from gl.gitlab_install(monkeypatch, tmp_path, labels=(None, gl.FAST))
+
+
+def test_answer_mention_on_a_second_labels_poll_starts_one_request_on_gitlab(
+    gitlab_two_labels: gl.GitLabInstall,
+) -> None:
+    """A developer's reply that mentions the bot, on an answering issue that
+    carries the tracker's own label. GitLab's incremental listing is not label
+    filtered (``updated_after``,
+    https://docs.gitlab.com/api/issues/#list-project-issues), so the same pass
+    delivers the note as an answer under that label's poll and as a mention
+    under the other label's. The comment starts exactly one request."""
+
+    install = gitlab_two_labels
+    backend = install.backend
+    # The other surface is in use: its label's first poll lists an issue, so
+    # that label's cursor is read from GitLab's own issue times.
+    other = backend.add_issue("Widget parser drops a quoted field", author=backend.developer)
+    backend.label_issue(other, gl.FAST, backend.developer)
+    iid, work_item_id = _gitlab_asked(install)
+    [fast_item] = gl.work_items(other)
+    assert fast_item["trigger_label"] == gl.FAST
+    before = _ids(work_item_id)
+
+    note_id = backend.issue_note(iid, backend.developer, gl.mention_body(install))
+    gl.reconcile()
+
+    _assert_admitted(work_item_id, install.issue_ref(iid), str(note_id), before)
+    assert _receipts(work_item_id) == {
+        str(note_id): ("admitted", _answer_id(install.issue_ref(iid), str(note_id)))
+    }
+    gl.reconcile()
+    assert len(_ids(work_item_id)) == len(before) + 1
+
+
+def test_answer_mention_replayed_after_its_round_cleared_starts_nothing(intake: Intake) -> None:
+    """Issue A's answer is held (its question is ``posting``), so the label's
+    cursor stays and the next pass replays the page. In the held pass issue
+    B's reply, which mentions the bot, is admitted as B's answer. B's answer
+    request then runs and ends, which clears B's round, so the replayed page
+    delivers B's reply as a mention. The receipt it already has decides it:
+    no second request. A is admitted once its round is recorded."""
+
+    intake.agent()
+    first, second = _issue(intake), _issue(intake)
+    intake.jira.add_label(first.id, LABEL, intake.starter)
+    intake.jira.add_label(second.id, LABEL, intake.starter)
+    intake.poll()
+    [a_item] = _work_items(first)
+    [b_item] = _work_items(second)
+    [a_request] = _ids(a_item["id"])
+    [b_request] = _ids(b_item["id"])
+    _ask_and_settle(intake, b_item["id"], b_request)
+
+    a_epoch = _start(intake, a_request)
+    a_capability = _mint(intake.client, a_request)
+    intake.jira.fail_next("comment_create", status=502, applied=True)
+    assert _ask(intake, a_capability).status_code == 503
+    assert _round_state(a_item["id"]) == ("posting", None)
+
+    cursor = _cursor()
+    a_answer = intake.jira.add_comment(first.id, intake.starter, ANSWER_TEXT)
+    # An ADF ``mention`` node naming the bot (the comment body is ADF,
+    # https://developer.atlassian.com/cloud/jira/platform/apis/document/nodes/mention/).
+    b_reply = intake.jira.add_comment(
+        second.id,
+        intake.starter,
+        jira_fake.adf_mention(jira_fake.BOT_ACCOUNT_ID, jira_fake.BOT_NAME, after=" the blue one"),
+    )
+    intake.poll()
+
+    assert _cursor() == cursor
+    assert _ids(a_item["id"]) == [a_request]
+    b_answer = _assert_admitted(b_item["id"], intake.ref(second), b_reply, [b_request])
+
+    # B's answer runs and ends without a question: its round clears.
+    _finish(intake.client, b_answer, _start(intake, b_answer))
+    assert _round_state(b_item["id"]) == ("cleared", b_answer)
+    b_after = _ids(b_item["id"])
+    # A's run retries the route and ends with the question.
+    assert _ask(intake, a_capability).status_code == 200
+    _finish(intake.client, a_request, a_epoch)
+    _settled_outstanding(a_item["id"], a_request)
+
+    intake.poll()
+
+    assert _ids(b_item["id"]) == b_after
+    assert _receipts(b_item["id"]) == {b_reply: ("admitted", b_answer)}
+    _assert_admitted(a_item["id"], intake.ref(first), a_answer, [a_request])
+    assert _cursor() != cursor
+
+
+def test_answer_first_poll_again_after_a_held_page_admits_the_answer(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    """The label's first page holds an issue (its code host does not answer),
+    so no cursor is saved and every pass is a first poll. Another issue is
+    admitted, asked and settled, and the starter answers it: the next pass,
+    still a first poll, admits exactly one request for the answer."""
+
+    intake = make_intake(_dc_document())
+    held, issue, _event = _held_tickets(intake)
+    intake.dc_down = True
+    intake.poll()
+    assert _cursor() is None
+    assert _work_items(held) == []
+    [item] = _work_items(issue)
+    [request_id] = _ids(item["id"])
+    _ask_and_settle(intake, item["id"], request_id)
+
+    comment_id = intake.jira.add_comment(issue.id, intake.starter, ANSWER_TEXT)
+    intake.poll()
+
+    assert _cursor() is None
+    _assert_admitted(item["id"], intake.ref(issue), comment_id, [request_id])
+
+    # The outage ends: the page is applied, the cursor saved, nothing repeats.
+    intake.dc_down = False
+    intake.poll()
+    assert _cursor() is not None
+    assert len(_work_items(held)) == 1
+    assert len(_ids(item["id"])) == 2
+    assert _receipts(item["id"]) == {
+        comment_id: ("admitted", _answer_id(intake.ref(issue), comment_id))
+    }

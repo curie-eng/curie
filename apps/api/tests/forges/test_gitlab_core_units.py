@@ -235,6 +235,43 @@ def test_gitlab_core_answer_a_plain_note_on_a_non_answering_issue_is_nothing() -
     asyncio.run(scenario())
 
 
+def test_gitlab_core_answer_the_first_poll_delivers_answers_only_on_answering_issues() -> None:
+    """A label whose first page held an issue saves no cursor and polls as a
+    first poll again, so a first poll delivers an answering issue's notes by
+    a person as answers; elsewhere a plain note and a mention are only
+    remembered."""
+
+    async def scenario() -> None:
+        fake = _gitlab()
+        tracker = gitlab_tracker(fake)
+        asked, quiet = _labelled(fake, "Asked"), _labelled(fake, "Not asked")
+        early = fake.issue_note(asked, OUTSIDER, "An early answer.")
+        fake.issue_note(asked, BOT, "Status: WORKING")
+        fake.issue_note(asked, WRITER, "changed the description", system=True)
+        fake.issue_note(quiet, OUTSIDER, "A plain note.")
+        fake.issue_note(quiet, WRITER, f"@{BOT.login} please look")
+        late = fake.issue_note(asked, WRITER, f"@{BOT.login} the blue one")
+
+        first = await tracker.poll_marked(None, running=(), answering=(fake.issue_ref(asked),))
+
+        assert [(n.issue, n.event_id, n.actor) for n in _answers(first)] == [
+            (fake.issue_ref(asked), f"note:{early}", OUTSIDER),
+            (fake.issue_ref(asked), f"note:{late}", WRITER),
+        ]
+        assert _answers(first)[0].occurred_at == fake.notes[early].created_at
+        assert [n.disposition for n in first.notices if n.issue == fake.issue_ref(quiet)] == [
+            Disposition.ADMIT
+        ]
+        unasked = await tracker.poll_marked(None, running=(), answering=())
+        assert {n.disposition for n in unasked.notices} == {Disposition.ADMIT}
+        again = await tracker.poll_marked(
+            first.cursor, running=(), answering=(fake.issue_ref(asked),)
+        )
+        assert again.notices == ()
+
+    asyncio.run(scenario())
+
+
 def test_gitlab_core_answer_system_own_and_bot_notes_are_never_answers() -> None:
     async def scenario() -> None:
         fake = _gitlab()

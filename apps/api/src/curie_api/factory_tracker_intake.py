@@ -25,6 +25,14 @@ the comment stands) and the binding's start authority read now, then goes to
 time, which owns the fence, the coalescing, the follow-up and the receipt. The
 sweep passes no answering set.
 
+The answering set is a snapshot taken before the tracker reads, and a second
+label's poll on the same binding is not given its issues, so a comment that
+mentions the factory can still arrive as a ``MENTION``. Its kind is therefore
+decided at admission, under the WorkItem lock: a comment that already has an
+answer receipt starts nothing more, and a mention on a WorkItem whose question
+row is ``posting``, ``outstanding`` or ``answered`` goes to the answer core
+like an answer. One comment never starts both an answer and a mention.
+
 A ``posting`` row is in the answering set on purpose. Its question comment may
 already be on the ticket while the row is not yet ``outstanding`` (the tracker
 write landed but its answer was lost, and the asking request retries the
@@ -102,7 +110,13 @@ from .forges.types import (
 )
 from .github_factory import lock_issue, work_item_for
 from .github_review_events import FeedbackUnavailable
-from .models import ExecutionRequest, FactoryPollCursor, FactoryQuestionRound, WorkItem
+from .models import (
+    ExecutionRequest,
+    FactoryAnswerReceipt,
+    FactoryPollCursor,
+    FactoryQuestionRound,
+    WorkItem,
+)
 from .workitem_dispatch import Admission
 from .workitems import lifecycle
 
@@ -866,6 +880,34 @@ async def _mention(
             binding.name,
         )
         return
+    # The comment's kind is decided now, under the WorkItem lock, not by the
+    # answering set the poll was given: a mention on an answering issue is an
+    # answer, however the poll delivered it (a second label's poll, a page
+    # replayed after the round cleared, a question posted mid-poll).
+    work_item_id = existing.id
+    if await lifecycle.lock_work_item(session, work_item_id) is None:
+        return
+    comment_id = mention_comment_id(issue.kind, notice.event_id)
+    decided = await session.scalar(
+        select(FactoryAnswerReceipt.work_item_id).where(
+            FactoryAnswerReceipt.work_item_id == work_item_id,
+            FactoryAnswerReceipt.comment_key == comment_id,
+        )
+    )
+    if decided is not None:
+        logger.info(
+            "tracker intake for binding %s skipped a mention already decided as an answer "
+            "on work item %s",
+            binding.name,
+            work_item_id,
+        )
+        return
+    state = await session.scalar(
+        select(FactoryQuestionRound.state).where(FactoryQuestionRound.work_item_id == work_item_id)
+    )
+    if state in _ANSWERING_STATES:
+        await _to_answer_core(session, scope, tracker, notice, work_item_id)
+        return
     surface = await agent_binding(session, existing.agent_id, scope.surface_kind, scope.location)
     if surface is None:
         return
@@ -917,19 +959,32 @@ async def _answer(
             binding.name,
         )
         return
+    await _to_answer_core(session, scope, tracker, notice, existing.id)
+
+
+async def _to_answer_core(
+    session: AsyncSession,
+    scope: _Scope,
+    tracker: Tracker,
+    notice: MarkedNotice,
+    work_item_id: uuid.UUID,
+) -> None:
+    """`factory_questions.admit_answer` for an authorized comment, held while
+    the question row is ``posting``. The caller checked start authority."""
+
     # Under the WorkItem lock the row cannot move into ``posting``; only the
     # tracker write, which does not take this lock, moves it out of it.
-    locked = await lifecycle.lock_work_item(session, existing.id)
-    if locked is None:
+    if await lifecycle.lock_work_item(session, work_item_id) is None:
         return
     state = await session.scalar(
-        select(FactoryQuestionRound.state).where(FactoryQuestionRound.work_item_id == locked.id)
+        select(FactoryQuestionRound.state).where(FactoryQuestionRound.work_item_id == work_item_id)
     )
     if state == factory_questions.POSTING:
         await session.rollback()
         raise _AnswerAwaitsQuestion
+    issue = notice.issue
     facts = factory_questions.AnswerFacts(
-        work_item_id=locked.id,
+        work_item_id=work_item_id,
         issue=issue,
         comment_id=mention_comment_id(issue.kind, notice.event_id),
         created_at=notice.occurred_at,
@@ -938,10 +993,12 @@ async def _answer(
     try:
         await factory_questions.admit_answer(session, facts)
     except factory_questions.AnswerNotAdmitted as refused:
+        # ``work_item_id`` is a plain value: the core rolled back, so no
+        # ORM attribute is read after it.
         logger.info(
             "tracker intake for binding %s did not admit an answer on work item %s: %s",
-            binding.name,
-            locked.id,
+            scope.binding.name,
+            work_item_id,
             refused.code,
         )
 
