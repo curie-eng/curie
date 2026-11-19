@@ -1053,6 +1053,122 @@ def test_ordinary_connect_login_never_mints_console_administration(
     assert console_sessions() == before
 
 
+@pytest.mark.parametrize("groups", [None, ["members"]], ids=["missing", "wrong"])
+def test_shared_issuer_connect_claims_depend_on_directory(
+    connect_browser, monkeypatch: pytest.MonkeyPatch, groups: list[str] | None
+) -> None:
+    import re
+    from urllib.parse import urlsplit
+
+    import httpx
+
+    client, directory_token, directory_id, directory_principal_id, _, idp = connect_browser
+    idp.redirect_uri = "https://testserver/console/oidc/callback"
+    monkeypatch.setenv("FACTORY_MODEL_AUTH_MODE", "personal")
+    monkeypatch.setenv("CURIE_OIDC_REDIRECT_URI", idp.redirect_uri)
+    monkeypatch.setenv("CURIE_OIDC_REQUIRED_CLAIMS", '{"groups":"operators"}')
+    monkeypatch.setenv("CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "false")
+    get_settings.cache_clear()
+    if groups is not None:
+        idp.extra_claims["groups"] = groups
+
+    async def issue_personal_token() -> tuple[uuid.UUID, str]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                tenant, person, _, team = await seed(session)
+                config = await session.get(TenantIdentityProvider, tenant.id)
+                assert config is not None
+                await session.delete(config)
+                await session.delete(team)
+                await session.delete(person)
+                await session.flush()
+                token = await issue(session, tenant)
+                assert token is not None
+                personal = await session.get(IdentityConnectToken, connect.hash_token(token))
+                directory = await session.get(
+                    IdentityConnectToken, connect.hash_token(directory_token)
+                )
+                assert personal is not None and directory is not None
+                assert personal.idp_issuer == directory.idp_issuer == get_settings().oidc_issuer
+                await session.commit()
+                return tenant.id, token
+        finally:
+            await engine.dispose()
+
+    tenant_id, personal_token = asyncio.run(issue_personal_token())
+
+    async def personal_counts() -> list[int | None]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                return [
+                    await session.scalar(select(func.count()).select_from(model).where(*filters))
+                    for model, filters in (
+                        (Principal, (Principal.tenant_id == tenant_id,)),
+                        (IdentityLink, (IdentityLink.tenant_id == tenant_id,)),
+                        (
+                            IdentityConnectToken,
+                            (
+                                IdentityConnectToken.tenant_id == tenant_id,
+                                IdentityConnectToken.consumed_at.is_not(None),
+                            ),
+                        ),
+                    )
+                ]
+        finally:
+            await engine.dispose()
+
+    def sign_in() -> httpx.Response:
+        login = client.get("/console/oidc/login", follow_redirects=False)
+        assert login.status_code == 302, login.text
+        with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:
+            authorized = browser.get(login.headers["location"])
+        back = urlsplit(authorized.headers["location"])
+        return client.get(f"{back.path}?{back.query}", follow_redirects=False)
+
+    def confirm(path: str) -> None:
+        page = client.get(path)
+        csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
+        assert csrf is not None
+        response = client.post(
+            f"{path}/confirm",
+            data={"csrf": csrf.group(1)},
+            headers={"Origin": "https://testserver"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303, response.text
+        assert response.headers["location"] == "/settings/claude-plan"
+
+    console_refusal = sign_in()
+    assert console_refusal.status_code == 401
+
+    directory_path = f"/identity/connect/{directory_token}"
+    assert client.get(directory_path).status_code == 200
+    callback = sign_in()
+    assert callback.status_code == 303, callback.text
+    assert callback.headers["location"] == directory_path
+    confirm(directory_path)
+    assert ("UALICE001", directory_principal_id) in browser_links(directory_id)
+
+    personal_path = f"/identity/connect/{personal_token}"
+    assert client.get(personal_path).status_code == 200
+    before = asyncio.run(personal_counts())
+    assert before == [0, 0, 0]
+    callback = sign_in()
+    assert callback.status_code == console_refusal.status_code
+    assert callback.json() == console_refusal.json()
+    assert asyncio.run(personal_counts()) == before
+
+    idp.extra_claims["groups"] = ["operators"]
+    assert client.get(personal_path).status_code == 200
+    callback = sign_in()
+    assert callback.status_code == 303, callback.text
+    assert callback.headers["location"] == personal_path
+    confirm(personal_path)
+    assert asyncio.run(personal_counts()) == [1, 1, 1]
+
+
 @pytest.mark.parametrize("connect_browser", ["/api"], indirect=True)
 def test_actual_proxy_prefix_is_preserved_through_connect_oidc_and_confirm(connect_browser):
     import re

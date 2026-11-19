@@ -73,7 +73,7 @@ from ..auth import (
 from ..config import get_settings
 from ..deps import SessionDep
 from ..identity import connect as identity_connect
-from ..models import Principal
+from ..models import Principal, TenantIdentityProvider
 from ..principal_authority import PrincipalAuthorityRefusal
 from ..rate_limit import require_rate_limit
 from .identity_connect import (
@@ -507,11 +507,12 @@ async def oidc_callback(
             response = _refuse_callback("account connection issuer mismatch")
             clear_connect_cookies(response)
             return response
-    # Ordinary account connection authenticates a person, never an admin.
-    # Console sign-in retains its existing administrator admission policy.
-    if not connect_token and not oidc.meets_required_claims(
-        claims, get_settings().oidc_required_claims
-    ):
+    # live_token locks the tenant and only accepts the fallback when there is
+    # no directory configuration. Both paths can use the same issuer URL.
+    if (
+        connect_row is None
+        or await session.get(TenantIdentityProvider, connect_row.tenant_id) is None
+    ) and not oidc.meets_required_claims(claims, get_settings().oidc_required_claims):
         return _refuse_callback("ID token lacks a required claim")
     # @spec HTTP-PRINCIPAL-ADOPTION-V1-10, HTTP-PRINCIPAL-ADOPTION-V1-11.
     try:
