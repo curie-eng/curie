@@ -22,6 +22,7 @@ import logging
 import sys
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -497,6 +498,20 @@ def test_not_outstanding_when_no_round_is_open(
     assert _receipts(triage.work_item_id) == {comment_id: ("not_outstanding", None)}
     assert _round_row(triage.work_item_id) == row
     _replays(triage, comment_id, result)
+
+
+def test_not_outstanding_is_never_reported_for_a_missing_work_item_replay_safe(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    triage = _settled_asked(admitted, monkeypatch, 5172)
+    missing = replace(triage, work_item_id=uuid.uuid4())
+    comment_id = _comment(triage)
+    before = _counts()
+    for _delivery in range(2):
+        with pytest.raises(factory_questions.AnswerNotAdmitted) as refused:
+            _admit(missing, comment_id, _fence(triage) + SECOND)
+        assert refused.value.code == "work_item_not_found"
+        assert _counts() == before
 
 
 def test_cancelled_work_item_takes_no_answer(

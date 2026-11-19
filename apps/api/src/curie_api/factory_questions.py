@@ -782,8 +782,9 @@ async def admit_answer(session: AsyncSession, facts: AnswerFacts) -> AnswerOutco
     that one only moves a ``posting`` row, which is never acted on here.
 
     Raises ValueError when the facts do not name the WorkItem's own ticket or
-    carry no comment id, and `AnswerNotAdmitted` when the request could not be
-    created. This function owns its transaction: any exception rolls it back
+    carry no comment id, and `AnswerNotAdmitted` with ``work_item_not_found``
+    when the WorkItem no longer exists, or with the conflict code when the
+    request could not be created. This function owns its transaction: any exception rolls it back
     before it propagates, so a caller that catches it and commits persists
     nothing of the answer (a lifecycle commit only released a savepoint).
     """
@@ -802,11 +803,9 @@ async def _admit(session: AsyncSession, facts: AnswerFacts) -> AnswerOutcome:
         raise ValueError("an answer needs its tracker comment id")
     work_item = await lifecycle.lock_work_item(session, facts.work_item_id)
     if work_item is None:
-        # A receipt needs its WorkItem (a foreign key); the caller found it,
-        # so it was deleted since.
-        await session.commit()
-        _log_answer(NOT_OUTSTANDING, facts.work_item_id, facts.comment_id, None)
-        return AnswerOutcome(NOT_OUTSTANDING, None, False)
+        # The caller found it, so it was deleted since. A receipt needs its
+        # WorkItem (a foreign key), so no outcome can be recorded durably.
+        raise AnswerNotAdmitted("work_item_not_found")
     if work_item.tracker_issue != facts.issue:
         raise ValueError("the answer's issue is not the WorkItem's ticket")
 
