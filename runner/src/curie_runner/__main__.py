@@ -137,9 +137,8 @@ from .memory_facts import (
     format_facts_preamble,
     resolve_facts_store,
 )
-from .memory_rules_context import BLOCKED_EXPLANATION as RULES_BLOCKED_EXPLANATION
 from .memory_rules_context import Failed as RulesFailed
-from .memory_rules_context import MemoryRulesContextGate
+from .memory_rules_context import MemoryRulesContextGate, blocked_explanation
 from .memory_rules_context import attach_gate as attach_rules_gate
 from .otel import RunTracer, build_tracer_provider
 from .platform_slack.capability import ChannelReadTurn, url_origin
@@ -978,7 +977,9 @@ def build_runner(
                 rules_gate.applied.section() if rules_gate.applied is not None else None
             ),
             requester_preamble=(
-                requester_gate.applied.section() if requester_gate.applied is not None else None
+                requester_gate.applied.section(learned_rules=rules_gate.applied is not None)
+                if requester_gate.applied is not None
+                else None
             ),
             facts_preamble=memory_facts_preamble,
             guidance_preamble=(
@@ -1625,9 +1626,9 @@ def build_runner(
                 # Blocked before any model session: a learned rules envelope
                 # still to come is answered as such, never acknowledged.
                 rules_gate.block()
-            elif isinstance(await rules_gate.wait(), RulesFailed):
+            elif isinstance(rules_outcome := await rules_gate.wait(), RulesFailed):
                 # The session waits for both acknowledgments (#5798).
-                preflight_block = RULES_BLOCKED_EXPLANATION
+                preflight_block = blocked_explanation(rules_outcome.reason)
         if build_real_options is not None:
             real_options = build_real_options(compose_system_prompt(verification), bound_contract)
 

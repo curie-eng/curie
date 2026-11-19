@@ -297,10 +297,10 @@ class MemoryRulesContextGate:
             )
         return 200, acknowledgment(binding, decided)
 
-    async def wait(self, deadline_s: float = DELIVERY_DEADLINE_SECONDS) -> Outcome:
+    async def wait(self, deadline_s: float | None = None) -> Outcome:
         """The delivered outcome; ``missing_envelope`` when none came in time."""
 
-        with anyio.move_on_after(deadline_s):
+        with anyio.move_on_after(DELIVERY_DEADLINE_SECONDS if deadline_s is None else deadline_s):
             await self._decided.wait()
         if self._outcome is None:
             self._decide(Failed("missing_envelope"))
@@ -313,6 +313,13 @@ BLOCKED_EXPLANATION = (
     "This run did not start: the accepted learned rules for this repository could not "
     "be verified for this execution, so no model work ran."
 )
+
+
+def blocked_explanation(reason: str) -> str:
+    """The offline explanation, naming the refusal so a missing or refused envelope
+    never reads as the generic verification failure."""
+
+    return f"{BLOCKED_EXPLANATION} Reason: {reason}."
 
 
 def _deny(reason: str) -> dict[str, Any]:
@@ -393,6 +400,7 @@ def attached_gate(runner: object) -> MemoryRulesContextGate | None:
 
 __all__ = [
     "BLOCKED_EXPLANATION",
+    "blocked_explanation",
     "CONTEXT_PATH",
     "MAX_ENVELOPE_BYTES",
     "PREFLIGHT_BLOCKED",

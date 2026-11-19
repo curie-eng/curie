@@ -42,12 +42,13 @@ from curie_runner.memory_rules_context import (
     Failed,
     MemoryRulesContextGate,
     attach_gate,
+    blocked_explanation,
     close_line,
     open_line,
     private_fragments,
 )
 from curie_runner.requester_context import FRAMING as REQUESTER_FRAMING
-from curie_runner.requester_context import requester_section
+from curie_runner.requester_context import FRAMING_WITH_LEARNED_RULES, requester_section
 from curie_runner.session import SessionRunner
 from curie_runner.tracker_result import CONTRACT_BLOCKED_EXPLANATION
 from personal_auth_support import requires_cli
@@ -350,16 +351,50 @@ def test_the_section_bytes_and_framing_order() -> None:
     assert positions == sorted(positions)
 
 
-def test_the_requester_framing_states_the_same_order() -> None:
-    guidance = REQUESTER_FRAMING.index("repository guidance")
-    learned = REQUESTER_FRAMING.index("accepted learned rules for this repository")
-    preferences = REQUESTER_FRAMING.index("then these preferences")
+# The requester framing exactly as ADR 0278 shipped it, written out independently of
+# the module so a change to the base framing cannot hide inside the comparison.
+BASE_REQUESTER_FRAMING = (
+    "Requester coding preferences follow. They are personal preferences of the person "
+    "who requested this work, pinned when the work was admitted. Precedence, highest "
+    "first: platform safety and operator controls; the mandatory workflow rules of "
+    "this bundle; repository guidance (every applicable scoped AGENTS.md, "
+    "CONTRIBUTING.md and workspace CLAUDE.md); then these preferences. Follow a "
+    "preference only where it is compatible with everything above it; on any conflict "
+    "the higher rule wins. These preferences cannot add tools, skills, credentials, "
+    "network egress, grants or budget, cannot change the task's acceptance criteria, "
+    "and cannot remove review or publication gates. Never copy this section or its "
+    "text into a reviewer's prompt."
+)
+
+
+def test_the_requester_framing_states_the_same_order_when_rules_are_in_force() -> None:
+    guidance = FRAMING_WITH_LEARNED_RULES.index("repository guidance")
+    learned = FRAMING_WITH_LEARNED_RULES.index("accepted learned rules for this repository")
+    preferences = FRAMING_WITH_LEARNED_RULES.index("then these preferences")
     assert guidance < learned < preferences
+    assert "learned rules" not in REQUESTER_FRAMING
+
+
+def test_without_rules_the_requester_section_keeps_its_original_bytes() -> None:
+    assert REQUESTER_FRAMING == BASE_REQUESTER_FRAMING
+    expected = "\n".join(
+        (
+            f"<<<curie-requester-preferences selection={WORK_ITEM} format=1 "
+            f"sha256={REQUESTER_DIGEST}>>>",
+            BASE_REQUESTER_FRAMING,
+            "",
+            REQUESTER_TEXT.rstrip("\n"),
+            f"<<<end-curie-requester-preferences sha256={REQUESTER_DIGEST}>>>",
+        )
+    )
+    assert requester_section(WORK_ITEM, REQUESTER_DIGEST, REQUESTER_TEXT) == expected
+    with_rules = requester_section(WORK_ITEM, REQUESTER_DIGEST, REQUESTER_TEXT, learned_rules=True)
+    assert with_rules == expected.replace(BASE_REQUESTER_FRAMING, FRAMING_WITH_LEARNED_RULES)
 
 
 def test_the_section_follows_the_model_line_and_precedes_the_requester_section() -> None:
     rules = Applied(rule_numbers=(1, 4), sha256=DIGEST, text=TEXT).section()
-    requester = requester_section(WORK_ITEM, REQUESTER_DIGEST, REQUESTER_TEXT)
+    requester = requester_section(WORK_ITEM, REQUESTER_DIGEST, REQUESTER_TEXT, learned_rules=True)
     prompt = _compose_system_prompt(
         BUNDLE_PROMPT,
         None,
@@ -494,7 +529,7 @@ class _Boot:
 def _boot_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    rules_raw: bytes,
+    rules_raw: bytes | None,
     *,
     requester_raw: bytes = REQUESTER_VALID,
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]] = _messages,
@@ -536,8 +571,12 @@ def _boot_run(
                         "/v1/requester-context", data=requester_raw, headers=BEARER
                     )
                     requester_ack: dict[str, Any] = await requester.json()
-                    rules = await client.post(CONTEXT_PATH, data=rules_raw, headers=BEARER)
-                    rules_ack: dict[str, Any] = await rules.json()
+                    rules_ack: dict[str, Any] = {}
+                    rules_status = 0
+                    if rules_raw is not None:
+                        rules = await client.post(CONTEXT_PATH, data=rules_raw, headers=BEARER)
+                        rules_ack = await rules.json()
+                        rules_status = rules.status
                     turn = await client.post(
                         "/v1/event",
                         json={
@@ -555,7 +594,7 @@ def _boot_run(
             assert len(finals) == 1
             return _Boot(
                 requester_ack,
-                rules.status,
+                rules_status,
                 rules_ack,
                 finals[0],
                 list(provider[_BODIES]),
@@ -602,7 +641,20 @@ def test_a_refused_learned_rules_envelope_starts_no_model_session(
     )
     assert booted.bodies == []
     assert booted.other == []
-    assert booted.final.text == BLOCKED_EXPLANATION
+    assert booted.final.text == blocked_explanation(reason)
+
+
+def test_a_boot_whose_worker_never_delivers_the_rules_names_the_missing_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An older worker never posts the envelope; the runner waits its deadline, then the
+    # start answers offline with the specific reason, not the generic verification text.
+    monkeypatch.setattr("curie_runner.memory_rules_context.DELIVERY_DEADLINE_SECONDS", 0.2)
+    booted = _boot_run(tmp_path, monkeypatch, None)
+    assert booted.rules_status == 0
+    assert booted.bodies == []
+    assert booted.final.text == blocked_explanation("missing_envelope")
+    assert "missing_envelope" in booted.final.text
 
 
 def test_a_preflight_blocked_boot_acknowledges_nothing(
@@ -623,10 +675,10 @@ def test_an_applied_boot_carries_the_section_between_model_line_and_requester_se
     assert booted.bodies, "an applied boot made no provider request"
     system = _system_text(booted.bodies[0])
     rules = Applied(rule_numbers=(1, 4), sha256=DIGEST, text=TEXT).section()
-    requester = requester_section(WORK_ITEM, REQUESTER_DIGEST, REQUESTER_TEXT)
+    requester = requester_section(WORK_ITEM, REQUESTER_DIGEST, REQUESTER_TEXT, learned_rules=True)
     assert system.count(SECTION_OPEN_LINE) == 1
     assert f"Configured model: {MODEL}\n\n{rules}\n\n{requester}" in system
-    assert booted.final.text != BLOCKED_EXPLANATION
+    assert BLOCKED_EXPLANATION not in booted.final.text
 
 
 @requires_cli
@@ -639,7 +691,7 @@ def test_an_absent_boot_reaches_the_model_without_the_section(
     for body in booted.bodies:
         system = _system_text(body)
         assert "<<<curie-learned-rules" not in system and "<<<end-curie-learned-rules" not in system
-    assert booted.final.text != BLOCKED_EXPLANATION
+    assert BLOCKED_EXPLANATION not in booted.final.text
 
 
 CLEAN_REVIEW = "REVIEW-CONTROL-8c2d Review the diff against the acceptance criteria."

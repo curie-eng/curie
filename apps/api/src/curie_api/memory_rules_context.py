@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .factory_tracker_result_runtime import CONTRACT_IMPLEMENTATION
 from .models import Agent, ExecutionRequest, WorkItem, WorkItemMemoryRuleSnapshot
 
 ContextRefusal = Literal[
@@ -84,6 +85,12 @@ async def _running(
     return request, item
 
 
+def _delivers(request: ExecutionRequest) -> bool:
+    """Whether the request's session receives the pinned rules (the implementer only)."""
+
+    return request.completion_contract == CONTRACT_IMPLEMENTATION
+
+
 async def read_envelope(
     session: AsyncSession, request_id: uuid.UUID, *, runtime_epoch: int
 ) -> dict[str, Any] | Refused:
@@ -97,7 +104,7 @@ async def read_envelope(
     if tenant is None:
         return Refused("memory_rules_unavailable")
     selection: MemoryRulesSelectedV1 | AbsentMemoryRules
-    if item.memory_rules_state == "selected":
+    if item.memory_rules_state == "selected" and _delivers(request):
         snapshot = await session.scalar(
             select(WorkItemMemoryRuleSnapshot).where(
                 WorkItemMemoryRuleSnapshot.work_item_id == item.id
@@ -166,7 +173,7 @@ async def accept_acknowledgment(
             await session.rollback()
             return Refused("acknowledgment_mismatch")
     current = request.memory_rules_evidence
-    selected = item.memory_rules_state == "selected"
+    selected = item.memory_rules_state == "selected" and _delivers(request)
     if ack is not None and ack.outcome == "applied":
         if not selected or ack.sha256 != item.memory_rules_sha256:
             await session.rollback()

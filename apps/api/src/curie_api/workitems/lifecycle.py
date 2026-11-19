@@ -1103,7 +1103,9 @@ async def _insert_waiting_request(
                 result_policy_digest=result_policy_digest,
                 **snapshot_columns(work_item),
                 **request_selection_columns(work_item),
-                **memory_rules_admission.request_selection_columns(work_item),
+                **memory_rules_admission.request_selection_columns(
+                    work_item, completion_contract=completion_contract
+                ),
                 **(columns or {}),
             )
         )
@@ -1254,7 +1256,11 @@ async def create_revision_request(
                     version=1,
                     **snapshot_columns(work_item),
                     **request_selection_columns(work_item),
-                    **memory_rules_admission.request_selection_columns(work_item),
+                    # A queued mention is an implementation request: it is stored to
+                    # run under the default contract when it is promoted.
+                    **memory_rules_admission.request_selection_columns(
+                        work_item, completion_contract=CONTRACT_IMPLEMENTATION
+                    ),
                     **snapshot,
                 )
             )

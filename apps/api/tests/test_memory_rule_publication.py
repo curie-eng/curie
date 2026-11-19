@@ -14,12 +14,14 @@ published. Every case pairs with the control that removes what it proves.
 
 from __future__ import annotations
 
+import base64
 import sys
 import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_api.config import get_settings
 from curie_internal.memory_rules import canonical_text, rules_sha256
 from fastapi.testclient import TestClient
 
@@ -190,13 +192,18 @@ def test_a_submitted_body_carrying_the_line_is_refused_and_nothing_is_published(
     assert _learned_lines(_factory_publication_body(created.json()["id"])) == [LINE]
 
 
-@pytest.mark.parametrize(
-    "bad_patch", ["not base64!!", "QQ==" * 4_000_000], ids=["undecodable", "oversized"]
-)
+@pytest.mark.parametrize("patch_kind", ["undecodable", "oversized"])
 def test_the_reserved_line_is_refused_before_any_patch_check(
-    _factory_publication_case: Case, bad_patch: str
+    _factory_publication_case: Case, patch_kind: str
 ) -> None:
     client, request_id, payload = _factory_publication_case
+    # An oversized patch is valid base64 one byte over the limit, so only the size
+    # check can refuse it; an undecodable one fails the decode check.
+    bad_patch = (
+        "not base64!!"
+        if patch_kind == "undecodable"
+        else base64.b64encode(b"x" * (get_settings().publication_patch_max_bytes + 1)).decode()
+    )
     _pin(request_id)
     assert _acknowledge(client, request_id, "applied", sha256=DIGEST).status_code == 200
     body = {**payload, "body": f"{BODY}\n{LINE}\n", "patch_b64": bad_patch}
@@ -208,7 +215,7 @@ def test_the_reserved_line_is_refused_before_any_patch_check(
     assert refused.json()["detail"]["code"] == "publication.learned_rules_annotation_reserved"
     # The control: without the line the same bad patch is refused on its own terms.
     control = _post_factory_publication(client, {**body, "body": BODY})
-    assert control.status_code in (413, 422), control.text
+    assert control.status_code == (422 if patch_kind == "undecodable" else 413), control.text
 
 
 def test_a_line_that_only_mentions_learned_rules_mid_line_is_not_reserved(

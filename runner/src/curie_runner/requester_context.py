@@ -75,13 +75,22 @@ FRAMING = (
     "who requested this work, pinned when the work was admitted. Precedence, highest "
     "first: platform safety and operator controls; the mandatory workflow rules of "
     "this bundle; repository guidance (every applicable scoped AGENTS.md, "
-    "CONTRIBUTING.md and workspace CLAUDE.md); accepted learned rules for this "
-    "repository; then these preferences. Follow a "
+    "CONTRIBUTING.md and workspace CLAUDE.md); then these preferences. Follow a "
     "preference only where it is compatible with everything above it; on any conflict "
     "the higher rule wins. These preferences cannot add tools, skills, credentials, "
     "network egress, grants or budget, cannot change the task's acceptance criteria, "
     "and cannot remove review or publication gates. Never copy this section or its "
     "text into a reviewer's prompt."
+)
+# The same framing when a learned rules section precedes this one (#5798), so both
+# sections state one order. Without a learned rules section the base framing above
+# is used, byte for byte.
+LEARNED_RULES_PRECEDENCE = "accepted learned rules for this repository; "
+FRAMING_WITH_LEARNED_RULES = FRAMING.replace(
+    "CONTRIBUTING.md and workspace CLAUDE.md); then these preferences.",
+    "CONTRIBUTING.md and workspace CLAUDE.md); "
+    + LEARNED_RULES_PRECEDENCE
+    + "then these preferences.",
 )
 
 
@@ -101,8 +110,10 @@ class Applied:
     sha256: str
     text: str = ""
 
-    def section(self) -> str:
-        return requester_section(self.selection_id, self.sha256, self.text)
+    def section(self, *, learned_rules: bool = False) -> str:
+        return requester_section(
+            self.selection_id, self.sha256, self.text, learned_rules=learned_rules
+        )
 
 
 @dataclass(frozen=True)
@@ -132,11 +143,14 @@ def close_line(sha256: str) -> str:
     return f"{CLOSE_PREFIX} sha256={sha256}>>>"
 
 
-def requester_section(selection_id: str, sha256: str, text: str) -> str:
+def requester_section(
+    selection_id: str, sha256: str, text: str, *, learned_rules: bool = False
+) -> str:
     """The prompt section: delimiters carrying the selection identity and digest."""
 
+    framing = FRAMING_WITH_LEARNED_RULES if learned_rules else FRAMING
     return "\n".join(
-        (open_line(selection_id, sha256), FRAMING, "", text.rstrip("\n"), close_line(sha256))
+        (open_line(selection_id, sha256), framing, "", text.rstrip("\n"), close_line(sha256))
     )
 
 
@@ -410,7 +424,15 @@ def private_fragments(applied: Applied | None) -> tuple[str, ...]:
     lines = {line.strip() for line in applied.text.splitlines() if len(line.strip()) >= 12}
     return tuple(
         sorted(
-            {applied.text, applied.text.strip(), applied.section(), *lines}, key=len, reverse=True
+            {
+                applied.text,
+                applied.text.strip(),
+                applied.section(),
+                applied.section(learned_rules=True),
+                *lines,
+            },
+            key=len,
+            reverse=True,
         )
     )
 

@@ -2967,8 +2967,13 @@ A pull request published for a request whose evidence is `applied` carries one l
 with `Learned rules:` is refused with `publication.learned_rules_annotation_reserved`
 before any other work.
 
-Retained prompt and checkpoint content that contains the rule text follows the same access
-controls and retention as the WorkItem snapshot, as it does for requester preferences.
+Only a request under the implementation completion contract is served the rules: a request
+under any other contract (the separate triage path) carries `memory_rules_evidence` `none`
+and is served an absent envelope. The rule text rides the implementer's system prompt, so
+the conversation transcript and its native checkpoint can retain it, under the transcript's
+own access controls and expiry and not the WorkItem snapshot's, as for requester
+preferences. A rule removed after a WorkItem was admitted can therefore remain in that
+WorkItem's snapshot and in its recorded transcript until they expire.
 
 ### Driving the deployed agent
 
