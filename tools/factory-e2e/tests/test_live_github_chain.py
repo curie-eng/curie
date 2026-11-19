@@ -59,6 +59,12 @@ def drop_line(body: str, prefix: str) -> str:
     return "\n".join(x for x in body.splitlines() if not x.startswith(prefix)) + "\n"
 
 
+OUTSIDE_DECISIONS = (
+    "Closes #11\n\n## Decisions\n\nNone.\n\n## Notes\n\n"
+    "Answered on the ticket by fixture-writer: print 2 decimal places.\n"
+)
+
+
 def second_revision(requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
     extra = {**requests[-1], "id": "request-extra", "created_at": at(31)}
     return [*requests, extra]
@@ -191,7 +197,13 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "no-answered-line",
         [("beat_b/open_pulls/0/body", lambda s: drop_line(s, "Answered on the ticket by "))],
         "beat_b",
-        "Answered on the ticket by",
+        "Decisions section lacks",
+    ),
+    (
+        "answered-line-outside-the-decisions-section",
+        [("beat_b/open_pulls/0/body", OUTSIDE_DECISIONS)],
+        "beat_b",
+        "Decisions section lacks",
     ),
     (
         "two-pull-requests",
@@ -241,19 +253,40 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "not COMMENT",
     ),
     (
-        "review-with-zero-inline-comments",
-        [("beat_c/review_comments", []), ("beat_c/post/body/comments", [])],
+        "posted-review-with-zero-inline-comments",
+        [("beat_c/post/body/comments", [])],
         "beat_c",
-        "0 inline comments",
+        "posted review carries 0",
     ),
     (
-        "review-with-two-inline-comments",
-        [
-            ("beat_c/review_comments", lambda cs: [*cs, *cs]),
-            ("beat_c/post/body/comments", lambda cs: [*cs, *cs]),
-        ],
+        "posted-review-with-two-inline-comments",
+        [("beat_c/post/body/comments", lambda cs: [*cs, *cs])],
         "beat_c",
-        "2 inline comments",
+        "posted review carries 2",
+    ),
+    (
+        "read-back-review-with-zero-inline-comments",
+        [("beat_c/review_comments", [])],
+        "beat_c",
+        "reads back 0",
+    ),
+    (
+        "read-back-review-with-two-inline-comments",
+        [("beat_c/review_comments", lambda cs: [*cs, *cs])],
+        "beat_c",
+        "reads back 2",
+    ),
+    (
+        "posted-comment-differs-from-the-read-back-comment",
+        [("beat_c/post/body/comments/0/path", "unitconv/other.py")],
+        "beat_c",
+        "differ",
+    ),
+    (
+        "posted-comment-is-not-the-rule-text",
+        [("beat_c/post/body/comments/0/body", "Rename this.")],
+        "beat_c",
+        "posted inline comment is not the rule text",
     ),
     (
         "inline-comment-not-on-an-added-line",
@@ -582,7 +615,15 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         [
             (
                 "beat_h/label_events",
-                [{"label": "curie-factory:queued", "actor": {"login": "fixture-app[bot]"}}],
+                lambda events: [
+                    *events,
+                    {
+                        "event": "labeled",
+                        "label": {"name": "curie-factory:queued"},
+                        "actor": {"login": "fixture-app[bot]", "id": 9000003},
+                        "created_at": at(121),
+                    },
+                ],
             )
         ],
         "beat_h",
@@ -614,18 +655,202 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "usage-delta-at-the-cap",
-        [("usage/samples/2/usage", 60.0)],
+        [("usage/samples/8/usage", 60.0)],
         "spend",
         "reached 50",
     ),
     (
         "usage-not-measured",
-        [("usage/samples/2/usage", None)],
+        [("usage/samples/8/usage", None)],
         "spend",
-        "not measured",
+        "not measured at",
     ),
     ("third-attempt", [("attempt", 3)], "attempts", "outside 1..2"),
     ("attempt-zero", [("attempt", 0)], "attempts", "outside 1..2"),
+    (
+        "request-still-active-at-the-60-second-deadline",
+        [
+            ("beat_a/quiet_snapshot/requests/0/finished_at", at(7)),
+            ("beat_a/quiet_snapshot/observed_at", at(7, 10)),
+        ],
+        "beat_a",
+        "60 seconds after the questions",
+    ),
+    (
+        "snapshot-holds-another-work-items-request",
+        [("beat_a/quiet_snapshot/requests/0/work_item_id", "work-item-z")],
+        "beat_a",
+        "another work item",
+    ),
+    (
+        "restart-belongs-to-another-work-item",
+        [("beat_b/requests/1/work_item_id", "work-item-z")],
+        "beat_b",
+        "no new request",
+    ),
+    (
+        "answer-is-on-another-issue",
+        [("beat_b/answer/issue_number", 5)],
+        "beat_b",
+        "not on ticket A",
+    ),
+    (
+        "ticket-a-history-missing-at-the-restart",
+        [("beat_b/requests", lambda rs: rs[1:])],
+        "beat_b",
+        "history of ticket A is missing",
+    ),
+    (
+        "ticket-a-history-missing-at-the-review",
+        [("beat_c/requests", lambda rs: rs[1:])],
+        "beat_c",
+        "history of ticket A is missing",
+    ),
+    (
+        "review-on-another-pull-request",
+        [("beat_b/open_pulls/0/number", 99)],
+        "beat_c",
+        "another pull request than ticket A's",
+    ),
+    (
+        "review-head-is-not-ticket-as-pull-head",
+        [("beat_b/open_pulls/0/head/sha", "d" * 40)],
+        "beat_c",
+        "not ticket A's pull head",
+    ),
+    (
+        "review-posted-on-another-repository",
+        [("beat_c/post/path", "/repos/other-owner/other-repo/pulls/12/reviews")],
+        "beat_c",
+        "fixture repository",
+    ),
+    (
+        "review-read-back-from-another-pull-request",
+        [("beat_c/review/pull_request_url", lambda u: u.replace("pulls/12", "pulls/99"))],
+        "beat_c",
+        "another pull request or review",
+    ),
+    (
+        "inline-comment-of-another-review",
+        [("beat_c/review_comments/0/pull_request_review_id", 1)],
+        "beat_c",
+        "another pull request or review",
+    ),
+    (
+        "rule-label-is-not-r1",
+        [("beat_d/rules_after_merge/output/rules/0/label", "R2")],
+        "beat_d",
+        "not R1",
+    ),
+    (
+        "acted-on-rule-is-not-the-promoted-rule",
+        [
+            ("beat_e/rule_before/id", "rule-id-9"),
+            ("beat_e/reader_command/rule_id", "rule-id-9"),
+            ("beat_e/writer_command/rule_id", "rule-id-9"),
+            ("beat_e/writer_command/output/id", "rule-id-9"),
+            ("beat_g/remove_command/rule_id", "rule-id-9"),
+            ("beat_g/remove_command/output/id", "rule-id-9"),
+        ],
+        "beat_e",
+        "not the promoted rule",
+    ),
+    (
+        "reader-accept-names-another-rule",
+        [("beat_e/reader_command/rule_id", "rule-id-9")],
+        "beat_e",
+        "reader's accept names another rule",
+    ),
+    (
+        "writer-accept-names-another-rule",
+        [("beat_e/writer_command/rule_id", "rule-id-9")],
+        "beat_e",
+        "writer's accept names another rule",
+    ),
+    (
+        "writer-accept-changed-another-rule",
+        [("beat_e/writer_command/output/id", "rule-id-9")],
+        "beat_e",
+        "changed another rule",
+    ),
+    (
+        "removal-names-another-rule",
+        [("beat_g/remove_command/rule_id", "rule-id-9")],
+        "beat_g",
+        "another rule than the accepted one",
+    ),
+    (
+        "removal-changed-another-rule",
+        [("beat_g/remove_command/output/id", "rule-id-9")],
+        "beat_g",
+        "removal changed another rule",
+    ),
+    (
+        "removal-by-the-reader",
+        [("beat_g/remove_command/output/removed_by/principal_id", "principal-reader")],
+        "beat_g",
+        "not removed by the writer principal",
+    ),
+    (
+        "removal-after-ticket-c-was-labelled",
+        [("beat_g/remove_command/output/removed_at", at(95))],
+        "beat_g",
+        "after ticket C was labelled",
+    ),
+    (
+        "commented-out-assert-almost-equal",
+        [("beat_f/diff_added_lines", ["        # self.assertAlmostEqual(1, 2, places=6)"])],
+        "beat_f",
+        "adds no assertAlmostEqual",
+    ),
+    (
+        "places-six-only-in-a-message",
+        [("beat_f/diff_added_lines", ['        self.assertAlmostEqual(1, 2, msg="places=6")'])],
+        "beat_f",
+        "lack places=6",
+    ),
+    (
+        "places-six-only-in-a-trailing-comment",
+        [("beat_f/diff_added_lines", ["        self.assertAlmostEqual(1, 2)  # places=6"])],
+        "beat_f",
+        "lack places=6",
+    ),
+    (
+        "places-six-only-in-a-nested-call",
+        [("beat_f/diff_added_lines", ["        self.assertAlmostEqual(round(x, places=6), 2)"])],
+        "beat_f",
+        "lack places=6",
+    ),
+    (
+        "unbound-label-never-applied",
+        [("beat_h/label_events", [])],
+        "beat_h",
+        "applied 0 times",
+    ),
+    (
+        "bound-label-applied-instead-of-the-unbound-one",
+        [("beat_h/label_events/0/label/name", "factory")],
+        "beat_h",
+        "applied 0 times",
+    ),
+    (
+        "label-is-not-an-unbound-label",
+        [("beat_h/label", "factory"), ("beat_h/label_events/0/label/name", "factory")],
+        "beat_h",
+        "not an unbound factory label",
+    ),
+    (
+        "intermediate-usage-sample-over-the-cap",
+        [("usage/samples/4/usage", 70.0)],
+        "spend",
+        "reached 50",
+    ),
+    (
+        "no-usage-sample-after-a-beat",
+        [("usage/samples", lambda ss: [s for s in ss if s["label"] != "after_c"])],
+        "spend",
+        "not measured at: ['after_c']",
+    ),
     *[
         (f"teardown-{key}-unverified", [(f"teardown/{key}", False)], "teardown", key)
         for key in judge.TEARDOWN_KEYS
@@ -660,8 +885,17 @@ def test_judge_rejects_each_broken_shape(
         [("beat_a/comments/0/created_at", at(3))],  # exactly the 180 s bound
         [("beat_e/reader_command/output/error", "memory_rules.write_access_unverifiable: x")],
         [("beat_e/reader_permission", "read"), ("beat_e/reader_command/elapsed_seconds", 60)],
-        [("usage/samples/2/usage", 59.99)],
+        [("usage/samples/8/usage", 59.99)],
         [("attempt", 2)],
+        [("beat_g/remove_command/elapsed_seconds", 61)],
+        [("beat_a/quiet_snapshot/requests/0/finished_at", at(6))],
+        [("beat_f/diff_added_lines", ['self.assertAlmostEqual(f(")"), 2, places=6)  # places=7'])],
+        [
+            (
+                "beat_f/diff_added_lines",
+                ["self.assertAlmostEqual(", "    f(1),", "    2,", "    places=6,", ")"],
+            )
+        ],
         [("beat_b/open_pulls/0/body", lambda s: s.replace("Closes #11", "Closes #11."))],
         [
             (
@@ -678,6 +912,10 @@ def test_judge_rejects_each_broken_shape(
         "cli-bound-inclusive",
         "usage-just-under",
         "second-attempt",
+        "removal-has-no-time-bound",
+        "request-finished-at-the-deadline",
+        "paren-in-a-string-and-a-comment",
+        "call-split-over-lines",
         "closes-with-punctuation",
         "refusal-code-at-any-depth",
         "tool-note-as-mapping",
@@ -837,3 +1075,28 @@ def test_the_judge_module_is_pure() -> None:
         "open(",
     ):
         assert forbidden not in source
+
+
+def test_sanitizer_replaces_percent_encoded_identifiers_in_urls_and_queries() -> None:
+    evidence = {
+        "url": "https://code-host.example.invalid/demo-owner/demo-repo/pull/1"
+        "?author=Fixture%2dWriter&uid=%39%30%30%30%30%30%31&q=fixture%2Dreader%20x",
+        "nested": [{"next": "https%3A%2F%2Fcode-host.example.invalid%2Fdemo-owner%2Fdemo-repo"}],
+        "whole": "id=%39%30%30%30%30%30%310 and %349000001",
+    }
+    cleaned = judge.sanitize_evidence(evidence, IDENTIFIERS)
+    assert cleaned == {
+        "url": "<code-host>/<fixture-repo>/pull/1?author=<writer>&uid=<writer>&q=<reader>%20x",
+        "nested": [{"next": "<code-host>%2F<fixture-repo>"}],
+        "whole": "id=%39%30%30%30%30%30%310 and %349000001",
+    }
+
+
+def test_sanitizer_refuses_percent_encoded_leftovers() -> None:
+    for leaky in (
+        "https://x.example/p?login=Fixture%2dWriter",
+        {"q": [{"uid": "%39%30%30%30%30%30%32"}]},
+        "path=demo%2downer",
+    ):
+        with pytest.raises(judge.EvidenceLeak):
+            judge.refuse_leaks(leaky, IDENTIFIERS)

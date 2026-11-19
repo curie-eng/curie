@@ -35,17 +35,22 @@ are each isolated in one small named constant or parser below, marked
 :data:`TOOL_NOTES_KEY` (#5794, #5796), :data:`RULES_KEY`,
 :func:`refusal_code`, :func:`accepted_rule_of` (#5797), :func:`work_item_rules_of`
 and :data:`LEARNED_RULES_LINE` (#5798), :func:`deploy_refusal_codes` (#5804)
-and :data:`ACTIVE_REQUEST_STATES`.
+and :data:`ACTIVE_REQUEST_STATES`. Requests carry ``work_item_id`` and ``finished_at``
+(None while active) so the judge can tie evidence to ticket A's work item and
+read the requests active at the 60 second mark; usage samples are labelled
+:data:`SPEND_SAMPLE_LABELS`; label events use GitHub's timeline shape.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import re
+import tokenize
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 # --- Bounds of decisions 7 and 8 (seconds unless named) ---------------------
@@ -85,6 +90,7 @@ PROPOSE_RULE_TOOL = "propose_rule"
 # ``curie cluster memory --rules --json`` output, and the rule states.
 RULES_KEY = "rules"
 PROPOSED_STATE = "proposed"
+RULE_LABEL = "R1"
 ACCEPTED_STATE = "accepted"
 REMOVED_STATE = "removed"
 # ASSUMED (#5797 decision 3): the CLI refusal codes of a reader's accept.
@@ -95,6 +101,9 @@ READER_REFUSAL_CODES = frozenset(
 BUNDLE_RETIRED_CODE = "bundle.result_declaration_retired"
 # ASSUMED: request states that mean a run is queued or in progress.
 ACTIVE_REQUEST_STATES = frozenset({"queued", "running"})
+UNBOUND_LABEL_PREFIX = "factory-unbound-"
+# One model usage sample before beat (a) and one after each beat (decision 8).
+SPEND_SAMPLE_LABELS = ("before_a", *(f"after_{beat}" for beat in "abcdefgh"))
 WRITE_PERMISSIONS = frozenset({"write", "admin"})
 TEARDOWN_KEYS = (
     "verified",
@@ -272,17 +281,83 @@ def added_text_of(added_lines: Sequence[str]) -> str:
     return "\n".join(added_lines)
 
 
-def almost_equal_calls(added_text: str) -> list[str]:
-    """Each ``assertAlmostEqual(`` call in the added text, through its closing paren."""
+def _code_tokens(added_text: str) -> list[tokenize.TokenInfo]:
+    """Python tokens of added lines, comments and strings kept as single tokens.
 
-    calls = []
-    for found in re.finditer(r"assertAlmostEqual\(", added_text):
-        depth, end = 1, found.end()
-        while end < len(added_text) and depth:
-            depth += {"(": 1, ")": -1}.get(added_text[end], 0)
-            end += 1
-        calls.append(added_text[found.start() : end])
-    return calls
+    The lines are a diff fragment, so indentation is dropped and an unfinished
+    statement at the end is tolerated: the tokens read so far are returned.
+    """
+
+    source = "\n".join(line.strip() for line in added_text.splitlines()) + "\n"
+    tokens: list[tokenize.TokenInfo] = []
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            tokens.append(token)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        pass
+    return tokens
+
+
+def almost_equal_call_flags(added_text: str) -> list[bool]:
+    """One flag per ``assertAlmostEqual(`` call in the added code: does it pass ``places=6``?
+
+    A call in a comment or a string is not a call, and ``places=6`` counts only
+    as a keyword argument of that call (``msg="places=6"`` does not).
+    """
+
+    tokens = [t for t in _code_tokens(added_text) if t.type not in _IGNORED_TOKENS]
+    flags: list[bool] = []
+    for index, token in enumerate(tokens[:-1]):
+        if token.type != tokenize.NAME or token.string != "assertAlmostEqual":
+            continue
+        if tokens[index + 1].string != "(" or (index and tokens[index - 1].string == "def"):
+            continue
+        depth = 1
+        arguments: list[list[tokenize.TokenInfo]] = []
+        current: list[tokenize.TokenInfo] = []
+        for inner in tokens[index + 2 :]:
+            if inner.type == tokenize.OP and inner.string in {"(", "[", "{"}:
+                depth += 1
+            elif inner.type == tokenize.OP and inner.string in {")", "]", "}"}:
+                depth -= 1
+                if depth == 0:
+                    break
+            if depth == 1 and inner.type == tokenize.OP and inner.string == ",":
+                arguments.append(current)
+                current = []
+            else:
+                current.append(inner)
+        arguments.append(current)
+        flags.append(any(_is_places_six(argument) for argument in arguments))
+    return flags
+
+
+_IGNORED_TOKENS = {
+    tokenize.COMMENT,
+    tokenize.NL,
+    tokenize.NEWLINE,
+    tokenize.INDENT,
+    tokenize.DEDENT,
+    tokenize.ENDMARKER,
+}
+
+
+def _is_places_six(argument: Sequence[tokenize.TokenInfo]) -> bool:
+    shape = [(t.type, t.string) for t in argument]
+    return shape == [(tokenize.NAME, "places"), (tokenize.OP, "="), (tokenize.NUMBER, "6")]
+
+
+def section_lines(body: str, heading: str) -> list[str]:
+    """Lines under a markdown heading named ``heading``, up to the next heading."""
+
+    lines, inside = [], False
+    for line in (body or "").splitlines():
+        found = re.match(r"^\s{0,3}#{1,6}\s*(.*?)\s*#*\s*$", line)
+        if found:
+            inside = found.group(1).lower() == heading.lower()
+        elif inside:
+            lines.append(line)
+    return lines
 
 
 def _lines_starting(body: str, prefix: str) -> list[str]:
@@ -319,6 +394,21 @@ def _judge_session_probe(b: _Beat, rec: Mapping[str, Any]) -> None:
     )
 
 
+def _mine(requests: Sequence[Mapping[str, Any]], work_item: str) -> list[Mapping[str, Any]]:
+    """The requests of ticket A's work item; another ticket's requests never count."""
+
+    return [r for r in requests if r["work_item_id"] == work_item]
+
+
+def _active_at(request: Mapping[str, Any], moment: Any) -> bool:
+    """ASSUMED: a request is active from ``created_at`` until ``finished_at`` (None: still)."""
+
+    if parse_time(request["created_at"]) > parse_time(moment):
+        return False
+    finished = request["finished_at"]
+    return finished is None or parse_time(finished) > parse_time(moment)
+
+
 def _judge_beat_a(b: _Beat, rec: Mapping[str, Any]) -> None:
     a, ids = rec["beat_a"], rec["identities"]
     b.check(rec["agent"]["memory_rule_proposals"] is True, "rule proposals were not turned on")
@@ -352,26 +442,37 @@ def _judge_beat_a(b: _Beat, rec: Mapping[str, Any]) -> None:
     )
     b.check(QUESTIONS_LABEL in a["issue_labels"], "the issue lacks the questions label")
     quiet = a["quiet_snapshot"]
+    requests = _mine(quiet["requests"], a["work_item_id"])
+    b.check(
+        len(requests) == len(quiet["requests"]), "the snapshot holds another work item's request"
+    )
+    deadline = parse_time(question["created_at"]) + timedelta(seconds=QUIET_AFTER_QUESTIONS)
     b.check(
         b.elapsed("quiet_wait_seconds", question["created_at"], quiet["observed_at"])
         >= QUIET_AFTER_QUESTIONS,
         "the work item was read before the quiet period elapsed",
     )
-    active = [r["id"] for r in quiet["requests"] if r["status"] in ACTIVE_REQUEST_STATES]
+    b.check(
+        not [r["id"] for r in requests if _active_at(r, deadline)],
+        "a request was still queued or running 60 seconds after the questions",
+    )
+    active = [r["id"] for r in requests if r["status"] in ACTIVE_REQUEST_STATES]
     b.check(not active, "a request is still queued or running after the questions")
 
 
 def _judge_beat_b(b: _Beat, rec: Mapping[str, Any]) -> None:
-    beat, ids = rec["beat_b"], rec["identities"]
-    issue = rec["beat_a"]["issue_number"]
+    beat, ids, a = rec["beat_b"], rec["identities"], rec["beat_a"]
+    issue = a["issue_number"]
     answer = beat["answer"]
+    b.check(answer["issue_number"] == issue, "the answer is not on ticket A")
     b.check(answer["user"]["id"] == ids["writer_id"], "the answer was not posted by the writer")
     b.check(answer["body"].strip() == ANSWER_TEXT, "the answer text is not the fixture answer")
     b.check("@" not in answer["body"], "the answer mentions an account")
+    requests = _mine(beat["requests"], a["work_item_id"])
+    earlier = {r["id"] for r in a["quiet_snapshot"]["requests"]}
+    b.check(earlier <= {r["id"] for r in requests}, "the request history of ticket A is missing")
     restarts = [
-        r
-        for r in beat["requests"]
-        if parse_time(r["created_at"]) >= parse_time(answer["created_at"])
+        r for r in requests if parse_time(r["created_at"]) >= parse_time(answer["created_at"])
     ]
     if b.check(bool(restarts), "no new request after the answer"):
         b.within(
@@ -393,21 +494,28 @@ def _judge_beat_b(b: _Beat, rec: Mapping[str, Any]) -> None:
         )
         b.check(_closes(pull["body"], issue), f"the pull request lacks `Closes #{issue}`")
         b.check(
-            bool(_lines_starting(pull["body"], ANSWERED_PREFIX)),
-            "the pull request lacks an `Answered on the ticket by ` line",
+            bool(
+                _lines_starting(
+                    "\n".join(section_lines(pull["body"], "Decisions")), ANSWERED_PREFIX
+                )
+            ),
+            "the Decisions section lacks an `Answered on the ticket by ` line",
         )
     others = [i["number"] for i in beat["issues"] if _by_app(i, ids)]
     b.check(not others, f"the App opened issues: {others}")
 
 
 def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
-    c, ids = rec["beat_c"], rec["identities"]
+    c, ids, a = rec["beat_c"], rec["identities"], rec["beat_a"]
     number = c["pull_number"]
     post, body = c["post"], c["post"]["body"]
+    pull = rec["beat_b"]["open_pulls"][0]
+    b.check(number == pull["number"], "the review is on another pull request than ticket A's")
+    b.check(c["pull_before"]["head"] == pull["head"], "the review head is not ticket A's pull head")
+    path = rf"/?repos/{re.escape(ids['repository_path'])}/pulls/{number}/reviews"
     b.check(
-        post["method"] == "POST"
-        and re.fullmatch(rf"/?repos/[^/]+/[^/]+/pulls/{number}/reviews", post["path"]) is not None,
-        "the feedback was not posted as a pull request review",
+        post["method"] == "POST" and re.fullmatch(path, post["path"]) is not None,
+        "the feedback was not posted as a pull request review on the fixture repository",
     )
     b.check(body["commit_id"] == c["pull_before"]["head"]["sha"], "the review names another head")
     b.check(body["event"] == "COMMENT", "the review event is not COMMENT")
@@ -415,9 +523,18 @@ def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
     posted = body["comments"]
     read = c["review_comments"]
     b.check(len(posted) == 1, f"the posted review carries {len(posted)} inline comments")
-    if not b.check(len(read) == 1, f"the review reads back {len(read)} inline comments"):
+    b.check(len(read) == 1, f"the review reads back {len(read)} inline comments")
+    if len(posted) != 1 or len(read) != 1:
         return
-    comment = read[0]
+    comment, sent = read[0], posted[0]
+    b.check(
+        sent["body"].strip() == REVIEW_RULE_TEXT, "the posted inline comment is not the rule text"
+    )
+    b.check(
+        (sent["path"], sent["line"], sent["body"])
+        == (comment["path"], comment["line"], comment["body"]),
+        "the posted and the read back inline comment differ",
+    )
     b.check(comment["body"].strip() == REVIEW_RULE_TEXT, "the inline comment is not the rule text")
     b.check("@" not in comment["body"], "the inline comment mentions an account")
     b.check(
@@ -428,8 +545,16 @@ def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
     b.check(review["state"] == "COMMENTED", "the review is not in state COMMENTED")
     b.check(bool(review["submitted_at"]), "the review is not submitted")
     b.check(review["user"]["id"] == ids["writer_id"], "the review was not written by the actor")
+    b.check(
+        review["pull_request_url"].endswith(f"/{ids['repository_path']}/pulls/{number}")
+        and comment["pull_request_review_id"] == review["id"],
+        "the review or its comment belongs to another pull request or review",
+    )
     submitted = review["submitted_at"]
-    after = [r for r in c["requests"] if parse_time(r["created_at"]) >= parse_time(submitted)]
+    requests = _mine(c["requests"], a["work_item_id"])
+    earlier = {r["id"] for r in rec["beat_b"]["requests"]}
+    b.check(earlier <= {r["id"] for r in requests}, "the request history of ticket A is missing")
+    after = [r for r in requests if parse_time(r["created_at"]) >= parse_time(submitted)]
     if not b.check(len(after) == 1, f"expected one revision request, found {len(after)}"):
         return
     request = after[0]
@@ -483,14 +608,20 @@ def _judge_beat_d(b: _Beat, rec: Mapping[str, Any]) -> None:
     expected = review_url(ids["repository_url"], c["pull_number"], c["review"]["id"])
     b.check(rules[0]["state"] == PROPOSED_STATE, "the rule is not proposed")
     b.check(rules[0]["source_url"] == expected, "the rule source is not the submitted review URL")
+    b.check(rules[0]["label"] == RULE_LABEL, f"the rule is not {RULE_LABEL}")
 
 
 def _judge_beat_e(b: _Beat, rec: Mapping[str, Any]) -> None:
     e = rec["beat_e"]
+    rule_id = e["rule_before"]["id"]
+    promoted = [r["id"] for r in rules_of(rec["beat_d"]["rules_after_merge"]["output"])]
+    b.check(not promoted or rule_id in promoted, "the rule acted on is not the promoted rule")
     b.check(
         e["reader_permission"] not in WRITE_PERMISSIONS, "the reader can write to the repository"
     )
     reader, writer = e["reader_command"], e["writer_command"]
+    b.check(reader["rule_id"] == rule_id, "the reader's accept names another rule")
+    b.check(writer["rule_id"] == rule_id, "the writer's accept names another rule")
     b.check(reader["exit_code"] == 1, "the reader's accept did not exit 1")
     b.check(
         refusal_code(reader["output"]) in READER_REFUSAL_CODES,
@@ -502,6 +633,7 @@ def _judge_beat_e(b: _Beat, rec: Mapping[str, Any]) -> None:
     )
     b.check(writer["exit_code"] == 0, "the writer's accept did not exit 0")
     rule = accepted_rule_of(writer["output"])
+    b.check(rule.get("id") == rule_id, "the writer's accept changed another rule")
     b.check(rule.get("state") == ACCEPTED_STATE, "the writer's accept did not end accepted")
     b.check(
         principal_of(rule.get("accepted_by")) == rec["session_probe"]["writer"]["principal_id"],
@@ -545,23 +677,28 @@ def _judge_beat_f(b: _Beat, rec: Mapping[str, Any]) -> None:
             at + 1 < len(all_lines) and all_lines[at + 1].startswith(REQUESTER_PREFIX),
             "the line is not immediately before the Requester preferences line",
         )
-    calls = almost_equal_calls(added_text_of(f["diff_added_lines"]))
-    if b.check(bool(calls), "the diff adds no assertAlmostEqual( call"):
-        loose = [call for call in calls if re.search(r"\bplaces\s*=\s*6\b", call) is None]
-        b.check(not loose, f"{len(loose)} added assertAlmostEqual( calls lack places=6")
+    flags = almost_equal_call_flags(added_text_of(f["diff_added_lines"]))
+    if b.check(bool(flags), "the diff adds no assertAlmostEqual( call"):
+        b.check(all(flags), f"{flags.count(False)} added assertAlmostEqual( calls lack places=6")
 
 
 def _judge_beat_g(b: _Beat, rec: Mapping[str, Any]) -> None:
     g = rec["beat_g"]
     removal = g["remove_command"]
+    rule_id = rec["beat_e"]["rule_before"]["id"]
+    b.check(removal["rule_id"] == rule_id, "the removal names another rule than the accepted one")
     b.check(removal["exit_code"] == 0, "the writer's removal did not exit 0")
+    rule = accepted_rule_of(removal["output"])
+    b.check(rule.get("id") == rule_id, "the removal changed another rule")
+    b.check(rule.get("state") == REMOVED_STATE, "the removal did not end removed")
     b.check(
-        accepted_rule_of(removal["output"]).get("state") == REMOVED_STATE,
-        "the removal did not end removed",
+        principal_of(rule.get("removed_by")) == rec["session_probe"]["writer"]["principal_id"],
+        "the rule was not removed by the writer principal",
     )
-    seconds = float(removal["elapsed_seconds"])
-    b.measures["remove_command_seconds"] = seconds
-    b.check(seconds <= CLI_WITHIN, f"the removal took {seconds:.0f}s")
+    b.check(
+        b.elapsed("removed_before_ticket_c_seconds", rule["removed_at"], g["labelled_at"]) >= 0,
+        "the rule was removed after ticket C was labelled",
+    )
     pulls = [p for p in g["open_pulls"] if _closes(p["body"], g["issue_number"])]
     if b.check(len(pulls) == 1, f"expected one pull request for ticket C, found {len(pulls)}"):
         b.within(
@@ -583,8 +720,20 @@ def _judge_beat_g(b: _Beat, rec: Mapping[str, Any]) -> None:
 
 def _judge_beat_h(b: _Beat, rec: Mapping[str, Any]) -> None:
     h, ids = rec["beat_h"], rec["identities"]
+    label = str(h["label"])
+    b.check(label.startswith(UNBOUND_LABEL_PREFIX), "the label is not an unbound factory label")
+    applied = [
+        e
+        for e in h["label_events"]
+        if e["event"] == "labeled"
+        and e["label"]["name"] == label
+        and e["actor"]["id"] == ids["writer_id"]
+    ]
+    if not b.check(len(applied) == 1, f"the unbound label was applied {len(applied)} times"):
+        return
     b.check(
-        b.elapsed("quiet_wait_seconds", h["labelled_at"], h["observed_at"]) >= UNBOUND_QUIET_WINDOW,
+        b.elapsed("quiet_wait_seconds", applied[0]["created_at"], h["observed_at"])
+        >= UNBOUND_QUIET_WINDOW,
         "the unbound issue was read before the quiet window elapsed",
     )
     b.check(not h["work_items"], "the unbound label produced a work item")
@@ -608,15 +757,17 @@ def _judge_beat_h(b: _Beat, rec: Mapping[str, Any]) -> None:
 
 
 def _judge_spend(b: _Beat, rec: Mapping[str, Any]) -> None:
-    usages = [s["usage"] for s in rec["usage"]["samples"]]
-    if not b.check(
-        len(usages) >= 2 and all(isinstance(u, (int, float)) for u in usages),
-        "the model usage was not measured before and after",
-    ):
+    samples = {s["label"]: s["usage"] for s in rec["usage"]["samples"]}
+    missing = [
+        label for label in SPEND_SAMPLE_LABELS if not isinstance(samples.get(label), (int, float))
+    ]
+    if not b.check(not missing, f"the model usage was not measured at: {missing}"):
         return
-    delta = float(usages[-1]) - float(usages[0])
-    b.measures["delta_usd"] = delta
-    b.check(delta < SPEND_CAP_USD, f"the usage delta {delta:.2f} USD reached {SPEND_CAP_USD:.0f}")
+    base = float(samples[SPEND_SAMPLE_LABELS[0]])
+    deltas = {label: float(samples[label]) - base for label in SPEND_SAMPLE_LABELS}
+    over = [label for label, delta in deltas.items() if delta >= SPEND_CAP_USD]
+    b.measures["delta_usd"] = max(deltas.values())
+    b.check(not over, f"the usage delta reached {SPEND_CAP_USD:.0f} USD at {over}")
 
 
 def _judge_attempts(b: _Beat, rec: Mapping[str, Any]) -> None:
@@ -712,9 +863,21 @@ def _tokens(identifiers: Identifiers) -> list[tuple[str, str]]:
     return sorted(pairs.items(), key=lambda pair: (-len(pair[0]), pair[0]))
 
 
+def _char_pattern(char: str) -> str:
+    """One character, literally or percent-encoded (``%2d``, ``%39``), as in URLs and queries."""
+
+    encoded = "".join(f"%{byte:02x}" for byte in char.encode())
+    options = [re.escape(char), encoded]
+    if char == " ":
+        options.append(r"\+")
+    return "(?:" + "|".join(options) + ")"
+
+
 def _pattern(token: str) -> str:
-    # A numeric id matches as a whole number, never inside a longer one.
-    return rf"(?<!\d){re.escape(token)}(?!\d)" if token.isdigit() else re.escape(token)
+    body = "".join(_char_pattern(char) for char in token)
+    # A numeric id matches as a whole number, never inside a longer one, written
+    # in digits or as percent-encoded digits.
+    return rf"(?<!\d)(?<!%3\d){body}(?!\d)(?!%3\d)" if token.isdigit() else body
 
 
 def _compiled(identifiers: Identifiers) -> tuple[re.Pattern[str] | None, dict[str, str]]:

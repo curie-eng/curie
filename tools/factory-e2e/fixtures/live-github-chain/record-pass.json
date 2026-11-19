@@ -6,7 +6,8 @@
     "reader_id": 9000002,
     "repository_id": 9100001,
     "repository_url": "https://code-host.example.invalid/fixture-owner/fixture-repo",
-    "default_branch": "main"
+    "default_branch": "main",
+    "repository_path": "fixture-owner/fixture-repo"
   },
   "agent": {
     "tenant_id": "tenant-fake",
@@ -63,10 +64,13 @@
         {
           "id": "request-1",
           "status": "completed",
-          "created_at": "2030-01-01T00:00:25Z"
+          "created_at": "2030-01-01T00:00:25Z",
+          "work_item_id": "work-item-a",
+          "finished_at": "2030-01-01T00:05:05Z"
         }
       ]
-    }
+    },
+    "work_item_id": "work-item-a"
   },
   "beat_b": {
     "answer": {
@@ -75,25 +79,34 @@
       "created_at": "2030-01-01T00:10:00Z",
       "user": {
         "id": 9000001
-      }
+      },
+      "issue_number": 11
     },
     "requests": [
       {
         "id": "request-1",
         "status": "completed",
-        "created_at": "2030-01-01T00:00:25Z"
+        "created_at": "2030-01-01T00:00:25Z",
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:05:05Z"
       },
       {
         "id": "request-2",
         "status": "completed",
-        "created_at": "2030-01-01T00:10:30Z"
+        "created_at": "2030-01-01T00:10:30Z",
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:24:00Z"
       }
     ],
     "open_pulls": [
       {
         "number": 12,
         "body": "Closes #11\n\n## Decisions\n\nAnswered on the ticket by fixture-writer: print 2 decimal places.\n",
-        "created_at": "2030-01-01T00:25:00Z"
+        "created_at": "2030-01-01T00:25:00Z",
+        "head": {
+          "ref": "curie/issue-11",
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
       }
     ],
     "issues": [
@@ -136,13 +149,15 @@
       "submitted_at": "2030-01-01T00:30:00Z",
       "user": {
         "id": 9000001
-      }
+      },
+      "pull_request_url": "https://api.code-host.example.invalid/repos/fixture-owner/fixture-repo/pulls/12"
     },
     "review_comments": [
       {
         "path": "unitconv/tests/test_convert.py",
         "line": 40,
-        "body": "Use `self.assertAlmostEqual(..., places=6)` for every floating point result; every float assertion in this repository's tests does that."
+        "body": "Use `self.assertAlmostEqual(..., places=6)` for every floating point result; every float assertion in this repository's tests does that.",
+        "pull_request_review_id": 7001
       }
     ],
     "diff_added_lines": {
@@ -158,7 +173,9 @@
         "id": "request-1",
         "created_at": "2030-01-01T00:00:25Z",
         "objective": "",
-        "tool_notes": []
+        "tool_notes": [],
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:05:05Z"
       },
       {
         "id": "request-2",
@@ -166,7 +183,9 @@
         "objective": "",
         "tool_notes": [
           "Read"
-        ]
+        ],
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:24:00Z"
       },
       {
         "id": "96fdb3de-72f5-5142-9f06-1232ff930e96",
@@ -176,7 +195,9 @@
           "Read",
           "Edit",
           "mcp__curie__propose_rule"
-        ]
+        ],
+        "work_item_id": "work-item-a",
+        "finished_at": "2030-01-01T00:39:00Z"
       }
     ],
     "pull_after": {
@@ -229,7 +250,8 @@
         "error": "memory_rules.write_access_required: no linked write access",
         "fix": "Ask someone who can merge to this repository."
       },
-      "elapsed_seconds": 1.2
+      "elapsed_seconds": 1.2,
+      "rule_id": "rule-id-1"
     },
     "rule_after_reader": {
       "version": 1
@@ -247,7 +269,8 @@
         "version": 2,
         "applies_from": "next_ticket"
       },
-      "elapsed_seconds": 1.5
+      "elapsed_seconds": 1.5,
+      "rule_id": "rule-id-1"
     }
   },
   "beat_f": {
@@ -288,9 +311,15 @@
         "id": "rule-id-1",
         "label": "R1",
         "state": "removed",
-        "version": 3
+        "version": 3,
+        "removed_by": {
+          "principal_id": "principal-writer",
+          "display_name": "Fixture Writer"
+        },
+        "removed_at": "2030-01-01T01:28:00Z"
       },
-      "elapsed_seconds": 1.1
+      "elapsed_seconds": 1.1,
+      "rule_id": "rule-id-1"
     },
     "open_pulls": [
       {
@@ -315,16 +344,20 @@
     }
   },
   "beat_h": {
-    "labelled_at": "2030-01-01T02:00:00Z",
     "observed_at": "2030-01-01T02:03:30Z",
     "work_items": [],
     "comments": [],
     "label_events": [
       {
-        "label": "factory-unbound-run1",
+        "event": "labeled",
+        "label": {
+          "name": "factory-unbound-run1"
+        },
         "actor": {
-          "login": "fixture-writer"
-        }
+          "login": "fixture-writer",
+          "id": 9000001
+        },
+        "created_at": "2030-01-01T02:00:00Z"
       }
     ],
     "retired_bundle": {
@@ -339,7 +372,8 @@
       },
       "version_before": "v3",
       "version_after": "v3"
-    }
+    },
+    "label": "factory-unbound-run1"
   },
   "usage": {
     "samples": [
@@ -349,7 +383,31 @@
       },
       {
         "label": "after_a",
+        "usage": 11.25
+      },
+      {
+        "label": "after_b",
         "usage": 12.5
+      },
+      {
+        "label": "after_c",
+        "usage": 13.75
+      },
+      {
+        "label": "after_d",
+        "usage": 15.0
+      },
+      {
+        "label": "after_e",
+        "usage": 16.25
+      },
+      {
+        "label": "after_f",
+        "usage": 17.5
+      },
+      {
+        "label": "after_g",
+        "usage": 18.75
       },
       {
         "label": "after_h",
