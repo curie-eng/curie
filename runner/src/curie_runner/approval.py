@@ -76,6 +76,7 @@ from .publication_precheck import PublicationPrecheck
 from .tool_names import (
     PROGRESS_TOOL,
     QUESTION_TOOL,
+    RUN_HANDOFF_TOOL,
     STATE_TOOL_NAMES,
     TRACKER_RESULT_TOOL,
     TURN_PROGRESS_TOOL,
@@ -238,6 +239,7 @@ APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 # The live-status-card progress tool (#3077), mounted on the same server only
 # when the worker injected a progress URL and token.
 PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{PROGRESS_TOOL}"
+RUN_HANDOFF_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{RUN_HANDOFF_TOOL}"
 # Deliberate progress (ADR 0130's ``curie_progress``), mounted on the same server
 # whenever ``report_progress`` is not; see ``turn_progress.py``.
 TURN_PROGRESS_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{TURN_PROGRESS_TOOL}"
@@ -293,6 +295,7 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
         APPROVAL_TOOL_NAME,
         PLATFORM_PUBLISH_TOOL_NAME,
         PROGRESS_TOOL_NAME,
+        RUN_HANDOFF_TOOL_NAME,
         TURN_PROGRESS_TOOL_NAME,
         ISSUE_TOOL_NAME,
         TRACKER_RESULT_TOOL_NAME,

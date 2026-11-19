@@ -16,6 +16,7 @@ STATE_READ_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     f"mcp__{STATE_SERVER_NAME}__{name}" for name in ("get", "list")
 )
 PROGRESS_TOOL: Final = "report_progress"
+RUN_HANDOFF_TOOL: Final = "report_run_handoff"
 TURN_PROGRESS_TOOL: Final = "progress"
 # The platform channel read tools (ADR 0100, #2877), mounted on the reserved
 # ``curie-slack`` server only for a ``channelRead``-granted, real-model boot. They are governed

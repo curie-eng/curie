@@ -57,6 +57,7 @@ PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
         {
             "mcp__curie__request_approval",
             "mcp__curie__report_progress",
+            "mcp__curie__report_run_handoff",
             "mcp__curie__progress",
             "mcp__curie__get_issue",
             # Catalog listing reads metadata only. Fetch is deliberately absent:

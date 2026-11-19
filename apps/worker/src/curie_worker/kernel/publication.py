@@ -60,6 +60,16 @@ def _is_publish_provenance(gate_kind: str | None, granted_tool: str | None) -> b
     return (gate_kind, granted_tool) == constants._PUBLISH_PROVENANCE
 
 
+def _read_only_no_change_tools(tools_called: frozenset[str], saw_side_effect: bool) -> bool:
+    """Telemetry must not turn a no-change answer into an unpublished retry."""
+
+    return not saw_side_effect and all(
+        failures._is_context_tool(tool)
+        or tool in {constants._PROGRESS_TOOL_NAME, constants._RUN_HANDOFF_TOOL_NAME}
+        for tool in tools_called
+    )
+
+
 def _publication_approval_summary(snapshot: RunnerWorkspaceSnapshot) -> str:
     """Build approval text from validated facts, labeling requester prose."""
 
@@ -212,10 +222,7 @@ async def _continue_unpublished(
         return outcome
     has_recorded_pr = bool(run.recorded_pr_url and run.recorded_pr_url.strip())
     no_change_prefix = "No changes needed:"
-    read_only = not outcome.saw_side_effect and all(
-        failures._is_context_tool(tool) or tool == constants._PROGRESS_TOOL_NAME
-        for tool in outcome.tools_called
-    )
+    read_only = _read_only_no_change_tools(outcome.tools_called, outcome.saw_side_effect)
     if (
         has_recorded_pr
         and read_only

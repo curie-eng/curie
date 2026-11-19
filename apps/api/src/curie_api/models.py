@@ -2155,6 +2155,7 @@ class FactoryStatusComment(Base):
     applied_label: Mapped[str | None] = mapped_column(Text, default=None)
     declaration: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     activity: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    run_handoff: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     refused_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )

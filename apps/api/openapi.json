@@ -10426,6 +10426,46 @@
         "title": "FileDescriptor",
         "type": "object"
       },
+      "Finding": {
+        "additionalProperties": false,
+        "properties": {
+          "next_step": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Next Step",
+            "type": "string"
+          },
+          "owner": {
+            "enum": [
+              "agent",
+              "human",
+              "platform",
+              "unknown"
+            ],
+            "title": "Owner",
+            "type": "string"
+          },
+          "source": {
+            "const": "agent_reported",
+            "title": "Source",
+            "type": "string"
+          },
+          "summary": {
+            "maxLength": 160,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "owner",
+          "next_step",
+          "source"
+        ],
+        "title": "Finding",
+        "type": "object"
+      },
       "FinishBody": {
         "properties": {
           "cause": {
@@ -17354,6 +17394,75 @@
         "title": "RoutingCheckRequest",
         "type": "object"
       },
+      "RunHandoff": {
+        "additionalProperties": false,
+        "properties": {
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            },
+            "maxItems": 10,
+            "title": "Findings",
+            "type": "array"
+          },
+          "human_decision": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Human Decision"
+          },
+          "later_gate": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Later Gate"
+          },
+          "next_action": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Next Action",
+            "type": "string"
+          },
+          "next_owner": {
+            "enum": [
+              "agent",
+              "human",
+              "platform",
+              "unknown"
+            ],
+            "title": "Next Owner",
+            "type": "string"
+          },
+          "verification": {
+            "items": {
+              "$ref": "#/components/schemas/Verification"
+            },
+            "maxItems": 20,
+            "title": "Verification",
+            "type": "array"
+          }
+        },
+        "required": [
+          "next_owner",
+          "next_action"
+        ],
+        "title": "RunHandoff",
+        "type": "object"
+      },
       "RunnerPods": {
         "description": "The runner sandbox pods in a namespace (populates the Logs pod dropdown).",
         "properties": {
@@ -19602,6 +19711,60 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "Verification": {
+        "additionalProperties": false,
+        "properties": {
+          "acceptance_criteria": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "title": "Acceptance Criteria",
+            "type": "array"
+          },
+          "check": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Check",
+            "type": "string"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "maxLength": 240,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "source": {
+            "const": "agent_reported",
+            "title": "Source",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "passed",
+              "failed",
+              "unverified",
+              "not_run"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "check",
+          "state",
+          "source"
+        ],
+        "title": "Verification",
         "type": "object"
       },
       "VerificationObservation": {
@@ -40944,6 +41107,75 @@
           }
         },
         "summary": "Report Work Item Progress",
+        "tags": [
+          "factory-status"
+        ]
+      }
+    },
+    "/v1/work-item-progress/{request_id}/handoff": {
+      "post": {
+        "operationId": "report_work_item_handoff_v1_work_item_progress__request_id__handoff_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunHandoff"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Report Work Item Handoff V1 Work Item Progress  Request Id  Handoff Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Work Item Handoff",
         "tags": [
           "factory-status"
         ]

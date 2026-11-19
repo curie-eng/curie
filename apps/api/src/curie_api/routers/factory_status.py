@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from curie_internal import sandbox_token
-from curie_internal.factory_phase_view import phase_view
+from curie_internal.factory_phase_view import WAIT_CI_PHASE, phase_view
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
@@ -34,8 +34,10 @@ from ..factory_progress import (
     ProgressReport,
     VerificationObservation,
     record_report,
+    record_run_handoff,
     record_verification,
 )
+from ..factory_run_handoff import RunHandoff
 from ..factory_usage import PriceBook, UsageReport, get_price_book, record_usage
 from ..models import (
     ExecutionRequest,
@@ -97,6 +99,22 @@ async def report_work_item_progress(
 
 
 @router.post(
+    "/v1/work-item-progress/{request_id}/handoff",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_progress_token)],
+)
+async def report_work_item_handoff(
+    request_id: uuid.UUID, body: RunHandoff, session: SessionDep
+) -> Any:
+    result = await record_run_handoff(session, token_request_id=request_id, body=body)
+    if result.outcome != "recorded":
+        return JSONResponse(
+            status_code=_STATUS_CODES[result.outcome], content={"code": result.outcome}
+        )
+    return {"recorded": True, "request_id": str(result.request_id)}
+
+
+@router.post(
     "/v1/work-item-progress/{request_id}/usage",
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_progress_token)],
@@ -113,9 +131,7 @@ async def report_work_item_usage(
     is safe.
     """
 
-    if not await record_usage(
-        session, request_id=request_id, body=body, price_book=price_book
-    ):
+    if not await record_usage(session, request_id=request_id, body=body, price_book=price_book):
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND, content={"code": "request_not_found"}
         )
@@ -185,6 +201,16 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
     terminal = request.terminal_cause if request.terminal_at is not None else None
     # Any automatic successor, owner loss or ordinary failure (ADR 0269).
     retrying = await retry_successor(session, request) is not None
+    latest_note = next((report for report in reversed(reports) if report.note), None)
+    latest_wait = next(
+        (report for report in reversed(reports) if report.phase == WAIT_CI_PHASE), None
+    )
+    run_handoff = None
+    if row.run_handoff is not None:
+        try:
+            run_handoff = RunHandoff.model_validate(row.run_handoff)
+        except ValueError:
+            pass
     body = render_card(
         CardInput(
             repo=work_item.repository_path,
@@ -198,16 +224,18 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             terminal_at=request.terminal_at,
             now=datetime.now(UTC),
             activity=row.activity,
-            note=next((report.note for report in reversed(reports) if report.note), None),
+            note=latest_note.note if latest_note else None,
+            note_at=latest_note.reported_at if latest_note else None,
+            wait_at=latest_wait.reported_at if latest_wait else None,
+            no_pull_request=terminal == "no_pull_request",
+            next_owner=run_handoff.next_owner if run_handoff is not None else None,
             phase_view=phase_view(
                 row.declaration or {"phases": [], "loops": []},
                 reports,
                 request.status,
                 request.terminal_cause,
             ),
-            cause_text=(
-                cause_text(terminal) if terminal and terminal != "completed" else None
-            ),
+            cause_text=(cause_text(terminal) if terminal and terminal != "completed" else None),
         )
     )
     return Response(
