@@ -23,7 +23,14 @@ from types import MappingProxyType
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -283,6 +290,88 @@ def selected_from_rules(rules: Sequence[tuple[int, str]]) -> SelectedMemoryRules
         sha256=rules_sha256(text),
         count=len(rules),
     )
+
+
+ENVELOPE_VERSION: Literal[1] = 1
+MAX_EXECUTION_FENCE = 9_223_372_036_854_775_807
+
+
+def _version(value: object) -> int:
+    # Strict ``Literal[1]`` accepts ``True`` and ``1.0``; refuse anything but an int.
+    if type(value) is not int or value != 1:
+        raise ValueError("invalid_version")
+    return value
+
+
+def _uuid(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("invalid_identifier")
+    try:
+        if str(UUID(value)) != value:
+            raise ValueError("invalid_identifier")
+    except (ValueError, AttributeError):
+        raise ValueError("invalid_identifier") from None
+    return value
+
+
+EnvelopeVersion = Annotated[Literal[1], BeforeValidator(_version)]
+Identifier = Annotated[str, BeforeValidator(_uuid)]
+Fence = Annotated[int, Field(strict=True, ge=1, le=MAX_EXECUTION_FENCE)]
+
+
+class MemoryRulesSelectedV1(_Contract):
+    """The pinned rules as delivered: ``count`` is derived, so the wire omits it.
+
+    The model revalidates the numbers, every rule line, the snapshot byte bound and
+    the digest against the text, so a tampered or truncated envelope is refused.
+    """
+
+    kind: Literal["selected"] = "selected"
+    rule_numbers: list[int] = Field(max_length=MAX_ACCEPTED_PER_SCOPE)
+    sha256: Digest
+    format_version: EnvelopeVersion = FORMAT_VERSION
+    text: str = Field(repr=False)
+
+    @model_validator(mode="after")
+    def _valid_selection(self) -> Self:
+        if any(type(number) is not int for number in self.rule_numbers):
+            raise ValueError("invalid_selected_rules")
+        SelectedMemoryRules(
+            rule_numbers=tuple(self.rule_numbers),
+            text=self.text,
+            sha256=self.sha256,
+            count=len(self.rule_numbers),
+        )
+        return self
+
+
+MemoryRulesEnvelopeSelection = Annotated[
+    MemoryRulesSelectedV1 | AbsentMemoryRules, Field(discriminator="kind")
+]
+
+
+class MemoryRulesContextV1(_Contract):
+    envelope_version: EnvelopeVersion = ENVELOPE_VERSION
+    tenant_id: Identifier
+    work_item_id: Identifier
+    execution_request_id: Identifier
+    execution_fence: Fence
+    selection: MemoryRulesEnvelopeSelection
+
+
+class MemoryRulesAcknowledgmentV1(_Contract):
+    envelope_version: EnvelopeVersion = ENVELOPE_VERSION
+    work_item_id: Identifier
+    execution_request_id: Identifier
+    execution_fence: Fence
+    outcome: Literal["none", "applied", "failed"]
+    sha256: Digest | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def _digest_when_applied(self) -> Self:
+        if (self.outcome == "applied") != (self.sha256 is not None):
+            raise ValueError("invalid_acknowledgment_digest")
+        return self
 
 
 SCOPE_KINDS = ("agent", "binding", "repository")
