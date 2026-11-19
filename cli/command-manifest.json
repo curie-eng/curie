@@ -5283,7 +5283,7 @@
             },
             {
               "global": false,
-              "help": "Local port for Langfuse. Default: the Langfuse service port (3000)",
+              "help": "Local port for Langfuse. Default: 23000, the port the chart's Langfuse sign-in URL (`langfuse.nextauthUrl`) names",
               "id": "langfuse_port",
               "long": "langfuse-port",
               "positional": false,

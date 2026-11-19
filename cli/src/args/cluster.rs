@@ -433,7 +433,8 @@ pub(crate) enum ClusterAction {
         /// the way `cluster status` names it (18080 for the default UI port).
         #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
         ui_port: Option<u16>,
-        /// Local port for Langfuse. Default: the Langfuse service port (3000).
+        /// Local port for Langfuse. Default: 23000, the port the chart's
+        /// Langfuse sign-in URL (`langfuse.nextauthUrl`) names.
         #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
         langfuse_port: Option<u16>,
         /// Print the commands that would run and exit without executing.

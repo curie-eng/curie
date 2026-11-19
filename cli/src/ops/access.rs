@@ -2,10 +2,11 @@
 //! services are `ClusterIP`, through loopback `kubectl port-forward` sessions
 //! that live only while the command runs.
 //!
-//! Nothing is published on the host until an operator runs this command, and
-//! nothing stays published after it ends: the forwards are children of this
-//! process, bound to `127.0.0.1`, and are stopped and reaped on Ctrl-C,
-//! SIGTERM, or when any one of them dies.
+//! Nothing is published on the host until an operator runs this command. The
+//! forwards are children of this process, bound to `127.0.0.1`, and are stopped
+//! and reaped on Ctrl-C, SIGTERM, or when any one of them dies. A SIGKILL of
+//! this process cannot run that cleanup and leaves the forwards running; stop
+//! them with `kill` on the `kubectl port-forward` processes.
 
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use super::verbs::{
 use super::{plain, release_fullname, require_on_path, CommonOpts, OpsCommand, ReleaseFullname};
 use crate::ui::{CliOutput, DryRunPlan, Ui};
 
-/// How long a forward gets to exit after it is told to stop.
+/// How long to wait for a forward to be reaped after it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 /// How long a forward that has exited waits for a shutdown signal that may
 /// still be on its way, so a Ctrl-C that stopped it is not reported as a
@@ -33,7 +34,15 @@ struct Surface {
     api: bool,
     /// The flag that moves its local port.
     port_flag: &'static str,
+    /// The local port to use instead of the one derived from the service
+    /// port, when the service's own sign-in redirects name one.
+    default_local: Option<u16>,
 }
+
+/// The local port the chart's `langfuse.nextauthUrl` default names
+/// (`http://localhost:23000`). Langfuse builds its sign-in redirects from that
+/// origin, so the forward has to be there for sign-in to return to it.
+const LANGFUSE_LOCAL_PORT: u16 = 23000;
 
 const SURFACES: [Surface; 2] = [
     Surface {
@@ -41,12 +50,14 @@ const SURFACES: [Surface; 2] = [
         label: "Console",
         api: true,
         port_flag: "--ui-port",
+        default_local: None,
     },
     Surface {
         suffix: "langfuse-web",
         label: "Langfuse",
         api: false,
         port_flag: "--langfuse-port",
+        default_local: Some(LANGFUSE_LOCAL_PORT),
     },
 ];
 
@@ -56,7 +67,7 @@ pub struct AccessOpts {
     pub common: CommonOpts,
     /// Local port for the Console. Default: derived like `cluster status`.
     pub ui_port: Option<u16>,
-    /// Local port for Langfuse. Default: derived like `cluster status`.
+    /// Local port for Langfuse. Default: the port the chart's sign-in URL names.
     pub langfuse_port: Option<u16>,
 }
 
@@ -89,10 +100,19 @@ enum Skipped {
 impl Skipped {
     fn describe(&self, label: &str) -> String {
         match self {
-            Skipped::NotFound(service) => format!("{label}: service {service} not found"),
+            Skipped::NotFound(service) => format!(
+                "{label}: service {service} could not be read (it does not exist, or the cluster is unreachable)"
+            ),
             Skipped::Unreadable(service) => format!("{label}: could not read service {service}"),
         }
     }
+}
+
+/// The local port a surface is forwarded to when no flag moves it.
+fn default_local_port(surface: &Surface, remote: u16) -> u16 {
+    surface
+        .default_local
+        .unwrap_or_else(|| forward_local_port(remote))
 }
 
 /// Decide one surface's forward from the service JSON kubectl returned (`None`
@@ -116,7 +136,7 @@ fn plan_forward(
         label: surface.label,
         port_flag: surface.port_flag,
         service: service.to_string(),
-        local: local_override.unwrap_or_else(|| forward_local_port(remote)),
+        local: local_override.unwrap_or_else(|| default_local_port(surface, remote)),
         remote,
         path: api_suffix_path(surface.api),
     })
@@ -198,7 +218,7 @@ pub fn access_plan(opts: &AccessOpts) -> DryRunPlan {
             label: surface.label,
             port_flag: surface.port_flag,
             service: fullname.resource(surface.suffix),
-            local: override_port.unwrap_or_else(|| forward_local_port(remote)),
+            local: override_port.unwrap_or_else(|| default_local_port(surface, remote)),
             remote,
             path: api_suffix_path(surface.api),
         };
@@ -263,7 +283,7 @@ pub async fn access(opts: AccessOpts) -> Result<()> {
             Ok((child, _)) => running.push((forward, child)),
             Err(error) => {
                 let failure = format!(
-                    "could not forward the {} to localhost:{}: {error:#} Pass {} to use another local port.",
+                    "could not open the {} port-forward on localhost:{}: {error:#} If that local port is in use, pass {} to choose another.",
                     forward.label, forward.local, forward.port_flag
                 );
                 stop_all(running).await;
@@ -337,7 +357,7 @@ async fn stop_all(running: Vec<(Forward, tokio::process::Child)>) {
 }
 
 /// A receiver that changes when this process gets SIGINT or SIGTERM. The
-/// signal arrives on a helper thread that lives for the rest of the process.
+/// signal arrives on a helper thread that waits for the first one.
 #[cfg(unix)]
 fn shutdown_signal() -> Result<tokio::sync::watch::Receiver<bool>> {
     let (sender, receiver) = tokio::sync::watch::channel(false);
@@ -382,10 +402,10 @@ mod tests {
     }
 
     #[test]
-    fn langfuse_forwards_to_its_own_port_with_no_path() {
+    fn langfuse_forwards_to_the_port_its_sign_in_redirects_name_with_no_path() {
         let forward = plan(&SURFACES[1], Some(CLUSTERIP_LANGFUSE), None).unwrap();
-        assert_eq!((forward.local, forward.remote), (3000, 3000));
-        assert_eq!(forward.url(), "http://localhost:3000");
+        assert_eq!((forward.local, forward.remote), (23000, 3000));
+        assert_eq!(forward.url(), "http://localhost:23000");
     }
 
     #[test]
@@ -421,7 +441,7 @@ mod tests {
         );
         assert_eq!(
             Skipped::NotFound("curie-langfuse-web".into()).describe("Langfuse"),
-            "Langfuse: service curie-langfuse-web not found"
+            "Langfuse: service curie-langfuse-web could not be read (it does not exist, or the cluster is unreachable)"
         );
     }
 
@@ -437,16 +457,16 @@ mod tests {
         let langfuse = plan(&SURFACES[1], Some(CLUSTERIP_LANGFUSE), None).unwrap();
         assert_eq!(
             forward_command("curie", &fullname(), &langfuse).display(),
-            "kubectl -n curie port-forward --address 127.0.0.1 svc/curie-langfuse-web 3000:3000"
+            "kubectl -n curie port-forward --address 127.0.0.1 svc/curie-langfuse-web 23000:3000"
         );
         assert!(!command.display().contains("0.0.0.0"));
     }
 
     #[test]
     fn two_forwards_may_not_share_a_local_port() {
-        let ui = plan(&SURFACES[0], Some(CLUSTERIP_UI), Some(3000)).unwrap();
+        let ui = plan(&SURFACES[0], Some(CLUSTERIP_UI), Some(23000)).unwrap();
         let langfuse = plan(&SURFACES[1], Some(CLUSTERIP_LANGFUSE), None).unwrap();
-        assert_eq!(local_port_conflict(&[ui, langfuse.clone()]), Some(3000));
+        assert_eq!(local_port_conflict(&[ui, langfuse.clone()]), Some(23000));
         let ui = plan(&SURFACES[0], Some(CLUSTERIP_UI), None).unwrap();
         assert_eq!(local_port_conflict(&[ui, langfuse]), None);
     }
@@ -484,7 +504,7 @@ mod tests {
     fn the_report_lists_each_forward_and_each_skipped_surface() {
         let output = ClusterAccessOutput {
             forwards: vec![plan(&SURFACES[0], Some(CLUSTERIP_UI), None).unwrap()],
-            skipped: vec!["Langfuse: service curie-langfuse-web not found".into()],
+            skipped: vec!["Langfuse: service curie-langfuse-web could not be read (it does not exist, or the cluster is unreachable)".into()],
         };
         let json = output.to_json();
         assert_eq!(json["forwards"][0]["name"], "Console");
@@ -492,7 +512,7 @@ mod tests {
         assert_eq!(json["forwards"][0]["local_port"], 18080);
         assert_eq!(
             json["skipped"][0],
-            "Langfuse: service curie-langfuse-web not found"
+            "Langfuse: service curie-langfuse-web could not be read (it does not exist, or the cluster is unreachable)"
         );
     }
 }

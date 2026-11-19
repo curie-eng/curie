@@ -1023,6 +1023,8 @@ async fn execute(
                     budget_usd: *budget_usd,
                     output_tokens: *output_tokens,
                     credit_remaining_usd,
+                    namespace: namespace.to_string(),
+                    release: release.to_string(),
                 });
             }
         }

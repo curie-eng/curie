@@ -663,6 +663,9 @@ pub enum QuickstartOutput {
         output_tokens: u64,
         /// OpenRouter credit left to the model credential, when it was read.
         credit_remaining_usd: Option<f64>,
+        /// The release's namespace and name, for the `cluster access` hint only.
+        namespace: String,
+        release: String,
     },
     /// An agent added to a release that already records factory intake.
     AgentAdded {
@@ -717,6 +720,9 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 budget_usd,
                 output_tokens,
                 credit_remaining_usd,
+                // Only the human render uses these, for the `cluster access` hint.
+                namespace: _,
+                release: _,
             } => serde_json::json!({
                 "phase": "ready",
                 "context": context,
@@ -798,6 +804,8 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 budget_usd,
                 output_tokens,
                 credit_remaining_usd,
+                namespace,
+                release,
                 ..
             } => {
                 let mention_note = if *mention_inferred {
@@ -829,7 +837,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                     "Reviewers run {REVIEWER_MODEL}. Plan on {} USD of OpenRouter credit per run.{credit_left}",
                     budget_display(RUN_CREDIT_USD)
                 ));
-                if let Some(hint) = console_access_hint(context) {
+                if let Some(hint) = console_access_hint(context, namespace, release) {
                     ui.payload(&hint);
                 }
             }
@@ -987,10 +995,16 @@ fn is_kind_context(name: &str) -> bool {
 /// How to reach the Console and Langfuse on a kind context, whose services
 /// quickstart leaves ClusterIP. `None` on any other context, which keeps the
 /// exposure `cluster up` defaults to.
-fn console_access_hint(context: &str) -> Option<String> {
+fn console_access_hint(context: &str, namespace: &str, release: &str) -> Option<String> {
     is_kind_context(context).then(|| {
+        let mut command = format!("curie cluster access --context {context}");
+        for (flag, value) in [("--namespace", namespace), ("--release", release)] {
+            if value != "curie" {
+                command.push_str(&format!(" {flag} {value}"));
+            }
+        }
         format!(
-            "The Console and Langfuse are not published on this host. Run `curie cluster access --context {context}` to open them on localhost while it runs."
+            "The Console and Langfuse are not published on this host. Run `{command}` to open them on localhost while it runs."
         )
     })
 }
@@ -2920,12 +2934,24 @@ mod tests {
 
     #[test]
     fn the_access_hint_names_the_context_and_only_a_kind_context_gets_it() {
-        let hint = console_access_hint(KIND_CONTEXT).unwrap();
+        let hint = console_access_hint(KIND_CONTEXT, "curie", "curie").unwrap();
         assert!(
-            hint.contains(&format!("curie cluster access --context {KIND_CONTEXT}")),
+            hint.contains(&format!("`curie cluster access --context {KIND_CONTEXT}`")),
             "{hint}"
         );
-        assert_eq!(console_access_hint("remote-cluster"), None);
+        assert_eq!(
+            console_access_hint("remote-cluster", "curie", "curie"),
+            None
+        );
+        // A namespace or release that is not the default must be in the command,
+        // or the command it prints addresses a different release.
+        let hint = console_access_hint(KIND_CONTEXT, "factory", "acme").unwrap();
+        assert!(
+            hint.contains(&format!(
+                "`curie cluster access --context {KIND_CONTEXT} --namespace factory --release acme`"
+            )),
+            "{hint}"
+        );
     }
 
     #[test]
@@ -3215,6 +3241,8 @@ mod tests {
             budget_usd: DEFAULT_BUDGET_USD,
             output_tokens: DEFAULT_OUTPUT_TOKENS_PER_RUN,
             credit_remaining_usd: None,
+            namespace: "curie".into(),
+            release: "curie".into(),
         };
         let json = crate::ui::CliOutput::to_json(&ready);
         assert_eq!(json["repo"], "acme/widgets");
