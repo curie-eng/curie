@@ -36,7 +36,7 @@ import contextlib
 import logging
 import sys
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -46,6 +46,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_factory_tracker_results as tr
+import test_github_answer_intake as intake
 from curie_api import factory_questions
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import body_digest
@@ -86,10 +87,11 @@ from test_factory_tracker_intake import (  # noqa: F401  (fixtures)
     HOLD_MARKER,
     Intake,
     _cursor,
+    _document,
     _marker,
-    intake,
     make_intake,
 )
+from test_github_answer_intake import world  # noqa: F401  (fixture)
 
 NEEDS_HUMAN = "curie-factory:needs-human"
 PR_OPEN = "curie-factory:pr-open"
@@ -872,7 +874,7 @@ def test_an_older_status_pass_is_rewritten_after_the_roll(
 # The tracker intake reads an answer beside an older replica ------------------------------
 
 
-def _redrive_after_the_roll(intake: Intake) -> None:
+def _redrive_after_the_roll(jira_intake: Intake) -> None:
     """The roll is done: a new replica's reconciler runs its question round
     re-drive. Only that step of the pass runs, since the pass's tracker poll
     would reach the network on this install rather than the Jira fake."""
@@ -886,26 +888,26 @@ def _redrive_after_the_roll(intake: Intake) -> None:
         valkey = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
         try:
             reconciler = WorkItemReconciler(
-                intake.client.app.state.sessionmaker, valkey, get_settings()
+                jira_intake.client.app.state.sessionmaker, valkey, get_settings()
             )
             await reconciler._redrive_question_rounds()
         finally:
             await valkey.aclose()
 
-    intake.client.portal.call(go)
+    jira_intake.client.portal.call(go)
 
 
-def _selected_for_redrive(intake: Intake, work_item_id: uuid.UUID) -> bool:
+def _selected_for_redrive(jira_intake: Intake, work_item_id: uuid.UUID) -> bool:
     async def go() -> list[uuid.UUID]:
-        async with intake.client.app.state.sessionmaker() as session:
+        async with jira_intake.client.app.state.sessionmaker() as session:
             return await lifecycle.question_rounds_to_redrive(session, limit=100)
 
-    return work_item_id in intake.client.portal.call(go)
+    return work_item_id in jira_intake.client.portal.call(go)
 
 
 @pytest.mark.usefixtures("clean_db")
 def test_an_answer_to_a_posting_round_is_held_until_the_redrive(
-    intake: Intake, caplog: pytest.LogCaptureFixture
+    make_intake: Callable[[dict[str, Any]], Intake], caplog: pytest.LogCaptureFixture
 ) -> None:
     """On Jira the question comment is written but the create's answer is
     lost, so the round stays ``posting``. An older replica then takes the
@@ -922,56 +924,100 @@ def test_an_answer_to_a_posting_round_is_held_until_the_redrive(
     The hold lasts until the re-drive, never longer."""
 
     caplog.set_level(logging.INFO)
-    intake.agent()
-    issue = _issue(intake)
-    work_item_id, request_id = _admitted(intake, issue)
-    epoch = _start(intake, request_id)
-    capability = _mint(intake.client, request_id)
-    intake.jira.fail_next("comment_create", status=502, applied=True)
-    lost = _ask_on_jira(intake, capability)
+    jira_intake = make_intake(_document())
+    jira_intake.agent()
+    issue = _issue(jira_intake)
+    work_item_id, request_id = _admitted(jira_intake, issue)
+    epoch = _start(jira_intake, request_id)
+    capability = _mint(jira_intake.client, request_id)
+    jira_intake.jira.fail_next("comment_create", status=502, applied=True)
+    lost = _ask_on_jira(jira_intake, capability)
     assert lost.status_code == 503, lost.text
     question = factory_questions.marker_for(request_id)
-    assert [_marker(c) for c in intake.jira.own_comments(issue.id)] == [question]
+    assert [_marker(c) for c in jira_intake.jira.own_comments(issue.id)] == [question]
     assert _round_row(work_item_id)["state"] == "posting"  # type: ignore[index]
 
     with _older_replica():
-        _finish_on_jira(intake.client, request_id, epoch)
+        _finish_on_jira(jira_intake.client, request_id, epoch)
     assert _request(request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
     assert _round_row(work_item_id)["state"] == "posting"  # type: ignore[index]
 
     cursor = _cursor()
     assert cursor is not None
-    intake.jira.add_comment(issue.id, intake.starter, ANSWER_TEXT)
-    intake.poll()
+    jira_intake.jira.add_comment(issue.id, jira_intake.starter, ANSWER_TEXT)
+    jira_intake.poll()
 
     assert "still posting" in caplog.text
     assert ANSWER_TEXT not in caplog.text
     assert [r["id"] for r in _requests(work_item_id)] == [request_id]
     assert _answer_receipts(work_item_id) == {}
-    assert HOLD_MARKER not in {_marker(c) for c in intake.jira.own_comments(issue.id)}
+    assert HOLD_MARKER not in {_marker(c) for c in jira_intake.jira.own_comments(issue.id)}
     assert _cursor() == cursor
-    assert _selected_for_redrive(intake, work_item_id)
+    assert _selected_for_redrive(jira_intake, work_item_id)
 
-    _redrive_after_the_roll(intake)
+    _redrive_after_the_roll(jira_intake)
     row = _round_row(work_item_id)
     assert row is not None
     assert (row["state"], row["pending_request_id"], row["rounds_used"]) == ("cleared", None, 0)
     assert _request(request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
-    assert not _selected_for_redrive(intake, work_item_id)
+    assert not _selected_for_redrive(jira_intake, work_item_id)
 
     caplog.clear()
-    intake.poll()
+    jira_intake.poll()
 
     assert "still posting" not in caplog.text
     assert [r["id"] for r in _requests(work_item_id)] == [request_id]
     assert _answer_receipts(work_item_id) == {}
-    assert HOLD_MARKER not in {_marker(c) for c in intake.jira.own_comments(issue.id)}
+    assert HOLD_MARKER not in {_marker(c) for c in jira_intake.jira.own_comments(issue.id)}
     advanced = _cursor()
     assert advanced is not None and advanced != cursor
     # Settled once: a later pass changes nothing.
-    intake.poll()
+    jira_intake.poll()
     assert [r["id"] for r in _requests(work_item_id)] == [request_id]
     assert _answer_receipts(work_item_id) == {}
+
+
+# A plain answer comment read by a new replica's intake (#5787) --------------------------
+
+
+@pytest.mark.parametrize("path", intake.PATHS)
+def test_a_plain_answer_after_an_older_finish_is_the_one_continuation(
+    world: intake.World, path: str
+) -> None:
+    """The asker settled ``failed`` on an older replica, so the row still
+    reads ``outstanding`` with no question ending. A plain answer comment
+    reaches a new replica's intake, by webhook or by poll, before any
+    re-drive. It is admitted once; after the roll the asker ends with the
+    question and the answer is its one continuation, and the other door
+    reading the same comment again adds nothing."""
+
+    number = 1231 if path == "webhook" else 1232
+    triage = intake._running(world, number)
+    assert _ask(triage).status_code == 200
+    with _older_replica():
+        tr._finish(triage, "failed", "no_pull_request")
+    assert _request(triage.request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
+    assert _round_row(triage.work_item_id)["state"] == "outstanding"  # type: ignore[index]
+
+    comment = world.github.add_comment(number, intake.ANSWER, user=intake.WRITER)
+    result = intake._deliver(world, path, comment, number)
+    if result is not None:
+        assert result["status"] == "factory_admitted", result
+    answer = intake._answer_id(triage, comment)
+
+    _after_the_roll()
+    assert _request(triage.request_id) == QUESTION_ENDING
+    assert _after_asker(triage) == [(answer, "waiting")]
+    row = _round_row(triage.work_item_id)
+    assert row is not None
+    assert (row["state"], row["pending_request_id"]) == ("answered", answer)
+    again = intake._deliver(world, "poll" if path == "webhook" else "webhook", comment, number)
+    if again is not None:
+        assert again["status"] == "factory_duplicate", again
+    _after_the_roll()
+    assert _after_asker(triage) == [(answer, "waiting")]
+    _take_over(triage, answer)
+    assert _request(answer)["status"] == "running"
 
 
 # Guard: every reader and writer of the round state is covered above --------------------
@@ -1011,6 +1057,30 @@ _EXPECTED_USES = {
         "QUESTIONS_LABEL",
         "ROUND_LIMIT",
         "asked_round",
+    },
+    # The plain answer intake (#5787): the webhook and the poll pass read the
+    # row state and hand the comment to the answer core. Proved beside an
+    # older finish above.
+    "curie_api/factory_poll_intake.py": {
+        "ANSWERED",
+        "FactoryQuestionRound",
+        "OUTSTANDING",
+        "POSTING",
+    },
+    "curie_api/github_factory.py": {
+        "ADMITTED",
+        "ANSWERED",
+        "AnswerFacts",
+        "AnswerNotAdmitted",
+        "COALESCED",
+        "FactoryAnswerReceipt",
+        "FactoryQuestionRound",
+        "OUTSTANDING",
+        "POSTING",
+        "QUESTION_POSTING",
+        "QUEUED_FOLLOW_UP",
+        "WORK_ITEM_CANCELLED",
+        "admit_answer",
     },
     "curie_api/routers/work_item_issue.py": {
         "ALREADY_ASKED",

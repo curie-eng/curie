@@ -9,14 +9,16 @@ Slack.
 
 import logging
 import uuid
-from collections.abc import Collection
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import cast, func, select, text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
@@ -28,7 +30,7 @@ from curie_api.workitems.lifecycle import (
     same_repository,
 )
 
-from . import factory_intake_notices, factory_rediscovery, workitem_dispatch
+from . import factory_intake_notices, factory_questions, factory_rediscovery, workitem_dispatch
 from .config import Settings, get_settings
 from .factory_admission import (
     LABEL_REFUSAL_MARKER,
@@ -37,10 +39,12 @@ from .factory_admission import (
     label_refusal,
     label_span,
 )
+from .factory_facts_schema import InvalidFactsRequest, parse_request
 from .forges.errors import ForgeError, NotFound, Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND, resolve_binding
 from .forges.github.comments import static_token
 from .forges.github.identity import delivery_uuid
+from .forges.github.review_polling import trailing_id
 from .forges.github.tracker import GitHubTracker, IssueFacts, last_label_event
 from .forges.github.transport import parse_time
 from .forges.hosts import (
@@ -65,15 +69,18 @@ from .github_factory_events import (
     parse_factory_event,
 )
 from .github_review_audit import claim_review_delivery, settle_review_delivery
-from .github_review_events import FeedbackIgnored, FeedbackUnavailable
+from .github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from .models import (
     AgentChannel,
     ExecutionRequest,
+    FactoryAnswerReceipt,
+    FactoryPollCursor,
+    FactoryQuestionRound,
     FactorySlackThread,
     PersonalClaudeEnrollment,
     WorkItem,
 )
-from .personal_execution import OwnerContext
+from .personal_execution import ModelAuthMode, OwnerContext, existing_work_item_refusal
 from .workitem_dispatch import Admission, DispatchConflict
 from .workspace_policy import repository_is_allowed
 
@@ -114,6 +121,17 @@ IGNORED = {
     "work_item_other_agent",
     "label_conflict",
     "publication_exists",
+    # Answer intake (#5787): a comment while a question is open that is not
+    # admitted as an answer, or that the answer rule refuses.
+    "answer_from_bot",
+    "answer_not_authorized",
+    "ticket_closed",
+    "trigger_label_absent",
+    "comment_unavailable",
+    "binding_missing",
+    "installation_mismatch",
+    "not_outstanding",
+    "not_after_question",
 }
 
 
@@ -814,6 +832,289 @@ async def cancel_notice(
     return await cancel_work_item(session, item)
 
 
+# Answers to the factory's questions (#5787) -----------------------------------
+
+ANSWER_FROM_BOT = "answer_from_bot"
+ANSWER_NOT_AUTHORIZED = "answer_not_authorized"
+TICKET_CLOSED = "ticket_closed"
+TRIGGER_LABEL_ABSENT = "trigger_label_absent"
+COMMENT_UNAVAILABLE = "comment_unavailable"
+# The poll cursor key prefix of an answer comment to read again (#5787): the
+# poll pass, or in webhook mode the work item reconciler, drains it.
+ANSWER_RETRY = "answer-retry:"
+# Rows a comment can answer, or will once the round's tracker write lands.
+_ANSWERABLE = frozenset(
+    {factory_questions.POSTING, factory_questions.OUTSTANDING, factory_questions.ANSWERED}
+)
+_ANSWER_RESULTS = {
+    factory_questions.ADMITTED: "factory_admitted",
+    factory_questions.QUEUED_FOLLOW_UP: "factory_queued",
+    factory_questions.COALESCED: "factory_coalesced",
+}
+
+
+def _refuse_answer(
+    code: str, item: WorkItem, notice: FactoryNotice, actor: int | None = None
+) -> WebhookResult:
+    # Identifiers and the reason only: never the comment's text or a token.
+    logger.info(
+        "factory answer refused reason=%s work_item=%s comment=%s actor=%s",
+        code,
+        item.id,
+        notice.comment_id,
+        actor,
+    )
+    return ignored(code)
+
+
+def _facts_request(body: object) -> bool:
+    if not isinstance(body, str):
+        return False
+    try:
+        parse_request(body)
+    except InvalidFactsRequest:
+        return False
+    return True
+
+
+async def add_answer_retry(
+    session: AsyncSession,
+    *,
+    kind: str,
+    host: str,
+    scope_id: str,
+    scope_path: str,
+    comment_id: int,
+) -> None:
+    """Keep ``answer-retry:<comment id>`` in the scope's poll cursor, in the
+    caller's transaction (#5787).
+
+    The key is merged into the row as it is now (jsonb ``||``, the row created
+    with no since values when absent), never written from a cursor snapshot,
+    so a concurrent writer of another key is kept. The poll pass's cursor save
+    never writes or drops these keys; only this and the retry drain's jsonb
+    ``-`` change them.
+    """
+
+    added = cast({f"{ANSWER_RETRY}{comment_id}": "pending"}, JSONB)
+    await session.execute(
+        pg_insert(FactoryPollCursor)
+        .values(
+            tracker_kind=kind,
+            tracker_host=host,
+            tracker_scope_id=scope_id,
+            scope_path=scope_path,
+            etags=added,
+        )
+        .on_conflict_do_update(
+            index_elements=[
+                FactoryPollCursor.tracker_kind,
+                FactoryPollCursor.tracker_host,
+                FactoryPollCursor.tracker_scope_id,
+            ],
+            set_={
+                "etags": FactoryPollCursor.etags.op("||")(added),
+                "updated_at": func.now(),
+            },
+        )
+    )
+
+
+async def record_answer_retry(
+    session: AsyncSession, notice: FactoryNotice, registry: ForgeRegistry
+) -> None:
+    """Keep a deferred webhook answer for a later read (#5787).
+
+    A webhook answer that cannot be decided yet is answered 503, which GitHub
+    never redelivers by itself; the key is what reads it again, through the
+    poll pass or, in webhook mode, the work item reconciler's answer drain.
+    """
+
+    if notice.comment_id is None:
+        return
+    issue = notice_issue(notice, registry)
+    await add_answer_retry(
+        session,
+        kind=issue.kind,
+        host=issue.host,
+        scope_id=issue.scope_id,
+        scope_path=notice.repo_full_name,
+        comment_id=notice.comment_id,
+    )
+
+
+@dataclass(frozen=True)
+class _AnswerOwner:
+    """An answer's admission facts as the owner guard reads them: the
+    install's mode and no named owner, exactly as a mention's (#5787)."""
+
+    model_auth_mode: ModelAuthMode
+    owner: None = None
+
+
+async def admit_answer_notice(
+    session: AsyncSession,
+    settings: Settings,
+    tracker: GitHubTracker | Callable[[], Awaitable[GitHubTracker]],
+    notice: FactoryNotice,
+    comment: Mapping[str, Any] | None,
+) -> WebhookResult | None:
+    """Recognise one created issue comment as an answer and admit it (#5787).
+
+    The one GitHub recognition rule, shared by the webhook and the poll pass
+    (ADR 0161: both doors admit identically). None when the comment is not an
+    answer: the issue has no WorkItem, or its question row is absent,
+    ``cleared`` or ``exhausted``; the caller then applies its mention or
+    ordinary comment rules unchanged. Otherwise the comment is never also a
+    mention (decision 4), and the result is the answer's.
+
+    ``comment`` is the factory's own authenticated read of the comment (the
+    poll listing); None reads it now through the App, since a webhook payload
+    is not trusted for who wrote it or through which App (decision 2). The
+    actor rule is ADR 0279's for labels: a ``User`` with a valid id, not acting
+    through this factory's own App; a person acting through another App
+    passes. Permission, open state and the trigger label are read fresh
+    (decision 3). A Slack kickoff's WorkItem has no trigger label, so only the
+    open check applies to it. A ``posting`` round is passed to the answer core,
+    which refuses it before writing anything (`factory_questions.QUESTION_POSTING`);
+    that is `FeedbackUnavailable`, retried until the round is ``outstanding``.
+
+    A comment with an answer receipt was already decided as an answer, so it
+    replays (``factory_duplicate``) whatever the round is now and with no
+    GitHub read: a mention that answered stays an answer after the round
+    clears. A comment whose authenticated body is a facts request (ADR 0280)
+    is never an answer. Before any GitHub read the WorkItem's agent must still
+    have a GitHub surface on the repository (``binding_missing``) and the
+    delivery must come from the WorkItem's installation
+    (``installation_mismatch``), and the install's model auth mode must fit
+    the WorkItem (`personal_execution.existing_work_item_refusal`, so a
+    retained service WorkItem under personal mode is ``personal_owner_required``),
+    each as for a mention.
+
+    The caller holds the issue lock (`lock_issue`) and commits; the answer
+    core runs in a savepoint of the caller's transaction. ``tracker`` may be a
+    factory, resolved only once the comment needs a GitHub read.
+    """
+
+    registry = forges_registry(settings)
+    issue = notice_issue(notice, registry)
+    item = await work_item_for(session, issue)
+    if item is None:
+        return None
+    if notice.comment_id is None:
+        raise FactoryRefused("invalid_comment")
+    receipt = await session.scalar(
+        select(FactoryAnswerReceipt.outcome).where(
+            FactoryAnswerReceipt.work_item_id == item.id,
+            FactoryAnswerReceipt.comment_key == str(notice.comment_id),
+        )
+    )
+    if receipt is not None:
+        logger.info(
+            "factory answer replayed %s work_item=%s comment=%s",
+            receipt,
+            item.id,
+            notice.comment_id,
+        )
+        return WebhookResult(status="factory_duplicate")
+    row: FactoryQuestionRound | None = await session.scalar(
+        select(FactoryQuestionRound)
+        .where(FactoryQuestionRound.work_item_id == item.id)
+        .execution_options(populate_existing=True)
+    )
+    if row is None or row.state not in _ANSWERABLE:
+        return None
+    if item.cancelled_at is not None:
+        return _refuse_answer(factory_questions.WORK_ITEM_CANCELLED, item, notice)
+    if (
+        await agent_binding(session, item.agent_id, GITHUB_CHANNEL_KIND, notice.repo_full_name)
+        is None
+    ):
+        return _refuse_answer("binding_missing", item, notice)
+    if (
+        item.code_host_installation_id is not None
+        and item.code_host_installation_id != notice.installation_id
+    ):
+        return _refuse_answer("installation_mismatch", item, notice)
+    mode_refusal = await existing_work_item_refusal(
+        session, item, _AnswerOwner(settings.factory_model_auth_mode)
+    )
+    if mode_refusal is not None:
+        return _refuse_answer(mode_refusal.code, item, notice)
+    github = tracker if isinstance(tracker, GitHubTracker) else await tracker()
+    if comment is None:
+        try:
+            comment = await github.issue_comment(notice.comment_id)
+        except NotFound:
+            return _refuse_answer(COMMENT_UNAVAILABLE, item, notice)
+        except ForgeError:
+            raise FeedbackUnavailable(COMMENT_UNAVAILABLE) from None
+    if comment.get("id") != notice.comment_id or (
+        trailing_id(comment.get("issue_url")) != notice.issue_number
+    ):
+        return _refuse_answer("comment_target_mismatch", item, notice)
+    if _facts_request(comment.get("body")):
+        # The facts exchange keeps precedence (decision 6), judged on the
+        # body GitHub returns now, not the one a payload or listing claimed.
+        return None
+    try:
+        actor_id, actor_login = label_actor(
+            {
+                "actor": comment.get("user"),
+                "performed_via_github_app": comment.get("performed_via_github_app"),
+            },
+            app_id=github.app_id,
+        )
+    except FeedbackIgnored as exc:
+        code = (
+            ANSWER_FROM_BOT if exc.code in {"actor_bot", "actor_own_app"} else ANSWER_NOT_AUTHORIZED
+        )
+        return _refuse_answer(code, item, notice)
+    author = replace(notice, sender_id=actor_id, sender_login=actor_login)
+    if await github.label_permission(author) is not None:
+        return _refuse_answer(ANSWER_NOT_AUTHORIZED, item, notice, actor_id)
+    try:
+        state = await github.issue_state(notice.issue_number)
+    except NotFound:
+        return _refuse_answer(TICKET_CLOSED, item, notice, actor_id)
+    except ForgeError:
+        raise FeedbackUnavailable("issue_unavailable") from None
+    if state.state != "open" or state.pull_request:
+        return _refuse_answer(TICKET_CLOSED, item, notice, actor_id)
+    label = admitting_label(
+        registry, item, kickoff_items=await kickoff_work_items(session, [item.id])
+    )
+    if label is not None and label not in state.labels:
+        return _refuse_answer(TRIGGER_LABEL_ABSENT, item, notice, actor_id)
+    facts = factory_questions.AnswerFacts(
+        work_item_id=item.id,
+        issue=issue,
+        comment_id=str(notice.comment_id),
+        created_at=parse_time(comment.get("created_at")),
+        requester=f"github:{actor_id}:{actor_login}",
+    )
+    # The answer core commits and rolls back its own session; in a savepoint
+    # the issue lock and the webhook's delivery audit stay in the caller's
+    # transaction, as admission's dispatch calls do.
+    async with AsyncSession(
+        bind=await session.connection(),
+        join_transaction_mode="create_savepoint",
+        expire_on_commit=False,
+    ) as answering:
+        try:
+            outcome = await factory_questions.admit_answer(answering, facts)
+        except factory_questions.AnswerNotAdmitted as exc:
+            if exc.code == factory_questions.QUESTION_POSTING:
+                raise FeedbackUnavailable(exc.code) from None
+            return _refuse_answer(exc.code, item, notice, actor_id)
+    if outcome.replayed:
+        return WebhookResult(status="factory_duplicate")
+    status = _ANSWER_RESULTS.get(outcome.outcome)
+    if status is None:
+        return ignored(outcome.outcome)
+    return WebhookResult(status=status)
+
+
 async def _with_label_event(
     notice: FactoryNotice,
     *,
@@ -898,17 +1199,39 @@ async def handle_factory_delivery(
             app_slug=await factory_app_slug(registry),
         )
         await lock_issue(session, notice_issue(notice, registry))
-        if notice.disposition == "admit":
-            notice = await _with_label_event(notice, settings=settings, client=client)
-        verified = await verify_current(notice, settings=settings, client=client)
-        if notice.disposition == "cancel":
-            outcome = await cancel_notice(session, notice, settings)
-        elif notice.disposition == "base_label":
-            outcome = await record_base_label_notice(
-                session, notice, verified, settings, client=client
-            )
+        answered: WebhookResult | None = None
+        if notice.event == "issue_comment":
+            # A comment is an answer first (#5787 decision 4); only a comment
+            # that is not one goes on to today's mention or comment rules.
+            commented = notice
+            try:
+                answered = await admit_answer_notice(
+                    session,
+                    settings,
+                    lambda: _tracker(commented, registry=registry, client=client),
+                    notice,
+                    None,
+                )
+            except FeedbackUnavailable:
+                # Settled with the retryable audit below, in this transaction.
+                await record_answer_retry(session, commented, registry)
+                raise
+            if answered is None and notice.disposition == "comment":
+                raise FactoryRefused(notice.comment_refusal or "ordinary_comment")
+        if answered is not None:
+            outcome = answered
         else:
-            outcome = await admit_notice(session, notice, settings, verified, client=client)
+            if notice.disposition == "admit":
+                notice = await _with_label_event(notice, settings=settings, client=client)
+            verified = await verify_current(notice, settings=settings, client=client)
+            if notice.disposition == "cancel":
+                outcome = await cancel_notice(session, notice, settings)
+            elif notice.disposition == "base_label":
+                outcome = await record_base_label_notice(
+                    session, notice, verified, settings, client=client
+                )
+            else:
+                outcome = await admit_notice(session, notice, settings, verified, client=client)
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()

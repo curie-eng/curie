@@ -20,7 +20,9 @@ tracker's intake hands a recognised, authorized ticket comment to. It decides
 whether the comment answers the current round, folds several answers into one
 attempt, queues one follow-up behind a live run, and keeps one receipt per
 comment so a redelivery returns its first outcome. It never reads the
-comment's text.
+comment's text. A comment that arrives while the round's own comment is
+still being recorded (``posting``) is refused with no receipt, so its
+redelivery or the next poll decides it once the round is ``outstanding``.
 
 Lock order: every write takes the WorkItem row lock first, then the request
 lock where it needs one, then the question row, as every
@@ -794,6 +796,10 @@ COALESCED: Final = "coalesced"
 QUEUED_FOLLOW_UP: Final = "queued_follow_up"
 NOT_OUTSTANDING: Final = "not_outstanding"
 NOT_AFTER_QUESTION: Final = "not_after_question"
+# Raised, never a receipt: the round's tracker write has not been recorded yet
+# (#5787 X2). Once the asking request's retry records it ``outstanding`` (the
+# marked write finds the comment it already posted), the same comment answers.
+QUESTION_POSTING: Final = "question_posting"
 # Every receipt outcome, as `FACTORY_ANSWER_RECEIPT_OUTCOMES` (the table's CHECK) lists them.
 ANSWER_OUTCOMES: Final = (
     ADMITTED,
@@ -917,8 +923,12 @@ async def admit_answer(session: AsyncSession, facts: AnswerFacts) -> AnswerOutco
 
     Under the WorkItem lock: a receipt for (WorkItem, comment) replays its
     outcome and changes nothing. Otherwise the first rule that applies wins:
-    a cancelled WorkItem; a row absent, ``posting``, ``cleared`` or
-    ``exhausted`` (``not_outstanding``); a comment not created after the
+    a cancelled WorkItem; a ``posting`` row, which raises `AnswerNotAdmitted`
+    with `QUESTION_POSTING` and writes nothing (the question comment may
+    already be on the ticket, with the answer after it, while its round is not
+    yet recorded: a receipt now would refuse that answer for good); a row
+    absent, ``cleared`` or ``exhausted`` (``not_outstanding``); a comment not
+    created after the
     row's ``answer_after`` (``not_after_question``); a pending request that
     has not started (``coalesced``); else one implementation request through
     `lifecycle.create_revision_request`, waiting when nothing is live
@@ -936,8 +946,9 @@ async def admit_answer(session: AsyncSession, facts: AnswerFacts) -> AnswerOutco
 
     Raises ValueError when the facts do not name the WorkItem's own ticket or
     carry no comment id, and `AnswerNotAdmitted` with ``work_item_not_found``
-    when the WorkItem no longer exists, or with the conflict code when the
-    request could not be created. This function owns its transaction: any exception rolls it back
+    when the WorkItem no longer exists, with `QUESTION_POSTING` for a
+    ``posting`` row, or with the conflict code when the request could not be
+    created. This function owns its transaction: any exception rolls it back
     before it propagates, so a caller that catches it and commits persists
     nothing of the answer (a lifecycle commit only released a savepoint).
     """
@@ -1005,6 +1016,11 @@ async def _decide(session: AsyncSession, work_item: WorkItem, facts: AnswerFacts
         .where(FactoryQuestionRound.work_item_id == work_item.id)
         .execution_options(populate_existing=True)
     )
+    if row is not None and row.state == POSTING:
+        # Decided under the WorkItem lock, so a row that moved from
+        # ``answered`` to a new round's ``posting`` since the intake read it
+        # is caught here too.
+        raise AnswerNotAdmitted(QUESTION_POSTING)
     if row is None or row.state not in (OUTSTANDING, ANSWERED):
         return AnswerOutcome(NOT_OUTSTANDING, None, False)
     if not _after_fence(facts.created_at, facts.comment_id, row.answer_after, row.comment_id):

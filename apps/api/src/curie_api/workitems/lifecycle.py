@@ -2116,6 +2116,7 @@ async def terminalize_execution(
     retry_safety: RetrySafety | None,
     retry_condition: RetryConditionFact | None,
     exhausted_volume: str | None,
+    finisher: Literal["worker", "control_plane"],
 ) -> WorkItemResult:
     """Settle a running request completed or failed.
 
@@ -2126,7 +2127,9 @@ async def terminalize_execution(
     transaction, before terminal settlement. ``exhausted_volume`` is the
     scratch volume a ``sandbox_scratch_exhausted`` finish named (#5427); the
     terminal UPDATE adds it to the request's delivered limits record, where
-    the successor's gate reads it.
+    the successor's gate reads it. ``finisher`` names who ends the run: the
+    worker's own finish, or a settlement the control plane makes itself. It
+    decides what becomes of a lease parked at the execution deadline.
     """
 
     work_item = await lock_work_item(session, work_item_id)
@@ -2300,6 +2303,26 @@ async def terminalize_execution(
             )
         }
     )
+    # ADR 0268 decision 4 gives a personal owner one active process. A started
+    # personal request's sandbox claim holds that slot until a worker deletes
+    # it, and the worker's own release runs only when its turn settles the
+    # request, so this write owes the teardown (#5840): terminate wakes follow
+    # until a worker records the runtime gone. When the control plane settles
+    # the run, a parked CI or approval hold is released so any worker can claim
+    # it at once. When the worker finishes it, a parked hold becomes the short
+    # lease an ordinary finish leaves, so its ADR 0251 recovery capture keeps
+    # live authority and the wake waits for that lease to lapse. Service rows
+    # are unchanged.
+    teardown_values: dict[str, Any] = (
+        {
+            "teardown_unconfirmed_at": func.clock_timestamp(),
+            "runtime_heartbeat_expires_at": (
+                _shorten_parked_hold() if finisher == "worker" else _release_parked_hold()
+            ),
+        }
+        if request.model_auth_mode == "personal" and request.started_at is not None
+        else {}
+    )
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -2323,6 +2346,7 @@ async def terminalize_execution(
             version=ExecutionRequest.version + 1,
             updated_at=func.clock_timestamp(),
             **volume_values,
+            **teardown_values,
         )
         .returning(ExecutionRequest.id)
     )
@@ -2392,6 +2416,7 @@ async def complete_execution(
         retry_safety=retry_safety,
         retry_condition=retry_condition,
         exhausted_volume=None,
+        finisher="control_plane",
     )
 
 
@@ -2420,6 +2445,7 @@ async def fail_execution(
         retry_safety=retry_safety,
         retry_condition=retry_condition,
         exhausted_volume=None,
+        finisher="control_plane",
     )
 
 
@@ -2550,6 +2576,7 @@ async def settle_ci_verdict(
                 retry_safety=None,
                 retry_condition=None,
                 exhausted_volume=None,
+                finisher="control_plane",
             )
         if isinstance(result, WorkItemOutcome):
             await session.execute(
@@ -2579,6 +2606,7 @@ async def settle_ci_verdict(
         retry_safety=None,
         retry_condition=None,
         exhausted_volume=None,
+        finisher="control_plane",
     )
 
 
@@ -2631,6 +2659,21 @@ def _release_parked_hold() -> ColumnElement[datetime]:
         (
             ExecutionRequest.runtime_heartbeat_expires_at == ExecutionRequest.execution_deadline,
             func.clock_timestamp(),
+        ),
+        else_=ExecutionRequest.runtime_heartbeat_expires_at,
+    )
+
+
+def _shorten_parked_hold() -> ColumnElement[datetime]:
+    # A worker finishing a turn that ran under a parked CI or approval hold
+    # keeps a live short lease, as any other finish does, so its ADR 0251
+    # recovery capture keeps live authority; the terminate wake waits for that
+    # lease to lapse (#5840). An ordinary short lease is kept as it is.
+    return case(
+        (
+            ExecutionRequest.runtime_heartbeat_expires_at == ExecutionRequest.execution_deadline,
+            func.clock_timestamp()
+            + timedelta(seconds=get_settings().work_item_runtime_ttl_seconds),
         ),
         else_=ExecutionRequest.runtime_heartbeat_expires_at,
     )
@@ -3328,7 +3371,10 @@ async def fence_enrollment_generation(
        records the teardown.
     2. A started ``completed``, ``failed`` or ``expired`` request with no
        termination observation is marked ``teardown_unconfirmed_at``, so
-       terminate wakes run until a worker records its runtime gone.
+       terminate wakes run until a worker records its runtime gone. A
+       completed or failed one is normally marked already by its own terminal
+       write (#5840); this covers rows that ended without the mark, such as
+       rows settled before it.
     3. ``cancellation_requested`` requests already end with an observation,
        and ``queued`` and ``waiting`` ones are fenced by their generation, so
        neither changes. The WorkItem is never cancelled.
@@ -3814,7 +3860,8 @@ async def _confirm_settled_teardown(
     """Record a worker teardown a terminal request still owes.
 
     Either a force-settled cancellation or a started completed, failed or
-    expired request an enrollment fence marked (#5377). The request is already
+    expired request its own terminal write (#5840) or an enrollment fence
+    (#5377) marked. The request is already
     terminal and its notice already went out, so this only records the
     observation (replacing a settle placeholder) and clears the flag. Its
     status, cause, ``terminal_at`` and runtime epoch stay as they were.

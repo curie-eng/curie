@@ -156,12 +156,29 @@ def _acquire(request_id: UUID, *, owner: str = support.RUNTIME_OWNER) -> None:
 def _finished(
     api: TestClient, world: support.World, agent_id: UUID, issue: int, *, cause: str
 ) -> tuple[support.Admitted, int]:
-    """A started request the worker finished ``failed`` with ``cause``."""
+    """A started request the worker finished ``failed`` with ``cause``, unmarked.
+
+    The finish itself marks a personal request ``teardown_unconfirmed_at``
+    (#5840). These tests are about the fence marking a terminal row that lacks
+    the mark, so the flag is cleared to seed a row that ended before #5840's
+    mark; nothing else of the finished row changes.
+    """
 
     admitted = _admit(api, world, agent_id, issue)
     epoch = support.start_request(admitted.request_id)
     support.finish_failed(admitted.request_id, epoch, cause=cause)
+    _unmark(admitted.request_id)
     return admitted, epoch
+
+
+def _unmark(request_id: UUID) -> None:
+    """Seed a terminal row that ended before #5840's mark: clear the flag."""
+
+    support.rows(
+        "UPDATE curie.execution_requests SET teardown_unconfirmed_at = NULL "
+        "WHERE id = :id AND teardown_unconfirmed_at IS NOT NULL",
+        {"id": request_id},
+    )
 
 
 def _completed(request_id: UUID) -> None:
@@ -541,6 +558,8 @@ def test_terminate_wakes_cover_fenced_and_unconfirmed_terminal_rows_but_not_a_li
     # The fenced running requests stop; the stopping sibling still blocks the
     # teardown of the run before it.
     assert _request(started_sibling)["terminal_cause"] == "enrollment_fenced"
+    # A terminal row's wake waits out its finisher's live lease (#5840).
+    _expire_lease(lone.request_id)
     assert _wakes() == sorted((running.request_id, lone.request_id, started_sibling))
     for request_id in (acquiring.request_id, started.request_id):
         _expire_lease(request_id)
@@ -568,6 +587,7 @@ def test_waiting_sibling_without_acquire_lease_does_not_block_terminal_teardown(
     assert _request(sibling)["enrollment_generation"] == old
 
     # A waiting sibling nobody is acquiring owns no sandbox.
+    _expire_lease(first.request_id)  # The wake waits out the finisher's live lease (#5840).
     assert _wakes() == [first.request_id]
     claim = _claimed(api, first.request_id)
     assert claim["runtime_epoch"] == epoch
@@ -694,6 +714,7 @@ def test_confirmation_preserves_the_prior_terminal_outcome_and_epoch(
         _completed(first.request_id)
     else:
         support.finish_failed(first.request_id, epoch, cause="model_error")
+        _unmark(first.request_id)
     _fence(world)
     before = _request(first.request_id)
     assert before["teardown_unconfirmed_at"] is not None
@@ -1103,6 +1124,8 @@ def test_fence_and_pending_teardown_survive_an_api_restart(
         beat = _heartbeat(restarted, running.request_id, epoch)
         assert beat.status_code == 200, beat.text
         assert beat.json()["terminal_cause"] == "enrollment_fenced"
+        # The terminal row's wake waits out its finisher's live lease (#5840).
+        _expire_lease(terminal.request_id)
         assert _wakes() == sorted((running.request_id, terminal.request_id))
         _conflict(_revalidate(restarted, world, agent_id, terminal.work_item_id), "runtime_live")
         claim = _claimed(restarted, terminal.request_id)
