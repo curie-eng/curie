@@ -78,7 +78,7 @@ def _execution_at_0163(request_id: Any) -> str:
             "- 'retry_condition_reason' - 'retry_condition_retry_at' "
             "- 'retry_condition_scope_key' - 'delivered_limits' - 'resource_gate' "
             "- 'execution_kind' - 'recovery_candidate_id' - 'recovery_candidate_sha256' "
-            "- 'guarded_dispatch_not_before')::text "
+            "- 'guarded_dispatch_not_before' - 'memory_rules_evidence')::text "
             "AS bytes "
             "FROM curie.execution_requests r WHERE id = :id",
             {"id": request_id},
@@ -495,7 +495,14 @@ def migration_admitted(isolated_migration_db: Any, request: pytest.FixtureReques
     query = "SELECT * FROM curie.agents WHERE id = :id"
     before = _rows(query, {"id": agent_id})
     command.upgrade(alembic_config(), "head")
-    assert _rows(query, {"id": agent_id}) == before
+    # Columns later revisions added to ``agents`` read their defaults; the columns the
+    # row already had must come through unchanged.
+    after = _rows(query, {"id": agent_id})
+    assert len(after) == len(before)
+    kept = [
+        {name: row[name] for name in old_row} for old_row, row in zip(before, after, strict=True)
+    ]
+    assert kept == before
     return request.getfixturevalue("admitted")
 
 
