@@ -257,6 +257,43 @@ def test_resume_and_grant_recheck_the_preserved_selected_person(
     assert grant_check(case, entry, row["id"]) == CONTINUE
 
 
+@pytest.mark.parametrize("revocation", ["ceiling_user", "key_id"])
+def test_approved_resume_grant_and_republish_require_current_ceiling_and_key(
+    selection_case: SimpleNamespace, revocation: str,
+) -> None:
+    """@spec REQUEST-APPROVAL-5: an approved answer still needs its ceiling and selector key."""
+    case = selection_case
+    configured(case, users=BOTH)
+    row = dynamic(case, (APPROVER_A, APPROVER_B))
+    approval_id = row["id"]
+    answered(case, row, NATIVE_A)
+    entry = published(case, approval_id)
+    approved = approval_row(approval_id)
+    assert approved["resumed_at"] is not None
+    assert turn_check(case, entry, approval_id) == CONTINUE
+    assert grant_check(case, entry, approval_id) == CONTINUE
+
+    restore = _revoke(case, revocation)
+    code = REVOCATION_CODES[revocation]
+    before = len(resume_refusals(approval_id))
+    try:
+        assert turn_check(case, entry, approval_id) == REFUSE
+        one_more_resume_refusal(approval_id, before, NATIVE_A, code=code)
+        assert grant_check(case, entry, approval_id) == REFUSE
+        one_more_resume_refusal(approval_id, before + 1, NATIVE_A, code=code)
+        assert republish(case, approval_id) == "caller_not_allowed"
+        one_more_resume_refusal(approval_id, before + 2, NATIVE_A, code=code)
+        assert approval_row(approval_id) == {**approved, "resumed_at": None}
+        assert published(case, approval_id) == entry
+    finally:
+        restore()
+
+    assert republish(case, approval_id) is None
+    assert turn_check(case, entry, approval_id) == CONTINUE
+    assert grant_check(case, entry, approval_id) == CONTINUE
+    assert len(resume_refusals(approval_id)) == before + 3
+
+
 def test_resume_and_grant_audit_an_authenticated_capture_refusal(
     selection_case: SimpleNamespace,
 ) -> None:
