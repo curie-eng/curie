@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
@@ -228,6 +228,7 @@ class _Comment:
     author: Actor
     body: str
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class InMemoryMarkedComments(_Declared):
@@ -257,6 +258,10 @@ class InMemoryMarkedComments(_Declared):
         self._page_size = page_size
         self._threads: dict[ReplyTarget, list[_Comment]] = {}
         self._ids = itertools.count(1)
+        # The tracker's own clock, which stamps each comment's creation time,
+        # and the shape of its comment ids (numeric by default).
+        self.clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+        self.comment_id: Callable[[int], str] = str
 
     @staticmethod
     def embed(marker: str, body: str) -> str:
@@ -272,7 +277,7 @@ class InMemoryMarkedComments(_Declared):
     def seed_comment(self, target: ReplyTarget, author: Actor, body: str) -> str:
         """A comment someone else (or a past run) left; returns its id."""
 
-        comment = _Comment(str(next(self._ids)), author, body)
+        comment = _Comment(self.comment_id(next(self._ids)), author, body, created_at=self.clock())
         self._accept(target).append(comment)
         return comment.id
 
@@ -288,7 +293,7 @@ class InMemoryMarkedComments(_Declared):
             for comment in thread[start : start + self._page_size]:
                 # Only our own identity's comments count; a pasted marker does not.
                 if comment.author == self.identity and embedded in comment.body:
-                    return MarkedComment(comment.id, target, comment.body)
+                    return MarkedComment(comment.id, target, comment.body, comment.created_at)
         return None
 
     async def find_facts(self, target: ReplyTarget, prefix: str) -> MarkedComment | None:
@@ -339,10 +344,15 @@ class InMemoryMarkedComments(_Declared):
                 return UpsertResult(found, written=False)
             comment.body = text
             self._ledger.record()
-            return UpsertResult(MarkedComment(comment.id, target, text), written=True)
+            return UpsertResult(
+                MarkedComment(comment.id, target, text, comment.created_at), written=True
+            )
         comment_id = self.seed_comment(target, self.identity, text)
         self._ledger.record()
-        return UpsertResult(MarkedComment(comment_id, target, text), written=True)
+        created = next(item for item in thread if item.id == comment_id)
+        return UpsertResult(
+            MarkedComment(comment_id, target, text, created.created_at), written=True
+        )
 
 
 @dataclass

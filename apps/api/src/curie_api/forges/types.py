@@ -676,11 +676,16 @@ class StoredEvidence:
 
 @dataclass(frozen=True)
 class MarkedComment:
-    """A status comment the adapter's own identity wrote, carrying a marker."""
+    """A status comment the adapter's own identity wrote, carrying a marker.
+
+    ``created_at`` is the comment's creation time on the tracker's own clock,
+    when the tracker reported it; never part of equality.
+    """
 
     id: str
     target: ReplyTarget
     body: str
+    created_at: datetime | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

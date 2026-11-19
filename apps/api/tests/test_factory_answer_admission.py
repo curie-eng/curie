@@ -302,6 +302,48 @@ def test_coalesce_a_second_answer_before_the_request_starts(
     assert _requests(triage.work_item_id)[-1]["id"] == first.request_id
 
 
+def test_an_answer_never_coalesces_into_a_request_past_its_wait_deadline(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past its stored wait deadline the pending answer request can no longer
+    be claimed, though it reads ``waiting`` until the expiry sweep runs. A
+    second answer in that window starts its own request, which survives the
+    sweep."""
+
+    import curie_api.workitems.lifecycle as workitems
+
+    triage = _settled_asked(admitted, monkeypatch, 5112)
+    _first_id, first = _answer(triage)
+    assert first.outcome == "admitted" and first.request_id is not None
+    (row,) = _rows(
+        "SELECT wait_deadline - clock_timestamp() AS remaining "
+        "FROM curie.execution_requests WHERE id = :id",
+        {"id": first.request_id},
+    )
+    shift: timedelta = row["remaining"] + SECOND
+    real_now = workitems.database_now
+
+    async def past_the_deadline(session: Any) -> datetime:
+        return await real_now(session) + shift
+
+    # The database clock crosses the stored deadline; the deadline stays.
+    monkeypatch.setattr(workitems, "database_now", past_the_deadline)
+
+    second_id, second = _answer(triage, 2 * SECOND)
+    _reconcile()
+
+    started = factory_questions.answer_request_id(triage.issue, second_id)
+    assert second.outcome in factory_questions.ANSWER_STARTED_OUTCOMES
+    assert second.request_id == started
+    assert _receipts(triage.work_item_id)[second_id] == (second.outcome, started)
+    assert _request(first.request_id)["status"] not in {"waiting", "queued", "running"}
+    assert _request(started)["status"] == "waiting"
+    row = _round_row(triage.work_item_id)
+    assert row is not None
+    assert (row["state"], row["pending_request_id"]) == ("answered", started)
+    _replays(triage, second_id, second)
+
+
 # Criterion 3: answers during the answered run queue one follow-up --------------------
 
 
@@ -384,16 +426,10 @@ def test_fence_refuses_a_comment_not_created_after_the_question(
 ) -> None:
     triage = _settled_asked(admitted, monkeypatch, 5141)
     fence = _fence(triage)
-    # Created in the second before the question's, well before it, with no
-    # time, and with a time that names no zone. (A comment created after the
-    # question in its own second is an answer: see the immediate-answer test.)
-    before_its_second = fence.replace(microsecond=0) - timedelta(microseconds=1)
-    for created_at in (
-        before_its_second,
-        fence - SECOND,
-        None,
-        fence.replace(tzinfo=None) + SECOND,
-    ):
+    # A comment with no time, and with a time that names no zone. (The
+    # tracker's ids order a comment against the question: see the
+    # immediate-answer and late-delivery tests.)
+    for created_at in (None, fence.replace(tzinfo=None) + SECOND):
         before = _counts()
         comment_id = _comment(triage)
         refused = _admit(triage, comment_id, created_at)
@@ -402,17 +438,6 @@ def test_fence_refuses_a_comment_not_created_after_the_question(
         assert _receipts(triage.work_item_id)[comment_id] == ("not_after_question", None)
     row = _round_row(triage.work_item_id)
     assert row is not None and (row["state"], row["pending_request_id"]) == ("outstanding", None)
-
-    # Written before the question, delivered after a later answer.
-    old_id = _comment(triage)
-    _later_id, later = _answer(triage, timedelta(microseconds=1))
-    assert later.outcome == "admitted"
-    before = _counts()
-    late = _admit(triage, old_id, fence - 5 * SECOND)
-    assert late == AnswerOutcome("not_after_question", None, False)
-    assert _counts() == (before[0], before[1] + 1)
-    row = _round_row(triage.work_item_id)
-    assert row is not None and row["pending_request_id"] == later.request_id
 
 
 def test_fence_moves_to_the_second_round(admitted: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -502,6 +527,80 @@ def test_fence_refuses_a_comment_written_before_the_question_delivered_late(
     assert _counts() == (before[0], before[1] + 1)
     row = _round_row(triage.work_item_id)
     assert row is not None and (row["state"], row["pending_request_id"]) == ("outstanding", None)
+
+
+def _tracker_clock(triage: tr._Triage, at: datetime) -> list[datetime]:
+    """Pin the tracker's own clock at ``at``; the returned cell moves it."""
+
+    stamp = [at]
+    triage.tracker.marked_comments.clock = lambda: stamp[0]
+    return stamp
+
+
+def _opaque_ids(triage: tr._Triage) -> None:
+    triage.tracker.marked_comments.comment_id = lambda n: f"comment-{n:x}"
+
+
+def test_fence_admits_a_same_second_reply_whose_question_response_was_held(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tracker created the question late in a second and its response was
+    held past the boundary, so the database clock (or a tracker clock behind
+    it) reads seconds later. A higher id in the question's second answers it."""
+
+    triage = _running(admitted, monkeypatch, 5146)
+    question_at = (datetime.now(UTC) - 3 * SECOND).replace(microsecond=900_000)
+    _tracker_clock(triage, question_at)
+    asked = _ask(triage)
+    assert asked.status_code == 200, asked.text
+    tr._finish(triage, "failed", "no_pull_request")
+    requests = _requests(triage.work_item_id)
+
+    reply_id = _comment(triage)
+    result = _admit(triage, reply_id, question_at.replace(microsecond=0))
+
+    expected = factory_questions.answer_request_id(triage.issue, reply_id)
+    assert result == AnswerOutcome("admitted", expected, False)
+    assert [r["id"] for r in _requests(triage.work_item_id)] == [
+        *(r["id"] for r in requests),
+        expected,
+    ]
+
+
+def test_fence_orders_opaque_ids_by_the_tracker_s_question_time(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ids that carry no order, the tracker's own creation times decide.
+
+    The tracker clock runs ahead of the database's: a comment written before
+    the question is refused though its time reads later than the database
+    clock, and a reply the tracker stamps in a later second is admitted.
+    """
+
+    triage = _running(admitted, monkeypatch, 5147)
+    _opaque_ids(triage)
+    early_at = (datetime.now(UTC) + 5 * SECOND).replace(microsecond=100_000)
+    stamp = _tracker_clock(triage, early_at)
+    early_id = _comment(triage)
+    stamp[0] = early_at + SECOND / 2
+    asked = _ask(triage)
+    assert asked.status_code == 200, asked.text
+    tr._finish(triage, "failed", "no_pull_request")
+    row = _round_row(triage.work_item_id)
+    assert row is not None and row["comment_id"].startswith("comment-")
+    requests = _requests(triage.work_item_id)
+    before = _counts()
+
+    refused = _admit(triage, early_id, early_at.replace(microsecond=0))
+    assert refused == AnswerOutcome("not_after_question", None, False)
+    assert _requests(triage.work_item_id) == requests
+    assert _counts() == (before[0], before[1] + 1)
+
+    stamp[0] = early_at + SECOND
+    reply_id = _comment(triage)
+    result = _admit(triage, reply_id, (early_at + SECOND).replace(microsecond=0))
+    expected = factory_questions.answer_request_id(triage.issue, reply_id)
+    assert result == AnswerOutcome("admitted", expected, False)
 
 
 # Criterion 6: no open round, a cancelled WorkItem, and replays -------------------------
@@ -611,14 +710,14 @@ def _every_outcome(
 
     reached: list[tuple[tr._Triage, str, AnswerOutcome]] = []
 
-    def admit(triage: tr._Triage, created_at: datetime) -> None:
+    def admit(triage: tr._Triage, created_at: datetime | None) -> None:
         comment_id = _comment(triage, text)
         reached.append(
             (triage, comment_id, _admit(triage, comment_id, created_at, requester=requester))
         )
 
     asking = _asked(admitted, monkeypatch, base)
-    admit(asking, _fence(asking) - SECOND)
+    admit(asking, None)  # no creation time: not after the question
     admit(asking, _fence(asking) + SECOND)
     admit(asking, _fence(asking) + 2 * SECOND)
     settled = _settled_asked(admitted, monkeypatch, base + 1)
@@ -679,6 +778,26 @@ def test_status_line_leads_an_admitted_answer_while_waiting_and_running(
     running = _status_body(sink, result.request_id)
     assert running.startswith(ANSWER_LINE)
     assert INVESTIGATING_LINE not in running
+
+
+def test_status_line_leads_an_answer_started_request_that_settled_before_its_first_sync(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _client, _github, sink = admitted
+    triage = _settled_asked(admitted, monkeypatch, 5194)
+    _comment_id, result = _answer(triage)
+    assert result.outcome == "admitted" and result.request_id is not None
+
+    # The attempt starts and settles through the worker finish path before
+    # the reconciler first syncs its status comment.
+    started = _take_over(triage, result.request_id)
+    tr._finish(started, "failed", "no_pull_request")
+    assert _request(result.request_id)["status"] == "failed"
+    _reconcile()
+
+    body = _status_body(sink, result.request_id)
+    assert body.startswith(f"{ANSWER_LINE}\n\n")
+    assert INVESTIGATING_LINE not in body
 
 
 def test_status_line_leads_a_queued_follow_up_once_promoted(

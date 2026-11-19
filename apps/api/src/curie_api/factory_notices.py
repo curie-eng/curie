@@ -1691,17 +1691,17 @@ async def _render(
         is not None
     )
     # An answer-started request says the answer was received (#5786), first,
-    # even when it continues on an existing pull request.
+    # even when it continues on an existing pull request or has already
+    # settled by its first status sync.
     answer_started = False
     lead_line: str | None = None
     if (
-        request.terminal_at is None
-        and target.kind == "issue"
+        target.kind == "issue"
         and not is_tracker_result(request)
         and request.execution_kind != "publication_recovery"
     ):
         answer_started = await _answer_started(session, work_item.id, request.id)
-        if not continuing:
+        if request.terminal_at is None and not continuing:
             lead_line = ANSWER_RECEIVED_LINE if answer_started else INVESTIGATING_LINE
     body = status_body(
         request_id=row.execution_request_id,
@@ -1720,6 +1720,9 @@ async def _render(
         if answer_started:
             body = f"{ANSWER_RECEIVED_LINE}\n\n{body}"
         body = redact_factory_comment(body)
+    elif answer_started and (lead_line is None or result is not None):
+        # A final body carries no lead line.
+        body = redact_factory_comment(f"{ANSWER_RECEIVED_LINE}\n\n{body}")
     observation = await session.get(FactoryCiObservation, request.id)
     if observation is not None:
         until = observation.expires_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")

@@ -41,7 +41,7 @@ from datetime import datetime
 from typing import Final
 
 import httpx
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,7 +52,7 @@ from .forges.errors import ForgeError
 from .forges.ports import MarkedComments
 from .forges.registry import forges_registry
 from .forges.trackers import issue_link, reply_route
-from .forges.types import ReplyTarget, TrackerIssueRef
+from .forges.types import MarkedComment, ReplyTarget, TrackerIssueRef
 from .github_app import GitHubAppError
 from .models import (
     FACTORY_QUESTION_ROUND_LIMIT,
@@ -442,11 +442,12 @@ async def post_round(
     *,
     request_id: uuid.UUID,
     posting: Posting,
-) -> str:
+) -> MarkedComment:
     """Write the round's marked comment; outside any transaction.
 
-    Returns the tracker's comment id. Every failure, a configuration one
-    included, is `TrackerUnavailable`.
+    Returns the tracker's comment: its id and, when the tracker reports it,
+    its creation time on the tracker's clock. Every failure, a configuration
+    one included, is `TrackerUnavailable`.
     """
 
     try:
@@ -457,7 +458,7 @@ async def post_round(
             )
     except (GitHubAppError, ForgeError, ValueError, TimeoutError):
         raise TrackerUnavailable from None
-    return result.comment.id
+    return result.comment
 
 
 async def post_and_record(
@@ -476,10 +477,12 @@ async def post_and_record(
     second tracker write (decision 9). Only the question row and the count
     row are locked, never the WorkItem, so settlement and cancellation (the
     WorkItem lock, then the row) wait for at most the capped tracker write and
-    cannot deadlock with it. ``answer_after`` is the database clock read by
-    the UPDATE after the write returned (``clock_timestamp()``, not the
-    transaction start), so no comment written before the question can pass
-    the fence. A tracker failure rolls back and leaves the round ``posting``.
+    cannot deadlock with it. ``comment_id`` and ``answer_after`` are the
+    question comment's tracker id and its creation time on the tracker's own
+    clock, the boundary the answer fence compares against. A tracker that
+    reports no creation time falls back to the database clock read by the
+    UPDATE after the write returned (``clock_timestamp()``). A tracker
+    failure rolls back and leaves the round ``posting``.
     """
 
     work_item_id = posting.work_item.id
@@ -499,7 +502,7 @@ async def post_and_record(
             # Read before the UPDATE: the session synchronizes ``row`` with it.
             posted = row.rounds_used + 1
             try:
-                comment_id = await post_round(
+                question = await post_round(
                     settings, client, request_id=request_id, posting=posting
                 )
             except TrackerUnavailable:
@@ -510,9 +513,13 @@ async def post_and_record(
                 .where(FactoryQuestionRound.work_item_id == work_item_id)
                 .values(
                     state=OUTSTANDING,
-                    comment_id=comment_id,
+                    comment_id=question.id,
                     rounds_used=posted,
-                    answer_after=func.clock_timestamp(),
+                    answer_after=(
+                        func.clock_timestamp()
+                        if question.created_at is None
+                        else question.created_at
+                    ),
                     version=FactoryQuestionRound.version + 1,
                     updated_at=func.clock_timestamp(),
                 )
@@ -749,14 +756,12 @@ def _after_fence(
     """Whether a comment was created after the current question (decision 3).
 
     A missing time, a time with no zone, or a row with no fence fails closed.
-    When the comment and the question comment both carry the tracker's
-    ordered numeric ids, the ids decide: a tracker reports creation times in
-    whole seconds on its own clock, while ``answer_after`` is the database
-    clock with microseconds, so a reply posted in the same second as the
-    question would read as older, and a comment written before the question
-    would read as newer whenever the tracker's clock runs ahead. The time
-    then only has to fall in or after the question's second. Without
-    comparable ids the time alone decides, refusing a tie.
+    The boundary is the tracker's own: the question comment's id and its
+    creation time on the tracker's clock. When the comment and the question
+    comment both carry the tracker's ordered numeric ids, the ids alone
+    decide, since a tracker reports creation times in whole seconds, so a
+    reply in the question's own second ties. Without comparable ids the
+    tracker's creation times decide, refusing a tie.
     """
 
     if created_at is None or answer_after is None:
@@ -766,7 +771,7 @@ def _after_fence(
     answer_order = _comment_order(comment_id)
     question_order = _comment_order(question_comment_id)
     if answer_order is not None and question_order is not None:
-        return answer_order > question_order and created_at >= answer_after.replace(microsecond=0)
+        return answer_order > question_order
     return created_at > answer_after
 
 
@@ -886,12 +891,26 @@ async def _decide(session: AsyncSession, work_item: WorkItem, facts: AnswerFacts
         return AnswerOutcome(NOT_AFTER_QUESTION, None, False)
     seen_version, seen_state, seen_pending = row.version, row.state, row.pending_request_id
     pending = seen_pending
-    pending_status = (
-        await session.scalar(select(ExecutionRequest.status).where(ExecutionRequest.id == pending))
+    # A waiting request past its wait deadline can no longer be claimed; the
+    # expiry sweep (on the same clock) ends it, so an answer never coalesces
+    # into it.
+    from .workitems.lifecycle import database_now
+
+    startable = (
+        await session.scalar(
+            select(ExecutionRequest.id).where(
+                ExecutionRequest.id == pending,
+                ExecutionRequest.status.in_(_NOT_STARTED),
+                or_(
+                    ExecutionRequest.wait_deadline.is_(None),
+                    ExecutionRequest.wait_deadline > await database_now(session),
+                ),
+            )
+        )
         if pending is not None
         else None
     )
-    if pending_status in _NOT_STARTED:
+    if startable is not None:
         result = AnswerOutcome(COALESCED, None, False)
     else:
         pending = answer_request_id(work_item.tracker_issue, facts.comment_id)
