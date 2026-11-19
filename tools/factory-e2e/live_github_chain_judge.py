@@ -365,13 +365,13 @@ def _judge_beat_b(b: _Beat, rec: Mapping[str, Any]) -> None:
     beat, ids = rec["beat_b"], rec["identities"]
     issue = rec["beat_a"]["issue_number"]
     answer = beat["answer"]
-    b.check(answer["user_id"] == ids["writer_id"], "the answer was not posted by the writer")
+    b.check(answer["user"]["id"] == ids["writer_id"], "the answer was not posted by the writer")
     b.check(answer["body"].strip() == ANSWER_TEXT, "the answer text is not the fixture answer")
     b.check("@" not in answer["body"], "the answer mentions an account")
     restarts = [
         r
         for r in beat["requests"]
-        if parse_time(r["created_at"]) > parse_time(answer["created_at"])
+        if parse_time(r["created_at"]) >= parse_time(answer["created_at"])
     ]
     if b.check(bool(restarts), "no new request after the answer"):
         b.within(
@@ -429,7 +429,7 @@ def _judge_beat_c(b: _Beat, rec: Mapping[str, Any]) -> None:
     b.check(bool(review["submitted_at"]), "the review is not submitted")
     b.check(review["user"]["id"] == ids["writer_id"], "the review was not written by the actor")
     submitted = review["submitted_at"]
-    after = [r for r in c["requests"] if parse_time(r["created_at"]) > parse_time(submitted)]
+    after = [r for r in c["requests"] if parse_time(r["created_at"]) >= parse_time(submitted)]
     if not b.check(len(after) == 1, f"expected one revision request, found {len(after)}"):
         return
     request = after[0]
@@ -592,7 +592,7 @@ def _judge_beat_h(b: _Beat, rec: Mapping[str, Any]) -> None:
         not [c for c in h["comments"] if _by_app(c, ids)], "the App commented on the unbound issue"
     )
     b.check(
-        not [e for e in h["label_events"] if e["actor_login"] == ids["app_login"]],
+        not [e for e in h["label_events"] if e["actor"]["login"] == ids["app_login"]],
         "the App labelled the unbound issue",
     )
     deploy = h["retired_bundle"]

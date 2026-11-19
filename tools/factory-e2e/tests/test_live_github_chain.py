@@ -582,7 +582,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         [
             (
                 "beat_h/label_events",
-                [{"label": "curie-factory:queued", "actor_login": "fixture-app[bot]"}],
+                [{"label": "curie-factory:queued", "actor": {"login": "fixture-app[bot]"}}],
             )
         ],
         "beat_h",

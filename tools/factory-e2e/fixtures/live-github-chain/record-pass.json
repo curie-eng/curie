@@ -73,7 +73,9 @@
       "id": 3,
       "body": "Show 2 decimal places in the CLI output.",
       "created_at": "2030-01-01T00:10:00Z",
-      "user_id": 9000001
+      "user": {
+        "id": 9000001
+      }
     },
     "requests": [
       {
@@ -320,7 +322,9 @@
     "label_events": [
       {
         "label": "factory-unbound-run1",
-        "actor_login": "fixture-writer"
+        "actor": {
+          "login": "fixture-writer"
+        }
       }
     ],
     "retired_bundle": {
