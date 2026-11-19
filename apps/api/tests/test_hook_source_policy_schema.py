@@ -241,7 +241,8 @@ def test_source_policy_additive_upgrade_preserves_existing_agent(
     assert len(before) == len(after) == 1
     # Deploy notifications and the reviewer model, then tenant scope and bot
     # identity (#2911), the connector requester identity flag (0151), then the
-    # factory Slack progress destination (#5414).
+    # factory Slack progress destination (#5414), then the learned memory rule
+    # proposal switch (#5795).
     added = {
         "deploy_notifications": False,
         "reviewer_model": None,
@@ -255,6 +256,7 @@ def test_source_policy_additive_upgrade_preserves_existing_agent(
         "connector_requester_identity_version": 1,
         "factory_slack_channel": None,
         "factory_slack_since": None,
+        "memory_rule_proposals": False,
     }
     assert not set(added) & set(before[0])
     assert set(after[0]) == set(before[0]) | set(added)

@@ -608,6 +608,153 @@ async def settle_terminal(
         await transcripts.expire_for_work_item(session, work_item)
 
 
+async def question_rounds_to_redrive(session: AsyncSession, *, limit: int) -> list[uuid.UUID]:
+    """WorkItems whose question round an older API replica settled past."""
+
+    return await factory_questions.rows_an_older_replica_settled(
+        session, unpublished_causes=_UNPUBLISHED_CAUSES, limit=limit
+    )
+
+
+async def redrive_question_round(session: AsyncSession, *, work_item_id: uuid.UUID) -> None:
+    """Apply the round settlement an older API replica skipped (#5785).
+
+    The API rolls one replica at a time, so during an upgrade a replica built
+    before the question rounds can settle, cancel or expire a request whose
+    round a new replica posted. It runs the same transitions without the
+    round hooks: its finish leaves an asker that ended without a pull
+    request ``failed`` instead of with the question ending, and its
+    cancellation keeps the row. Under the WorkItem lock, and only while the
+    row is still one the selection names, this applies what the settlement on
+    this version would have:
+
+    1. A cancelled WorkItem's row is deleted, as its cancellation would.
+    2. An asker whose posted round is current and that failed with an
+       unpublished cause takes the question ending after all: ``completed``
+       with ``questions_asked``, and its status comment is reopened to say
+       so. Not when a publication owns its terminus, or when a request other
+       than the round's queued answer was admitted after it and has not
+       ended (a retry the older replica started): the attempt continues, so
+       converting would start a second one.
+       This holds too when the queued answer already ran and settled here,
+       which left the row ``cleared``.
+    3. ``settle_round`` then runs for the terminal asker, and for the
+       terminal queued answer of an ``answered`` row, exactly as at
+       settlement.
+    4. The status label recorded for the converted asker and for that answer
+       is forgotten, so the status pass writes the ticket's label again: an
+       older pass records labels while keeping ``curie-factory:questions``,
+       which it does not know, on the ticket.
+
+    The caller commits.
+    """
+
+    work_item = await lock_work_item(session, work_item_id)
+    if work_item is None:
+        return
+    row = await factory_questions.locked_round(session, work_item_id)
+    if row is None:
+        return
+    # Selected before the lock: a relabel and a new ask since then make the
+    # row a new round this version settles itself.
+    if not await factory_questions.rows_an_older_replica_settled(
+        session, unpublished_causes=_UNPUBLISHED_CAUSES, limit=1, work_item_id=work_item_id
+    ):
+        return
+    if work_item.cancelled_at is not None:
+        await factory_questions.delete_for_cancellation(session, work_item_id)
+        return
+    pending_id = row.pending_request_id
+    answered = row.state == factory_questions.ANSWERED
+    posted = row.state in (factory_questions.OUTSTANDING, factory_questions.ANSWERED) or (
+        row.state == factory_questions.CLEARED and row.comment_id is not None
+    )
+    converted = False
+    asker = await lock_request(session, work_item_id=work_item_id, request_id=row.asking_request_id)
+    if asker is not None and asker.terminal_at is not None:
+        if posted and await _older_question_ending(session, work_item, asker, pending_id):
+            converted = True
+            await session.execute(
+                update(ExecutionRequest)
+                .where(
+                    ExecutionRequest.id == asker.id,
+                    ExecutionRequest.version == asker.version,
+                    ExecutionRequest.status == "failed",
+                )
+                .values(
+                    status="completed",
+                    terminal_cause=factory_questions.QUESTIONS_ASKED,
+                    version=ExecutionRequest.version + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+            )
+            await session.execute(
+                update(FactoryStatusComment)
+                .where(FactoryStatusComment.execution_request_id == asker.id)
+                .values(
+                    terminal_cause=factory_questions.QUESTIONS_ASKED,
+                    applied_label=None,
+                    finalized_at=case(
+                        (FactoryStatusComment.refused_at.is_(None), None),
+                        else_=FactoryStatusComment.finalized_at,
+                    ),
+                    sync_invalidated=FactoryStatusComment.sync_owner.is_not(None),
+                )
+            )
+            asker = await reload_request(session, asker.id)
+        if row.state != factory_questions.CLEARED:
+            await factory_questions.settle_round(session, work_item, asker)
+    if pending_id is None or asker is None or pending_id == asker.id:
+        return
+    pending = await reload_request(session, pending_id)
+    # Only this round's answer: a relabel that superseded an earlier round's
+    # answer leaves that request, ended before this round was posted, on its
+    # row.
+    if (
+        pending.terminal_at is None
+        or row.answer_after is None
+        or pending.terminal_at <= row.answer_after
+    ):
+        return
+    if answered:
+        await factory_questions.settle_round(session, work_item, pending)
+    elif not converted:
+        return
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(FactoryStatusComment.execution_request_id == pending.id)
+        .values(applied_label=None)
+    )
+
+
+async def _older_question_ending(
+    session: AsyncSession,
+    work_item: WorkItem,
+    asker: ExecutionRequest,
+    pending_id: uuid.UUID | None,
+) -> bool:
+    """Whether a terminal asker earned the question ending its settlement skipped."""
+
+    if (
+        asker.status != "failed"
+        or (asker.terminal_cause or "").strip() not in _UNPUBLISHED_CAUSES
+        or asker.completion_contract == CONTRACT_TRACKER_RESULT
+    ):
+        return False
+    if await _publication_owns_terminus(session, work_item, asker):
+        return False
+    # A later request that already ended continued nothing: a queued mention
+    # can run, and ask, after a higher-sequence relabel ended.
+    later = select(ExecutionRequest.id).where(
+        ExecutionRequest.work_item_id == work_item.id,
+        ExecutionRequest.sequence > asker.sequence,
+        ExecutionRequest.terminal_at.is_(None),
+    )
+    if pending_id is not None:
+        later = later.where(ExecutionRequest.id != pending_id)
+    return await session.scalar(later.limit(1)) is None
+
+
 CancellationCause = Literal["issue_cancelled", "issue_deleted"]
 
 
@@ -2679,6 +2826,11 @@ async def readmit(
             .limit(1)
         )
         return await outcome(session, work_item, predecessor, replayed=True)
+    if work_item.cancelled_at is not None:
+        # A cancellation deletes the question row, but one an older API
+        # replica took during a rolling upgrade kept it; the relabel must not
+        # inherit the cancelled round (#5785).
+        await factory_questions.delete_for_cancellation(session, work_item_id)
     now = await database_now(session)
     moving = await session.scalar(
         select(FactoryBaseTransition)
@@ -2835,6 +2987,9 @@ async def admit_pending_readmit(
     if active is not None and active.status != "waiting":
         await session.commit()
         return None
+    if work_item.cancelled_at is not None:
+        # As in readmit: drop a round an older replica's cancellation kept.
+        await factory_questions.delete_for_cancellation(session, work_item_id)
     moving = await session.scalar(
         select(FactoryBaseTransition.id)
         .where(
