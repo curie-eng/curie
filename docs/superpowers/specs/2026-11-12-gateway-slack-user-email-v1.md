@@ -85,38 +85,57 @@ set, the gateway receives it as `CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN`. When
 unset, nothing changes. The operator gives the same value to the identity
 provider.
 
-## 7. A lookup-only Slack identity
+## 7. Lookup identities
 
 <!-- @spec GATEWAY-USER-EMAIL-7 -->
-An operator may give the lookup its own Slack app instead of adding
-`users:read.email` to an agent's bot app. A declared Slack identity
+An operator may give directory reads their own provider credential instead of
+adding a directory scope to an agent's app. A declared Slack identity
 (`CURIE_SLACK_IDENTITIES`) needs an app token and Socket Mode, which a
-directory-lookup app has no use for, so the gateway accepts one optional
-lookup-only identity: `CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY` names
-it and `CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN` holds its bot token
-(scopes `users:read` and `users:read.email`). The gateway hands that token to
-the `user_email` read and to nothing else: replies, group membership, file
-fetches, channel and canvas reads, sender identities and account profiles
-never see it, and the dispatcher, API and worker never receive it. A
-`user_email` request naming the lookup identity reads `users.info` with that
-token, under the same answers and refusals as sections 2, 3 and 5; every other
-operation naming it answers as for an unknown identity.
-
-The gateway refuses to start when only one of the two settings is set, when
-the name does not match the Slack identity name pattern of
-`aci_protocol.slack_identities`, or when it equals `default` or any declared
-identity's name. When neither is set, every identity and read behaves as
-before. The `token_custody.refuse_slack_tokens` check refuses the bot token
-setting in any process that consumes gateway ports.
-
-## 8. Chart: lookup-only identity
+directory-lookup app has no use for, so the gateway accepts a separate
+declaration, `CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES`: a JSON list of
+`{"name", "kind", "token_env"}` entries, defined in
+`curie_channel_gateway.lookup_identities`. `name` follows the Slack identity
+name pattern of `aci_protocol.slack_identities`. `kind` names the provider;
+`slack` is the only kind, a bot token with `users:read` and
+`users:read.email`. `token_env` names the variable holding the credential and
+must be `CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__<index>`. An entry carries no other
+field. Adding a kind adds one adapter and one registry entry in the gateway
+and leaves the declaration's shape unchanged.
 
 <!-- @spec GATEWAY-USER-EMAIL-8 -->
-`channelGateway.identityLookup.slackIdentity`,
-`channelGateway.identityLookup.slackBotTokenExistingSecret` and
-`channelGateway.identityLookup.slackBotTokenKey` (default `token`) render the
-section 7 settings into the gateway workload only, reading the bot token from
-the named operator-supplied Secret. Setting the Secret without the identity
-name, or an empty key, fails the render. When the Secret is unset, the
-rendered manifests are unchanged and no other workload receives either
-setting.
+A lookup identity's credential reaches directory reads only, which today is
+the `user_email` read of sections 2 and 3. Replies, group membership, file
+fetches, channel and canvas reads, sender identities, account profiles,
+preflight and the dispatcher never receive it, and every other operation
+naming a lookup identity answers as for an unknown identity. A `user_email`
+request resolves its identity across the declared Slack identities and the
+lookup identities; for a lookup identity it reads with that identity's kind
+adapter and credential, under the same answers, refusals and logging rules as
+sections 2, 3 and 5.
+
+<!-- @spec GATEWAY-USER-EMAIL-9 -->
+The gateway refuses to start when the declaration is not a JSON list of such
+entries, when two entries share a name or a `token_env`, when a name is
+`default`, `curie-cluster-message` or a declared Slack identity's name, when a
+kind is not supported (the refusal names the supported kinds), or when a
+declared `token_env` is unset or blank. No refusal echoes a credential. When
+the declaration is absent or empty, every identity and read behaves as
+before.
+
+<!-- @spec GATEWAY-USER-EMAIL-10 -->
+`token_custody.refuse_slack_tokens` refuses any variable named with the
+`CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__` prefix in every process that consumes
+gateway ports, and the worker drops that prefix from every agent child
+environment.
+
+## 8. Chart: lookup identities
+
+<!-- @spec GATEWAY-USER-EMAIL-11 -->
+`channelGateway.lookupIdentities` (default `[]`) lists
+`{name, kind, existingSecret, key}` entries, `key` defaulting to `token`;
+`values.schema.json` limits `kind` to the supported kinds. For a non-empty
+list the chart renders `CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES` and one
+`CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__<index>` per entry, read from that entry's
+operator-supplied Secret, into the gateway workload only. A repeated or
+reserved name fails the render. An empty list renders the manifests unchanged
+and no other workload receives either variable.
