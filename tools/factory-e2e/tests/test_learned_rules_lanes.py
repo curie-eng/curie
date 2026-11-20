@@ -479,3 +479,43 @@ def test_a_replayed_revision_quoting_the_stub_address_matches_its_recording(
     else:
         assert status == 422
         assert router.lanes[("implementation", lrl.TICKETS["a"])].used == set()
+
+
+def _reminder(branch_id: str) -> str:
+    # The git status a Claude Code session opens with, on the published branch.
+    return (
+        "<system-reminder>\n# gitStatus\n"
+        f"Current branch: curie/publication-{branch_id}\n\nStatus:\n(clean)\n"
+        f"Review {BASE}/{REPO}/pull/{PULLS['a']} for #3815.\n</system-reminder>"
+    )
+
+
+@pytest.mark.parametrize("normalized", [True, False])
+def test_a_replayed_session_on_a_new_publication_branch_matches_its_recording(
+    model_module: Any, tmp_path: Path, normalized: bool
+) -> None:
+    recorded, replayed = "d0605405adc24aed96c7474fd3fd10a6", "b35a907c279549cbaae61aa75eeef074"
+    exchange = {
+        "lane_key": model_module.scrub(_reminder(recorded)),
+        "ordinal": 0,
+        "message": _message("a-review-0"),
+    }
+    paths = lrl.transcript_paths(_empty_transcript(tmp_path, model_module))
+    for letter, path in paths.items():
+        model_module.dump_transcript(path, [exchange] if letter == "a" else [])
+    router = lrl.build_router(model_module, paths, lambda _request: lrl.TICKETS["a"])
+    if not normalized:
+        router.normalize_key = None
+    model_module.dump_transcript(tmp_path / "empty.json", [])
+    script = model_module.ModelScript(tmp_path / "empty.json")
+    router.install(script, model_module, fallback=False)
+    script.start()
+    try:
+        status, body = _post(script.base_url, _body(_reminder(replayed)))
+    finally:
+        script._server.shutdown()
+        script._server.server_close()
+    if normalized:
+        assert status == 200 and body["content"][0]["text"] == "a-review-0"
+    else:
+        assert status == 422

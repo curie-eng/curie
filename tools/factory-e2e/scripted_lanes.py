@@ -148,7 +148,7 @@ class LaneRouter:
         default_agent: str = IMPLEMENTATION,
         *,
         issue_of: Callable[[dict[str, Any]], int | None] = request_issue,
-        normalize: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        normalize_key: Callable[[str], str] | None = None,
     ) -> None:
         # No marker at all is a router of one agent: every request is the default
         # agent's, and the lanes tell its issues apart.
@@ -157,9 +157,9 @@ class LaneRouter:
         self.agent_markers = dict(agent_markers)
         self.default_agent = default_agent
         self.issue_of = issue_of
-        # Applied to a request before its key is computed, so a replay can undo the
-        # live address a recording replaced with a placeholder outside any URL.
-        self.normalize = normalize
+        # Applied to both lane keys before they are compared, for run-specific text
+        # the model server's scrub keeps (an address outside a URL, a branch id).
+        self.normalize_key = normalize_key
         self.lanes: dict[tuple[str, int], Lane] = {}
         self.unrouted: list[dict[str, Any]] = []
         self.hooks: list[Callable[[Lane, int], None]] = []
@@ -226,10 +226,14 @@ class LaneRouter:
                 self.unrouted.append({"agent": self.agent_of(request), "issue": None})
                 return None
             return self._fallback(method, path, body)
-        keyed = request if self.normalize is None else self.normalize(request)
-        wanted = self._request_key(keyed)
+        wanted = self._request_key(request)
+        normalize = self.normalize_key or (lambda key: key)
+        if wanted is not None:
+            wanted = (normalize(wanted[0]), wanted[1])
         for index, exchange in enumerate(lane.exchanges):
-            if index in lane.used or (exchange["lane_key"], exchange["ordinal"]) != wanted:
+            if index in lane.used:
+                continue
+            if (normalize(exchange["lane_key"]), exchange["ordinal"]) != wanted:
                 continue
             answer = copy.deepcopy(exchange)
             encoded = json.dumps(answer["message"])

@@ -18,6 +18,10 @@ from typing import Any
 
 import scripted_lanes as lanes
 
+# publication_branch_name: the default prefix and the lineage id hex, new each run.
+PUBLICATION_BRANCH = re.compile(r"curie/publication-[0-9a-f]{32}\b")
+PUBLICATION_BRANCH_PLACEHOLDER = "curie/publication-<branch>"
+
 TICKETS: dict[str, int] = {"a": 3815, "b": 3921, "c": 3922}
 _BY_NUMBER = {number: letter for letter, number in TICKETS.items()}
 _ISSUE_OR_PULL = re.compile(r"/(?:issues|pull)/(\d+)")
@@ -85,18 +89,21 @@ def build_router(
     identity: Callable[[dict[str, Any]], int | None],
     replacements: dict[str, str] | None = None,
 ) -> lanes.LaneRouter:
-    """Lanes A, B and C. ``replacements`` are the ones the recording applied to its
-    transcripts; a request gets the same before its key is computed, because a
-    pull request body quotes the stub's address outside any URL the key scrubs."""
+    """Lanes A, B and C, compared on keys with run-specific text normalized.
 
-    normalize = None
-    if replacements:
-        table = dict(replacements)
+    ``replacements`` are the ones the recording applied to its transcripts; a pull
+    request body quotes the stub's address outside any URL the key scrub covers.
+    The published branch id is random per run and appears in a session's git status.
+    """
 
-        def normalize(request: dict[str, Any]) -> dict[str, Any]:
-            return dict(scrub_recording([request], table)[0])
+    table = dict(replacements or {})
 
-    router = lanes.LaneRouter({}, issue_of=identity, normalize=normalize)
+    def normalize(key: str) -> str:
+        for old, new in table.items():
+            key = key.replace(old, new)
+        return PUBLICATION_BRANCH.sub(PUBLICATION_BRANCH_PLACEHOLDER, key)
+
+    router = lanes.LaneRouter({}, issue_of=identity, normalize_key=normalize)
     for letter, number in TICKETS.items():
         exchanges = model_module.load_transcript(transcripts[letter])
         router.add(
