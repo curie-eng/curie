@@ -340,6 +340,51 @@ def test_github_link_creates_once_revokes_and_keeps_secrets_out(
     assert USER_TOKEN not in text and CLIENT_SECRET not in text
 
 
+def test_github_link_start_sweeps_consumed_and_expired_state(
+    github_link_api: tuple[TestClient, GitHub],
+    github_link_owners: list[support.Owner],
+) -> None:
+    """#5829: every start sweeps dead one-use state in its own transaction.
+
+    A consumed row and an expired row are dead whichever principal owns them,
+    while another principal's live unconsumed row survives the sweep. The
+    callback drops its own row once its consume succeeded.
+    """
+    api, _github = github_link_api
+    owner, other = github_link_owners
+    surviving = start(api, other)
+    consumed = hashlib.sha256(b"consumed-example-state").hexdigest()
+    expired = hashlib.sha256(b"expired-example-state").hexdigest()
+    sql_rows(
+        "INSERT INTO curie.github_link_states "
+        "(state_hash, tenant_id, principal_id, expires_at, consumed_at) "
+        "VALUES (:hash, :tenant, :principal, now() + interval '10 minutes', now())",
+        {"hash": consumed, "tenant": owner.tenant_id, "principal": owner.principal_id},
+    )
+    sql_rows(
+        "INSERT INTO curie.github_link_states "
+        "(state_hash, tenant_id, principal_id, expires_at, consumed_at) "
+        "VALUES (:hash, :tenant, :principal, now() - interval '1 minute', NULL)",
+        {"hash": expired, "tenant": owner.tenant_id, "principal": owner.principal_id},
+    )
+    state = start(api, owner)
+    remaining = {
+        row["state_hash"] for row in sql_dicts("SELECT state_hash FROM curie.github_link_states")
+    }
+    assert consumed not in remaining
+    assert expired not in remaining
+    assert hashlib.sha256(surviving.encode()).hexdigest() in remaining
+    assert hashlib.sha256(state.encode()).hexdigest() in remaining
+    assert callback(api, state, owner).headers["location"].endswith("github=linked")
+    assert (
+        sql_dicts(
+            "SELECT * FROM curie.github_link_states WHERE state_hash = :hash",
+            {"hash": hashlib.sha256(state.encode()).hexdigest()},
+        )
+        == []
+    )
+
+
 @pytest.mark.parametrize(
     "failure",
     [
