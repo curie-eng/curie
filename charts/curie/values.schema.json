@@ -253,16 +253,33 @@
             "timeoutSeconds": {
               "type": "number",
               "exclusiveMinimum": 0
-            },
-            "slackIdentity": {
-              "type": "string"
-            },
-            "slackBotTokenExistingSecret": {
-              "type": "string"
-            },
-            "slackBotTokenKey": {
-              "type": "string",
-              "minLength": 1
+            }
+          }
+        },
+        "lookupIdentities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "kind", "existingSecret"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+                "maxLength": 40,
+                "not": {"enum": ["default", "curie-cluster-message"]}
+              },
+              "kind": {
+                "enum": ["slack"]
+              },
+              "existingSecret": {
+                "type": "string",
+                "minLength": 1
+              },
+              "key": {
+                "type": "string",
+                "minLength": 1
+              }
             }
           }
         },

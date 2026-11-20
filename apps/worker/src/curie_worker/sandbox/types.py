@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from aci_protocol import BootEnv
 from aci_protocol.service_config import API_KEY_ENV
 from aci_protocol.slack_identities import SLACK_CREDENTIAL_ENV_PREFIXES
+from curie_channel_gateway.token_custody import LOOKUP_TOKEN_ENV_PREFIX
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT
 from plugin_format import is_reserved_boot_env_name
 
@@ -168,10 +169,14 @@ HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
     }
 )
 
-#: A second Slack identity's tokens are indexed (ADR-0168 decision 1), so they
-#: are matched by prefix rather than listed. Every name here is under ``CURIE_``,
-#: which a connector secret may never declare, so no marker readmits one.
-HOST_APPLICATION_CREDENTIAL_ENV_PREFIXES: tuple[str, ...] = SLACK_CREDENTIAL_ENV_PREFIXES
+#: A second Slack identity's tokens are indexed (ADR-0168 decision 1), and so
+#: is a gateway lookup identity's credential (@spec GATEWAY-USER-EMAIL-10), so
+#: they are matched by prefix rather than listed. Every name here is under
+#: ``CURIE_``, which a connector secret may never declare, so no marker readmits one.
+HOST_APPLICATION_CREDENTIAL_ENV_PREFIXES: tuple[str, ...] = (
+    *SLACK_CREDENTIAL_ENV_PREFIXES,
+    LOOKUP_TOKEN_ENV_PREFIX,
+)
 
 
 def _is_host_application_credential(name: str) -> bool:

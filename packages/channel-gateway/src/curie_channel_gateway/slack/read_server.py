@@ -1,23 +1,24 @@
 """Standalone Slack gateway process; application services hold only caller credentials."""
 
 import logging
-import re
 import ssl
 from importlib.metadata import version
 from pathlib import Path
 
 import httpx
-from aci_protocol.slack_identities import (
-    IDENTITY_NAME_MAX_LENGTH,
-    IDENTITY_NAME_PATTERN,
-    declared_slack_identity_names,
-)
-from aci_protocol.turn import CLUSTER_MESSAGE_ADAPTER, DEFAULT_IDENTITY
+from aci_protocol.slack_identities import declared_slack_identity_names
 from aiohttp import web
 from curie_telemetry import bootstrap_service_telemetry
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ..lookup_identities import (
+    LOOKUP_IDENTITIES_ENV,
+    DirectoryEmails,
+    LookupIdentities,
+    LookupSourceFactory,
+    lookup_email_sources,
+)
 from ..read_transport import GatewayProviders, gateway_application
 from ..reply_delivery import ReplyDeliveryStore
 from ..request_replay import RequestReplayStore
@@ -48,14 +49,8 @@ class GatewayConfig(BaseSettings):
     user_email_timeout_s: float = Field(
         default=5.0, gt=0, validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S"
     )
-    # Optional lookup-only Slack identity for the user_email read alone
-    # (@spec GATEWAY-USER-EMAIL-7).
-    user_email_slack_identity: str = Field(
-        default="", validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY"
-    )
-    user_email_slack_bot_token: str = Field(
-        default="", validation_alias="CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN", repr=False
-    )
+    # Credentials for directory reads alone (@spec GATEWAY-USER-EMAIL-7).
+    lookup_identities: LookupIdentities = Field(default=(), validation_alias=LOOKUP_IDENTITIES_ENV)
     host: str = Field(default="0.0.0.0", validation_alias="CURIE_CHANNEL_GATEWAY_HOST")
     port: int = Field(default=8081, validation_alias="CURIE_CHANNEL_GATEWAY_PORT")
     allow_insecure_http: bool = Field(
@@ -83,44 +78,35 @@ def gateway_callers(config: GatewayConfig) -> dict[str, str]:
     return callers
 
 
-def user_email_tokens(
-    config: GatewayConfig, slack: SlackProviderConfig, tokens: dict[str, str]
-) -> dict[str, str]:
-    """The bot tokens the user_email read may use (@spec GATEWAY-USER-EMAIL-7).
+def lookup_registry(
+    config: GatewayConfig, http: httpx.AsyncClient
+) -> dict[str, LookupSourceFactory]:
+    """Each lookup identity kind's directory adapter (@spec GATEWAY-USER-EMAIL-7)."""
 
-    The declared identities' tokens, plus the lookup-only identity when one is
-    configured. Only ``SlackUserEmails`` receives this mapping.
-    """
+    def slack(name: str, token: str) -> SlackUserEmails:
+        return SlackUserEmails(
+            http,
+            {name: token},
+            base_url=config.slack_api_base_url or None,
+            timeout_s=config.user_email_timeout_s,
+        )
 
-    name = config.user_email_slack_identity
-    token = config.user_email_slack_bot_token
-    if not name and not token:
-        return tokens
-    if not name.strip() or not token.strip():
-        raise ValueError(
-            "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY and "
-            "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN must be set together"
-        )
-    if len(name) > IDENTITY_NAME_MAX_LENGTH or not re.fullmatch(IDENTITY_NAME_PATTERN, name):
-        raise ValueError(
-            "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY must match the Slack identity "
-            "name pattern"
-        )
-    reserved = {DEFAULT_IDENTITY, CLUSTER_MESSAGE_ADAPTER} | declared_slack_identity_names(
-        slack.slack_identities
-    )
-    if name in reserved:
-        raise ValueError(
-            "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY must not name a declared or "
-            "reserved Slack identity"
-        )
-    return {**tokens, name: token}
+    return {"slack": slack}
 
 
 async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.Application:
     tokens = slack_bot_tokens(slack)
-    email_tokens = user_email_tokens(config, slack, tokens)
     http = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    try:
+        # @spec GATEWAY-USER-EMAIL-8, -9: only the user email read sees these.
+        lookups = lookup_email_sources(
+            config.lookup_identities,
+            registry=lookup_registry(config, http),
+            declared=declared_slack_identity_names(slack.slack_identities),
+        )
+    except Exception:
+        await http.aclose()
+        raise
     sink = SlackReplyAdapter(
         tokens.get("default", ""),
         identity_tokens=tokens,
@@ -149,11 +135,14 @@ async def application(config: GatewayConfig, slack: SlackProviderConfig) -> web.
                 channel=SlackChannelReader(http, tokens),
                 canvas=SlackCanvasReader(http, tokens),
                 senders=SlackSenderIdentities(tokens, base_url=config.slack_api_base_url or None),
-                emails=SlackUserEmails(
-                    http,
-                    email_tokens,
-                    base_url=config.slack_api_base_url or None,
-                    timeout_s=config.user_email_timeout_s,
+                emails=DirectoryEmails(
+                    SlackUserEmails(
+                        http,
+                        tokens,
+                        base_url=config.slack_api_base_url or None,
+                        timeout_s=config.user_email_timeout_s,
+                    ),
+                    lookups,
                 ),
                 profiles=SlackAccountProfiles(
                     http, tokens, base_url=config.slack_api_base_url or None

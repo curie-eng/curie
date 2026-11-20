@@ -2439,14 +2439,17 @@ bounds each Slack call. That caller can only read a user's email. Restart the
 gateway after rotating the Secret. See the
 [http identity operator guide](../../docs/http-identity-operator.md).
 
-The lookup reads Slack with a declared identity's bot token unless it has its
-own Slack app. `channelGateway.identityLookup.slackBotTokenExistingSecret`
-names a Secret whose `slackBotTokenKey` (default `token`) holds a bot token
-with `users:read` and `users:read.email` only, and
-`channelGateway.identityLookup.slackIdentity` names that lookup-only identity,
-which must not be a declared Slack identity. Only the gateway workload
-receives them, and only its user email read uses the token. The provider sets
-`CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY` to the same name.
+`channelGateway.lookupIdentities` (default `[]`) gives directory reads their
+own provider credentials, so no agent's app needs a directory scope. Each
+entry is `{name, kind, existingSecret, key}`: `name` follows the Slack
+identity name pattern and must not be `default` or a declared Slack identity,
+`kind` is `slack` (a bot-token-only app with `users:read` and
+`users:read.email`), and `existingSecret` names a Secret whose `key` (default
+`token`) holds the credential. The chart renders
+`CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES` and one
+`CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__<index>` per entry into the gateway alone,
+and only its user email read uses them. The provider sets
+`CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY` to the entry's name.
 
 An external gateway uses `channelGateway.url`; configure separate
 `channelGateway.apiToken` and `channelGateway.workerToken`. For a private CA,

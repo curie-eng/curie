@@ -104,16 +104,29 @@ spec:
             - name: CURIE_CHANNEL_GATEWAY_USER_EMAIL_TIMEOUT_S
               value: {{ $gateway.identityLookup.timeoutSeconds | quote }}
             {{- end }}
-            {{- with $gateway.identityLookup.slackBotTokenExistingSecret }}
-            # Optional lookup-only Slack identity: its bot token serves the
-            # user_email read and nothing else in the gateway.
-            - name: CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY
-              value: {{ required "channelGateway.identityLookup.slackIdentity must name the lookup-only Slack identity when slackBotTokenExistingSecret is set" $gateway.identityLookup.slackIdentity | quote }}
-            - name: CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN
+            {{- with $gateway.lookupIdentities }}
+            {{- $declared := list }}
+            {{- $seen := dict }}
+            {{- range $identity := $identities.items }}
+            {{- $_ := set $seen $identity.name "a declared Slack identity" }}
+            {{- end }}
+            {{- range $index, $lookup := . }}
+            {{- if hasKey $seen $lookup.name }}
+            {{- fail (printf "channelGateway.lookupIdentities[%d].name %q repeats %s; lookup identity names are unique and distinct from declared Slack identities." $index $lookup.name (get $seen $lookup.name)) }}
+            {{- end }}
+            {{- $_ := set $seen $lookup.name (printf "channelGateway.lookupIdentities entry %d" $index) }}
+            {{- $declared = append $declared (dict "name" $lookup.name "kind" $lookup.kind "token_env" (printf "CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__%d" $index)) }}
+            {{- end }}
+            # Lookup identities: credentials for the gateway's directory reads alone.
+            - name: CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES
+              value: {{ $declared | toJson | quote }}
+            {{- range $index, $lookup := . }}
+            - name: CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__{{ $index }}
               valueFrom:
                 secretKeyRef:
-                  name: {{ . | quote }}
-                  key: {{ required "channelGateway.identityLookup.slackBotTokenKey must name the Secret key that holds the lookup bot token" $gateway.identityLookup.slackBotTokenKey | quote }}
+                  name: {{ $lookup.existingSecret | quote }}
+                  key: {{ $lookup.key | default "token" | quote }}
+            {{- end }}
             {{- end }}
             {{- if $tlsSecret }}
             - name: CURIE_CHANNEL_GATEWAY_TLS_CERT
