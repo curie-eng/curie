@@ -12,10 +12,11 @@ use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use curie::exit::{classify, ExitClass};
-use curie::ops::{down, down_commands, CommonOpts, DownOpts};
+use curie::ops::{down, down_commands, ClusterDownOutput, CommonOpts, DownOpts};
 
 /// Prepend `dir` to the current process PATH so its fake binaries win resolution.
 fn prepend_path(dir: &Path) {
@@ -45,6 +46,47 @@ fn set_extension_timing(interval_ms: u64, deadline_ms: u64) {
 fn clear_extension_timing() {
     std::env::remove_var(EXTENSION_INTERVAL_ENV);
     std::env::remove_var(EXTENSION_DEADLINE_ENV);
+}
+
+/// Restores PATH and the extension-timing environment, including on panic.
+struct RestoredProcessEnv {
+    path: Option<OsString>,
+}
+
+impl RestoredProcessEnv {
+    fn capture() -> Self {
+        Self {
+            path: std::env::var_os("PATH"),
+        }
+    }
+
+    fn restore_now(&self) {
+        restore_path(&self.path);
+    }
+}
+
+impl Drop for RestoredProcessEnv {
+    fn drop(&mut self) {
+        restore_path(&self.path);
+        clear_extension_timing();
+    }
+}
+
+fn api_resource_calls(logged: &str) -> usize {
+    logged
+        .lines()
+        .filter(|line| line.split_whitespace().next() == Some("api-resources"))
+        .count()
+}
+
+fn resource_gets(logged: &str, resource: &str) -> usize {
+    logged
+        .lines()
+        .filter(|line| {
+            let args: Vec<&str> = line.split_whitespace().collect();
+            args.first() == Some(&"get") && args.get(1) == Some(&resource)
+        })
+        .count()
 }
 
 fn labeled_namespace_lists(logged: &str) -> usize {
@@ -103,6 +145,7 @@ fn sweep_command_carries_300s_timeout() {
 #[tokio::test]
 async fn cluster_down_names_a_remaining_configmap_and_exits_transient() {
     let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
     let original_path = std::env::var_os("PATH");
     // A mistaken extension must fail this control in well under five minutes.
     set_extension_timing(30, 400);
@@ -554,6 +597,7 @@ exit 1
 #[tokio::test]
 async fn cluster_down_extends_for_controller_owned_residue() {
     let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
     let original_path = std::env::var_os("PATH");
     set_extension_timing(30, 15_000);
     let started = std::time::Instant::now();
@@ -593,6 +637,7 @@ async fn cluster_down_extends_for_controller_owned_residue() {
 #[tokio::test]
 async fn cluster_down_extension_expiry_stays_transient() {
     let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
     let original_path = std::env::var_os("PATH");
     set_extension_timing(40, 2_000);
     let started = std::time::Instant::now();
@@ -630,4 +675,731 @@ async fn cluster_down_extension_expiry_stays_transient() {
 
     clear_extension_timing();
     restore_path(&original_path);
+}
+
+const MIXED_NAMESPACE_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"agent-ns","deletionTimestamp":"2026-01-01T00:00:00Z"},"status":{"phase":"Terminating","conditions":[{"type":"NamespaceDeletionDiscoveryFailure","status":"False"},{"type":"NamespaceDeletionGroupVersionParsingFailure","status":"False"},{"type":"NamespaceDeletionContentFailure","status":"False"},{"type":"NamespaceContentRemaining","status":"False"},{"type":"NamespaceFinalizersRemaining","status":"False"}]}},{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"other-ns","deletionTimestamp":"2026-01-01T00:00:00Z"},"status":{"phase":"Terminating","conditions":[{"type":"NamespaceDeletionDiscoveryFailure","status":"False"},{"type":"NamespaceDeletionGroupVersionParsingFailure","status":"False"},{"type":"NamespaceDeletionContentFailure","status":"False"},{"type":"NamespaceContentRemaining","status":"False"},{"type":"NamespaceFinalizersRemaining","status":"False"}]}}]}"#;
+
+const POD_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":"web","namespace":"other-ns"}}]}"#;
+
+const NAMELESS_EVENT_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"evt-a","namespace":"agent-ns"}},{"apiVersion":"v1","kind":"Event","metadata":{}}]}"#;
+
+const CUSTOM_EVENT_LIST: &str = r#"{"apiVersion":"example.com/v1","kind":"List","items":[{"apiVersion":"example.com/v1","kind":"Event","metadata":{"name":"custom-evt","namespace":"agent-ns"}}]}"#;
+
+struct CapturedStderr {
+    saved: libc::c_int,
+    path: std::path::PathBuf,
+}
+
+impl CapturedStderr {
+    fn start(path: &Path) -> Self {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .expect("open stderr capture");
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved >= 0, "dup stderr");
+        let redirected = unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
+        assert!(redirected >= 0, "redirect stderr");
+        Self {
+            saved,
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn finish(mut self) -> String {
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        self.restore();
+        fs::read_to_string(&self.path).unwrap_or_default()
+    }
+
+    fn restore(&mut self) {
+        if self.saved >= 0 {
+            unsafe {
+                libc::dup2(self.saved, libc::STDERR_FILENO);
+                libc::close(self.saved);
+            }
+            self.saved = -1;
+        }
+    }
+}
+
+impl Drop for CapturedStderr {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn process_gone(pid: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "pid="])
+            .output()
+            .expect("inspect stalled child");
+        if !output.status.success() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn read_pid(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn cluster_down_extension_refuses_a_mixed_namespace() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(30, 800);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let mixed = dir.path().join("mixed.json");
+    let events = dir.path().join("events.json");
+    let endpoints = dir.path().join("endpoints.json");
+    let slices = dir.path().join("slices.json");
+    let root_ca = dir.path().join("root-ca.json");
+    let pod = dir.path().join("pod.json");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&mixed, MIXED_NAMESPACE_LIST).expect("write mixed list");
+    fs::write(&events, EVENT_LIST).expect("write events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    fs::write(&pod, POD_LIST).expect("write pod");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+ns=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = -n ]; then
+    ns=$arg
+  fi
+  prev=$arg
+done
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      cat '{mixed}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps pods
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = pods ]; then
+  if [ "$ns" = other-ns ]; then
+    cat '{pod}'
+  else
+    printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  fi
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{events}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            mixed = mixed.display(),
+            pod = pod.display(),
+            events = events.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+        ),
+    );
+    prepend_path(dir.path());
+
+    let err = down(down_opts())
+        .await
+        .expect_err("one non-qualifying namespace refuses the extension");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+    assert!(shown.contains("agent-ns"), "{shown}");
+    assert!(shown.contains("other-ns"), "{shown}");
+    assert!(shown.contains("web"), "{shown}");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(labeled_namespace_lists(&logged), 1, "{logged}");
+    assert_eq!(api_resource_calls(&logged), 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+}
+
+#[tokio::test]
+async fn cluster_down_extension_refuses_incomplete_inventory() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let restored = RestoredProcessEnv::capture();
+    set_extension_timing(30, 800);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let nameless = dir.path().join("nameless.json");
+    let endpoints = dir.path().join("endpoints.json");
+    let slices = dir.path().join("slices.json");
+    let root_ca = dir.path().join("root-ca.json");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    fs::write(&nameless, NAMELESS_EVENT_LIST).expect("write nameless events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{nameless}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            nameless = nameless.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+        ),
+    );
+    prepend_path(dir.path());
+    let err = down(down_opts())
+        .await
+        .expect_err("an object without a name cannot qualify");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(labeled_namespace_lists(&logged), 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+
+    restored.restore_now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let events = dir.path().join("events.json");
+    let endpoints = dir.path().join("endpoints.json");
+    let slices = dir.path().join("slices.json");
+    let root_ca = dir.path().join("root-ca.json");
+    let custom = dir.path().join("custom.json");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    fs::write(&events, EVENT_LIST).expect("write events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    fs::write(&custom, CUSTOM_EVENT_LIST).expect("write custom event");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps widgets.example.com
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{events}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = widgets.example.com ]; then
+  cat '{custom}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            events = events.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+            custom = custom.display(),
+        ),
+    );
+    prepend_path(dir.path());
+    let err = down(down_opts())
+        .await
+        .expect_err("a custom resource group cannot qualify");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+    assert!(shown.contains("custom-evt"), "{shown}");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(labeled_namespace_lists(&logged), 1, "{logged}");
+    assert_eq!(api_resource_calls(&logged), 1, "{logged}");
+
+    restored.restore_now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let present = dir.path().join("present.json");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  printf '%s\n' '{{'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            present = present.display(),
+        ),
+    );
+    prepend_path(dir.path());
+    let err = down(down_opts())
+        .await
+        .expect_err("a malformed namespace list is not an empty sweep");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+}
+
+#[tokio::test]
+async fn cluster_down_extension_does_not_repeat_discovery() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(30, 15_000);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = install_qualifying_kubectl(dir.path(), true);
+    prepend_path(dir.path());
+
+    down(down_opts())
+        .await
+        .expect("controller-owned residue that disappears is a completed sweep");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(
+        api_resource_calls(&logged),
+        1,
+        "discovery runs once, at admission: {logged}"
+    );
+    assert_eq!(resource_gets(&logged, "events"), 1, "{logged}");
+    assert_eq!(resource_gets(&logged, "endpoints"), 1, "{logged}");
+    assert_eq!(resource_gets(&logged, "endpointslices"), 1, "{logged}");
+    assert_eq!(resource_gets(&logged, "configmaps"), 1, "{logged}");
+    assert_eq!(labeled_namespace_lists(&logged), 4, "{logged}");
+}
+
+#[tokio::test]
+async fn cluster_down_extension_kills_a_stalled_child() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(40, 800);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let parent_pid = dir.path().join("parent.pid");
+    let child_pid = dir.path().join("child.pid");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  echo $$ > '{parent_pid}'
+  (sleep 8) &
+  echo $! > '{child_pid}'
+  sleep 8
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            parent_pid = parent_pid.display(),
+            child_pid = child_pid.display(),
+        ),
+    );
+    prepend_path(dir.path());
+
+    let err = down(down_opts())
+        .await
+        .expect_err("a stalled discovery read stays inside the post-timeout deadline");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "the stalled child must be reaped inside the deadline, elapsed {elapsed:?}"
+    );
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 300s"), "{shown}");
+    assert!(!shown.contains("waited 600s"), "{shown}");
+    assert!(shown.contains("agent-ns"), "{shown}");
+    let parent = read_pid(&parent_pid);
+    let child = read_pid(&child_pid);
+    assert!(parent > 0, "the stalled kubectl must record its pid");
+    assert!(child > 0, "the stalled kubectl must record its grandchild");
+    assert!(
+        process_gone(parent),
+        "stalled kubectl {parent} is still running"
+    );
+    assert!(
+        process_gone(child),
+        "stalled grandchild {child} is still running"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert!(logged.contains("--timeout=300s"), "{logged}");
+    assert_eq!(labeled_namespace_lists(&logged), 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+}
+
+#[tokio::test]
+async fn cluster_down_extension_reports_removed() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(30, 15_000);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = install_qualifying_kubectl(dir.path(), true);
+    let stderr_path = dir.path().join("stderr.txt");
+    prepend_path(dir.path());
+    let captured = CapturedStderr::start(&stderr_path);
+
+    let output = down(down_opts())
+        .await
+        .expect("controller-owned residue that disappears is a completed sweep");
+    let shown = captured.finish();
+    assert!(
+        matches!(
+            output,
+            ClusterDownOutput::Down {
+                release_was_absent: false
+            }
+        ),
+        "the normal down entry must finish as a removed release"
+    );
+    assert!(
+        shown.contains("sweeping namespaces: ok")
+            || (shown.contains("sweeping namespaces") && shown.contains("removed")),
+        "down must report the removed sweep: {shown}"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert!(
+        logged.contains("timed out waiting"),
+        "the removed result follows the timed-out delete: {logged}"
+    );
+}
+
+#[tokio::test]
+async fn cluster_down_extension_failed_list_keeps_the_last_namespaces() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let _restored = RestoredProcessEnv::capture();
+    set_extension_timing(40, 1_200);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = dir.path().join("kubectl-argv.log");
+    let present = dir.path().join("present.json");
+    let qualifying = dir.path().join("qualifying.json");
+    let events = dir.path().join("events.json");
+    let endpoints = dir.path().join("endpoints.json");
+    let slices = dir.path().join("slices.json");
+    let root_ca = dir.path().join("root-ca.json");
+    let count = dir.path().join("list-count");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    fs::write(&events, EVENT_LIST).expect("write events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    test_executable::install_in(
+        dir.path(),
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      n=0
+      if [ -f '{count}' ]; then
+        n=$(wc -l < '{count}' | tr -d ' ')
+      fi
+      printf '\n' >> '{count}'
+      if [ "$n" -ge 1 ]; then
+        echo 'error: the server rejected the list' >&2
+        exit 1
+      fi
+      cat '{qualifying}'
+      exit 0
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{events}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            qualifying = qualifying.display(),
+            count = count.display(),
+            events = events.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+        ),
+    );
+    prepend_path(dir.path());
+
+    let err = down(down_opts())
+        .await
+        .expect_err("a failed namespace list is not an empty sweep");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(8),
+        "a failed poll must stay inside the injected deadline: {:?}",
+        started.elapsed()
+    );
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(shown.contains("waited 600s"), "{shown}");
+    assert!(shown.contains("agent-ns"), "{shown}");
+    assert!(
+        shown.contains("evt-a"),
+        "expiry keeps the last admitted objects: {shown}"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert_eq!(api_resource_calls(&logged), 1, "{logged}");
+    assert!(labeled_namespace_lists(&logged) > 1, "{logged}");
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
 }
