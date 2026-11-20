@@ -1173,3 +1173,53 @@ def test_answer_held_reply_replayed_after_the_issue_changed_on_gitlab(
         return
     assert ids == [first_request, answer]
     assert item["cancelled_at"] is not None
+
+
+# --- 04-tu: a plain answer read under a snapshot from before its question ----------------
+
+
+def test_answer_plain_reply_after_a_first_polls_snapshot_is_admitted_on_gitlab(
+    gitlab: gl.GitLabInstall,
+) -> None:
+    """The binding's first poll takes its answering snapshot before the
+    question exists. Between that snapshot and the poll's note read, the run
+    posts its question, ends, and the developer replies with a plain note:
+    the first poll sees a plain note on an issue that is not answering, so it
+    starts nothing, and it saves the label's first cursor. The next poll, with
+    the issue now answering, admits that reply as the answer, exactly once.
+    Another labelled issue's read answers 503 on the admitting pass
+    (https://docs.gitlab.com/api/rest/troubleshooting/#status-codes), so the
+    cursor stays unsaved until the pass under test."""
+
+    backend = gitlab.backend
+    blocked = backend.add_issue("Widget exporter drops the header row", author=backend.developer)
+    backend.label_issue(blocked, gitlab.label, backend.developer)
+    gitlab.fake.script(503, path=f"/projects/{backend.project_id}/issues/{blocked}", method="GET")
+    iid = gl.admit(gitlab)
+    assert _gitlab_cursor(gitlab) is None
+    [item] = gl.work_items(iid)
+    work_item_id = item["id"]
+    [first] = _ids(work_item_id)
+    epoch = gl.start_request(gitlab.client, first)
+    capability = _mint(gitlab.client, first)
+    replies: list[int] = []
+
+    def ask_then_reply() -> None:
+        asked = _post_questions(gitlab.client, capability)
+        assert asked.status_code == 200, asked.text
+        _finish(gitlab.client, first, epoch)
+        replies.append(backend.issue_note(iid, backend.developer, ANSWER_TEXT))
+
+    gitlab.fake.before_next(ask_then_reply, method="GET", path=_issues_listing(gitlab))
+    gl.reconcile()
+
+    [reply] = replies
+    _settled_outstanding(work_item_id, first)
+    assert _gitlab_cursor(gitlab) is not None
+    assert _ids(work_item_id) == [first]
+
+    gl.reconcile()
+
+    _assert_admitted(work_item_id, gitlab.issue_ref(iid), str(reply), [first])
+    gl.reconcile()
+    assert len(_ids(work_item_id)) == 2

@@ -376,7 +376,10 @@ class GitLabTracker:
         """No cursor: the latest add of the label is a notice when a person made
         it, on an ``answering`` issue every note by a person is an answer, and
         on a ``live`` (running) issue every mention since that latest add is a
-        mention. Everything else in the overlap is remembered.
+        mention. Label events and mentions in the overlap are remembered; a
+        plain note on an issue that is not answering is not, as on a later
+        poll, so a plain answer read under a snapshot taken before its
+        question is delivered by the next poll once the issue is answering.
 
         Answers and those mentions are delivered because a label whose first
         page held an issue saves no cursor and polls as a first poll again; a
@@ -385,9 +388,14 @@ class GitLabTracker:
         question, its receipt makes a replay harmless, and a replayed mention
         replays under its request id."""
 
-        for event in (*labels, *notes):
+        for event in labels:
             if event.at >= floor:
                 considered[event.token] = event.at
+        for note in notes:
+            body = note.payload.get("body")
+            if note.at >= floor and isinstance(body, str):
+                if answering or self._mention.search(body):
+                    considered[note.token] = note.at
         delivered: list[_Pending] = []
         since = None if answering or not live else self._labelled_at(labels)
         if answering or since is not None:

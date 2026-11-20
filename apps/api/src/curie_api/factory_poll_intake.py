@@ -506,7 +506,15 @@ async def _poll_traffic(
     serves: bool,
     feedback: bool,
 ) -> None:
-    await _cancel_stale(
+    # An issue whose question is open is cancelled only after this pass has
+    # judged its comments as answers: a close or label removal found with an
+    # answer in the same pass refuses that answer as such (``ticket_closed``,
+    # ``trigger_label_absent``), as when the answer is read first (#5787
+    # criterion 4), instead of the cancellation deleting its round unseen.
+    answering = (
+        await _answering_issue_numbers(sessionmaker, tracker) if serves and feedback else set()
+    )
+    deferred = await _cancel_stale(
         sessionmaker,
         settings,
         client,
@@ -514,24 +522,38 @@ async def _poll_traffic(
         tracker,
         installation_id=installation_id,
         repository=repository,
+        defer=answering,
     )
     if not feedback:
         return
-    await _admit_mentions(
-        sessionmaker,
-        settings,
-        client,
-        cursor,
-        tracker,
-        now=now,
-        api=api,
-        token=token,
-        repo_path=repo_path,
-        installation_id=installation_id,
-        repository=repository,
-        verified=verified,
-        serves=serves,
-    )
+    try:
+        await _admit_mentions(
+            sessionmaker,
+            settings,
+            client,
+            cursor,
+            tracker,
+            now=now,
+            api=api,
+            token=token,
+            repo_path=repo_path,
+            installation_id=installation_id,
+            repository=repository,
+            verified=verified,
+            serves=serves,
+        )
+    finally:
+        if deferred:
+            await _cancel_stale(
+                sessionmaker,
+                settings,
+                client,
+                cursor,
+                tracker,
+                installation_id=installation_id,
+                repository=repository,
+                only=deferred,
+            )
     owned = await open_pulls(
         sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
     )
@@ -684,9 +706,19 @@ async def _cancel_stale(
     *,
     installation_id: int,
     repository: dict[str, Any],
-) -> None:
+    defer: set[int] | None = None,
+    only: set[int] | None = None,
+) -> set[int]:
+    """Cancel each watched WorkItem whose issue a person closed or unlabelled.
+
+    An issue in ``defer`` found closed or unlabelled is left for a later call
+    and returned; ``only`` limits the pass to those issues. Its ETag is never
+    kept, so the later call reads it in full.
+    """
+
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
     registry = forges_registry(settings)
+    deferred: set[int] = set()
     async with sessionmaker() as session:
         items = list(
             await session.scalars(
@@ -706,10 +738,13 @@ async def _cancel_stale(
             if label is not None or item.id in kickoff:
                 watched[int(item.tracker_issue_id)] = label
     keys = {_etag_key(number, label) for number, label in watched.items()}
-    for key in list(cursor.etags):
-        if key.startswith("issue:") and key not in keys:
-            del cursor.etags[key]
+    if only is None:
+        for key in list(cursor.etags):
+            if key.startswith("issue:") and key not in keys:
+                del cursor.etags[key]
     for number in sorted(watched):
+        if only is not None and number not in only:
+            continue
         label = watched[number]
         key = _etag_key(number, label)
         try:
@@ -730,6 +765,9 @@ async def _cancel_stale(
             # Retry cancellation authority on every pass until it succeeds.
             # A cached issue must not hide a later permission or event repair.
             cursor.etags.pop(key, None)
+            if defer is not None and number in defer:
+                deferred.add(number)
+                continue
             events = await tracker.issue_events(number)
             event = last_event_of_kind(events, kind, label=label if kind == "unlabeled" else None)
             if event is None:
@@ -755,6 +793,7 @@ async def _cancel_stale(
             await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             logger.info("factory stale issue poll for %s issue %s deferred", repo, number)
+    return deferred
 
 
 def _etag_key(number: int, label: str | None) -> str:
