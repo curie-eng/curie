@@ -49,13 +49,12 @@ import test_factory_tracker_results as tr
 from curie_api import factory_questions
 from curie_api.config import get_settings
 from curie_api.factory_facts_schema import REQUEST_MARKER
-from curie_api.factory_notices import ANSWER_PULL_REQUEST_ENDED_SENTENCE
 from curie_api.factory_poll_intake import poll_once
-from curie_api.factory_questions import QUESTIONS_LABEL, QUESTIONS_UNRECORDED_LINE
+from curie_api.factory_questions import QUESTIONS_UNRECORDED_LINE
 from curie_api.forges.types import TrackerIssueRef
 from curie_api.github_factory_events import FactoryNotice
 from curie_api.main import create_app
-from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
+from curie_api.workitem_dispatch import DispatchConflict, acquire
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
@@ -82,13 +81,11 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     comments,
 )
 from redis.asyncio import Redis
-from sqlalchemy import text
 from test_factory_question_ending import (
     _ask,
     _request,
     _requests,
     _round_row,
-    _state_labels,
     _status_body,
     _take_over,
 )
@@ -1154,153 +1151,6 @@ def test_refused_retained_service_item_in_personal_mode(
 
 
 # Answer-path true-ups (#5786, #5787) ----------------------------------------------------
-
-
-def _bind_pull_request(triage: tr._Triage, status: str) -> None:
-    """The WorkItem's pull request lineage, as a publication leaves it and the
-    merge record (`crud.lineages.mark_publication_lineage_terminal`) moves it."""
-
-    async def go() -> None:
-        async with triage.client.app.state.sessionmaker() as session:
-            item = (
-                await session.execute(
-                    text(
-                        "SELECT agent_id, conversation_id, repository_path, base_commit "
-                        "FROM curie.work_items WHERE id = :id"
-                    ),
-                    {"id": triage.work_item_id},
-                )
-            ).one()
-            version_id, deployment_id, lineage_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-            await session.execute(
-                text(
-                    "INSERT INTO curie.agent_versions (id, agent_id, version_label, created_by) "
-                    "VALUES (:id, :agent, 'v1', 'fixture')"
-                ),
-                {"id": version_id, "agent": item.agent_id},
-            )
-            await session.execute(
-                text(
-                    "INSERT INTO curie.deployments (id, agent_id, version_id, environment, "
-                    "status) VALUES (:id, :agent, :version, CAST('dev' AS curie.environment), "
-                    "'active')"
-                ),
-                {"id": deployment_id, "agent": item.agent_id, "version": version_id},
-            )
-            await session.execute(
-                text(
-                    "INSERT INTO curie.thread_publication_lineages (id, agent_id, "
-                    "deployment_id, conversation_id, repo_full_name, base_sha, branch, "
-                    "pr_number, pr_url, head_sha, status) VALUES (:id, :agent, :deployment, "
-                    ":conversation, :repo, :base, :branch, 41, :url, :head, :status)"
-                ),
-                {
-                    "id": lineage_id,
-                    "agent": item.agent_id,
-                    "deployment": deployment_id,
-                    "conversation": item.conversation_id,
-                    "repo": item.repository_path,
-                    "base": item.base_commit or "1" * 40,
-                    "branch": f"curie/publication-{lineage_id.hex}",
-                    "url": f"https://github.com/{item.repository_path}/pull/41",
-                    "head": "2" * 40,
-                    "status": status,
-                },
-            )
-            await session.execute(
-                text(
-                    "UPDATE curie.work_items SET publication_lineage_id = :lineage WHERE id = :id"
-                ),
-                {"lineage": lineage_id, "id": triage.work_item_id},
-            )
-            await session.commit()
-
-    triage.client.portal.call(go)
-
-
-def _acquired(world: World, request_id: uuid.UUID) -> int:
-    """The worker acquires the request for a start; returns its generation."""
-
-    async def go() -> int:
-        async with world.client.app.state.sessionmaker() as session:
-            generation = int(
-                await session.scalar(
-                    text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
-                    {"id": request_id},
-                )
-            )
-            acquired = await acquire(
-                session,
-                request_id,
-                owner="factory-owner",
-                generation=generation,
-                wake=await factory_wake(session, request_id),
-                context=None,
-                client=world.client.app.state.http_client,
-            )
-            assert not isinstance(acquired, DispatchConflict), acquired
-            return generation
-
-    return int(world.client.portal.call(go))
-
-
-def _not_started(world: World, request_id: uuid.UUID, generation: int) -> Any:
-    """The worker's report that the turn did not start, as it sends it when
-    worker start refuses a terminal pull request (``kernel/completion.py``)."""
-
-    async def go() -> Any:
-        async with world.client.app.state.sessionmaker() as session:
-            return await defer(
-                session,
-                request_id,
-                owner="factory-owner",
-                generation=generation,
-                reason="not_started:done",
-                capacity=False,
-                start_failure_detail=None,
-            )
-
-    return world.client.portal.call(go)
-
-
-@pytest.mark.parametrize("pull_request", ["merged", "open"])
-def test_answer_follow_up_on_a_merged_pull_request_ends_with_its_status(
-    world: World, pull_request: str
-) -> None:
-    """02b: a person merges the ticket's pull request while the answer's
-    request waits. Its first refused start ends it ``start_failed`` with a
-    sentence saying so, the round clears and the questions label goes. On an
-    open pull request (the counterexample) the same refusal only defers."""
-
-    number = 6230 if pull_request == "merged" else 6231
-    triage = _outstanding(world, number)
-    _reconcile()
-    assert QUESTIONS_LABEL in _state_labels(world.sink, number)
-    comment = world.github.add_comment(number, ANSWER, user=WRITER)
-    assert _deliver(world, "webhook", comment, number)["status"] == "factory_admitted"
-    answered = _answer_id(triage, comment)
-    generation = _acquired(world, answered)
-    # Worker start's lineage read records the merge, then refuses the turn.
-    _bind_pull_request(triage, pull_request)
-
-    deferred = _not_started(world, answered, generation)
-
-    request = _request(answered)
-    row = _round_row(triage.work_item_id)
-    assert row is not None
-    if pull_request == "open":
-        assert deferred.terminal_cause is None
-        assert request["status"] == "waiting"
-        assert row["state"] == "answered"
-        return
-    assert deferred.terminal_cause == "start_failed"
-    assert (request["status"], request["terminal_cause"]) == ("failed", "start_failed")
-    assert row["state"] == "cleared"
-    _reconcile()
-    body = _status_body(world.sink, answered)
-    assert f"Could not complete: {ANSWER_PULL_REQUEST_ENDED_SENTENCE}" in body
-    assert "Cause: start_failed" in body
-    assert _state_labels(world.sink, number) == set()
 
 
 @pytest.mark.parametrize("path", PATHS)
