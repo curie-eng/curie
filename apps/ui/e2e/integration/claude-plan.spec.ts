@@ -66,14 +66,16 @@ test.describe("claude_plan", () => {
 
     await input.fill(neverIssued());
     await write.click();
-    await expect(status).toHaveText("Connected, generation 1");
+    await expect(status).toHaveText("Connected");
+    await expect(page.getByTestId("claude-plan-generation")).toHaveText("Generation 1");
     await expect(input).toHaveValue("");
     expect(await owned(page)).toMatchObject({ state: "active", generation: 1 });
 
     await expect(write).toHaveText("Replace");
     await input.fill(neverIssued());
     await write.click();
-    await expect(status).toHaveText("Connected, generation 2");
+    await expect(status).toHaveText("Connected");
+    await expect(page.getByTestId("claude-plan-generation")).toHaveText("Generation 2");
     expect(await owned(page)).toMatchObject({ state: "active", generation: 2 });
 
     await page.getByTestId("claude-plan-disconnect").click();
@@ -88,7 +90,8 @@ test.describe("claude_plan", () => {
     await expect(write).toHaveText("Reconnect");
     await input.fill(neverIssued());
     await write.click();
-    await expect(status).toHaveText(/^Connected, generation \d+$/);
+    await expect(status).toHaveText("Connected");
+    await expect(page.getByTestId("claude-plan-generation")).toHaveText(/^Generation \d+$/);
     expect((await owned(page)).state).toBe("active");
   });
 });

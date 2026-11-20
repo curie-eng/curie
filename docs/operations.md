@@ -3410,7 +3410,13 @@ account can hold at most five live tokens. The confirmation names the Slack
 account, warns that anyone using it can start runs on the confirming person's
 plan, and requires sign-in and an explicit CSRF-bound confirmation. In personal
 mode, confirmation redirects to `/settings/claude-plan`; a linked sender with
-an inactive enrollment gets that page directly. A refusal without a URL stays
+an inactive enrollment gets that page directly. The confirmation and its refusals
+are server-rendered pages in the Console's dark style. Their only stylesheet is
+inline and allowed by its SHA-256 hash in the page's Content-Security-Policy, so
+the page loads no script, font, image or other origin. A browser (Accept names `text/html`) sees an
+expired, used or mismatched link, including one that lapses during
+organization sign-in, a missing sign-in, and a cross-site confirmation as
+pages; other clients keep the JSON `detail`. A refusal without a URL stays
 private, has no button, and names the operator. Other kickoff refusals keep
 their public thread replies ending with `Outcome: <code>`:
 
