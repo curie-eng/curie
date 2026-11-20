@@ -480,6 +480,18 @@ describe("WiredAgentDetail — model edit (#254)", () => {
   });
 });
 
+describe("WiredAgentDetail — factory progress channel", () => {
+  it("shows the agent's Slack progress channel beside the model field", async () => {
+    vi.mocked(getAgents).mockResolvedValue([{ ...AGENT, factory_slack_channel: "C0EXAMPLE1" }]);
+    renderDetail();
+
+    const input = await screen.findByTestId("factory-progress-input");
+    await waitFor(() => expect(input).toHaveValue("C0EXAMPLE1"));
+    expect(screen.getByTestId("factory-progress-current")).toHaveTextContent("Posting progress to C0EXAMPLE1");
+    expect(screen.getByTestId("model-input")).toBeInTheDocument();
+  });
+});
+
 describe("WiredAgentDetail — bundle tree (item 4)", () => {
   it("renders every bundle file, not just SKILL.md", async () => {
     renderDetail();

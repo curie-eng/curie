@@ -419,6 +419,90 @@ export async function updateAgent(
   return jsonOrThrow<AgentOut>(resp);
 }
 
+// A Slack channel id the API accepts for `factory_slack_channel`: a public (C) or
+// private (G) channel id. Mirrors the server pattern; the console checks it first
+// so a typo never costs a round trip.
+export const SLACK_PROGRESS_CHANNEL_RE = /^[CG][A-Z0-9]{6,}$/;
+
+export const SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE =
+  "Not a Slack channel id: use a public or private channel id such as C0EXAMPLE1 " +
+  "(uppercase letters and digits, at least 7 characters, starting with C or G).";
+
+/**
+ * A failed `factory_slack_channel` write, classified so the console can say what
+ * to do next: `unbound` (409, the agent has no Slack binding for that channel),
+ * `invalid` (422 pattern failure), or `other`.
+ */
+export class FactorySlackChannelError extends ApiError {
+  code: "unbound" | "invalid" | "other";
+  constructor(status: number, code: "unbound" | "invalid" | "other", message: string) {
+    super(status, message);
+    this.name = "FactorySlackChannelError";
+    this.code = code;
+  }
+}
+
+// 409 body: { detail: { code: "factory_slack_channel_unbound" } }.
+function isUnboundBody(body: unknown): boolean {
+  if (!body || typeof body !== "object" || !("detail" in body)) return false;
+  const detail = (body as { detail: unknown }).detail;
+  return (
+    !!detail &&
+    typeof detail === "object" &&
+    (detail as { code?: unknown }).code === "factory_slack_channel_unbound"
+  );
+}
+
+// 422 body: FastAPI's array detail, with a string_pattern_mismatch on the
+// factory_slack_channel field.
+function isPatternFailureBody(body: unknown): boolean {
+  if (!body || typeof body !== "object" || !("detail" in body)) return false;
+  const detail = (body as { detail: unknown }).detail;
+  if (!Array.isArray(detail)) return false;
+  return detail.some((item) => {
+    if (!item || typeof item !== "object") return false;
+    const { loc, type } = item as { loc?: unknown; type?: unknown };
+    return (
+      type === "string_pattern_mismatch" &&
+      Array.isArray(loc) &&
+      loc[loc.length - 1] === "factory_slack_channel"
+    );
+  });
+}
+
+// Set (a channel id) or clear (null) the Slack channel an agent's factory runs
+// post progress to. Only the one key is sent: an explicit null clears it, which
+// is the same three-way rule as `model` above. The API refuses a channel the
+// agent has no Slack binding for with a coded 409; that and the 422 pattern
+// failure surface as FactorySlackChannelError, everything else as ApiError.
+export async function setFactorySlackChannel(
+  agentId: string,
+  channel: string | null,
+): Promise<AgentOut> {
+  const resp = await request(`/agents/${agentId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ factory_slack_channel: channel }),
+  });
+  if (resp.ok) return (await resp.json()) as AgentOut;
+  const body = await resp.json().catch(() => null);
+  if (resp.status === 409 && isUnboundBody(body)) {
+    throw new FactorySlackChannelError(
+      resp.status,
+      "unbound",
+      `This agent has no Slack binding for ${channel ?? "that channel"}. Add the channel as a surface first, then set it here.`,
+    );
+  }
+  if (resp.status === 422 && isPatternFailureBody(body)) {
+    throw new FactorySlackChannelError(resp.status, "invalid", SLACK_PROGRESS_CHANNEL_FORMAT_MESSAGE);
+  }
+  throw new FactorySlackChannelError(
+    resp.status,
+    "other",
+    describeError(body) ?? resp.statusText,
+  );
+}
+
 // Move one surface binding to a new kind/address (ADR-0118). The pair being
 // moved is named by `selector` (its CURRENT kind/address) and rides in the
 // query string, never the body, so it can never be confused with `next`, the
