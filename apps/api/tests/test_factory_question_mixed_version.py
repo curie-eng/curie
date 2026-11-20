@@ -45,6 +45,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import test_factory_tracker_results as tr
+import test_github_answer_intake as intake
 from curie_api import factory_questions
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import body_digest
@@ -71,6 +72,7 @@ from test_factory_question_ending import (
     _versions,
 )
 from test_factory_terminus import _reconcile
+from test_github_answer_intake import world  # noqa: F401  (fixture)
 
 NEEDS_HUMAN = "curie-factory:needs-human"
 PR_OPEN = "curie-factory:pr-open"
@@ -850,6 +852,49 @@ def test_an_older_status_pass_is_rewritten_after_the_roll(
     _matches_new_replicas_only(admitted, monkeypatch, triage, revision, number)
 
 
+# A plain answer comment read by a new replica's intake (#5787) --------------------------
+
+
+@pytest.mark.parametrize("path", intake.PATHS)
+def test_a_plain_answer_after_an_older_finish_is_the_one_continuation(
+    world: intake.World, path: str
+) -> None:
+    """The asker settled ``failed`` on an older replica, so the row still
+    reads ``outstanding`` with no question ending. A plain answer comment
+    reaches a new replica's intake, by webhook or by poll, before any
+    re-drive. It is admitted once; after the roll the asker ends with the
+    question and the answer is its one continuation, and the other door
+    reading the same comment again adds nothing."""
+
+    number = 1231 if path == "webhook" else 1232
+    triage = intake._running(world, number)
+    assert _ask(triage).status_code == 200
+    with _older_replica():
+        tr._finish(triage, "failed", "no_pull_request")
+    assert _request(triage.request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
+    assert _round_row(triage.work_item_id)["state"] == "outstanding"  # type: ignore[index]
+
+    comment = world.github.add_comment(number, intake.ANSWER, user=intake.WRITER)
+    result = intake._deliver(world, path, comment, number)
+    if result is not None:
+        assert result["status"] == "factory_admitted", result
+    answer = intake._answer_id(triage, comment)
+
+    _after_the_roll()
+    assert _request(triage.request_id) == QUESTION_ENDING
+    assert _after_asker(triage) == [(answer, "waiting")]
+    row = _round_row(triage.work_item_id)
+    assert row is not None
+    assert (row["state"], row["pending_request_id"]) == ("answered", answer)
+    again = intake._deliver(world, "poll" if path == "webhook" else "webhook", comment, number)
+    if again is not None:
+        assert again["status"] == "factory_duplicate", again
+    _after_the_roll()
+    assert _after_asker(triage) == [(answer, "waiting")]
+    _take_over(triage, answer)
+    assert _request(answer)["status"] == "running"
+
+
 # Guard: every reader and writer of the round state is covered above --------------------
 
 _API_SRC = Path(__file__).resolve().parents[1] / "src" / "curie_api"
@@ -876,6 +921,30 @@ _EXPECTED_USES = {
         "QUESTIONS_LABEL",
         "ROUND_LIMIT",
         "asked_round",
+    },
+    # The plain answer intake (#5787): the webhook and the poll pass read the
+    # row state and hand the comment to the answer core. Proved beside an
+    # older finish above.
+    "curie_api/factory_poll_intake.py": {
+        "ANSWERED",
+        "FactoryQuestionRound",
+        "OUTSTANDING",
+        "POSTING",
+    },
+    "curie_api/github_factory.py": {
+        "ADMITTED",
+        "ANSWERED",
+        "AnswerFacts",
+        "AnswerNotAdmitted",
+        "COALESCED",
+        "FactoryAnswerReceipt",
+        "FactoryQuestionRound",
+        "OUTSTANDING",
+        "POSTING",
+        "QUESTION_POSTING",
+        "QUEUED_FOLLOW_UP",
+        "WORK_ITEM_CANCELLED",
+        "admit_answer",
     },
     "curie_api/routers/work_item_issue.py": {
         "ALREADY_ASKED",

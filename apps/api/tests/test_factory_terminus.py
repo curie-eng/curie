@@ -2543,6 +2543,7 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(
                     retry_safety=None,
                     retry_condition=None,
                     exhausted_volume=None,
+                    finisher="worker",
                 )
                 assert isinstance(result, WorkItemConflict), result
                 assert result.code == "stale_version"
