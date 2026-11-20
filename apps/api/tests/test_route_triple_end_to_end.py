@@ -197,6 +197,50 @@ def test_a_repost_of_the_same_route_is_idempotent(
     ]
 
 
+def test_a_progress_channel_held_under_the_default_identity_is_bound_under_a_named_one(
+    client: Any, auth_headers: dict[str, str], clean_db: None, two_identities: None
+) -> None:
+    """The recovery the CLI and Console print when the default identity is taken.
+
+    Another agent holds the channel under `default`, so the agent being set up
+    gets the coded 409, and the plain `--add slack=<channel>` it would try
+    first binds under `default` and is refused too. Adding it under the free
+    declared identity is the command that works, and the same PATCH then
+    succeeds.
+    """
+    _create(client, auth_headers, "holder")
+    other = client.post(
+        "/agents",
+        json={"name": "other", "channel": {"kind": "slack", "address": "C0EXAMPLE2"}},
+        headers=auth_headers,
+    )
+    assert other.status_code == 201, other.text
+    agent = str(other.json()["id"])
+    patch = {"factory_slack_channel": CHANNEL}
+
+    refused = client.patch(f"/agents/{agent}", json=patch, headers=auth_headers)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == {"code": "factory_slack_channel_unbound"}
+
+    default_form = client.post(
+        f"/agents/{agent}/channels",
+        json={"kind": "slack", "address": CHANNEL},
+        headers=auth_headers,
+    )
+    assert default_form.status_code == 409, default_form.text
+
+    named_form = client.post(
+        f"/agents/{agent}/channels",
+        json={"kind": "slack", "address": CHANNEL, "adapter": "second"},
+        headers=auth_headers,
+    )
+    assert named_form.status_code == 201, named_form.text
+
+    stored = client.patch(f"/agents/{agent}", json=patch, headers=auth_headers)
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["factory_slack_channel"] == CHANNEL
+
+
 def _binding_ids(agent_id: str) -> dict[str, str]:
     async def go() -> dict[str, str]:
         engine = create_async_engine(get_settings().database_url)
