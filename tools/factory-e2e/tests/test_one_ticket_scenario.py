@@ -171,6 +171,97 @@ def test_a_follow_up_request_at_the_end_is_refused() -> None:
         ots.assert_finished(items, [*requests, _request(3, "waiting")], final, pull)
 
 
+def test_the_wrong_work_item_shape_is_refused() -> None:
+    item = {"id": "w", "agent_id": "a", "trigger_label": ots.LABEL, "cancelled_at": None}
+    assert ots.assert_one_work_item([item], "a") is item
+    with pytest.raises(ots.OneTicketAssertionError, match="found 2"):
+        ots.assert_one_work_item([item, item], "a")
+    with pytest.raises(ots.OneTicketAssertionError, match="found 0"):
+        ots.assert_one_work_item([], "a")
+    with pytest.raises(ots.OneTicketAssertionError, match="another agent"):
+        ots.assert_one_work_item([item], "b")
+    with pytest.raises(ots.OneTicketAssertionError, match="another label"):
+        ots.assert_one_work_item([{**item, "trigger_label": "other"}], "a")
+    with pytest.raises(ots.OneTicketAssertionError, match="cancelled"):
+        ots.assert_one_work_item([{**item, "cancelled_at": "2026-11-19T12:00:00Z"}], "a")
+
+
+def test_two_question_comments_are_refused() -> None:
+    with pytest.raises(ots.OneTicketAssertionError, match="found 2"):
+        ots.assert_one_question_comment([_questions(), _questions()], ots.ISSUE, BOT_LOGIN)
+
+
+def test_a_question_comment_from_someone_else_is_refused() -> None:
+    with pytest.raises(ots.OneTicketAssertionError, match="not posted by the App"):
+        ots.assert_one_question_comment(
+            [{**_questions(), "user": {"login": "someone"}}], ots.ISSUE, BOT_LOGIN
+        )
+
+
+def test_an_extra_pull_request_is_refused() -> None:
+    pull = {"body": f"Closes #{ots.ISSUE}", "html_url": "u"}
+    other = {"body": "Unrelated", "html_url": "v"}
+    with pytest.raises(ots.OneTicketAssertionError, match="found 2"):
+        ots.assert_one_pull_request([pull, other], ots.ISSUE, 0)
+    with pytest.raises(ots.OneTicketAssertionError, match="found 0"):
+        ots.assert_one_pull_request([], ots.ISSUE, 0)
+    with pytest.raises(ots.OneTicketAssertionError, match="found 2"):
+        ots.assert_one_pull_request([pull, {**pull, "html_url": "w"}], ots.ISSUE, 0)
+
+
+def test_a_line_seen_before_its_cause_is_refused() -> None:
+    with pytest.raises(ots.OneTicketAssertionError, match="before its cause"):
+        ots.assert_first_response(T0, T0 - timedelta(seconds=1))
+    asking = _request(1, "completed", cause="questions_asked")
+    second = _request(2, "running", created="2026-11-19T12:00:10Z")
+    with pytest.raises(ots.OneTicketAssertionError, match="before its cause"):
+        ots.assert_answer_admitted(
+            [asking, second], str(asking["id"]), T0, T0 - timedelta(seconds=5)
+        )
+
+
+def test_a_status_line_is_placed_by_the_comment_that_carried_it_first() -> None:
+    marker = "<!-- curie-execution-request:r1 -->"
+    line = ots.INVESTIGATING_LINE
+    history = [
+        {"at": "2026-11-19T12:00:00Z", "body": f"{marker}\nQueued."},
+        {"at": "2026-11-19T12:00:02Z", "body": f"{marker}\n{line}\nworking"},
+        {"at": "2026-11-19T12:00:09Z", "body": f"{marker}\nDone."},
+    ]
+    found = ots.first_line_instant(history, marker, line)
+    assert found == ots.instant("2026-11-19T12:00:02Z")
+    # The line later dropped from the body is still placed; another request's
+    # comment, or a body without the marker, never is.
+    assert ots.first_line_instant(history, "<!-- curie-execution-request:r2 -->", line) is None
+    bare = [{"at": "2026-11-19T12:00:00Z", "body": line}]
+    assert ots.first_line_instant(bare, marker, line) is None
+
+
+def _receipt(comment: int, outcome: str, request: str | None) -> dict[str, Any]:
+    return {"comment_key": str(comment), "outcome": outcome, "request_id": request}
+
+
+def test_the_answer_receipt_names_the_second_request() -> None:
+    good = [_receipt(6, "admitted", "req2"), _receipt(7, "coalesced", None)]
+    ots.assert_answer_receipts(good, "6", "7", "req2")
+
+
+def test_a_follow_up_that_started_the_run_in_the_answers_place_is_refused() -> None:
+    swapped = [_receipt(6, "not_after_question", None), _receipt(7, "admitted", "req2")]
+    with pytest.raises(ots.OneTicketAssertionError, match="not admitted"):
+        ots.assert_answer_receipts(swapped, "6", "7", "req2")
+    elsewhere = [_receipt(6, "admitted", "other"), _receipt(7, "coalesced", None)]
+    with pytest.raises(ots.OneTicketAssertionError, match="another request"):
+        ots.assert_answer_receipts(elsewhere, "6", "7", "req2")
+    split = [_receipt(6, "admitted", "req2"), _receipt(7, "queued_follow_up", "req3")]
+    with pytest.raises(ots.OneTicketAssertionError, match="queued_follow_up"):
+        ots.assert_answer_receipts(split, "6", "7", "req2")
+    with pytest.raises(ots.OneTicketAssertionError, match="no receipt for the answer"):
+        ots.assert_answer_receipts([], "6", "7", "req2")
+    with pytest.raises(ots.OneTicketAssertionError, match="no receipt for the follow-up"):
+        ots.assert_answer_receipts([_receipt(6, "admitted", "req2")], "6", "7", "req2")
+
+
 # Handoff: the stub's comment payload through the production intake ---------
 
 
@@ -188,6 +279,27 @@ def stub(tmp_path: Path) -> Iterator[Any]:
         yield server
     finally:
         server.close()
+
+
+def test_comments_appended_together_share_one_instant_and_consecutive_ids(stub: Any) -> None:
+    first, second = stub.append_comments(
+        ots.ISSUE, ["Accept `k`.", "That is all."], author=GITHUB.HUMAN
+    )
+
+    assert second["id"] == first["id"] + 1
+    assert first["created_at"] == first["updated_at"] == second["created_at"]
+    assert [c["id"] for c in stub._rows("comment")] == [first["id"], second["id"]]
+
+
+def test_the_stub_keeps_every_body_a_comment_held_in_order(stub: Any) -> None:
+    comment = stub.append_comment(ots.ISSUE, "Investigating.", author=GITHUB.HUMAN)
+    stub.edit_comment_body(comment["id"], "Done.")
+
+    history = stub.comment_history(comment["id"])
+
+    assert [revision["body"] for revision in history] == ["Investigating.", "Done."]
+    assert stub._get("comment", comment["id"])["body"] == "Done."
+    assert ots.instant(history[1]["at"]) >= ots.instant(history[0]["at"])
 
 
 def _tracker(stub: Any, client: httpx.AsyncClient) -> GitHubTracker:
@@ -347,17 +459,21 @@ def test_the_transcript_serves_the_asking_session_then_the_publishing_one(
 ) -> None:
     script, router = served
 
-    first = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(6)]
+    # Session 1 is the asking turn and the worker's one continuation turn, which
+    # also ends; only then does session 2 start again from ordinal 0.
+    first = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(7)]
     second = [script._match("POST", "/v1/messages", _turn(ots.ISSUE, n)) for n in range(18)]
 
     assert "mcp__curie__ask_questions" in _tools(first[4])
-    assert first[5]["message"]["stop_reason"] == "end_turn"
+    assert [first[n]["message"]["stop_reason"] for n in (5, 6)] == ["end_turn", "end_turn"]
+    assert first[6]["message"]["id"] == "msg_one_ticket_done_again"
+    assert all(e["message"]["id"] != "msg_one_ticket_done_again" for e in second)
     assert all("mcp__curie__publish_changes" not in _tools(e) for e in first)
     assert "mcp__curie__publish_changes" in _tools(second[17])
     assert all("mcp__curie__ask_questions" not in _tools(e) for e in second)
     assert router.unrouted == []
     served_ordinals = router.evidence()["one-ticket"]["served_ordinals"]
-    assert served_ordinals == [*range(6), *range(18)]
+    assert served_ordinals == [*range(7), *range(18)]
 
 
 def test_the_asked_questions_are_exactly_two_and_the_publication_closes_the_issue() -> None:
@@ -388,4 +504,4 @@ def test_the_publication_scenario_routes_a_fixture_issue_it_never_labelled_to_th
 def test_the_scenario_observation_names_only_the_fixture_issue() -> None:
     sql = run.observation_sql(ots.ISSUE)
     assert f"tracker_issue_id = '{ots.ISSUE}'" in sql
-    assert sql.count("tracker_issue_id") == 3
+    assert sql.count("tracker_issue_id") == 4

@@ -51,7 +51,24 @@ def _within(start: datetime, end: datetime | None, seconds: int, what: str) -> N
     _require(end is not None, f"{what} was never seen")
     assert end is not None
     elapsed = (end - start).total_seconds()
+    _require(elapsed >= 0, f"{what} was seen {-elapsed:.0f} seconds before its cause")
     _require(elapsed <= seconds, f"{what} took {elapsed:.0f} seconds, bound {seconds}")
+
+
+def first_line_instant(
+    history: Iterable[Mapping[str, Any]], marker: str, line: str
+) -> datetime | None:
+    """The instant a comment first held both ``marker`` and ``line``, from its body history.
+
+    The marker binds the line to one execution request's own status comment, so a
+    line another request's comment carried, or carried earlier, never counts.
+    """
+
+    for revision in history:
+        body = revision["body"]
+        if marker in body and line in body:
+            return instant(revision["at"])
+    return None
 
 
 def labels_of(issue: Mapping[str, Any]) -> set[str]:
@@ -142,6 +159,30 @@ def assert_answer_admitted(
     )
     _within(answer_at, received_at, RESPONSE_SECONDS, f"the line {ANSWER_RECEIVED_LINE!r}")
     return second
+
+
+def assert_answer_receipts(
+    receipts: Sequence[Mapping[str, Any]], answer: str, follow_up: str, second_request: str
+) -> None:
+    """The answer comment, and no other, made the second request; the follow-up folded into it.
+
+    The durable receipt is the link between a comment and what it started. It
+    rules out a poll that skipped the answer and let the follow-up start the run
+    in the answer's place.
+    """
+
+    by_comment = {str(r["comment_key"]): r for r in receipts}
+    mine = by_comment.get(answer)
+    _require(mine is not None, f"no receipt for the answer comment {answer}")
+    assert mine is not None
+    _require(mine["outcome"] == "admitted", f"the answer was {mine['outcome']}, not admitted")
+    _require(str(mine["request_id"]) == second_request, "the answer started another request")
+    later = by_comment.get(follow_up)
+    _require(later is not None, f"no receipt for the follow-up comment {follow_up}")
+    assert later is not None
+    _require(later["outcome"] == "coalesced", f"the follow-up was {later['outcome']}")
+    started = [str(r["request_id"]) for r in receipts if r.get("request_id") is not None]
+    _require(started == [second_request], f"requests started by comments: {started}")
 
 
 def closing_pulls(pulls: Iterable[Mapping[str, Any]], issue: int) -> list[Mapping[str, Any]]:

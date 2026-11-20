@@ -82,6 +82,11 @@ def observation_sql(issue: int) -> str:
         "'rounds',(SELECT coalesce(json_agg(json_build_object("
         "'state',q.state,'rounds_used',q.rounds_used)),'[]'::json) "
         "FROM curie.factory_question_rounds q JOIN curie.work_items w ON w.id=q.work_item_id "
+        f"WHERE w.tracker_issue_id = '{number}'),"
+        "'receipts',(SELECT coalesce(json_agg(json_build_object("
+        "'comment_key',a.comment_key,'outcome',a.outcome,'request_id',a.request_id)"
+        " ORDER BY a.created_at),'[]'::json) "
+        "FROM curie.factory_answer_receipts a JOIN curie.work_items w ON w.id=a.work_item_id "
         f"WHERE w.tracker_issue_id = '{number}'))"
     )
 
@@ -98,7 +103,6 @@ class OneTicket:
         self.stub = driver.stub
         self.router = router
         self.evidence: dict[str, Any] = {"scenario": "one-ticket", "result": "failed"}
-        self.sightings: dict[str, datetime] = {}
         self.baseline_issues: list[int] = []
         self.baseline_pulls = 0
 
@@ -125,30 +129,30 @@ class OneTicket:
             raise OneTicketError("the fixture issue is gone")
         return found
 
-    def sight(self, name: str, line: str, bot_login: str) -> None:
-        """Stamp the first moment the factory's own comment carried ``line``.
+    def line_at(self, request_id: str, line: str, bot_login: str) -> datetime | None:
+        """The instant the request's own status comment first carried ``line``.
 
-        A status comment is edited in place and drops its lead line once its
-        run ends, so the line is only ever observable while it is live.
+        A status comment is edited in place and drops its lead line once its run
+        ends, so the stub's history of the comment's bodies is what places the
+        line in time, on the stub's one clock.
         """
 
-        if name in self.sightings:
-            return
+        marker = f"<!-- curie-execution-request:{request_id} -->"
         for comment in self.comments():
-            if comment["user"]["login"] == bot_login and line in comment["body"]:
-                self.sightings[name] = now()
-                return
+            if comment["user"]["login"] != bot_login:
+                continue
+            found = ots.first_line_instant(self.stub.comment_history(comment["id"]), marker, line)
+            if found is not None:
+                return found
+        return None
 
     def wait(self, what: str, ready: Any, github: Any) -> Any:
-        """Poll until ``ready()`` answers truthy, stamping the visible status lines."""
+        """Poll until ``ready()`` answers truthy."""
 
         deadline = self.driver.deadline
         assert deadline is not None
-        bot = github.BOT["login"]
         while time.monotonic() < deadline:
             self.check_boundaries()
-            self.sight("investigating", ots.INVESTIGATING_LINE, bot)
-            self.sight("answer_received", ots.ANSWER_RECEIVED_LINE, bot)
             found = ready()
             if found:
                 return found
@@ -266,9 +270,10 @@ class OneTicket:
         # Session 1 asks.
         observed = self.asked(github)
         item = ots.assert_one_work_item(observed["work_items"], agent)
-        ots.assert_first_response(label_at, self.sightings.get("investigating"))
-        ots.assert_one_question_comment(self.comments(), ots.ISSUE, bot)
         asking = ots.assert_questions_state(self.issue(), observed["requests"])
+        investigating_at = self.line_at(str(asking["id"]), ots.INVESTIGATING_LINE, bot)
+        ots.assert_first_response(label_at, investigating_at)
+        ots.assert_one_question_comment(self.comments(), ots.ISSUE, bot)
         self.evidence.update(work_item_id=str(item["id"]), asking_request_id=str(asking["id"]))
 
         # Comments that are not answers start nothing.
@@ -279,15 +284,22 @@ class OneTicket:
         ots.assert_ignored_comments(len(observed["requests"]), len(self.observe()["requests"]))
 
         # The labeller's plain answer, and a second plain comment beside it.
-        answer = self.stub.append_comment(ots.ISSUE, ANSWER_TEXT, author=github.HUMAN)
-        follow_up = self.stub.append_comment(ots.ISSUE, FOLLOW_UP_TEXT, author=github.HUMAN)
+        # Posted together, so one listing of the comments returns both.
+        answer, follow_up = self.stub.append_comments(
+            ots.ISSUE, [ANSWER_TEXT, FOLLOW_UP_TEXT], author=github.HUMAN
+        )
         answer_at = ots.instant(answer["created_at"])
         observed = self.answered(github, str(asking["id"]))
+        received_at = None
+        if len(observed["requests"]) > 1:
+            received_at = self.line_at(
+                str(observed["requests"][1]["id"]), ots.ANSWER_RECEIVED_LINE, bot
+            )
         second = ots.assert_answer_admitted(
-            observed["requests"],
-            str(asking["id"]),
-            answer_at,
-            self.sightings.get("answer_received"),
+            observed["requests"], str(asking["id"]), answer_at, received_at
+        )
+        ots.assert_answer_receipts(
+            observed["receipts"], str(answer["id"]), str(follow_up["id"]), str(second["id"])
         )
 
         # Session 2 publishes, and the follow-up starts nothing.
@@ -304,8 +316,8 @@ class OneTicket:
             answer_comment_id=answer["id"],
             follow_up_comment_id=follow_up["id"],
             pull_request=pull["number"],
-            investigating_seconds=(self.sightings["investigating"] - label_at).total_seconds(),
-            answer_received_seconds=(self.sightings["answer_received"] - answer_at).total_seconds(),
+            investigating_seconds=(investigating_at - label_at).total_seconds(),
+            answer_received_seconds=(received_at - answer_at).total_seconds(),
             second_request_seconds=(ots.instant(second["created_at"]) - answer_at).total_seconds(),
         )
         self.evidence["result"] = "passed"
