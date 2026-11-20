@@ -121,5 +121,54 @@ for bad in ("channelGateway.identityLookup.timeoutSeconds=0",
                              "--set", bad], capture_output=True, text=True)
     assert result.returncode != 0, bad + " was accepted"
 
+
+def rendered_env(*sets):
+    args = ["helm", "template", "acme", sys.argv[2], "-f", sys.argv[3]]
+    for value in sets:
+        args += ["--set", value]
+    rendered = subprocess.run(args, capture_output=True, text=True, check=True).stdout
+    objects = [item for item in yaml.safe_load_all(rendered) if item]
+    envs = {}
+    for item in objects:
+        spec = item.get("spec", {})
+        pod = spec.get("template", {}).get("spec") or spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec")
+        for container in (pod or {}).get("containers", []) + (pod or {}).get("initContainers", []):
+            envs[item["metadata"]["name"] + "/" + container["name"]] = {
+                entry["name"]: entry for entry in container.get("env", [])}
+    return rendered, envs
+
+
+# @spec GATEWAY-USER-EMAIL-8: a lookup-only Slack identity renders into the gateway alone.
+LOOKUP_ENV = ("CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY",
+              "CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN")
+plain, _ = rendered_env("channelGateway.identityLookup.existingSecret=idp-gateway")
+for name in LOOKUP_ENV:
+    assert name not in plain, name + " rendered without a lookup Secret"
+rendered, envs = rendered_env("channelGateway.identityLookup.existingSecret=idp-gateway",
+                              "channelGateway.identityLookup.slackIdentity=directory",
+                              "channelGateway.identityLookup.slackBotTokenExistingSecret=directory-app")
+gateway = envs["acme-curie-channel-gateway/channel-gateway"]
+assert gateway[LOOKUP_ENV[0]]["value"] == "directory"
+assert gateway[LOOKUP_ENV[1]]["valueFrom"] == {
+    "secretKeyRef": {"name": "directory-app", "key": "token"}}
+for workload, env in envs.items():
+    if workload != "acme-curie-channel-gateway/channel-gateway":
+        assert not set(LOOKUP_ENV) & env.keys(), workload + " received the lookup identity"
+assert rendered.count("directory-app") == 1, "the lookup Secret is referenced outside the gateway"
+_, keyed = rendered_env("channelGateway.identityLookup.slackIdentity=directory",
+                        "channelGateway.identityLookup.slackBotTokenExistingSecret=directory-app",
+                        "channelGateway.identityLookup.slackBotTokenKey=bot")
+assert keyed["acme-curie-channel-gateway/channel-gateway"][LOOKUP_ENV[1]]["valueFrom"] == {
+    "secretKeyRef": {"name": "directory-app", "key": "bot"}}
+for bad in (("channelGateway.identityLookup.slackBotTokenExistingSecret=directory-app",),
+            ("channelGateway.identityLookup.slackBotTokenExistingSecret=directory-app",
+             "channelGateway.identityLookup.slackIdentity=directory",
+             "channelGateway.identityLookup.slackBotTokenKey=")):
+    args = ["helm", "template", "acme", sys.argv[2], "-f", sys.argv[3]]
+    for value in bad:
+        args += ["--set", value]
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode != 0, " ".join(bad) + " was accepted"
+
 print("PASS: unchanged pre-gateway Slack values render on install and upgrade; TLS, token custody and retained defaults are wired")
 PYTHON
