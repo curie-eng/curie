@@ -3015,9 +3015,11 @@ A pull request published for a request whose evidence is `applied` carries one l
 with `Learned rules:` is refused with `publication.learned_rules_annotation_reserved`
 before any other work.
 
-Only a request under the implementation completion contract is served the rules: a request
-under any other contract (the separate triage path) carries `memory_rules_evidence` `none`
-and is served an absent envelope. The rule text rides the implementer's system prompt, so
+Every request the factory admits from a labelled ticket runs under the implementation
+completion contract and is served the rules pinned at admission; there is no separate
+triage path. A bundle that still carries `workflow/result.json` is refused at upload,
+push, deploy and promote with `bundle.result_declaration_retired`: delete the file and
+deploy again. The rule text rides the implementer's system prompt, so
 the conversation transcript and its native checkpoint can retain it, under the transcript's
 own access controls and expiry and not the WorkItem snapshot's, as for requester
 preferences. A rule removed after a WorkItem was admitted can therefore remain in that
