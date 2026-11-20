@@ -1776,6 +1776,23 @@ channelGateway:
     existingSecret: ""
     tokenKey: token
     timeoutSeconds: 5
+  # Optional lookup identities: provider credentials the gateway uses for
+  # directory reads alone (today the Slack user email lookup above), so no
+  # agent's app needs a directory scope. Each entry is {name, kind,
+  # existingSecret, key}: name follows the Slack identity name pattern and must
+  # not be default or a declared Slack identity; kind is the provider, and slack
+  # (a bot-token-only app with users:read and users:read.email, no Socket Mode,
+  # no events) is the only one; existingSecret names an operator-supplied
+  # Secret whose key (default token) holds the credential. An identity provider
+  # then sets CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY to that name. Only the
+  # gateway receives these credentials, and only its directory reads use them;
+  # replies, other reads, the dispatcher, API and worker never do. Empty (the
+  # default) changes nothing. Restart the gateway after rotating a Secret.
+  #   lookupIdentities:
+  #     - name: directory
+  #       kind: slack
+  #       existingSecret: directory-lookup-app
+  lookupIdentities: []
   readinessProbe:
     initialDelaySeconds: 1
     periodSeconds: 5

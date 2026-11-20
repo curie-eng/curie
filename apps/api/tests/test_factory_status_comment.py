@@ -695,7 +695,7 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert WAITING in body
     assert FINAL_MARKER not in body
     assert "![Curie status]" not in body
-    assert body.rstrip().endswith(github_ask_line(MENTION))
+    _assert_one_current_ask_line(body)
     assert _curie_labels(sink, number) == {"curie-factory:queued"}
     # Human and admission labels are never touched.
     assert {LABEL, "bug"} <= sink.issue_labels[number]
@@ -757,7 +757,7 @@ def test_a_card_url_replaces_the_checklist_as_phases_advance(
     assert "Read issue" not in body
     assert WAITING not in body
     assert marker_for(request_id) in body
-    assert body.rstrip().endswith(github_ask_line(MENTION))
+    _assert_one_current_ask_line(body)
 
 
 def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811
@@ -771,8 +771,40 @@ def test_github_status_comment_ends_with_the_factory_ask_line(admitted: Any) -> 
     assert "Status: QUEUED" in body
     assert WAITING in body
     assert marker_for(request_id) in body
-    assert body.rstrip().endswith(ask)
+    _assert_one_current_ask_line(body)
     assert body.count(ask) == 1
+
+
+def _assert_one_current_ask_line(body: str) -> None:
+    """Exactly one ask line, the current text, one blank line after the body text.
+
+    Anything after it is a platform annotation line; none may be an ask line.
+    """
+
+    lines = body.rstrip("\n").splitlines()
+    asks = [i for i, line in enumerate(lines) if line.startswith("Ask the factory:")]
+    assert len(asks) == 1, body
+    at = asks[0]
+    assert lines[at] == github_ask_line(MENTION)
+    assert lines[at - 1] == "" and lines[at - 2].strip()
+    assert f"mention @{MENTION} on this pull request" not in body
+
+
+def test_status_comment_replaces_the_previous_ask_wording(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 9930)
+    _reconcile()
+    body = _posts(sink)[0][1] or ""
+    old = f"Ask the factory: mention @{MENTION} on this pull request."
+    seeded = body.replace(github_ask_line(MENTION), old)
+    assert old in seeded and github_ask_line(MENTION) not in seeded
+
+    # The real writer's last step, applied to a body carrying the old wording.
+    rewritten = factory_notices.append_github_ask_line(seeded, MENTION)
+
+    assert old not in rewritten
+    assert marker_for(request_id) in rewritten
+    _assert_one_current_ask_line(rewritten)
 
 
 def test_non_github_status_comments_omit_the_factory_ask_line(admitted: Any) -> None:  # noqa: F811

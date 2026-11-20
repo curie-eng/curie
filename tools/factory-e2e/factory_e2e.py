@@ -35,10 +35,10 @@ comment must name the exact pull request URL. A failure comment must state
 `Could not complete:` followed by a reason.
 
 `revision --issue-file <file> [--revision-file <file>]` waits for that run to
-open a pull request and post its final issue comment, posts an ordinary PR
-comment (it must be ignored), then a mention comment, and judges that the
-mention adds a second request to the same WorkItem that pushes a new commit to
-the same pull request and gets one linked App reply. `cancel-waiting` installs
+open a pull request and post its final issue comment, posts one plain PR
+conversation comment (no mention), and judges that it adds exactly one request
+to the same WorkItem that pushes one new commit to the same pull request and
+gets one linked App reply. `cancel-waiting` installs
 with a sandbox pod quota of 0 so
 the request waits on capacity, removes the label, and judges a direct
 `cancelled` with cause `issue_cancelled`. `cancel-running [--issue-file]`
@@ -167,6 +167,24 @@ rebuilds a catalog repository's runner and a turn on the custom repository, CI f
 the stub, then teardown proved object by object. It exits 0 only when
 docker_scenario.py's judge finds nothing and teardown is verified. Live use is the
 w2 waypoint and acceptance.
+
+`live-github-chain` (live_github_chain.py, judged by live_github_chain_judge.py, #5808)
+runs the whole GitHub product flow on the preflight's install: questions on
+ticket A, a plain answer, a submitted review that revises the pull request and
+becomes a proposed rule after the merge, a reader refused and the writer
+accepting it, ticket B carrying the rule over a conflicting personal
+instruction, its removal before ticket C, and the retired triage path. Before
+any lock or kubectl call it checks that every blocker of #5808 has a closing
+pull request merged into next whose merge commit is in the candidate, and it
+needs CURIE_FACTORY_READER_ACCOUNT_ID (the numeric id of a public account other
+than the actor). It opens its own tickets, so no seed issue is labelled. It
+installs a disposable Dex for two OIDC principals, links them to the actor and
+the reader, and writes evidence and logs only through the judge's sanitizer.
+`--stop-after links` stops after the session probe and the links, before any
+ticket exists, so it needs no model key and makes no model request; the full
+run needs CURIE_FACTORY_MODEL_API_KEY. `--live-chain-attempt N` (1 or 2) records
+which of the at most two attempts this is. Both flags are refused for any
+other scenario.
 
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
@@ -436,8 +454,10 @@ SCENARIOS: dict[str, ScenarioDriver | None] = {
     "tls-code-host": None,  # bound at the bottom from tls_code_host.py
     "repo-runner": None,  # bound at the bottom from repo_runner.py
     "docker": None,  # bound at the bottom from docker_driver.py
+    "live-github-chain": None,  # bound at the bottom from live_github_chain.py
 }
 SCENARIO_NAMES = tuple(SCENARIOS)
+LIVE_CHAIN_SCENARIO = "live-github-chain"
 WHOLE_FLOW_SCENARIOS = frozenset({"tls-code-host", "repo-runner", "docker"})
 
 
@@ -455,15 +475,56 @@ def resolve_scenario(name: str) -> ScenarioDriver:
 LOOP_SCENARIOS: dict[str, str | None] = {"forge-loop": None, "github-loop": "github"}
 
 
+# Scenarios that open every ticket they judge themselves.
+OWN_TICKET_SCENARIOS = frozenset({"evaluation", "live-github-chain"})
+
+
 def scenario_opens_seed_issue(name: str | None) -> bool:
-    """The preflight seed issue is for every mode except evaluation and the loops.
+    """The preflight seed issue is for every mode except the ones that open their own.
 
     Evaluation opens one issue per case itself. A seed issue would admit a
-    second, unjudged run beside the first case. A loop opens its ticket
-    through its forge driver.
+    second, unjudged run beside the first case. live-github-chain opens its own
+    tickets: a seed issue would start an unjudged paid run and add a pull
+    request before ticket A. A loop opens its ticket through its forge driver.
     """
 
-    return name != "evaluation" and name not in LOOP_SCENARIOS and name not in WHOLE_FLOW_SCENARIOS
+    return (
+        name not in OWN_TICKET_SCENARIOS
+        and name not in LOOP_SCENARIOS
+        and name not in WHOLE_FLOW_SCENARIOS
+    )
+
+
+ValuesTransform = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+@dataclasses.dataclass(frozen=True)
+class ScenarioHooks:
+    """Optional calls a scenario adds around the shared preflight.
+
+    ``before_run`` is the first statement of ``Preflight.run``, before any tool
+    check, lock, kubectl or helm call. ``install_values`` runs after the
+    namespace exists and before the install; its transformer is applied to
+    every values build, so the install and each upgrade carry it. ``finish``
+    runs in ``main`` after the teardown and before the evidence is written;
+    False fails the run. ``ensure_label`` replaces the shared intake label
+    step. ``private_binary`` keeps the CLI binary's path out of the log and
+    the evidence (its version is still recorded), and the completion line
+    names the evidence file by its basename only.
+    """
+
+    before_run: Callable[[Preflight], None] | None = None
+    install_values: Callable[[Preflight], ValuesTransform] | None = None
+    finish: Callable[[Preflight, list[dict[str, Any]]], bool] | None = None
+    ensure_label: Callable[[Preflight], None] | None = None
+    private_binary: bool = False
+
+
+SCENARIO_HOOKS: dict[str, ScenarioHooks] = {}
+
+
+def scenario_hooks(name: str | None) -> ScenarioHooks:
+    return SCENARIO_HOOKS.get(name or "", ScenarioHooks())
 
 
 # --------------------------------------------------------------------------
@@ -1198,7 +1259,7 @@ def last_label_event_id(events: list[Any], label: str) -> int | None:
 
 
 def revision_request_id(repository_id: int, comment_id: int) -> uuid.UUID:
-    """The execution request id the api derives for a PR mention revision.
+    """The execution request id the api derives for a PR conversation comment revision.
 
     Mirrors UnverifiedFeedback.event_id in github_review_events.py and the
     request id _admit derives from it in github_factory_review.py.
@@ -1676,23 +1737,18 @@ def judge_cli_state(
 
 
 def judge_revision(obs: Mapping[str, Any]) -> list[str]:
-    """Every way a PR mention revision falls short. Empty means it passed. Pure."""
+    """Every way a plain PR comment revision falls short. Empty means it passed. Pure."""
 
     failures: list[str] = []
-    if obs.get("ordinary_delivery_api_status") != "factory_ignored":
+    if obs.get("comment_delivery_status_code") != 200:
+        failures.append(f"the comment delivery got HTTP {obs.get('comment_delivery_status_code')}")
+    if obs.get("comment_delivery_api_status") != "factory_admitted":
         failures.append(
-            "the ordinary PR comment was not ignored: api status "
-            f"{obs.get('ordinary_delivery_api_status')!r}"
+            f"the comment was not admitted: api status {obs.get('comment_delivery_api_status')!r}"
         )
-    if obs.get("ordinary_new_requests") != 0:
+    if obs.get("comment_new_requests") != 1:
         failures.append(
-            f"the ordinary PR comment created {obs.get('ordinary_new_requests')} request(s)"
-        )
-    if obs.get("mention_delivery_status_code") != 200:
-        failures.append(f"the mention delivery got HTTP {obs.get('mention_delivery_status_code')}")
-    if obs.get("mention_delivery_api_status") != "factory_admitted":
-        failures.append(
-            f"the mention was not admitted: api status {obs.get('mention_delivery_api_status')!r}"
+            f"the comment added {obs.get('comment_new_requests')} request(s), expected exactly 1"
         )
     if not obs.get("work_item_id") or obs.get("revision_request_work_item_id") != obs.get(
         "work_item_id"
@@ -1711,19 +1767,25 @@ def judge_revision(obs: Mapping[str, Any]) -> list[str]:
         failures.append(f"the pull request changed: #{before} before, #{after} after")
     if not obs.get("head_sha_after") or obs.get("head_sha_after") == obs.get("head_sha_before"):
         failures.append("the pull request head did not move")
-    if int(obs.get("commits_after") or 0) <= int(obs.get("commits_before") or 0):
-        failures.append("the pull request gained no commit")
+    gained = int(obs.get("commits_after") or 0) - int(obs.get("commits_before") or 0)
+    if gained != 1:
+        failures.append(f"the pull request gained {gained} commit(s), expected exactly 1")
     replies = list(obs.get("revision_replies") or [])
     if len(replies) != 1:
         failures.append(f"{len(replies)} App replies carry the revision marker, expected one")
-    elif not obs.get("mention_comment_url") or not re.search(
-        rf"(?m)^In response to {re.escape(str(obs['mention_comment_url']))}\s*$",
+    elif not obs.get("comment_url") or not re.search(
+        rf"(?m)^In response to {re.escape(str(obs['comment_url']))}\s*$",
         str(replies[0].get("body") or ""),
     ):
-        failures.append("the revision reply does not link the mention comment")
-    if obs.get("app_comments_after_ordinary") != 1:
+        failures.append("the revision reply does not link the plain comment")
+    if int(obs.get("revision_replies_on_other_pull_requests") or 0) != 0:
         failures.append(
-            f"{obs.get('app_comments_after_ordinary')} App comments followed the ordinary "
+            f"{obs.get('revision_replies_on_other_pull_requests')} revision reply(ies) landed "
+            "on another pull request"
+        )
+    if obs.get("app_comments_after_comment") != 1:
+        failures.append(
+            f"{obs.get('app_comments_after_comment')} App comments followed the plain "
             "comment, expected only the revision reply"
         )
     if obs.get("default_branch_moved"):
@@ -1919,9 +1981,22 @@ class Teardown:
 # --------------------------------------------------------------------------
 
 
+# Filters every logged line and printed error passes through, in order. A
+# scenario that must not print raw identifiers installs its sanitizer here.
+LOG_FILTERS: list[Callable[[str], str]] = []
+
+
+def filtered(text: str) -> str:
+    for apply in LOG_FILTERS:
+        text = apply(text)
+    return text
+
+
 def log(message: str) -> None:
     print(
-        f"[factory-e2e {dt.datetime.now(dt.UTC):%H:%M:%S}] {message}", file=sys.stderr, flush=True
+        f"[factory-e2e {dt.datetime.now(dt.UTC):%H:%M:%S}] {filtered(message)}",
+        file=sys.stderr,
+        flush=True,
     )
 
 
@@ -1933,7 +2008,10 @@ def run(argv: list[str], *, check: bool = True, input_text: str | None = None) -
     return result.stdout
 
 
-def resolve_curie_binary(binary: str) -> tuple[str, str]:
+def resolve_curie_binary(binary: str, *, show_path: bool = True) -> tuple[str, str]:
+    """The resolved binary and its version; ``show_path`` False never prints the path."""
+
+    named = repr(binary) if show_path else "(path withheld)"
     try:
         if os.path.dirname(binary):
             path = Path(binary)
@@ -1941,10 +2019,11 @@ def resolve_curie_binary(binary: str) -> tuple[str, str]:
         else:
             resolved = shutil.which(binary)
         if resolved is None:
-            raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable")
+            raise ConfigError(f"CURIE_BIN {named} cannot be resolved to an executable")
         curie_bin = str(Path(resolved).resolve())
     except (OSError, RuntimeError):
-        raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable") from None
+        raise ConfigError(f"CURIE_BIN {named} cannot be resolved to an executable") from None
+    shown = repr(curie_bin) if show_path else "(path withheld)"
     try:
         result = subprocess.run(
             [curie_bin, "--version"],
@@ -1954,14 +2033,15 @@ def resolve_curie_binary(binary: str) -> tuple[str, str]:
             timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired, UnicodeError):
-        raise ConfigError(f"CURIE_BIN {curie_bin!r} could not run --version") from None
+        raise ConfigError(f"CURIE_BIN {shown} could not run --version") from None
     if result.returncode:
-        raise ConfigError(f"CURIE_BIN {curie_bin!r} failed --version (exit {result.returncode})")
+        raise ConfigError(f"CURIE_BIN {shown} failed --version (exit {result.returncode})")
     lines = result.stdout.splitlines()
     version = lines[0] if lines else ""
     if not version.strip():
-        raise ConfigError(f"CURIE_BIN {curie_bin!r} did not report a version")
-    print(f"factory-e2e: curie binary {curie_bin} ({version})", file=sys.stderr, flush=True)
+        raise ConfigError(f"CURIE_BIN {shown} did not report a version")
+    where = f"{curie_bin} " if show_path else ""
+    print(f"factory-e2e: curie binary {where}({version})", file=sys.stderr, flush=True)
     return curie_bin, version
 
 
@@ -2146,6 +2226,9 @@ class Preflight:
         self.issue_spec = issue_spec
         self.scenario_name = scenario_name
         self.revision_text = revision_text
+        if scenario_name == "revision" and revision_text:
+            # Refuse before any cluster or GitHub work, not at the post.
+            plain_comment_text(revision_text)
         self.expect = expect
         self.expect_causes = frozenset(expect_causes)
         self.expect_reasons = tuple(expect_reasons)
@@ -2201,6 +2284,16 @@ class Preflight:
         self._issue_token_minted = 0.0
         self._fixture_restore_pushed = False
         self._loop_driver: ForgeDriver | None = None
+        # Scenario hook state: the install values transformer, the evidence
+        # serializer (None writes plain JSON) and the scenario's CLI options.
+        self.values_transform: ValuesTransform | None = None
+        self.evidence_serializer: Callable[[dict[str, Any]], str] | None = None
+        self.scenario_options: dict[str, Any] = {}
+        # True once the serializer refused the evidence: main fails the run.
+        self.evidence_refused = False
+        # The bundle directory the last deploy_bundle uploaded (the private
+        # copy build_runner_layer returns, or the source bundle).
+        self.deployed_bundle: Path | None = None
 
     # --- small wrappers -------------------------------------------------
 
@@ -2802,6 +2895,8 @@ class Preflight:
             forge=self.install_forge,
         )
         values["priorityClasses"] = priority_class_values(config.priority_classes, self.release)
+        if self.values_transform is not None:
+            values = self.values_transform(values)
         return values
 
     def install(
@@ -3117,6 +3212,7 @@ class Preflight:
 
         assert self.chart_dir is not None, "install() extracts the chart first"
         bundle = self.build_runner_layer(self.config.bundle_dir)
+        self.deployed_bundle = bundle
         manifest = json.loads((bundle / ".claude-plugin" / "plugin.json").read_text())
         kubeconfig = self._write_kubeconfig()
         token = self._issue_read_token() if github_token else ""
@@ -3341,11 +3437,15 @@ class Preflight:
             raise PreflightFailed("the fixture repository did not read back as reset") from None
         return {"closed": closed, "branches_deleted": deleted, "verified_clean": True}
 
-    def ensure_label(self) -> None:
+    def ensure_label(self, *, on_create: Callable[[], None] | None = None) -> None:
+        """Create the intake label when it is missing; ``on_create`` runs just before."""
+
         repo = f"/repos/{self.config.repo}"
         name = urllib.parse.quote(self.config.label, safe="")
         status, _ = self.as_actor("GET", f"{repo}/labels/{name}")
         if status == 404:
+            if on_create is not None:
+                on_create()
             status, _ = self.as_actor(
                 "POST", f"{repo}/labels", {"name": self.config.label, "color": "5319e7"}
             )
@@ -3796,6 +3896,9 @@ class Preflight:
         return self._loop_driver
 
     def run(self, scenario: ScenarioDriver | None) -> None:
+        hooks = scenario_hooks(self.scenario_name)
+        if hooks.before_run is not None:
+            hooks.before_run(self)
         if scenario is not None and self.scenario_name in WHOLE_FLOW_SCENARIOS:
             # Each whole-flow driver owns setup and observation in this teardown.
             self.evidence["scenario"] = scenario(self)
@@ -3818,6 +3921,8 @@ class Preflight:
             self.build_candidate_images()
         self.sweep_stale_namespaces()
         self.create_namespace()
+        if hooks.install_values is not None:
+            self.values_transform = hooks.install_values(self)
         self.install()
         self.port_forward()
         if setup is None:
@@ -3832,7 +3937,10 @@ class Preflight:
         for name, step in driver.teardowns() if driver is not None else ():
             self.teardown.push(name, step)
         if github:
-            self.ensure_label()
+            if hooks.ensure_label is not None:
+                hooks.ensure_label(self)
+            else:
+                self.ensure_label()
             self.tunnel()
             self.point_card_at_tunnel()
             self.repoint_webhook()
@@ -4088,10 +4196,24 @@ class Preflight:
 
     def write_evidence(self) -> None:
         self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.evidence_serializer is None:
+            text = json.dumps(self.evidence, indent=2, default=str) + "\n"
+        else:
+            try:
+                text = self.evidence_serializer(self.evidence)
+            except ValueError as exc:
+                # The serializer refused (a raw identifier it could not
+                # replace); write only that it refused, never the evidence.
+                refusal = {
+                    "schema": self.evidence.get("schema"),
+                    "result": "failed",
+                    "error": f"evidence refused by the scenario serializer: {exc}",
+                }
+                text = json.dumps(refusal, indent=2) + "\n"
+                self.evidence_refused = True
         fd = os.open(self.evidence_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
-            json.dump(self.evidence, handle, indent=2, default=str)
-            handle.write("\n")
+            handle.write(text)
 
 
 # --------------------------------------------------------------------------
@@ -4656,7 +4778,6 @@ SCENARIOS["issue-to-pr"] = issue_to_pr
 # Scenarios: revision, cancel-waiting, cancel-running
 # --------------------------------------------------------------------------
 
-REVISION_QUIET_SECONDS = 60
 CANCEL_QUIET_SECONDS = 180
 CANCEL_SETTLE_SECONDS = 600
 WAITING_HOLD_SECONDS = 300
@@ -4686,6 +4807,31 @@ def revision_comment_text(text: str | None, mention: str) -> str:
 
     body = (text or DEFAULT_REVISION_TEXT).strip()
     return body if f"@{mention}" in body else f"@{mention} {body}"
+
+
+# Any @login token, as mentions_login in apps/api/src/curie_api/github_factory_events.py
+# bounds one: an address inside a word (ops@example.com) is not a mention.
+_ANY_MENTION = re.compile(r"(?<![A-Za-z0-9-])@[A-Za-z0-9][A-Za-z0-9-]*")
+
+
+def plain_comment_text(text: str | None) -> str:
+    """The plain comment body: the operator text, not addressed to anyone.
+
+    Refuses text that mentions any login. A mention of the factory (its
+    configured mention, its App slug, or an alias the driver cannot see when
+    the App is configured from the environment alone) would pass against a
+    mention-required factory and prove nothing. Pure.
+    """
+
+    body = (text or DEFAULT_REVISION_TEXT).strip()
+    found = _ANY_MENTION.search(body)
+    if found is not None:
+        raise ConfigError(
+            f"the revision text mentions {found.group(0)}; the revision scenario must prove "
+            "that a plain comment (no mention) starts a revision, so remove the mention "
+            "from the revision file"
+        )
+    return body
 
 
 def _timeline(obs: dict[str, Any], event: str, **facts: Any) -> None:
@@ -4776,8 +4922,8 @@ def _new_obs(p: Preflight) -> dict[str, Any]:
 
 
 def revision(p: Preflight) -> dict[str, Any]:
-    """The labelled run opens a PR; an ordinary PR comment is ignored; a
-    mention revises the same PR under the same WorkItem."""
+    """The labelled run opens a PR; one plain PR comment revises the same PR
+    under the same WorkItem."""
 
     obs = _new_obs(p)
     work_item_id = obs["work_item_id"]
@@ -4849,37 +4995,22 @@ def revision(p: Preflight) -> dict[str, Any]:
     )
     requests_before = len(detail.get("requests") or [])
 
-    # An ordinary comment on the owned PR: ignored, no request, no reply.
+    # One plain comment on the owned PR: one revision request on the same WorkItem.
     since = time.time()
-    ordinary = p.post_pr_comment(
-        pr_number, "Noting for the record: the change reads fine so far. No action needed."
+    comment = p.post_pr_comment(
+        pr_number, plain_comment_text(p.revision_text)
     )
-    obs["ordinary_comment_id"] = ordinary.get("id")
-    obs["ordinary_comment_created_at"] = ordinary.get("created_at")
-    _timeline(obs, "ordinary comment posted", comment_id=ordinary.get("id"))
-    delivery = _await_comment_delivery(p, int(ordinary["id"]), since)
-    obs["ordinary_delivery_id"] = delivery.get("guid")
-    obs["ordinary_delivery_status_code"] = delivery.get("status_code")
-    obs["ordinary_delivery_api_status"] = delivery_api_status(delivery)
-    _timeline(obs, "ordinary comment delivered", api_status=obs["ordinary_delivery_api_status"])
-    log(f"revision: quiet window {REVISION_QUIET_SECONDS}s after the ordinary comment")
-    time.sleep(REVISION_QUIET_SECONDS)
-    quiet = p.work_item_detail(work_item_id) or {}
-    obs["ordinary_new_requests"] = len(quiet.get("requests") or []) - requests_before
-
-    # The mention: one revision request on the same WorkItem.
-    since = time.time()
-    mention = p.post_pr_comment(pr_number, revision_comment_text(p.revision_text, p.config.mention))
-    mention_id = int(mention["id"])
-    obs["mention_comment_id"] = mention_id
-    obs["mention_comment_url"] = mention.get("html_url")
-    _timeline(obs, "mention posted", comment_id=mention_id)
-    delivery = _await_comment_delivery(p, mention_id, since)
-    obs["mention_delivery_id"] = delivery.get("guid")
-    obs["mention_delivery_status_code"] = delivery.get("status_code")
-    obs["mention_delivery_api_status"] = delivery_api_status(delivery)
-    _timeline(obs, "mention delivered", api_status=obs["mention_delivery_api_status"])
-    revision_id = str(revision_request_id(p.repository_id, mention_id))
+    comment_id = int(comment["id"])
+    obs["comment_id"] = comment_id
+    obs["comment_url"] = comment.get("html_url")
+    obs["comment_created_at"] = comment.get("created_at")
+    _timeline(obs, "plain comment posted", comment_id=comment_id)
+    delivery = _await_comment_delivery(p, comment_id, since)
+    obs["comment_delivery_id"] = delivery.get("guid")
+    obs["comment_delivery_status_code"] = delivery.get("status_code")
+    obs["comment_delivery_api_status"] = delivery_api_status(delivery)
+    _timeline(obs, "plain comment delivered", api_status=obs["comment_delivery_api_status"])
+    revision_id = str(revision_request_id(p.repository_id, comment_id))
     obs["revision_request_id"] = revision_id
     try:
         request = _wait(
@@ -4918,6 +5049,7 @@ def revision(p: Preflight) -> dict[str, Any]:
     obs["pr_number_after"] = pr_after.get("number") if pr_after else None
     obs["work_item_state_after"] = detail.get("state")
     obs["request_statuses"] = _ordered_statuses(detail)
+    obs["comment_new_requests"] = len(detail.get("requests") or []) - requests_before
     obs["publication"] = detail.get("publication")
     obs["head_sha_after"], obs["commits_after"] = p.pr_head(pr_number)
     obs["pull_request_numbers"] = _scenario_pr_numbers(p)
@@ -4928,13 +5060,16 @@ def revision(p: Preflight) -> dict[str, Any]:
     obs["revision_replies"] = [
         {**r, "body": record_agent_text(r["body"], known)[0]} for r in replies
     ]
-    ordinary_at = _parse_time(obs.get("ordinary_comment_created_at"))
-    obs["app_comments_after_ordinary"] = sum(
+    obs["revision_replies_on_other_pull_requests"] = sum(
+        len(replies_on(number)) for number in obs["pull_request_numbers"] if number != pr_number
+    )
+    comment_at = _parse_time(obs.get("comment_created_at"))
+    obs["app_comments_after_comment"] = sum(
         1
         for c in pr_comments
         if _app_authored(c, p.config.mention, p.config.app_id)
-        and ordinary_at is not None
-        and (_parse_time(c.get("created_at")) or ordinary_at) >= ordinary_at
+        and comment_at is not None
+        and (_parse_time(c.get("created_at")) or comment_at) >= comment_at
     )
     obs["default_branch_moved"] = p.default_branch_head() != p.head_before
     _timeline(obs, "revision ended", terminal=terminal, head_sha=obs["head_sha_after"])
@@ -6646,6 +6781,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     scenario.add_argument(
+        "--stop-after",
+        choices=("links",),
+        help=(
+            "live-github-chain: stop after the session probe and the code host links, before "
+            "any ticket exists, so no model request is possible"
+        ),
+    )
+    scenario.add_argument(
+        "--live-chain-attempt",
+        type=int,
+        choices=(1, 2),
+        help="live-github-chain: which of the at most two attempts this run is (default 1)",
+    )
+    scenario.add_argument(
         "--expect",
         choices=EXPECTATIONS,
         default="any",
@@ -7204,6 +7353,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.mode == "run":
             driver = resolve_scenario(args.scenario)
+            if args.scenario != LIVE_CHAIN_SCENARIO:
+                for flag, value in (
+                    ("--stop-after", args.stop_after),
+                    ("--live-chain-attempt", args.live_chain_attempt),
+                ):
+                    if value is not None:
+                        raise ConfigError(f"{flag} applies only to {LIVE_CHAIN_SCENARIO}")
             forge = loop_forge(args.scenario, args.forge)
             forge_target = loop_forge_target(forge, args.forge_target)
             if args.scenario == "issue-to-pr":
@@ -7259,10 +7415,13 @@ def main(argv: list[str] | None = None) -> int:
                     else DEFAULT_CANCEL_RUNNING_ISSUE
                 )
         whole_flow = args.mode == "run" and args.scenario in WHOLE_FLOW_SCENARIOS
+        show_path = not scenario_hooks(args.scenario if args.mode == "run" else None).private_binary
         # Whole-flow input refusal must precede even a local binary command.
         # Ordinary preflight checks its binary before loading factory actions.
         if not whole_flow:
-            curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+            curie_bin, curie_version = resolve_curie_binary(
+                os.environ.get("CURIE_BIN") or "curie", show_path=show_path
+            )
         if whole_flow:
             if args.scenario == "repo-runner" and args.model_base_url:
                 raise ConfigError("repo-runner refuses an external model endpoint")
@@ -7288,6 +7447,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "run" and (
             args.scenario in ("revision", "cancel-running", "evaluation", "quiesce")
             or args.scenario in LOOP_SCENARIOS
+            or (args.scenario == LIVE_CHAIN_SCENARIO and args.stop_after is None)
         ):
             if not config.model_api_key:
                 raise ConfigError(
@@ -7302,7 +7462,9 @@ def main(argv: list[str] | None = None) -> int:
                     "CURIE_FACTORY_MODEL"
                 )
         if whole_flow:
-            curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+            curie_bin, curie_version = resolve_curie_binary(
+                os.environ.get("CURIE_BIN") or "curie", show_path=show_path
+            )
         config = dataclasses.replace(config, curie_bin=curie_bin)
         repo_root = _repo_root()
         if args.mode == "run" and args.scenario == "docker":
@@ -7338,13 +7500,19 @@ def main(argv: list[str] | None = None) -> int:
         candidate_images=args.candidate_images,
         kind_cluster=args.kind_cluster,
     )
-    preflight.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
+    if show_path:
+        preflight.evidence["curie_bin"] = curie_bin
+    preflight.evidence["curie_version"] = curie_version
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"
     if forge is not None:
         preflight.evidence["forge"] = forge
     if forge_target is not None:
         preflight.evidence["forge_target"] = forge_target
+    if args.mode == "run" and args.scenario == LIVE_CHAIN_SCENARIO:
+        preflight.scenario_options.update(
+            stop_after=args.stop_after, attempt=args.live_chain_attempt or 1
+        )
 
     def _terminate(signum: int, _frame: Any) -> None:
         raise SystemExit(128 + signum)
@@ -7372,14 +7540,18 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         preflight.evidence["result"] = "refused"
         preflight.evidence["error"] = str(exc)
-        print(f"factory-e2e: {exc}", file=sys.stderr)
+        print(f"factory-e2e: {filtered(str(exc))}", file=sys.stderr)
         code = EXIT_CONFIG
     except BaseException as exc:  # noqa: BLE001 - always tear down
         preflight.evidence["result"] = "failed"
         preflight.evidence["error"] = f"{type(exc).__name__}: {exc}"
         if not isinstance(exc, (PreflightFailed, KeyboardInterrupt, SystemExit)):
-            traceback.print_exc()
-        print(f"factory-e2e: FAILED: {exc}", file=sys.stderr)
+            if LOG_FILTERS:
+                # A raw traceback can carry identifiers; print the filtered text.
+                print(filtered(traceback.format_exc()), file=sys.stderr, end="")
+            else:
+                traceback.print_exc()
+        print(f"factory-e2e: FAILED: {filtered(str(exc))}", file=sys.stderr)
         code = EXIT_FAILED
     finally:
         log("teardown")
@@ -7388,6 +7560,17 @@ def main(argv: list[str] | None = None) -> int:
         preflight.evidence["teardown_clean"] = all(r["ok"] for r in results)
         # By step name, so a check can name one step by a dotted evidence path.
         preflight.evidence["teardown_ok"] = {r["step"]: r["ok"] for r in results}
+        finish = scenario_hooks(preflight.scenario_name).finish
+        if finish is not None:
+            try:
+                finished = finish(preflight, results)
+            except Exception as exc:  # noqa: BLE001 - a crashed finish fails the run
+                preflight.evidence["finish_error"] = f"{type(exc).__name__}: {exc}"
+                finished = False
+            if not finished:
+                if preflight.evidence.get("result") == "passed":
+                    preflight.evidence["result"] = "failed"
+                code = code or EXIT_FAILED
         preflight.evidence["finished_at"] = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         shutil.rmtree(preflight.workdir, ignore_errors=True)
         preflight.write_evidence()
@@ -7397,7 +7580,14 @@ def main(argv: list[str] | None = None) -> int:
     if not preflight.evidence["teardown_clean"]:
         print("factory-e2e: teardown incomplete; see the evidence file", file=sys.stderr)
         code = code or EXIT_FAILED
-    print(f"factory-e2e: {preflight.evidence['result']}; evidence {evidence_path}", file=sys.stderr)
+    if preflight.evidence_refused:
+        print("factory-e2e: the evidence serializer refused the evidence", file=sys.stderr)
+        code = code or EXIT_FAILED
+    shown_evidence = evidence_path if show_path else evidence_path.name
+    print(
+        filtered(f"factory-e2e: {preflight.evidence['result']}; evidence {shown_evidence}"),
+        file=sys.stderr,
+    )
     return code
 
 
@@ -7455,6 +7645,43 @@ def _drive_docker(p: Preflight) -> dict[str, Any]:
 
 
 SCENARIOS["docker"] = _drive_docker
+
+
+def load_live_github_chain() -> Any:
+    """Load the live-github-chain driver once (live_github_chain.py, #5808)."""
+
+    return _load_by_path("live_github_chain", Path(__file__).with_name("live_github_chain.py"))
+
+
+def _drive_live_github_chain(p: Preflight) -> dict[str, Any]:
+    # Loaded at call time: live_github_chain imports this module.
+    return cast(dict[str, Any], load_live_github_chain().drive(p))
+
+
+def _live_chain_before_run(p: Preflight) -> None:
+    load_live_github_chain().before_run(p)
+
+
+def _live_chain_install_values(p: Preflight) -> ValuesTransform:
+    return cast(ValuesTransform, load_live_github_chain().install_values(p))
+
+
+def _live_chain_finish(p: Preflight, results: list[dict[str, Any]]) -> bool:
+    return bool(load_live_github_chain().finish(p, results))
+
+
+def _live_chain_ensure_label(p: Preflight) -> None:
+    load_live_github_chain().ensure_label(p)
+
+
+SCENARIOS[LIVE_CHAIN_SCENARIO] = _drive_live_github_chain
+SCENARIO_HOOKS[LIVE_CHAIN_SCENARIO] = ScenarioHooks(
+    before_run=_live_chain_before_run,
+    install_values=_live_chain_install_values,
+    finish=_live_chain_finish,
+    ensure_label=_live_chain_ensure_label,
+    private_binary=True,
+)
 
 
 if __name__ == "__main__":

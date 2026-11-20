@@ -1751,3 +1751,64 @@ the evidence.
 5. The hermetic tests replace `kubectl`, `docker`, `helm`, `git` and `openssl`
    with recording stubs and substitute the Slack Web API. They prove refusals,
    ordering and the judge, not the live path.
+
+## Live GitHub chain (#5808)
+
+`factory_e2e.py run --scenario live-github-chain` runs the whole GitHub
+product flow on one install built from the candidate: questions on ticket A,
+a plain answer, a submitted review that revises the pull request and becomes a
+proposed rule after the merge, a reader refused and the writer accepting the
+rule, ticket B carrying it over a conflicting personal instruction, its removal
+before ticket C, and the retired triage path. The driver is
+`live_github_chain.py`; the judge and the evidence sanitizer are
+`live_github_chain_judge.py`.
+
+### Inputs
+
+1. The usual App, fixture repository, actor token and kube context inputs of
+   this harness.
+2. `CURIE_FACTORY_READER_ACCOUNT_ID`: the numeric id of a public account other
+   than the actor, without write access to the fixture repository. Digits
+   only; a refusal never echoes the value.
+3. `CURIE_FACTORY_MODEL_API_KEY` for the full run. `--stop-after links` needs
+   none.
+4. `--live-chain-attempt N` (1 or 2) records which of the at most two attempts
+   this run is. Both chain flags are refused for any other scenario.
+
+### Before any lock or cluster call
+
+The run first installs the sanitizer for the identifiers the configuration
+names, then reads the reader id, the actor, the reader account and the fixture
+repository and installs the full sanitizer, so evidence and logs never carry
+a raw account, repository, App, namespace or context. It then checks that
+every blocker of #5808 has a closing pull request into `curie-eng/curie`'s
+`next` whose merge commit is in the candidate (the full run refuses an unready
+candidate; the stop mode records it and goes on), and it refuses a fixture
+repository with any open issue or pull request. A refused evidence file makes
+the run exit nonzero.
+
+### What `--stop-after links` proves
+
+It installs the candidate with the fake model (any model key or base URL is
+dropped first), a disposable Dex for two OIDC principals, two real logins, a
+session probe that both are principal sessions in the agent's tenant, and the
+code host links of both principals to the actor and the reader. It stops
+before any ticket exists and opens no seed issue, so it can send no model
+request.
+
+### What the full run proves
+
+The eight beats (a) to (h) of #5808 decision 7 in order. Each prerequisite is
+checked before the action that depends on it (rule proposals read on before
+ticket A, the instruction write before ticket B, the removal before ticket C),
+each beat is judged before the next beat's first side effect (beat (c) and its
+revision checks before beat (d) merges), and a model usage sample is required
+before ticket A and after every beat; a missing sample or a delta at the
+spend cap stops the run.
+
+### Teardown
+
+Teardown deletes Dex and the OIDC Secret, the session files, the code host
+links, the run's unbound label (read back as gone), closes the run's issues,
+moves the default branch back to its head before the merge (read back), and
+deletes the namespace. The verdict fails unless every step is verified.
