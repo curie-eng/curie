@@ -182,7 +182,8 @@ def test_pending_5857_recorded_propose_rule_call_becomes_a_tool_note_the_judge_r
             "work_item_id": r["work_item_id"],
             "status": "completed",
             "created_at": r["created_at"],
-            "terminal_at": r["finished_at"],
+            "terminal_at": r["terminal_at"],
+            "terminal_cause": r["terminal_cause"],
             "objective": r["objective"],
         }
         for r in c["requests"]

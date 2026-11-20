@@ -923,7 +923,8 @@ def request_records(
                 "work_item_id": str(row["work_item_id"]),
                 "status": row["status"],
                 "created_at": row["created_at"],
-                "finished_at": row.get("terminal_at"),
+                "terminal_at": row.get("terminal_at"),
+                "terminal_cause": row.get("terminal_cause"),
                 "objective": row.get("objective") or "",
                 judge.TOOL_NOTES_KEY: list(recorded.get(request_id, ())),
             }
@@ -1381,7 +1382,7 @@ def _uuid(value: str) -> str:
 def request_rows(p: fe.Preflight, work_item_id: str) -> list[dict[str, Any]]:
     return sql_json(
         p,
-        "SELECT id, work_item_id, status, created_at, terminal_at, objective "
+        "SELECT id, work_item_id, status, created_at, terminal_at, terminal_cause, objective "
         f"FROM execution_requests WHERE work_item_id = '{_uuid(work_item_id)}' ORDER BY sequence",
     )
 

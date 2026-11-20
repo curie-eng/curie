@@ -702,7 +702,7 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     (
         "request-still-active-at-the-60-second-deadline",
         [
-            ("beat_a/quiet_snapshot/requests/0/finished_at", at(7)),
+            ("beat_a/quiet_snapshot/requests/0/terminal_at", at(7)),
             ("beat_a/quiet_snapshot/observed_at", at(7, 10)),
         ],
         "beat_a",
@@ -1147,7 +1147,7 @@ def test_judge_rejects_each_broken_shape(
         [("usage/samples/8/usage", 59.99)],
         [("attempt", 2)],
         [("beat_g/remove_command/elapsed_seconds", 61)],
-        [("beat_a/quiet_snapshot/requests/0/finished_at", at(6))],
+        [("beat_a/quiet_snapshot/requests/0/terminal_at", at(6))],
         [("beat_f/diff_added_lines", ['self.assertAlmostEqual(f(")"), 2, places=6)  # places=7'])],
         [
             (
@@ -1225,6 +1225,53 @@ def test_judge_still_accepts_the_valid_neighbour_of_each_bound(
     edits: list[tuple[str, Any]],
 ) -> None:
     assert failed_beats(broken(*edits)) == {}
+
+
+def _beat_a_reasons(record: dict[str, Any]) -> tuple[str, ...]:
+    return judge.judge_beat("beat_a", record).reasons
+
+
+def test_question_request_liveness_the_pass_record_passes_beat_a() -> None:
+    # Liveness: ticket A's one request ended completed with cause questions_asked.
+    request = PASSING["beat_a"]["quiet_snapshot"]["requests"][0]
+    assert (request["status"], request["terminal_cause"]) == ("completed", "questions_asked")
+    assert _beat_a_reasons(copy.deepcopy(PASSING)) == ()
+
+
+def test_question_request_history_empty_fails_beat_a() -> None:
+    reasons = _beat_a_reasons(broken(("beat_a/quiet_snapshot/requests", [])))
+    assert "the quiet snapshot holds no request of ticket A" in reasons
+
+
+@pytest.mark.parametrize(
+    ("status", "cause"),
+    [("completed", "completed"), ("failed", "execution_deadline"), ("failed", "owner_lost")],
+)
+def test_question_request_that_ended_another_way_fails_beat_a(status: str, cause: str) -> None:
+    reasons = _beat_a_reasons(
+        broken(
+            ("beat_a/quiet_snapshot/requests/0/status", status),
+            ("beat_a/quiet_snapshot/requests/0/terminal_cause", cause),
+        )
+    )
+    assert any("did not end completed with cause questions_asked" in r for r in reasons), reasons
+
+
+def test_question_request_is_the_newest_request_of_ticket_a() -> None:
+    # An earlier request that asked, followed by one that ended another way, fails.
+    first = PASSING["beat_a"]["quiet_snapshot"]["requests"][0]
+    later = {**first, "id": "request-later", "created_at": at(5, 1), "terminal_cause": "completed"}
+    reasons = _beat_a_reasons(broken(("beat_a/quiet_snapshot/requests", [first, later])))
+    assert any("did not end completed with cause questions_asked" in r for r in reasons), reasons
+
+
+def test_terminal_at_old_finished_at_shape_fails_beat_a_with_a_reason() -> None:
+    def old_shape(request: dict[str, Any]) -> dict[str, Any]:
+        kept = {k: v for k, v in request.items() if k not in ("terminal_at", "terminal_cause")}
+        return {**kept, "finished_at": request["terminal_at"]}
+
+    reasons = _beat_a_reasons(broken(("beat_a/quiet_snapshot/requests/0", old_shape)))
+    assert reasons == ("a quiet snapshot request lacks ['terminal_at', 'terminal_cause']",)
 
 
 def test_a_missing_or_malformed_section_fails_its_beat_without_raising() -> None:

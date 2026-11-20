@@ -35,9 +35,11 @@ are each isolated in one small named constant or parser below, marked
 :data:`TOOL_NOTES_KEY` (#5794, #5796), :data:`RULES_KEY`,
 :func:`refusal_code`, :func:`accepted_rule_of` (#5797), :func:`work_item_rules_of`
 and :data:`LEARNED_RULES_LINE` (#5798), :func:`deploy_refusal_codes` (#5804)
-and :data:`ACTIVE_REQUEST_STATES`. Requests carry ``work_item_id`` and ``finished_at``
-(None while active) so the judge can tie evidence to ticket A's work item and
-read the requests active at the 60 second mark; usage samples are labelled
+and :data:`ACTIVE_REQUEST_STATES`. Requests carry the product's own
+``execution_requests`` keys (the ``request_view`` names): ``work_item_id``,
+``terminal_at`` (None while active) and ``terminal_cause``, so the judge can tie
+evidence to ticket A's work item, read the requests active at the 60 second mark
+and see that the question request ended :data:`QUESTIONS_ASKED`; usage samples are labelled
 :data:`SPEND_SAMPLE_LABELS`; label events use GitHub's timeline shape.
 
 Fields the driver part added to the record, each read as GitHub returns it:
@@ -129,6 +131,12 @@ BUNDLE_RETIRED_CODE = "bundle.result_declaration_retired"
 # Request states that mean a run is queued or in progress: the live states of
 # ``execution_requests_status_ck`` (models.py); ``waiting`` is queued on capacity.
 ACTIVE_REQUEST_STATES = frozenset({"queued", "waiting", "running", "cancellation_requested"})
+# Mirror of curie_api.factory_questions.QUESTIONS_ASKED (a test pins equality):
+# the terminal cause of a ``completed`` request that posted questions.
+QUESTIONS_ASKED = "questions_asked"
+# The keys of one request record the judge reads, each a column of
+# ``execution_requests`` and a key of ``request_view`` (a test pins both).
+REQUEST_KEYS = ("id", "work_item_id", "status", "created_at", "terminal_at", "terminal_cause")
 UNBOUND_LABEL_PREFIX = "factory-unbound-"
 # One model usage sample before beat (a) and one after each beat (decision 8).
 SPEND_SAMPLE_LABELS = ("before_a", *(f"after_{beat}" for beat in "abcdefgh"))
@@ -673,12 +681,18 @@ def _mine(requests: Sequence[Mapping[str, Any]], work_item: str) -> list[Mapping
 
 
 def _active_at(request: Mapping[str, Any], moment: Any) -> bool:
-    """ASSUMED: a request is active from ``created_at`` until ``finished_at`` (None: still)."""
+    """A request is active from ``created_at`` until ``terminal_at`` (None: still)."""
 
     if parse_time(request["created_at"]) > parse_time(moment):
         return False
-    finished = request["finished_at"]
-    return finished is None or parse_time(finished) > parse_time(moment)
+    terminal = request["terminal_at"]
+    return terminal is None or parse_time(terminal) > parse_time(moment)
+
+
+def _request_keys_missing(requests: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The :data:`REQUEST_KEYS` some request record lacks, in order."""
+
+    return [key for key in REQUEST_KEYS if any(key not in r for r in requests)]
 
 
 def _judge_beat_a(b: _Beat, rec: Mapping[str, Any]) -> None:
@@ -720,10 +734,20 @@ def _judge_beat_a(b: _Beat, rec: Mapping[str, Any]) -> None:
     )
     b.check(QUESTIONS_LABEL in a["issue_labels"], "the issue lacks the questions label")
     quiet = a["quiet_snapshot"]
+    missing = _request_keys_missing(quiet["requests"])
+    if not b.check(not missing, f"a quiet snapshot request lacks {missing}"):
+        return
     requests = _mine(quiet["requests"], a["work_item_id"])
     b.check(
         len(requests) == len(quiet["requests"]), "the snapshot holds another work item's request"
     )
+    if b.check(bool(requests), "the quiet snapshot holds no request of ticket A"):
+        last = max(requests, key=lambda r: parse_time(r["created_at"]))
+        b.check(
+            last["status"] == "completed" and last["terminal_cause"] == QUESTIONS_ASKED,
+            "ticket A's question request did not end completed with cause questions_asked "
+            f"(it ended {last['status']} with cause {last['terminal_cause']})",
+        )
     deadline = parse_time(question["created_at"]) + timedelta(seconds=QUIET_AFTER_QUESTIONS)
     b.check(
         b.elapsed("quiet_wait_seconds", question["created_at"], quiet["observed_at"])

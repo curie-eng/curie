@@ -1366,7 +1366,15 @@ def test_wiring_beat_a_keeps_the_first_read_of_the_investigating_lead(
     monkeypatch.setattr(lgc, "issue_comments", issue_comments)
     monkeypatch.setattr(lgc, "open_and_label", lambda *_a: ({"number": 11, "id": 99}, labelled))
     monkeypatch.setattr(lgc, "work_item_for_issue", lambda *_a: "work-item-a")
-    rows = [_row("request-1", "completed", "2000-01-01T00:00:25Z", "2000-01-01T00:05:05Z")]
+    rows = [
+        _row(
+            "request-1",
+            "completed",
+            "2000-01-01T00:00:25Z",
+            "2000-01-01T00:05:05Z",
+            cause=judge.QUESTIONS_ASKED,
+        )
+    ]
     monkeypatch.setattr(lgc, "request_rows", lambda *_a: rows)
     labels = [{"name": "factory"}, {"name": judge.QUESTIONS_LABEL}]
     monkeypatch.setattr(p, "as_actor", lambda *_a, **_k: (200, labels))
@@ -1950,15 +1958,22 @@ def _gh_comment(
 
 
 def _row(
-    rid: str, status: str, created: str, terminal: str | None, objective: str = ""
+    rid: str,
+    status: str,
+    created: str,
+    terminal: str | None,
+    objective: str = "",
+    cause: str | None = None,
 ) -> dict[str, Any]:
     # One row_to_json of execution_requests: Postgres timestamps with an offset.
+    # An ended request without a named cause ended the ordinary way, ``completed``.
     return {
         "id": rid,
         "work_item_id": "work-item-a",
         "status": status,
         "created_at": created.replace("Z", ".123456+00:00"),
         "terminal_at": terminal.replace("Z", ".5+00:00") if terminal else None,
+        "terminal_cause": cause or ("completed" if terminal else None),
         "objective": objective,
     }
 
@@ -1982,7 +1997,10 @@ def _judged(beat: str, section: dict[str, Any]) -> judge.BeatVerdict:
 
 
 def _beat_a(
-    status: str = "completed", terminal: str | None = "2030-01-01T00:05:05Z"
+    status: str = "completed",
+    terminal: str | None = "2030-01-01T00:05:05Z",
+    cause: str | None = judge.QUESTIONS_ASKED,
+    rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     app = {"login": "fixture-app[bot]", "id": 9000003, "type": "Bot"}
     question = PASSING["beat_a"]["comments"][1]["body"]
@@ -2006,7 +2024,11 @@ def _beat_a(
             {"id": 1, "name": "factory", "color": "ededed"},
             {"id": 2, "name": "curie-factory:questions", "color": "ededed"},
         ],
-        quiet_rows=[_row("request-1", status, "2030-01-01T00:00:25Z", terminal)],
+        quiet_rows=(
+            [_row("request-1", status, "2030-01-01T00:00:25Z", terminal, cause=cause)]
+            if rows is None
+            else rows
+        ),
         observed_at="2030-01-01T00:06:10Z",
         work_item_id="work-item-a",
     )
@@ -2017,6 +2039,52 @@ def test_shape_beat_a_builder_into_the_judge() -> None:
     assert not _judged("beat_a", _beat_a("waiting", None)).passed
 
 
+def test_handoff_question_request_cause_mirrors_the_product() -> None:
+    from curie_api.factory_questions import QUESTIONS_ASKED
+
+    assert judge.QUESTIONS_ASKED == QUESTIONS_ASKED
+
+
+def test_shape_terminal_at_request_records_carry_real_request_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_api.models import ExecutionRequest
+    from curie_api.workitem_dispatch import request_view
+
+    columns = set(ExecutionRequest.__table__.columns.keys())
+    view = set(request_view(ExecutionRequest()))
+    assert {"terminal_at", "terminal_cause"} <= view
+    assert set(judge.REQUEST_KEYS) <= columns
+    # The driver's own read selects every column a record carries.
+    seen: list[str] = []
+
+    def fake_sql(_p: Any, query: str) -> list[dict[str, Any]]:
+        seen.append(query)
+        return []
+
+    monkeypatch.setattr(lgc, "sql_json", fake_sql)
+    lgc.request_rows(Any, "00000000-0000-4000-8000-000000000001")
+    selected = {c.strip() for c in seen[0].split("SELECT", 1)[1].split("FROM", 1)[0].split(",")}
+    assert selected <= columns, selected - columns
+    rows = [
+        _row(
+            "request-1",
+            "completed",
+            "2030-01-01T00:00:25Z",
+            "2030-01-01T00:05:05Z",
+            cause=judge.QUESTIONS_ASKED,
+        )
+    ]
+    assert set(rows[0]) == selected
+    records = lgc.request_records(rows)
+    emitted = set(records[0]) - {judge.TOOL_NOTES_KEY}
+    assert emitted <= columns, emitted - columns
+    assert set(judge.REQUEST_KEYS) <= emitted
+    assert _judged("beat_a", _beat_a(rows=rows)).passed
+    asked_otherwise = _judged("beat_a", _beat_a(cause="completed"))
+    assert any("cause questions_asked" in r for r in asked_otherwise.reasons)
+
+
 def _beat_b(ack: str = judge.ANSWER_RECEIVED_LINE) -> dict[str, Any]:
     app = {"login": "fixture-app[bot]", "id": 9000003, "type": "Bot"}
     writer = {"login": "fixture-writer", "id": 9000001, "type": "User"}
@@ -2025,7 +2093,13 @@ def _beat_b(ack: str = judge.ANSWER_RECEIVED_LINE) -> dict[str, Any]:
         answer=_gh_comment(3, judge.ANSWER_TEXT, writer, "2030-01-01T00:10:00Z"),
         issue_number=11,
         request_rows=[
-            _row("request-1", "completed", "2030-01-01T00:00:25Z", "2030-01-01T00:05:05Z"),
+            _row(
+                "request-1",
+                "completed",
+                "2030-01-01T00:00:25Z",
+                "2030-01-01T00:05:05Z",
+                cause=judge.QUESTIONS_ASKED,
+            ),
             _row("request-2", "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
         ],
         open_pulls=[_gh_pull(12, body, "2030-01-01T00:25:00Z", "a" * 40, "curie/issue-11")],
@@ -2142,7 +2216,13 @@ def _beat_c(transcripts: list[Any] | None = None, conclusion: str = "success") -
             {"filename": path, "status": "modified", "additions": 4, "deletions": 0, "patch": PATCH}
         ],
         request_rows=[
-            _row("request-1", "completed", "2030-01-01T00:00:25Z", "2030-01-01T00:05:05Z"),
+            _row(
+                "request-1",
+                "completed",
+                "2030-01-01T00:00:25Z",
+                "2030-01-01T00:05:05Z",
+                cause=judge.QUESTIONS_ASKED,
+            ),
             _row("request-2", "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
             _row(
                 revision,
@@ -2232,7 +2312,13 @@ def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
     rows = [
         {**row, "work_item_id": work_item}
         for row in (
-            _row("request-1", "completed", "2030-01-01T00:00:25Z", "2030-01-01T00:05:05Z"),
+            _row(
+                "request-1",
+                "completed",
+                "2030-01-01T00:00:25Z",
+                "2030-01-01T00:05:05Z",
+                cause=judge.QUESTIONS_ASKED,
+            ),
             _row("request-2", "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
             _row(
                 revision,
