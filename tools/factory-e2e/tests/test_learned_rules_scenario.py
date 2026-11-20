@@ -831,7 +831,8 @@ def _chain_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, writer_code: 
 
     def revise(_github: Any, _pull: int) -> str:
         run.chain["steps"].append(passing["b"])
-        return REPLY_URL
+        # The raw URL names the live stub; the stored step holds the scrubbed one.
+        return REPLY_URL.replace("https://stub.example.test", "http://192.0.2.10:18080")
 
     def promote(_pull: int, _reply_url: str) -> dict[str, Any]:
         run.chain["steps"].append(passing["c"])

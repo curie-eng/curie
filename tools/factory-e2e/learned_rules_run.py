@@ -750,8 +750,10 @@ class LearnedRulesRun(sk.ScriptedRun):
         # Judge each step as it lands, so a broken link stops the run before the
         # next ticket's model calls are made; assert_chain still judges the whole.
         self.judge(lrs.assert_ticket_a, "a")
-        reply_url = self.revise(github, pull_a)
-        self.judge(lrs.assert_revision, "b", pull_a)
+        self.revise(github, pull_a)
+        # Steps are stored scrubbed, so later checks take the reply target the
+        # judge read from step b, never the raw stub URL revise saw.
+        reply_url = self.judge(lrs.assert_revision, "b", pull_a)
         rule = self.promote(pull_a, reply_url)
         rule = self.judge(lrs.assert_promoted, "c", pull_a, reply_url)
         accepted = self.accept(rule)
