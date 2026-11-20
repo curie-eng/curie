@@ -444,6 +444,29 @@ def test_a_zero_work_turn_is_reprompted_once_then_ends_as_early_stop(make_harnes
     asyncio.run(exercise())
 
 
+def test_a_context_only_turn_with_handoff_uses_early_stop_continuation(make_harness) -> None:
+    from curie_worker.kernel.constants import _EARLY_STOP_PROMPT
+
+    async def exercise() -> None:
+        opened, items, _ = await _run_execute(
+            make_harness,
+            [
+                [
+                    _tool("Read"),
+                    _tool(RUN_HANDOFF_TOOL),
+                    _done("Could not complete: verification was unavailable."),
+                ],
+                [_done("Could not complete: verification remains unavailable.")],
+            ],
+        )
+
+        assert len(opened) == 2
+        assert _EARLY_STOP_PROMPT in opened[1]
+        assert items.finishes[0]["cause"] == "early_stop"
+
+    asyncio.run(exercise())
+
+
 # --- W2: worked, never published -> continuation -> no_pull_request ---------------
 
 
