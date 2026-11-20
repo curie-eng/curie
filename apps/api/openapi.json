@@ -6875,6 +6875,116 @@
         "title": "ChannelReadRequest",
         "type": "object"
       },
+      "ChannelRuleOut": {
+        "description": "One accepted rule a session loads at its start.",
+        "properties": {
+          "accepted_at": {
+            "format": "date-time",
+            "title": "Accepted At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "number": {
+            "title": "Number",
+            "type": "integer"
+          },
+          "scope_key": {
+            "title": "Scope Key",
+            "type": "string"
+          },
+          "scope_kind": {
+            "enum": [
+              "agent",
+              "binding"
+            ],
+            "title": "Scope Kind",
+            "type": "string"
+          },
+          "scope_label": {
+            "title": "Scope Label",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "scope_kind",
+          "scope_key",
+          "scope_label",
+          "number",
+          "text",
+          "accepted_at"
+        ],
+        "title": "ChannelRuleOut",
+        "type": "object"
+      },
+      "ChannelRuleRefusal": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/ChannelRuleRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "ChannelRuleRefusal",
+        "type": "object"
+      },
+      "ChannelRuleRefusalDetail": {
+        "description": "A coded refusal of the state router's learned rule routes.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "fix": {
+            "title": "Fix",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "fix"
+        ],
+        "title": "ChannelRuleRefusalDetail",
+        "type": "object"
+      },
+      "ChannelRulesOut": {
+        "description": "The accepted rules a non-factory session loads at its start (#5801).",
+        "properties": {
+          "proposals_enabled": {
+            "description": "Whether the agent may propose rules (`memory_rule_proposals`).",
+            "title": "Proposals Enabled",
+            "type": "boolean"
+          },
+          "rules": {
+            "description": "Accepted rules of the agent scope, then of the credential's binding scope, each ordered by acceptance, at most 16 per scope.",
+            "items": {
+              "$ref": "#/components/schemas/ChannelRuleOut"
+            },
+            "title": "Rules",
+            "type": "array"
+          }
+        },
+        "required": [
+          "proposals_enabled",
+          "rules"
+        ],
+        "title": "ChannelRulesOut",
+        "type": "object"
+      },
       "ChannelSelector": {
         "additionalProperties": false,
         "description": "A bound channel named by the agent. ``kind`` is required in practice and\nrefused by name when absent, so the agent learns what to send.",
@@ -12052,8 +12162,11 @@
       "MemoryRuleDecisionOut": {
         "properties": {
           "applies_from": {
-            "const": "next_ticket",
-            "description": "The decision is recorded now and takes effect at the next ticket's admission once admission reads learned rules (#5798); a running request keeps the rules it was admitted with.",
+            "description": "When the decision takes effect. `next_ticket` for a repository scope rule: at the next ticket's admission; a running request keeps the rules it was admitted with. `next_session` for an agent or binding scope rule: at the next session start of the agent; a running session keeps the rules it loaded (#5801).",
+            "enum": [
+              "next_ticket",
+              "next_session"
+            ],
             "title": "Applies From",
             "type": "string"
           },
@@ -26299,7 +26412,7 @@
     },
     "/agents/{agent_id}/memory/rules/{rule_id}/accept": {
       "post": {
-        "description": "Accept a proposed rule. The decision is recorded now and takes effect at the\nnext ticket's admission once admission reads learned rules (#5798); a running\nrequest keeps the rules it was admitted with.",
+        "description": "Accept a proposed rule. The decision is recorded now. A repository rule takes\neffect at the next ticket's admission (#5798), and a running request keeps the\nrules it was admitted with; an agent or binding scope rule takes effect at the\nagent's next session start (#5801).",
         "operationId": "accept_rule_agents__agent_id__memory_rules__rule_id__accept_post",
         "parameters": [
           {
@@ -26386,7 +26499,7 @@
                 }
               }
             },
-            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected"
+            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected"
           },
           "404": {
             "content": {
@@ -26524,7 +26637,7 @@
                 }
               }
             },
-            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected"
+            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected"
           },
           "404": {
             "content": {
@@ -26575,7 +26688,7 @@
     },
     "/agents/{agent_id}/memory/rules/{rule_id}/remove": {
       "post": {
-        "description": "Remove an accepted rule. The decision is recorded now and takes effect at the\nnext ticket's admission once admission reads learned rules (#5798); a running\nrequest keeps the rules it was admitted with.",
+        "description": "Remove an accepted rule. The decision is recorded now. A repository rule\nstops applying at the next ticket's admission (#5798), and a running request\nkeeps the rules it was admitted with; an agent or binding scope rule stops\napplying at the agent's next session start (#5801).",
         "operationId": "remove_rule_agents__agent_id__memory_rules__rule_id__remove_post",
         "parameters": [
           {
@@ -26662,7 +26775,7 @@
                 }
               }
             },
-            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, or the console session origin rejected"
+            "description": "`memory_rules.write_access_required`, `memory_rules.write_access_unverifiable` (repository scope only), or the console session origin rejected"
           },
           "404": {
             "content": {
@@ -27373,6 +27486,249 @@
           }
         },
         "summary": "List Namespaces",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_rules": {
+      "get": {
+        "description": "The accepted rules a non-factory session loads at its start (#5801).\n\nOnly a scoped sandbox state credential with memory claims reads it (the\nboot read credential or a turn's write credential); the platform key, the\nbundle token and a legacy token are refused 403. Answers the agent's\n``memory_rule_proposals`` as ``proposals_enabled`` and the ``accepted``\nrules of the agent scope, then of the binding scope the credential's\n``binding`` claim names (none for a credential with no binding), each\nordered by acceptance and at most 16 per scope. Never a proposed,\nrejected or removed rule, and never another binding's.",
+        "operationId": "read_rules_agents__agent_id__state__rules_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRulesOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing or invalid credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "A credential that may not use this route (a plain string), or `rule_proposal_not_eligible`"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "`agent_not_found`"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "`rule_already_proposed`"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "`invalid_body`, `invalid_text`, `too_large` or `reserved_text`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "`rule_proposal_unavailable` or `rules_unavailable`"
+          }
+        },
+        "summary": "Read Rules",
+        "tags": [
+          "state"
+        ]
+      },
+      "post": {
+        "description": "Propose one learned rule for this turn (ADR 0287 decision 7, #5801).\n\nOnly the per-turn memory write credential (ADR 0188) may propose: the\nplatform key, the bundle token, a legacy token and a read credential are\nrefused 403. The body is exactly ``rule``, ``reason`` and an optional\n``scope`` (``channel``, the default, or ``agent``); everything else comes\nfrom the credential: the scope key from its ``binding`` claim, the source\nturn from ``turn`` and the proposer from ``sender``. The rule is stored\n``proposed`` with the next number of its scope and applies only after a\nperson accepts it, from the agent's next session. A turn the worker\nreported ended is refused 403; the agent's ``memory_rule_proposals`` off\nis 403 ``rule_proposal_not_eligible``; a second proposal of one turn is\n409 ``rule_already_proposed``; a malformed body is 422 ``invalid_body`` and\ntext outside the bounds 422 ``invalid_text``, ``too_large`` or\n``reserved_text``. No refusal and no log line carries the submitted text.",
+        "operationId": "propose_rule_agents__agent_id__state__rules_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "A non-factory turn's one learned rule proposal (#5801, ADR 0287 decision 7).\n\nExactly these fields; any other body is refused 422 ``invalid_body`` with\nnothing echoed. ``scope`` picks the credential's own channel (the default)\nor the whole agent. The scope key, the proposer, the source turn and the\nstate come from the per turn credential and the server, never from the body.",
+                "properties": {
+                  "reason": {
+                    "description": "Why it should always apply, at most 240 UTF-8 bytes.",
+                    "title": "Reason",
+                    "type": "string"
+                  },
+                  "rule": {
+                    "description": "The rule, one line of at most 240 UTF-8 bytes.",
+                    "title": "Rule",
+                    "type": "string"
+                  },
+                  "scope": {
+                    "default": "channel",
+                    "description": "`channel`: the credential's own binding. `agent`: every channel.",
+                    "enum": [
+                      "channel",
+                      "agent"
+                    ],
+                    "title": "Scope",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "rule",
+                  "reason"
+                ],
+                "title": "ChannelRuleProposalIn",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRuleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Missing or invalid credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "A credential that may not use this route (a plain string), or `rule_proposal_not_eligible`"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "`agent_not_found`"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "`rule_already_proposed`"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "`invalid_body`, `invalid_text`, `too_large` or `reserved_text`"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelRuleRefusal"
+                }
+              }
+            },
+            "description": "`rule_proposal_unavailable` or `rules_unavailable`"
+          }
+        },
+        "summary": "Propose Rule",
         "tags": [
           "state"
         ]

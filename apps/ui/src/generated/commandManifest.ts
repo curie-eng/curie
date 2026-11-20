@@ -9130,6 +9130,18 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "With --rules, show only the agent scope rules (not a channel's or a repository's). `--channel KIND=ADDRESS` with --rules selects one bound channel instead",
+              "id": "agent_scope",
+              "long": "agent-scope",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Accept this proposed rule. Needs --expected-version and --session-file",
               "id": "accept",
               "long": "accept",

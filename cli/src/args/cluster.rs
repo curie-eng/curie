@@ -117,7 +117,7 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(
         long,
         conflicts_with_all = [
-            "add", "delete", "channel", "guidance", "guidance_from", "reset_guidance",
+            "add", "delete", "guidance", "guidance_from", "reset_guidance",
             "accept", "reject", "remove",
         ],
         group = "rule_verb"
@@ -128,8 +128,22 @@ pub(crate) struct MemoryRuleArgs {
     #[arg(long, value_name = "STATE", requires = "rules")]
     pub(crate) rule_state: Option<String>,
     /// With --rules, show only rules of this exact scope key.
-    #[arg(long, value_name = "KEY", requires = "rules")]
+    #[arg(
+        long,
+        value_name = "KEY",
+        requires = "rules",
+        conflicts_with = "channel"
+    )]
     pub(crate) scope_key: Option<String>,
+    /// With --rules, show only the agent scope rules (not a channel's or a
+    /// repository's). `--channel KIND=ADDRESS` with --rules selects one
+    /// bound channel instead.
+    #[arg(
+        long,
+        requires = "rules",
+        conflicts_with_all = ["channel", "scope_key"]
+    )]
+    pub(crate) agent_scope: bool,
     /// Accept this proposed rule. Needs --expected-version and --session-file.
     #[arg(
         long,

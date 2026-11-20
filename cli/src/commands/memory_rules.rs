@@ -101,11 +101,50 @@ fn checked_rule_id(rule_id: &str) -> Result<String> {
     }
 }
 
-fn query_string(state: &Option<String>, scope_key: &Option<String>) -> String {
+/// Which scope a `--rules` list is narrowed to: the API's `scope_kind` and the
+/// exact `scope_key` (`agent` has the empty key, a bound channel is
+/// `<kind>:<address>`, the string the API's binding claim carries).
+#[derive(Debug, Clone, Default)]
+pub struct RuleScopeFilter {
+    pub kind: Option<String>,
+    pub key: Option<String>,
+}
+
+impl RuleScopeFilter {
+    /// Resolve the `--channel`, `--agent-scope` and `--scope-key` flags.
+    pub fn resolve(
+        channel: Option<String>,
+        agent_scope: bool,
+        scope_key: Option<String>,
+    ) -> Result<Self> {
+        if agent_scope {
+            return Ok(Self {
+                kind: Some("agent".to_string()),
+                key: Some(String::new()),
+            });
+        }
+        if let Some(channel) = super::memory_channel(channel)? {
+            return Ok(Self {
+                kind: Some("binding".to_string()),
+                key: Some(format!("{}:{}", channel.kind, channel.address)),
+            });
+        }
+        Ok(Self {
+            kind: None,
+            key: scope_key,
+        })
+    }
+}
+
+fn query_string(state: &Option<String>, scope: &RuleScopeFilter) -> String {
     let mut query = Vec::new();
     if let Some(state) = state {
         query.push(format!("state={state}"));
     }
+    if let Some(kind) = &scope.kind {
+        query.push(format!("scope_kind={kind}"));
+    }
+    let scope_key = &scope.key;
     if let Some(scope_key) = scope_key {
         query.push(format!("scope_key={scope_key}"));
     }
@@ -120,7 +159,7 @@ fn query_string(state: &Option<String>, scope_key: &Option<String>) -> String {
 pub struct MemoryRuleListSessionOpts {
     pub agent: String,
     pub state: Option<String>,
-    pub scope_key: Option<String>,
+    pub scope: RuleScopeFilter,
     pub session_file: PathBuf,
     pub api_url: Option<String>,
     pub namespace: String,
@@ -150,7 +189,7 @@ pub async fn memory_rules_list_session(
             lines: vec![
                 format!(
                     "GET {base}/agents/<id>/memory/rules{}  (would resolve agent {:?} first)",
-                    query_string(&opts.state, &opts.scope_key),
+                    query_string(&opts.state, &opts.scope),
                     opts.agent
                 ),
                 format!(
@@ -163,7 +202,12 @@ pub async fn memory_rules_list_session(
     let client = OwnerApiClient::new(&api_url, cookie)?;
     let agent = client.find_agent(&opts.agent).await?;
     let rules = client
-        .list_memory_rules(&agent.id, opts.state.as_deref(), opts.scope_key.as_deref())
+        .list_memory_rules(
+            &agent.id,
+            opts.state.as_deref(),
+            opts.scope.kind.as_deref(),
+            opts.scope.key.as_deref(),
+        )
         .await?;
     Ok(MemoryRulesOutput::Rules(rules))
 }
@@ -172,10 +216,10 @@ pub async fn memory_rules_list_session(
 pub async fn memory_rules_list(
     opts: AgentActionOpts,
     state: Option<String>,
-    scope_key: Option<String>,
+    scope: RuleScopeFilter,
 ) -> Result<MemoryRulesOutput> {
     if opts.dry_run {
-        let query = query_string(&state, &scope_key);
+        let query = query_string(&state, &scope);
         return Ok(MemoryRulesOutput::DryRun(DryRunPlan {
             lines: vec![
                 format!(
@@ -190,7 +234,12 @@ pub async fn memory_rules_list(
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
     let rules = client
-        .list_memory_rules(&agent.id, state.as_deref(), scope_key.as_deref())
+        .list_memory_rules(
+            &agent.id,
+            state.as_deref(),
+            scope.kind.as_deref(),
+            scope.key.as_deref(),
+        )
         .await?;
     Ok(MemoryRulesOutput::Rules(rules))
 }

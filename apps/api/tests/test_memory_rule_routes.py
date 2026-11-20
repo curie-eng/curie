@@ -16,8 +16,8 @@ answering in GitHub's documented shapes:
    (answers ``permission`` and the ``user`` it is for).
 
 App installation tokens are answered by ``fake_installation_tokens``. Rules are
-seeded as rows, since no proposal route exists in this change. Placeholder
-identifiers only.
+seeded as rows. Agent and binding scope rules read no code host (#5801).
+Placeholder identifiers only.
 """
 
 from __future__ import annotations
@@ -971,15 +971,105 @@ def test_refusal_invalid_transition_from_an_unlisted_state(
     _accepts(stack, _rule(stack))
 
 
-@pytest.mark.parametrize("scope_kind", ["agent", "binding"])
-def test_refusal_scope_not_supported(stack: Stack, scope_kind: str) -> None:
-    _link(stack, stack.owner)
-    rule_id = _rule(stack, scope_kind=scope_kind, scope_key="slack:C0EXAMPLE1")
-    before = _snapshot(rule_id)
-    response = _decide(stack, rule_id)
-    _refused(response, 403, "memory_rules.scope_not_supported", rule_id, before)
+# --- #5801 AC4: agent and binding scope rules ----------------------------------------
+
+BINDING = "slack:C0EXAMPLE1"
+
+
+def _channel_rule(
+    stack: Stack, scope_kind: str, *, state: str = "proposed", **kw: Any
+) -> uuid.UUID:
+    label = "agent" if scope_kind == "agent" else BINDING
+    return _rule(
+        stack, scope_kind=scope_kind, scope_key=BINDING, scope_label=label, state=state, **kw
+    )
+
+
+def _decided_once(
+    stack: Stack,
+    rule_id: uuid.UUID,
+    action: str,
+    from_state: str,
+    to_state: str,
+    by: str,
+) -> None:
+    events_before = _events(rule_id)
+    response = _decide(stack, rule_id, action, version=_row(rule_id)["version"])
+    assert response.status_code == 200, response.text
+    assert response.headers["Cache-Control"] == "no-store"
+    found = response.json()
+    assert found["applies_from"] == "next_session"
+    assert found["rule"]["state"] == to_state
+    row = _row(rule_id)
+    assert row["state"] == to_state and row[by] == stack.owner.principal_id
+    events = _events(rule_id)
+    assert events[: len(events_before)] == events_before
+    (event,) = events[len(events_before) :]
+    assert {name: value for name, value in event.items() if name != "id"} == {
+        "event": action,
+        "from_state": from_state,
+        "to_state": to_state,
+        "actor_kind": "principal",
+        "actor": str(stack.owner.principal_id),
+        "principal_id": stack.owner.principal_id,
+    }
+
+
+@pytest.mark.parametrize("scope_kind", ["binding", "agent"])
+def test_channel_scope_rule_is_decided_by_a_principal_of_the_tenant(
+    stack: Stack, scope_kind: str
+) -> None:
+    """No code host link and no code host read: any active principal of the
+    agent's tenant decides an agent or binding scope rule (ADR 0287 decision 7)."""
+
+    accepted = _channel_rule(stack, scope_kind, minute=1)
+    rejected = _channel_rule(stack, scope_kind, minute=2)
+    _decided_once(stack, accepted, "accept", "proposed", "accepted", "accepted_by")
+    _decided_once(stack, rejected, "reject", "proposed", "rejected", "rejected_by")
+    _decided_once(stack, accepted, "remove", "accepted", "removed", "removed_by")
     assert stack.seen == []
-    _accepts(stack, _rule(stack))
+
+
+def test_channel_scope_rule_refuses_another_tenant_and_the_platform_key(stack: Stack) -> None:
+    rule_id = _channel_rule(stack, "binding")
+    before = _snapshot(rule_id)
+    stranger = enrollment.seed_owner(enrollment.seed_tenant(), issuer=stack.issuer)
+    _refused(
+        _decide(stack, rule_id, owner=stranger), 404, "memory_rules.not_found", rule_id, before
+    )
+    _refused(_decide(stack, rule_id, headers=stack.platform), 401, UNAUTHENTICATED, rule_id, before)
+    # Liveness: the agent's own tenant's principal accepts the same rule.
+    response = _decide(stack, rule_id)
+    assert response.status_code == 200, response.text
+    assert response.json()["applies_from"] == "next_session"
+
+
+def test_channel_scope_rule_keeps_the_version_check_and_the_scope_cap(stack: Stack) -> None:
+    rule_id = _channel_rule(stack, "binding")
+    before = _snapshot(rule_id)
+    detail = _refused(
+        _decide(stack, rule_id, version=2), 409, "memory_rules.stale_version", rule_id, before
+    )
+    assert isinstance(detail, dict) and detail["current_version"] == 1
+    for index in range(16):
+        _channel_rule(stack, "binding", state="accepted", minute=index)
+    detail = _refused(_decide(stack, rule_id), 409, "memory_rules.scope_full", rule_id, before)
+    assert isinstance(detail, dict) and detail["limit"] == 16
+
+
+def test_repository_rule_still_needs_write_access_beside_a_channel_rule(stack: Stack) -> None:
+    """The same unlinked principal decides a binding scope rule but not a
+    repository rule, which keeps the write access check and ``next_ticket``."""
+
+    repository = _rule(stack)
+    before = _snapshot(repository)
+    _refused(
+        _decide(stack, repository), 403, "memory_rules.write_access_required", repository, before
+    )
+    channel = _channel_rule(stack, "binding")
+    assert _decide(stack, channel).status_code == 200
+    _link(stack, stack.owner)
+    _accepts(stack, repository)
 
 
 @pytest.mark.parametrize(

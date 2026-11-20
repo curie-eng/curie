@@ -1,19 +1,24 @@
-"""Learned rules: list them, and let a person who can merge decide them (#5797).
+"""Learned rules: list them, and let a person decide them (#5797, #5801).
 
 The list route sits on the memory API's own authorization (platform key or a
 live console session). Accept, reject and remove take a principal console
 session only, never the platform key: a rule applies only after a person
-decides it, and for a repository rule only a person whose linked code host
-account can write to that repository right now.
+decides it. For a repository rule only a person whose linked code host account
+can write to that repository right now decides. For an agent or binding scope
+rule (ADR 0287 decision 7) any active principal of the agent's tenant decides,
+since a channel has no code host permission to check and the console session
+is already the authority over this agent's memory.
 
 The write check reads the code host with no database transaction open, by the
 repository's immutable id; the label stored on the rule is passed to the
 adapter only as the credential hint an id read needs and never decides
 identity. The decision itself is one transaction under the identity reader
 fence and then the agent row lock, which serializes the per-scope cap; under
-the fence it re-reads the principal and its tenant, and the exact link the
-provider check used, so a principal disabled, a tenant suspended or a link
-revoked while the code host was being read refuses the decision.
+the fence it re-reads the principal and its tenant, and for a repository rule
+the exact link the provider check used, so a principal disabled, a tenant
+suspended or a link revoked while the code host was being read refuses the
+decision. An agent or binding scope decision reads no code host and no link,
+and keeps every other check.
 """
 
 from __future__ import annotations
@@ -102,11 +107,6 @@ _REFUSALS: dict[str, tuple[int, str, str]] = {
         "List the agent's rules with `curie cluster memory <agent> --rules` and use an id "
         "from that list.",
     ),
-    "scope_not_supported": (
-        403,
-        "Rules in agent or binding scope cannot be decided through this route yet.",
-        "Only repository scope rules can be accepted, rejected or removed here.",
-    ),
     "write_access_required": (
         403,
         "Your linked code host account cannot write to this rule's repository.",
@@ -173,8 +173,8 @@ _DECISION_RESPONSES: dict[int | str, dict[str, Any]] = {
     403: {
         "model": MemoryRuleRefusal | MemoryRuleAuthRefusal,
         "description": "`memory_rules.write_access_required`, "
-        "`memory_rules.write_access_unverifiable`, `memory_rules.scope_not_supported`, "
-        "or the console session origin rejected",
+        "`memory_rules.write_access_unverifiable` (repository scope only), or the console "
+        "session origin rejected",
     },
     404: {**_CODED, "description": "`memory_rules.not_found`"},
     409: {
@@ -488,9 +488,10 @@ class _Checked:
     principal_id: uuid.UUID
     scope_kind: str
     scope_key: str
-    scope: _Scope
-    # The exact link whose account the code host said can write.
-    link: _Link
+    # A repository rule's scope and the exact link whose account the code host
+    # said can write; both None for an agent or binding scope rule.
+    scope: _Scope | None
+    link: _Link | None
 
 
 async def _check(
@@ -500,7 +501,9 @@ async def _check(
     agent_id: uuid.UUID,
     rule_id: uuid.UUID,
 ) -> _Checked:
-    """Ownership, scope and write access, read before any lock is taken."""
+    """Ownership, scope and, for a repository rule, write access, read before any
+    lock is taken. An agent or binding scope rule needs only the tenant: the
+    session dependency already proved an active principal (ADR 0287 decision 7)."""
 
     tenant_id, principal_id = principal.tenant_id, principal.id
     agent_tenant = await session.scalar(select(Agent.tenant_id).where(Agent.id == agent_id))
@@ -520,7 +523,8 @@ async def _check(
         raise _refusal("not_found")
     scope_kind, scope_key, scope_label = found
     if scope_kind != "repository":
-        raise _refusal("scope_not_supported")
+        await session.rollback()
+        return _Checked(tenant_id, principal_id, scope_kind, scope_key, None, None)
     scope = _parse_scope(scope_key, scope_label)
     if scope is None:
         raise _refusal("write_access_unverifiable")
@@ -601,11 +605,12 @@ async def _apply(
         or not await principal_is_active(session, principal)
     ):
         raise HTTPException(401, UNAUTHENTICATED, headers=NO_STORE)
-    current = await _linked_accounts(
-        session, checked.tenant_id, checked.principal_id, checked.scope
-    )
-    if current != [checked.link]:
-        raise _refusal("write_access_required")
+    if checked.scope is not None:
+        current = await _linked_accounts(
+            session, checked.tenant_id, checked.principal_id, checked.scope
+        )
+        if current != [checked.link]:
+            raise _refusal("write_access_required")
     agent_tenant = await session.scalar(
         select(Agent.tenant_id).where(Agent.id == agent_id).with_for_update()
     )
@@ -684,7 +689,12 @@ async def _decide(
     except DBAPIError:
         await session.rollback()
         raise _refusal("unavailable") from None
-    return MemoryRuleDecisionOut(rule=item, applies_from="next_ticket")
+    # A repository rule reaches the next ticket's admission pin (#5798); an agent
+    # or binding scope rule the agent's next session start load (#5801).
+    applies_from: Literal["next_ticket", "next_session"] = (
+        "next_ticket" if item.scope_kind == "repository" else "next_session"
+    )
+    return MemoryRuleDecisionOut(rule=item, applies_from=applies_from)
 
 
 @decision_router.post(
@@ -701,9 +711,10 @@ async def accept_rule(
     _origin: SameOriginDep,
     session: SessionDep,
 ) -> MemoryRuleDecisionOut:
-    """Accept a proposed rule. The decision is recorded now and takes effect at the
-    next ticket's admission once admission reads learned rules (#5798); a running
-    request keeps the rules it was admitted with."""
+    """Accept a proposed rule. The decision is recorded now. A repository rule takes
+    effect at the next ticket's admission (#5798), and a running request keeps the
+    rules it was admitted with; an agent or binding scope rule takes effect at the
+    agent's next session start (#5801)."""
 
     return await _decide(request, session, principal, agent_id, rule_id, "accept", body)
 
@@ -741,8 +752,9 @@ async def remove_rule(
     _origin: SameOriginDep,
     session: SessionDep,
 ) -> MemoryRuleDecisionOut:
-    """Remove an accepted rule. The decision is recorded now and takes effect at the
-    next ticket's admission once admission reads learned rules (#5798); a running
-    request keeps the rules it was admitted with."""
+    """Remove an accepted rule. The decision is recorded now. A repository rule
+    stops applying at the next ticket's admission (#5798), and a running request
+    keeps the rules it was admitted with; an agent or binding scope rule stops
+    applying at the agent's next session start (#5801)."""
 
     return await _decide(request, session, principal, agent_id, rule_id, "remove", body)

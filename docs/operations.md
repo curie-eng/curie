@@ -2992,11 +2992,42 @@ WorkItem's snapshot and in its recorded transcript until they expire.
 ### Learned rules
 
 A learned rule is a one-line rule an agent proposes, for example after a
-merged pull request. A proposed rule applies only after a person accepts it.
-Accepting or removing a rule changes only stored rows. The decision is
-recorded now and takes effect at the next ticket's admission once admission
-reads learned rules (#5798); a running request keeps the rules it was admitted
-with. Every decision answers `"applies_from": "next_ticket"`.
+merged pull request, or when someone in a channel tells the agent how it
+should always work from now on. A proposed rule applies only after a person
+accepts it. Accepting or removing a rule changes only stored rows. A rule
+lives in one scope: a repository (factory runs), one channel binding, or the
+whole agent. A repository rule's decision takes effect at the next ticket's
+admission and a running request keeps the rules it was admitted with; the
+decision answers `"applies_from": "next_ticket"`. An agent or binding scope
+rule's decision takes effect at the agent's next session start and a running
+session keeps the rules it loaded; the decision answers
+`"applies_from": "next_session"`.
+
+Outside the factory, an agent proposes and loads rules through the state
+router with its sandbox credentials (ADR 0287 decision 7, which amends ADR
+0188):
+
+1. `POST /agents/{agent_id}/state/_rules` takes the body
+   `{"rule": ..., "reason": ..., "scope": "channel" | "agent"}` (`scope`
+   defaults to `channel`) and stores one `proposed` rule with the next free
+   number of its scope. Only the per turn memory write credential may call
+   it. The scope key is that credential's own binding for `channel`, or the
+   agent scope for `agent`; the proposer is its sender and the source turn its
+   turn. A turn proposes at most one rule (409 `rule_already_proposed`). The
+   agent's `memory_rule_proposals` switch must be on (else 403
+   `rule_proposal_not_eligible`); turn it on with
+   `curie cluster overrides <agent> --memory-rule-proposals on`. The boot read
+   credential, the bundle token, the platform key and another agent's
+   credential are refused with 403, and so is a turn the worker reported
+   ended. A body with any other field is 422 `invalid_body`, and text over 240
+   bytes is 422 `too_large`; no refusal or log line echoes the text.
+2. `GET /agents/{agent_id}/state/_rules` answers `proposals_enabled` and the
+   `accepted` rules of the agent scope, then of the credential's own binding,
+   each ordered by acceptance and at most 16 per scope. The runner reads it
+   once at session start with its boot credential when the run is not a
+   factory run, and puts the rules in its prompt. A credential that names no
+   binding reads the agent scope only. The platform key is refused; operators
+   list rules with the route below.
 
 The routes:
 
@@ -3025,8 +3056,10 @@ resolves the repository by the immutable id stored in the rule's scope, and
 only then reads the permission. It never uses the repository path stored on
 the rule, so after a rename a writer on a different repository at the old path
 cannot decide the original's rules. An operator links a person with
-`POST /identity/admin/{tenant_id}/code-host-links`. Rules in agent or binding
-scope cannot be decided through these routes yet.
+`POST /identity/admin/{tenant_id}/code-host-links`. A rule in an agent or
+binding scope has no repository to check, so any active person of the agent's
+tenant with a console session decides it, with the same version check, cap
+and audit event.
 
 Each scope holds at most 16 accepted rules, and their delivered text, one
 `R<number>: <text>` line per rule, must stay within 4096 bytes. Long rules with
@@ -3044,14 +3077,13 @@ declares that body as `MemoryRuleRefusal`:
    repository keyed by its numeric id on a configured code host, its id now
    answers for another repository or none, or the person has more than one
    linked account on the host.
-3. 403 `memory_rules.scope_not_supported`: an agent or binding scope rule.
-4. 404 `memory_rules.not_found`: no such agent or rule for this person.
-5. 409 `memory_rules.stale_version` (with `current_version`),
+3. 404 `memory_rules.not_found`: no such agent or rule for this person.
+4. 409 `memory_rules.stale_version` (with `current_version`),
    `memory_rules.invalid_transition`, `memory_rules.scope_full` (with
    `limit`) and `memory_rules.snapshot_full` (with `limit_bytes`).
-6. 503 `memory_rules.code_host_unavailable` when GitHub cannot be read, and
+5. 503 `memory_rules.code_host_unavailable` when GitHub cannot be read, and
    `memory_rules.unavailable` when the database cannot. Nothing changes; retry.
-7. 422 `memory_rules.invalid_request` for a malformed query, path or body.
+6. 422 `memory_rules.invalid_request` for a malformed query, path or body.
 
 A refused credential (401) or console origin (403) is a plain `detail` string
 instead, declared as `MemoryRuleAuthRefusal`. A principal disabled, or whose
@@ -3060,7 +3092,9 @@ identity fence with the same 401 as a dead session, and nothing changes.
 
 From the CLI, `curie cluster memory <agent> --rules` lists rules over the
 cluster connection; add `--rule-state STATE` or `--scope-key KEY` to filter,
-and `--json` for the API object. `curie cluster memory <agent> --accept RULE_ID
+`--channel KIND=ADDRESS` for one bound channel's rules (scope key
+`KIND:ADDRESS`), `--agent-scope` for the agent scope rules, and `--json` for
+the API object. `curie cluster memory <agent> --accept RULE_ID
 --expected-version N --session-file PATH` decides one rule, and `--reject` and
 `--remove` take the same arguments. The session file holds only the console
 session cookie value and must be readable by its owner alone (mode 0600 or

@@ -30,6 +30,7 @@ from curie_internal.memory_rules import (
     RuleState,
     ScopeOverfull,
     SelectedMemoryRules,
+    binding_claim_scope_key,
     binding_scope_key,
     canonical_text,
     initial_state,
@@ -445,6 +446,22 @@ def test_scope_key_binding_refusals(args: Any) -> None:
         binding_scope_key(*args)
     assert info.value.code == "invalid_text"
     assert binding_scope_key("k", "a:b") == "k:a:b"
+
+
+def test_binding_claim_scope_key_splits_at_the_first_colon() -> None:
+    assert binding_claim_scope_key("slack:C1") == binding_scope_key("slack", "C1") == "slack:C1"
+    assert binding_claim_scope_key("mail:ops/team@example.com") == "mail:ops/team@example.com"
+    assert binding_claim_scope_key("slack:T1:C2") == binding_scope_key("slack", "T1:C2")
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [None, 7, b"slack:C1", "", "slack", ":C1", "slack:", "slack:C1\n", "sla\nck:C1"],
+)
+def test_binding_claim_scope_key_refusals(claim: object) -> None:
+    with pytest.raises(InvalidRule) as info:
+        binding_claim_scope_key(claim)
+    assert info.value.code == "invalid_text"
 
 
 def test_scope_key_repository_keys_never_collide_and_parse_back() -> None:

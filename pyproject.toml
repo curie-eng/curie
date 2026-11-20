@@ -641,6 +641,7 @@ testpaths = [
     "tools/factory-e2e/tests",
     "tools/github-stub/tests",
     "tools/identity-e2e/tests",
+    "tools/oidc-e2e/tests",
     "tools/model-script/tests",
     "tools/sandbox-admission-observer/tests",
     "tools/runtime-assertion-gate/tests",

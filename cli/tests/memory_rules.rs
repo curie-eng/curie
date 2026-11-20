@@ -188,6 +188,75 @@ fn rules_json_prints_one_object_with_the_rule_list() {
     assert_eq!(list.header("x-api-key"), Some("list-key"));
 }
 
+/// The raw request path of the one rule list a run of `args` sends.
+fn rule_list_path(extra: &[&str]) -> String {
+    let fixture = Fixture::new();
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("GET", p) if p.starts_with(&format!("/agents/{AGENT_ID}/memory/rules")) => {
+            Response::json(200, &rule_list().to_string())
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let mut args = vec!["--json", "cluster", "memory", "acme-bot", "--rules"];
+    args.extend(extra);
+    args.extend(["--api-url", &server.base_url, "--api-key", "list-key"]);
+    let output = fixture.run(&args);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert_eq!(object(&output), rule_list());
+    let requests = server.recorded();
+    requests
+        .iter()
+        .find(|r| r.path.contains("/memory/rules"))
+        .expect("the list request reached the stub")
+        .path
+        .clone()
+}
+
+#[test]
+fn rules_with_a_channel_send_the_binding_scope() {
+    let path = rule_list_path(&["--channel", "slack=C1"]);
+    assert_eq!(
+        path,
+        format!("/agents/{AGENT_ID}/memory/rules?scope_kind=binding&scope_key=slack%3AC1")
+    );
+}
+
+#[test]
+fn rules_with_agent_scope_send_the_agent_scope_and_an_empty_key() {
+    let path = rule_list_path(&["--agent-scope"]);
+    assert_eq!(
+        path,
+        format!("/agents/{AGENT_ID}/memory/rules?scope_kind=agent&scope_key=")
+    );
+}
+
+#[test]
+fn rules_without_a_scope_flag_send_no_scope_kind() {
+    let path = rule_list_path(&["--rule-state", "accepted"]);
+    assert_eq!(
+        path,
+        format!("/agents/{AGENT_ID}/memory/rules?state=accepted")
+    );
+}
+
+#[test]
+fn rules_with_a_malformed_channel_exit_2_before_any_request() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&[
+        "--json",
+        "cluster",
+        "memory",
+        "acme-bot",
+        "--rules",
+        "--channel",
+        "slack",
+        "--api-url",
+        "http://127.0.0.1:9",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+}
+
 #[test]
 fn rules_human_output_names_label_state_scope_and_text() {
     let fixture = Fixture::new();
@@ -388,7 +457,37 @@ fn conflicting_or_incomplete_flags_exit_2_before_any_request() {
         (vec!["--rules", "--accept", RULE_ID], conflict),
         (vec!["--rules", "--add", "text"], conflict),
         (vec!["--rules", "--delete", "fact"], conflict),
-        (vec!["--rules", "--channel", "slack=C0EXAMPLE1"], conflict),
+        (
+            vec!["--accept", RULE_ID, "--channel", "slack=C0EXAMPLE1"],
+            conflict,
+        ),
+        (
+            vec!["--reject", RULE_ID, "--channel", "slack=C0EXAMPLE1"],
+            conflict,
+        ),
+        (
+            vec!["--remove", RULE_ID, "--channel", "slack=C0EXAMPLE1"],
+            conflict,
+        ),
+        (
+            vec!["--rules", "--agent-scope", "--channel", "slack=C0EXAMPLE1"],
+            conflict,
+        ),
+        (
+            vec!["--rules", "--agent-scope", "--scope-key", "agent"],
+            conflict,
+        ),
+        (
+            vec![
+                "--rules",
+                "--channel",
+                "slack=C0EXAMPLE1",
+                "--scope-key",
+                "x",
+            ],
+            conflict,
+        ),
+        (vec!["--agent-scope"], missing),
         (vec!["--rules", "--guidance"], conflict),
         (vec!["--accept", RULE_ID, "--reject", RULE_ID], conflict),
         (vec!["--accept", RULE_ID, "--add", "text"], conflict),

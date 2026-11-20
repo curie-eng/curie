@@ -4846,11 +4846,15 @@ impl ApiClient {
         &self,
         agent_id: &str,
         state: Option<&str>,
+        scope_kind: Option<&str>,
         scope_key: Option<&str>,
     ) -> Result<MemoryRules> {
         let mut query: Vec<(&str, &str)> = Vec::new();
         if let Some(state) = state {
             query.push(("state", state));
+        }
+        if let Some(scope_kind) = scope_kind {
+            query.push(("scope_kind", scope_kind));
         }
         if let Some(scope_key) = scope_key {
             query.push(("scope_key", scope_key));
@@ -6966,11 +6970,15 @@ impl OwnerApiClient {
         &self,
         agent_id: &str,
         state: Option<&str>,
+        scope_kind: Option<&str>,
         scope_key: Option<&str>,
     ) -> Result<MemoryRules> {
         let mut query: Vec<(&str, &str)> = Vec::new();
         if let Some(state) = state {
             query.push(("state", state));
+        }
+        if let Some(scope_kind) = scope_kind {
+            query.push(("scope_kind", scope_kind));
         }
         if let Some(scope_key) = scope_key {
             query.push(("scope_key", scope_key));
