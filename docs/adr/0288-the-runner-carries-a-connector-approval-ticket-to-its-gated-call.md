@@ -2,7 +2,15 @@
 
 Date: 2026-11-19
 
-Status: Draft
+Status: Accepted
+
+Accepted on 2026-11-20 alongside implementation, with explicit maintainer
+approval from Brian Conn recorded in
+[the review of #5876](https://github.com/curie-eng/curie/pull/5876#pullrequestreview-5991710461),
+under the coordinated exception of
+[ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
+The realizing code paths are named below. Required evidence item 5, the live
+run behind the caller proxy, remains required.
 
 Partially supersedes [ADR 0271](0271-per-request-approver-sets-and-separation-of-duties.md)
 decision 3, only its opaque, unparsed transport of the ticket: "Carry the opaque
@@ -18,7 +26,6 @@ Source inspection: `origin/main` at
 `5249832af2a8fef903f7df81275d7b1bfe1a5ef6`, both fetched on 2026-11-19.
 Neither branch has a ticket reference, a runner ticket reader or hook
 `updatedInput` support. This is source evidence, not runtime qualification.
-This Draft authorizes no implementation.
 
 ## Context
 
