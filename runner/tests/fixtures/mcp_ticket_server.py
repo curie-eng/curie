@@ -1,4 +1,4 @@
-"""Tiny stdio MCP connector for the runner's approval ticket carry tests (Draft ADR 0288).
+"""Tiny stdio MCP connector for the runner's approval ticket carry tests (ADR 0288).
 
 ``prepare`` answers the way an ADR 0271 preparation tool does: a JSON text
 block whose ``apply_grant_arguments`` carry the signed ticket named by

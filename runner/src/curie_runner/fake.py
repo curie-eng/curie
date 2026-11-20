@@ -666,7 +666,7 @@ class FakeModelSession:
         self._pre_tool_use_hook = pre_tool_use_hook
         # Like ``pre_tool_use_hook``: test-injected only, never a bundle command
         # hook. Called for each scripted tool result before it is delivered, the
-        # order the real CLI runs PostToolUse in (Draft ADR 0288).
+        # order the real CLI runs PostToolUse in (ADR 0288).
         self._post_tool_use_hook = post_tool_use_hook
         self._tool_names: dict[str, str] = {}
         self._emit_partial_boundaries = emit_partial_boundaries

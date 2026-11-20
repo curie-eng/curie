@@ -1,4 +1,4 @@
-"""Carry a connector-issued approval ticket to its gated call (Draft ADR 0288).
+"""Carry a connector-issued approval ticket to its gated call (ADR 0288).
 
 ADR 0271 has a hosted connector's preparation tool return a signed
 ``cat1.<payload>.<signature>`` ticket, and the model must copy it unchanged
@@ -12,11 +12,11 @@ any authority. It remembers the well-formed tickets a hosted connector returned
 in this conversation, reading their claims WITHOUT trusting them. When the
 model calls that connector's gated tool with a damaged copy, it puts back the
 ticket the copy was taken from, identified by evidence in the copy itself: a
-damaged copy keeps either its source's exact ``cat1.<payload>`` part (the
-signature was damaged) or its exact signature segment (the payload was
-damaged). The source must be the one remembered ticket sharing such a part with
-the copy, must name this connector and tool, and must have been issued for
-exactly the other arguments of this call.
+damaged copy starts with its source's exact ``cat1.<payload>.`` (the signature
+was damaged) or ends with its exact ``.<signature>`` (the payload was damaged).
+The source must be the one remembered ticket matching the copy this way, must
+name this connector and tool, and must have been issued for exactly the other
+arguments of this call.
 
 Because the source is identified by the copy and checked against the call, a
 ticket the runner never saw, forgot, or saw twice cannot be confused with
@@ -30,8 +30,8 @@ call alone": in every case the rule does not cover, ``restore`` returns None and
 the caller records the model's own arguments exactly as before.
 
 Memory is per process, which is per conversation: a suspended sandbox resumes
-in a new process with nothing remembered (ADR-0003). The approved call does not
-need this memory; it takes the ticket from the grant's stored arguments.
+in a new process with nothing remembered (ADR-0003). The approved call never
+reads this memory; it takes the ticket from the grant's stored arguments.
 """
 
 from __future__ import annotations
@@ -274,28 +274,12 @@ class TicketCarry:
 
         Called when a string the model may have seen can no longer be counted:
         a reply read only in part, a forgotten ticket, or an observation that
-        failed. Every later ``restore`` returns None and ``other_sources``
-        returns True.
+        failed. Every later ``restore`` returns None.
         """
 
         if self._whole:
             logger.info("approval ticket carry stops for this conversation: %s", reason)
         self._whole = False
-
-    def other_sources(self, copy: object, token: str) -> bool:
-        """Whether ``copy`` could also be a damaged copy of something other than ``token``.
-
-        True when any remembered ticket other than ``token`` matches the copy's
-        evidence, or when the carry can no longer tell (``_whole`` is False).
-        The approved call's repair uses this so it is never less careful than
-        the creation path.
-        """
-
-        if not self._whole:
-            return True
-        return any(
-            entry.token != token and damaged_copy_of(copy, entry.token) for entry in self._entries
-        )
 
     def restore(self, tool_name: str, tool_input: Mapping[str, Any]) -> dict[str, Any] | None:
         """The call's arguments with the ticket its copy came from, or None to leave them.
@@ -343,10 +327,11 @@ def damaged_copy_of(copy: object, token: str) -> bool:
     """Whether ``copy`` is a damaged copy of ``token``, by evidence in the copy itself.
 
     A damaged copy is a string that starts like a ticket, is no longer than a
-    ticket may be, no longer parses as a complete ticket, and still carries
-    either ``token``'s exact ``cat1.<payload>`` part or its exact signature
-    segment. A copy that still parses is never a damaged copy: a same-length
-    change inside the signature cannot be told apart from a different ticket.
+    ticket may be, no longer parses as a complete ticket, and either starts
+    with ``token``'s exact ``cat1.<payload>.`` (the signature was damaged) or
+    ends with its exact ``.<signature>`` (the payload was damaged). A copy that
+    still parses is never a damaged copy: a same-length change inside the
+    signature cannot be told apart from a different ticket.
     """
 
     if not isinstance(copy, str) or not copy.startswith("cat1.") or copy == token:
@@ -359,6 +344,7 @@ def damaged_copy_of(copy: object, token: str) -> bool:
         pass
     else:
         return False
-    payload, _, signature = copy.rpartition(".")
+    # Anchored at the copy's ends, never a substring: the copy starts with the
+    # source's exact ``cat1.<payload>.`` or ends with its exact ``.<signature>``.
     source_payload, _, source_signature = token.rpartition(".")
-    return payload == source_payload or signature == source_signature
+    return copy.startswith(f"{source_payload}.") or copy.endswith(f".{source_signature}")

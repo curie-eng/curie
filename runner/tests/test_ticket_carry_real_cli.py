@@ -1,4 +1,4 @@
-"""Approval ticket carry on the real bundled CLI (Draft ADR 0288).
+"""Approval ticket carry on the real bundled CLI (ADR 0288).
 
 The fake tier cannot show two things the carry depends on: that the real CLI
 runs the runner's PostToolUse callback for an MCP tool before the next model

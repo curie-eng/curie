@@ -657,8 +657,8 @@ class ApprovalGate:
     # (#1461). Same fact-not-default reasoning as ``state_server_mounted``:
     # ``__main__`` sets it from the expression that decides the mount.
     memory_tools_mounted: bool = False
-    # The connector-issued approval tickets this conversation has seen (Draft
-    # ADR 0288). Deliberately NOT cleared by ``reset()``: a ticket prepared in
+    # The connector-issued approval tickets this conversation has seen (ADR
+    # 0288). Deliberately NOT cleared by ``reset()``: a ticket prepared in
     # one turn may be used in the next. It holds no authority; see
     # ``carried_input``.
     ticket_carry: TicketCarry = field(default_factory=TicketCarry, repr=False)
@@ -814,7 +814,7 @@ class ApprovalGate:
     def carried_input(self, tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
         """The arguments to record for a held call: the model's, or the carried ticket's.
 
-        Draft ADR 0288 decision 1. For a hosted connector's gated tool, the one
+        ADR 0288 decision 1. For a hosted connector's gated tool, the one
         remembered ticket issued for exactly these other arguments replaces the
         model's copy of it. In every other case the model's arguments are
         returned unchanged, which is the behavior before this rule existed. The
@@ -832,7 +832,7 @@ class ApprovalGate:
     ) -> dict[str, Any] | None:
         """The approved arguments when this call differs from them only in its ticket.
 
-        Draft ADR 0288 decision 2. The grant's stored arguments are the trusted
+        ADR 0288 decision 2. The grant's stored arguments are the trusted
         resume boot input (#3255) and carry the exact ticket the API verified.
         When the model's call names the granted tool, carries a damaged copy of
         the granted ticket (``ticket_carry.damaged_copy_of``) and is canonically
@@ -860,11 +860,11 @@ class ApprovalGate:
         if (claims.connector, claims.tool) != pair:
             return None
         # The same evidence rule as creation: only a damaged copy of the
-        # granted ticket itself, and of nothing else this conversation has
-        # seen, is repaired; a different or missing ticket keeps the
-        # grant-mismatch refusal.
-        copy = tool_input.get(TICKET_ARGUMENT)
-        if not damaged_copy_of(copy, ticket) or self.ticket_carry.other_sources(copy, ticket):
+        # granted ticket itself is repaired; a different or missing ticket
+        # keeps the grant-mismatch refusal. No runner memory is read: the
+        # stored arguments are the only trust anchor, and the repaired call is
+        # the approved call byte for byte, whatever else the runner has seen.
+        if not damaged_copy_of(tool_input.get(TICKET_ARGUMENT), ticket):
             return None
         others = {key: value for key, value in tool_input.items() if key != TICKET_ARGUMENT}
         approved = {key: value for key, value in granted.items() if key != TICKET_ARGUMENT}
@@ -973,8 +973,8 @@ class _GateDecision(NamedTuple):
     ungated: bool
     refusal: str | None = None
     continue_turn: bool = False
-    # The arguments an allowed call must run with instead of the model's (Draft
-    # ADR 0288 decision 2): the grant's stored arguments when the model's copy
+    # The arguments an allowed call must run with instead of the model's (ADR
+    # 0288 decision 2): the grant's stored arguments when the model's copy
     # differed only in its approval ticket. None leaves the call as written.
     updated_input: dict[str, Any] | None = None
 
@@ -1200,7 +1200,7 @@ async def _decide_gate(
     # Policy gates are additive to legacy/operator gates. A policy allow never
     # removes a legacy gate, while approvalRequired joins the same one-shot path.
     if outcome is ToolPolicyDecision.APPROVAL_REQUIRED and tool_name not in gate.required:
-        # Draft ADR 0288 decision 2: a copy that differs from the grant only in
+        # ADR 0288 decision 2: a copy that differs from the grant only in
         # its ticket runs with the grant's stored arguments.
         granted = gate.granted_with_ticket(tool_name, tool_input)
         if granted is not None:
@@ -1216,7 +1216,7 @@ async def _decide_gate(
             )
         if gate.consume_grant(tool_name, tool_input):
             return _GateDecision(blocked=False, ungated=False, updated_input=granted)
-        # Draft ADR 0288 decision 1: record the connector's own ticket, not the copy.
+        # ADR 0288 decision 1: record the connector's own ticket, not the copy.
         gate.block(tool_name, gate.carried_input(tool_name, tool_input))
         if tool_use_id is not None:
             gate.held_call_ids.add(tool_use_id)

@@ -1,4 +1,4 @@
-"""The runner carries a connector's approval ticket to its gated call (Draft ADR 0288).
+"""The runner carries a connector's approval ticket to its gated call (ADR 0288).
 
 A hosted connector's preparation tool returns a signed ``cat1`` ticket that the
 model must copy into the gated tool's top-level ``approval_ticket``. These tests
@@ -448,6 +448,34 @@ def test_a_copy_with_a_shortened_signature_gets_its_identical_payload_back() -> 
     }
 
 
+def test_a_copy_keeps_its_source_when_its_damaged_signature_gains_a_dot() -> None:
+    # The evidence is the copy's ends: it starts with the source's exact
+    # ``cat1.<payload>.``, whatever follows that prefix.
+    ticket = _ticket(_ARGS)
+    gate = _gate()
+    _observe(gate, _PREPARE, _reply(ticket))
+    payload, _, signature = ticket.rpartition(".")
+    damaged = f"{payload}.{signature[:10]}.{signature[10:]}"
+    assert _held_arguments(gate, {**_ARGS, "approval_ticket": damaged}) == {
+        **_ARGS,
+        "approval_ticket": ticket,
+    }
+
+
+def test_the_evidence_is_anchored_at_the_copys_ends() -> None:
+    # The source's payload or signature appearing elsewhere in the copy, not
+    # as its exact prefix or suffix, is no evidence: the call is left alone.
+    ticket = _ticket(_ARGS)
+    gate = _gate()
+    _observe(gate, _PREPARE, _reply(ticket))
+    payload, _, signature = ticket.rpartition(".")
+    body = payload.removeprefix("cat1.")
+    for copy in (f"cat1.x{body}.{signature[:-4]}", f"{payload[:-4]}.{signature}x"):
+        gate.reset()
+        model_call = {**_ARGS, "approval_ticket": copy}
+        assert _held_arguments(gate, model_call) == model_call
+
+
 def test_a_copy_that_still_parses_is_never_replaced() -> None:
     # Same-length signature damage parses like a different ticket would, and an
     # intact ticket the carry never saw parses too. Neither is replaced.
@@ -643,7 +671,6 @@ def test_a_failed_observation_stops_the_carry(hook_input: Any) -> None:
     assert anyio.run(post, hook_input, None, {"signal": None}) == {}
     model_call = {**_ARGS, "approval_ticket": _damaged(ticket)}
     assert _held_arguments(gate, model_call) == model_call
-    assert gate.ticket_carry.other_sources(_damaged(ticket), ticket)
 
 
 def test_json_scalars_do_not_stop_the_carry() -> None:
@@ -758,62 +785,45 @@ def test_the_grant_is_repaired_only_from_a_stored_ticket_for_this_tool(stored: s
     assert gate.grant_tool == _GATED
 
 
-def test_the_grant_is_not_repaired_when_another_seen_ticket_shares_the_evidence() -> None:
-    # After resume the conversation saw a string that reuses the granted
-    # ticket's signature. The copy could come from either, so the exact-call
-    # refusal stands, as it would at creation.
-    ticket = _ticket(_ARGS)
-    other = _ticket({**_ARGS, "resource": "other"}, nonce_seed="z")
-    forged = f"{other.rpartition('.')[0]}.{ticket.rpartition('.')[2]}"
-    gate = _granted_gate(ticket)
-    gate.observe_tool_result(_PREPARE, _reply(forged))
-    output = _decide(gate, _GATED, {**_ARGS, "approval_ticket": _damaged(ticket)})
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert gate.grant_tool == _GATED
+def _seen_since_resume(kind: str, ticket: str) -> Any:
+    """One PostToolUse input the resumed runner observes before the approved call."""
+
+    if kind == "failed":
+        return _Exploding()
+    if kind == "unrelated-echo":
+        return {"tool_name": _PREPARE, "tool_response": _reply(_ticket(_ARGS, connector="other"))}
+    # A string that reuses the granted ticket's signature, so the model's copy
+    # is also a damaged copy of it: a forged ticket for other details from the
+    # same connector, or an echo of a ticket naming another connector.
+    other = (
+        _ticket({**_ARGS, "resource": "other"}, nonce_seed="z")
+        if kind == "shared-evidence"
+        else _ticket(_ARGS, connector="other", nonce_seed="z")
+    )
+    shared = f"{other.rpartition('.')[0]}.{ticket.rpartition('.')[2]}"
+    return {"tool_name": _PREPARE, "tool_response": _reply(shared)}
 
 
-def test_the_grant_is_not_repaired_when_an_echo_for_another_connector_shares_the_evidence() -> None:
-    # The competing string names another connector, so it can never be chosen,
-    # but the copy could still come from it.
+@pytest.mark.parametrize(
+    "kind", ["shared-evidence", "echo-sharing-the-evidence", "unrelated-echo", "failed"]
+)
+def test_the_grant_repair_reads_no_runner_memory(kind: str) -> None:
+    # ADR 0288 decision 2: the grant's stored arguments are the only trust
+    # anchor. The repaired call is the approved call byte for byte, so nothing
+    # the runner observed since the resume (and nothing it failed to observe)
+    # changes the repair.
     ticket = _ticket(_ARGS)
-    other = _ticket(_ARGS, connector="other", nonce_seed="z")
-    echo = f"{other.rpartition('.')[0]}.{ticket.rpartition('.')[2]}"
     gate = _gate(
         proxied=frozenset({_SERVER, "other"}),
         grant_tool=_GATED,
         grant_arguments={**_ARGS, "approval_ticket": ticket},
     )
-    assert gate.observe_tool_result(_PREPARE, _reply(echo)) == 0
-    output = _decide(gate, _GATED, {**_ARGS, "approval_ticket": _damaged(ticket)})
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert gate.grant_tool == _GATED
-
-
-def test_an_unrelated_echo_for_another_connector_does_not_block_the_grant_repair() -> None:
-    # The companion of the case above: an echo that shares neither part of the
-    # granted ticket is not a possible source, so the repair still runs.
-    ticket = _ticket(_ARGS)
-    echo = _ticket(_ARGS, connector="other", nonce_seed="z")
-    gate = _gate(
-        proxied=frozenset({_SERVER, "other"}),
-        grant_tool=_GATED,
-        grant_arguments={**_ARGS, "approval_ticket": ticket},
-    )
-    assert gate.observe_tool_result(_PREPARE, _reply(echo)) == 0
+    _, post = _callbacks(gate)
+    assert anyio.run(post, _seen_since_resume(kind, ticket), None, {"signal": None}) == {}
     output = _decide(gate, _GATED, {**_ARGS, "approval_ticket": _damaged(ticket)})
     assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert output["hookSpecificOutput"]["updatedInput"] == {**_ARGS, "approval_ticket": ticket}
     assert gate.grant_tool is None
-
-
-def test_the_grant_is_not_repaired_after_a_failed_observation() -> None:
-    ticket = _ticket(_ARGS)
-    gate = _granted_gate(ticket)
-    _, post = _callbacks(gate)
-    anyio.run(post, _Exploding(), None, {"signal": None})
-    output = _decide(gate, _GATED, {**_ARGS, "approval_ticket": _damaged(ticket)})
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert gate.grant_tool == _GATED
 
 
 def test_the_grant_is_not_repaired_for_a_tool_outside_the_hosted_connectors() -> None:

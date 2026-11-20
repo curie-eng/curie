@@ -419,7 +419,7 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
             # record. Prose is not a halt mechanism; this flag is. It rides the
             # DENY only: an allow that carried it would kill every ungated call.
             return PermissionResultDeny(message=_DENY_MESSAGE, interrupt=True)
-        # Draft ADR 0288 decision 2: an approved call whose ticket copy differed
+        # ADR 0288 decision 2: an approved call whose ticket copy differed
         # runs with the grant's stored arguments (``PermissionResultAllow.updated_input``).
         return PermissionResultAllow(updated_input=decision.updated_input)
 
@@ -596,7 +596,7 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
                 "permissionDecisionReason": _HOOK_GRANT_REASON,
             }
             if decision.updated_input is not None:
-                # Draft ADR 0288 decision 2: the approved call runs with the
+                # ADR 0288 decision 2: the approved call runs with the
                 # grant's stored arguments, so the connector receives the exact
                 # ticket the API verified rather than the model's second copy.
                 # ``updatedInput`` is declared on PreToolUseHookSpecificOutput.
@@ -629,7 +629,7 @@ def build_approval_hook(gate: ApprovalGate) -> dict[str, list[HookMatcher]]:
         "PreToolUse": [HookMatcher(matcher=None, hooks=[callback])]
     }
     if gate.proxied_connector_servers:
-        # Draft ADR 0288 decision 1: remember the tickets hosted connectors
+        # ADR 0288 decision 1: remember the tickets hosted connectors
         # return. PostToolUse runs before the model sees the result, so a
         # ticket is remembered before any call that copies it can be decided.
         observer: Any = build_ticket_observer(gate)
