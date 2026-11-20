@@ -375,7 +375,9 @@ def connect_browser(migrated: None, request: pytest.FixtureRequest):
     from redis.asyncio import Redis
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    prefix = getattr(request, "param", "")
+    param = getattr(request, "param", "")
+    fenced = param == "fenced"
+    prefix = "" if fenced else param
     with TestIdP(
         client_id=AUDIENCE,
         client_secret=CLIENT_SECRET,
@@ -437,6 +439,11 @@ def connect_browser(migrated: None, request: pytest.FixtureRequest):
             app.include_router(channels.router)
             app.include_router(console.router)
             app.include_router(identity_connect.router)
+            if fenced:
+                # What production runs in front of the confirm POST.
+                from curie_api.identity_fence import IdentityFenceMiddleware
+
+                app.add_middleware(IdentityFenceMiddleware)
 
             async def proxy(scope, receive, send):
                 if prefix and scope["type"] == "http":
@@ -1497,3 +1504,79 @@ def test_admission_wire_keeps_real_connect_url_and_private_confirmation(connect_
                 await engine.dispose()
 
         asyncio.run(remove_route())
+
+
+@pytest.mark.parametrize("connect_browser", ["fenced"], indirect=True)
+def test_fenced_confirm_without_sign_in_is_private_page_or_json(connect_browser) -> None:
+    """The writer fence answers a missing browser proof before the route runs."""
+    from curie_api.routers.identity_connect import CSRF_COOKIE, PRIVATE_HEADERS
+
+    client, raw, tenant_id, _, _, _ = connect_browser
+    path = f"/identity/connect/{raw}"
+    assert client.get(path).status_code == 200
+    csrf = client.cookies.get(CSRF_COOKIE)
+    origin = {"Origin": "https://testserver"}
+
+    page = client.post(
+        f"{path}/confirm", data={"csrf": csrf}, headers={**origin, "Accept": "text/html"}
+    )
+    assert page.status_code == 401 and "<title>Sign in required</title>" in page.text
+    plain = client.post(f"{path}/confirm", data={"csrf": csrf}, headers=origin)
+    assert plain.status_code == 401 and plain.json() == {"detail": "sign in required"}
+    for response in (page, plain):
+        for name, value in PRIVATE_HEADERS.items():
+            assert response.headers[name] == value
+    assert browser_links(tenant_id) == []
+
+    # Other identity writers keep the fence's own JSON refusal and headers.
+    other = client.post("/identity/me/github-link", headers={"Accept": "text/html"})
+    assert other.headers["content-type"].startswith("application/json")
+    assert other.headers["referrer-policy"] == "no-referrer"
+
+
+@pytest.mark.parametrize("accept", ["text/html", None])
+def test_oidc_callback_with_lapsed_connect_link_refuses_privately(
+    connect_browser, accept: str | None
+) -> None:
+    """A link that expires during sign-in: a page for a browser, the generic JSON otherwise."""
+    from urllib.parse import urlsplit
+
+    import httpx
+    from curie_api.routers.identity_connect import PRIVATE_HEADERS
+
+    client, raw, _, _, _, _ = connect_browser
+    path = f"/identity/connect/{raw}"
+    assert client.get(path).status_code == 200
+
+    async def expire() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as s:
+                row = await s.get(IdentityConnectToken, connect.hash_token(raw))
+                assert row
+                row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                await s.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(expire())
+    login = client.get("/console/oidc/login", follow_redirects=False)
+    assert login.status_code == 302
+    with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:
+        authorized = browser.get(login.headers["location"])
+    back = urlsplit(authorized.headers["location"])
+    response = client.get(
+        f"{back.path}?{back.query}",
+        headers={"Accept": accept} if accept else {},
+        follow_redirects=False,
+    )
+    assert response.status_code == 401
+    if accept:
+        assert "<title>This link can't be used</title>" in response.text
+        for name, value in PRIVATE_HEADERS.items():
+            assert response.headers[name] == value
+    else:
+        assert response.json() == {"detail": "OIDC login failed"}
+    cleared = " ".join(response.headers.get_list("set-cookie"))
+    assert "__Host-curie_identity_connect=" in cleared and "Max-Age=0" in cleared
+    assert client.get(path).status_code == 400

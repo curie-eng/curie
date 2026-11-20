@@ -1,6 +1,7 @@
 """Private browser confirmation for a sender-bound account-connect capability."""
 
 import hmac
+import re
 import secrets
 from collections.abc import Callable, Coroutine, Mapping
 from typing import Annotated, Any
@@ -47,35 +48,51 @@ PRIVATE_HEADERS = {
 }
 
 
-def wants_html(request: Request) -> bool:
-    """True when Accept names the text/html media range itself with a nonzero q.
+# A comma or semicolon splits only outside a quoted string, so a quoted
+# parameter value cannot smuggle in a media range of its own.
+_OUTSIDE_QUOTES = r'{sep}(?=(?:[^"]*"[^"]*")*[^"]*$)'
+_QVALUE = re.compile(r"0(\.\d{0,3})?|1(\.0{0,3})?")
 
-    `*/*` and parameters that merely contain the text do not count: only a
-    browser that asks for a page gets one.
+
+def wants_html(request: Request) -> bool:
+    """True when Accept names the text/html media range itself with a valid nonzero q.
+
+    `*/*`, a parameter that merely contains the text, and a malformed or zero
+    weight do not count: only a browser that asks for a page gets one.
     """
-    for part in request.headers.get("accept", "").split(","):
-        media, *params = (piece.strip() for piece in part.split(";"))
+    accept = request.headers.get("accept", "")
+    for part in re.split(_OUTSIDE_QUOTES.format(sep=","), accept):
+        media, *params = (
+            piece.strip() for piece in re.split(_OUTSIDE_QUOTES.format(sep=";"), part)
+        )
         if media.lower() != "text/html":
             continue
-        quality = 1.0
+        quality = "1"
         for param in params:
             name, _, value = param.partition("=")
             if name.strip().lower() == "q":
-                try:
-                    quality = float(value)
-                except ValueError:
-                    quality = 0.0
-        if quality > 0:
+                quality = value.strip()
+        if _QVALUE.fullmatch(quality) and float(quality or "0") > 0:
             return True
     return False
 
 
-def refusal_page(status: int, headers: Mapping[str, str] | None = None) -> HTMLResponse:
+def refusal_page(
+    status: int, headers: Mapping[str, str] | None = None, *, page: int | None = None
+) -> HTMLResponse:
+    """A refusal page; `page` picks the wording when it differs from the HTTP status."""
     return HTMLResponse(
-        render_refusal_page(status),
+        render_refusal_page(page or status),
         status_code=status,
         headers={**(headers or {}), **PRIVATE_HEADERS},
     )
+
+
+def private_refusal(request: Request, status: int, detail: str) -> Response:
+    """The connect route's refusal for code that runs before the route (the writer fence)."""
+    if status in REFUSALS and wants_html(request):
+        return refusal_page(status)
+    return JSONResponse({"detail": detail}, status_code=status, headers=PRIVATE_HEADERS)
 
 
 class PrivateConnectRoute(APIRoute):

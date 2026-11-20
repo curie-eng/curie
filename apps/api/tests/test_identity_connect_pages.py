@@ -236,3 +236,34 @@ def test_refusal_pages_cover_only_their_statuses() -> None:
     assert set(REFUSALS) == {400, 401, 403}
     with pytest.raises(KeyError):
         render_refusal_page(404)
+
+
+@pytest.mark.parametrize(
+    ("accept", "html"),
+    [
+        ("text/html,application/xhtml+xml,*/*;q=0.8", True),
+        ("TEXT/HTML ; q=0.5", True),
+        ("application/json, text/html;q=0.001", True),
+        ("text/html;q=1", True),
+        ("*/*", False),
+        ("", False),
+        ("application/json", False),
+        ("text/html;q=0", False),
+        ("text/html;q=0.0", False),
+        ("text/html;q=1.1", False),
+        ("text/html;q=inf", False),
+        ("text/html;q=nan", False),
+        ("text/html;q=-1", False),
+        ("text/html;q=abc", False),
+        ('application/json; profile="text/html"', False),
+        ('application/json; profile="a, text/html, b"', False),
+        ('application/json; profile="a; text/html"', False),
+        ('application/json; profile="x", text/html', True),
+    ],
+)
+def test_wants_html_requires_an_explicit_valid_text_html_range(accept: str, html: bool) -> None:
+    from curie_api.routers.identity_connect import wants_html
+    from starlette.requests import Request
+
+    scope = {"type": "http", "headers": [(b"accept", accept.encode())]}
+    assert wants_html(Request(scope)) is html

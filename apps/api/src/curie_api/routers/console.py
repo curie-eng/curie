@@ -80,7 +80,9 @@ from .identity_connect import (
     CONNECT_COOKIE,
     clear_connect_cookies,
     connect_path,
+    refusal_page,
     set_browser_proof_cookie,
+    wants_html,
 )
 
 logger = logging.getLogger(__name__)
@@ -190,9 +192,7 @@ async def current_session(
             headers={"Cache-Control": "no-store"},
         )
     if row.principal_id is not None:
-        principal = await authorized_console_principal(
-            session, console_session or "", live_row=row
-        )
+        principal = await authorized_console_principal(session, console_session or "", live_row=row)
         if principal is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -359,6 +359,21 @@ def _refuse_callback(reason: str) -> JSONResponse:
     return response
 
 
+def _refuse_connect_callback(request: Request, reason: str) -> Response:
+    """The callback refusal for an account-connect link that lapsed during sign-in.
+
+    Same status, generic JSON detail and cookie handling as `_refuse_callback`;
+    a browser (Accept names text/html) additionally gets the link-refusal page
+    instead of raw JSON. The reason still goes to logs only.
+    """
+    if not wants_html(request):
+        return _refuse_callback(reason)
+    logger.warning("oidc callback refused: %s", reason)
+    response = refusal_page(status.HTTP_401_UNAUTHORIZED, _NO_STORE, page=400)
+    _clear_state_cookie(response)
+    return response
+
+
 @router.get("/oidc/login", status_code=status.HTTP_302_FOUND, response_class=RedirectResponse)
 async def oidc_login(
     request: Request, session: SessionDep, return_to: str | None = None
@@ -500,11 +515,11 @@ async def oidc_callback(
         try:
             connect_row = await identity_connect.live_token(session, connect_token, lock=True)
         except identity_connect.ConnectRefused:
-            response = _refuse_callback("invalid account connection")
+            response = _refuse_connect_callback(request, "invalid account connection")
             clear_connect_cookies(response)
             return response
         if claims.issuer != connect_row.idp_issuer:
-            response = _refuse_callback("account connection issuer mismatch")
+            response = _refuse_connect_callback(request, "account connection issuer mismatch")
             clear_connect_cookies(response)
             return response
     # live_token locks the tenant and only accepts the fallback when there is
