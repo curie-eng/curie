@@ -756,6 +756,7 @@ fn read_pid(path: &Path) -> u32 {
         .unwrap_or(0)
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct ProcFields {
     state: char,
@@ -765,6 +766,7 @@ struct ProcFields {
 /// Fields after the comm in `/proc/<pid>/stat`. The comm is wrapped in
 /// parentheses and can itself contain parentheses, so the split is the last
 /// `)`.
+#[cfg(target_os = "linux")]
 fn proc_fields(pid: u32) -> Option<ProcFields> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = text.rsplit_once(')')?.1.trim_start();
@@ -775,6 +777,7 @@ fn proc_fields(pid: u32) -> Option<ProcFields> {
     Some(ProcFields { state, pgrp })
 }
 
+#[cfg(target_os = "linux")]
 fn holds_stdout_pipe(pid: u32) -> bool {
     fs::read_link(format!("/proc/{pid}/fd/1"))
         .map(|target| target.to_string_lossy().starts_with("pipe:"))
@@ -786,6 +789,7 @@ fn holds_stdout_pipe(pid: u32) -> bool {
 /// stays unreaped while the live holder keeps the stdout pipe and the group.
 /// `wait_with_output` reaps the leader as soon as it exits, so this window
 /// does not last. A descendant that is only an orphan zombie is not accepted.
+#[cfg(target_os = "linux")]
 fn leader_stayed_unreaped_while_child_held_the_pipe(
     parent_path: &Path,
     child_path: &Path,
@@ -828,16 +832,21 @@ fn leader_stayed_unreaped_while_child_held_the_pipe(
     ))
 }
 
-/// Stops a leaked `sleep` descendant. The pid is signaled only when its comm
-/// is still `sleep`, so a recycled pid is left alone.
-fn stop_leaked_sleep(path: &Path) {
-    let pid = read_pid(path);
-    if pid <= 1 {
+/// Stops a live pipe holder in the fixture's group after a failed assertion.
+#[cfg(target_os = "linux")]
+fn stop_leaked_sleep(parent_path: &Path, child_path: &Path) {
+    let parent = read_pid(parent_path);
+    let child = read_pid(child_path);
+    if parent <= 1 || child <= 1 || parent == child {
         return;
     }
-    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-    if comm.trim() == "sleep" {
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    if proc_fields(child).is_some_and(|fields| fields.state != 'Z' && fields.pgrp == parent)
+        && holds_stdout_pipe(child)
+    {
+        let comm = fs::read_to_string(format!("/proc/{child}/comm")).unwrap_or_default();
+        if comm.trim() == "sleep" {
+            unsafe { libc::kill(child as i32, libc::SIGKILL) };
+        }
     }
 }
 
@@ -1498,6 +1507,7 @@ exit 1
 /// while that child holds the pipe, then stop the child itself. Reaping the
 /// leader the way `wait_with_output` does fails the unreaped observation even
 /// when a later signal happens to reach the group.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn cluster_down_extension_stops_a_pipe_holder_after_the_leader_exits() {
     let _env = crate::support::ENV_LOCK.lock().await;
@@ -1581,15 +1591,21 @@ exit 1
         leader_stayed_unreaped_while_child_held_the_pipe(&parent_watch, &child_watch)
     });
     // Runs on the way out, including after a failed assertion. It does not
-    // run before `process_gone`, so it cannot hide a descendant the sweep left
-    // behind.
-    struct StopLeakedSleep<'a>(&'a std::path::Path);
+    // run before the process checks, so it cannot hide a descendant the sweep
+    // left behind.
+    struct StopLeakedSleep<'a> {
+        parent: &'a Path,
+        child: &'a Path,
+    }
     impl Drop for StopLeakedSleep<'_> {
         fn drop(&mut self) {
-            stop_leaked_sleep(self.0);
+            stop_leaked_sleep(self.parent, self.child);
         }
     }
-    let _stop_leaked_sleep = StopLeakedSleep(&child_pid);
+    let _stop_leaked_sleep = StopLeakedSleep {
+        parent: &parent_pid,
+        child: &child_pid,
+    };
 
     let err = down(down_opts())
         .await
@@ -1625,8 +1641,10 @@ exit 1
         "the pipe holder must stay in the leader's group so a group signal can stop it"
     );
     held.expect("the exited leader must stay unreaped while the descendant holds the pipe");
+    // The descendant was reparented when the leader exited. Reaping the
+    // descendant belongs to its new parent, so verify that it stopped.
     assert!(
-        process_gone(child),
+        proc_fields(child).is_none_or(|fields| fields.state == 'Z'),
         "pipe holder {child} is still running after the leader exited"
     );
     assert!(
