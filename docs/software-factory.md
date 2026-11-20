@@ -169,10 +169,15 @@ provide the equivalent provider-specific steps.
    invoke
    `$review-pr <pr-url>`. The [PR review guide](guides/factory-pr-review.md)
    covers component details, coverage, manual tests and approved feedback.
-5. **Request a revision.** Use a new issue comment explicitly mentioning the
-   configured App login, such as `@<app-slug>`, with your requested change.
-   Ordinary comments and edits do not execute work. Authorized PR mentions
-   and review feedback are also supported when configured. Feedback
+5. **Request a revision.** On the pull request, an authorized reviewer's plain
+   comment starts a revision on GitHub, with no mention. One submitted review
+   is one revision (its body and all its inline comments together), and an
+   approving review starts none unless a comment mentions the factory. Each
+   pull request allows 10 plain-comment revisions; the factory then posts one
+   notice and a mention, such as `@<app-slug>`, is required. A mention always
+   works and is not counted. GitLab and Bitbucket still require the mention.
+   On the issue, use a new comment explicitly mentioning the configured App
+   login; ordinary issue comments and edits do not execute work. Feedback
    publication requires a new human approval even where initial factory
    publication is automatic; see the operations reference.
 6. **Stop or retry deliberately.** Remove the factory label or close the issue

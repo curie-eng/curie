@@ -80,7 +80,9 @@ class VerifiedRepository:
     repository: dict[str, Any]
 
 
-def _check_feedback_lineage(feedback: UnverifiedFeedback, lineage: BoundReviewLineage) -> None:
+def check_feedback_lineage(feedback: UnverifiedFeedback, lineage: BoundReviewLineage) -> None:
+    """The feedback names the lineage's repository, pull request and installation."""
+
     if (
         feedback.repo_full_name.casefold() != lineage.repo_full_name.casefold()
         or feedback.pr_number != lineage.pr_number
@@ -139,7 +141,7 @@ async def verify_feedback_truth(
     REST response URL is fetched, and redirects cannot carry the App token to
     another endpoint. All credential-bearing requests stay inside the API.
     """
-    _check_feedback_lineage(feedback, lineage)
+    check_feedback_lineage(feedback, lineage)
     verified = await verify_repository(
         lineage, client=client, credentials=credentials, api_url=api_url
     )
@@ -161,7 +163,7 @@ async def verify_feedback_in_repository(
     The pull request, the feedback object and the sender's write permission
     (ADR 0197 authority 3) are still read fresh for this one piece of feedback.
     """
-    _check_feedback_lineage(feedback, lineage)
+    check_feedback_lineage(feedback, lineage)
     if verified.installation_id != lineage.installation_id:
         raise FeedbackIgnored("installation_unverified")
     api, token, repository = verified.api, verified.token, verified.repository
@@ -257,6 +259,8 @@ async def verify_feedback_in_repository(
         canonical,
         str(feedback.delivery_id),
         github_html_base=settings.github_html_base,
+        # A review held with an empty body was parsed allowing one.
+        allow_empty_review=feedback.event == "pull_request_review" and feedback.body == "",
     )
     # Repository spelling may differ in a signed payload; it is case-insensitive
     # identity. The canonical URL retained for the model comes from our lineage.
@@ -269,6 +273,11 @@ async def verify_feedback_in_repository(
         repo_full_name=observed.repo_full_name,
         url=observed.url,
         author_association=observed.author_association,
+        # A review is its own batch key. Feedback stored before parse recorded
+        # it (the Slack-bound arm's rows) names none.
+        review_id=(
+            observed.review_id if feedback.event == "pull_request_review" else feedback.review_id
+        ),
     )
     if observed != expected:
         raise FeedbackIgnored("feedback_changed")
