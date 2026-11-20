@@ -353,23 +353,23 @@ fn the_release_workflow_publishes_the_layer_render_locks() {
     assert!(release_needs.contains(&Value::String("dark-factory-runner-merge".into())));
 }
 
-/// The separate triage flow is gone: `curie example` offers the two bundles
-/// that remain, and the old subcommand is an unknown one, not a render.
+/// `curie example` offers exactly the two bundles that remain; the separate
+/// triage flow the one-ticket flow replaced is no longer a subcommand.
 #[test]
-fn the_retired_triage_example_is_not_a_command() {
+fn the_example_command_offers_only_the_remaining_bundles() {
     let help = Command::new(env!("CARGO_BIN_EXE_curie"))
         .args(["example", "--help"])
         .output()
         .expect("run curie example --help");
     assert!(help.status.success());
     let listing = String::from_utf8_lossy(&help.stdout);
-    assert!(listing.contains("sre-bot") && listing.contains("dark-factory"));
-    assert!(!listing.contains("factory-triage"), "{listing}");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_curie"))
-        .args(["example", "factory-triage", "render", "--out", "unused"])
-        .output()
-        .expect("run curie example factory-triage render");
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("factory-triage"));
+    let mut names: Vec<&str> = listing
+        .lines()
+        .skip_while(|line| !line.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|line| line.starts_with("  "))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["dark-factory", "help", "sre-bot"], "{listing}");
 }
