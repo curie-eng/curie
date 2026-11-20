@@ -136,6 +136,25 @@ async def claim_review_delivery(
     return await _lock_delivery(session, delivery_id=delivery_id, event=event, digest=digest)
 
 
+async def comment_refusal(
+    session: AsyncSession, comment_id: int, reasons: frozenset[str]
+) -> str | None:
+    """The reason a webhook delivery of this created issue comment was refused
+    for, among ``reasons``; None when no delivery of it was."""
+
+    return await session.scalar(
+        select(GitHubReviewDelivery.reason)
+        .where(
+            GitHubReviewDelivery.event_kind == "issue_comment",
+            GitHubReviewDelivery.action == "created",
+            GitHubReviewDelivery.source_object_id == comment_id,
+            GitHubReviewDelivery.status.in_(("ignored", "rejected")),
+            GitHubReviewDelivery.reason.in_(sorted(reasons)),
+        )
+        .limit(1)
+    )
+
+
 PushClaim = Literal["process", "duplicate", "unsettled", "conflict"]
 
 
