@@ -38,6 +38,37 @@ textarea {
   font-family: inherit;
 }
 
+/* A narrow viewport (a phone) stacks the shell: the sidebar becomes a block
+   above the page with its items in a wrapping row, so no part of the console
+   needs a horizontal scroll. The component styles are inline, hence !important. */
+@media (max-width: 640px) {
+  .app-shell {
+    flex-direction: column !important;
+  }
+  .app-sidebar {
+    width: auto !important;
+    height: auto !important;
+    position: static !important;
+    border-right: none !important;
+    border-bottom: 1px solid #2e2e2e;
+    padding: 10px 16px !important;
+  }
+  .app-nav {
+    flex-direction: row !important;
+    flex-wrap: wrap;
+  }
+  .app-nav > button {
+    width: auto !important;
+  }
+  .app-topbar {
+    padding: 12px 16px !important;
+    flex-wrap: wrap;
+  }
+  .app-main {
+    padding: 20px 16px !important;
+  }
+}
+
 @keyframes blink {
   0%,
   49% {

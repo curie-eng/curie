@@ -618,6 +618,138 @@ export async function deleteMemory(
   throw new ApiError(resp.status, describeError(body) ?? resp.statusText);
 }
 
+// ---- Learned rules: list, accept, reject and remove (#5800) ----
+
+export type MemoryRule = Schemas["MemoryRuleOut"];
+export type MemoryRules = Schemas["MemoryRulesOut"];
+export type MemoryRuleChange = Schemas["MemoryRuleDecisionOut"];
+
+/**
+ * A coded refusal of a learned rule route: `detail` is `{code, message, fix}`
+ * with `code` of the form `memory_rules.<name>`. `message` is the API's own
+ * sentence; the page maps the codes it knows to its own wording.
+ */
+export class MemoryRuleRefusal extends ApiError {
+  code: string;
+  limit: number | null;
+  constructor(status: number, code: string, message: string, limit: number | null) {
+    super(status, message);
+    this.name = "MemoryRuleRefusal";
+    this.code = code;
+    this.limit = limit;
+  }
+}
+
+/** The answer did not have the shape the API documents (a skewed release). */
+export class MemoryRuleShapeError extends Error {
+  constructor(operation: string, field: string) {
+    super(`${operation} answered with a body that is not a learned rule (at \`${field}\`)`);
+    this.name = "MemoryRuleShapeError";
+  }
+}
+
+const RULE_STATES = ["proposed", "accepted", "rejected", "removed"];
+const RULE_SCOPE_KINDS = ["agent", "binding", "repository"];
+const RULE_STRINGS = [
+  "id", "label", "scope_key", "scope_label", "text", "reason", "proposed_by", "proposed_at",
+] as const;
+const RULE_NULLABLE_STRINGS = [
+  "source_url", "accepted_at", "rejected_at", "removed_at",
+] as const;
+const RULE_DECIDERS = ["accepted_by", "rejected_by", "removed_by"] as const;
+
+// The API always sends every field (null when it has no value). A rule missing
+// one, such as `version`, is refused here rather than acted on: an action would
+// send `expected_version: undefined` and the person would see a bare 422.
+function checkRule(operation: string, at: string, value: unknown): MemoryRule {
+  const rule = (value ?? {}) as Record<string, unknown>;
+  const bad = (field: string): never => {
+    throw new MemoryRuleShapeError(operation, `${at}.${field}`);
+  };
+  if (typeof value !== "object" || value === null) return bad("");
+  for (const field of RULE_STRINGS) if (typeof rule[field] !== "string") bad(field);
+  for (const field of RULE_NULLABLE_STRINGS) {
+    if (typeof rule[field] !== "string" && rule[field] !== null) bad(field);
+  }
+  for (const field of RULE_DECIDERS) {
+    const d = rule[field];
+    if (d === null) continue;
+    const decider = (d ?? {}) as Record<string, unknown>;
+    if (
+      typeof d !== "object" ||
+      typeof decider.principal_id !== "string" ||
+      (typeof decider.display_name !== "string" && decider.display_name !== null)
+    ) {
+      bad(field);
+    }
+  }
+  if (!Number.isInteger(rule.number)) bad("number");
+  if (!Number.isInteger(rule.version)) bad("version");
+  if (!RULE_STATES.includes(rule.state as string)) bad("state");
+  if (!RULE_SCOPE_KINDS.includes(rule.scope_kind as string)) bad("scope_kind");
+  return rule as unknown as MemoryRule;
+}
+
+function checkRules(body: unknown): MemoryRules {
+  const op = "GET /agents/{id}/memory/rules";
+  const list = (body ?? {}) as Record<string, unknown>;
+  if (!Array.isArray(list.rules)) throw new MemoryRuleShapeError(op, "rules");
+  list.rules.forEach((r, i) => checkRule(op, `rules[${i}]`, r));
+  if (!Number.isInteger(list.in_force_limit)) throw new MemoryRuleShapeError(op, "in_force_limit");
+  return list as unknown as MemoryRules;
+}
+
+function checkChange(body: unknown): MemoryRuleChange {
+  const op = "POST /agents/{id}/memory/rules/{rule_id}/<action>";
+  const change = (body ?? {}) as Record<string, unknown>;
+  checkRule(op, "rule", change.rule);
+  if (change.applies_from !== "next_ticket") throw new MemoryRuleShapeError(op, "applies_from");
+  return change as unknown as MemoryRuleChange;
+}
+
+async function ruleJsonOrThrow<T>(resp: Response, check: (body: unknown) => T): Promise<T> {
+  if (resp.ok) return check(await resp.json());
+  const body = await resp.json().catch(() => null);
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  if (detail && typeof detail === "object" && typeof (detail as { code?: unknown }).code === "string") {
+    const d = detail as { code: string; message?: unknown; limit?: unknown };
+    throw new MemoryRuleRefusal(
+      resp.status,
+      d.code,
+      typeof d.message === "string" ? d.message : resp.statusText,
+      typeof d.limit === "number" ? d.limit : null,
+    );
+  }
+  throw new ApiError(resp.status, describeError(body) ?? resp.statusText);
+}
+
+// Every learned rule of an agent in every state; the page picks what to show.
+export async function listMemoryRules(agentId: string): Promise<MemoryRules> {
+  const resp = await request(`/agents/${agentId}/memory/rules`);
+  return ruleJsonOrThrow(resp, checkRules);
+}
+
+async function decideMemoryRule(
+  agentId: string,
+  ruleId: string,
+  action: "accept" | "reject" | "remove",
+  expectedVersion: number,
+): Promise<MemoryRuleChange> {
+  const resp = await request(`/agents/${agentId}/memory/rules/${ruleId}/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expected_version: expectedVersion }),
+  });
+  return ruleJsonOrThrow(resp, checkChange);
+}
+
+export const acceptMemoryRule = (agentId: string, ruleId: string, expectedVersion: number) =>
+  decideMemoryRule(agentId, ruleId, "accept", expectedVersion);
+export const rejectMemoryRule = (agentId: string, ruleId: string, expectedVersion: number) =>
+  decideMemoryRule(agentId, ruleId, "reject", expectedVersion);
+export const removeMemoryRule = (agentId: string, ruleId: string, expectedVersion: number) =>
+  decideMemoryRule(agentId, ruleId, "remove", expectedVersion);
+
 // ---- Durable state store: operator read/inspect surface (#250) ----
 
 // One namespace in an agent's durable state store, summarized for the inspector:

@@ -13,6 +13,7 @@ const PRODUCTION_ROOT = join(process.cwd(), "src");
 const EXPECTED_COMMAND_IDS = [
   "cluster.console.login",
   "cluster.deploy",
+  "cluster.memory",
   "cluster.observability.metrics",
   "cluster.observability.run",
   "cluster.observability.runs",

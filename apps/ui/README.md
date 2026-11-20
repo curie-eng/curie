@@ -88,7 +88,7 @@ directory; other test fixtures stay outside the UI build context.
 - `src/views/` — the wired views: `wired/*` (Overview, Agents, AgentDetail,
   Versions, Evals, and the `ComingSoon`/stub views in `WiredStubs.tsx`), `Observability.tsx`
   and its `obs/*` panels (RealTraces, RealMetrics, RealLogs, RealCost,
-  RealApprovals, RealMemory).
+  RealApprovals), and `wired/WiredMemoryPage.tsx` (the left navigation Memory page).
 - `e2e/` — Playwright specs. `design-review/` — committed side-by-side fidelity
   screenshots (impl vs the design canon).
 
@@ -129,13 +129,15 @@ honest `ComingSoon` stub (Usage, Settings).
   an emergency stop with confirm-before-kill and an unmistakable red killed-state
   banner. The wired Cost view is per-agent panels rather than the fixture fleet
   table (the API is per agent).
-- Memory tab (Observability > Memory): agent-scoped (an agent selector, since
-  the memory endpoint is per agent). Lists an agent's learned memory with its
-  provenance (session + source traces) from `GET /agents/{id}/memory`, and lets
-  an operator correct an entry against `PUT /agents/{id}/memory/{index}` or remove
-  one with `DELETE /agents/{id}/memory/{index}`; edits/deletes take effect at the
-  agent's next session boot. Reuses the same `WiredAgentMemory` panel the agent
-  detail page consumes (the endpoint was already live and consumed there).
+- Memory page (left navigation, after Factory): agent-scoped (an agent selector,
+  since the endpoints are per agent). Learned rules sub-tab: the proposed and
+  in force rules of one repository from `GET /agents/{id}/memory/rules`, with
+  Accept, Dismiss and Remove against `POST .../rules/{rule_id}/{accept,reject,remove}`
+  (each sends the rule's `version` as `expected_version`, then reloads), refusals
+  shown on the rule's card, and the order of authority. Facts sub-tab: the
+  `WiredAgentMemory` panel (`GET/PUT/DELETE /agents/{id}/memory`) that the
+  Observability Memory tab used to carry; edits/deletes take effect at the
+  agent's next session boot.
 - Approvals tab (Observability > Approvals): the operator visibility + resolve
   surface for durable approvals (#867). Lists approvals (pending by default,
   with a status filter) from `GET /approvals`; a row opens a detail with the
@@ -261,7 +263,7 @@ Config reference: `.env.example`.
 
 - Onboarding uses the classic create-agent modal (template picker + skill.md
   editor + Deploy), not the interview wizard (deferred).
-- The Observability Memory tab is wired to `GET/PUT/DELETE /agents/{id}/memory`
+- The Memory page's Facts sub-tab is wired to `GET/PUT/DELETE /agents/{id}/memory`
   (#869), reusing the `WiredAgentMemory` panel from the agent detail page behind
   an agent selector. The ACI (Agent Container Interface) `memory_ref` seam
   stays in the contract.
