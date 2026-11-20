@@ -975,12 +975,13 @@ def _two_owner_support() -> Any:
 
 
 def _port_unused(port: int) -> bool:
-    for host in (LOCAL_HOST, "0.0.0.0"):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            try:
-                sock.bind((host, port))
-            except OSError:
-                return False
+    # Loopback only: on Linux this bind fails with EADDRINUSE while a wildcard listener holds the
+    # port, so a port Docker published on every interface is still caught.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((LOCAL_HOST, port))
+        except OSError:
+            return False
     return True
 
 

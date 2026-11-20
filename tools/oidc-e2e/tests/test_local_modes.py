@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -207,6 +208,25 @@ def test_local_env_gateway_tokens_are_fresh_and_distinct(
     again = oidc_e2e.read_env_file(tmp_path / "again.env")
     assert again[TOKEN_VARIABLES[0]] != api
     assert again[TOKEN_VARIABLES[1]] != worker
+
+
+def _held_port(host: str) -> tuple[socket.socket, int]:
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind((host, 0))
+    holder.listen()
+    return holder, holder.getsockname()[1]
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"], ids=["loopback", "wildcard"])
+def test_a_port_held_by_a_listener_reads_as_used(host: str) -> None:
+    """A Docker published port listens on every interface, so the loopback probe must see it."""
+
+    holder, port = _held_port(host)
+    try:
+        assert not oidc_e2e._port_unused(port)
+    finally:
+        holder.close()
+    assert oidc_e2e._port_unused(port)
 
 
 def test_local_env_refuses_a_bad_project(tmp_path: Path) -> None:
