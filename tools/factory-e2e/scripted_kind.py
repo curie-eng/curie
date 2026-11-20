@@ -460,6 +460,8 @@ class ScriptedRun:
             "unsupported_stub_requests": [],
         }
         self.workdir: Path | None = None
+        # When the final issue comment was seen: the Slack progress bound starts here.
+        self.final_comment_at: float | None = None
         self.stub: Any = None
         self.model: Any = None
         # Per-agent model lanes and the Slack recorder, which the channel
@@ -1078,7 +1080,8 @@ class ScriptedRun:
         url = pull_request.get("html_url") if isinstance(pull_request, dict) else None
         if not url:
             raise ScriptedScenarioError("no pull request to find in the Slack ready reply")
-        deadline = time.monotonic() + SLACK_PROGRESS_SECONDS
+        started = self.final_comment_at if self.final_comment_at is not None else time.monotonic()
+        deadline = started + SLACK_PROGRESS_SECONDS
         while True:
             try:
                 counts = scenario.assert_slack_progress(
@@ -1096,6 +1099,21 @@ class ScriptedRun:
             break
         self.evidence["slack_posts"] = counts
 
+    def verify_slack_progress(self) -> None:
+        """The progress card still holds at the end of the run: nothing arrived late."""
+
+        if not self.gateway_enabled():
+            return
+        if self.slack is None:
+            raise ScriptedScenarioError("the Slack recorder did not start")
+        url = self.evidence["pull_request"]["html_url"]
+        try:
+            self.evidence["slack_posts"] = scenario.assert_slack_progress(
+                self.slack.posts(), scenario.SLACK_CHANNEL, url
+            )
+        except scenario.ScenarioAssertionError as exc:
+            raise ScriptedScenarioError(f"Slack progress at the end of the run: {exc}") from None
+
     def run_scenarios(self, github: Any) -> None:
         """What runs on the install once the publication scenario has finished."""
 
@@ -1103,6 +1121,7 @@ class ScriptedRun:
         self.wait_for_slack_progress()
         if self.router is not None and self.runs_one_ticket:
             self.run_one_ticket(github)
+        self.verify_slack_progress()
 
     def one_ticket_required(self) -> bool:
         """Whether this command owes a one-ticket verdict: every replay of an install.
@@ -1517,6 +1536,7 @@ class ScriptedRun:
                 self.evidence["elapsed_seconds"] = time.monotonic() - self.install_started
                 self.evidence["final_comment"] = final[0]
                 self.evidence["final_comment_count"] = len(final)
+                self.final_comment_at = time.monotonic()
                 return
             if self.args.record and self.record_start_remaining is not None:
                 self.assert_record_budget(self.provider_remaining())

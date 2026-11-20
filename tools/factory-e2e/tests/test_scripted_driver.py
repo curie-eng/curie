@@ -2557,6 +2557,28 @@ def test_a_settled_result_after_the_bound_is_late(monkeypatch: pytest.MonkeyPatc
     assert "slack_posts" not in run.evidence
 
 
+def test_the_bound_starts_at_the_final_comment_not_at_the_slack_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _publication_run(_slack_run())
+    run.final_comment_at = 0.0
+    monkeypatch.setattr(
+        sk, "time", type("Clock", (), {"monotonic": staticmethod(lambda: 190.0),
+                                       "sleep": staticmethod(lambda _s: None)})
+    )
+    with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
+        run.wait_for_slack_progress()
+
+
+def test_a_duplicate_card_that_arrives_after_the_first_check_fails_the_run() -> None:
+    run = _publication_run(_slack_run())
+    run.wait_for_slack_progress()
+    assert run.evidence["slack_posts"] == {"root": 1, "card": 1, "ready": 1}
+    run.slack = _RecordedSlack(_slack_run(extra_card=True))  # type: ignore[assignment]
+    with pytest.raises(sk.ScriptedScenarioError, match="end of the run: .*one card"):
+        run.verify_slack_progress()
+
+
 def test_the_publication_install_fails_without_its_recorder() -> None:
     run = sk.ScriptedRun(_gateway_argv("publication"))
     run.evidence["pull_request"] = {"html_url": PULL_REQUEST}
@@ -2576,10 +2598,11 @@ def test_the_publication_binds_slack_then_labels_then_waits_then_verifies(
     monkeypatch.setattr(run, "wait_for_final", lambda: calls.append("wait"))
     monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
     monkeypatch.setattr(run, "wait_for_slack_progress", lambda: calls.append("slack"))
+    monkeypatch.setattr(run, "verify_slack_progress", lambda: calls.append("slack-final"))
     monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
     run.router = lanes.LaneRouter({})
     run.run_publication(None)
-    assert calls == ["bind", "label", "wait", "observe", "slack", "one-ticket"]
+    assert calls == ["bind", "label", "wait", "observe", "slack", "one-ticket", "slack-final"]
 
 
 def test_slack_progress_refuses_a_card_that_was_never_updated() -> None:
@@ -2684,11 +2707,12 @@ def test_the_scenarios_after_the_publication_scenario_call_the_one_ticket_scenar
     calls: list[str] = []
     monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
     monkeypatch.setattr(run, "wait_for_slack_progress", lambda: calls.append("slack"))
+    monkeypatch.setattr(run, "verify_slack_progress", lambda: calls.append("slack-final"))
     monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
 
     run.run_scenarios(None)
 
-    assert calls == ["observe", "slack", "one-ticket"]
+    assert calls == ["observe", "slack", "one-ticket", "slack-final"]
 
 
 def test_a_fixture_that_owns_its_agents_does_not_run_the_one_ticket_scenario(
