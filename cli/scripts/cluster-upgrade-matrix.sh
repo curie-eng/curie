@@ -1350,6 +1350,11 @@ run_scenario_timed() {
 
 cleanup() {
     local status=$? restore_failed=0
+    if (( status != 0 && OWNED_HELM )) && [[ "${CURIE_MATRIX_IMAGE_DIAGNOSTICS:-}" == 1 ]]; then
+        timeout 15s python3 "$REPO_ROOT/cli/scripts/diagnose-matrix-images.py" \
+            "$EVIDENCE_DIR" "$KIND_CLUSTER" \
+            || log "pre-teardown image evidence collection failed (upgrade exit $status)"
+    fi
     restore_retire_runner_tags || restore_failed=1
     if [[ -n "$APPLY_KILL_PID" ]]; then
         sigkill_tree "$APPLY_KILL_PID"
@@ -3847,6 +3852,10 @@ run_matrix() {
     fi
     prepare_candidate_images
     log "prelude elapsed_seconds=$((SECONDS - prelude_started))"
+    if [[ "${GITHUB_ACTIONS:-}" == true && "$KIND_CLUSTER" == curie-upgrade-matrix \
+        && "$NAMESPACE" == acme-2590 && "$RELEASE" == t2590 && ( "$SHARD" == s01 || "$SHARD" == s06 ) ]]; then
+        export CURIE_MATRIX_IMAGE_DIAGNOSTICS=1
+    fi
     if [[ -n "$SHARD" ]]; then
         run_shard
     else

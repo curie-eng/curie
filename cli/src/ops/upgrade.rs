@@ -4571,6 +4571,17 @@ impl LiveHost {
                 Some(requested),
             ))
         });
+        if !observation.image_binding_diagnostics.is_empty() {
+            use std::io::Write;
+            let _diagnostic_write = writeln!(
+                std::io::stderr().lock(),
+                "matrix-image-observation {}",
+                serde_json::json!({
+                    "issues": observation.issues,
+                    "images": observation.image_binding_diagnostics,
+                })
+            );
+        }
         Ok(ConvergenceVerdict {
             convergence: convergence_from(&observation),
             issues: observation.issues.clone(),

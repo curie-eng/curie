@@ -76,6 +76,7 @@ pub(super) struct Observation {
     /// The Helm revision the sample's first status read reported. The waiters
     /// pin their target to the first sample's value and never adopt another.
     pub revision: Option<u64>,
+    pub image_binding_diagnostics: Vec<Value>,
 }
 
 impl Observation {
@@ -526,6 +527,41 @@ fn observed_image_matches(expected: &str, status: &Value, node: Option<&Value>) 
     expected_identity == identity && alias_identity == identity
 }
 
+fn diagnostic_node_inventory(node: &Value, expected: &str, image: &str, image_id: &str) -> Value {
+    let inventory = array(node, "/status/images");
+    let running = manifest_identity(
+        image_id
+            .strip_prefix("docker-pullable://")
+            .unwrap_or(image_id),
+    );
+    let repositories = [repository(expected), repository(image)];
+    let rows: Vec<_> = inventory
+        .iter()
+        .filter(|row| {
+            array(row, "/names")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|name| {
+                    repositories.contains(&repository(name))
+                        || running.as_ref().is_some_and(|identity| {
+                            name.split_once('@').map(|(_, digest)| digest)
+                                == identity.split_once('@').map(|(_, digest)| digest)
+                        })
+                })
+        })
+        .take(50)
+        .map(|row| serde_json::json!({"names": row["names"], "size_bytes": row["sizeBytes"]}))
+        .collect();
+    serde_json::json!({
+        "name": text(node, "/metadata/name"),
+        "resource_version": text(node, "/metadata/resourceVersion"),
+        "image_row_count": inventory.len(),
+        "rows": rows,
+        "expected_binding": running.as_deref().and_then(|id| resolve_reference_identity(node, expected, id)),
+        "status_image_binding": running.as_deref().and_then(|id| resolve_reference_identity(node, image, id)),
+    })
+}
+
 fn selected(workload: &Value, pod: &Value) -> bool {
     let selector = &workload["spec"]["selector"];
     let labels = &pod["metadata"]["labels"];
@@ -635,11 +671,11 @@ fn compare_containers(
             let actual_container = actual_containers
                 .iter()
                 .find(|item| text(item, "/name") == name);
-            if image.is_empty()
-                || actual_container.is_none_or(|item| {
-                    normalize_image(text(item, "/image")) != normalize_image(image)
-                })
-            {
+            let spec_matches = !image.is_empty()
+                && actual_container.is_some_and(|item| {
+                    normalize_image(text(item, "/image")) == normalize_image(image)
+                });
+            if !spec_matches {
                 result.issue(
                     Facet::Image,
                     id,
@@ -647,14 +683,34 @@ fn compare_containers(
                 );
             }
             if !pod {
+                if !spec_matches && image_binding_diagnostic_enabled(actual, result) {
+                    result.image_binding_diagnostics.push(serde_json::json!({
+                        "workload": id, "container": name, "init": init,
+                        "target_image": image, "spec_image": actual_container.map(|c| text(c, "/image")),
+                    }));
+                }
                 continue;
             }
             let status = array(actual, &format!("/status/{status_field}"))
                 .iter()
                 .find(|item| text(item, "/name") == name);
-            let image_matches = status.is_some_and(|status| {
-                observed_image_matches(image, status, nodes.get(text(actual, "/spec/nodeName")))
-            });
+            let node_name = text(actual, "/spec/nodeName");
+            let node = nodes.get(node_name);
+            let image_matches =
+                status.is_some_and(|status| observed_image_matches(image, status, node));
+            if (!spec_matches || !image_matches) && image_binding_diagnostic_enabled(actual, result)
+            {
+                let status_image = status.map(|s| text(s, "/image"));
+                let image_id = status.map(|s| text(s, "/imageID"));
+                result.image_binding_diagnostics.push(serde_json::json!({
+                    "pod": id, "container": name, "init": init, "pod_node": node_name,
+                    "pod_resource_version": text(actual, "/metadata/resourceVersion"),
+                    "target_image": image, "spec_image": actual_container.map(|c| text(c, "/image")),
+                    "status_image": status_image, "image_id": image_id,
+                    "spec_matches": spec_matches, "image_matches": image_matches,
+                    "node": node.map(|node| diagnostic_node_inventory(node, image, status_image.unwrap_or(""), image_id.unwrap_or(""))),
+                }));
+            }
             let valid = image_matches
                 && status.is_some_and(|status| {
                     if init
@@ -715,6 +771,14 @@ fn compare_containers(
             }
         }
     }
+}
+
+fn image_binding_diagnostic_enabled(actual: &Value, result: &Observation) -> bool {
+    result.image_binding_diagnostics.len() < 16
+        && text(actual, "/metadata/namespace") == "acme-2590"
+        && text(actual, "/metadata/name").starts_with("t2590-curie-")
+        && std::env::var("CURIE_MATRIX_IMAGE_DIAGNOSTICS").as_deref() == Ok("1")
+        && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
 }
 
 fn workload(
