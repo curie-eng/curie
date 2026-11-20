@@ -985,6 +985,49 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "float assertions without places=6",
     ),
     (
+        # The reviewer's example: the float sits in a variable, beside a valid
+        # assertAlmostEqual(..., places=6) the passing diff already adds.
+        "conflicting-float-assert-equal-through-a-variable",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    "        expected = 33.0",
+                    "        self.assertEqual(actual, expected)",
+                ],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-float-assert-equal-through-a-negative-variable",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, "        low = -1.5e2", "        self.assertNotEqual(low, got)"],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "deploy-refused-at-the-connector-lock-preflight",
+        [
+            (
+                "beat_h/retired_bundle/output",
+                {
+                    "error": "connectors.yaml declares a runner layer, but connectors.lock.yaml "
+                    "records no runner image for it. Build it before deploying.",
+                    "fix": "run `curie build --plugin-dir retired-bundle` and redeploy",
+                },
+            )
+        ],
+        "beat_h",
+        "deploy refusal is not",
+    ),
+    (
         "conflicting-bare-float-assert",
         [
             (
@@ -1051,6 +1094,17 @@ def test_judge_rejects_each_broken_shape(
         [("beat_f/diff_added_lines", ["self.assertAlmostEqual(f(1), (2.0), places = 6)"])],
         # Liveness: an integer assertEqual, and floats only in strings and comments.
         [("beat_f/diff_added_lines", lambda ls: [*ls, "        self.assertEqual(len(rows), 3)"])],
+        # Liveness: a name assigned an integer stays allowed.
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    "        expected = 33",
+                    "        self.assertEqual(count, expected)",
+                ],
+            )
+        ],
         [
             (
                 "beat_f/diff_added_lines",
@@ -1078,6 +1132,7 @@ def test_judge_rejects_each_broken_shape(
         "tool-note-as-mapping",
         "nested-parens-and-spacing",
         "integer-assert-equal",
+        "integer-variable-assert-equal",
         "floats-only-in-strings-and-comments",
         "acknowledgment-never-edited",
     ],

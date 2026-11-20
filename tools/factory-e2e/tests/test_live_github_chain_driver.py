@@ -139,13 +139,13 @@ class _Recorder:
         self.argv: list[list[str]] = []
         self.locks: list[str] = []
         monkeypatch.setattr(fe, "run", self.run)
-        monkeypatch.setattr(fe.Preflight, "_lock", self.lock)
+        monkeypatch.setattr(fe.Preflight, "_lock", lambda _p, name, holds: self.lock(name, holds))
 
     def run(self, argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
         self.argv.append(list(argv))
         return ""
 
-    def lock(self, _p: fe.Preflight, name: str, holds: str) -> None:
+    def lock(self, name: str, holds: str) -> None:
         self.locks.append(name)
 
     def cluster_calls(self) -> list[list[str]]:
@@ -155,6 +155,32 @@ class _Recorder:
 def _not_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(lgc, "graphql", _fake_graphql())
     monkeypatch.setattr(lgc, "git_ancestry", lambda _root, _candidate: lambda _oid: False)
+
+
+def _github(
+    monkeypatch: pytest.MonkeyPatch, *, open_items: list[dict[str, Any]] | None = None
+) -> list[tuple[str, str]]:
+    """The actor token's GitHub for ``main``: the three identity reads and the open items."""
+
+    calls: list[tuple[str, str]] = []
+
+    def as_actor(_self: fe.Preflight, method: str, path: str, body: Any = None) -> Any:
+        calls.append((method, path))
+        if method == "GET" and path == "/user":
+            return 200, WRITER
+        if method == "GET" and path == f"/user/{READER['id']}":
+            return 200, READER
+        if method == "GET" and path == f"/repos/{REPO}":
+            return 200, {**REPOSITORY, "permissions": {"push": True}}
+        if method == "GET" and path.startswith(f"/repos/{REPO}/issues?state=open&"):
+            return 200, list(open_items or [])
+        raise AssertionError(f"unexpected GitHub call {method} {path}")
+
+    monkeypatch.setattr(fe.Preflight, "as_actor", as_actor)
+    return calls
+
+
+DEFAULT_NAMESPACE = fe.default_namespace("c" * 40)
 
 
 # --------------------------------------------------------------------------
@@ -172,6 +198,7 @@ def test_wiring_full_mode_unready_candidate_exits_config_before_any_cluster_call
         CURIE_FACTORY_READER_ACCOUNT_ID="1002",
     )
     _not_ready(monkeypatch)
+    _github(monkeypatch)
     recorder = _Recorder(monkeypatch)
     evidence = tmp_path / "evidence.json"
 
@@ -192,6 +219,7 @@ def test_wiring_stop_mode_records_the_unready_candidate_and_goes_on(
 ) -> None:
     _main_env(monkeypatch, tmp_path, CURIE_FACTORY_READER_ACCOUNT_ID="1002")
     _not_ready(monkeypatch)
+    _github(monkeypatch)
     _Recorder(monkeypatch)
     reached: list[str] = []
 
@@ -221,6 +249,7 @@ def test_wiring_a_run_failing_before_drive_prints_and_writes_no_raw_identifier(
     # install and before drive: its logs named the kube context and the App id.
     _main_env(monkeypatch, tmp_path, CURIE_FACTORY_READER_ACCOUNT_ID="1002")
     _not_ready(monkeypatch)
+    _github(monkeypatch)
     _Recorder(monkeypatch)
     seen: dict[str, str] = {}
 
@@ -245,6 +274,208 @@ def test_wiring_a_run_failing_before_drive_prints_and_writes_no_raw_identifier(
     assert "lock context-<context> and app-<app> for <fixture-repo>" in err
     assert "curie build failed in <namespace> on <context>" in json.loads(written)["error"]
     assert len(fe.LOG_FILTERS) == 1
+
+
+def test_wiring_stop_mode_refuses_a_labelled_open_issue_before_any_lock_or_cluster_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A leftover labelled issue could be admitted by poll intake between the
+    # agent binding and the fixture reset, with the model key still installed.
+    _main_env(
+        monkeypatch,
+        tmp_path,
+        CURIE_FACTORY_MODEL_API_KEY="fake-mk",
+        CURIE_FACTORY_READER_ACCOUNT_ID="1002",
+    )
+    _not_ready(monkeypatch)
+    leftover = {"number": 5, "labels": [{"name": "factory"}], "user": WRITER}
+    _github(monkeypatch, open_items=[leftover])
+    recorder = _Recorder(monkeypatch)
+    reached: list[str] = []
+    monkeypatch.setattr(fe.Preflight, "check_tools", lambda _p: reached.append("check_tools"))
+    evidence = tmp_path / "evidence.json"
+
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+
+    assert code == fe.EXIT_FAILED
+    assert reached == [] and recorder.locks == [] and recorder.cluster_calls() == []
+    assert "1 open issues or pull requests" in json.loads(evidence.read_text())["error"]
+
+
+def test_wiring_an_empty_fixture_goes_on_past_the_open_item_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Liveness: an empty fixture repository proceeds to the shared preflight.
+    _main_env(monkeypatch, tmp_path, CURIE_FACTORY_READER_ACCOUNT_ID="1002")
+    _not_ready(monkeypatch)
+    calls = _github(monkeypatch, open_items=[])
+    _Recorder(monkeypatch)
+    reached: list[str] = []
+
+    def check_tools(_p: fe.Preflight) -> None:
+        reached.append("check_tools")
+        raise fe.PreflightFailed("stopped by the test after the open item check")
+
+    monkeypatch.setattr(fe.Preflight, "check_tools", check_tools)
+    evidence = tmp_path / "evidence.json"
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+    assert code == fe.EXIT_FAILED and reached == ["check_tools"]
+    assert any(path.startswith(f"/repos/{REPO}/issues?state=open") for _m, path in calls)
+    steps = [s["step"] for s in json.loads(evidence.read_text())["steps"]]
+    assert "live chain fixture has no open item" in steps
+
+
+def _install_through_main(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> list[tuple[str, dict[str, Any]]]:
+    """Stub the cluster edges of Preflight.run so main runs the real install, then stop."""
+
+    chart = tmp_path / "chart"
+    (chart / "crds").mkdir(parents=True)
+    for name in ("check_tools", "check_images", "check_app", "sweep_stale_namespaces"):
+        monkeypatch.setattr(fe.Preflight, name, lambda _p: None)
+    monkeypatch.setattr(fe.Preflight, "create_namespace", lambda _p: None)
+    monkeypatch.setattr(fe.Preflight, "extract_chart", lambda _p: chart)
+    monkeypatch.setattr(fe.Preflight, "existing_sandbox_controller", lambda _p: False)
+    monkeypatch.setattr(fe.Preflight, "assert_running_images", lambda _p: None)
+    monkeypatch.setattr(fe.Preflight, "egress_cidrs", lambda _p: [])
+    monkeypatch.setattr(fe.Preflight, "kubectl", lambda _p, *_a, **_k: "")
+    monkeypatch.setattr(fe.Preflight, "_lock", lambda *_a, **_k: None)
+
+    def stop(_p: fe.Preflight) -> None:
+        raise fe.PreflightFailed("stopped by the test after the install")
+
+    monkeypatch.setattr(fe.Preflight, "port_forward", stop)
+    helm_values: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        if argv[0] == "helm":
+            values_file = argv[argv.index("-f") + 1]
+            helm_values.append((argv[3], json.loads(Path(values_file).read_text())))
+        return ""
+
+    monkeypatch.setattr(fe, "run", fake_run)
+    return helm_values
+
+
+def test_wiring_stop_mode_with_a_model_key_installs_the_fake_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _main_env(
+        monkeypatch,
+        tmp_path,
+        CURIE_FACTORY_MODEL_API_KEY="fake-mk-stop-mode",
+        CURIE_FACTORY_MODEL_BASE_URL="https://model-proxy.example.invalid/v1",
+        CURIE_FACTORY_READER_ACCOUNT_ID="1002",
+    )
+    _not_ready(monkeypatch)
+    _github(monkeypatch, open_items=[])
+    helm_values = _install_through_main(monkeypatch, tmp_path)
+    evidence = tmp_path / "evidence.json"
+
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+
+    assert code == fe.EXIT_FAILED
+    assert [verb for verb, _ in helm_values] == ["install"]
+    values = helm_values[0][1]
+    text = json.dumps(values)
+    assert "fake-mk-stop-mode" not in text and "model-proxy.example.invalid" not in text
+    assert values["agentSandbox"]["runner"].get("fakeModel") is not False
+    assert "credentials" not in values["agentSandbox"]["runner"]
+    steps = {s["step"]: s for s in json.loads(evidence.read_text())["steps"]}
+    assert steps["installed"]["model"] == "fake"
+    assert steps["live chain stop mode installs the fake model"]["model_settings_dropped"]
+
+
+def test_wiring_an_invalid_reader_id_writes_no_raw_namespace_or_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _main_env(monkeypatch, tmp_path, CURIE_FACTORY_READER_ACCOUNT_ID="abc")
+    _Recorder(monkeypatch)
+    evidence = tmp_path / "evidence.json"
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+    assert code == fe.EXIT_CONFIG
+    written = evidence.read_text()
+    err = capsys.readouterr().err
+    for text in (written, err):
+        assert DEFAULT_NAMESPACE not in text and "ctx-fake" not in text, text
+    parsed = json.loads(written)
+    assert parsed["namespace"] == "<namespace>" and parsed["kube_context"] == "<context>"
+    assert lgc.READER_ENV in parsed["error"]
+
+
+def test_wiring_a_failure_right_after_check_app_writes_and_prints_no_raw_identifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _main_env(
+        monkeypatch,
+        tmp_path,
+        CURIE_FACTORY_READER_ACCOUNT_ID="1002",
+        CURIE_FACTORY_OPERATOR_LOGIN="octo-operator",
+    )
+    _not_ready(monkeypatch)
+    _github(monkeypatch, open_items=[])
+    _Recorder(monkeypatch)
+    for name in ("check_tools", "check_images"):
+        monkeypatch.setattr(fe.Preflight, name, lambda _p: None)
+    installation = {"id": 777, "permissions": {"checks": "read", "statuses": "read"}}
+    monkeypatch.setattr(
+        fe.Preflight, "as_app", lambda _p, method, path, body=None: (200, installation)
+    )
+
+    def sweep(p: fe.Preflight) -> None:
+        # check_app ran for real: it read the repository id and the actor login.
+        raise fe.PreflightFailed(
+            f"sweep failed for repository {p.repository_id} by {p.evidence['actor_login']} "
+            f"in {p.namespace} on {p.config.kube_context} for App {p.config.app_id}"
+        )
+
+    monkeypatch.setattr(fe.Preflight, "sweep_stale_namespaces", sweep)
+    evidence = tmp_path / "evidence.json"
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+
+    assert code == fe.EXIT_FAILED
+    written = evidence.read_text()
+    err = capsys.readouterr().err
+    raw = ["2001", "octo-writer", DEFAULT_NAMESPACE, "ctx-fake", "4242"]
+    for text in (written, err):
+        assert not [value for value in raw if value in text], text
+    parsed = json.loads(written)
+    assert parsed["actor_login"] == "<writer>"
+    assert parsed["fixture_repository_id"] == "<fixture-repo>"
+    assert "repository <fixture-repo> by <writer> in <namespace> on <context>" in parsed["error"]
+
+
+def test_wiring_a_serializer_refusal_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _main_env(monkeypatch, tmp_path, CURIE_FACTORY_READER_ACCOUNT_ID="1002")
+    monkeypatch.setattr(fe, "SCENARIO_HOOKS", {})
+
+    def refuse(_evidence: dict[str, Any]) -> str:
+        raise judge.EvidenceLeak([("writer", "$/steps[0]")])
+
+    def run(self: fe.Preflight, _driver: Any) -> None:
+        self.evidence_serializer = refuse
+
+    monkeypatch.setattr(fe.Preflight, "run", run)
+    evidence = tmp_path / "e.json"
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+    assert code == fe.EXIT_FAILED
+    written = json.loads(evidence.read_text())
+    assert written["result"] == "failed" and "refused" in written["error"]
 
 
 def _stub_preflight_steps(
@@ -746,6 +977,236 @@ def test_wiring_identities_refuse_the_actor_as_reader(
 
 
 # --------------------------------------------------------------------------
+# wiring: the beats of the paid path, each gated before its next side effect
+# --------------------------------------------------------------------------
+
+
+class _Opened(Exception):
+    """Raised by the fake open_and_label: a ticket would have been opened."""
+
+
+def _beat_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[fe.Preflight, lgc.ChainRun, list[str]]:
+    p = _chain_preflight(tmp_path, monkeypatch, open_items=[], stop=False)
+    chain = lgc.chain_of(p)
+    chain.record = {
+        key: copy.deepcopy(value)
+        for key, value in PASSING.items()
+        if not key.startswith("beat_") and key not in ("usage", "teardown")
+    }
+    chain.session_files = {role: tmp_path / f"{role}.session" for role in lgc.ROLES}
+    monkeypatch.setattr(p, "model_usage", lambda: 10.0)
+    opened: list[str] = []
+
+    def open_and_label(_p: Any, _chain: Any, fixture: str, _label: str) -> Any:
+        opened.append(fixture)
+        raise _Opened(fixture)
+
+    monkeypatch.setattr(lgc, "open_and_label", open_and_label)
+    return p, chain, opened
+
+
+def _overrides(proposals: Any) -> str:
+    output = json.loads((PENDING / "overrides-response.json").read_text())["output"]
+    return json.dumps({**output, "memory_rule_proposals": proposals})
+
+
+def _fake_cli(monkeypatch: pytest.MonkeyPatch, answer: Callable[[list[str]], Any]) -> None:
+    monkeypatch.setattr(lgc, "cluster_cli", lambda _p, args, **_k: answer(list(args)))
+
+
+@pytest.mark.parametrize("read", [_overrides(False), _overrides(None), "not json"])
+def test_wiring_beat_a_opens_no_issue_unless_the_proposals_read_shows_true(
+    read: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p, chain, opened = _beat_preflight(tmp_path, monkeypatch)
+    _fake_cli(monkeypatch, lambda args: (0, "{}" if "on" in args else read, 0.1))
+    with pytest.raises(lgc.ChainStopped, match="rule proposals on"):
+        lgc.beat_a(p, chain)
+    assert opened == []
+
+
+@pytest.mark.parametrize("usage", [None, float("nan"), float("inf")])
+def test_wiring_beat_a_opens_no_issue_without_a_finite_usage_baseline(
+    usage: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p, chain, opened = _beat_preflight(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "model_usage", lambda: usage)
+    _fake_cli(monkeypatch, lambda args: (0, "{}" if "on" in args else _overrides(True), 0.1))
+    with pytest.raises(lgc.ChainStopped, match="could not be read at before_a"):
+        lgc.beat_a(p, chain)
+    assert opened == []
+
+
+def test_wiring_beat_a_opens_ticket_a_with_proposals_on_and_a_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Liveness: proposals read true and a finite baseline open ticket A.
+    p, chain, opened = _beat_preflight(tmp_path, monkeypatch)
+    _fake_cli(monkeypatch, lambda args: (0, "{}" if "on" in args else _overrides(True), 0.1))
+    with pytest.raises(_Opened):
+        lgc.beat_a(p, chain)
+    assert opened == ["issue-a.md"]
+    assert chain.record["usage"]["samples"] == [{"label": "before_a", "usage": 10.0}]
+
+
+@pytest.mark.parametrize(("exit_code", "opens"), [(1, False), (0, True)])
+def test_wiring_a_failed_instruction_write_never_opens_ticket_b(
+    exit_code: int, opens: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # exit 0 is the liveness case.
+    p, chain, opened = _beat_preflight(tmp_path, monkeypatch)
+    _fake_cli(monkeypatch, lambda args: (exit_code, "{}", 0.1))
+    with pytest.raises(_Opened if opens else lgc.ChainStopped):
+        lgc.beat_f(p, chain)
+    assert opened == (["issue-b.md"] if opens else [])
+
+
+def _removal(state: str) -> str:
+    rule_id = PASSING["beat_e"]["rule_before"]["id"]
+    return json.dumps({"rule": {"id": rule_id, "state": state}, "applies_from": "next_ticket"})
+
+
+@pytest.mark.parametrize(
+    ("removal", "opens"),
+    [((1, "{}"), False), ((0, _removal("accepted")), False), ((0, _removal("removed")), True)],
+)
+def test_wiring_a_failed_removal_never_opens_ticket_c(
+    removal: tuple[int, str],
+    opens: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The removed state is the liveness case.
+    p, chain, opened = _beat_preflight(tmp_path, monkeypatch)
+    chain.record["beat_e"] = copy.deepcopy(PASSING["beat_e"])
+    rule_id = PASSING["beat_e"]["rule_before"]["id"]
+    listing = json.dumps({"rules": [{"id": rule_id, "version": 2, "state": "accepted"}]})
+
+    def answer(args: list[str]) -> Any:
+        if "--remove" in args:
+            return (*removal, 0.2)
+        return 0, listing, 0.1
+
+    _fake_cli(monkeypatch, answer)
+    with pytest.raises(_Opened if opens else lgc.ChainStopped):
+        lgc.beat_g(p, chain)
+    assert opened == (["issue-c.md"] if opens else [])
+
+
+def _recorded_beat(name: str, section: Any = None) -> Callable[[Any, Any], None]:
+    def beat(_p: Any, chain: lgc.ChainRun) -> None:
+        chain.record[name] = copy.deepcopy(PASSING[name] if section is None else section)
+
+    return beat
+
+
+@pytest.mark.parametrize("beat_c_passes", [False, True])
+def test_wiring_a_failed_beat_c_never_merges(
+    beat_c_passes: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # beat_c_passes=True is the liveness case: a passing beat (c) reaches the merge.
+    p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
+    failing = {**copy.deepcopy(PASSING["beat_c"]), "pull_comments": []}
+    monkeypatch.setattr(lgc, "beat_a", _recorded_beat("beat_a"))
+    monkeypatch.setattr(lgc, "beat_b", _recorded_beat("beat_b"))
+    monkeypatch.setattr(lgc, "beat_c", _recorded_beat("beat_c", None if beat_c_passes else failing))
+    monkeypatch.setattr(p, "default_branch_head", lambda: "a" * 40)
+    _fake_cli(monkeypatch, lambda args: (0, json.dumps({"rules": []}), 0.1))
+    calls: list[tuple[str, str]] = []
+
+    def as_actor(method: str, path: str, body: Any = None) -> Any:
+        calls.append((method, path))
+        raise _Opened("merge")
+
+    monkeypatch.setattr(p, "as_actor", as_actor)
+    with pytest.raises(_Opened if beat_c_passes else lgc.ChainStopped) as raised:
+        lgc.run_beats(p, chain)
+    merges = [c for c in calls if c[0] == "PUT" and c[1].endswith("/merge")]
+    assert len(merges) == (1 if beat_c_passes else 0)
+    if not beat_c_passes:
+        assert "beat_c failed" in str(raised.value)
+        assert "no App reply on the pull request" in str(raised.value)
+
+
+def test_wiring_a_missing_usage_sample_after_a_beat_stops_before_the_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
+    chain.record["usage"] = {"samples": [{"label": "before_a", "usage": 10.0}]}
+    monkeypatch.setattr(p, "model_usage", lambda: None)
+
+    def beat_a(_p: Any, run: lgc.ChainRun) -> None:
+        run.record["beat_a"] = copy.deepcopy(PASSING["beat_a"])
+        lgc.sample_usage(p, run, "after_a")
+
+    started: list[str] = []
+    monkeypatch.setattr(lgc, "beat_a", beat_a)
+    monkeypatch.setattr(lgc, "beat_b", lambda *_a: started.append("beat_b"))
+    with pytest.raises(lgc.ChainStopped, match="could not be read at after_a"):
+        lgc.run_beats(p, chain)
+    assert started == []
+    # The spend beat of the verdict fails on the missing sample.
+    assert not judge.judge_beat("spend", chain.record).passed
+
+
+@pytest.mark.parametrize(("read_back", "ok"), [("b" * 40, False), ("a" * 40, True)])
+def test_wiring_the_default_branch_restore_raises_when_the_head_does_not_read_back(
+    read_back: str, ok: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ok=True is the liveness case: the branch moves back and reads back.
+    p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
+    for beat in ("beat_a", "beat_c"):
+        chain.record[beat] = copy.deepcopy(PASSING[beat])
+    heads = iter(["a" * 40, "b" * 40, read_back])
+    monkeypatch.setattr(p, "default_branch_head", lambda: next(heads))
+    moved: list[str] = []
+    monkeypatch.setattr(p, "move_default_branch", moved.append)
+
+    def stop(_p: Any) -> Any:
+        raise lgc.ChainStopped("stopped by the test after the restore was pushed")
+
+    monkeypatch.setattr(lgc, "_rules", stop)
+    with pytest.raises(lgc.ChainStopped):
+        lgc.beat_d(p, chain)
+    results = p.teardown.run()
+    step = next(r for r in results if r["step"] == lgc.DEFAULT_BRANCH_STEP)
+    assert moved == ["a" * 40]
+    assert step["ok"] is ok
+    assert lgc.teardown_section(results, namespace_gone=True)["verified"] is ok
+
+
+@pytest.mark.parametrize(
+    ("delete_status", "read_status", "ok"), [(500, 404, False), (204, 200, False), (204, 404, True)]
+)
+def test_wiring_the_label_undo_raises_unless_the_label_reads_back_gone(
+    delete_status: int,
+    read_status: int,
+    ok: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # (204, 404) is the liveness case.
+    p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
+    p.run_id = "run1"
+
+    def as_actor(method: str, path: str, body: Any = None) -> Any:
+        if method == "POST":
+            return 201, {"name": "factory-unbound-run1"}
+        if method == "DELETE":
+            return delete_status, None
+        return read_status, {"name": "factory-unbound-run1"}
+
+    monkeypatch.setattr(p, "as_actor", as_actor)
+    with pytest.raises(_Opened):
+        lgc.beat_h(p, chain)
+    results = p.teardown.run()
+    step = next(r for r in results if r["step"] == lgc.LABEL_STEP)
+    assert step["ok"] is ok
+
+
+# --------------------------------------------------------------------------
 # readiness: real captured GraphQL answers
 # --------------------------------------------------------------------------
 
@@ -816,6 +1277,28 @@ def test_readiness_passes_when_every_blocker_is_merged_into_next_and_in_the_cand
     verdict = lgc.readiness_verdict(_body(), nodes, lambda oid: asked.append(oid) or True)
     assert verdict.passed, verdict.missing
     assert len(asked) == 6
+
+
+def test_readiness_refuses_a_fork_pull_request_into_its_own_next() -> None:
+    # The real captured #5787 node, with its closing pull request's base
+    # repository changed to a fork name: a fork's pull request into the fork's
+    # own next that says `Closes #5787` merges nothing into the product.
+    node = _merged_into_next_for(5787)
+    for item in node["timelineItems"]["nodes"]:
+        source = item.get("source") or {}
+        if source.get("__typename") == "PullRequest":
+            assert source["baseRepository"] == {"nameWithOwner": "curie-eng/curie"}
+            source["baseRepository"] = {"nameWithOwner": "someone/curie"}
+    body = "## Blocked by\n\n1. #5787.\n"
+    verdict = lgc.readiness_verdict(body, {5787: node}, lambda _o: True)
+    assert verdict.missing == ("#5787: no merged pull request into next closes it",)
+    # Liveness: the unchanged capture is counted.
+    real = lgc.readiness_verdict(body, {5787: _merged_into_next_for(5787)}, lambda _o: True)
+    assert real.passed, real.missing
+
+
+def test_readiness_query_reads_each_pull_requests_base_repository() -> None:
+    assert lgc.BLOCKER_QUERY.count("baseRepository { nameWithOwner }") == 2
 
 
 def test_readiness_does_not_count_a_reference_without_a_closing_keyword() -> None:
@@ -921,6 +1404,17 @@ def test_handoff_answer_acknowledgment_from_the_real_status_body() -> None:
     assert any("acknowledges the answer" in r for r in refused.reasons)
 
 
+# The revision reply and the merge notice are produced inside the API's async
+# status renderer (``_render`` in apps/api/src/curie_api/factory_notices.py),
+# which needs the API database, so a tools test cannot drive it. These tests
+# build the bodies from the product's own pure helpers (``status_body``,
+# ``result_section``, ``code_span``) and the format strings pinned against the
+# product source; the producer itself is exercised by the paid live run (#5808
+# criterion 1). The renderer posts on the request's stored reply target: the
+# pull request conversation for a review revision, ticket A for the
+# implementation request whose pull request merged.
+
+
 def test_handoff_revision_reply_from_the_real_status_body_and_code_span() -> None:
     from curie_api import factory_notices as notices
 
@@ -941,16 +1435,30 @@ def test_handoff_revision_reply_from_the_real_status_body_and_code_span() -> Non
             "observed at 2030-01-01 00:41:00 UTC after the run ended."
         )
 
-    def judged(text: str) -> judge.BeatVerdict:
+    def judged(pull_conversation: list[dict[str, Any]]) -> judge.BeatVerdict:
+        # beat_c reads the pull request's conversation (issue comments of the pull number).
         section = copy.deepcopy(PASSING["beat_c"])
-        section["pull_comments"] = lgc.comments_record(
-            [_app_comment(text, "2030-01-01T00:40:30Z", "2030-01-01T00:41:00Z")]
-        )
+        section["pull_comments"] = lgc.comments_record(pull_conversation)
         return judge.judge_beat("beat_c", _record_with("beat_c", section))
 
-    assert judged(reply("b" * 40)).passed
-    old_head = judged(reply("a" * 40))
+    def comment(text: str) -> dict[str, Any]:
+        return _app_comment(text, "2030-01-01T00:40:30Z", "2030-01-01T00:41:00Z")
+
+    assert judged([comment(reply("b" * 40))]).passed
+    old_head = judged([comment(reply("a" * 40))])
     assert any("names the revision commit" in r for r in old_head.reasons)
+    # Counterexample: the reply posted on ticket A instead. The pull request's
+    # conversation then holds only ticket A's own investigating status comment.
+    investigating = notices.status_body(
+        request_id=uuid.uuid4(),
+        card_url=None,
+        pill_label="RUNNING",
+        phase_view=None,
+        result=None,
+        lead_line=notices.INVESTIGATING_LINE,
+    )
+    on_ticket_a = judged([comment(investigating)])
+    assert any("names the revision commit" in r for r in on_ticket_a.reasons)
     source = Path(notices.__file__).read_text()
     assert "Checks passed on head {code_span(observation.head_sha)}, " in source
 
@@ -963,18 +1471,25 @@ def test_handoff_merge_notice_from_the_real_result_section() -> None:
     assert 'result += f"Pull request merged: {pr_url}\\n"' in source
     assert judge.MERGED_NOTICE_PREFIX == "Pull request merged: "
 
-    def judged(pr_url: str) -> judge.BeatVerdict:
+    def notice(pr_url: str) -> dict[str, Any]:
         text = (
             notices.result_section("completed", pr_url=pr_url) + f"Pull request merged: {pr_url}\n"
         )
+        return _app_comment(text, "2030-01-01T00:00:20Z", "2030-01-01T00:45:40Z")
+
+    def judged(ticket_a: list[dict[str, Any]]) -> judge.BeatVerdict:
+        # beat_d reads ticket A's issue comments after the merge.
         section = copy.deepcopy(PASSING["beat_d"])
-        section["ticket_comments_after_merge"] = lgc.comments_record(
-            [_app_comment(text, "2030-01-01T00:00:20Z", "2030-01-01T00:45:40Z")]
-        )
+        section["ticket_comments_after_merge"] = lgc.comments_record(ticket_a)
         return judge.judge_beat("beat_d", _record_with("beat_d", section))
 
-    assert judged(url).passed
-    assert not judged(url.replace("/pull/12", "/pull/99")).passed
+    assert judged([notice(url)]).passed
+    assert not judged([notice(url.replace("/pull/12", "/pull/99"))]).passed
+    # Counterexample: the notice posted on the pull request instead. Ticket A
+    # then holds only its completed result without the merged line.
+    completed = notices.result_section("completed", pr_url=url)
+    refused = judged([_app_comment(completed, "2030-01-01T00:00:20Z", "2030-01-01T00:40:00Z")])
+    assert any("names the merged pull request" in r for r in refused.reasons)
 
 
 def test_handoff_session_probe_from_the_real_console_schemas(
@@ -1406,7 +1921,41 @@ def test_shape_beat_g_builder_into_the_judge() -> None:
     assert not _judged("beat_g", _beat_g("selected")).passed
 
 
-def _beat_h(exit_code: int = 1) -> dict[str, Any]:
+# What `curie cluster deploy --json` prints when the API refuses the bundle
+# upload: cli/src/main.rs:63 emits cli/src/exit.rs:280 `error_json`, which is
+# {"error": format!("{err:#}"), "fix": <classify fix, none here>}; the error is
+# cli/src/api.rs:3055 `bail!("{what} failed with {status}: {}", body.trim())`
+# with what = "uploading the bundle" (cli/src/api.rs:3977), and the body is
+# FastAPI's {"detail": {"code", "message"}} of a 422 refusal
+# (apps/api/src/curie_api/routers/bundles.py:178). The code is #5804's (ASSUMED).
+RETIRED_REFUSAL = json.dumps(
+    {
+        "error": "uploading the bundle failed with 422 Unprocessable Entity: "
+        + json.dumps(
+            {
+                "detail": {
+                    "code": "bundle.result_declaration_retired",
+                    "message": "workflow/result.json is retired; remove it from the bundle",
+                }
+            },
+            separators=(",", ":"),
+        ),
+        "fix": None,
+    }
+)
+# The connector lock preflight's refusal of a bundle without its runner lock,
+# before any upload (cli/src/commands/connector_images.rs:507, rebuild_hint at
+# :438): the copy of the source bundle got this instead of the API's refusal.
+MISSING_LOCK_REFUSAL = json.dumps(
+    {
+        "error": "connectors.yaml declares a runner layer, but connectors.lock.yaml records "
+        "no runner image for it. Build it before deploying.",
+        "fix": "run `curie build --plugin-dir retired-bundle` and redeploy",
+    }
+)
+
+
+def _beat_h(exit_code: int = 1, refusal: str = RETIRED_REFUSAL) -> dict[str, Any]:
     writer = {"login": "fixture-writer", "id": 9000001}
     return lgc.beat_h_record(
         label="factory-unbound-run1",
@@ -1424,20 +1973,7 @@ def _beat_h(exit_code: int = 1) -> dict[str, Any]:
             },
             {"id": 2, "event": "renamed", "actor": writer, "created_at": "2030-01-01T02:00:01Z"},
         ],
-        deploy=(
-            exit_code,
-            json.dumps(
-                {
-                    "error": "bundle invalid",
-                    "issues": [
-                        {
-                            "code": "bundle.result_declaration_retired",
-                            "location": "workflow/result.json",
-                        }
-                    ],
-                }
-            ),
-        ),
+        deploy=(exit_code, refusal),
         version_before="version-3",
         version_after="version-3",
     )
@@ -1446,6 +1982,65 @@ def _beat_h(exit_code: int = 1) -> dict[str, Any]:
 def test_shape_beat_h_builder_into_the_judge() -> None:
     assert _judged("beat_h", _beat_h()).passed
     assert not _judged("beat_h", _beat_h(exit_code=0)).passed
+    missing_lock = _judged("beat_h", _beat_h(refusal=MISSING_LOCK_REFUSAL))
+    assert any("deploy refusal is not" in r for r in missing_lock.reasons)
+
+
+@pytest.mark.parametrize(
+    ("refusal", "passed"), [(RETIRED_REFUSAL, True), (MISSING_LOCK_REFUSAL, False)]
+)
+def test_handoff_retired_declaration_deploy_uses_the_deployed_bundle_copy(
+    refusal: str, passed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The deploy_bundle the preflight ran records the prepared copy it uploaded
+    # (with the runner lock `curie build` wrote); beat (h) deploys a copy of
+    # that one plus workflow/result.json, and the judge reads the CLI's real
+    # refusal envelope. The missing lock refusal is the counterexample.
+    p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
+    prepared = tmp_path / "prepared"
+    (prepared / ".claude-plugin").mkdir(parents=True)
+    (prepared / ".claude-plugin" / "plugin.json").write_text('{"name": "b", "version": "1"}')
+    (prepared / "connectors.lock.yaml").write_text("runner: {}\n")
+    p.chart_dir = tmp_path
+    monkeypatch.setattr(p, "build_runner_layer", lambda _bundle: prepared)
+    monkeypatch.setattr(p, "_write_kubeconfig", lambda: tmp_path / "kubeconfig")
+    monkeypatch.setattr(p, "_curie", lambda *_a: None)
+    p.deploy_bundle(github_token=False)
+    assert p.deployed_bundle == prepared
+
+    p.run_id = "run1"
+    label = "factory-unbound-run1"
+    writer = {"login": "fixture-writer", "id": PASSING["identities"]["writer_id"]}
+    monkeypatch.setattr(
+        lgc,
+        "open_and_label",
+        lambda *_a: ({"number": 21, "id": 99}, "2000-01-01T00:00:00Z"),
+    )
+    monkeypatch.setattr(p, "as_actor", lambda *_a, **_k: (201, {}))
+    events = [
+        {
+            "event": "labeled",
+            "label": {"name": label},
+            "actor": writer,
+            "created_at": "2000-01-01T00:00:00Z",
+        }
+    ]
+    monkeypatch.setattr(p, "_paged", lambda path: events if path.endswith("/events") else [])
+    monkeypatch.setattr(lgc, "work_item_for_issue", lambda *_a: None)
+    monkeypatch.setattr(lgc, "_in_force_version", lambda _p: "v3")
+    seen: dict[str, bool] = {}
+
+    def answer(args: list[str]) -> Any:
+        bundle = Path(args[args.index("--plugin-dir") + 1])
+        seen["lock"] = (bundle / "connectors.lock.yaml").is_file()
+        seen["result"] = (bundle / "workflow" / "result.json").is_file()
+        return 1, refusal, 3.0
+
+    _fake_cli(monkeypatch, answer)
+    lgc.beat_h(p, chain)
+    assert seen == {"lock": True, "result": True}
+    verdict = judge.judge_beat("beat_h", chain.record)
+    assert verdict.passed is passed, verdict.reasons
 
 
 def test_shape_teardown_section_from_teardown_results() -> None:

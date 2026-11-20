@@ -2275,6 +2275,11 @@ class Preflight:
         self.values_transform: ValuesTransform | None = None
         self.evidence_serializer: Callable[[dict[str, Any]], str] | None = None
         self.scenario_options: dict[str, Any] = {}
+        # True once the serializer refused the evidence: main fails the run.
+        self.evidence_refused = False
+        # The bundle directory the last deploy_bundle uploaded (the private
+        # copy build_runner_layer returns, or the source bundle).
+        self.deployed_bundle: Path | None = None
 
     # --- small wrappers -------------------------------------------------
 
@@ -3193,6 +3198,7 @@ class Preflight:
 
         assert self.chart_dir is not None, "install() extracts the chart first"
         bundle = self.build_runner_layer(self.config.bundle_dir)
+        self.deployed_bundle = bundle
         manifest = json.loads((bundle / ".claude-plugin" / "plugin.json").read_text())
         kubeconfig = self._write_kubeconfig()
         token = self._issue_read_token() if github_token else ""
@@ -4183,6 +4189,7 @@ class Preflight:
                     "error": f"evidence refused by the scenario serializer: {exc}",
                 }
                 text = json.dumps(refusal, indent=2) + "\n"
+                self.evidence_refused = True
         fd = os.open(self.evidence_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
             handle.write(text)
@@ -7531,6 +7538,9 @@ def main(argv: list[str] | None = None) -> int:
             log(f"teardown {result['step']}: {verdict} {result['detail']}")
     if not preflight.evidence["teardown_clean"]:
         print("factory-e2e: teardown incomplete; see the evidence file", file=sys.stderr)
+        code = code or EXIT_FAILED
+    if preflight.evidence_refused:
+        print("factory-e2e: the evidence serializer refused the evidence", file=sys.stderr)
         code = code or EXIT_FAILED
     print(
         filtered(f"factory-e2e: {preflight.evidence['result']}; evidence {evidence_path}"),

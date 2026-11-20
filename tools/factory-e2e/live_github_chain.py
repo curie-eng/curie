@@ -10,14 +10,16 @@ functions the tests call directly (the split of ``triage_run.py`` and
 Order, each stage a step of the evidence:
 
 1. ``before_run`` (the first statement of ``Preflight.run``, before any lock or
-   kubectl call): the reader account id from CURIE_FACTORY_READER_ACCOUNT_ID and
-   the readiness of #5808's blockers. Full mode refuses an unready candidate;
-   ``--stop-after links`` records it and goes on.
+   kubectl call): the configuration's sanitizer, the reader account id from
+   CURIE_FACTORY_READER_ACCOUNT_ID, the fake model for ``--stop-after links``,
+   the identities and the full sanitizer, the readiness of #5808's blockers
+   (full mode refuses an unready candidate; ``--stop-after links`` records it
+   and goes on), and a refusal of any open fixture issue or pull request.
 2. ``install_values`` (after the namespace, before the install): the OIDC client
    Secret and a disposable Dex, and a values transformer that adds the API's
    ``CURIE_OIDC_*`` settings to the install and every upgrade.
-3. ``drive``: identities and the sanitizer, the first check (no open item, no
-   work item), two real OIDC logins, the session probe, the code host links,
+3. ``drive``: the first check (no open item, no work item), two real OIDC
+   logins, the session probe, the code host links,
    then either the stop or beats (a) to (h).
 4. ``finish`` (after teardown): the teardown section, the verdict, and the
    run's pass or fail.
@@ -33,6 +35,7 @@ import datetime as dt
 import functools
 import http.client
 import json
+import math
 import os
 import re
 import secrets
@@ -58,6 +61,7 @@ FIXTURES = HERE / "fixtures" / "live-github-chain"
 # --- Readiness (the blockers of #5808 on the public product repository) ------
 PRODUCT_OWNER = "curie-eng"
 PRODUCT_NAME = "curie"
+PRODUCT_REPOSITORY = f"{PRODUCT_OWNER}/{PRODUCT_NAME}"
 CHAIN_ISSUE = 5808
 INTEGRATION_BRANCH = "next"
 GRAPHQL_URL = "https://api.github.com/graphql"
@@ -74,10 +78,12 @@ BLOCKER_QUERY = (
     "query($owner: String!, $name: String!, $number: Int!) { "
     "repository(owner: $owner, name: $name) { issue(number: $number) { number state "
     "closedByPullRequestsReferences(first: 10, includeClosedPrs: true) { "
-    "nodes { number state merged baseRefName mergeCommit { oid } } } "
+    "nodes { number state merged baseRefName baseRepository { nameWithOwner } "
+    "mergeCommit { oid } } } "
     "timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], first: 100) { "
     "nodes { ... on CrossReferencedEvent { source { __typename ... on PullRequest { "
-    "number state merged baseRefName mergeCommit { oid } body } } } } } } } }"
+    "number state merged baseRefName baseRepository { nameWithOwner } "
+    "mergeCommit { oid } body } } } } } } } }"
 )
 
 # --- Operator inputs ------------------------------------------------------------
@@ -110,6 +116,8 @@ SESSION_STEP = "delete live chain session files"
 LINKS_STEP = "revoke live chain code host links"
 ISSUES_STEP = "close live chain issues"
 PORT_FORWARD_STEP = "stop live chain dex port-forward"
+DEFAULT_BRANCH_STEP = "restore live chain default branch"
+LABEL_STEP = "delete live chain unbound label"
 
 USER_AGENT = "curie-factory-e2e"
 SPEND_SAMPLE_CAP = judge.SPEND_CAP_USD
@@ -200,14 +208,27 @@ def _closes(body: Any, number: int) -> bool:
     return re.search(pattern, str(body or "")) is not None
 
 
+def _base_repository(node: Mapping[str, Any]) -> str | None:
+    base = node.get("baseRepository")
+    name = base.get("nameWithOwner") if isinstance(base, Mapping) else None
+    return str(name) if name else None
+
+
 def closing_pulls(number: int, issue: Mapping[str, Any]) -> list[dict[str, Any]]:
     """The pull requests that close ``#number``: GitHub's closing links plus cross
-    referencing pull requests whose body says ``Closes #<number>``. Bodies are dropped."""
+    referencing pull requests whose body says ``Closes #<number>``. Bodies are dropped.
+
+    Only a pull request into the product repository counts: a fork's pull
+    request into its own ``next`` that says ``Closes #<number>`` merges nothing
+    the candidate can carry.
+    """
 
     found: dict[int, dict[str, Any]] = {}
 
     def keep(node: Any) -> None:
         if not isinstance(node, Mapping) or not isinstance(node.get("number"), int):
+            return
+        if _base_repository(node) != PRODUCT_REPOSITORY:
             return
         merge = node.get("mergeCommit")
         found.setdefault(
@@ -346,11 +367,22 @@ def reader_account_id(environ: Mapping[str, str]) -> int:
 
 
 def before_run(p: fe.Preflight) -> None:
-    """The scenario's config step: reader id, then readiness. No lock or kubectl yet."""
+    """The scenario's config step. No lock, kubectl or helm call happens before it ends.
+
+    In order: the configuration's sanitizer (so even a refused reader id writes
+    no raw namespace or context), the reader id, the fake model for
+    ``--stop-after links``, the identities and the full sanitizer (before
+    ``check_app`` logs the repository id and the actor), readiness, and the
+    fixture's open items (poll intake could admit a leftover labelled issue
+    between the agent binding and the fixture reset).
+    """
 
     chain = chain_of(p)
-    chain.reader_id = reader_account_id(os.environ)
     install_sanitizer(p, config_identifiers(p))
+    chain.reader_id = reader_account_id(os.environ)
+    if chain.stop_after == STOP_AFTER_LINKS:
+        use_fake_model(p)
+    stage_identities(p, chain)
     readiness = check_readiness(
         p.config.actor_token,
         repo_root=p.repo_root,
@@ -363,14 +395,34 @@ def before_run(p: fe.Preflight) -> None:
     p.evidence["live_chain_attempt"] = chain.attempt
     if readiness.passed:
         p.step("live chain readiness met", blockers=len(readiness.blockers))
-        return
-    if chain.stop_after == STOP_AFTER_LINKS:
+    elif chain.stop_after == STOP_AFTER_LINKS:
         p.step(
             "live chain readiness not met; --stop-after links goes on",
             missing=list(readiness.missing),
         )
-        return
-    raise fe.ConfigError(f"{SCENARIO} is not ready: " + "; ".join(readiness.missing))
+    else:
+        raise fe.ConfigError(f"{SCENARIO} is not ready: " + "; ".join(readiness.missing))
+    refuse_open_fixture_items(p)
+
+
+def use_fake_model(p: fe.Preflight) -> None:
+    """``--stop-after links`` installs the fake model: no model request is possible."""
+
+    dropped = bool(p.config.model_api_key or p.config.model_base_url)
+    p.config = dataclasses.replace(p.config, model_api_key=None, model_base_url=None)
+    p.step("live chain stop mode installs the fake model", model_settings_dropped=dropped)
+
+
+def refuse_open_fixture_items(p: fe.Preflight) -> None:
+    """Refuse a fixture repository with any open issue or pull request (actor token)."""
+
+    open_items = p._paged(f"/repos/{p.config.repo}/issues?state=open")
+    if open_items:
+        raise ChainStopped(
+            f"the fixture repository has {len(open_items)} open issues or pull requests; "
+            "close them before a live chain run"
+        )
+    p.step("live chain fixture has no open item")
 
 
 # --------------------------------------------------------------------------
@@ -612,7 +664,7 @@ def install_sanitizer(p: fe.Preflight, identifiers: judge.Identifiers) -> None:
     """Evidence and every later log line pass through the judge's sanitizer.
 
     A later call replaces the filter an earlier one installed (the full set
-    read in ``drive`` replaces the configuration's set of ``before_run``).
+    read from the accounts replaces the configuration's set).
     """
 
     p.evidence_serializer = evidence_serializer(identifiers)
@@ -1488,13 +1540,15 @@ def stop_evidence(chain: ChainRun) -> dict[str, Any]:
 def drive(p: fe.Preflight) -> dict[str, Any]:
     chain = chain_of(p)
     chain.record["attempt"] = chain.attempt
-    stage_identities(p, chain)
+    if "identities" not in chain.record:  # before_run read them already
+        stage_identities(p, chain)
     stage_first_check(p, chain)
     stage_logins(p, chain)
     stage_session_probe(p, chain)
     stage_links(p, chain)
     if chain.stop_after == STOP_AFTER_LINKS:
-        # No ticket exists and the seed issue is off: no model request was possible.
+        # The fake model is installed, no ticket exists and the seed issue is
+        # off: no model request was possible.
         return stop_evidence(chain)
     run_beats(p, chain)
     return {"stop_after": None, "attempt": chain.attempt, "beats": sorted(chain.record)}
@@ -1506,8 +1560,22 @@ def drive(p: fe.Preflight) -> dict[str, Any]:
 
 
 def sample_usage(p: fe.Preflight, chain: ChainRun, label: str) -> None:
+    """Record one usage sample; stop on a missing or non-finite one, or at the cap.
+
+    The ``before_a`` sample is the baseline of the spend cap, so ticket A is
+    never labelled without it; a later missing sample leaves the spend beat
+    failed (``finish`` judges the samples recorded so far).
+    """
+
     samples = chain.record.setdefault("usage", {"samples": []})["samples"]
-    samples.append({"label": label, "usage": p.model_usage()})
+    usage = p.model_usage()
+    samples.append({"label": label, "usage": usage})
+    if (
+        isinstance(usage, bool)
+        or not isinstance(usage, (int, float))
+        or not math.isfinite(float(usage))
+    ):
+        raise ChainStopped(f"the model usage could not be read at {label}")
     breach = usage_breach(samples)
     if breach is not None:
         raise ChainStopped(f"the model usage delta reached {breach:.2f} USD at {label}")
@@ -1587,7 +1655,10 @@ def beat_a(p: fe.Preflight, chain: ChainRun) -> None:
     if code != 0:
         raise fe.PreflightFailed(f"turning rule proposals on failed (exit {code})")
     code, out, _ = cluster_cli(p, ["overrides", fe.FACTORY_AGENT])
-    chain.record["agent"]["memory_rule_proposals"] = overrides_proposals(code, out)
+    proposals = overrides_proposals(code, out)
+    chain.record["agent"]["memory_rule_proposals"] = proposals
+    if proposals is not True:
+        raise ChainStopped(f"the agent read does not show rule proposals on (read {proposals})")
     sample_usage(p, chain, "before_a")
     issue, labelled_at = open_and_label(p, chain, "issue-a.md", p.config.label)
     number = int(issue["number"])
@@ -1713,6 +1784,9 @@ def beat_d(p: fe.Preflight, chain: ChainRun) -> None:
     repo = p.config.repo
     number = int(chain.record["beat_c"]["pull_number"])
     issue = int(chain.record["beat_a"]["issue_number"])
+    head = p.default_branch_head()
+    # Pushed before the merge, so a merge that lands but fails to answer is undone.
+    p.teardown.push(DEFAULT_BRANCH_STEP, lambda: restore_default_branch(p, head))
     rules_before = _rules(p)
     status, _ = p.as_actor("PUT", f"/repos/{repo}/pulls/{number}/merge", {"merge_method": "merge"})
     if status != 200:
@@ -1745,6 +1819,19 @@ def beat_d(p: fe.Preflight, chain: ChainRun) -> None:
         ticket_comments=comments,
     )
     sample_usage(p, chain, "after_d")
+
+
+def restore_default_branch(p: fe.Preflight, head: str) -> dict[str, Any]:
+    """Move the default branch back to ``head`` when the merge moved it; verify it."""
+
+    moved = p.default_branch_head() != head
+    if moved:
+        p.move_default_branch(head)
+    if p.default_branch_head() != head:
+        raise fe.PreflightFailed(
+            "the default branch did not read back as its head before the merge"
+        )
+    return {"moved_back": moved}
 
 
 def beat_e(p: fe.Preflight, chain: ChainRun) -> None:
@@ -1783,6 +1870,8 @@ def beat_f(p: fe.Preflight, chain: ChainRun) -> None:
             str(chain.session_files["writer"]),
         ],
     )
+    if code != 0:
+        raise ChainStopped(f"setting the conflicting coding instruction failed (exit {code})")
     issue, labelled_at = open_and_label(p, chain, "issue-b.md", p.config.label)
     number = int(issue["number"])
     pulls = _wait(
@@ -1808,6 +1897,9 @@ def beat_g(p: fe.Preflight, chain: ChainRun) -> None:
     rule_id = str(chain.record["beat_e"]["rule_before"]["id"])
     current = next(r for r in _rules(p)["rules"] if r["id"] == rule_id)
     removal = _rule_action(p, chain, "remove", current, "writer")
+    refusal = removal_refusal(rule_id, removal)
+    if refusal:
+        raise ChainStopped(refusal)
     issue, labelled_at = open_and_label(p, chain, "issue-c.md", p.config.label)
     number = int(issue["number"])
     _wait(
@@ -1828,14 +1920,52 @@ def beat_g(p: fe.Preflight, chain: ChainRun) -> None:
     sample_usage(p, chain, "after_g")
 
 
-def retired_bundle_copy(p: fe.Preflight) -> Path:
-    """A private copy of the deployed bundle with ``workflow/result.json`` added."""
+def removal_refusal(rule_id: str, removal: tuple[int, str, float]) -> str | None:
+    """Why the writer's removal did not remove the rule, or None when it did."""
 
+    exit_code, stdout, _elapsed = removal
+    if exit_code != 0:
+        return f"the writer's removal exited {exit_code}"
+    try:
+        rule = judge.accepted_rule_of(parse_cli_json(exit_code, stdout))
+    except (KeyError, TypeError):
+        return "the writer's removal printed no rule"
+    if not isinstance(rule, Mapping) or rule.get("id") != rule_id:
+        return "the writer's removal changed another rule"
+    if rule.get("state") != judge.REMOVED_STATE:
+        return f"the writer's removal left the rule {rule.get('state')}"
+    return None
+
+
+def retired_bundle_copy(p: fe.Preflight) -> Path:
+    """A private copy of the bundle the deploy uploaded, with ``workflow/result.json`` added.
+
+    The copy ``build_runner_layer`` prepared carries the runner lock ``curie
+    build`` wrote; the source bundle does not, so the CLI would refuse it at the
+    connector lock preflight before any upload reaches the API's refusal.
+    """
+
+    if p.deployed_bundle is None:
+        raise ChainStopped("no bundle was deployed to copy for the retired declaration")
     target = p.workdir / "retired-bundle"
-    shutil.copytree(p.config.bundle_dir, target)
+    shutil.rmtree(target, ignore_errors=True)
+    shutil.copytree(p.deployed_bundle, target)
     (target / "workflow").mkdir(exist_ok=True)
     (target / "workflow" / "result.json").write_text("{}\n")
     return target
+
+
+def delete_label(p: fe.Preflight, label: str) -> dict[str, Any]:
+    """Delete the run's unbound label, then read it back: only a 404 is gone."""
+
+    path = f"/repos/{p.config.repo}/labels/{urllib.parse.quote(label, safe='')}"
+    status, _ = p.as_actor("DELETE", path)
+    if status not in (204, 404):
+        raise fe.PreflightFailed(f"deleting the unbound label answered HTTP {status}")
+    read, _ = p.as_actor("GET", path)
+    if read != 404:
+        raise fe.PreflightFailed(f"the unbound label still reads back (HTTP {read})")
+    return {"deleted": True}
 
 
 def _in_force_version(p: fe.Preflight) -> Any:
@@ -1853,11 +1983,8 @@ def _in_force_version(p: fe.Preflight) -> Any:
 def beat_h(p: fe.Preflight, chain: ChainRun) -> None:
     repo = p.config.repo
     label = f"{judge.UNBOUND_LABEL_PREFIX}{p.run_id}"
+    p.teardown.push(LABEL_STEP, lambda: delete_label(p, label))
     p.as_actor("POST", f"/repos/{repo}/labels", {"name": label, "color": "ededed"})
-    p.teardown.push(
-        "delete live chain unbound label",
-        lambda: {"status": p.as_actor("DELETE", f"/repos/{repo}/labels/{label}")[0]},
-    )
     issue, labelled_at = open_and_label(p, chain, "issue-unbound.md", label)
     number = int(issue["number"])
     quiet_until = judge.parse_time(labelled_at) + dt.timedelta(
@@ -1898,9 +2025,31 @@ def beat_h(p: fe.Preflight, chain: ChainRun) -> None:
 
 
 def run_beats(p: fe.Preflight, chain: ChainRun) -> None:
-    for beat in (beat_a, beat_b, beat_c, beat_d, beat_e, beat_f, beat_g, beat_h):
+    """Each beat, then its judge: a failed beat stops before the next one's first side effect.
+
+    So, for example, beat (c) with its revision checks is judged before beat
+    (d) merges the pull request.
+    """
+
+    for name, beat in (
+        ("beat_a", beat_a),
+        ("beat_b", beat_b),
+        ("beat_c", beat_c),
+        ("beat_d", beat_d),
+        ("beat_e", beat_e),
+        ("beat_f", beat_f),
+        ("beat_g", beat_g),
+        ("beat_h", beat_h),
+    ):
         beat(p, chain)
-        p.step(f"live chain {beat.__name__.replace('_', ' ')} recorded")
+        verdict = judge.judge_beat(name, chain.record)
+        p.step(
+            f"live chain {name.replace('_', ' ')} recorded",
+            passed=verdict.passed,
+            reasons=list(verdict.reasons),
+        )
+        if not verdict.passed:
+            raise ChainStopped(f"{name} failed: " + "; ".join(verdict.reasons))
 
 
 # --------------------------------------------------------------------------

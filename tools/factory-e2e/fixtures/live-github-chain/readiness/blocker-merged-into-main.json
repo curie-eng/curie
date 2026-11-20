@@ -11,6 +11,9 @@
               "state": "MERGED",
               "merged": true,
               "baseRefName": "main",
+              "baseRepository": {
+                "nameWithOwner": "curie-eng/curie"
+              },
               "mergeCommit": {
                 "oid": "25408019f947d6217a65dfa188a4ebc5ded5ce1a"
               }
@@ -26,6 +29,9 @@
                 "state": "MERGED",
                 "merged": true,
                 "baseRefName": "main",
+                "baseRepository": {
+                  "nameWithOwner": "curie-eng/curie"
+                },
                 "mergeCommit": {
                   "oid": "25408019f947d6217a65dfa188a4ebc5ded5ce1a"
                 },
@@ -39,6 +45,9 @@
                 "state": "MERGED",
                 "merged": true,
                 "baseRefName": "main",
+                "baseRepository": {
+                  "nameWithOwner": "curie-eng/curie"
+                },
                 "mergeCommit": {
                   "oid": "3c376f40bc176d388040d5c3e35b63227f3cc742"
                 },
@@ -52,6 +61,9 @@
                 "state": "CLOSED",
                 "merged": false,
                 "baseRefName": "next",
+                "baseRepository": {
+                  "nameWithOwner": "curie-eng/curie"
+                },
                 "mergeCommit": null,
                 "body": "## Summary\n\nPort the per-agent turn duration histogram from #5815 to `next`. The worker records `curie.agent.turn.duration` with the same seconds as the fleet histogram and the same bounded attributes as `curie.agent.turn.completed`. The worker and runner both emit `curie.turn.duration` without an agent label. The runner keeps its per-agent duration under `curie.runner.turn.duration`, using the configured agent and the existing label budget shared with approval metrics.\n\n## Related issue\n\nRef #5814\n\n## Verification\n\n`uv run --locked pytest -q packages/telemetry/tests/test_metrics.py apps/worker/tests/kernel/test_otel_runtime.py runner/tests/test_signal_bootstrap.py apps/api/tests/test_openapi_telemetry_operations.py` passed all 108 cases with disposable Valkey and Collector. The test drives real worker completion and the real telemetry recorder and checks the SDK histogram points, including equal elapsed seconds and reserved and overflow labels. Restoring the prior worker, runner, registry and schema made all 19 affected behavior cases fail. All passed with the port restored.\n\n`bash scripts/check-docs.sh`, Ruff, and mypy passed. The generated worker and fleet histogram definitions match #5815, and all 65 other existing `next` metric definitions are unchanged.\n\n`git merge-tree --write-tree` merged this port with simulated post-revert `main` cleanly. The inputs were `main` at `b0badb1c3` and revert `cb9b7533f`. The revert restored the original merge's first-parent tree, and all eight port paths matched in the resulting forward merge. If later edits conflict in the registry, preserve both per-agent histograms and the unlabeled fleet histogram, then regenerate the schema from the resolved registry.\n\n## Disposition\n\nClosed unmerged. #5633 already records per-agent worker and runner duration as `curie.turn.duration` with the bounded `agent` attribute on `next`. A simulated forward merge after the #5853 revert keeps the existing emitters, registry, schema and tests unchanged. The current metric contract meets the per-agent duration requirement.\n"
               }

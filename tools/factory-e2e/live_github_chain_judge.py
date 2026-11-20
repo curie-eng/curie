@@ -295,8 +295,19 @@ def work_item_rules_of(work_item: Mapping[str, Any]) -> Mapping[str, Any]:
     return rules
 
 
+_BUNDLE_CODE = re.compile(r"(?<![\w.])bundle\.[a-z][a-z0-9_]*(?![\w.])")
+
+
 def deploy_refusal_codes(output: Any) -> set[str]:
-    """ASSUMED (#5804 decision 3): every ``code`` of a deploy refusal's JSON, at any depth."""
+    """Every refusal code of a deploy's ``--json`` output, at any depth.
+
+    ASSUMED (#5804 decision 3) for the code itself. The CLI renders an API
+    refusal of the bundle upload inside the ``error`` string of its
+    ``{"error", "fix"}`` envelope (``cli/src/api.rs`` ``expect_ok``:
+    ``"{what} failed with {status}: {body}"``; ``cli/src/exit.rs``
+    ``error_json``), so a ``bundle.<code>`` inside any string value counts too,
+    as does a ``code`` key of structured output.
+    """
 
     codes: set[str] = set()
     if isinstance(output, Mapping):
@@ -307,6 +318,8 @@ def deploy_refusal_codes(output: Any) -> set[str]:
     elif isinstance(output, list):
         for value in output:
             codes |= deploy_refusal_codes(value)
+    elif isinstance(output, str):
+        codes |= set(_BUNDLE_CODE.findall(output))
     return codes
 
 
@@ -410,11 +423,26 @@ def float_equality_assertions(added_text: str) -> list[str]:
     An ``assertEqual(``, ``assertEquals(`` or ``assertNotEqual(`` call with a float
     literal among its arguments (a number with a ``.`` or an exponent), and a bare
     ``assert`` statement comparing with ``==`` or ``!=`` to a float literal, break
-    the review rule. Comments and strings never count.
+    the review rule. So does such a call or statement naming a variable the added
+    code assigns a float literal (``expected = 33.0``, a unary minus included).
+    Comments and strings never count.
     """
 
     # NEWLINE is kept: it ends a bare ``assert`` statement.
     tokens = [t for t in _code_tokens(added_text) if t.type not in _NON_CODE_TOKENS]
+    float_names = _float_assigned_names(tokens)
+
+    def floaty(argument: Sequence[tokenize.TokenInfo]) -> bool:
+        return any(
+            _is_float_literal(t)
+            or (
+                t.type == tokenize.NAME
+                and t.string in float_names
+                and not (i and argument[i - 1].string == ".")
+            )
+            for i, t in enumerate(argument)
+        )
+
     found: list[str] = []
     for index, token in enumerate(tokens):
         if token.type != tokenize.NAME:
@@ -425,7 +453,7 @@ def float_equality_assertions(added_text: str) -> list[str]:
                 continue
             if index and tokens[index - 1].string == "def":
                 continue
-            if any(_is_float_literal(t) for t in _call_arguments(tokens[index + 1 :])):
+            if floaty(_call_arguments(tokens[index + 1 :])):
                 found.append(token.string)
         elif token.string == "assert":
             statement: list[tokenize.TokenInfo] = []
@@ -434,9 +462,39 @@ def float_equality_assertions(added_text: str) -> list[str]:
                     break
                 statement.append(inner)
             compares = any(t.type == tokenize.OP and t.string in {"==", "!="} for t in statement)
-            if compares and any(_is_float_literal(t) for t in statement):
+            if compares and floaty(statement):
                 found.append("assert")
     return found
+
+
+def _float_assigned_names(tokens: Sequence[tokenize.TokenInfo]) -> set[str]:
+    """Names a statement of the added code assigns a float literal: ``x = 33.0``, ``x = -1e3``."""
+
+    names: set[str] = set()
+    for index, token in enumerate(tokens):
+        starts = (
+            index == 0
+            or tokens[index - 1].type == tokenize.NEWLINE
+            or (tokens[index - 1].string == ";")
+        )
+        if token.type != tokenize.NAME or not starts:
+            continue
+        rest = [t.string for t in tokens[index + 1 : index + 2]]
+        if rest != ["="]:
+            continue
+        value = list(tokens[index + 2 : index + 4])
+        if value and value[0].type == tokenize.OP and value[0].string in {"-", "+"}:
+            value = value[1:] + list(tokens[index + 4 : index + 5])
+        if not value or not _is_float_literal(value[0]):
+            continue
+        after = value[1:2]
+        if (
+            not after
+            or after[0].type in {tokenize.NEWLINE, tokenize.ENDMARKER}
+            or (after[0].string == ";")
+        ):
+            names.add(token.string)
+    return names
 
 
 def _is_places_six(argument: Sequence[tokenize.TokenInfo]) -> bool:

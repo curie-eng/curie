@@ -441,12 +441,8 @@
     "retired_bundle": {
       "exit_code": 1,
       "output": {
-        "issues": [
-          {
-            "code": "bundle.result_declaration_retired",
-            "location": "workflow/result.json"
-          }
-        ]
+        "error": "uploading the bundle failed with 422 Unprocessable Entity: {\"detail\":{\"code\":\"bundle.result_declaration_retired\",\"message\":\"workflow/result.json is retired; remove it from the bundle\"}}",
+        "fix": null
       },
       "version_before": "v3",
       "version_after": "v3"
