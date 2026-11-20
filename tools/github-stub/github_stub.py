@@ -28,6 +28,9 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 REPOSITORY = "acme-corp/acme-bot"
 HUMAN = {"id": 6601, "login": "octocat", "type": "User"}
 READER = {"id": 6602, "login": "reader", "type": "User"}
+# A person who may accept a learned rule, and one who may not.
+RULE_WRITER = {"id": 6630, "login": "rule-writer", "type": "User"}
+RULE_READER = {"id": 6631, "login": "rule-reader", "type": "User"}
 BOT = {"id": 51, "login": "example-app[bot]", "type": "Bot"}
 # Collaborator permission levels the REST answer may carry.
 # https://docs.github.com/en/rest/collaborators/collaborators#get-repository-permissions-for-a-user
@@ -231,6 +234,8 @@ class GithubStub:
                 [
                     (HUMAN["login"], "write", json.dumps(HUMAN)),
                     (READER["login"], "read", json.dumps(READER)),
+                    (RULE_WRITER["login"], "write", json.dumps(RULE_WRITER)),
+                    (RULE_READER["login"], "read", json.dumps(RULE_READER)),
                 ],
             )
         self._repository.parent.mkdir(parents=True, exist_ok=True)
@@ -572,6 +577,48 @@ class GithubStub:
         handler.end_headers()
         handler.wfile.write(payload)
 
+    def _conversation_comment(
+        self,
+        number: int,
+        body: str,
+        *,
+        author: dict[str, Any],
+        app: dict[str, Any] | None,
+        author_association: str | None,
+        created: str,
+        updated: str,
+    ) -> Callable[[int], dict[str, Any]]:
+        """Build a conversation comment row, on an issue or a pull request.
+
+        A pull request's conversation is its issue comment list, and GitHub
+        links a comment on one to ``/pull/{n}``, so a number with a pull row and
+        no issue row gets that URL.
+        """
+
+        segment = (
+            "pull" if self._get("issue", number) is None and self._get("pull", number) else "issues"
+        )
+
+        def build(identifier: int) -> dict[str, Any]:
+            row = {
+                "id": identifier,
+                "body": body,
+                "issue_number": number,
+                "user": author,
+                "performed_via_github_app": app,
+                "created_at": created,
+                "updated_at": updated,
+                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
+                "html_url": (
+                    f"{self.base_url}/{REPOSITORY}/{segment}/{number}#issuecomment-{identifier}"
+                ),
+            }
+            if author_association is not None:
+                row["author_association"] = author_association
+            return row
+
+        return build
+
     def add_issue_comment(
         self,
         number: int,
@@ -579,25 +626,27 @@ class GithubStub:
         *,
         author: dict[str, Any],
         app: dict[str, Any] | None = None,
+        author_association: str | None = None,
     ) -> dict[str, Any]:
-        """Seed an authenticated-read comment with independent author and App provenance."""
+        """Seed an authenticated-read comment with independent author and App provenance.
 
-        def build(identifier: int) -> dict[str, Any]:
-            return {
-                "id": identifier,
-                "body": body,
-                "issue_number": number,
-                "user": author,
-                "performed_via_github_app": app,
-                "created_at": _utc(),
-                "updated_at": _utc(),
-                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
-                "html_url": (
-                    f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}"
-                ),
-            }
+        ``number`` is an issue or a pull request number. ``author_association``
+        is GitHub's ``OWNER``, ``MEMBER``, ``COLLABORATOR`` and the like, carried
+        only when given.
+        """
 
-        return self._insert_new("comment", build)
+        return self._insert_new(
+            "comment",
+            self._conversation_comment(
+                number,
+                body,
+                author=author,
+                app=app,
+                author_association=author_association,
+                created=_utc(),
+                updated=_utc(),
+            ),
+        )
 
     def append_comment(
         self,
@@ -606,6 +655,7 @@ class GithubStub:
         *,
         author: dict[str, Any],
         app: dict[str, Any] | None = None,
+        author_association: str | None = None,
     ) -> dict[str, Any]:
         """Append a never-edited comment the way a person posts one, as ``_label_event``
         appends an event.
@@ -613,29 +663,74 @@ class GithubStub:
         Unlike ``add_issue_comment`` the row takes one instant for both
         timestamps: the factory's poll pass treats a comment whose ``updated_at``
         is later than its ``created_at`` as edited and never reads it as an answer.
+        ``number`` is an issue or a pull request number.
         """
 
-        issue = self._get("issue", number)
-        if issue is None:
-            raise ValueError(f"issue {number} does not exist")
+        if self._get("issue", number) is None and self._get("pull", number) is None:
+            raise ValueError(f"issue or pull request {number} does not exist")
+        instant = _utc()
+        return self._insert_new(
+            "comment",
+            self._conversation_comment(
+                number,
+                body,
+                author=author,
+                app=app,
+                author_association=author_association,
+                created=instant,
+                updated=instant,
+            ),
+        )
 
-        def build(identifier: int) -> dict[str, Any]:
-            instant = _utc()
-            return {
-                "id": identifier,
-                "body": body,
-                "issue_number": number,
-                "user": author,
-                "performed_via_github_app": app,
-                "created_at": instant,
-                "updated_at": instant,
-                "issue_url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/issues/{number}",
-                "html_url": (
-                    f"{self.base_url}/{REPOSITORY}/issues/{number}#issuecomment-{identifier}"
-                ),
-            }
+    def merge_pull(self, number: int) -> dict[str, Any]:
+        """Merge an open pull request the way a fast-forward merge does.
 
-        return self._insert_new("comment", build)
+        Moves ``main`` to the pull request head and marks the row closed and
+        merged. A head that is not a descendant of ``main`` is refused.
+        """
+
+        row = self._get("pull", number)
+        if row is None:
+            raise ValueError(f"pull request {number} does not exist")
+        if row["state"] != "open":
+            raise ValueError(f"pull request {number} is not open")
+        head = self._ref(row["head"]["ref"])
+        base = self._ref(row["base"]["ref"])
+        ancestor = subprocess.run(
+            (
+                "git",
+                "--git-dir",
+                str(self._repository),
+                "merge-base",
+                "--is-ancestor",
+                base,
+                head,
+            ),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if ancestor.returncode != 0:
+            raise ValueError(f"pull request {number} is not a fast-forward of {row['base']['ref']}")
+        self._run(
+            "git",
+            "--git-dir",
+            str(self._repository),
+            "update-ref",
+            f"refs/heads/{row['base']['ref']}",
+            head,
+            base,
+        )
+        instant = _utc()
+        row.update(
+            state="closed",
+            merged=True,
+            merged_at=instant,
+            merge_commit_sha=head,
+            updated_at=instant,
+        )
+        self._put("pull", number, row)
+        return self._fresh_pull(row)
 
     def add_user(self, user: dict[str, Any], permission: str) -> dict[str, Any]:
         """Add a repository collaborator with ``permission``; returns the user."""
@@ -1031,6 +1126,16 @@ class GithubStub:
                 "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                 "permissions": PERMISSIONS,
             }
+        account = re.fullmatch(r"/user/(\d+)", path)
+        if method == "GET" and account:
+            # https://docs.github.com/en/rest/users/users#get-a-user-using-their-id
+            with sqlite3.connect(self._database) as connection:
+                rows = [
+                    json.loads(row[0])
+                    for row in connection.execute("SELECT user FROM collaborators")
+                ]
+            found = next((user for user in rows if str(user["id"]) == account[1]), None)
+            return (200, found) if found is not None else (404, {"message": "Not Found"})
         prefix = f"/repos/{REPOSITORY}"
         # GitHub serves /repositories/{id}/... as the same resource tree.
         by_id = f"/repositories/{self._repository_row()['id']}"
@@ -1188,10 +1293,18 @@ class GithubStub:
             parts = tail.split("/")
             number = int(parts[1])
             existing_issue = self._get("issue", number)
-            if existing_issue is None:
-                return 404, {"message": "Not Found"}
-            issue = existing_issue
             suffix = "/".join(parts[2:])
+            # A pull request's conversation is its issue comment list, though
+            # no issue row backs the number.
+            # https://docs.github.com/en/rest/issues/comments#list-issue-comments
+            on_pull = (
+                existing_issue is None
+                and suffix == "comments"
+                and self._get("pull", number) is not None
+            )
+            if existing_issue is None and not on_pull:
+                return 404, {"message": "Not Found"}
+            issue = existing_issue or {}
             if not suffix and method in {"GET", "PATCH"}:
                 if method == "PATCH":
                     issue.update(
@@ -1247,6 +1360,8 @@ class GithubStub:
                     if fault is not None and fault[0] == "refuse":
                         return fault[1], {"message": "Server Error"}
 
+                    kind = "issues" if existing_issue else "pull"
+
                     def build(identifier: int) -> dict[str, Any]:
                         return {
                             "id": identifier,
@@ -1258,8 +1373,8 @@ class GithubStub:
                             "updated_at": _utc(),
                             "issue_url": f"{self.base_url}{prefix}/issues/{number}",
                             "html_url": (
-                                f"{self.base_url}/{REPOSITORY}/issues/{number}"
-                                f"#issuecomment-{identifier}"
+                                f"{self.base_url}/{REPOSITORY}/{kind}"
+                                f"/{number}#issuecomment-{identifier}"
                             ),
                         }
 
@@ -1297,6 +1412,9 @@ class GithubStub:
                         "number": number,
                         "state": "open",
                         "merged": False,
+                        "merged_at": None,
+                        "draft": False,
+                        "updated_at": _utc(),
                         "title": body["title"],
                         "body": body.get("body", ""),
                         "user": BOT,
@@ -1341,6 +1459,7 @@ class GithubStub:
                             for key, value in body.items()
                             if key in {"title", "body", "state"}
                         }
+                        | {"updated_at": _utc()}
                     )
                     self._put("pull", number, pull)
                 return 200, self._fresh_pull(pull)
