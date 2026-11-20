@@ -998,6 +998,29 @@ couldn't be read (pass `--api-key` yourself); a tunnel failure usually means
 the release isn't healthy (check with `curie cluster status`); and if
 nothing's been deployed yet, `curie cluster message` will say so plainly.
 
+### Giving a hosted connector its own ServiceAccount
+
+A hosted connector's pod runs as the namespace's `default` ServiceAccount. A
+connector that reaches a cloud provider through workload identity federation
+exchanges that ServiceAccount's token for cloud credentials, so give it its
+own ServiceAccount rather than sharing `default` with every other pod. Create
+the ServiceAccount in the release namespace together with its cloud
+federation, then name it in the chart values and upgrade:
+
+```yaml
+connectorServiceAccounts:
+  - agent: acme-bot
+    connector: storage
+    serviceAccountName: acme-bot-storage
+```
+
+The next deploy or reconcile pass of `acme-bot` rolls only the `storage`
+connector's Deployment onto that ServiceAccount. Curie never creates the
+ServiceAccount; if it is missing, the Deployment cannot create a pod and the
+connector is reported not ready. Removing the entry returns the pod to
+`default`. The [chart README](../charts/curie/README.md#a-connectors-own-serviceaccount)
+describes the validation.
+
 ### Automatically, with git-flow
 
 Beyond `curie cluster deploy`, a bundle can also deploy automatically on

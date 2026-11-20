@@ -552,8 +552,13 @@ def render_connector_manifests(
     grant_store: connector_render.GrantStore | None = None,
     gated_tools: Mapping[str, tuple[str, ...]] | None = None,
     e2e: E2EInstall | None = None,
+    service_accounts: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Kubernetes objects for a bundle's hosted connectors (ADR-0086, #1063).
+
+    ``service_accounts`` is the operator's connector-to-ServiceAccount mapping
+    for this agent; an entry for a connector the bundle does not declare is
+    ignored, since one installation-wide list serves every agent.
 
     The API renders but never applies. Rendering is a pure function, so it needs
     no cluster access, and the API's RBAC stays the deliberately read-only
@@ -580,6 +585,7 @@ def render_connector_manifests(
                 proxy=proxy,
                 gated_tools=tools,
                 grant_store=grant_store if proxy is not None else None,
+                service_account=(service_accounts or {}).get(name),
             )
         )
     if install.enabled and CONNECTOR_NAME in connectors.connectors:

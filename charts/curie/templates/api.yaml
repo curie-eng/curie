@@ -329,6 +329,11 @@ spec:
             # connector object holds the password as a literal.
             - name: CURIE_CONNECTOR_GRANT_STORE_SECRET_NAME
               value: {{ include "curie.storeSecretName" (dict "root" . "store" .Values.valkey) | quote }}
+            # Operator-named connector ServiceAccounts, rendered into the
+            # matching connector's pod template. The API refuses to boot on a
+            # list it cannot render from; values.schema.json refuses the same.
+            - name: CURIE_CONNECTOR_SERVICE_ACCOUNTS
+              value: {{ .Values.connectorServiceAccounts | default list | toJson | quote }}
             {{- $e2e := .Values.e2eConnector }}
             {{- if and $e2e.enabled (or (not $e2e.ownerLabel.value) (not $e2e.serviceAccount) (not $e2e.serviceAccountNamespace) (not $e2e.workerClusterRole)) }}
             {{- fail "e2eConnector.enabled requires ownerLabel.value, serviceAccount, serviceAccountNamespace, and workerClusterRole" }}
