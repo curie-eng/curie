@@ -563,11 +563,23 @@ pub(super) struct OwnedNamespaceWait {
     pub phase: String,
     pub conditions: String,
     pub objects: String,
+    /// True only when this namespace is Terminating, no condition status is
+    /// True, the inventory was readable, and every remaining object is one
+    /// the namespace controller removes itself.
+    controller_owned: bool,
 }
 
 /// Operator text for a sweep wait that expired. Names each remaining namespace.
 /// It does not say that any finalizer was cleared.
 pub(super) fn format_owned_namespace_wait(rows: &[OwnedNamespaceWait], resume: &str) -> String {
+    format_owned_namespace_wait_after(rows, resume, OWNED_NAMESPACE_SWEEP_TIMEOUT)
+}
+
+fn format_owned_namespace_wait_after(
+    rows: &[OwnedNamespaceWait],
+    resume: &str,
+    waited: &str,
+) -> String {
     let listed = rows
         .iter()
         .map(|row| {
@@ -579,8 +591,72 @@ pub(super) fn format_owned_namespace_wait(rows: &[OwnedNamespaceWait], resume: &
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "owned namespace sweep waited {OWNED_NAMESPACE_SWEEP_TIMEOUT} and these namespaces are still present: {listed}. Resume with: {resume}"
+        "owned namespace sweep waited {waited} and these namespaces are still present: {listed}. Resume with: {resume}"
     )
+}
+
+/// Production extension cadence and deadline. Reported copy stays `300s` and
+/// `600s` even when a test injects a shorter pair.
+const OWNED_NAMESPACE_EXTENSION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const OWNED_NAMESPACE_EXTENSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+const OWNED_NAMESPACE_EXTENDED_WAIT: &str = "600s";
+
+/// Test-only timing overrides. Integration tests keep the public `DownOpts`
+/// shape and set these under `ENV_LOCK`, so reversing the product still
+/// compiles and fails on the sweep outcome. Release builds ignore them and
+/// cannot be stretched past the production deadline.
+const EXTENSION_INTERVAL_ENV: &str = "CURIE_NAMESPACE_SWEEP_EXTENSION_INTERVAL_MS";
+const EXTENSION_DEADLINE_ENV: &str = "CURIE_NAMESPACE_SWEEP_EXTENSION_DEADLINE_MS";
+
+fn extension_bounds() -> (std::time::Duration, std::time::Duration) {
+    if !cfg!(debug_assertions) {
+        return (
+            OWNED_NAMESPACE_EXTENSION_INTERVAL,
+            OWNED_NAMESPACE_EXTENSION_DEADLINE,
+        );
+    }
+    let interval_ms = std::env::var(EXTENSION_INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000)
+        .clamp(1, 5_000);
+    let deadline_ms = std::env::var(EXTENSION_DEADLINE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300_000)
+        .clamp(1, 300_000);
+    (
+        std::time::Duration::from_millis(interval_ms),
+        std::time::Duration::from_millis(deadline_ms),
+    )
+}
+
+/// True for the residue the namespace controller removes on its own.
+///
+/// `conditions` is the diagnosis rendering (`Type=Status` joined by commas).
+/// A condition status of `True`, any other kind, a ConfigMap other than
+/// `kube-root-ca.crt`, a phase other than `Terminating`, or an unreadable
+/// inventory refuses the extension. An empty object list qualifies.
+pub(super) fn controller_owned_residue_only(
+    phase: &str,
+    conditions: &str,
+    objects: &[(&str, &str)],
+    inventory_readable: bool,
+) -> bool {
+    if !inventory_readable || phase != "Terminating" {
+        return false;
+    }
+    if conditions
+        .split(',')
+        .any(|part| part.trim().ends_with("=True"))
+    {
+        return false;
+    }
+    objects.iter().all(|(kind, name)| match *kind {
+        "Event" | "Endpoints" | "EndpointSlice" => true,
+        "ConfigMap" => *name == "kube-root-ca.crt",
+        _ => false,
+    })
 }
 
 fn owned_namespace_list_cmd(o: &CommonOpts) -> OpsCommand {
@@ -757,6 +833,7 @@ async fn diagnose_owned_namespace_wait(o: &CommonOpts) -> Result<Vec<OwnedNamesp
                     phase: namespace.phase,
                     conditions: namespace.conditions,
                     objects: "inventory timed out".to_string(),
+                    controller_owned: false,
                 })
                 .collect());
         }
@@ -805,6 +882,21 @@ async fn diagnose_owned_namespace_wait(o: &CommonOpts) -> Result<Vec<OwnedNamesp
                 Err(_) => failures.push(format!("{resource}: list failed")),
             }
         }
+        let inventory_readable = failures.is_empty();
+        let object_refs: Vec<(String, String)> = grouped
+            .iter()
+            .flat_map(|(kind, names)| names.iter().map(move |name| (kind.clone(), name.clone())))
+            .collect();
+        let object_pairs: Vec<(&str, &str)> = object_refs
+            .iter()
+            .map(|(kind, name)| (kind.as_str(), name.as_str()))
+            .collect();
+        let controller_owned = controller_owned_residue_only(
+            &namespace.phase,
+            &namespace.conditions,
+            &object_pairs,
+            inventory_readable,
+        );
         let mut objects = format_remaining_objects(grouped);
         if !failures.is_empty() {
             if objects == "none" {
@@ -819,9 +911,50 @@ async fn diagnose_owned_namespace_wait(o: &CommonOpts) -> Result<Vec<OwnedNamesp
             phase: namespace.phase,
             conditions: namespace.conditions,
             objects,
+            controller_owned,
         });
     }
     Ok(rows)
+}
+
+enum NamespaceExtension {
+    Removed { waited: std::time::Duration },
+    Expired { rows: Vec<OwnedNamespaceWait> },
+    Refused { rows: Vec<OwnedNamespaceWait> },
+}
+
+/// Poll the owned-namespace list until it is empty, the residue stops
+/// qualifying, or the extension deadline passes. Sleeps and subprocess waits
+/// both use the running Tokio clock and never outlive the deadline.
+async fn extend_owned_namespace_sweep(
+    o: &CommonOpts,
+    interval: std::time::Duration,
+    deadline: std::time::Duration,
+) -> NamespaceExtension {
+    let started = tokio::time::Instant::now();
+    let deadline_at = started + deadline;
+    loop {
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return NamespaceExtension::Expired { rows: Vec::new() };
+        }
+        tokio::time::sleep(interval.min(remaining)).await;
+        let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return NamespaceExtension::Expired { rows: Vec::new() };
+        }
+        match tokio::time::timeout(remaining, diagnose_owned_namespace_wait(o)).await {
+            Err(_) => return NamespaceExtension::Expired { rows: Vec::new() },
+            Ok(Err(_)) => return NamespaceExtension::Refused { rows: Vec::new() },
+            Ok(Ok(rows)) if rows.is_empty() => {
+                return NamespaceExtension::Removed {
+                    waited: started.elapsed(),
+                };
+            }
+            Ok(Ok(rows)) if rows.iter().all(|row| row.controller_owned) => continue,
+            Ok(Ok(rows)) => return NamespaceExtension::Refused { rows },
+        }
+    }
 }
 
 /// #707 ownership stamp. Returns the single `kubectl label namespace` step that
@@ -1666,19 +1799,68 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
                         &hook_err,
                     ) =>
             {
-                step.fail("still present");
-                for line in out.lines().chain(sweep_err.lines()) {
-                    ui.plumbing(line);
-                }
-                let resume = resume_command(
-                    &outstanding_steps(helm_outcome, hook_outcome, SweepOutcome::Failed),
-                    &opts.common,
-                );
-                return Err(
-                    crate::exit::CliError::transient(format_owned_namespace_wait(&rows, &resume))
+                let resume_for = || {
+                    resume_command(
+                        &outstanding_steps(helm_outcome, hook_outcome, SweepOutcome::Failed),
+                        &opts.common,
+                    )
+                };
+                if rows.iter().all(|row| row.controller_owned) {
+                    let (interval, deadline) = extension_bounds();
+                    match extend_owned_namespace_sweep(&opts.common, interval, deadline).await {
+                        NamespaceExtension::Removed { waited } => {
+                            ui.plumbing(&format!(
+                                "namespace sweep extension waited {}ms",
+                                waited.as_millis()
+                            ));
+                            step.done("removed");
+                            SweepOutcome::Removed
+                        }
+                        NamespaceExtension::Expired { rows: later } => {
+                            step.fail("still present");
+                            for line in out.lines().chain(sweep_err.lines()) {
+                                ui.plumbing(line);
+                            }
+                            let resume = resume_for();
+                            let reported = if later.is_empty() { &rows } else { &later };
+                            return Err(crate::exit::CliError::transient(
+                                format_owned_namespace_wait_after(
+                                    reported,
+                                    &resume,
+                                    OWNED_NAMESPACE_EXTENDED_WAIT,
+                                ),
+                            )
+                            .with_fix(resume)
+                            .into());
+                        }
+                        NamespaceExtension::Refused { rows: later } => {
+                            step.fail("still present");
+                            for line in out.lines().chain(sweep_err.lines()) {
+                                ui.plumbing(line);
+                            }
+                            let resume = resume_for();
+                            let reported = if later.is_empty() { &rows } else { &later };
+                            return Err(crate::exit::CliError::transient(
+                                format_owned_namespace_wait(reported, &resume),
+                            )
+                            .with_fix(resume)
+                            .into());
+                        }
+                    }
+                } else {
+                    step.fail("still present");
+                    for line in out.lines().chain(sweep_err.lines()) {
+                        ui.plumbing(line);
+                    }
+                    let resume = resume_for();
+                    return Err(
+                        crate::exit::CliError::transient(format_owned_namespace_wait(
+                            &rows, &resume,
+                        ))
                         .with_fix(resume)
                         .into(),
-                );
+                    );
+                }
             }
             Ok(rows) => {
                 // A permanent helm or hook failure still decides the exit
@@ -6059,6 +6241,7 @@ mod tests {
                 phase: "Terminating".into(),
                 conditions: "NamespaceFinalizersRemaining=True".into(),
                 objects: "ConfigMap (1): hold".into(),
+                controller_owned: false,
             }],
             resume,
         );
@@ -6072,6 +6255,70 @@ mod tests {
         assert!(message.contains("hold"), "{message}");
         assert!(message.contains("--timeout=300s"), "{message}");
         assert!(!message.contains("finalizer removed"), "{message}");
+    }
+
+    // #5735: the extension classifier accepts only the residue the namespace
+    // controller removes itself. Names are anonymized from the release-QA shape.
+    #[test]
+    fn controller_owned_residue_only_accepts_the_observed_shape_and_rejects_holds() {
+        let conditions = "NamespaceDeletionDiscoveryFailure=False, NamespaceDeletionGroupVersionParsingFailure=False, NamespaceDeletionContentFailure=False, NamespaceContentRemaining=False, NamespaceFinalizersRemaining=False";
+        let observed = [
+            ("ConfigMap", "kube-root-ca.crt"),
+            ("EndpointSlice", "svc-a"),
+            ("Endpoints", "svc-a"),
+            ("Event", "evt-a"),
+        ];
+        assert!(controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &observed,
+            true
+        ));
+        assert!(controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &[],
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &[("Pod", "web")],
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &[("PersistentVolumeClaim", "data")],
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &[("ConfigMap", "hold")],
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            "NamespaceDeletionContentFailure=True",
+            &observed,
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            "NamespaceFinalizersRemaining=True",
+            &observed,
+            true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Active", conditions, &observed, true
+        ));
+        assert!(!controller_owned_residue_only(
+            "Terminating",
+            conditions,
+            &observed,
+            false
+        ));
     }
 
     // #1654 cross-release teardown scope. Two independent Curie installs on one

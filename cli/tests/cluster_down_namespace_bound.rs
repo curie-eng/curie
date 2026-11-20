@@ -2,11 +2,11 @@
 //! expires, names a remaining object instead of clearing finalizers (#707,
 //! #767, #768).
 //!
-//! The PATH-mutating scenario lives in ONE async test. `down()` resolves
-//! `helm`/`kubectl` off the process PATH, so a second parallel test in this
-//! file would race on that shared state, and it holds `support::ENV_LOCK`
-//! against every other test in the process. The sync test below builds argv only
-//! and never touches PATH. It is the fix pin.
+//! Each PATH-mutating test holds `support::ENV_LOCK` for the whole case,
+//! including the extension-timing environment, so parallel tests cannot race
+//! on PATH. The sync test below builds argv only and never touches PATH. It
+//! is the #4017 fix pin. The #5735 pin is
+//! `cluster_down_extends_for_controller_owned_residue`.
 
 use crate::support::executable as test_executable;
 
@@ -32,6 +32,31 @@ fn restore_path(original: &Option<OsString>) {
         Some(p) => std::env::set_var("PATH", p),
         None => std::env::remove_var("PATH"),
     }
+}
+
+const EXTENSION_INTERVAL_ENV: &str = "CURIE_NAMESPACE_SWEEP_EXTENSION_INTERVAL_MS";
+const EXTENSION_DEADLINE_ENV: &str = "CURIE_NAMESPACE_SWEEP_EXTENSION_DEADLINE_MS";
+
+fn set_extension_timing(interval_ms: u64, deadline_ms: u64) {
+    std::env::set_var(EXTENSION_INTERVAL_ENV, interval_ms.to_string());
+    std::env::set_var(EXTENSION_DEADLINE_ENV, deadline_ms.to_string());
+}
+
+fn clear_extension_timing() {
+    std::env::remove_var(EXTENSION_INTERVAL_ENV);
+    std::env::remove_var(EXTENSION_DEADLINE_ENV);
+}
+
+fn labeled_namespace_lists(logged: &str) -> usize {
+    logged
+        .lines()
+        .filter(|line| {
+            let args: Vec<&str> = line.split_whitespace().collect();
+            args.first() == Some(&"get")
+                && args.get(1) == Some(&"namespace")
+                && args.contains(&"-l")
+        })
+        .count()
 }
 
 fn down_opts() -> DownOpts {
@@ -79,6 +104,8 @@ fn sweep_command_carries_300s_timeout() {
 async fn cluster_down_names_a_remaining_configmap_and_exits_transient() {
     let _env = crate::support::ENV_LOCK.lock().await;
     let original_path = std::env::var_os("PATH");
+    // A mistaken extension must fail this control in well under five minutes.
+    set_extension_timing(30, 400);
 
     // Scenario A: the sweep wait expires and a ConfigMap named hold is still
     // in the terminating namespace. The product must say so and exit 3, and
@@ -176,6 +203,19 @@ exit 1
     assert!(
         !logged.contains("--force"),
         "the sweep must not force the delete: {logged}"
+    );
+    assert!(
+        shown.contains("waited 300s"),
+        "a non-qualifying hold keeps the 300s wording: {shown}"
+    );
+    assert!(
+        !shown.contains("waited 600s"),
+        "a non-qualifying hold must not report the extension: {shown}"
+    );
+    assert_eq!(
+        labeled_namespace_lists(&logged),
+        1,
+        "a non-qualifying hold must not poll the extension: {logged}"
     );
 
     // Scenario B: a delete that finishes is not a wait expiry, so the product
@@ -393,5 +433,201 @@ exit 1
     assert_eq!(class, ExitClass::Failure, "{err}");
     assert_eq!(class.code(), 1);
 
+    clear_extension_timing();
+    restore_path(&original_path);
+}
+
+const QUALIFYING_NAMESPACE_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"agent-ns","deletionTimestamp":"2026-01-01T00:00:00Z"},"status":{"phase":"Terminating","conditions":[{"type":"NamespaceDeletionDiscoveryFailure","status":"False"},{"type":"NamespaceDeletionGroupVersionParsingFailure","status":"False"},{"type":"NamespaceDeletionContentFailure","status":"False"},{"type":"NamespaceContentRemaining","status":"False"},{"type":"NamespaceFinalizersRemaining","status":"False"}]}}]}"#;
+
+const EVENT_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Event","metadata":{"name":"evt-a","namespace":"agent-ns"}}]}"#;
+
+const ENDPOINTS_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"Endpoints","metadata":{"name":"svc-a","namespace":"agent-ns"}}]}"#;
+
+const ENDPOINTSLICE_LIST: &str = r#"{"apiVersion":"discovery.k8s.io/v1","kind":"List","items":[{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"svc-a","namespace":"agent-ns"}}]}"#;
+
+const ROOT_CA_LIST: &str = r#"{"apiVersion":"v1","kind":"List","items":[{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"kube-root-ca.crt","namespace":"agent-ns"}}]}"#;
+
+/// `empty_on_fourth` makes the fourth labeled namespace list empty. The first
+/// list is the initial diagnosis and the next three are extension polls.
+fn install_qualifying_kubectl(dir: &Path, empty_on_fourth: bool) -> std::path::PathBuf {
+    let argv_log = dir.join("kubectl-argv.log");
+    let present = dir.join("present.json");
+    let qualifying = dir.join("qualifying.json");
+    let events = dir.join("events.json");
+    let endpoints = dir.join("endpoints.json");
+    let slices = dir.join("slices.json");
+    let root_ca = dir.join("root-ca.json");
+    let count = dir.join("list-count");
+    fs::write(&present, PRESENT_NAMESPACE).expect("write present namespace");
+    fs::write(&qualifying, QUALIFYING_NAMESPACE_LIST).expect("write qualifying list");
+    fs::write(&events, EVENT_LIST).expect("write events");
+    fs::write(&endpoints, ENDPOINTS_LIST).expect("write endpoints");
+    fs::write(&slices, ENDPOINTSLICE_LIST).expect("write endpoint slices");
+    fs::write(&root_ca, ROOT_CA_LIST).expect("write root ca");
+    let list_body = if empty_on_fourth {
+        format!(
+            r#"n=0
+if [ -f '{count}' ]; then
+  n=$(wc -l < '{count}' | tr -d ' ')
+fi
+printf '\n' >> '{count}'
+if [ "$n" -ge 3 ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+cat '{qualifying}'
+exit 0"#,
+            count = count.display(),
+            qualifying = qualifying.display(),
+        )
+    } else {
+        format!(
+            "cat '{qualifying}'\nexit 0",
+            qualifying = qualifying.display()
+        )
+    };
+    test_executable::install_in(
+        dir,
+        "helm",
+        "#!/bin/sh\necho 'release uninstalled'\nexit 0\n",
+    );
+    test_executable::install_in(
+        dir,
+        "kubectl",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{argv}'
+if [ "$1" = get ] && [ "$2" = namespace ] && [ "$3" = agent-ns ]; then
+  cat '{present}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = jobs ]; then
+  printf '%s\n' '{{"apiVersion":"v1","kind":"List","items":[]}}'
+  exit 0
+fi
+if [ "$1" = delete ]; then
+  echo 'error: timed out waiting for the condition on namespaces/agent-ns' | tee -a '{argv}' >&2
+  exit 1
+fi
+if [ "$1" = get ] && [ "$2" = namespace ]; then
+  for arg in "$@"; do
+    if [ "$arg" = -l ]; then
+      {list_body}
+    fi
+  done
+fi
+if [ "$1" = api-resources ]; then
+  printf '%s\n' events endpoints endpointslices configmaps
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = events ]; then
+  cat '{events}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpoints ]; then
+  cat '{endpoints}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = endpointslices ]; then
+  cat '{slices}'
+  exit 0
+fi
+if [ "$1" = get ] && [ "$2" = configmaps ]; then
+  cat '{root_ca}'
+  exit 0
+fi
+echo "unexpected kubectl $*" >&2
+exit 1
+"#,
+            argv = argv_log.display(),
+            present = present.display(),
+            events = events.display(),
+            endpoints = endpoints.display(),
+            slices = slices.display(),
+            root_ca = root_ca.display(),
+            list_body = list_body,
+        ),
+    );
+    argv_log
+}
+
+#[tokio::test]
+async fn cluster_down_extends_for_controller_owned_residue() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let original_path = std::env::var_os("PATH");
+    set_extension_timing(30, 15_000);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = install_qualifying_kubectl(dir.path(), true);
+    prepend_path(dir.path());
+
+    down(down_opts())
+        .await
+        .expect("controller-owned residue that disappears is a completed sweep");
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert!(
+        logged.contains("--timeout=300s"),
+        "the initial sweep keeps the 300s argv: {logged}"
+    );
+    assert!(
+        logged.contains("timed out waiting"),
+        "the sweep delete must expire before the extension: {logged}"
+    );
+    assert_eq!(
+        labeled_namespace_lists(&logged),
+        4,
+        "the list becomes empty on the third extension poll: {logged}"
+    );
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the injected deadline must not wait out the production extension: {:?}",
+        started.elapsed()
+    );
+
+    clear_extension_timing();
+    restore_path(&original_path);
+}
+
+#[tokio::test]
+async fn cluster_down_extension_expiry_stays_transient() {
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let original_path = std::env::var_os("PATH");
+    set_extension_timing(40, 2_000);
+    let started = std::time::Instant::now();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let argv_log = install_qualifying_kubectl(dir.path(), false);
+    prepend_path(dir.path());
+
+    let err = down(down_opts())
+        .await
+        .expect_err("an extension that never clears the namespace stays incomplete");
+    let (class, _fix) = classify(&err);
+    assert_eq!(class, ExitClass::Transient, "{err}");
+    assert_eq!(class.code(), 3);
+    let shown = err.to_string();
+    assert!(
+        shown.contains("waited 600s"),
+        "expiry reports the production 600s bound: {shown}"
+    );
+    assert!(
+        shown.contains("agent-ns"),
+        "expiry names the namespace: {shown}"
+    );
+    let logged = fs::read_to_string(&argv_log).expect("read kubectl argv log");
+    assert!(
+        labeled_namespace_lists(&logged) > 1,
+        "expiry must poll before giving up: {logged}"
+    );
+    assert!(!logged.contains("finalize"), "{logged}");
+    assert!(!logged.contains("--force"), "{logged}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "a short injected deadline must not run for the production 300s: {:?}",
+        started.elapsed()
+    );
+
+    clear_extension_timing();
     restore_path(&original_path);
 }
