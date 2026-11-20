@@ -161,6 +161,15 @@ against a runner endpoint, records to Langfuse if configured, prints the
 `EvalRunResult` as JSON (for the PR-check reporter), and exits non-zero if any
 case failed (so the Job / GitHub check reflects the result).
 
+The recorder submits scores before exporting spans. If the export fails, the
+recording fails and any accepted scores stay attached to their original trace
+IDs under the Langfuse project's retention policy. An eval stream redelivery
+runs the suite again and records a new attempt with fresh trace and score IDs.
+If investigating an ambiguous export, check for the original trace IDs and look
+up accepted scores by score ID when available. Legacy trace filters can omit a
+score whose trace has not arrived. Some spans may have arrived, and replaying
+the original payload can duplicate observations.
+
 Env: `CURIE_EVAL_SUITE` (suite JSON path), `CURIE_EVAL_TARGET_URL` (runner
 base_url), `CURIE_EVAL_VERSION` (version/sha tag, default `local`),
 `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` (record scores

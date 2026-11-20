@@ -70,18 +70,22 @@ async def _traces_for_version(
     return traces
 
 
-async def _score_for_trace(client: httpx.AsyncClient, trace_id: str, *, v4: bool) -> float | None:
+async def _score_for_trace(
+    client: httpx.AsyncClient, trace_id: str, *, v4: bool, score_id: str | None = None
+) -> float | None:
     # https://langfuse.com/self-hosting/upgrade/upgrade-guides/upgrade-v3-to-v4
-    api = "v3/scores" if v4 else "scores"
-    params = {"traceId": trace_id, "name": SCORE_NAME}
-    if v4:
+    # The legacy trace filter can hide a score whose trace has not arrived.
+    use_v3_api = v4 or score_id is not None
+    api = "v3/scores" if use_v3_api else "scores"
+    params = {"traceId": trace_id, "name": SCORE_NAME} if score_id is None else {"id": score_id}
+    if use_v3_api:
         params["fields"] = "subject"
     resp = await client.get(f"{_LF_HOST}/api/public/{api}", params=params, auth=(_LF_PK, _LF_SK))
     resp.raise_for_status()
     for score in resp.json()["data"]:
         matches_trace = (
             score["subject"] == {"kind": "trace", "id": trace_id}
-            if v4
+            if use_v3_api
             else score["traceId"] == trace_id
         )
         if matches_trace and score["name"] == SCORE_NAME:
@@ -90,7 +94,7 @@ async def _score_for_trace(client: httpx.AsyncClient, trace_id: str, *, v4: bool
 
 
 async def _score_for_trace_eventually(
-    client: httpx.AsyncClient, trace_id: str, *, v4: bool
+    client: httpx.AsyncClient, trace_id: str, *, v4: bool, score_id: str | None = None
 ) -> float | None:
     """Poll one trace's ``eval_pass`` score until it ingests (#1165).
 
@@ -105,12 +109,13 @@ async def _score_for_trace_eventually(
         client: an authenticated httpx client.
         trace_id: the trace whose score to wait for.
         v4: whether the test server serves v4 reads.
+        score_id: optional direct lookup for a score whose trace may be missing.
 
     Returns:
         The score, or ``None`` when it never materialized.
     """
     for _ in range(_INGEST_POLL_ATTEMPTS):
-        score = await _score_for_trace(client, trace_id, v4=v4)
+        score = await _score_for_trace(client, trace_id, v4=v4, score_id=score_id)
         if score is not None:
             return score
         await asyncio.sleep(1)
@@ -351,6 +356,60 @@ def test_every_trace_records_the_authoritative_run_case_count() -> None:
         traces, _ = await _capture_writes(run)
         assert len(traces) == 2
         assert {trace["metadata"]["case_count"] for trace in traces.values()} == {2}
+
+    asyncio.run(go())
+
+
+def test_score_survives_otlp_transport_failure() -> None:
+    async def go() -> None:
+        failed_trace_id: str | None = None
+        first_score: dict[str, Any] | None = None
+
+        async def fail_first_export(request: httpx.Request) -> None:
+            nonlocal failed_trace_id, first_score
+            if request.url.path == "/api/public/ingestion" and first_score is None:
+                first_score = json.loads(request.content)["batch"][0]["body"]
+            if request.url.path == "/api/public/otel/v1/traces" and failed_trace_id is None:
+                payload = json.loads(request.content)
+                span = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+                failed_trace_id = span["traceId"]
+                assert first_score is not None
+                assert first_score["traceId"] == failed_trace_id
+                raise httpx.ConnectError("injected OTLP connection failure", request=request)
+
+        async with httpx.AsyncClient(
+            timeout=30.0, event_hooks={"request": [fail_first_export]}
+        ) as client:
+            health = await client.get(f"{_LF_HOST}/api/public/health")
+            health.raise_for_status()
+            v4 = health.json()["version"].startswith("4.")
+            recorder = LangfuseEvalRecorder(
+                base_url=_LF_HOST, public_key=_LF_PK, secret_key=_LF_SK, client=client
+            )
+            run = EvalRunResult(
+                version=f"v-{uuid.uuid4().hex[:8]}",
+                suite="recorder-test",
+                results=[
+                    EvalCaseResult(
+                        case_id="pass-case", outcome=EvalOutcome.PASS, output="ok", latency_ms=1.0
+                    ),
+                ],
+            )
+            with pytest.raises(httpx.ConnectError, match="injected OTLP connection failure"):
+                await recorder.record(run)
+
+            assert failed_trace_id is not None
+            assert first_score is not None
+            score_id = first_score["id"]
+            assert (
+                await _score_for_trace_eventually(client, failed_trace_id, v4=v4, score_id=score_id)
+                == 1.0
+            )
+
+            [retry_trace_id] = await recorder.record(run)
+            assert retry_trace_id != failed_trace_id
+            assert await _score_for_trace_eventually(client, retry_trace_id, v4=v4) == 1.0
+            assert await _score_for_trace(client, failed_trace_id, v4=v4, score_id=score_id) == 1.0
 
     asyncio.run(go())
 
