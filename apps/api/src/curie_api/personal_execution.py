@@ -78,7 +78,6 @@ OWNER_COLUMNS = frozenset(
 _LIVE_STATUSES = ("running", "cancellation_requested")
 # Requests revalidation rebinds; a terminal snapshot keeps the generation it ran under.
 _REBOUND_STATUSES = ("queued", "waiting")
-OWNER_RESUME_CAUSES = frozenset({"authentication_required", "enrollment_fenced"})
 
 
 @dataclass(frozen=True)
@@ -488,14 +487,6 @@ async def revalidate_for_owner_admission(
 ) -> Revalidated | ContextConflict | None:
     """Check a locked personal WorkItem for resume by its verified owner."""
 
-    cause = await session.scalar(
-        select(ExecutionRequest.terminal_cause)
-        .where(ExecutionRequest.work_item_id == work_item.id)
-        .order_by(ExecutionRequest.sequence.desc())
-        .limit(1)
-    )
-    if cause not in OWNER_RESUME_CAUSES:
-        return None
     header = (
         await session.execute(
             select(PersonalClaudeEnrollment.generation, PersonalClaudeEnrollment.active).where(

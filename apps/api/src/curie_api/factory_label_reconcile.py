@@ -44,8 +44,7 @@ from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
-from .models import AgentChannel, ExecutionRequest, FactoryPollCursor, ThreadTranscript, WorkItem
-from .personal_execution import OWNER_RESUME_CAUSES
+from .models import AgentChannel, FactoryPollCursor, ThreadTranscript, WorkItem
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name
 from .workspace_policy import repository_is_allowed
 
@@ -74,13 +73,6 @@ async def bound_repositories(session: AsyncSession) -> list[str]:
 def cancellable_github_item() -> ColumnElement[bool]:
     """An open item or one whose retained resume transcript still needs close handling."""
 
-    latest_cause = (
-        select(ExecutionRequest.terminal_cause)
-        .where(ExecutionRequest.work_item_id == WorkItem.id)
-        .order_by(ExecutionRequest.sequence.desc())
-        .limit(1)
-        .scalar_subquery()
-    )
     retained = (
         select(ThreadTranscript.id)
         .where(
@@ -92,11 +84,7 @@ def cancellable_github_item() -> ColumnElement[bool]:
     )
     return or_(
         WorkItem.cancelled_at.is_(None),
-        and_(
-            WorkItem.model_auth_mode == "personal",
-            latest_cause.in_(OWNER_RESUME_CAUSES),
-            retained,
-        ),
+        and_(WorkItem.model_auth_mode == "personal", retained),
     )
 
 

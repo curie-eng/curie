@@ -216,7 +216,8 @@ def _cause(
             )
         text = f"failed: {cause}"
         if cause in {"enrollment_fenced", "authentication_required"}:
-            text += f". {cause_text(cause)}"
+            guidance = cause_text(cause)
+            text += f". {guidance[:1].upper()}{guidance[1:]}"
         elif cause == "deadline_halted":
             text += (
                 "; the run hit the delivery budget, raise "

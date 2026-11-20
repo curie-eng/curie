@@ -31,13 +31,13 @@ import importlib
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
 import personal_execution_support as support
 import pytest
-from curie_api import workitem_dispatch
+from curie_api import personal_enrollments, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.models import ExecutionRequest
@@ -74,7 +74,12 @@ RELABEL_OBJECTIVE = "Run the task again after the label was added back"
 
 
 def _github_personal_failure(
-    github_factory: GitHubFactory, number: int
+    github_factory: GitHubFactory,
+    number: int,
+    *,
+    failure: Literal["authentication_required", "enrollment_fenced", "start_failed"] = (
+        "authentication_required"
+    ),
 ) -> tuple[TestClient, GitHubAPI, UUID, UUID, int]:
     owner = _seed_default_tenant_owner()
     client, github = github_factory("personal")
@@ -84,12 +89,33 @@ def _github_personal_failure(
     assert first.json()["status"] == "factory_admitted", first.text
     [item] = _github_items(number)
     [request] = _resume_requests(item["id"])
-    _fail_github_personal_request(item["id"], request["id"])
-    support.rows(
-        "UPDATE curie.personal_claude_enrollments SET generation = 2, version = version + 1 "
-        "WHERE principal_id = :owner",
-        {"owner": owner},
-    )
+    if failure == "authentication_required":
+        _fail_github_personal_request(item["id"], request["id"])
+    elif failure == "enrollment_fenced":
+        _start_github_personal_request(item["id"], request["id"])
+
+    async def replace_enrollment(session: AsyncSession) -> None:
+        await personal_enrollments._lock_owner(session, DEFAULT_TENANT, owner)
+        await session.execute(
+            text(
+                "UPDATE curie.personal_claude_enrollments "
+                "SET generation = 2, version = version + 1 WHERE principal_id = :owner"
+            ),
+            {"owner": owner},
+        )
+        await lifecycle.fence_enrollment_generation(
+            session, tenant_id=DEFAULT_TENANT, owner_principal_id=owner
+        )
+        await session.commit()
+
+    support.with_session(replace_enrollment)
+    if failure == "start_failed":
+        support.rows(
+            "UPDATE curie.execution_requests SET status = 'failed', terminal_at = now(), "
+            "terminal_cause = 'start_failed', last_deferral_reason = "
+            "'not_started:enrollment_generation_mismatch' WHERE id = :id",
+            {"id": request["id"]},
+        )
     return client, github, item["id"], request["id"], account
 
 
@@ -108,12 +134,16 @@ def _link_github_account(client: TestClient, owner: UUID, account: int) -> None:
     assert linked.status_code == 201, linked.text
 
 
-def _fail_github_personal_request(item_id: UUID, request_id: UUID) -> None:
+def _start_github_personal_request(item_id: UUID, request_id: UUID) -> int:
     support.rows(
         "UPDATE curie.work_items SET base_resolved_request_id = :request WHERE id = :id",
         {"id": item_id, "request": request_id},
     )
-    epoch = support.start_request(request_id)
+    return support.start_request(request_id)
+
+
+def _fail_github_personal_request(item_id: UUID, request_id: UUID) -> None:
+    epoch = _start_github_personal_request(item_id, request_id)
     support.finish_failed(request_id, epoch, cause="authentication_required")
 
 
@@ -194,6 +224,85 @@ def test_owner_github_relabel_waits_for_worker_teardown(
     resumed = _post(client, "issues", relabel)
     assert resumed.json()["status"] == "factory_admitted", resumed.text
     assert [request["enrollment_generation"] for request in _resume_requests(item_id)] == [1, 2]
+
+
+def test_owner_github_relabel_recovers_a_stale_start_failure(
+    github_factory: GitHubFactory, owned_rows: None
+) -> None:
+    number = 58885
+    client, github, item_id, failed_id, _ = _github_personal_failure(
+        github_factory, number, failure="start_failed"
+    )
+    [item] = support.rows("SELECT agent_id FROM curie.work_items WHERE id = :id", {"id": item_id})
+    agent = item["agent_id"]
+    thread = _seed_transcript(agent, item_id)
+    [before] = _resume_requests(item_id)
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.json()["status"] == "factory_cancelled", removed.text
+    github.labels = [LABEL]
+    github.advance_label_event(number)
+
+    resumed = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+
+    assert resumed.json()["status"] == "factory_admitted", resumed.text
+    predecessor, successor = _resume_requests(item_id)
+    assert (successor["enrollment_generation"], successor["status"]) == (2, "waiting")
+    assert predecessor == before
+    assert (predecessor["id"], predecessor["terminal_cause"]) == (failed_id, "start_failed")
+    assert _transcripts(agent, thread) == 1
+
+
+@pytest.mark.parametrize("close_before_teardown", [False, True], ids=["resume", "close"])
+def test_owner_unlabel_preserves_a_stopping_enrollment_fence(
+    github_factory: GitHubFactory, owned_rows: None, close_before_teardown: bool
+) -> None:
+    number = 58886
+    client, github, item_id, stopping_id, _ = _github_personal_failure(
+        github_factory, number, failure="enrollment_fenced"
+    )
+    [item] = support.rows("SELECT agent_id FROM curie.work_items WHERE id = :id", {"id": item_id})
+    agent = item["agent_id"]
+    thread = _seed_transcript(agent, item_id)
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.json()["status"] == "factory_cancellation_requested", removed.text
+    github.labels = [LABEL]
+    github.advance_label_event(number)
+    relabel = _issue_event("labeled", number, label={"name": LABEL})
+    before = _resume_requests(item_id)
+
+    refused = _post(client, "issues", relabel)
+    assert refused.json()["errors"] == [{"code": "runtime_live"}], refused.text
+    assert _resume_requests(item_id) == before
+    assert _github_items(number)[0]["enrollment_generation"] == 1
+    assert before[0]["terminal_cause"] == "enrollment_fenced"
+
+    if close_before_teardown:
+        github.issue_state = "closed"
+        closed = _post(client, "issues", _issue_event("closed", number))
+        assert closed.json()["status"] == "factory_duplicate", closed.text
+
+    _confirm_resume_teardown(stopping_id)
+    [predecessor] = _resume_requests(item_id)
+    if close_before_teardown:
+        assert (predecessor["status"], predecessor["terminal_cause"]) == (
+            "cancelled",
+            "issue_cancelled",
+        )
+        assert _transcripts(agent, thread) == 0
+    else:
+        assert (predecessor["status"], predecessor["terminal_cause"]) == (
+            "failed",
+            "enrollment_fenced",
+        )
+        github.advance_label_event(number)
+        resumed = _post(client, "issues", relabel)
+        assert resumed.json()["status"] == "factory_admitted", resumed.text
+        old, successor = _resume_requests(item_id)
+        assert old == predecessor
+        assert successor["enrollment_generation"] == 2
+        assert _transcripts(agent, thread) == 1
 
 
 def test_non_owner_github_relabel_keeps_the_old_enrollment_generation(
