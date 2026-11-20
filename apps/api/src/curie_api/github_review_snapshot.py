@@ -24,7 +24,7 @@ from typing import Any
 import httpx
 
 from .forges.github.transport import github_headers, parse_time
-from .github_review_events import FeedbackIgnored, FeedbackUnavailable
+from .github_review_events import FeedbackIgnored, FeedbackUnavailable, feedback_event_id
 from .github_review_truth import VerifiedRepository
 
 ACTIONABLE_STATES = frozenset({"COMMENTED", "CHANGES_REQUESTED"})
@@ -43,6 +43,16 @@ def review_request_id(repository_id: int, pr_number: int, review_id: int) -> uui
     """The one request id every piece of one submitted review admits under."""
 
     return uuid.uuid5(uuid.NAMESPACE_URL, f"curie-review:{repository_id}:{pr_number}:{review_id}")
+
+
+def event_request_id(repository_id: int, event: str, feedback_id: int) -> uuid.UUID:
+    """The per-event request id one piece of feedback admits under on its own.
+
+    Before #5794 every review and inline comment that mentioned the factory was
+    admitted under this id, so a review answered then names no review key.
+    """
+
+    return uuid.uuid5(uuid.NAMESPACE_URL, feedback_event_id(repository_id, event, feedback_id))
 
 
 @dataclass(frozen=True)
@@ -199,6 +209,34 @@ def _comment(
     return ReviewComment(comment_id, path, line, body)
 
 
+async def _review_items(
+    client: httpx.AsyncClient, verified: VerifiedRepository, *, pull_url: str, review_id: int
+) -> list[Any]:
+    """Every item of the review's comment listing, unchecked."""
+
+    items: list[Any] = []
+    for page in range(1, _MAX_PAGES + 1):
+        response = await _get(
+            client,
+            f"{pull_url}/reviews/{review_id}/comments",
+            verified.token,
+            {"per_page": _PER_PAGE, "page": page},
+            "review_comments_unavailable",
+        )
+        if response.status_code != 200:
+            raise FeedbackUnavailable("review_comments_unavailable")
+        try:
+            listed = response.json()
+        except ValueError:
+            raise FeedbackUnavailable("review_comments_unavailable") from None
+        if not isinstance(listed, list):
+            raise FeedbackUnavailable("review_comments_unavailable")
+        items.extend(listed)
+        if len(listed) < _PER_PAGE:
+            return items
+    raise FeedbackIgnored("feedback_too_large")
+
+
 async def read_review_comments(
     client: httpx.AsyncClient,
     verified: VerifiedRepository,
@@ -215,26 +253,30 @@ async def read_review_comments(
     """
 
     pull_url = _pull_url(verified, repo_path, pr_number)
-    comments: list[ReviewComment] = []
-    for page in range(1, _MAX_PAGES + 1):
-        response = await _get(
-            client,
-            f"{pull_url}/reviews/{review.id}/comments",
-            verified.token,
-            {"per_page": _PER_PAGE, "page": page},
-            "review_comments_unavailable",
-        )
-        if response.status_code != 200:
-            raise FeedbackUnavailable("review_comments_unavailable")
-        try:
-            listed = response.json()
-        except ValueError:
-            raise FeedbackUnavailable("review_comments_unavailable") from None
-        if not isinstance(listed, list):
-            raise FeedbackUnavailable("review_comments_unavailable")
-        comments.extend(
-            _comment(item, review, pull_url=pull_url, head_sha=head_sha) for item in listed
-        )
-        if len(listed) < _PER_PAGE:
-            return tuple(sorted(comments, key=lambda comment: comment.id))
-    raise FeedbackIgnored("feedback_too_large")
+    items = await _review_items(client, verified, pull_url=pull_url, review_id=review.id)
+    comments = [_comment(item, review, pull_url=pull_url, head_sha=head_sha) for item in items]
+    return tuple(sorted(comments, key=lambda comment: comment.id))
+
+
+async def read_review_comment(
+    client: httpx.AsyncClient,
+    verified: VerifiedRepository,
+    *,
+    repo_path: str,
+    pr_number: int,
+    review: SubmittedReview,
+    comment_id: int,
+    head_sha: str,
+) -> ReviewComment:
+    """Comment ``comment_id`` of ``review``, held to the same checks alone.
+
+    An inline comment admitted on its own (a mention in an approved review) is
+    refused ``edited_feedback`` when it was edited after submission; the other
+    comments of its review are not its feedback.
+    """
+
+    pull_url = _pull_url(verified, repo_path, pr_number)
+    for item in await _review_items(client, verified, pull_url=pull_url, review_id=review.id):
+        if isinstance(item, dict) and item.get("id") == comment_id:
+            return _comment(item, review, pull_url=pull_url, head_sha=head_sha)
+    raise FeedbackUnavailable("review_comments_unavailable")

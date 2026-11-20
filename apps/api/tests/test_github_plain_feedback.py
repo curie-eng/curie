@@ -27,6 +27,7 @@ import sys
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -376,7 +377,9 @@ def test_plain_inline_comment_of_a_submitted_review_admits_one_revision(
     factory: Factory, path: str
 ) -> None:
     """The inline comment is written in a pending review; submission, 8 s later,
-    bumps its ``updated_at`` without an edit (#2794). That bump is no edit."""
+    bumps its ``updated_at`` without an edit (#2794). That bump is no edit. On
+    the poll path the review listing fails for the pass, so only the inline
+    comment listing can admit it."""
 
     pull = factory.pull()
     pending = factory.github.create_review(
@@ -397,7 +400,11 @@ def test_plain_inline_comment_of_a_submitted_review_admits_one_revision(
         assert first.json()["status"] == "factory_admitted", first.text
         assert factory.post(review_delivery).json()["status"] == "factory_duplicate"
     else:
-        factory.deliver(path, submitted)
+        factory.github.drain_deliveries()
+        reviews = f"/repos/{REPO}/pulls/{pull.number}/reviews"
+        factory.github.fail_reads(f"GET {reviews}$", 502)
+        factory.poll()
+        assert reviews in {request.url.path for request in factory.github.http_requests}
 
     rows = _requests(pull.issue)
     assert len(rows) == 2
@@ -602,6 +609,85 @@ def test_mentions_in_an_approved_review_are_not_refused(
     assert _lineage(pull)["plain_feedback_revisions"] == 0
 
 
+def test_approved_review_inline_comment_edited_to_add_a_mention_is_refused(
+    factory: Factory,
+) -> None:
+    """An approved review's plain inline comment edited 10 s after submission
+    to add the mention, past the 5 s submission allowance. Its webhook was
+    plain; the poll lists the edited comment, whose fresh read matches, and
+    admits nothing."""
+
+    pull = factory.pull()
+    posted = factory.github.create_review(
+        pull.number,
+        REVIEWER,
+        body="Approved.",
+        event="APPROVE",
+        comments=[_comment("src/acme/helper.py", 12, "Nit: rename this helper.")],
+    )
+    (inline,) = factory.github.comments_of_review(posted.item["id"])
+    factory.github.tick(10)
+    factory.github.edit_comment(inline["id"], f"@{MENTION} nit: rename this helper.")
+    factory.github.drain_deliveries()
+    before = _all_requests()
+
+    factory.poll()
+
+    assert _all_requests() == before
+    assert len(_requests(pull.issue)) == 1
+    listing = f"/repos/{REPO}/pulls/{pull.number}/reviews/{posted.item['id']}/comments"
+    assert listing in {request.url.path for request in factory.github.http_requests}
+
+
+@pytest.mark.parametrize("listings", ["both", "reviews_only"])
+def test_upgrade_review_answered_under_a_per_event_id_is_not_answered_again(
+    factory: Factory, listings: str
+) -> None:
+    """Before #5794 a mentioning inline comment was admitted under its own
+    per-event id. The row is written by the production admission: today's
+    approved-review mention path is the base's per-piece admission unchanged
+    (same request id, objective and review-thread reply target). GitHub then
+    reports the review as commented, as for a base-era review answered that
+    way. On the unchanged head a poll pass that lists the review again, alone
+    (``reviews_only``: the inline comment listing is not modified) or with its
+    inline comment, admits nothing."""
+
+    pull = factory.pull()
+    posted = factory.github.create_review(
+        pull.number,
+        REVIEWER,
+        body="One rename.",
+        event="APPROVE",
+        comments=[_comment("src/acme/helper.py", 12, f"@{MENTION} please rename this helper.")],
+    )
+    factory.github.drain_deliveries()
+    _, inline = posted.deliveries
+    assert factory.post(inline).json()["status"] in {"factory_admitted", "factory_queued"}
+    rows = _requests(pull.issue)
+    assert len(rows) == 2
+    per_event = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        "github-feedback-"
+        + str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{REPO_ID}:pull_request_review_comment:{inline.payload['comment']['id']}",
+            )
+        ),
+    )
+    assert (rows[1]["id"], rows[1]["reply_target_kind"]) == (per_event, "review_thread")
+    factory.github._review_of(pull.number, posted.item["id"])["state"] = "COMMENTED"
+    if listings == "reviews_only":
+        factory.github.fail_reads(rf"GET /repos/{REPO}/pulls/comments$", 304)
+
+    factory.poll()
+
+    review_comments = f"/repos/{REPO}/pulls/{pull.number}/reviews/{posted.item['id']}/comments"
+    assert review_comments in {request.url.path for request in factory.github.http_requests}
+    assert [row["id"] for row in _requests(pull.issue)] == [row["id"] for row in rows]
+    assert _lineage(pull)["plain_feedback_revisions"] == 0
+
+
 # --- criterion 3: one submitted review coalesces into one request -------------------------
 
 
@@ -651,12 +737,14 @@ def test_review_pieces_coalesce_into_one_request(factory: Factory, order: str) -
 
 
 def test_inline_before_review_pending_review_creates_nothing_until_submitted(
-    factory: Factory,
+    factory: Factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """(a) The review is pending: the App's review read is a 404 and its listings
-    omit the review and its comments, so a poll pass creates nothing. After
-    submission with a second inline comment, the next poll and the review
-    event together create one request with the body and both comments."""
+    """(a) The review is pending: the App's review read is a 404, so a poll pass
+    creates nothing. GitHub's listings omit a pending comment; here the inline
+    comment leaks into the App's comment listing anyway, so the poll's
+    admission reaches the review read and is refused there. After submission
+    with a second inline comment, the next poll and the review event together
+    create one request with the body and both comments."""
 
     pull = factory.pull()
     pending = factory.github.create_review(
@@ -666,7 +754,16 @@ def test_inline_before_review_pending_review_creates_nothing_until_submitted(
         comments=[_comment("src/acme/helper.py", 12, "Rename this helper.")],
     )
     review_id = pending.item["id"]
+    author_only = factory.github._sees
+
+    def leaking(viewer: dict[str, Any], item: dict[str, Any]) -> bool:
+        # Comments leak to every viewer; the review itself stays its author's.
+        return "pull_request_review_id" in item or author_only(viewer, item)
+
+    monkeypatch.setattr(factory.github, "_sees", leaking)
+    review_read = f"/repos/{REPO}/pulls/{pull.number}/reviews/{review_id}"
     factory.poll()
+    assert review_read in {request.url.path for request in factory.github.http_requests}
     assert len(_requests(pull.issue)) == 1
 
     factory.github._add_review_comment(
@@ -917,6 +1014,47 @@ def test_cap_after_ten_plain_revisions_needs_a_mention(factory: Factory, path: s
     assert len(_requests(pull.issue)) == 12
     assert _lineage(pull)["plain_feedback_revisions"] == 10
     assert len(factory.notices(pull)) == 1
+
+
+def test_cap_notice_that_fails_to_post_blocks_no_later_feedback(factory: Factory) -> None:
+    """The mention-needed notice post is refused once (403). The 11th plain
+    comment is refused with no notice and the cap left unrecorded; a mention
+    later in the same pass is admitted and the cursor moves past both. A 12th
+    plain comment on a later pass posts the notice once."""
+
+    pull = factory.pull()
+    for index in range(1, 11):
+        _plain(factory, pull, "poll", index)
+    assert len(_requests(pull.issue)) == 11
+    notice_post = f"/repos/{REPO}/issues/{pull.number}/comments"
+    factory.github.fail_writes(f"POST {notice_post}$", 403)
+    factory.comment(pull, "Please also rename helper 11.")
+    mention = factory.comment(pull, f"@{MENTION} please rename one more helper.")
+    factory.github.drain_deliveries()
+
+    factory.poll()
+
+    assert any(
+        request.method == "POST" and request.url.path == notice_post
+        for request in factory.github.http_requests
+    )
+    assert factory.notices(pull) == []
+    rows = _requests(pull.issue)
+    assert len(rows) == 12
+    assert MENTION in _provenance(rows[-1]["objective"])["body"]
+    lineage = _lineage(pull)
+    assert (lineage["plain_feedback_revisions"], lineage["plain_feedback_capped_at"]) == (10, None)
+    (cursor,) = _rows("SELECT comments_since FROM curie.factory_poll_cursors")
+    assert cursor["comments_since"] == datetime.fromisoformat(
+        mention.item["created_at"].replace("Z", "+00:00")
+    )
+
+    _plain(factory, pull, "poll", 12)
+
+    assert len(_requests(pull.issue)) == 12
+    (notice,) = factory.notices(pull)
+    assert NOTICE in notice["body"]
+    assert _lineage(pull)["plain_feedback_capped_at"] is not None
 
 
 def test_per_pull_request_count_starts_at_zero(factory: Factory) -> None:

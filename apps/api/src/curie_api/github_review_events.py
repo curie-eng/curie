@@ -120,8 +120,14 @@ class UnverifiedFeedback:
         # delivery ID for the same comment/review cannot create a second turn.
         # Installation identity is authorization provenance, not comment
         # identity: reinstalling the same App must not replay an old comment.
-        identity = f"{self.repository_id}:{self.event}:{self.feedback_id}"
-        return f"github-feedback-{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
+        return feedback_event_id(self.repository_id, self.event, self.feedback_id)
+
+
+def feedback_event_id(repository_id: int, event: str, feedback_id: int) -> str:
+    """The per-event identity of one comment or review (`UnverifiedFeedback.event_id`)."""
+
+    identity = f"{repository_id}:{event}:{feedback_id}"
+    return f"github-feedback-{uuid.uuid5(uuid.NAMESPACE_URL, identity)}"
 
 
 def _object(value: Any, code: str) -> dict[str, Any]:

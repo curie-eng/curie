@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Iterable
 from typing import Any
 
 import httpx
@@ -52,6 +53,8 @@ from .github_review_events import (
 from .github_review_snapshot import (
     ReviewComment,
     SubmittedReview,
+    event_request_id,
+    read_review_comment,
     read_review_comments,
     read_submitted_review,
     review_request_id,
@@ -226,8 +229,12 @@ async def _post_mention_notice(
     pr_number: int,
     installation_id: int,
     mention: str,
-) -> None:
-    """Keep the one mention-needed comment on the pull request conversation."""
+) -> bool:
+    """Keep the one mention-needed comment on the pull request conversation.
+
+    False when the provider refused or failed the write. A failed notice never
+    blocks later feedback; the next plain comment past the cap posts it again.
+    """
 
     repository = work_item.repository
     try:
@@ -240,7 +247,27 @@ async def _post_mention_notice(
             mention_notice_text(mention),
         )
     except ForgeError:
-        raise FeedbackUnavailable("mention_notice_unavailable") from None
+        logger.info("factory mention notice deferred: mention_notice_unavailable")
+        return False
+    return True
+
+
+async def _review_replay(
+    session: AsyncSession, work_item: WorkItem, request_ids: Iterable[uuid.UUID]
+) -> WebhookResult | None:
+    """The replay answer when the review was already admitted under one of
+    ``request_ids`` on this WorkItem, or None when none of them exists."""
+
+    owners = set(
+        await session.scalars(
+            select(ExecutionRequest.work_item_id).where(ExecutionRequest.id.in_(set(request_ids)))
+        )
+    )
+    if not owners:
+        return None
+    if owners != {work_item.id}:
+        return ignored("identity_mismatch")
+    return WebhookResult(status="factory_duplicate")
 
 
 def _bound(lineage: ThreadPublicationLineage) -> BoundReviewLineage:
@@ -317,15 +344,22 @@ async def admit_parsed_feedback(
         else review_request_id(feedback.repository_id, feedback.pr_number, feedback.review_id)
     )
     if review_key is not None:
+        assert feedback.review_id is not None
         # Another piece of this review already admitted it: replay without
-        # reading the provider again, as admission's own replay answers.
-        existing = await session.scalar(
-            select(ExecutionRequest.work_item_id).where(ExecutionRequest.id == review_key)
+        # reading the provider again, as admission's own replay answers. A
+        # review answered before #5794 was admitted under the per-event id of
+        # the review or of a mentioning piece.
+        replay = await _review_replay(
+            session,
+            work_item,
+            (
+                review_key,
+                event_request_id(feedback.repository_id, "pull_request_review", feedback.review_id),
+                event_request_id(feedback.repository_id, feedback.event, feedback.feedback_id),
+            ),
         )
-        if existing is not None:
-            if existing != work_item.id:
-                return ignored("identity_mismatch")
-            return WebhookResult(status="factory_duplicate")
+        if replay is not None:
+            return replay
     check_feedback_lineage(feedback, bound)
     if verified is None:
         code_host = factory_code_host_entry(registry)
@@ -351,6 +385,18 @@ async def admit_parsed_feedback(
             # a mention in it is admitted on its own, as before.
             if not mentions_factory(feedback.body, mention, app_slug):
                 raise FeedbackIgnored("non_actionable_review")
+            if feedback.event == "pull_request_review_comment":
+                # The fresh read below matches an edit that added the mention;
+                # only the comment's updated_at against submission shows it.
+                await read_review_comment(
+                    client,
+                    verified,
+                    repo_path=repo_path,
+                    pr_number=bound.pr_number,
+                    review=review,
+                    comment_id=feedback.feedback_id,
+                    head_sha=bound.head_sha,
+                )
             review = None
     # The fresh read of this piece is its edit check. A review body edited
     # before the review is first admitted is caught only when the review's own
@@ -375,6 +421,18 @@ async def admit_parsed_feedback(
             raise FeedbackUnavailable("review_comments_unavailable")
         if not review.body.strip() and not comments:
             raise FeedbackIgnored("empty_feedback")
+        # A review whose mentioning inline comment was admitted on its own
+        # before #5794 was answered then.
+        replay = await _review_replay(
+            session,
+            work_item,
+            (
+                event_request_id(feedback.repository_id, "pull_request_review_comment", comment.id)
+                for comment in comments
+            ),
+        )
+        if replay is not None:
+            return replay
         request_id = review_key
         url = feedback_url(
             settings.github_html_base,
@@ -435,18 +493,17 @@ async def admit_parsed_feedback(
             select(ExecutionRequest.id).where(ExecutionRequest.id == request_id)
         )
         if replay is None:
-            if current_lineage.plain_feedback_capped_at is None:
-                # Post first: a failed post leaves the cap unrecorded, so a
-                # later plain comment posts it again; the marker keeps it one.
-                await _post_mention_notice(
-                    registry,
-                    client,
-                    work_item,
-                    lineage_id=current_lineage.id,
-                    pr_number=feedback.pr_number,
-                    installation_id=feedback.installation_id,
-                    mention=mention,
-                )
+            # Post first: a failed post leaves the cap unrecorded, so a later
+            # plain comment posts it again; the marker keeps it one.
+            if current_lineage.plain_feedback_capped_at is None and await _post_mention_notice(
+                registry,
+                client,
+                work_item,
+                lineage_id=current_lineage.id,
+                pr_number=feedback.pr_number,
+                installation_id=feedback.installation_id,
+                mention=mention,
+            ):
                 await session.execute(
                     update(ThreadPublicationLineage)
                     .where(ThreadPublicationLineage.id == current_lineage.id)
