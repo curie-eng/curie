@@ -333,10 +333,7 @@ fn agent() -> Value {
     json!({"id":"agent-fixture","name":"dark-factory","channels":[],"created_at":"2026-10-04T00:00:00Z","memory":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
 }
 
-fn platform(
-    req: &Request,
-    state: &std::sync::Mutex<Value>,
-) -> Response {
+fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
     let path = req.path.split('?').next().unwrap();
     let mut saved = state.lock().unwrap();
     let result = match (req.method.as_str(), path) {
@@ -455,11 +452,7 @@ impl Fixture {
         Self::open(account_left, bot_status, bot_body)
     }
 
-    fn open(
-        account_left: f64,
-        bot_status: u16,
-        bot_body: &'static str,
-    ) -> Self {
+    fn open(account_left: f64, bot_status: u16, bot_body: &'static str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("bin")).unwrap();
         for tool in ["helm", "kubectl", "kind", "docker"] {
@@ -3248,4 +3241,3 @@ fn the_ready_path_puts_the_factory_output_allowance_and_reports_it() {
         json!({"max_output_tokens_per_run": 250000, "max_usd_per_day": 5.0})
     );
 }
-
