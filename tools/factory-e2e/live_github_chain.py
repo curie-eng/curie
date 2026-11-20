@@ -18,6 +18,8 @@ Order, each stage a step of the evidence:
 2. ``install_values`` (after the namespace, before the install): the OIDC client
    Secret and a disposable Dex, and a values transformer that adds the API's
    ``CURIE_OIDC_*`` settings to the install and every upgrade.
+   ``ensure_label`` replaces the shared intake label step: ``--stop-after
+   links`` creates none, and the full mode deletes a label it created.
 3. ``drive``: the first check (no open item, no work item), two real OIDC
    logins, the session probe, the code host links,
    then either the stop or beats (a) to (h).
@@ -118,6 +120,7 @@ ISSUES_STEP = "close live chain issues"
 PORT_FORWARD_STEP = "stop live chain dex port-forward"
 DEFAULT_BRANCH_STEP = "restore live chain default branch"
 LABEL_STEP = "delete live chain unbound label"
+INTAKE_LABEL_STEP = "delete live chain intake label"
 
 USER_AGENT = "curie-factory-e2e"
 SPEND_SAMPLE_CAP = judge.SPEND_CAP_USD
@@ -635,6 +638,24 @@ def evidence_serializer(identifiers: judge.Identifiers) -> Callable[[dict[str, A
     return serialize
 
 
+def local_identifiers(p: fe.Preflight) -> dict[str, list[str | int]]:
+    """Operator-machine values: the CLI binary's path and the webhook restore URL.
+
+    ``main`` keeps the binary path out of the log and the evidence (the hook's
+    ``private_binary``); these catch it anywhere else, and the restore URL a
+    dead tunnel's step names. A bare command name is not a path and is skipped.
+    """
+
+    ids: dict[str, list[str | int]] = {}
+    binaries = {p.config.curie_bin, os.environ.get("CURIE_BIN") or ""}
+    paths: list[str | int] = sorted(b for b in binaries if os.path.dirname(b))
+    if paths:
+        ids["binary"] = paths
+    if p.config.restore_webhook_url:
+        ids["restore-url"] = [p.config.restore_webhook_url]
+    return ids
+
+
 def config_identifiers(p: fe.Preflight) -> dict[str, list[str | int]]:
     """The raw identifiers the configuration alone names, before any account read.
 
@@ -654,7 +675,7 @@ def config_identifiers(p: fe.Preflight) -> dict[str, list[str | int]]:
     host = registry_host(p.config.layer_registry)
     if host:
         ids["registry"] = [host]
-    return ids
+    return {**ids, **local_identifiers(p)}
 
 
 _INSTALLED_FILTERS: list[Callable[[str], str]] = []
@@ -824,17 +845,75 @@ def comments_record(raw: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return [_comment(item) for item in raw]
 
 
+# A turn record is appended when its runner turn ends, just before the worker
+# marks the request terminal; the margin absorbs the clock of the runner's pod.
+TRANSCRIPT_TURN_MARGIN = dt.timedelta(seconds=60)
+
+
+def turn_tool_names(record: Mapping[str, Any]) -> list[str]:
+    """The ``tool_use`` names of one transcript turn record, in order.
+
+    Shape: ``curie_runner.history.TurnRecord.to_dict`` (``type`` ``turn``, ``ts``,
+    ``messages`` whose content blocks carry ``{"type": "tool_use", "name"}``).
+    """
+
+    names: list[str] = []
+    for message in record.get("messages") or []:
+        content = message.get("content") if isinstance(message, Mapping) else None
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, Mapping) and block.get("type") == "tool_use":
+                names.append(str(block.get("name") or ""))
+    return names
+
+
+def request_tool_calls(
+    rows: Iterable[Mapping[str, Any]], transcripts: Iterable[Any]
+) -> dict[str, list[str]]:
+    """The tool calls the thread transcript recorded for each request, by request id.
+
+    ``transcripts`` are the stored values of the work item's thread
+    (``thread_transcripts.value``, a JSON array of records). A turn belongs to
+    the newest request created at or before its ``ts`` that had not ended more
+    than ``TRANSCRIPT_TURN_MARGIN`` before it; a turn no request owns, and a
+    record that is not a turn, is dropped.
+    """
+
+    spans = sorted(
+        (
+            judge.parse_time(row["created_at"]),
+            judge.parse_time(row["terminal_at"]) if row.get("terminal_at") else None,
+            str(row["id"]),
+        )
+        for row in rows
+    )
+    calls: dict[str, list[str]] = {request_id: [] for _start, _end, request_id in spans}
+    for value in transcripts:
+        for record in value if isinstance(value, list) else []:
+            if not isinstance(record, Mapping) or record.get("type") != "turn":
+                continue
+            try:
+                ts = judge.parse_time(record.get("ts"))
+            except ValueError:
+                continue
+            owners = [span for span in spans if span[0] <= ts]
+            if not owners:
+                continue
+            _start, end, request_id = owners[-1]
+            if end is None or ts <= end + TRANSCRIPT_TURN_MARGIN:
+                calls[request_id].extend(turn_tool_names(record))
+    return calls
+
+
 def request_records(
-    rows: Iterable[Mapping[str, Any]], proposals: Iterable[str] = ()
+    rows: Iterable[Mapping[str, Any]], tool_calls: Mapping[str, Sequence[str]] | None = None
 ) -> list[dict[str, Any]]:
     """Execution request rows of the install, in the judge's shape.
 
-    ``proposals`` are the request ids a ``propose_rule`` call stored a rule for
-    (``memory_rules.source_request_id``, #5796): that stored row is the record of
-    the call, so such a request's tool notes carry ``propose_rule``.
+    ``tool_calls`` are the tool names the thread transcript recorded for each
+    request (``request_tool_calls``); they become the request's tool notes.
     """
 
-    proposed = {str(item) for item in proposals}
+    recorded = tool_calls or {}
     records = []
     for row in rows:
         request_id = str(row["id"])
@@ -846,7 +925,7 @@ def request_records(
                 "created_at": row["created_at"],
                 "finished_at": row.get("terminal_at"),
                 "objective": row.get("objective") or "",
-                judge.TOOL_NOTES_KEY: [judge.PROPOSE_RULE_TOOL] if request_id in proposed else [],
+                judge.TOOL_NOTES_KEY: list(recorded.get(request_id, ())),
             }
         )
     return sorted(records, key=lambda r: judge.parse_time(r["created_at"]))
@@ -865,19 +944,44 @@ def pull_record(raw: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def investigating_comment(
+    comments: Iterable[Mapping[str, Any]], app_login: str
+) -> Mapping[str, Any] | None:
+    """The App's comment that carries the investigating lead in this read, or None.
+
+    The status comment is edited in place (``factory_notices._sync_comment``):
+    its lead opens every non-final body and is gone from the terminal one, so
+    beat (a) keeps the first read that shows it.
+    """
+
+    for comment in comments:
+        by_app = (comment.get("user") or {}).get("login") == app_login
+        if by_app and str(comment.get("body") or "").startswith(judge.STATUS_COMMENT_PREFIX):
+            return comment
+    return None
+
+
 def beat_a_record(
     *,
     issue_number: int,
     labelled_at: str,
+    investigating: tuple[Mapping[str, Any], str] | None,
     comments: Sequence[Mapping[str, Any]],
     labels: Sequence[Mapping[str, Any]],
     quiet_rows: Sequence[Mapping[str, Any]],
     observed_at: str,
     work_item_id: str,
 ) -> dict[str, Any]:
+    """``investigating`` is the first read showing the lead: the comment and when it was read."""
+
     return {
         "issue_number": issue_number,
         "labelled_at": labelled_at,
+        "investigating": (
+            {"comment": _comment(investigating[0]), "observed_at": investigating[1]}
+            if investigating is not None
+            else None
+        ),
         "comments": comments_record(comments),
         "issue_labels": [str(label.get("name")) for label in labels],
         "quiet_snapshot": {"observed_at": observed_at, "requests": request_records(quiet_rows)},
@@ -975,7 +1079,7 @@ def beat_c_record(
     review_comments: Sequence[Mapping[str, Any]],
     files: Sequence[Mapping[str, Any]],
     request_rows: Sequence[Mapping[str, Any]],
-    proposals: Iterable[str],
+    transcripts: Sequence[Any],
     pull_after: Mapping[str, Any],
     committed_at: str,
     branches: Sequence[Mapping[str, Any]],
@@ -1009,7 +1113,7 @@ def beat_c_record(
             for c in review_comments
         ],
         "diff_added_lines": added_lines_by_path(files),
-        "requests": request_records(request_rows, proposals),
+        "requests": request_records(request_rows, request_tool_calls(request_rows, transcripts)),
         "pull_after": {"head": {**after["head"], "committed_at": committed_at}},
         "branches": [str(b.get("name")) for b in branches],
         "pull_comments": comments_record(pull_comments),
@@ -1282,13 +1386,21 @@ def request_rows(p: fe.Preflight, work_item_id: str) -> list[dict[str, Any]]:
     )
 
 
-def proposal_request_ids(p: fe.Preflight, work_item_id: str) -> list[str]:
+def thread_transcripts(p: fe.Preflight, work_item_id: str) -> list[Any]:
+    """The stored transcripts of the work item's thread (``thread_transcripts``).
+
+    The runner appends one turn record per turn, with its ``tool_use`` blocks,
+    to the thread whose key is the work item's ``conversation_id``; the row is
+    deleted only when the work item ends, so it is still there in beat (c).
+    """
+
     rows = sql_json(
         p,
-        "SELECT r.source_request_id AS id FROM memory_rules r JOIN execution_requests e "
-        f"ON e.id = r.source_request_id WHERE e.work_item_id = '{_uuid(work_item_id)}'",
+        "SELECT t.value AS value FROM thread_transcripts t JOIN work_items w "
+        "ON t.agent_id = w.agent_id AND t.thread_key = w.conversation_id "
+        f"WHERE w.id = '{_uuid(work_item_id)}' ORDER BY t.created_at",
     )
-    return [str(row["id"]) for row in rows]
+    return [row["value"] for row in rows]
 
 
 def work_item_for_issue(
@@ -1416,6 +1528,7 @@ def stage_identities(p: fe.Preflight, chain: ChainRun) -> None:
         kube_context=p.config.kube_context,
         registry=p.config.layer_registry,
     )
+    chain.identifiers.update(local_identifiers(p))
     install_sanitizer(p, chain.identifiers)
     chain.record["identities"] = identities_record(actor, reader, repository, p.config.mention)
     chain.record.setdefault("agent", {})
@@ -1664,9 +1777,15 @@ def beat_a(p: fe.Preflight, chain: ChainRun) -> None:
     number = int(issue["number"])
     app = chain.record["identities"]["app_login"]
     repository_id = int(chain.record["identities"]["repository_id"])
+    # The first read, from label time on, that shows the investigating lead.
+    seen: list[tuple[Mapping[str, Any], str]] = []
 
     def question() -> dict[str, Any] | None:
-        for comment in issue_comments(p, number):
+        comments = issue_comments(p, number)
+        lead = investigating_comment(comments, app) if not seen else None
+        if lead is not None:
+            seen.append((copy.deepcopy(dict(lead)), now_iso()))
+        for comment in comments:
             if (comment.get("user") or {}).get("login") == app and judge.QUESTIONS_MARKER in str(
                 comment.get("body")
             ):
@@ -1686,6 +1805,7 @@ def beat_a(p: fe.Preflight, chain: ChainRun) -> None:
     chain.record["beat_a"] = beat_a_record(
         issue_number=number,
         labelled_at=labelled_at,
+        investigating=seen[0] if seen else None,
         comments=issue_comments(p, number),
         labels=_github(p, "GET", f"/repos/{p.config.repo}/issues/{number}/labels"),
         quiet_rows=request_rows(p, work_item_id),
@@ -1769,7 +1889,7 @@ def beat_c(p: fe.Preflight, chain: ChainRun) -> None:
         ),
         files=files,
         request_rows=request_rows(p, work_item_id),
-        proposals=proposal_request_ids(p, work_item_id),
+        transcripts=thread_transcripts(p, work_item_id),
         pull_after=after,
         committed_at=str(commit["commit"]["committer"]["date"]),
         branches=p._paged(f"/repos/{repo}/branches"),
@@ -1956,28 +2076,71 @@ def retired_bundle_copy(p: fe.Preflight) -> Path:
 
 
 def delete_label(p: fe.Preflight, label: str) -> dict[str, Any]:
-    """Delete the run's unbound label, then read it back: only a 404 is gone."""
+    """Delete a label the run created, then read it back: only a 404 is gone."""
 
     path = f"/repos/{p.config.repo}/labels/{urllib.parse.quote(label, safe='')}"
     status, _ = p.as_actor("DELETE", path)
     if status not in (204, 404):
-        raise fe.PreflightFailed(f"deleting the unbound label answered HTTP {status}")
+        raise fe.PreflightFailed(f"deleting the label answered HTTP {status}")
     read, _ = p.as_actor("GET", path)
     if read != 404:
-        raise fe.PreflightFailed(f"the unbound label still reads back (HTTP {read})")
+        raise fe.PreflightFailed(f"the label still reads back (HTTP {read})")
     return {"deleted": True}
 
 
-def _in_force_version(p: fe.Preflight) -> Any:
-    """The agent's newest deployment's version: a refused deploy must leave it unchanged."""
+def ensure_label(p: fe.Preflight) -> None:
+    """The scenario's intake label step, in place of the shared ``ensure_label``.
+
+    ``--stop-after links`` opens no ticket, so it creates no label. The full
+    mode creates it when missing and then deletes it in teardown, verified by a
+    404 read-back; the undo is pushed before the create, so an ambiguous create
+    is undone too.
+    """
+
+    if chain_of(p).stop_after == STOP_AFTER_LINKS:
+        p.step("live chain stop mode creates no intake label")
+        return
+    label = p.config.label
+    p.ensure_label(
+        on_create=lambda: p.teardown.push(INTAKE_LABEL_STEP, lambda: delete_label(p, label))
+    )
+
+
+def serving_version(rows: Iterable[Mapping[str, Any]]) -> str | None:
+    """The version the worker boots for the agent, or None when none serves.
+
+    The worker's selection (``apps/worker/src/curie_worker/binding.py``
+    ``_RESOLVE_AGENT_SQL``): an ``active`` deployment whose version is the
+    agent's, prod before any other environment, then the newest
+    ``deployed_at``, then the greatest deployment id.
+    """
+
+    active = [row for row in rows if row.get("status") == "active" and row.get("version_id")]
+    if not active:
+        return None
+    best = max(
+        active,
+        key=lambda row: (
+            row.get("environment") == "prod",
+            judge.parse_time(row["deployed_at"]),
+            str(row["id"]),
+        ),
+    )
+    return str(best["version_id"])
+
+
+def _in_force_version(p: fe.Preflight) -> str | None:
+    """The agent's serving version: a refused deploy must leave it serving and unchanged."""
 
     agent_id = _uuid(str(p.evidence.get("agent_id") or ""))
     rows = sql_json(
         p,
-        "SELECT version_id FROM deployments "
-        f"WHERE agent_id = '{agent_id}' ORDER BY deployed_at DESC LIMIT 1",
+        "SELECT d.id, d.status, d.environment, d.deployed_at, d.version_id "
+        "FROM deployments d JOIN agent_versions v "
+        "ON v.id = d.version_id AND v.agent_id = d.agent_id "
+        f"WHERE d.agent_id = '{agent_id}'",
     )
-    return str(rows[0]["version_id"]) if rows else None
+    return serving_version(rows)
 
 
 def beat_h(p: fe.Preflight, chain: ChainRun) -> None:

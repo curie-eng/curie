@@ -110,11 +110,27 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
     ),
     (
         "investigating-late",
-        [("beat_a/comments/0/created_at", at(4))],
+        [("beat_a/investigating/comment/created_at", at(4))],
         "beat_a",
         "investigating comment came late",
     ),
-    ("no-investigating", [("beat_a/comments/0/body", "Working.")], "beat_a", "no investigating"),
+    (
+        "no-investigating",
+        [("beat_a/investigating/comment/body", "Working.")],
+        "beat_a",
+        "no investigating",
+    ),
+    (
+        # The lead never appeared in any read from label time on: the later
+        # snapshot cannot stand in for it.
+        "investigating-never-observed",
+        [
+            ("beat_a/investigating", None),
+            ("beat_a/comments/0/body", "Investigating this ticket."),
+        ],
+        "beat_a",
+        "no investigating",
+    ),
     (
         "questions-late",
         [("beat_a/comments/1/created_at", at(31))],
@@ -654,6 +670,22 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "in force version changed",
     ),
     (
+        # The serving deployment was deactivated: nothing serves afterwards.
+        "no-serving-version-after-the-refused-deploy",
+        [("beat_h/retired_bundle/version_after", None)],
+        "beat_h",
+        "no serving version after",
+    ),
+    (
+        "no-serving-version-before-the-refused-deploy",
+        [
+            ("beat_h/retired_bundle/version_before", None),
+            ("beat_h/retired_bundle/version_after", None),
+        ],
+        "beat_h",
+        "no serving version before",
+    ),
+    (
         "usage-delta-at-the-cap",
         [("usage/samples/8/usage", 60.0)],
         "spend",
@@ -1013,6 +1045,46 @@ CASES: list[tuple[str, list[tuple[str, Any]], str, str]] = [
         "float assertions without places=6",
     ),
     (
+        # The reviewer's example: an exact equality on the fixture converter's
+        # float result, beside the compliant assertAlmostEqual(..., places=6)
+        # the passing diff already adds.
+        "conflicting-assert-equal-on-the-converter-result",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, '        self.assertEqual(convert(0, "c", "de"), 150)'],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-assert-equal-on-the-package-converter",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [*ls, '        self.assertEqual(unitconv.convert(0, "c", "de"), 150)'],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
+        "conflicting-assert-equal-on-an-imported-converter-alias",
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    "from unitconv.convert import UnknownUnit, convert as conv",
+                    *ls,
+                    '        self.assertNotEqual(conv(0, "c", "de"), 150)',
+                ],
+            )
+        ],
+        "beat_f",
+        "float assertions without places=6",
+    ),
+    (
         "deploy-refused-at-the-connector-lock-preflight",
         [
             (
@@ -1069,7 +1141,7 @@ def test_judge_rejects_each_broken_shape(
 @pytest.mark.parametrize(
     "edits",
     [
-        [("beat_a/comments/0/created_at", at(3))],  # exactly the 180 s bound
+        [("beat_a/investigating/comment/created_at", at(3))],  # exactly the 180 s bound
         [("beat_e/reader_command/output/error", "memory_rules.write_access_unverifiable: x")],
         [("beat_e/reader_permission", "read"), ("beat_e/reader_command/elapsed_seconds", 60)],
         [("usage/samples/8/usage", 59.99)],
@@ -1094,6 +1166,17 @@ def test_judge_rejects_each_broken_shape(
         [("beat_f/diff_added_lines", ["self.assertAlmostEqual(f(1), (2.0), places = 6)"])],
         # Liveness: an integer assertEqual, and floats only in strings and comments.
         [("beat_f/diff_added_lines", lambda ls: [*ls, "        self.assertEqual(len(rows), 3)"])],
+        # Liveness: assertEqual on a call that is not the fixture converter.
+        [
+            (
+                "beat_f/diff_added_lines",
+                lambda ls: [
+                    *ls,
+                    '        self.assertEqual(self.convert_label("c"), "C")',
+                    "        self.assertEqual(parser.convert(1), 1)",
+                ],
+            )
+        ],
         # Liveness: a name assigned an integer stays allowed.
         [
             (
@@ -1132,6 +1215,7 @@ def test_judge_rejects_each_broken_shape(
         "tool-note-as-mapping",
         "nested-parens-and-spacing",
         "integer-assert-equal",
+        "assert-equal-on-another-call",
         "integer-variable-assert-equal",
         "floats-only-in-strings-and-comments",
         "acknowledgment-never-edited",

@@ -507,12 +507,16 @@ class ScenarioHooks:
     namespace exists and before the install; its transformer is applied to
     every values build, so the install and each upgrade carry it. ``finish``
     runs in ``main`` after the teardown and before the evidence is written;
-    False fails the run.
+    False fails the run. ``ensure_label`` replaces the shared intake label
+    step. ``private_binary`` keeps the CLI binary's path out of the log and
+    the evidence (its version is still recorded).
     """
 
     before_run: Callable[[Preflight], None] | None = None
     install_values: Callable[[Preflight], ValuesTransform] | None = None
     finish: Callable[[Preflight, list[dict[str, Any]]], bool] | None = None
+    ensure_label: Callable[[Preflight], None] | None = None
+    private_binary: bool = False
 
 
 SCENARIO_HOOKS: dict[str, ScenarioHooks] = {}
@@ -2002,7 +2006,10 @@ def run(argv: list[str], *, check: bool = True, input_text: str | None = None) -
     return result.stdout
 
 
-def resolve_curie_binary(binary: str) -> tuple[str, str]:
+def resolve_curie_binary(binary: str, *, show_path: bool = True) -> tuple[str, str]:
+    """The resolved binary and its version; ``show_path`` False never prints the path."""
+
+    named = repr(binary) if show_path else "(path withheld)"
     try:
         if os.path.dirname(binary):
             path = Path(binary)
@@ -2010,10 +2017,11 @@ def resolve_curie_binary(binary: str) -> tuple[str, str]:
         else:
             resolved = shutil.which(binary)
         if resolved is None:
-            raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable")
+            raise ConfigError(f"CURIE_BIN {named} cannot be resolved to an executable")
         curie_bin = str(Path(resolved).resolve())
     except (OSError, RuntimeError):
-        raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable") from None
+        raise ConfigError(f"CURIE_BIN {named} cannot be resolved to an executable") from None
+    shown = repr(curie_bin) if show_path else "(path withheld)"
     try:
         result = subprocess.run(
             [curie_bin, "--version"],
@@ -2023,14 +2031,15 @@ def resolve_curie_binary(binary: str) -> tuple[str, str]:
             timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired, UnicodeError):
-        raise ConfigError(f"CURIE_BIN {curie_bin!r} could not run --version") from None
+        raise ConfigError(f"CURIE_BIN {shown} could not run --version") from None
     if result.returncode:
-        raise ConfigError(f"CURIE_BIN {curie_bin!r} failed --version (exit {result.returncode})")
+        raise ConfigError(f"CURIE_BIN {shown} failed --version (exit {result.returncode})")
     lines = result.stdout.splitlines()
     version = lines[0] if lines else ""
     if not version.strip():
-        raise ConfigError(f"CURIE_BIN {curie_bin!r} did not report a version")
-    print(f"factory-e2e: curie binary {curie_bin} ({version})", file=sys.stderr, flush=True)
+        raise ConfigError(f"CURIE_BIN {shown} did not report a version")
+    where = f"{curie_bin} " if show_path else ""
+    print(f"factory-e2e: curie binary {where}({version})", file=sys.stderr, flush=True)
     return curie_bin, version
 
 
@@ -3423,11 +3432,15 @@ class Preflight:
             raise PreflightFailed("the fixture repository did not read back as reset") from None
         return {"closed": closed, "branches_deleted": deleted, "verified_clean": True}
 
-    def ensure_label(self) -> None:
+    def ensure_label(self, *, on_create: Callable[[], None] | None = None) -> None:
+        """Create the intake label when it is missing; ``on_create`` runs just before."""
+
         repo = f"/repos/{self.config.repo}"
         name = urllib.parse.quote(self.config.label, safe="")
         status, _ = self.as_actor("GET", f"{repo}/labels/{name}")
         if status == 404:
+            if on_create is not None:
+                on_create()
             status, _ = self.as_actor(
                 "POST", f"{repo}/labels", {"name": self.config.label, "color": "5319e7"}
             )
@@ -3919,7 +3932,10 @@ class Preflight:
         for name, step in driver.teardowns() if driver is not None else ():
             self.teardown.push(name, step)
         if github:
-            self.ensure_label()
+            if hooks.ensure_label is not None:
+                hooks.ensure_label(self)
+            else:
+                self.ensure_label()
             self.tunnel()
             self.point_card_at_tunnel()
             self.repoint_webhook()
@@ -7381,10 +7397,13 @@ def main(argv: list[str] | None = None) -> int:
                     else DEFAULT_CANCEL_RUNNING_ISSUE
                 )
         whole_flow = args.mode == "run" and args.scenario in WHOLE_FLOW_SCENARIOS
+        show_path = not scenario_hooks(args.scenario if args.mode == "run" else None).private_binary
         # Whole-flow input refusal must precede even a local binary command.
         # Ordinary preflight checks its binary before loading factory actions.
         if not whole_flow:
-            curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+            curie_bin, curie_version = resolve_curie_binary(
+                os.environ.get("CURIE_BIN") or "curie", show_path=show_path
+            )
         if whole_flow:
             if args.scenario == "repo-runner" and args.model_base_url:
                 raise ConfigError("repo-runner refuses an external model endpoint")
@@ -7425,7 +7444,9 @@ def main(argv: list[str] | None = None) -> int:
                     "CURIE_FACTORY_MODEL"
                 )
         if whole_flow:
-            curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+            curie_bin, curie_version = resolve_curie_binary(
+                os.environ.get("CURIE_BIN") or "curie", show_path=show_path
+            )
         config = dataclasses.replace(config, curie_bin=curie_bin)
         repo_root = _repo_root()
         if args.mode == "run" and args.scenario == "docker":
@@ -7461,7 +7482,9 @@ def main(argv: list[str] | None = None) -> int:
         candidate_images=args.candidate_images,
         kind_cluster=args.kind_cluster,
     )
-    preflight.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
+    if show_path:
+        preflight.evidence["curie_bin"] = curie_bin
+    preflight.evidence["curie_version"] = curie_version
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"
     if forge is not None:
@@ -7628,11 +7651,17 @@ def _live_chain_finish(p: Preflight, results: list[dict[str, Any]]) -> bool:
     return bool(load_live_github_chain().finish(p, results))
 
 
+def _live_chain_ensure_label(p: Preflight) -> None:
+    load_live_github_chain().ensure_label(p)
+
+
 SCENARIOS[LIVE_CHAIN_SCENARIO] = _drive_live_github_chain
 SCENARIO_HOOKS[LIVE_CHAIN_SCENARIO] = ScenarioHooks(
     before_run=_live_chain_before_run,
     install_values=_live_chain_install_values,
     finish=_live_chain_finish,
+    ensure_label=_live_chain_ensure_label,
+    private_binary=True,
 )
 
 

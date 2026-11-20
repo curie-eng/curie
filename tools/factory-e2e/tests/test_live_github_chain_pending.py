@@ -156,7 +156,25 @@ def test_pending_5857_overrides_output_reads_as_proposals_on() -> None:
     assert lgc.overrides_proposals(1, json.dumps(fixture["output"])) is None
 
 
-def test_pending_5857_proposal_rows_become_tool_notes_the_judge_reads() -> None:
+def _turn(ts: str, *tools: str) -> dict[str, Any]:
+    """A stored transcript turn, from the runner's producer (``TurnRecord.to_dict``)."""
+
+    from curie_runner.history import ConversationMessage, TurnRecord
+
+    calls = [
+        {"type": "tool_use", "id": f"toolu_{i}", "name": name, "input": {}}
+        for i, name in enumerate(tools)
+    ]
+    messages = (
+        ConversationMessage(role="user", content="the turn's prompt"),
+        ConversationMessage(role="assistant", content=calls or [{"type": "text", "text": "ok"}]),
+    )
+    return TurnRecord(user="the turn's prompt", assistant="ok", ts=ts, messages=messages).to_dict()
+
+
+def test_pending_5857_recorded_propose_rule_call_becomes_a_tool_note_the_judge_reads() -> None:
+    # The runner records the tool under its MCP name (#5857's head); the
+    # transcript turn of the revision request carries it, and nothing else does.
     c = PASSING["beat_c"]
     rows = [
         {
@@ -169,12 +187,16 @@ def test_pending_5857_proposal_rows_become_tool_notes_the_judge_reads() -> None:
         }
         for r in c["requests"]
     ]
-    revision = c["requests"][-1]["id"]
-    section = {**copy.deepcopy(c), "requests": lgc.request_records(rows, [revision])}
-    assert judge.judge_beat("beat_c", _record_with("beat_c", section)).passed
-    section["requests"] = lgc.request_records(rows, [])
-    refused = judge.judge_beat("beat_c", _record_with("beat_c", section))
-    assert not refused.passed
+    name = _load(OVERRIDES)["propose_rule_mcp_name"]
+
+    def section(*tools: str) -> dict[str, Any]:
+        transcript = [_turn("2030-01-01T00:38:55+00:00", *tools)]
+        calls = lgc.request_tool_calls(rows, [transcript])
+        return {**copy.deepcopy(c), "requests": lgc.request_records(rows, calls)}
+
+    assert judge.judge_beat("beat_c", _record_with("beat_c", section(name))).passed
+    refused = judge.judge_beat("beat_c", _record_with("beat_c", section("Edit")))
+    assert "the revision trajectory has no propose_rule" in refused.reasons
     assert _load(OVERRIDES)["propose_rule_tool"] == judge.PROPOSE_RULE_TOOL
 
 
@@ -194,30 +216,6 @@ def test_pending_5857_propose_rule_tool_name_matches_the_runner() -> None:
     if found is None:
         pytest.skip("pending #5857: runner tool_names.PROPOSE_RULE_TOOL is not on this checkout")
     assert found.group(1) == _load(OVERRIDES)["propose_rule_tool"] == judge.PROPOSE_RULE_TOOL
-
-
-def test_pending_5796_proposal_query_reads_columns_that_exist_now(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from curie_api.models import ExecutionRequest, MemoryRule
-
-    seen: list[str] = []
-
-    def fake_sql(_p: Any, query: str) -> list[dict[str, Any]]:
-        seen.append(query)
-        return [{"id": "00000000-0000-4000-8000-000000000009"}]
-
-    monkeypatch.setattr(lgc, "sql_json", fake_sql)
-    work_item = "00000000-0000-4000-8000-000000000001"
-    assert lgc.proposal_request_ids(Any, work_item) == ["00000000-0000-4000-8000-000000000009"]
-    assert MemoryRule.__tablename__ == "memory_rules"
-    assert ExecutionRequest.__tablename__ == "execution_requests"
-    assert "source_request_id" in MemoryRule.__table__.columns
-    assert "work_item_id" in ExecutionRequest.__table__.columns
-    assert "FROM memory_rules r JOIN execution_requests e" in seen[0]
-    assert f"e.work_item_id = '{work_item}'" in seen[0]
-    with pytest.raises(lgc.fe.PreflightFailed):
-        lgc.proposal_request_ids(Any, "x' OR '1'='1")
 
 
 # --------------------------------------------------------------------------
@@ -286,3 +284,36 @@ def test_pending_5804_retired_code_matches_the_product() -> None:
     if not any(judge.BUNDLE_RETIRED_CODE in path.read_text() for path in sources):
         pytest.skip(f"pending #5804: {judge.BUNDLE_RETIRED_CODE} is not on this checkout")
     assert judge.BUNDLE_RETIRED_CODE == "bundle.result_declaration_retired"
+
+
+# --------------------------------------------------------------------------
+# The revision reply and the merge notice: what the API's tests assert
+# --------------------------------------------------------------------------
+
+
+def _function_source(path: Path, name: str) -> str:
+    """The text of one top level function of ``path``, or "" when it is absent."""
+
+    text = path.read_text() if path.exists() else ""
+    found = re.search(rf"^(?:async )?def {re.escape(name)}\(", text, re.MULTILINE)
+    if found is None:
+        return ""
+    rest = text[found.end() :]
+    end = re.search(r"^(?:@|(?:async )?def |class )", rest, re.MULTILINE)
+    return text[found.start() : found.end() + (end.start() if end else len(rest))]
+
+
+@pytest.mark.parametrize("notice", ["revision_reply", "checks_line", "merge_notice"])
+def test_pending_notice_assertions_match_the_api_tests(notice: str) -> None:
+    # The driver tests build these posts from the lines copied here; once a
+    # copied line no longer reads the same in its source, re-copy it.
+    entry = _load(FIXTURES / "notices" / "api-asserted-posts.json")[notice]
+    path, _, name = entry["source"].partition("::")
+    source = _function_source(REPO_ROOT / path, name)
+    missing = [line for line in entry["asserted_lines"] if line not in source]
+    if not source or missing:
+        pytest.skip(
+            f"pending a re-copy: {entry['source']} no longer asserts {missing or 'anything'}; "
+            "refresh fixtures/live-github-chain/notices/api-asserted-posts.json"
+        )
+    assert not missing

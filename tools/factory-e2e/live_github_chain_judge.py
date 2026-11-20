@@ -241,7 +241,12 @@ def review_url(repository_url: str, pull_number: Any, review_id: Any) -> str:
 
 
 def request_tool_names(request: Mapping[str, Any]) -> list[str]:
-    """ASSUMED (#5796): the tool names of a request's recorded tool notes."""
+    """The tool names a request's turns recorded in the thread transcript.
+
+    The driver reads them from the stored transcript of the work item's thread
+    (``live_github_chain.request_tool_calls``); a stored rule proposal row is
+    no record of the call.
+    """
 
     names = []
     for note in request.get(TOOL_NOTES_KEY) or []:
@@ -424,13 +429,25 @@ def float_equality_assertions(added_text: str) -> list[str]:
     literal among its arguments (a number with a ``.`` or an exponent), and a bare
     ``assert`` statement comparing with ``==`` or ``!=`` to a float literal, break
     the review rule. So does such a call or statement naming a variable the added
-    code assigns a float literal (``expected = 33.0``, a unary minus included).
-    Comments and strings never count.
+    code assigns a float literal (``expected = 33.0``, a unary minus included),
+    or calling the fixture's converter, which returns a float
+    (``convert(0, "c", "de")``, ``unitconv.convert(...)`` or a name imported
+    from it). Comments and strings never count.
     """
 
     # NEWLINE is kept: it ends a bare ``assert`` statement.
     tokens = [t for t in _code_tokens(added_text) if t.type not in _NON_CODE_TOKENS]
     float_names = _float_assigned_names(tokens)
+    functions, modules = _converter_names(tokens)
+
+    def converter_call(argument: Sequence[tokenize.TokenInfo], i: int) -> bool:
+        if i + 1 >= len(argument) or argument[i + 1].string != "(":
+            return False
+        dotted = i > 0 and argument[i - 1].string == "."
+        if not dotted:
+            return argument[i].string in functions
+        owner = argument[i - 2].string if i > 1 else ""
+        return argument[i].string == CONVERTER_FUNCTION and owner in modules
 
     def floaty(argument: Sequence[tokenize.TokenInfo]) -> bool:
         return any(
@@ -440,6 +457,7 @@ def float_equality_assertions(added_text: str) -> list[str]:
                 and t.string in float_names
                 and not (i and argument[i - 1].string == ".")
             )
+            or (t.type == tokenize.NAME and converter_call(argument, i))
             for i, t in enumerate(argument)
         )
 
@@ -495,6 +513,55 @@ def _float_assigned_names(tokens: Sequence[tokenize.TokenInfo]) -> set[str]:
         ):
             names.add(token.string)
     return names
+
+
+# The fixture's converter (``fixtures/unitconv/unitconv/convert.py``): ``convert``
+# returns a float, so an exact equality on its result is a float assertion.
+CONVERTER_PACKAGE = "unitconv"
+CONVERTER_FUNCTION = "convert"
+
+
+def _converter_names(tokens: Sequence[tokenize.TokenInfo]) -> tuple[set[str], set[str]]:
+    """The names that call the fixture converter, and the names of its modules.
+
+    ``convert`` and the package ``unitconv`` always count; an added
+    ``from unitconv[.convert] import convert [as c]`` adds ``c``, and an added
+    ``import unitconv[.convert] as m`` adds ``m`` as a module.
+    """
+
+    functions = {CONVERTER_FUNCTION}
+    modules = {CONVERTER_PACKAGE, CONVERTER_FUNCTION}
+    strings = [t.string for t in tokens]
+    for index, word in enumerate(strings):
+        if word not in {"from", "import"}:
+            continue
+        if index + 1 >= len(strings) or strings[index + 1] != CONVERTER_PACKAGE:
+            continue
+        end = index + 1
+        while end < len(tokens) and tokens[end].type != tokenize.NEWLINE:
+            end += 1
+        statement = strings[index + 1 : end]
+        if word == "import":
+            if "as" in statement:
+                modules.add(statement[statement.index("as") + 1])
+            continue
+        if "import" not in statement:
+            continue
+        imported = [
+            name
+            for name in statement[statement.index("import") + 1 :]
+            if name not in {"(", ")", ","}
+        ]
+        for at, name in enumerate(imported):
+            if name != CONVERTER_FUNCTION or (at and imported[at - 1] == "as"):
+                continue
+            alias = (
+                imported[at + 2] if at + 2 < len(imported) and imported[at + 1] == "as" else name
+            )
+            # ``from unitconv import convert as c`` may name the module or the function.
+            functions.add(alias)
+            modules.add(alias)
+    return functions, modules
 
 
 def _is_places_six(argument: Sequence[tokenize.TokenInfo]) -> bool:
@@ -618,14 +685,20 @@ def _judge_beat_a(b: _Beat, rec: Mapping[str, Any]) -> None:
     a, ids = rec["beat_a"], rec["identities"]
     b.check(rec["agent"]["memory_rule_proposals"] is True, "rule proposals were not turned on")
     label_at = a["labelled_at"]
-    statuses = [
-        c for c in a["comments"] if _by_app(c, ids) and c["body"].startswith(STATUS_COMMENT_PREFIX)
-    ]
-    if b.check(bool(statuses), "no investigating status comment"):
+    # The status comment is edited in place (``factory_notices._sync_comment``),
+    # so its investigating lead is judged from the first read that showed it,
+    # not from the later snapshot, where the body may already be terminal.
+    seen = a["investigating"]
+    lead = seen["comment"] if isinstance(seen, Mapping) else None
+    if b.check(
+        lead is not None and _by_app(lead, ids) and lead["body"].startswith(STATUS_COMMENT_PREFIX),
+        "no investigating status comment was observed",
+    ):
+        assert lead is not None
         b.within(
             "status_seconds",
             label_at,
-            min((c["created_at"] for c in statuses), key=parse_time),
+            lead["created_at"],
             STATUS_COMMENT_WITHIN,
             "the investigating comment came late",
         )
@@ -987,10 +1060,12 @@ def _judge_beat_h(b: _Beat, rec: Mapping[str, Any]) -> None:
         BUNDLE_RETIRED_CODE in deploy_refusal_codes(deploy["output"]),
         f"the deploy refusal is not {BUNDLE_RETIRED_CODE}",
     )
-    b.check(
-        deploy["version_before"] == deploy["version_after"],
-        "the in force version changed after the refused deploy",
-    )
+    # The serving version is the one the worker boots: the agent's active
+    # deployment, prod first, then the newest (``live_github_chain.serving_version``).
+    before, after = deploy["version_before"], deploy["version_after"]
+    b.check(bool(before), "no serving version before the refused deploy")
+    b.check(bool(after), "no serving version after the refused deploy")
+    b.check(before == after, "the in force version changed after the refused deploy")
 
 
 def _judge_spend(b: _Beat, rec: Mapping[str, Any]) -> None:
@@ -1070,6 +1145,8 @@ ROLE_PLACEHOLDERS: Mapping[str, str] = {
     "context": "<context>",
     "registry": "<registry>",
     "code-host": "<code-host>",
+    "binary": "<curie-bin>",
+    "restore-url": "<restore-url>",
 }
 
 

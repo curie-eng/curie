@@ -13,6 +13,7 @@ GitHub shapes follow the REST docs cited beside each builder in
 from __future__ import annotations
 
 import copy
+import dataclasses
 import datetime as dt
 import json
 import subprocess
@@ -456,6 +457,151 @@ def test_wiring_a_failure_right_after_check_app_writes_and_prints_no_raw_identif
     assert "repository <fixture-repo> by <writer> in <namespace> on <context>" in parsed["error"]
 
 
+PRIVATE_RESTORE_URL = "https://private.example.internal/hook"
+
+
+def _private_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A working CLI binary under an operator's private path."""
+
+    binary = tmp_path / "home" / "someone" / "private" / "bin" / "curie"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nprintf 'curie 0.0.0-test\\n'\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("CURIE_BIN", str(binary))
+    return binary
+
+
+def _dead_tunnel_webhook(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """The App webhook still points at a dead quick tunnel; PATCHes are recorded."""
+
+    hook = {"url": "https://dead-tunnel-word.trycloudflare.com/github/webhook"}
+    patched: list[Any] = []
+
+    def as_app(_p: fe.Preflight, method: str, path: str, body: Any = None) -> Any:
+        if method == "PATCH":
+            patched.append(body)
+            hook["url"] = body["url"]
+        return 200, dict(hook)
+
+    monkeypatch.setattr(fe.Preflight, "as_app", as_app)
+    monkeypatch.setattr(fe, "tunnel_alive", lambda *_a, **_k: False)
+    return patched
+
+
+def test_wiring_the_binary_path_and_restore_url_reach_no_log_or_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    binary = _private_binary(tmp_path, monkeypatch)
+    _main_env(
+        monkeypatch,
+        tmp_path,
+        CURIE_FACTORY_READER_ACCOUNT_ID="1002",
+        CURIE_FACTORY_WEBHOOK_RESTORE_URL=PRIVATE_RESTORE_URL,
+    )
+    _not_ready(monkeypatch)
+    _github(monkeypatch, open_items=[])
+    _Recorder(monkeypatch)
+    patched = _dead_tunnel_webhook(monkeypatch)
+
+    def check_tools(p: fe.Preflight) -> None:
+        # The shared webhook step, reached early: it records where it restores to.
+        p.tunnel_url = "https://live-tunnel-word.trycloudflare.com"
+        p.repoint_webhook()
+        fe.log(f"the CLI at {p.config.curie_bin} restores to {PRIVATE_RESTORE_URL}")
+        raise fe.PreflightFailed(f"stopped by the test; {p.config.curie_bin} stays private")
+
+    monkeypatch.setattr(fe.Preflight, "check_tools", check_tools)
+    evidence = tmp_path / "evidence.json"
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+
+    assert code == fe.EXIT_FAILED
+    assert patched[-1]["url"] == PRIVATE_RESTORE_URL  # the restore itself still happened
+    out, err = capsys.readouterr()
+    written = evidence.read_text()
+    for text in (out, err, written):
+        for raw in (str(binary), "someone/private", PRIVATE_RESTORE_URL, "private.example"):
+            assert raw not in text, (raw, text)
+    parsed = json.loads(written)
+    assert "curie_bin" not in parsed
+    assert parsed["curie_version"] == "curie 0.0.0-test"
+    detected = next(s for s in parsed["steps"] if s["step"] == "dead tunnel webhook detected")
+    assert detected["restore_to"] == "<restore-url>"
+    assert "factory-e2e: curie binary (curie 0.0.0-test)" in err
+    assert "the CLI at <curie-bin> restores to <restore-url>" in err
+
+
+def test_wiring_a_refused_reader_read_prints_no_binary_path_or_restore_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Only the configuration's sanitizer is installed when the identity reads
+    # fail, so it alone must name the binary path and the restore URL.
+    binary = _private_binary(tmp_path, monkeypatch)
+    _main_env(
+        monkeypatch,
+        tmp_path,
+        CURIE_FACTORY_READER_ACCOUNT_ID="1002",
+        CURIE_FACTORY_WEBHOOK_RESTORE_URL=PRIVATE_RESTORE_URL,
+    )
+    _Recorder(monkeypatch)
+
+    def as_actor(p: fe.Preflight, method: str, path: str, body: Any = None) -> Any:
+        fe.log(f"reading {path} with {p.config.curie_bin} for {PRIVATE_RESTORE_URL}")
+        return 404, {"message": "Not Found"}
+
+    monkeypatch.setattr(fe.Preflight, "as_actor", as_actor)
+    evidence = tmp_path / "evidence.json"
+    code = fe.main(
+        ["run", "--scenario", lgc.SCENARIO, "--stop-after", "links", "--evidence", str(evidence)]
+    )
+    assert code == fe.EXIT_FAILED
+    out, err = capsys.readouterr()
+    for text in (out, err, evidence.read_text()):
+        assert str(binary) not in text and PRIVATE_RESTORE_URL not in text, text
+    assert "with <curie-bin> for <restore-url>" in err
+
+
+def test_wiring_another_scenario_keeps_the_binary_path_in_its_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression: only the live chain withholds the path; issue-to-pr keeps it.
+    binary = _private_binary(tmp_path, monkeypatch)
+    _main_env(monkeypatch, tmp_path)
+    issue = tmp_path / "issue.md"
+    issue.write_text("A title\n\nA body.\n")
+
+    def stop(_p: fe.Preflight, _driver: Any) -> None:
+        raise fe.PreflightFailed("stopped by the test")
+
+    monkeypatch.setattr(fe.Preflight, "run", stop)
+    evidence = tmp_path / "evidence.json"
+    code = fe.main(
+        [
+            "run",
+            "--scenario",
+            "issue-to-pr",
+            "--issue-file",
+            str(issue),
+            "--evidence",
+            str(evidence),
+        ]
+    )
+    assert code == fe.EXIT_FAILED
+    parsed = json.loads(evidence.read_text())
+    assert parsed["curie_bin"] == str(binary.resolve())
+    assert parsed["curie_version"] == "curie 0.0.0-test"
+    assert f"factory-e2e: curie binary {binary.resolve()} (curie 0.0.0-test)" in (
+        capsys.readouterr().err
+    )
+
+
 def test_wiring_a_serializer_refusal_exits_nonzero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -479,7 +625,7 @@ def test_wiring_a_serializer_refusal_exits_nonzero(
 
 
 def _stub_preflight_steps(
-    p: fe.Preflight, monkeypatch: pytest.MonkeyPatch, order: list[str]
+    p: fe.Preflight, monkeypatch: pytest.MonkeyPatch, order: list[str], *, keep: str = ""
 ) -> None:
     for step in (
         "check_tools",
@@ -496,6 +642,8 @@ def _stub_preflight_steps(
         "repoint_webhook",
         "record_baseline",
     ):
+        if step == keep:
+            continue
 
         def stub(*_a: Any, _step: str = step, **_k: Any) -> None:
             order.append(_step)
@@ -525,6 +673,103 @@ def test_wiring_preflight_run_never_opens_a_seed_issue_for_the_chain(
     assert order[0] == "before_run"
     assert order.index("create_namespace") < order.index("install")
     assert p.evidence["scenario"] == {"ran": True}
+
+
+class _Labels:
+    """The fixture repository's labels as GitHub answers the actor token."""
+
+    def __init__(self, *, exists: bool, read_back: int = 404) -> None:
+        self.exists = exists
+        self.read_back = read_back
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        self.calls.append((method, path))
+        if method == "GET" and "/labels/" in path:
+            if self.exists:
+                return 200, {"name": "factory"}
+            return (self.read_back, {}) if ("DELETE", path) in self.calls else (404, {})
+        if method == "POST" and path.endswith("/labels"):
+            self.exists = True
+            return 201, {"name": body["name"]}
+        if method == "DELETE" and "/labels/" in path:
+            self.exists = False
+            return 204, None
+        raise AssertionError(f"unexpected GitHub call {method} {path}")
+
+    def creates(self) -> list[tuple[str, str]]:
+        return [c for c in self.calls if c[0] == "POST"]
+
+
+def _run_label_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, labels: _Labels, **options: Any
+) -> fe.Preflight:
+    """Preflight.run with every step stubbed but the intake label step."""
+
+    p = _preflight(tmp_path, **options)
+    _stub_preflight_steps(p, monkeypatch, [], keep="ensure_label")
+    monkeypatch.setattr(lgc, "before_run", lambda _p: None)
+    monkeypatch.setattr(lgc, "install_values", lambda _p: lambda values: values)
+    monkeypatch.setattr(p, "as_actor", labels)
+    p.run(lambda _p: {"ran": True})
+    return p
+
+
+def test_wiring_stop_mode_creates_no_intake_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    labels = _Labels(exists=False)
+    p = _run_label_step(tmp_path, monkeypatch, labels, stop_after="links")
+    assert labels.calls == []
+    assert "live chain stop mode creates no intake label" in [
+        s["step"] for s in p.evidence["steps"]
+    ]
+    assert lgc.INTAKE_LABEL_STEP not in [r["step"] for r in p.teardown.run()]
+
+
+@pytest.mark.parametrize(("read_back", "ok"), [(404, True), (200, False)])
+def test_wiring_full_mode_deletes_the_intake_label_it_created(
+    read_back: int, ok: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # read_back=404 is the liveness case: only a label that reads back gone is undone.
+    labels = _Labels(exists=False, read_back=read_back)
+    p = _run_label_step(tmp_path, monkeypatch, labels, stop_after=None)
+    assert len(labels.creates()) == 1
+    step = next(r for r in p.teardown.run() if r["step"] == lgc.INTAKE_LABEL_STEP)
+    assert step["ok"] is ok
+    assert labels.calls[-2:] == [
+        ("DELETE", f"/repos/{REPO}/labels/curie-factory"),
+        ("GET", f"/repos/{REPO}/labels/curie-factory"),
+    ]
+
+
+def test_wiring_full_mode_leaves_an_existing_intake_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    labels = _Labels(exists=True)
+    p = _run_label_step(tmp_path, monkeypatch, labels, stop_after=None)
+    assert labels.creates() == []
+    assert lgc.INTAKE_LABEL_STEP not in [r["step"] for r in p.teardown.run()]
+    assert labels.calls == [("GET", f"/repos/{REPO}/labels/curie-factory")]
+
+
+def test_wiring_another_scenario_keeps_the_shared_label_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: issue-to-pr creates a missing label and registers no undo.
+    labels = _Labels(exists=False)
+    p = _preflight(tmp_path)
+    p.scenario_name = "issue-to-pr"
+    _stub_preflight_steps(p, monkeypatch, [], keep="ensure_label")
+    monkeypatch.setattr(p, "open_labelled_issue", lambda: 1)
+    monkeypatch.setattr(p, "assert_admission", lambda *_a: None)
+    monkeypatch.setattr(p, "as_actor", labels)
+    p.run(None)
+    assert labels.calls == [
+        ("GET", f"/repos/{REPO}/labels/curie-factory"),
+        ("POST", f"/repos/{REPO}/labels"),
+    ]
+    assert [r["step"] for r in p.teardown.run()] == ["reset fixture repository"]
 
 
 def _oidc_entries(values: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1051,6 +1296,99 @@ def test_wiring_beat_a_opens_ticket_a_with_proposals_on_and_a_baseline(
     assert chain.record["usage"]["samples"] == [{"label": "before_a", "usage": 10.0}]
 
 
+def _status_body(lead: str | None) -> str:
+    from curie_api import factory_notices as notices
+
+    if lead is None:
+        result = notices.result_section("questions_asked", pr_url=None, question_round=1)
+        return notices.status_body(
+            request_id=uuid.UUID(int=1),
+            card_url=None,
+            pill_label="WAITING",
+            phase_view=None,
+            result=result,
+        )
+    return notices.status_body(
+        request_id=uuid.UUID(int=1),
+        card_url=None,
+        pill_label="RUNNING",
+        phase_view=None,
+        result=None,
+        lead_line=lead,
+    )
+
+
+@pytest.mark.parametrize(
+    ("reads", "reason"),
+    [
+        # The status comment reads with its lead, then gains the questions, then
+        # is edited in place to its terminal body before the quiet snapshot.
+        ([["lead"], ["lead", "questions"], ["terminal", "questions"]], None),
+        # Counterexample: the lead appears only 200 s after the label.
+        ([[], ["late-lead", "questions"], ["terminal", "questions"]], "came late"),
+        # Counterexample: no read from label time on ever shows the lead.
+        ([["terminal"], ["terminal", "questions"]], "no investigating status comment"),
+    ],
+    ids=["edited-in-place", "lead-late", "lead-never-seen"],
+)
+def test_wiring_beat_a_keeps_the_first_read_of_the_investigating_lead(
+    reads: list[list[str]],
+    reason: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_api import factory_notices as notices
+
+    p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
+    app = {"login": PASSING["identities"]["app_login"], "id": 9000003, "type": "Bot"}
+    labelled = "2000-01-01T00:00:00Z"  # the quiet window has long elapsed
+    status = 501
+    comments = {
+        "lead": _gh_comment(
+            status, _status_body(notices.INVESTIGATING_LINE), app, "2000-01-01T00:00:20Z"
+        ),
+        "late-lead": _gh_comment(
+            status, _status_body(notices.INVESTIGATING_LINE), app, "2000-01-01T00:03:20Z"
+        ),
+        "terminal": _gh_comment(
+            status, _status_body(None), app, "2000-01-01T00:00:20Z", "2000-01-01T00:05:05Z"
+        ),
+        "questions": _gh_comment(
+            502, PASSING["beat_a"]["comments"][1]["body"], app, "2000-01-01T00:05:00Z"
+        ),
+    }
+    pending = [[comments[name] for name in read] for read in reads]
+
+    def issue_comments(_p: Any, number: int) -> list[dict[str, Any]]:
+        assert number == 11
+        return copy.deepcopy(pending.pop(0) if len(pending) > 1 else pending[0])
+
+    monkeypatch.setattr(lgc, "issue_comments", issue_comments)
+    monkeypatch.setattr(lgc, "open_and_label", lambda *_a: ({"number": 11, "id": 99}, labelled))
+    monkeypatch.setattr(lgc, "work_item_for_issue", lambda *_a: "work-item-a")
+    rows = [_row("request-1", "completed", "2000-01-01T00:00:25Z", "2000-01-01T00:05:05Z")]
+    monkeypatch.setattr(lgc, "request_rows", lambda *_a: rows)
+    labels = [{"name": "factory"}, {"name": judge.QUESTIONS_LABEL}]
+    monkeypatch.setattr(p, "as_actor", lambda *_a, **_k: (200, labels))
+    monkeypatch.setattr(fe, "POLL_SECONDS", 0)
+    _fake_cli(monkeypatch, lambda args: (0, "{}" if "on" in args else _overrides(True), 0.1))
+
+    lgc.beat_a(p, chain)
+
+    a = chain.record["beat_a"]
+    verdict = judge.judge_beat("beat_a", chain.record)
+    if reason is None:
+        assert verdict.passed, verdict.reasons
+        assert a["investigating"]["comment"]["id"] == status
+        assert a["investigating"]["comment"]["body"].startswith(judge.STATUS_COMMENT_PREFIX)
+        # The later snapshot holds the same comment id with its terminal body.
+        assert a["comments"][0]["id"] == status
+        assert not a["comments"][0]["body"].startswith(judge.STATUS_COMMENT_PREFIX)
+    else:
+        assert not verdict.passed
+        assert any(reason in r for r in verdict.reasons), verdict.reasons
+
+
 @pytest.mark.parametrize(("exit_code", "opens"), [(1, False), (0, True)])
 def test_wiring_a_failed_instruction_write_never_opens_ticket_b(
     exit_code: int, opens: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1406,89 +1744,126 @@ def test_handoff_answer_acknowledgment_from_the_real_status_body() -> None:
 
 # The revision reply and the merge notice are produced inside the API's async
 # status renderer (``_render`` in apps/api/src/curie_api/factory_notices.py),
-# which needs the API database, so a tools test cannot drive it. These tests
-# build the bodies from the product's own pure helpers (``status_body``,
-# ``result_section``, ``code_span``) and the format strings pinned against the
-# product source; the producer itself is exercised by the paid live run (#5808
-# criterion 1). The renderer posts on the request's stored reply target: the
-# pull request conversation for a review revision, ticket A for the
-# implementation request whose pull request merged.
+# which needs the API database, so a tools test cannot drive it. The API's own
+# tests drive it against a path-scoped fake GitHub; what they assert that fake
+# receives is copied verbatim into fixtures/live-github-chain/notices/
+# (test_pending_notice_assertions_match_the_api_tests skips once a copied line
+# changes shape). These tests build each post from the product's pure helpers
+# so it satisfies exactly those assertions, file it under the path the API test
+# asserts, and read it back through the driver's own read of that path.
+NOTICES = json.loads((FIXTURES / "notices" / "api-asserted-posts.json").read_text())
+NOTICE_REPO = "fixture-owner/fixture-repo"
 
 
-def test_handoff_revision_reply_from_the_real_status_body_and_code_span() -> None:
+def _github_lists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[fe.Preflight, dict[str, list[dict[str, Any]]]]:
+    """A preflight whose GitHub lists answer by path, like the API tests' fake sink."""
+
+    p = _preflight(tmp_path)
+    p.config = dataclasses.replace(p.config, repo=NOTICE_REPO)
+    lists: dict[str, list[dict[str, Any]]] = {}
+    monkeypatch.setattr(p, "_paged", lambda path: copy.deepcopy(lists.get(path, [])))
+    return p, lists
+
+
+def test_handoff_revision_reply_on_the_path_the_api_tests_assert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from curie_api import factory_notices as notices
+    from curie_api.factory_comment_text import marker_for
 
-    feedback = "https://github.com/example-org/unitconv/pull/12#pullrequestreview-7001"
-    result = notices.result_section("completed", pr_url=None, feedback_url=feedback)
+    spec, checks = NOTICES["revision_reply"], NOTICES["checks_line"]
+    issue, pr = PASSING["beat_a"]["issue_number"], PASSING["beat_c"]["pull_number"]
+    review = PASSING["beat_c"]["review"]["id"]
+    fragment = f"pullrequestreview-{review}"
+    revision = uuid.uuid5(uuid.NAMESPACE_URL, "revision")
+    head = PASSING["beat_c"]["pull_after"]["head"]["sha"]
+    old_head = PASSING["beat_c"]["pull_before"]["head"]["sha"]
 
     def reply(sha: str) -> str:
+        feedback = f"https://github.com/{NOTICE_REPO}/pull/{pr}#{fragment}"
         body = notices.status_body(
-            request_id=uuid.uuid4(),
+            request_id=revision,
+            card_url=None,
+            pill_label="COMPLETED",
+            phase_view=None,
+            result=notices.result_section("completed", pr_url=None, feedback_url=feedback),
+        )
+        line = checks["format"].format(head=notices.code_span(sha), when="2030-01-01 00:41:00 UTC")
+        body += f"\n\n{line}"
+        values = {"repo": NOTICE_REPO, "pr": pr, "fragment": fragment}
+        for part in spec["body_contains"]:
+            expected = part.format(**values, marker=marker_for(revision))
+            assert expected in body, expected
+        return body
+
+    p, lists = _github_lists(tmp_path, monkeypatch)
+
+    def judged(path: str, text: str) -> judge.BeatVerdict:
+        lists.clear()
+        lists[path] = [_app_comment(text, "2030-01-01T00:40:30Z", "2030-01-01T00:41:00Z")]
+        # beat (c) reads the pull request's conversation: issue comments of the pull number.
+        section = copy.deepcopy(PASSING["beat_c"])
+        section["pull_comments"] = lgc.comments_record(lgc.issue_comments(p, pr))
+        return judge.judge_beat("beat_c", _record_with("beat_c", section))
+
+    on_pull = spec["post_path"].format(repo=NOTICE_REPO, pr=pr)
+    assert judged(on_pull, reply(head)).passed
+    stale = judged(on_pull, reply(old_head))
+    assert any("names the revision commit" in r for r in stale.reasons)
+    # Counterexample: the reply posted on ticket A instead of the pull request.
+    on_ticket_a = judged(on_pull.replace(f"/issues/{pr}/", f"/issues/{issue}/"), reply(head))
+    assert any("names the revision commit" in r for r in on_ticket_a.reasons)
+
+
+def test_handoff_merge_notice_on_the_path_the_api_tests_assert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api import factory_notices as notices
+
+    spec = NOTICES["merge_notice"]
+    issue, pr = PASSING["beat_a"]["issue_number"], PASSING["beat_c"]["pull_number"]
+    url = PASSING["beat_b"]["open_pulls"][0]["html_url"]
+    merged = spec["result_last_line"].format(url=url)
+    assert merged.startswith(judge.MERGED_NOTICE_PREFIX)
+
+    def status(result: str) -> dict[str, Any]:
+        text = notices.status_body(
+            request_id=uuid.UUID(int=1),
             card_url=None,
             pill_label="COMPLETED",
             phase_view=None,
             result=result,
         )
-        # factory_notices appends this line to the status body once checks pass.
-        return body + (
-            f"\n\nChecks passed on head {notices.code_span(sha)}, "
-            "observed at 2030-01-01 00:41:00 UTC after the run ended."
-        )
-
-    def judged(pull_conversation: list[dict[str, Any]]) -> judge.BeatVerdict:
-        # beat_c reads the pull request's conversation (issue comments of the pull number).
-        section = copy.deepcopy(PASSING["beat_c"])
-        section["pull_comments"] = lgc.comments_record(pull_conversation)
-        return judge.judge_beat("beat_c", _record_with("beat_c", section))
-
-    def comment(text: str) -> dict[str, Any]:
-        return _app_comment(text, "2030-01-01T00:40:30Z", "2030-01-01T00:41:00Z")
-
-    assert judged([comment(reply("b" * 40))]).passed
-    old_head = judged([comment(reply("a" * 40))])
-    assert any("names the revision commit" in r for r in old_head.reasons)
-    # Counterexample: the reply posted on ticket A instead. The pull request's
-    # conversation then holds only ticket A's own investigating status comment.
-    investigating = notices.status_body(
-        request_id=uuid.uuid4(),
-        card_url=None,
-        pill_label="RUNNING",
-        phase_view=None,
-        result=None,
-        lead_line=notices.INVESTIGATING_LINE,
-    )
-    on_ticket_a = judged([comment(investigating)])
-    assert any("names the revision commit" in r for r in on_ticket_a.reasons)
-    source = Path(notices.__file__).read_text()
-    assert "Checks passed on head {code_span(observation.head_sha)}, " in source
-
-
-def test_handoff_merge_notice_from_the_real_result_section() -> None:
-    from curie_api import factory_notices as notices
-
-    url = PASSING["beat_b"]["open_pulls"][0]["html_url"]
-    source = Path(notices.__file__).read_text()
-    assert 'result += f"Pull request merged: {pr_url}\\n"' in source
-    assert judge.MERGED_NOTICE_PREFIX == "Pull request merged: "
-
-    def notice(pr_url: str) -> dict[str, Any]:
-        text = (
-            notices.result_section("completed", pr_url=pr_url) + f"Pull request merged: {pr_url}\n"
-        )
         return _app_comment(text, "2030-01-01T00:00:20Z", "2030-01-01T00:45:40Z")
 
-    def judged(ticket_a: list[dict[str, Any]]) -> judge.BeatVerdict:
-        # beat_d reads ticket A's issue comments after the merge.
+    completed = notices.result_section("completed", pr_url=url)
+    with_notice = status(completed + f"{merged}\n")
+    # The API test's own checks of the ticket's comment, applied to this body.
+    (part,) = [x for x in with_notice["body"].split("\n\n") if merged in x]
+    assert part.rstrip("\n").splitlines()[-1] == merged
+    ticket_path = spec["ticket_path"].format(repo=NOTICE_REPO, issue=issue)
+    pull_path = spec["pull_path"].format(repo=NOTICE_REPO, pr=pr)
+
+    p, lists = _github_lists(tmp_path, monkeypatch)
+
+    def judged(posted: dict[str, list[dict[str, Any]]]) -> judge.BeatVerdict:
+        lists.clear()
+        lists.update(posted)
+        # beat (d) reads ticket A's issue comments after the merge.
         section = copy.deepcopy(PASSING["beat_d"])
-        section["ticket_comments_after_merge"] = lgc.comments_record(ticket_a)
+        section["ticket_comments_after_merge"] = lgc.comments_record(lgc.issue_comments(p, issue))
         return judge.judge_beat("beat_d", _record_with("beat_d", section))
 
-    assert judged([notice(url)]).passed
-    assert not judged([notice(url.replace("/pull/12", "/pull/99"))]).passed
-    # Counterexample: the notice posted on the pull request instead. Ticket A
-    # then holds only its completed result without the merged line.
-    completed = notices.result_section("completed", pr_url=url)
-    refused = judged([_app_comment(completed, "2030-01-01T00:00:20Z", "2030-01-01T00:40:00Z")])
+    # The API test asserts the notice on both: the ticket's own comment and the
+    # revision's comment on the pull request.
+    assert judged({ticket_path: [with_notice], pull_path: [with_notice]}).passed
+    other = status(completed + spec["result_last_line"].format(url=url.replace("/12", "/99")))
+    assert not judged({ticket_path: [other]}).passed
+    # Counterexample: the notice only on the pull request; ticket A keeps its
+    # completed result without the merged line.
+    refused = judged({ticket_path: [status(completed)], pull_path: [with_notice]})
     assert any("names the merged pull request" in r for r in refused.reasons)
 
 
@@ -1611,17 +1986,20 @@ def _beat_a(
 ) -> dict[str, Any]:
     app = {"login": "fixture-app[bot]", "id": 9000003, "type": "Bot"}
     question = PASSING["beat_a"]["comments"][1]["body"]
+    lead = _gh_comment(
+        1,
+        "Investigating this ticket. The factory will open a pull request "
+        "or post its questions here.",
+        app,
+        "2030-01-01T00:00:20Z",
+    )
     return lgc.beat_a_record(
         issue_number=11,
         labelled_at="2030-01-01T00:00:00Z",
+        investigating=(lead, "2030-01-01T00:00:30Z"),
         comments=[
-            _gh_comment(
-                1,
-                "Investigating this ticket. The factory will open a pull request "
-                "or post its questions here.",
-                app,
-                "2030-01-01T00:00:20Z",
-            ),
+            # The same status comment, edited in place to its terminal body.
+            {**lead, "body": "Status: WAITING", "updated_at": "2030-01-01T00:05:05Z"},
             _gh_comment(2, question, app, "2030-01-01T00:05:00Z"),
         ],
         labels=[
@@ -1679,7 +2057,52 @@ PATCH = (
 )
 
 
-def _beat_c(proposals: list[str] | None = None, conclusion: str = "success") -> dict[str, Any]:
+def _turn(ts: str, *tools: str) -> dict[str, Any]:
+    """One stored transcript record from the runner's own producer (``TurnRecord.to_dict``)."""
+
+    from curie_runner.history import ConversationMessage, TurnRecord
+
+    calls = [
+        {"type": "tool_use", "id": f"toolu_{i}", "name": name, "input": {}}
+        for i, name in enumerate(tools)
+    ]
+    results = [
+        {"type": "tool_result", "tool_use_id": f"toolu_{i}", "content": "ok"}
+        for i in range(len(tools))
+    ]
+    messages = [ConversationMessage(role="user", content="the turn's prompt")]
+    if calls:
+        messages += [
+            ConversationMessage(role="assistant", content=calls),
+            ConversationMessage(role="user", content=results),
+        ]
+    messages.append(ConversationMessage(role="assistant", content=[{"type": "text", "text": "ok"}]))
+    record = TurnRecord(
+        user="the turn's prompt",
+        assistant="ok",
+        ts=ts,
+        messages=tuple(messages),
+        record_id=uuid.uuid4().hex,
+    )
+    return record.to_dict()
+
+
+PROPOSE = "mcp__curie__propose_rule"
+
+
+def _transcript(*revision_tools: str) -> list[Any]:
+    """The thread's stored transcript: one turn per request, the revision's last."""
+
+    return [
+        [
+            _turn("2030-01-01T00:05:00+00:00"),
+            _turn("2030-01-01T00:23:50+00:00", "Read"),
+            _turn("2030-01-01T00:38:55+00:00", *revision_tools),
+        ]
+    ]
+
+
+def _beat_c(transcripts: list[Any] | None = None, conclusion: str = "success") -> dict[str, Any]:
     app = {"login": "fixture-app[bot]", "id": 9000003, "type": "Bot"}
     revision = judge.revision_request_id(9100001, 12, 7001)
     rule = judge.REVIEW_RULE_TEXT
@@ -1729,7 +2152,7 @@ def _beat_c(proposals: list[str] | None = None, conclusion: str = "success") -> 
                 f"Review feedback on {path} line 40: {rule}",
             ),
         ],
-        proposals=[revision] if proposals is None else proposals,
+        transcripts=_transcript("Read", "Edit", PROPOSE) if transcripts is None else transcripts,
         pull_after=_gh_pull(12, "", "2030-01-01T00:25:00Z", sha, "curie/issue-11"),
         committed_at="2030-01-01T00:40:00Z",
         branches=[
@@ -1768,8 +2191,159 @@ def test_shape_beat_c_builder_into_the_judge() -> None:
     section = _beat_c()
     assert section["post"]["body"]["comments"][0]["line"] == 40
     assert _judged("beat_c", section).passed
-    assert not _judged("beat_c", _beat_c(proposals=[])).passed
+    assert section["requests"][-1]["tool_notes"] == ["Read", "Edit", PROPOSE]
+    assert section["requests"][1]["tool_notes"] == ["Read"]
+    # Counterexample: the revision's recorded turn called no propose_rule.
+    refused = _judged("beat_c", _beat_c(_transcript("Read", "Edit")))
+    assert any("no propose_rule" in r for r in refused.reasons)
+    # Counterexample: the call was recorded in a turn of an earlier request.
+    early = [[_turn("2030-01-01T00:23:50+00:00", PROPOSE), _turn("2030-01-01T00:38:55+00:00")]]
+    assert any("no propose_rule" in r for r in _judged("beat_c", _beat_c(early)).reasons)
+    # Counterexample: a turn recorded long after the revision ended belongs to no request.
+    late = [[_turn("2030-01-01T00:38:55+00:00"), _turn("2030-01-01T01:00:00+00:00", PROPOSE)]]
+    assert any("no propose_rule" in r for r in _judged("beat_c", _beat_c(late)).reasons)
+    # Liveness: a turn appended within the margin after the request ended still counts.
+    margin = [[_turn("2030-01-01T00:39:40+00:00", PROPOSE)]]
+    assert _judged("beat_c", _beat_c(margin)).passed
     assert not _judged("beat_c", _beat_c(conclusion="failure")).passed
+
+
+@pytest.mark.parametrize(
+    ("revision_tools", "passed"), [((PROPOSE,), True), (("Read", "Edit"), False)]
+)
+def test_wiring_beat_c_reads_the_tool_calls_the_transcript_recorded(
+    revision_tools: tuple[str, ...],
+    passed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # passed=True is the liveness case. The counterexample has a stored rule
+    # proposal row for the revision request but no recorded propose_rule call:
+    # the row is no evidence of the call, so beat (c) fails.
+    p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
+    repo = "fixture-owner/fixture-repo"
+    p.config = dataclasses.replace(p.config, repo=repo)
+    for beat in ("beat_a", "beat_b"):
+        chain.record[beat] = copy.deepcopy(PASSING[beat])
+    work_item = "00000000-0000-4000-8000-0000000000a1"
+    chain.record["beat_a"]["work_item_id"] = work_item
+    expected = _beat_c(_transcript(*revision_tools))
+    revision = expected["requests"][-1]["id"]
+    rows = [
+        {**row, "work_item_id": work_item}
+        for row in (
+            _row("request-1", "completed", "2030-01-01T00:00:25Z", "2030-01-01T00:05:05Z"),
+            _row("request-2", "completed", "2030-01-01T00:10:30Z", "2030-01-01T00:24:00Z"),
+            _row(
+                revision,
+                "completed",
+                "2030-01-01T00:30:20Z",
+                "2030-01-01T00:39:00Z",
+                expected["requests"][-1]["objective"],
+            ),
+        )
+    ]
+    queries: list[str] = []
+
+    def sql_json(_p: Any, query: str) -> list[dict[str, Any]]:
+        queries.append(query)
+        if "FROM execution_requests" in query:
+            return copy.deepcopy(rows)
+        if "thread_transcripts" in query:
+            return [{"value": value} for value in _transcript(*revision_tools)]
+        if "memory_rules" in query:
+            return [{"id": revision}]
+        raise AssertionError(f"unexpected query {query}")
+
+    monkeypatch.setattr(lgc, "sql_json", sql_json)
+    before, after = "a" * 40, "b" * 40
+    heads = iter([before, after])
+    review = {
+        "id": 7001,
+        "user": {"login": "fixture-writer", "id": PASSING["identities"]["writer_id"]},
+        "state": "COMMENTED",
+        "submitted_at": "2030-01-01T00:30:00Z",
+        "pull_request_url": f"https://api.code-host.example.invalid/repos/{repo}/pulls/12",
+    }
+    answers = {
+        f"/repos/{repo}/commits/{after}": {
+            "commit": {"committer": {"date": "2030-01-01T00:40:00Z"}}
+        },
+        f"/repos/{repo}/pulls/12/reviews/7001": review,
+        f"/repos/{repo}/pulls/12/reviews/7001/comments": [
+            {**expected["review_comments"][0], "id": 5}
+        ],
+        f"/repos/{repo}/commits/{after}/check-runs": expected["revision_checks"]["check_runs"],
+        f"/repos/{repo}/commits/{after}/status": expected["revision_checks"]["status"],
+    }
+
+    def as_actor(method: str, path: str, body: Any = None) -> Any:
+        if method == "GET" and path == f"/repos/{repo}/pulls/12":
+            sha = next(heads, after)
+            return 200, _gh_pull(12, "", "2030-01-01T00:25:00Z", sha, "curie/issue-11")
+        if method == "POST" and path == f"/repos/{repo}/pulls/12/reviews":
+            return 200, review
+        if method == "GET" and path in answers:
+            return 200, answers[path]
+        raise AssertionError(f"unexpected GitHub call {method} {path}")
+
+    paged = {
+        f"/repos/{repo}/pulls/12/files": [
+            {"filename": "unitconv/tests/test_convert.py", "status": "modified", "patch": PATCH}
+        ],
+        f"/repos/{repo}/issues/12/comments": [
+            _gh_comment(
+                21,
+                f"Checks passed on head `{after}`, observed at 2030-01-01 00:41:00 UTC "
+                "after the run ended.",
+                APP,
+                "2030-01-01T00:40:30Z",
+                "2030-01-01T00:41:00Z",
+            )
+        ],
+        f"/repos/{repo}/branches": [{"name": "main"}, {"name": "curie/issue-11"}],
+    }
+    monkeypatch.setattr(p, "as_actor", as_actor)
+    monkeypatch.setattr(p, "_paged", lambda path: copy.deepcopy(paged[path]))
+    chain.record["identities"] = {**chain.record["identities"], "repository_path": repo}
+
+    lgc.beat_c(p, chain)
+
+    recorded = chain.record["beat_c"]["requests"][-1]
+    assert recorded["id"] == revision
+    assert recorded["tool_notes"] == list(revision_tools)
+    assert not [q for q in queries if "memory_rules" in q]
+    verdict = judge.judge_beat("beat_c", chain.record)
+    assert verdict.passed is passed, verdict.reasons
+    if not passed:
+        assert verdict.reasons == ("the revision trajectory has no propose_rule",)
+
+
+def test_shape_transcript_query_reads_columns_that_exist_now(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_api.models import ThreadTranscript, WorkItem
+
+    seen: list[str] = []
+    stored = _transcript(PROPOSE)[0]
+
+    def fake_sql(_p: Any, query: str) -> list[dict[str, Any]]:
+        seen.append(query)
+        return [{"value": stored}]
+
+    monkeypatch.setattr(lgc, "sql_json", fake_sql)
+    work_item = "00000000-0000-4000-8000-000000000001"
+    assert lgc.thread_transcripts(Any, work_item) == [stored]
+    assert ThreadTranscript.__tablename__ == "thread_transcripts"
+    assert WorkItem.__tablename__ == "work_items"
+    for column in ("agent_id", "thread_key", "value", "created_at"):
+        assert column in ThreadTranscript.__table__.columns
+    for column in ("id", "agent_id", "conversation_id"):
+        assert column in WorkItem.__table__.columns
+    assert "t.thread_key = w.conversation_id" in seen[0]
+    assert f"w.id = '{work_item}'" in seen[0]
+    with pytest.raises(fe.PreflightFailed):
+        lgc.thread_transcripts(Any, "x' OR '1'='1")
 
 
 def _rules_vector() -> dict[str, Any]:
@@ -2041,6 +2615,100 @@ def test_handoff_retired_declaration_deploy_uses_the_deployed_bundle_copy(
     assert seen == {"lock": True, "result": True}
     verdict = judge.judge_beat("beat_h", chain.record)
     assert verdict.passed is passed, verdict.reasons
+
+
+def _deployment(
+    did: int, version: str, at: str, *, status: str = "active", env: str = "prod"
+) -> dict[str, Any]:
+    # One row_to_json of deployments: Postgres timestamps with an offset.
+    return {
+        "id": f"00000000-0000-4000-8000-{did:012d}",
+        "status": status,
+        "environment": env,
+        "deployed_at": at.replace("Z", ".25+00:00"),
+        "version_id": version,
+    }
+
+
+def test_shape_serving_version_follows_the_worker_selection() -> None:
+    older = _deployment(1, "v-prod", "2030-01-01T00:00:00Z")
+    newer_dev = _deployment(2, "v-dev", "2030-01-02T00:00:00Z", env="dev")
+    assert lgc.serving_version([older, newer_dev]) == "v-prod"  # prod outranks dev
+    newest = _deployment(3, "v-new", "2030-01-03T00:00:00Z")
+    assert lgc.serving_version([older, newer_dev, newest]) == "v-new"
+    tie = _deployment(4, "v-tie", "2030-01-03T00:00:00Z")
+    assert lgc.serving_version([newest, tie]) == "v-tie"  # then the greatest id
+    retired = {**newest, "status": "inactive"}
+    assert lgc.serving_version([older, retired]) == "v-prod"
+    assert lgc.serving_version([retired]) is None
+
+
+@pytest.mark.parametrize(
+    ("after", "reason"),
+    [
+        # Liveness: the active row is unchanged by the refused deploy.
+        (None, None),
+        # The newest row deactivated after the refusal: an older one now serves.
+        ("deactivate-newest", "in force version changed"),
+        # Every row deactivated: nothing serves.
+        ("deactivate-all", "no serving version after"),
+    ],
+)
+def test_handoff_beat_h_requires_the_same_serving_version_after_the_refusal(
+    after: str | None, reason: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p, chain, _opened = _beat_preflight(tmp_path, monkeypatch)
+    p.run_id = "run1"
+    p.deployed_bundle = tmp_path / "deployed"
+    (p.deployed_bundle / ".claude-plugin").mkdir(parents=True)
+    p.chart_dir = tmp_path
+    label = "factory-unbound-run1"
+    writer = {"login": "fixture-writer", "id": PASSING["identities"]["writer_id"]}
+    events = [
+        {
+            "event": "labeled",
+            "label": {"name": label},
+            "actor": writer,
+            "created_at": "2000-01-01T00:00:00Z",
+        }
+    ]
+    monkeypatch.setattr(
+        lgc, "open_and_label", lambda *_a: ({"number": 21, "id": 99}, events[0]["created_at"])
+    )
+    monkeypatch.setattr(p, "as_actor", lambda *_a, **_k: (201, {}))
+    monkeypatch.setattr(p, "_paged", lambda path: events if path.endswith("/events") else [])
+    monkeypatch.setattr(lgc, "work_item_for_issue", lambda *_a: None)
+    rows = [
+        _deployment(1, "v2", "2030-01-01T00:00:00Z"),
+        _deployment(2, "v3", "2030-01-02T00:00:00Z"),
+    ]
+    queries: list[str] = []
+
+    def sql_json(_p: Any, query: str) -> list[dict[str, Any]]:
+        queries.append(query)
+        return copy.deepcopy(rows)
+
+    monkeypatch.setattr(lgc, "sql_json", sql_json)
+
+    def deploy(args: list[str]) -> Any:
+        if after == "deactivate-newest":
+            rows[1]["status"] = "inactive"
+        elif after == "deactivate-all":
+            for row in rows:
+                row["status"] = "inactive"
+        return 1, RETIRED_REFUSAL, 3.0
+
+    _fake_cli(monkeypatch, deploy)
+    lgc.beat_h(p, chain)
+
+    assert len(queries) == 2 and "FROM deployments d JOIN agent_versions v" in queries[0]
+    retired = chain.record["beat_h"]["retired_bundle"]
+    assert retired["version_before"] == "v3"
+    verdict = judge.judge_beat("beat_h", chain.record)
+    if reason is None:
+        assert verdict.passed, verdict.reasons
+    else:
+        assert any(reason in r for r in verdict.reasons), verdict.reasons
 
 
 def test_shape_teardown_section_from_teardown_results() -> None:

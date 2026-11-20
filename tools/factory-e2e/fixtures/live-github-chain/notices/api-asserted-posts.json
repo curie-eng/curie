@@ -1,0 +1,40 @@
+{
+  "about": "What the API's own tests assert its fake GitHub receives for the revision reply and the merge notice, copied verbatim. Those tests need the API database, so a tools test cannot run them; tests/test_live_github_chain_driver.py builds its posts to satisfy exactly these assertions and routes them by path, and tests/test_live_github_chain_pending.py::test_pending_notice_assertions_match_the_api_tests skips when a copied line no longer reads the same in its source.",
+  "revision_reply": {
+    "source": "apps/api/tests/test_factory_terminus.py::test_conversation_and_review_revisions_comment_on_the_pull_request",
+    "fragment": "pullrequestreview-88104",
+    "asserted_lines": [
+      "assert [path for path, _ in posts] == [f\"/repos/{REPO}/issues/{pr}/comments\"]",
+      "assert pr != number",
+      "assert f\"https://github.com/{REPO}/pull/{pr}#{fragment}\" in body",
+      "assert marker_for(revision) in body"
+    ],
+    "post_path": "/repos/{repo}/issues/{pr}/comments",
+    "body_contains": ["https://github.com/{repo}/pull/{pr}#{fragment}", "{marker}"]
+  },
+  "checks_line": {
+    "source": "apps/api/src/curie_api/factory_notices.py::_render",
+    "note": "No API test asserts this line; it is copied from the renderer, which appends it to the request's status body once its checks passed.",
+    "asserted_lines": [
+      "f\"Checks passed on head {code_span(observation.head_sha)}, \"",
+      "f\"observed at {when} after the run ended.\"",
+      "body += f\"\\n\\n{line}\""
+    ],
+    "format": "Checks passed on head {head}, observed at {when} after the run ended."
+  },
+  "merge_notice": {
+    "source": "apps/api/tests/test_factory_merge_notice.py::test_merged_pull_request_after_a_revision_reaches_the_tickets_own_comment",
+    "asserted_lines": [
+      "ticket_path = f\"/repos/{REPO}/issues/{number}/comments\"",
+      "pull_path = f\"/repos/{REPO}/issues/{pr}/comments\"",
+      "url = f\"https://github.com/{REPO}/pull/{pr}\"",
+      "merged = f\"Pull request merged: {url}\"",
+      "(result,) = [part for part in ticket_after.split(\"\\n\\n\") if merged in part]",
+      "assert result.rstrip(\"\\n\").splitlines()[-1] == merged",
+      "assert merged in revision_comment"
+    ],
+    "ticket_path": "/repos/{repo}/issues/{issue}/comments",
+    "pull_path": "/repos/{repo}/issues/{pr}/comments",
+    "result_last_line": "Pull request merged: {url}"
+  }
+}

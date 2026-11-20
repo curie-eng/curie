@@ -34,15 +34,29 @@
   "beat_a": {
     "issue_number": 11,
     "labelled_at": "2030-01-01T00:00:00Z",
-    "comments": [
-      {
+    "investigating": {
+      "comment": {
         "id": 1,
         "body": "Investigating this ticket.",
         "created_at": "2030-01-01T00:00:20Z",
         "user": {
           "login": "fixture-app[bot]",
           "id": 9000003
-        }
+        },
+        "updated_at": "2030-01-01T00:00:20Z"
+      },
+      "observed_at": "2030-01-01T00:00:30Z"
+    },
+    "comments": [
+      {
+        "id": 1,
+        "body": "Status: WAITING",
+        "created_at": "2030-01-01T00:00:20Z",
+        "user": {
+          "login": "fixture-app[bot]",
+          "id": 9000003
+        },
+        "updated_at": "2030-01-01T00:05:05Z"
       },
       {
         "id": 2,
