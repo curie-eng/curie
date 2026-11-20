@@ -60,8 +60,9 @@ Sign in to the Console with your organization, then open
 plan. A login-code session cannot use it; the page says so and links to
 organization sign-in.
 
-1. The page shows one status line: "Not connected", "Connected, generation N",
-   or "Disconnected". While a disconnect is still finishing, a second line
+1. The page shows one status line: "Not connected", "Connected", or
+   "Disconnected". When connected, a muted line under it names the enrollment
+   generation ("Generation N"). While a disconnect is still finishing, a line
    names the runs and stored tokens left to clean up, and the page refreshes
    every 5 seconds until both are zero.
 2. Paste the token that `claude setup-token` printed into the box and choose
