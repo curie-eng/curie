@@ -385,7 +385,7 @@ _PAUSED_FOR_UPGRADE_LINE = (
 
 
 def public_result_detail(cause: str, *, unchanged: bool, detail: str | None) -> str | None:
-    """Exclude free-form agent finals from the public tracker result."""
+    """Keep an issue's free-form agent final out of its recorded result."""
 
     return None if cause in _AGENT_MESSAGE_CAUSES or unchanged else detail
 
@@ -1569,9 +1569,13 @@ async def _render(
                 cause,
                 pr_url=pr_url,
                 feedback_url=request.reply_target_url,
-                # Keep agent prose on the notice row for the authenticated
-                # report path; publish only typed handoff fields in trackers.
-                detail=public_result_detail(cause, unchanged=unchanged, detail=row.detail),
+                # Issue summaries use only attributed, bounded agent facts.
+                # PR replies retain their bounded, inert final-message quote.
+                detail=(
+                    public_result_detail(cause, unchanged=unchanged, detail=row.detail)
+                    if target.kind == "issue"
+                    else row.detail
+                ),
                 unchanged=unchanged,
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
@@ -1701,7 +1705,7 @@ async def _render(
         None if progress_line or not base else f"{base}/v1/factory/cards/{row.card_token}.svg"
     )
     live_summary: str | None = None
-    if result is None:
+    if result is None and target.kind == "issue":
         current_view = view or phase_view(
             {"phases": [], "loops": []}, reports, request.status, cause
         )
@@ -1724,7 +1728,7 @@ async def _render(
             f"**{safe_tracker_line(state_line[:120])}**  \n{safe_tracker_line(update_line[:200])}"
         )
     ci_observation = await session.get(FactoryCiObservation, request.id)
-    if result is not None and triage is None:
+    if result is not None and triage is None and target.kind == "issue":
         platform_checks: list[tuple[str, str | None, str, str]] = []
         try:
             observations = await read_verification_observations(session, request.id)
@@ -1767,7 +1771,7 @@ async def _render(
                 no_pull_request=cause == "no_pull_request",
                 retrying=retrying,
                 platform_checks=platform_checks,
-                agent_detail=row.detail if cause == "no_pull_request" else None,
+                agent_detail=row.detail if cause in _AGENT_MESSAGE_CAUSES else None,
             )
         )
         result = summary + "\n### Recorded result\n" + result

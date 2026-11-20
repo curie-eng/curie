@@ -127,8 +127,7 @@ def format_handoff(
     for check, platform_command, state, source in platform_checks:
         command_text = safe_tracker_line(platform_command) if platform_command else "not recorded"
         lines.append(
-            f"- **{safe_tracker_line(check)}:** {state} ({source}) · "
-            f"**Command:** {command_text}"
+            f"- **{safe_tracker_line(check)}:** {state} ({source}) · **Command:** {command_text}"
         )
     for item in handoff.verification:
         if item.acceptance_criteria:
@@ -158,7 +157,7 @@ def fallback_summary(
 ) -> str:
     """Keep platform facts separate from a bounded, attributed agent fallback."""
 
-    reason, question = _agent_failure_lines(agent_detail) if no_pull_request else (None, None)
+    reason, question = _agent_failure_lines(agent_detail)
     lines = ["## Run outcome"]
     if no_pull_request:
         lines.append("**No pull request was published.**")
@@ -178,7 +177,8 @@ def fallback_summary(
             f"**Next action:** {action}",
             (
                 f"**Human decision now:** {question} (agent reported)"
-                if question is not None else "**Human decision now:** none recorded."
+                if question is not None
+                else "**Human decision now:** none recorded."
             ),
             *([f"**Agent-reported reason:** {reason}"] if reason is not None else []),
             *(["**Recovery of uncommitted work:** unknown."] if status != "completed" else []),
@@ -192,8 +192,7 @@ def fallback_summary(
     for check, command, state, source in platform_checks:
         command_text = safe_tracker_line(command) if command else "not recorded"
         lines.append(
-            f"- **{safe_tracker_line(check)}:** {state} ({source}) · "
-            f"**Command:** {command_text}"
+            f"- **{safe_tracker_line(check)}:** {state} ({source}) · **Command:** {command_text}"
         )
     if not platform_checks:
         lines.append("No structured verification observations recorded.")
@@ -206,9 +205,7 @@ def _agent_failure_lines(detail: str | None) -> tuple[str | None, str | None]:
 
     if not detail:
         return None, None
-    lines = [
-        line.strip() for line in detail.replace("\r\n", "\n").replace("\r", "\n").splitlines()
-    ]
+    lines = [line.strip() for line in detail.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
     if not lines or not lines[0].startswith("Could not complete:"):
         return None, None
 

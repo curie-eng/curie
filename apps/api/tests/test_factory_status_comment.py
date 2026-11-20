@@ -261,8 +261,7 @@ def test_cancelled_status_sync_releases_claim_and_replacement_finalizes(admitted
             > 0
         )
         assert (
-            await sync_status_comments(maker, get_settings(), owner="status-owner-c", limit=1)
-            == 0
+            await sync_status_comments(maker, get_settings(), owner="status-owner-c", limit=1) == 0
         )
 
     client.portal.call(go)
@@ -1248,7 +1247,8 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
 
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    assert body.startswith("Could not complete:")
+    assert body.startswith("## Run outcome\n")
+    assert "### Recorded result\nCould not complete:" in body
     assert "Details: the tool call kept failing" in body
     assert "Provider message" not in body
     assert "Cause: runner_escalated" in body
@@ -1276,7 +1276,8 @@ def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> N
     assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    assert body.startswith("Could not complete: the sandbox terminated")
+    assert body.startswith("## Run outcome\n")
+    assert "### Recorded result\nCould not complete: the sandbox terminated" in body
     assert f"Details: {detail}" in body
     assert "Provider message:" not in body
     assert "Cause: sandbox_terminated" in body
@@ -1503,7 +1504,8 @@ def test_budget_failure_comment_identifies_the_limit_or_admits_it_is_unknown(
     assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    headline = body.splitlines()[0]
+    assert body.startswith("## Run outcome\n")
+    headline = body.split("### Recorded result\n", 1)[1].splitlines()[0]
     assert headline.startswith("Could not complete:")
     if field is None:
         assert "cannot identify" in headline.lower()
@@ -1567,14 +1569,14 @@ def _defer_start(client: Any, request_id: uuid.UUID, times: int) -> None:
         async with client.app.state.sessionmaker() as session:
             for _ in range(times):
                 generation = await session.scalar(
-                    text(
-                        "SELECT dispatch_generation FROM curie.execution_requests "
-                        "WHERE id = :id"
-                    ),
+                    text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
                     {"id": request_id},
                 )
                 acquired = await acquire(
-                    session, request_id, owner="factory-owner", generation=generation,
+                    session,
+                    request_id,
+                    owner="factory-owner",
+                    generation=generation,
                     wake=await factory_wake(session, request_id),
                     context=None,
                     client=client.app.state.http_client,
@@ -1613,7 +1615,8 @@ def test_start_failed_comment_names_the_attempts_and_last_reason(
     assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    assert body.splitlines()[0] == START_FAILED_SENTENCE
+    assert body.startswith("## Run outcome\n")
+    assert body.split("### Recorded result\n", 1)[1].splitlines()[0] == START_FAILED_SENTENCE
     assert "Cause: start_failed" in body
     assert "Provider message:" not in body
     assert "Status: NEEDS HUMAN" in body
@@ -2476,7 +2479,9 @@ def test_lineage_state_stale_version_and_another_work_item_do_not_invalidate(
 
 @pytest.mark.parametrize("terminal", ["failed", "expired", "completed"])
 def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotently(
-    admitted: Any, terminal: str, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+    admitted: Any,  # noqa: F811
+    terminal: str,
+    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
 ) -> None:
     import hashlib
 
@@ -2537,9 +2542,10 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
     (updated,) = _marked(sink, request_id)
     assert updated["id"] == comment["id"]
     if terminal == "completed":
-        assert updated["body"].split("\n\n")[0].rstrip("\n").splitlines()[-1] == (
-            f"Pull request merged: https://github.com/{REPO}/pull/77"
-        )
+        merged_line = f"Pull request merged: https://github.com/{REPO}/pull/77"
+        assert updated["body"].startswith("## Run outcome\n")
+        assert updated["body"].splitlines().count(merged_line) == 1
+        assert updated["body"].index(merged_line) < updated["body"].index("Status:")
     else:
         assert f"Cause: {request['terminal_cause']}" in updated["body"]
         assert f"Pull request: https://github.com/{REPO}/pull/77 (merged)" in updated["body"]

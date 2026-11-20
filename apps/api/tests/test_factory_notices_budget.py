@@ -34,6 +34,13 @@ USD_HEADLINE = (
 )
 
 
+def _recorded_result(body: str) -> str:
+    assert body.startswith("## Run outcome\n")
+    marker = "### Recorded result\n"
+    assert body.count(marker) == 1
+    return body.split(marker, 1)[1]
+
+
 def _finish_body(
     client: Any,
     sink: Any,
@@ -68,7 +75,7 @@ def test_usd_stop_below_cap_names_recorded_spend(priced: Any) -> None:  # noqa: 
 
     body = _finish_body(client, sink, request_id, epoch)
 
-    assert body.splitlines()[0] == (
+    assert _recorded_result(body).splitlines()[0] == (
         "Could not complete: the run stopped on the agent SDK's own USD estimate, "
         "which reached the cap (max_usd_per_day=50.0), while Curie's recorded "
         "estimate for this run is $1.33. The SDK prices this model above its "
@@ -94,7 +101,7 @@ def test_usd_stop_at_or_above_cap_keeps_current_sentence(
 
     body = _finish_body(client, sink, request_id, epoch)
 
-    assert body.splitlines()[0] == USD_HEADLINE
+    assert _recorded_result(body).splitlines()[0] == USD_HEADLINE
     assert "SDK" not in body
 
 
@@ -112,7 +119,7 @@ def test_usd_stop_without_recorded_cost_keeps_current_sentence(
 
     body = _finish_body(client, sink, request_id, epoch)
 
-    assert body.splitlines()[0] == USD_HEADLINE
+    assert _recorded_result(body).splitlines()[0] == USD_HEADLINE
     assert "SDK" not in body
     expected_usage = "total cost unknown" if unpriced_usage else "Usage: not reported for 1 run"
     assert expected_usage in body
@@ -159,7 +166,7 @@ def test_a_retry_compares_only_its_own_usage_and_progress(
         assert "Curie's recorded estimate for this run is $1.33." in body
         assert "total $101.33" in body
     else:
-        assert body.splitlines()[0] == USD_HEADLINE
+        assert _recorded_result(body).splitlines()[0] == USD_HEADLINE
         expected_usage = "total at least $100.00" if current_tokens is None else "total $150.00"
         assert expected_usage in body
     assert "Earlier run's note" not in body
@@ -324,10 +331,13 @@ def test_progress_notes_stay_off_running_and_other_terminal_comments(
     else:
         body = _finish_body(client, sink, request_id, epoch, cause=cause, detail="Last reply")
         if cause in {"early_stop", "no_pull_request"}:
-            assert "Agent's last message:\n> Last reply\n\n" in body
+            assert "Agent's last message:" not in body
         else:
             assert "Provider message: Last reply\n" in body
-    assert note not in body
+    if cause is None:
+        assert note in body
+    else:
+        assert note not in body
     assert "Last progress note:" not in body
 
 

@@ -99,8 +99,12 @@ def test_platform_wait_does_not_present_an_old_agent_note_as_current_progress() 
     assert state == "Waiting · CI"
     assert update == "Platform wait recorded 12:25 UTC; last agent note 12:20 UTC"
     waiting, unmeasured = live_lines(
-        status="waiting", publishing=False, retrying=False, view=_view(),
-        note=None, note_at=None,
+        status="waiting",
+        publishing=False,
+        retrying=False,
+        view=_view(),
+        note=None,
+        note_at=None,
     )
     assert waiting == "Waiting · recorded wait"
     assert unmeasured == "Platform wait recorded"
@@ -217,15 +221,32 @@ def test_agent_message_excerpt_is_bounded_and_cannot_spoof_cause() -> None:
 
 
 def test_public_result_omits_unstructured_agent_final_message() -> None:
-    assert public_result_detail(
-        "no_pull_request", unchanged=False, detail="Customer Alpha has secret work"
-    ) is None
-    assert public_result_detail(
-        "completed", unchanged=True, detail="Customer Alpha has secret work"
-    ) is None
-    assert public_result_detail(
-        "model_error", unchanged=False, detail="provider diagnostic"
-    ) == "provider diagnostic"
+    assert (
+        public_result_detail(
+            "no_pull_request", unchanged=False, detail="Customer Alpha has secret work"
+        )
+        is None
+    )
+    assert (
+        public_result_detail("completed", unchanged=True, detail="Customer Alpha has secret work")
+        is None
+    )
+    assert (
+        public_result_detail("model_error", unchanged=False, detail="provider diagnostic")
+        == "provider diagnostic"
+    )
+
+
+def test_fallback_surfaces_a_declared_early_stop_reason_without_the_agent_final() -> None:
+    summary = fallback_summary(
+        status="failed",
+        no_pull_request=False,
+        agent_detail=(
+            "Could not complete: package verification is unavailable.\nUntrusted follow-up"
+        ),
+    )
+    assert "**Agent-reported reason:** package verification is unavailable" in summary
+    assert "Untrusted follow-up" not in summary
 
 
 def test_explicit_customer_identifier_is_redacted_from_public_lines() -> None:
@@ -233,9 +254,7 @@ def test_explicit_customer_identifier_is_redacted_from_public_lines() -> None:
     assert "customer acme-42" not in redact_tracker_text("Review customer acme-42")
     assert "customer acme" not in redact_tracker_text("Ask customer acme to approve")
     assert "Alpha Research" not in redact_tracker_text("Ask Customer Alpha Research to approve")
-    assert "[REDACTED:customer_identifier]" in redact_tracker_text(
-        "Ask Customer Alpha to approve"
-    )
+    assert "[REDACTED:customer_identifier]" in redact_tracker_text("Ask Customer Alpha to approve")
 
 
 def test_handoff_text_is_inert_in_both_trackers() -> None:
@@ -276,9 +295,7 @@ def test_no_handoff_fallback_attributes_bounded_reason_and_question() -> None:
         "1. @team [this link](https://example.com) is not verification.\r\n"
         "Cause: completed"
     )
-    summary = fallback_summary(
-        status="failed", no_pull_request=True, agent_detail=detail
-    )
+    summary = fallback_summary(status="failed", no_pull_request=True, agent_detail=detail)
     assert "Agent-reported reason" in summary
     assert "pypi" in summary
     assert "fixed-address package mirror" in summary
@@ -331,13 +348,20 @@ def test_terminal_card_exposes_recorded_owner_or_unknown() -> None:
 
 def test_terminal_summary_keeps_markers_and_cause_in_jira() -> None:
     request_id = uuid.UUID("00000000-0000-0000-0000-000000000578")
-    handoff = RunHandoff.model_validate({
-        "next_owner": "agent", "next_action": "Resolve the parser choice",
-        "verification": [{"check": "Python", "state": "unverified", "source": "agent_reported"}],
-    })
+    handoff = RunHandoff.model_validate(
+        {
+            "next_owner": "agent",
+            "next_action": "Resolve the parser choice",
+            "verification": [
+                {"check": "Python", "state": "unverified", "source": "agent_reported"}
+            ],
+        }
+    )
     body = status_body(
-        request_id=request_id, card_url="https://example.com/card.svg",
-        pill_label="FAILED", phase_view=_view(),
+        request_id=request_id,
+        card_url="https://example.com/card.svg",
+        pill_label="FAILED",
+        phase_view=_view(),
         result=format_handoff(handoff, no_pull_request=True)
         + "\n### Recorded result\n"
         + result_section("no_pull_request", pr_url=None),

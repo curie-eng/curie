@@ -22,10 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "examples/factory-triage"
 FIXTURES = Path(__file__).parent / "fixtures/factory_triage"
 SKILL = BUNDLE / "skills/investigate-report/SKILL.md"
-SPECIFICATION = (
-    ROOT
-    / "examples/dark-factory/preparation/skills/prepare-factory-ticket/references/specification.md"
-)
+SPECIFICATION = FIXTURES / "preparation-specification-recorded.md"
 VARIANTS = ("candidate", "without-evidence")
 SECTIONS = (
     "Problem",
@@ -46,6 +43,8 @@ def cases() -> dict[str, dict]:
 def render(case_id: str, variant: str) -> str:
     if variant not in VARIANTS:
         raise ValueError("Unknown evaluation variant")
+    # Replays use the exact preparation reference shown to the recorded model.
+    # A live skill edit does not retroactively change a recording's prompt.
     policy = (
         SKILL.read_text()
         if variant == "candidate"

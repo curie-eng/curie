@@ -468,6 +468,19 @@ run_self_test() {
         log "self-test: exclusive_kind_tag must untag siblings before and after kind load"
         failed=1
     fi
+    if awk '/^run_migration_crash\(\)/,/^}/' "$script_path" | awk '
+        /pin_migration_crash_chart/ { pin=NR }
+        /cluster_upgrade "0.10.0" "\$MIGRATION_CRASH_CHART" --forward-only/ {
+            if (!first) first=NR
+            attempts++
+        }
+        END { exit (pin && first && pin < first && attempts == 2) ? 0 : 1 }
+    ' && awk '/^pin_migration_crash_chart\(\)/,/^}/' "$script_path" | grep -q 'kind_image_digest'; then
+        log "migration-crash uses a digest-pinned target chart on both attempts"
+    else
+        log "self-test: migration-crash must pin loaded target images before its first upgrade"
+        failed=1
+    fi
     if awk '/^run_guarded_rollback\(\)/,/^}/' "$script_path" | grep -q 'exclusive_kind_tag "0.10.0"'; then
         log "guarded rollback reloads exclusive 0.10.0 images"
     else
@@ -2350,13 +2363,58 @@ interrupt_schema_migrate() {
         --wait=false --ignore-not-found >/dev/null 2>&1 || true
 }
 
+# The migration-crash row reloads 0.8.8 after several earlier image imports.
+# The tagged target can then lack a unique Node.status.images binding,
+# which correctly makes converge refuse to guess what the serving pod ran.
+# Pin this row's private target chart to the exact images already loaded on
+# kind; both the interrupted attempt and retry use the same chart bytes.
+pin_migration_crash_chart() {
+    exclusive_kind_tag "0.10.0"
+    local api_digest worker_digest chart_dir pinned_dir
+    api_digest="$(kind_image_digest "$(image_for curie-api 0.10.0)")"
+    worker_digest="$(kind_image_digest "$(image_for curie-worker 0.10.0)")"
+    chart_dir="$WORKDIR/migration-crash/chart"
+    pinned_dir="$WORKDIR/migration-crash/packaged"
+    mkdir -p "$chart_dir" "$pinned_dir"
+    tar -xzf "$CHART_0100" -C "$chart_dir"
+    python3 - "$chart_dir/curie/values.yaml" "$api_digest" "$worker_digest" <<'PY'
+import json, pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+digests = {"api": sys.argv[2], "worker": sys.argv[3]}
+lines = path.read_text().splitlines(keepends=True)
+section = None
+in_image = False
+changed = set()
+for index, line in enumerate(lines):
+    if line and not line.startswith((" ", "#", "\n")):
+        section = line[:-2] if line.endswith(":\n") else None
+        in_image = False
+    if section in digests and line.startswith("  ") and not line.startswith("   "):
+        in_image = line.startswith("  image:")
+    if section in digests and in_image and line.startswith("    digest:"):
+        if section in changed:
+            raise SystemExit(f"duplicate {section}.image.digest in target chart")
+        lines[index] = "    digest: " + json.dumps(digests[section]) + "\n"
+        changed.add(section)
+if changed != set(digests):
+    raise SystemExit(f"target chart image digests missing: {sorted(set(digests) - changed)}")
+path.write_text("".join(lines))
+PY
+    helm package "$chart_dir/curie" -d "$pinned_dir" >/dev/null
+    MIGRATION_CRASH_CHART="$pinned_dir/curie-0.10.0.tgz"
+    [[ -f "$MIGRATION_CRASH_CHART" ]] || die "migration-crash digest-pinned chart was not packaged"
+    log "migration-crash target chart pins kind-loaded api and worker manifest digests"
+}
+
 run_migration_crash() {
     uninstall_owned
     helm_install_088
     insert_sentinel
+    pin_migration_crash_chart
     local pid status=0
     (
-        cluster_upgrade "0.10.0" "$CHART_0100" --forward-only
+        cluster_upgrade "0.10.0" "$MIGRATION_CRASH_CHART" --forward-only
     ) >"$EVIDENCE_DIR/migration-crash-upgrade.log" 2>&1 &
     pid=$!
     local deadline=$((SECONDS + 240)) seen=0
@@ -2403,7 +2461,7 @@ run_migration_crash() {
     fi
     log "first migration-crash upgrade exited $status; retrying"
     set +e
-    cluster_upgrade "0.10.0" "$CHART_0100" --forward-only
+    cluster_upgrade "0.10.0" "$MIGRATION_CRASH_CHART" --forward-only
     status=$?
     set -e
     record_upgrade_json "migration-crash-retry"
@@ -3392,16 +3450,20 @@ if "curietech.ai/agent" in labels:
 PY
 }
 
-kind_runner_digest() {
+kind_image_digest() {
     local reference="$1" node digest
     node="$(kind_node)"
-    [[ -n "$node" ]] || die "runner-layer-retire has no kind node"
+    [[ -n "$node" ]] || die "no kind node for image $reference"
     digest="$(docker exec "$node" ctr -n k8s.io images list \
         | awk -v ref="$reference" '$1 == ref {print $3}')"
     if [[ "$digest" != sha256:* ]] || ! is_sha256 "${digest#sha256:}"; then
-        die "kind has no manifest digest for runner $reference"
+        die "kind has no unique manifest digest for $reference"
     fi
     printf '%s' "$digest"
+}
+
+kind_runner_digest() {
+    kind_image_digest "$1"
 }
 
 restore_retire_runner_tags() {

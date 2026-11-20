@@ -387,7 +387,8 @@ def test_the_blocked_run_comment_shows_the_explanation_and_a_complete_zero_usage
 
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    assert explanation in body
+    assert "**Agent-reported reason:** in-sandbox verification is unavailable" in body
+    assert "Agent's last message:" not in body
     assert "Cause: early_stop" in body
     lines = body.splitlines()
     assert "Usage: implementer 0 tokens ($0.00), total $0.00" in lines
