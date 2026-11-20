@@ -63,6 +63,13 @@ MAX_REQUESTS = 2
 # How long the asking request may take to settle after its question comment;
 # the issue says "a few seconds", this only stops a run that never settles.
 SETTLE_SECONDS = 600
+# The answered run must end within this many seconds of its pull request being
+# recorded before the driver merges (it may still wait for the fixture's CI or
+# run a CI fix round); owned here so a stuck run cannot stretch the wait to the
+# execution deadline.
+ENDING_SECONDS = 2700
+# Reads of the work item immediately before the answer, while one is unreadable.
+PRE_ANSWER_READ_ATTEMPTS = 3
 POLL_SECONDS = 5
 
 # apps/api/src/curie_api/factory_notices.py INVESTIGATING_LINE and
@@ -84,6 +91,7 @@ COMMENT_PROPERTY = "curie.factory"
 LIVE_STATUSES = frozenset({"queued", "waiting", "running", "cancellation_requested"})
 
 ENV_FILE_VAR = "CURIE_FACTORY_JIRA_ENV_FILE"
+RESTORE_URL_VAR = "CURIE_FACTORY_WEBHOOK_RESTORE_URL"
 JIRA_KEYS = (
     "site",
     "cloud_id",
@@ -289,6 +297,14 @@ def judge(obs: Mapping[str, Any]) -> list[str]:
         failures.append(
             "a request was live between the settlement and the answer: " + ", ".join(sorted(live))
         )
+    elif obs.get("settled") is True:
+        pre_answer = obs.get("pre_answer_read")
+        if pre_answer == "unreadable":
+            failures.append("the work item could not be read immediately before the answer")
+        elif pre_answer == "no_request":
+            failures.append("the work item showed no request immediately before the answer")
+        elif pre_answer != "ok":
+            failures.append("the work item was not read immediately before the answer")
 
     second = _after(answer, obs.get("second_request_s"))
     if second is None:
@@ -320,7 +336,12 @@ def judge(obs: Mapping[str, Any]) -> list[str]:
         if pull.get("has_citation") is not True:
             failures.append(f"the pull request body has no line starting '{CITATION_PREFIX}'")
 
-    if obs.get("merge_ok") is not True:
+    if obs.get("answered_run_ended") is False:
+        failures.append(
+            f"the answered run did not end within {ENDING_SECONDS} s of the pull request; "
+            "not merged"
+        )
+    elif obs.get("merge_ok") is not True:
         failures.append("the merge failed")
     notice = _after(obs.get("merged_s"), obs.get("merged_notice_s"))
     if notice is None or notice > MERGED_NOTICE_SECONDS:
@@ -386,6 +407,7 @@ ROLE_ORDER = (
     "registry",
     "binary",
     "restore-url",
+    "issue",
     "home",
 )
 
@@ -597,6 +619,8 @@ def load_identities(
     for variable in ("CURIE_BIN", "CURIE_FACTORY_CLOUDFLARED"):
         if "/" in environ.get(variable, ""):
             add_identity(ids, "binary", environ[variable])
+    # The variable load_config reads into config.restore_webhook_url.
+    add_identity(ids, "restore-url", environ.get(RESTORE_URL_VAR))
     add_identity(ids, "home", environ.get("HOME"))
     return {role: values for role, values in ids.items() if values}
 
@@ -884,11 +908,13 @@ def new_observation() -> dict[str, Any]:
         "question_s": None,
         "settled": False,
         "settled_s": None,
+        "pre_answer_read": None,
         "live_before_answer": [],
         "answer_s": None,
         "second_request_s": None,
         "answer_received_s": None,
         "pull_requests": [],
+        "answered_run_ended": None,
         "merge_ok": False,
         "merged_s": None,
         "merged_notice_s": None,
@@ -901,13 +927,24 @@ def new_observation() -> dict[str, Any]:
 
 
 class _LiveRun:
-    """One live one-ticket run: each beat is a method, bounded by its deadline."""
+    """One live one-ticket run: each beat is a method, bounded by its deadline.
 
-    def __init__(self, p: Any) -> None:
+    ``clock`` and ``sleep`` are injectable so the beats run offline in tests.
+    """
+
+    def __init__(
+        self,
+        p: Any,
+        *,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         import factory_e2e as fe
 
         self.fe = fe
         self.p = p
+        self.clock = clock
+        self.sleep = sleep
         self.driver = p.loop_driver()
         self.obs = new_observation()
         self.obs["forge"] = self.driver.forge
@@ -918,6 +955,7 @@ class _LiveRun:
         self.work_item_id = ""
         self.status_before: str | None = None
         self.answer_at: float | None = None
+        self.pr_recorded_at: float | None = None
         self.status_markers: set[str] = set()
         self.second_marker: str | None = None
         self.change: Any = None
@@ -925,7 +963,7 @@ class _LiveRun:
     # -- small reads --
 
     def rel(self, at: float | None = None) -> float:
-        return round((time.time() if at is None else at) - float(self.p.labelled_at), 1)
+        return round((self.clock() if at is None else at) - float(self.p.labelled_at), 1)
 
     def note(self, event: str, **facts: Any) -> None:
         self.obs["timeline"].append({"event": event, "at_s": self.rel(), **facts})
@@ -941,6 +979,11 @@ class _LiveRun:
         title, body = self.p.issue_spec or self.fe.parse_issue_file(self.fe.ONE_TICKET_ISSUE_FILE)
 
         def before_label(issue_id: str, key: str) -> None:
+            # The issue id is in the driver's own failure messages (the label
+            # PUT below): an identity from here on.
+            identities = self.p.scenario_options.get("identities") or {}
+            add_identity(identities, "issue", issue_id)
+            install_sanitizer(self.p, identities)
             status, issue = self.driver.issue_fields(issue_id)
             found = status_id(issue) if status == 200 else None
             if found is None:
@@ -948,12 +991,11 @@ class _LiveRun:
                     f"the Jira issue's status could not be read before labelling (HTTP {status})"
                 )
             self.issue_id, self.key, self.status_before = issue_id, key, found
-            identities = self.p.scenario_options.get("identities") or {}
             add_identity(identities, "status", found)
             install_sanitizer(self.p, identities)
-            self.p.labelled_at = time.time()
+            self.p.labelled_at = self.clock()
 
-        self.p.labelled_at = time.time()
+        self.p.labelled_at = self.clock()
         self.work_item_id = self.driver.open_and_label_ticket(
             title, body, self.p.labelled_at, before_label=before_label
         )
@@ -976,17 +1018,30 @@ class _LiveRun:
                 ):
                     self.obs["question_s"] = self.rel()
                     self.note("question comment seen")
-            now = time.time()
+            now = self.clock()
             if self.obs["question_s"] is not None and (
                 self.obs["investigating_s"] is not None or now > start + INVESTIGATING_SECONDS
             ):
                 return True
             if now > start + QUESTION_SECONDS:
                 return self.obs["question_s"] is not None
-            time.sleep(POLL_SECONDS)
+            self.sleep(POLL_SECONDS)
+
+    def _pre_answer_detail(self, deadline: float) -> Mapping[str, Any] | None:
+        """A fresh work item read, retried while unreadable within ``deadline``."""
+
+        for attempt in range(PRE_ANSWER_READ_ATTEMPTS):
+            if attempt:
+                if self.clock() > deadline:
+                    break
+                self.sleep(POLL_SECONDS)
+            detail: Mapping[str, Any] | None = self.p.work_item_detail(self.work_item_id)
+            if detail is not None:
+                return detail
+        return None
 
     def settle_and_answer(self, answer: str) -> bool:
-        deadline = time.time() + SETTLE_SECONDS
+        deadline = self.clock() + SETTLE_SECONDS
         while True:
             status, issue = self.driver.issue_fields(self.issue_id)
             detail = self.p.work_item_detail(self.work_item_id)
@@ -1000,20 +1055,37 @@ class _LiveRun:
                 self.obs["settled_s"] = self.rel()
                 self.note("question ending settled")
                 break
-            if time.time() > deadline:
+            if self.clock() > deadline:
                 self.note("the question ending never settled")
                 return False
-            time.sleep(POLL_SECONDS)
+            self.sleep(POLL_SECONDS)
         for marker, _text in self.comments():
             if marker and marker.startswith(STATUS_MARKER_PREFIX):
                 self.status_markers.add(marker)
-        # The last read before the post: any live request here is a failure.
-        self.obs["live_before_answer"] = live_statuses(self.p.work_item_detail(self.work_item_id))
+        # The last read before the post: it must be readable, hold the first
+        # request and show none live, or no answer is posted (and no paid
+        # second run starts).
+        final = self._pre_answer_detail(deadline)
+        if final is None:
+            self.obs["pre_answer_read"] = "unreadable"
+            self.note("the work item was unreadable before the answer; not answering")
+            return False
+        if not requests_of(final):
+            self.obs["pre_answer_read"] = "no_request"
+            self.note("the work item showed no request before the answer; not answering")
+            return False
+        live = live_statuses(final)
+        if live:
+            self.obs["pre_answer_read"] = "live"
+            self.obs["live_before_answer"] = live
+            self.note("a request was live before the answer; not answering")
+            return False
+        self.obs["pre_answer_read"] = "ok"
         status, _ = self.driver.post_comment(self.issue_id, answer)
         if status != 201:
             self.note("posting the answer failed", http_status=status)
             return False
-        self.answer_at = time.time()
+        self.answer_at = self.clock()
         self.obs["answer_s"] = self.rel(self.answer_at)
         self.note("answer posted")
         return True
@@ -1046,9 +1118,9 @@ class _LiveRun:
                 and self.obs["answer_received_s"] is not None
             ):
                 return True
-            if time.time() > deadline:
+            if self.clock() > deadline:
                 return self.obs["second_request_s"] is not None
-            time.sleep(POLL_SECONDS)
+            self.sleep(POLL_SECONDS)
 
     def await_pull_request(self) -> bool:
         """The change the WorkItem records, within the pull request bound of the answer."""
@@ -1060,16 +1132,17 @@ class _LiveRun:
             pr = detail.get("pr")
             if isinstance(pr, dict) and pr.get("number"):
                 self.change = self.fe.ChangeRef(int(pr["number"]), str(pr.get("url") or ""))
+                self.pr_recorded_at = self.clock()
                 self.note("pull request recorded on the work item")
                 break
             requests = requests_of(detail)
             if len(requests) >= 2 and not live_statuses(detail):
                 self.note("the answered run ended without a pull request")
                 break
-            if time.time() > deadline:
+            if self.clock() > deadline:
                 self.note("no pull request within the bound")
                 break
-            time.sleep(POLL_SECONDS)
+            self.sleep(POLL_SECONDS)
         pulls: list[dict[str, Any]] = []
         repo = self.p.config.repo
         for number in self.driver.changes_opened():
@@ -1088,17 +1161,27 @@ class _LiveRun:
         self.obs["pull_requests"] = pulls
         return self.change is not None
 
+    def await_answered_run_ending(self) -> bool:
+        """At least two requests and none live, within ENDING_SECONDS of the pull request."""
+
+        deadline = (self.pr_recorded_at or self.clock()) + ENDING_SECONDS
+        while True:
+            detail = self.p.work_item_detail(self.work_item_id)
+            if detail is not None and len(requests_of(detail)) >= 2 and not live_statuses(detail):
+                self.obs["answered_run_ended"] = True
+                self.note("the answered run ended")
+                return True
+            if self.clock() > deadline:
+                self.obs["answered_run_ended"] = False
+                self.note(f"the answered run did not end within {ENDING_SECONDS} s; not merging")
+                return False
+            self.sleep(POLL_SECONDS)
+
     def merge_and_await_notice(self) -> None:
-        self.fe._await_ending(
-            self.p,
-            self.work_item_id,
-            since=self.answer_at or time.time(),
-            ended=lambda _detail: True,
-            what="the answered run",
-            min_requests=2,
-        )
+        if not self.await_answered_run_ending():
+            return
         merge = self.driver.merge(self.change)
-        merged_at = time.time()
+        merged_at = self.clock()
         self.obs["merge_ok"] = isinstance(merge, Mapping) and merge.get("merged") is True
         self.obs["merged_s"] = self.rel(merged_at)
         self.note("merge attempted", merged=self.obs["merge_ok"])
@@ -1120,10 +1203,10 @@ class _LiveRun:
                     }
                     self.note("merged notice seen")
                     return
-            if time.time() > deadline:
+            if self.clock() > deadline:
                 self.note("no merged notice within the bound")
                 return
-            time.sleep(POLL_SECONDS)
+            self.sleep(POLL_SECONDS)
 
     def final_reads(self) -> None:
         """Read before main's teardown closes the issue (that moves its status to Done)."""
@@ -1141,14 +1224,19 @@ class _LiveRun:
         self.obs["model_usage_after"] = self.p.model_usage()
 
 
-def drive(p: Any) -> dict[str, Any]:
+def drive(
+    p: Any,
+    *,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
     """Run the beats, judge them, log the anonymized summary, and finish the scenario."""
 
     import factory_e2e as fe
 
     add_run_identities(p)
     answer = str(p.scenario_options["answer_text"])
-    run = _LiveRun(p)
+    run = _LiveRun(p, clock=clock, sleep=sleep)
     run.open_ticket()
     if (
         run.await_question()

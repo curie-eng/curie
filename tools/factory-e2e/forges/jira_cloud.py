@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import datetime as dt
 import json
 import math
 import os
@@ -191,6 +192,37 @@ def created_since_jql(project_key: str, account_id: str, minutes: int) -> str:
     """JQL for the issues ``account_id`` created in the project in the last ``minutes``. Pure."""
 
     return f'project = "{project_key}" AND creator = "{account_id}" AND created >= -{minutes}m'
+
+
+def jira_created_epoch(value: Any) -> float | None:
+    """A Jira ``created`` timestamp (``2026-11-20T08:15:30.123+0000``) as epoch seconds.
+
+    None when it cannot be parsed. Pure.
+    """
+
+    if not isinstance(value, str):
+        return None
+    for shape in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return dt.datetime.strptime(value, shape).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def created_at_or_after(issues: Iterable[Any], since_epoch: float) -> int:
+    """How many search results were created at or after ``since_epoch``. Pure.
+
+    An issue whose ``fields.created`` cannot be read counts (fail closed).
+    """
+
+    count = 0
+    for issue in issues:
+        fields = issue.get("fields") if isinstance(issue, Mapping) else None
+        created = jira_created_epoch(fields.get("created") if isinstance(fields, Mapping) else None)
+        if created is None or created >= since_epoch:
+            count += 1
+    return count
 
 
 def jira_label_update(*, add: Iterable[str] = (), remove: Iterable[str] = ()) -> dict[str, Any]:
@@ -426,7 +458,8 @@ class JiraCloudDriver:
 
         Jira Cloud REST v3 "Search for issues using JQL enhanced search":
         https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/#api-rest-api-3-search-jql-post
-        JQL's relative ``created`` takes whole minutes, so the window is rounded up.
+        JQL's relative ``created`` takes whole minutes, so the window is rounded up
+        and each returned issue's ``fields.created`` is then held to ``since_epoch``.
         """
 
         minutes = max(1, math.ceil((time.time() - since_epoch) / 60) + 1)
@@ -440,7 +473,7 @@ class JiraCloudDriver:
         issues = found.get("issues") if isinstance(found, dict) else None
         if status != 200 or not isinstance(issues, list):
             return None
-        return len(issues)
+        return created_at_or_after(issues, since_epoch)
 
     # -- tracker evidence --
 

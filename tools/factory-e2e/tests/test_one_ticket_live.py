@@ -283,6 +283,7 @@ def _passing_obs() -> dict[str, Any]:
         "question_s": 420.0,
         "settled": True,
         "settled_s": 430.0,
+        "pre_answer_read": "ok",
         "live_before_answer": [],
         "answer_s": 435.0,
         "second_request_s": 445.0,
@@ -290,6 +291,7 @@ def _passing_obs() -> dict[str, Any]:
         "pull_requests": [
             {"number": 7, "opened_s": 1600.0, "names_key": True, "has_citation": True}
         ],
+        "answered_run_ended": True,
         "merge_ok": True,
         "merged_s": 2000.0,
         "merged_notice_s": 2040.0,
@@ -331,6 +333,23 @@ BROKEN: dict[str, tuple[dict[str, Any] | Any, str]] = {
     "live-between-settlement-and-answer": (
         {"live_before_answer": ["queued"]},
         "a request was live between the settlement and the answer: queued",
+    ),
+    "pre-answer-read-unreadable": (
+        {"pre_answer_read": "unreadable"},
+        "the work item could not be read immediately before the answer",
+    ),
+    "pre-answer-read-no-request": (
+        {"pre_answer_read": "no_request"},
+        "the work item showed no request immediately before the answer",
+    ),
+    "pre-answer-read-missing": (
+        {"pre_answer_read": None},
+        "the work item was not read immediately before the answer",
+    ),
+    "answered-run-never-ended": (
+        {"answered_run_ended": False, "merge_ok": False},
+        f"the answered run did not end within {otl.ENDING_SECONDS} s of the pull request; "
+        "not merged",
     ),
     "second-request-late": (
         {"second_request_s": 616.0},
@@ -1106,6 +1125,8 @@ class _FakeJira:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.search_status = 200
+        self.search_issues: list[dict[str, Any]] = []
+        self.label_status = 204
 
     def __call__(
         self,
@@ -1124,7 +1145,7 @@ class _FakeJira:
         if method == "POST" and route == "/issue":
             return 201, {"id": "10042", "key": ISSUE_KEY}
         if method == "PUT" and route == "/issue/10042":
-            return 204, None
+            return self.label_status, None
         if method == "GET" and route == "/issue/10042":
             return 200, _issue(STATUS_ID, "To Do", ["curie-factory"])
         if method == "POST" and route == "/issue/10042/comment":
@@ -1141,7 +1162,7 @@ class _FakeJira:
         if method == "POST" and route == "/search/jql":
             if self.search_status != 200:
                 return self.search_status, {"errorMessages": ["bad"]}
-            return 200, {"issues": [], "isLast": True}
+            return 200, {"issues": self.search_issues, "isLast": True}
         raise AssertionError(f"unexpected Jira call {method} {path}")
 
 
@@ -1215,3 +1236,349 @@ def test_driver_reads_and_writes_the_one_ticket_scenario_adds(
         assert driver.factory_created_issues(fe.time.time()) is None
     finally:
         fe.shutil.rmtree(p.workdir, ignore_errors=True)
+
+
+def _search_hit(issue_id: str, created: str) -> dict[str, Any]:
+    """One ``issues`` entry of ``POST /rest/api/3/search/jql`` with ``fields: ["created"]``."""
+
+    return {
+        "expand": "renderedFields,names,schema,operations,editmeta,changelog",
+        "id": issue_id,
+        "self": f"https://api.atlassian.com/ex/jira/x/rest/api/3/issue/{issue_id}",
+        "key": f"{PROJECT}-{issue_id[-2:]}",
+        "fields": {"created": created},
+    }
+
+
+def test_driver_factory_created_issues_counts_only_issues_created_since_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver, fake, p = _driver(tmp_path, monkeypatch)
+    since = datetime(2026, 11, 20, 8, 30, tzinfo=UTC).timestamp()
+    try:
+        fake.search_issues = [
+            # 08:15:30Z, inside the rounded JQL window but before the run.
+            _search_hit("10040", "2026-11-20T08:15:30.123+0000"),
+            # 04:45:10-0400 is 08:45:10Z: after the run once the offset is applied.
+            _search_hit("10041", "2026-11-20T04:45:10.000-0400"),
+        ]
+        assert driver.factory_created_issues(since) == 1
+        # Exactly at the start counts; an unparseable or missing created counts.
+        fake.search_issues = [
+            _search_hit("10042", "2026-11-20T08:30:00.000+0000"),
+            _search_hit("10043", "yesterday"),
+            {"id": "10044", "key": f"{PROJECT}-44", "fields": {}},
+        ]
+        assert driver.factory_created_issues(since) == 3
+    finally:
+        fe.shutil.rmtree(p.workdir, ignore_errors=True)
+
+
+def test_anonymize_issue_id_is_an_identity_before_the_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver, fake, p = _driver(tmp_path, monkeypatch)
+    ids = otl.load_identities(
+        _environ(tmp_path), fetch_myself=_fetch_myself, github_login=_no_login
+    )
+    otl.install_sanitizer(p, ids)
+    monkeypatch.setattr(p, "loop_driver", lambda: driver)
+    fake.label_status = 500
+    try:
+        run = otl._LiveRun(p, clock=lambda: 1000.0, sleep=_no_sleep)
+        with pytest.raises(fe.PreflightFailed) as refused:
+            run.open_ticket()
+        # The driver's own label failure names the numeric issue id.
+        assert "10042" in str(refused.value)
+        shown = fe.filtered(str(refused.value))
+        assert "10042" not in shown and "issue" in shown, shown
+        assert p.scenario_options["identities"]["issue"] == ["10042"]
+        assert p.scenario_options["identities"]["status"] == [STATUS_ID]
+    finally:
+        fe.shutil.rmtree(p.workdir, ignore_errors=True)
+
+
+def test_anonymize_load_identities_names_the_restore_url(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    url = "https://hooks.acme.example/restore"
+    environ = {**_environ(tmp_path), "CURIE_FACTORY_WEBHOOK_RESTORE_URL": url}
+    ids = otl.load_identities(environ, fetch_myself=_fetch_myself, github_login=_no_login)
+    assert ids["restore-url"] == [url]
+    target = tmp_path / "evidence.json"
+    target.write_text(json.dumps({"restore": url}))
+    code = otl.main(
+        ["check-clean", str(target)],
+        environ=environ,
+        fetch_myself=_fetch_myself,
+        github_login=_no_login,
+    )
+    assert (code, capsys.readouterr().out) == (1, "identities found: restore-url\n")
+
+
+# --- drive end to end against fakes, on an injected clock ---------------------------------
+
+
+def _no_sleep(_seconds: float) -> None:
+    raise AssertionError("this beat must not wait")
+
+
+class _Clock:
+    """Time that moves only when the driver sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 1_790_000_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat()
+
+
+REQUEST_1 = "11111111-1111-4111-8111-111111111111"
+REQUEST_2 = "22222222-2222-4222-8222-222222222222"
+
+
+class _World:
+    """The factory and Jira as the driver sees them, scripted against the clock.
+
+    ``final_read`` picks what every work item read after the first settled one
+    returns: ``"ok"`` (the real detail), ``"unreadable"`` (None) or ``"live"``
+    (a queued request). ``second_run_ends`` False keeps the answered run running.
+    """
+
+    forge = "jira_cloud"
+    pairing = "jira_cloud+github"
+
+    def __init__(self, clock: _Clock, *, final_read: str = "ok", second_run_ends: bool = True):
+        self.clock = clock
+        self.final_read = final_read
+        self.second_run_ends = second_run_ends
+        self.labelled: float | None = None
+        self.answered: float | None = None
+        self.merged: float | None = None
+        self.settled_reads = 0
+        self.posted: list[tuple[str, str]] = []
+        self.merges: list[Any] = []
+
+    def since(self, at: float | None, seconds: float) -> bool:
+        return at is not None and self.clock() >= at + seconds
+
+    # -- the driver --
+
+    def open_and_label_ticket(
+        self, title: str, body: str, since: float, *, before_label: Any = None
+    ) -> str:
+        assert title and body
+        before_label("10042", ISSUE_KEY)
+        self.labelled = self.clock()
+        return "wi-1"
+
+    def pin_fixture_base(self) -> None:
+        pass
+
+    def issue_fields(self, issue_id: str) -> tuple[int, dict[str, Any]]:
+        assert issue_id == "10042"
+        labels = ["curie-factory"]
+        if self.since(self.labelled, 405) and self.answered is None:
+            labels.append(otl.QUESTIONS_LABEL)
+        return 200, _issue(STATUS_ID, "To Do", labels)
+
+    def bot_comments(self, key: str) -> list[dict[str, Any]]:
+        assert key == ISSUE_KEY
+        values = []
+        if self.since(self.labelled, 20):
+            values.append(
+                _comment(
+                    "10100",
+                    f"curie-execution-request:{REQUEST_1}",
+                    _paragraph(_text("Investigating this ticket. The factory will open a pull ")),
+                )
+            )
+        if self.since(self.labelled, 400):
+            values.append(
+                _comment(
+                    "10101",
+                    f"curie-factory-questions:{REQUEST_1}",
+                    _paragraph(_text("Which rounding mode, and what default precision?")),
+                )
+            )
+        if self.since(self.answered, 15):
+            blocks = [
+                _paragraph(_text("Answer received. The factory is working on this ticket again."))
+            ]
+            if self.since(self.merged, 30):
+                blocks += [
+                    _paragraph(_text(USAGE_AT_LEAST)),
+                    _paragraph(_text("Pull request merged: "), _text(PR_URL, href=PR_URL)),
+                ]
+            values.append(_comment("10102", f"curie-execution-request:{REQUEST_2}", *blocks))
+        return values
+
+    def post_comment(self, issue_id: str, text: str) -> tuple[int, Any]:
+        self.posted.append((issue_id, text))
+        self.answered = self.clock()
+        return 201, {"id": "10200"}
+
+    def changes_opened(self) -> list[int]:
+        return [7] if self.since(self.answered, 1100) else []
+
+    def merge(self, change: Any) -> dict[str, Any]:
+        self.merges.append(change)
+        self.merged = self.clock()
+        return {"merged": True}
+
+    def factory_created_issues(self, since_epoch: float) -> int:
+        return 0
+
+    # -- the platform --
+
+    def detail(self) -> dict[str, Any] | None:
+        assert self.labelled is not None
+        first = "completed" if self.since(self.labelled, 405) else "running"
+        requests = [{"sequence": 1, "status": first, "created_at": _iso(self.labelled)}]
+        if self.answered is None and first == "completed":
+            self.settled_reads += 1
+            if self.settled_reads > 1 and self.final_read == "unreadable":
+                return None
+            if self.settled_reads > 1 and self.final_read == "live":
+                requests.append({"sequence": 2, "status": "queued", "created_at": _iso(0)})
+        if self.since(self.answered, 8):
+            assert self.answered is not None
+            ended = self.second_run_ends and self.since(self.answered, 1200)
+            requests.append(
+                {
+                    "sequence": 2,
+                    "status": "completed" if ended else "running",
+                    "created_at": _iso(self.answered + 8),
+                }
+            )
+        detail: dict[str, Any] = {"id": "wi-1", "requests": requests}
+        if self.since(self.answered, 1100):
+            detail["pr"] = {"number": 7, "url": "https://github.com/acme/fixture/pull/7"}
+        return detail
+
+    def pull(self) -> dict[str, Any]:
+        assert self.answered is not None
+        return {
+            "number": 7,
+            "created_at": _iso(self.answered + 1100),
+            "body": (
+                f"Adds rounding.\n\nJira: {ISSUE_KEY}\n\n"
+                f"Answered on the ticket by {LABELLER_NAME}: round half up."
+            ),
+        }
+
+
+class _FakePreflight:
+    """The Preflight surface ``drive`` reads."""
+
+    def __init__(self, world: _World, ids: Any) -> None:
+        self.world = world
+        self.config = fe.dataclasses.make_dataclass("Config", ["repo"])(REPO)
+        self.evidence: dict[str, Any] = {"actor_login": ACTOR}
+        self.scenario_options: dict[str, Any] = {
+            "answer_text": "Round half up, two decimal places by default.",
+            "identities": ids,
+        }
+        self.issue_spec = ("Add a rounding option", "The rounding mode is not decided here.")
+        self.labelled_at = 0.0
+        self.repository_id = REPOSITORY_ID
+        self.usage_before = 10.0
+        self.evidence_serializer: Any = None
+        self.detail_reads = 0
+
+    def loop_driver(self) -> _World:
+        return self.world
+
+    def work_item_detail(self, work_item_id: str) -> dict[str, Any] | None:
+        assert work_item_id == "wi-1"
+        self.detail_reads += 1
+        return self.world.detail()
+
+    def as_actor(self, method: str, path: str) -> tuple[int, Any]:
+        assert (method, path) == ("GET", f"/repos/{REPO}/pulls/7")
+        return 200, self.world.pull()
+
+    def model_usage(self) -> float:
+        return 14.25
+
+
+def _drive(tmp_path: Path, **world: Any) -> tuple[_FakePreflight, _World, _Clock]:
+    clock = _Clock()
+    w = _World(clock, **world)
+    p = _FakePreflight(w, _identities(tmp_path))
+    try:
+        otl.drive(p, clock=clock, sleep=clock.sleep)
+    except fe.PreflightFailed:
+        pass
+    return p, w, clock
+
+
+def test_judge_drive_end_to_end_passes_on_the_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fe, "_await_ending", _no_await_ending)
+    p, world, _clock = _drive(tmp_path)
+    obs = p.evidence["scenario"]
+    assert obs["verdict"] == "passed", obs.get("failures")
+    assert otl.judge(obs) == []
+    assert obs["pre_answer_read"] == "ok" and obs["answered_run_ended"] is True
+    assert world.posted == [("10042", "Round half up, two decimal places by default.")]
+    assert len(world.merges) == 1
+    assert obs["usage"] == {"kind": "at_least", "total": "3.10"}
+    assert obs["request_count"] == 2 and obs["status_id_unchanged"] is True
+    # The run's identities, the issue id among them, are in the sanitizer.
+    assert p.scenario_options["identities"]["issue"] == ["10042"]
+    text = p.evidence_serializer(p.evidence)
+    assert otl.find_identities(text, p.scenario_options["identities"]) == []
+
+
+def _no_await_ending(*_a: Any, **_k: Any) -> tuple[dict[str, Any], bool]:
+    """The harness wait gives up; the driver must not merge on it (its deadline is hours)."""
+
+    return {}, False
+
+
+@pytest.mark.parametrize(
+    ("final_read", "message"),
+    [
+        ("unreadable", "the work item could not be read immediately before the answer"),
+        ("live", "a request was live between the settlement and the answer: queued"),
+    ],
+)
+def test_judge_drive_never_answers_when_the_final_read_is_not_clean(
+    final_read: str, message: str, tmp_path: Path
+) -> None:
+    p, world, _clock = _drive(tmp_path, final_read=final_read)
+    obs = p.evidence["scenario"]
+    assert world.posted == [] and world.merges == []
+    assert obs["answer_s"] is None and obs["settled"] is True
+    assert obs["verdict"] == "failed"
+    assert message in obs["failures"], obs["failures"]
+    if final_read == "unreadable":
+        assert obs["live_before_answer"] == []
+        # The settled read, the bounded retries, then the request count read.
+        assert world.settled_reads == 1 + otl.PRE_ANSWER_READ_ATTEMPTS + 1
+
+
+def test_judge_drive_does_not_merge_a_run_that_never_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fe, "_await_ending", _no_await_ending)
+    p, world, clock = _drive(tmp_path, second_run_ends=False)
+    obs = p.evidence["scenario"]
+    assert world.merges == []
+    assert obs["answered_run_ended"] is False and obs["merge_ok"] is False
+    assert (
+        f"the answered run did not end within {otl.ENDING_SECONDS} s of the pull request; "
+        "not merged"
+    ) in obs["failures"]
+    assert world.answered is not None
+    # The wait is the module's own bound after the pull request, not the harness's.
+    assert clock.now <= world.answered + 1100 + otl.ENDING_SECONDS + 2 * otl.POLL_SECONDS
