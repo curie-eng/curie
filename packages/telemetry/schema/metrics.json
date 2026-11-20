@@ -1568,6 +1568,7 @@
           "/work-items/completion-contract",
           "/work-items/issue-read",
           "/work-items/questions",
+          "/work-items/rule-proposal",
           "/work-items/tracker-result",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
@@ -1599,7 +1600,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 10240
+      "cardinality_bound": 10280
     },
     "curie.http.server.request.duration": {
       "type": "histogram",
@@ -1858,6 +1859,7 @@
           "/work-items/completion-contract",
           "/work-items/issue-read",
           "/work-items/questions",
+          "/work-items/rule-proposal",
           "/work-items/tracker-result",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
@@ -1889,7 +1891,7 @@
           "5xx"
         ]
       },
-      "cardinality_bound": 10240
+      "cardinality_bound": 10280
     },
     "curie.http.server.active": {
       "type": "up_down_counter",
@@ -2148,6 +2150,7 @@
           "/work-items/completion-contract",
           "/work-items/issue-read",
           "/work-items/questions",
+          "/work-items/rule-proposal",
           "/work-items/tracker-result",
           "/work-items/{work_item_id}",
           "/work-items/{work_item_id}/usage",
@@ -2172,7 +2175,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 2048
+      "cardinality_bound": 2056
     },
     "curie.background.loop": {
       "type": "counter",
