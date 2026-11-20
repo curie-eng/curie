@@ -12901,6 +12901,18 @@ export interface components {
             /** Repo Full Name */
             repo_full_name: string;
         };
+        /**
+         * RuleProposalOut
+         * @description A stored proposal: a hidden candidate, shown to a person only after the
+         *     pull request merges.
+         */
+        RuleProposalOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "candidate";
+        };
         /** RunHandoff */
         RunHandoff: {
             /** Findings */
@@ -12918,18 +12930,6 @@ export interface components {
             next_owner: "agent" | "human" | "platform" | "unknown";
             /** Verification */
             verification?: components["schemas"]["Verification"][];
-        };
-        /**
-         * RuleProposalOut
-         * @description A stored proposal: a hidden candidate, shown to a person only after the
-         *     pull request merges.
-         */
-        RuleProposalOut: {
-            /**
-             * Status
-             * @constant
-             */
-            status: "candidate";
         };
         /**
          * RunnerPods
