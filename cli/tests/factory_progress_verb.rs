@@ -37,6 +37,11 @@ fn agent_value(channel: Option<&str>) -> serde_json::Value {
 /// binding per identity. An empty list leaves the agent bound to a different
 /// channel only, so the channel under test has no binding at all.
 fn agent_value_bound(channel: Option<&str>, identities: &[&str]) -> serde_json::Value {
+    agent_value_named(AGENT_NAME, channel, identities)
+}
+
+/// [`agent_value_bound`] for an agent stored under this name.
+fn agent_value_named(name: &str, channel: Option<&str>, identities: &[&str]) -> serde_json::Value {
     let mut channels: Vec<serde_json::Value> = identities
         .iter()
         .map(|adapter| serde_json::json!({"kind": "slack", "address": CHANNEL, "adapter": adapter}))
@@ -48,7 +53,7 @@ fn agent_value_bound(channel: Option<&str>, identities: &[&str]) -> serde_json::
     }
     serde_json::json!({
         "id": AGENT_ID,
-        "name": AGENT_NAME,
+        "name": name,
         "channels": channels,
         "repo_full_name": null,
         "deploy_notifications": false,
@@ -89,6 +94,16 @@ fn api_bound(
     patch: Patch,
     identities: &'static [&'static str],
 ) -> MockServer {
+    api_named(AGENT_NAME, initial, patch, identities)
+}
+
+/// [`api_bound`] for an agent stored under this name.
+fn api_named(
+    name: &'static str,
+    initial: Option<&'static str>,
+    patch: Patch,
+    identities: &'static [&'static str],
+) -> MockServer {
     let stored: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(initial.map(str::to_string)));
     serve(move |req| {
         let (method, path) = (req.method.as_str(), req.path.as_str());
@@ -96,8 +111,12 @@ fn api_bound(
         match method {
             "GET" if path == "/agents" => Response::json(
                 200,
-                &serde_json::Value::Array(vec![agent_value_bound(current.as_deref(), identities)])
-                    .to_string(),
+                &serde_json::Value::Array(vec![agent_value_named(
+                    name,
+                    current.as_deref(),
+                    identities,
+                )])
+                .to_string(),
             ),
             "PATCH" if path == format!("/agents/{AGENT_ID}") => match &patch {
                 Patch::Refuse(status, body) => Response::json(*status, body),
@@ -110,7 +129,7 @@ fn api_bound(
                     let now = stored.lock().unwrap().clone();
                     Response::json(
                         200,
-                        &agent_value_bound(now.as_deref(), identities).to_string(),
+                        &agent_value_named(name, now.as_deref(), identities).to_string(),
                     )
                 }
             },
@@ -426,7 +445,7 @@ fn unbound_names_the_exact_surfaces_command_for_the_tier() {
             "{tier}: a failure, not usage: {}",
             run.output()
         );
-        let expected = format!("curie {tier} surfaces {AGENT_NAME} --add slack={CHANNEL}");
+        let expected = format!("curie {tier} surfaces {AGENT_ID} --add slack={CHANNEL}");
         assert!(
             run.output().contains(&expected),
             "{tier}: the fix names `{expected}`: {}",
@@ -458,6 +477,44 @@ fn unbound_names_the_exact_surfaces_command_for_the_tier() {
                 .all(|r| !r.path.contains("/channels")),
             "{tier}: the binding is never created for the operator"
         );
+    }
+}
+
+/// A valid stored name can begin with `-`; as the positional of a printed
+/// command it would be read as a flag, so every printed command carries the
+/// agent id instead.
+#[test]
+fn unbound_commands_use_the_agent_id_for_a_name_that_looks_like_a_flag() {
+    const FLAG_NAME: &str = "--review-bot";
+    for tier in TIERS {
+        for identities in [&[][..], &["default", "second"][..]] {
+            let server = api_named(
+                FLAG_NAME,
+                None,
+                Patch::Refuse(409, UNBOUND_BODY),
+                match identities.len() {
+                    0 => &[],
+                    _ => &["default", "second"],
+                },
+            );
+            // The agent is addressed by id on the way in, so clap never sees
+            // the flag-shaped name.
+            let mut argv = vec![tier, "factory-progress", AGENT_ID];
+            argv.extend_from_slice(&["--slack-channel", CHANNEL]);
+            argv.extend_from_slice(&["--api-url", server.base_url.as_str(), "--api-key", "k"]);
+            let run = run(&argv);
+            assert_eq!(run.code, 1, "{tier}: {}", run.output());
+            let out = run.output();
+            assert!(
+                out.contains(&format!("curie {tier} surfaces {AGENT_ID}")),
+                "{tier}: {out}"
+            );
+            assert!(
+                !out.contains(&format!("surfaces {FLAG_NAME}"))
+                    && !out.contains(&format!("surfaces '{FLAG_NAME}'")),
+                "{tier}: no printed command names the flag-shaped name: {out}"
+            );
+        }
     }
 }
 
@@ -497,9 +554,15 @@ fn unbound_with_no_matching_binding_says_to_add_one_and_to_reuse_the_target() {
         );
         assert!(
             out.contains(&format!(
-                "curie {tier} surfaces {AGENT_NAME} --add slack={CHANNEL}"
+                "curie {tier} surfaces {AGENT_ID} --add slack={CHANNEL}"
             )),
             "{tier}: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "curie {tier} surfaces {AGENT_ID} --add slack={CHANNEL} --adapter <identity>"
+            )),
+            "{tier}: the named-identity form is printed too: {out}"
         );
         assert!(out.contains(unbound_target_sentence(tier)), "{tier}: {out}");
     }
@@ -518,7 +581,7 @@ fn unbound_with_two_matching_bindings_says_to_remove_the_extra_one() {
         );
         assert!(
             out.contains(&format!(
-                "curie {tier} surfaces {AGENT_NAME} --remove slack={CHANNEL} --adapter <identity>"
+                "curie {tier} surfaces {AGENT_ID} --remove slack={CHANNEL} --adapter <identity>"
             )),
             "{tier}: {out}"
         );
@@ -546,7 +609,7 @@ fn unbound_with_one_matching_binding_still_refused_gets_the_generic_message() {
             "{tier}: a bound channel is not reported as unbound: {out}"
         );
         assert!(
-            out.contains(&format!("curie {tier} surfaces {AGENT_NAME}")),
+            out.contains(&format!("curie {tier} surfaces {AGENT_ID}")),
             "{tier}: {out}"
         );
         assert!(out.contains(unbound_target_sentence(tier)), "{tier}: {out}");

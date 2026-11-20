@@ -499,7 +499,7 @@ export async function setFactorySlackChannel(
   throw new FactorySlackChannelError(
     resp.status,
     "other",
-    describeError(body) ?? resp.statusText,
+    describeError(body) || resp.statusText || `HTTP ${resp.status}`,
   );
 }
 

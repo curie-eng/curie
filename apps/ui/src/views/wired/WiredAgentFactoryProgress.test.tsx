@@ -131,6 +131,8 @@ describe("WiredAgentFactoryProgress", () => {
 
   const SURFACES_CLUSTER = "Copy command: curie cluster surfaces a1 --add slack=C0EXAMPLE1";
   const SURFACES_LOCAL = "Copy command: curie local surfaces a1 --add slack=C0EXAMPLE1";
+  const NAMED_CLUSTER = "Copy command: curie cluster surfaces a1 --add slack=C0EXAMPLE1 --adapter <identity>";
+  const NAMED_LOCAL = "Copy command: curie local surfaces a1 --add slack=C0EXAMPLE1 --adapter <identity>";
 
   async function saveUnbound(props: { env?: "prod" | "dev"; channels?: ChannelBinding[] }) {
     const user = userEvent.setup();
@@ -193,6 +195,19 @@ describe("WiredAgentFactoryProgress", () => {
     expect(screen.getByRole("button", { name: SURFACES_LOCAL })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: LIST_CLUSTER })).toBeNull();
     expect(screen.queryByRole("button", { name: LIST_LOCAL })).toBeNull();
+  });
+
+  it("also offers the named-identity add form when no Slack binding matches, for the case where the default identity is taken", async () => {
+    const error = await saveUnbound({ channels: [{ kind: "slack", address: "C0EXAMPLE9" }] });
+    expect(error).toHaveTextContent("another agent already holds the default Slack identity");
+    expect(screen.getByRole("button", { name: NAMED_CLUSTER })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: NAMED_LOCAL })).toBeInTheDocument();
+  });
+
+  it("offers no named-identity add form when the page shows one or two matching bindings", async () => {
+    await saveUnbound({ channels: [{ kind: "slack", address: "C0EXAMPLE1", adapter: "default" }] });
+    expect(screen.queryByRole("button", { name: NAMED_CLUSTER })).toBeNull();
+    expect(screen.queryByRole("button", { name: NAMED_LOCAL })).toBeNull();
   });
 
   it("tells the user to remove the extra identity when two Slack bindings match, with no add hint", async () => {
@@ -281,6 +296,18 @@ describe("WiredAgentFactoryProgress", () => {
     expect(await screen.findByTestId("factory-progress-error")).toHaveTextContent(
       "Could not update progress channel: database offline",
     );
+  });
+
+  it("falls back to the numeric status for a failure with no body and no status text", async () => {
+    const user = userEvent.setup();
+    fetchMock.mockResolvedValue(new Response("", { status: 502, statusText: "" }));
+    render(<Harness channel={null} onSaved={vi.fn()} />);
+
+    await user.type(screen.getByTestId("factory-progress-input"), "C0EXAMPLE1");
+    await user.click(screen.getByTestId("factory-progress-save"));
+
+    const error = await screen.findByTestId("factory-progress-error");
+    expect(error).toHaveTextContent("Could not update progress channel: HTTP 502");
   });
 
   it("clears a stale error once a later save succeeds", async () => {

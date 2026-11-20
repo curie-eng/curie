@@ -2645,6 +2645,7 @@ fn factory_slack_unbound_refusal(
     body: &str,
     tier: &str,
     agent: &str,
+    agent_id: &str,
     channel: &str,
     matching: usize,
 ) -> Option<anyhow::Error> {
@@ -2653,7 +2654,9 @@ fn factory_slack_unbound_refusal(
     if code != "factory_slack_channel_unbound" {
         return None;
     }
-    let quoted = crate::ops::shell_quote(agent);
+    // The printed commands name the agent by id: a valid stored name can begin
+    // with `-`, which the verb would read as a flag, while an id never does.
+    let quoted = crate::ops::shell_quote(agent_id);
     let surfaces = format!("curie {tier} surfaces {quoted}");
     let target = if tier == "local" {
         "against the same --api-url as this command"
@@ -2663,7 +2666,9 @@ fn factory_slack_unbound_refusal(
     let (message, action) = match matching {
         0 => (
             format!("agent {agent} has no Slack binding for channel {channel}"),
-            format!("bind the channel with `{surfaces} --add slack={channel}`"),
+            format!(
+                "bind the channel with `{surfaces} --add slack={channel}`, or, when another agent already holds the default Slack identity on that channel, under a free declared identity with `{surfaces} --add slack={channel} --adapter <identity>`"
+            ),
         ),
         1 => (
             format!(
@@ -3780,6 +3785,7 @@ impl ApiClient {
                     &text,
                     tier,
                     &agent.name,
+                    &agent.id,
                     channel,
                     slack_bindings_for(&agent.channels, channel),
                 ) {
@@ -7369,12 +7375,19 @@ mod tests {
 
     const UNBOUND: &str = r#"{"detail":{"code":"factory_slack_channel_unbound"}}"#;
     const CLUSTER_TARGET: &str = "Run each curie command against the same cluster target (the same --context, --namespace and --release, or --api-url) as this command";
+    const AGENT_ID: &str = "7d1c2a3e-0000-4000-8000-00000000a001";
     const LOCAL_TARGET: &str = "Run each curie command against the same --api-url as this command";
 
     fn unbound(tier: &str, agent: &str, matching: usize) -> (String, String) {
-        let error =
-            super::factory_slack_unbound_refusal(UNBOUND, tier, agent, "C0EXAMPLE1", matching)
-                .expect("the unbound code is recognised");
+        let error = super::factory_slack_unbound_refusal(
+            UNBOUND,
+            tier,
+            agent,
+            AGENT_ID,
+            "C0EXAMPLE1",
+            matching,
+        )
+        .expect("the unbound code is recognised");
         let (class, fix) = crate::exit::classify(&error);
         assert_eq!(class, crate::exit::ExitClass::Failure);
         (format!("{error:#}"), fix.expect("a fix"))
@@ -7390,7 +7403,7 @@ mod tests {
             );
             assert!(
                 fix.starts_with(&format!(
-                    "bind the channel with `curie {tier} surfaces acme-bot --add slack=C0EXAMPLE1`, then rerun this command."
+                    "bind the channel with `curie {tier} surfaces {AGENT_ID} --add slack=C0EXAMPLE1`, or, when another agent already holds the default Slack identity on that channel, under a free declared identity with `curie {tier} surfaces {AGENT_ID} --add slack=C0EXAMPLE1 --adapter <identity>`, then rerun this command."
                 )),
                 "{fix}"
             );
@@ -7408,12 +7421,14 @@ mod tests {
                 "{message}"
             );
             assert!(
-                fix.contains(&format!("list them with `curie {tier} surfaces acme-bot`")),
+                fix.contains(&format!(
+                    "list them with `curie {tier} surfaces {AGENT_ID}`"
+                )),
                 "{fix}"
             );
             assert!(
                 fix.contains(&format!(
-                    "`curie {tier} surfaces acme-bot --remove slack=C0EXAMPLE1 --adapter <identity>`"
+                    "`curie {tier} surfaces {AGENT_ID} --remove slack=C0EXAMPLE1 --adapter <identity>`"
                 )),
                 "{fix}"
             );
@@ -7433,7 +7448,9 @@ mod tests {
         );
         assert!(!message.contains("no Slack binding"), "{message}");
         assert!(
-            fix.contains("list the agent's bindings with `curie cluster surfaces acme-bot`"),
+            fix.contains(&format!(
+                "list the agent's bindings with `curie cluster surfaces {AGENT_ID}`"
+            )),
             "{fix}"
         );
         assert!(!fix.contains("--add") && !fix.contains("--remove"), "{fix}");
@@ -7450,20 +7467,23 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_name_is_shell_quoted_in_every_printed_command() {
-        for (agent, quoted) in [
-            ("acme bot", "'acme bot'"),
-            ("acme's bot", "'acme'\\''s bot'"),
-        ] {
+    fn printed_commands_name_the_agent_by_id_never_by_name() {
+        // A valid stored name can start with `-` (read as a flag), hold a
+        // space or an apostrophe; the id never does.
+        for agent in ["--review-bot", "-x", "acme bot", "acme's bot"] {
             for matching in [0, 1, 2] {
-                let (_, fix) = unbound("cluster", agent, matching);
+                let (message, fix) = unbound("cluster", agent, matching);
                 assert!(
-                    fix.contains(&format!("curie cluster surfaces {quoted}")),
+                    fix.contains(&format!("curie cluster surfaces {AGENT_ID}")),
                     "{agent:?} x{matching}: {fix}"
                 );
                 assert!(
-                    !fix.contains(&format!("surfaces {agent}")),
-                    "{agent:?} x{matching}: {fix}"
+                    !fix.contains(agent),
+                    "{agent:?} x{matching}: no command names the agent: {fix}"
+                );
+                assert!(
+                    message.contains(agent),
+                    "{agent:?} x{matching}: the message still names it: {message}"
                 );
             }
         }
@@ -7498,8 +7518,15 @@ mod tests {
             "not json factory_slack_channel_unbound",
         ] {
             assert!(
-                super::factory_slack_unbound_refusal(body, "local", "acme-bot", "C0EXAMPLE1", 0)
-                    .is_none(),
+                super::factory_slack_unbound_refusal(
+                    body,
+                    "local",
+                    "acme-bot",
+                    AGENT_ID,
+                    "C0EXAMPLE1",
+                    0,
+                )
+                .is_none(),
                 "{body}"
             );
         }

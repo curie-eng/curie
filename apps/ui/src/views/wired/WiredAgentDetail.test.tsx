@@ -553,8 +553,8 @@ describe("WiredAgentDetail — factory progress hints use the agent id", () => {
       const hints = within(root)
         .getAllByRole("button", { name: /^Copy command:/ })
         .map((b) => b.getAttribute("aria-label") ?? "");
-      // Two set commands plus the two add-surface commands.
-      expect(hints).toHaveLength(4);
+      // Two set commands, the two add-surface commands and the two named-identity ones.
+      expect(hints).toHaveLength(6);
       for (const hint of hints) {
         expect(hint).not.toContain("acme");
         expect(hint).toContain(" a1");

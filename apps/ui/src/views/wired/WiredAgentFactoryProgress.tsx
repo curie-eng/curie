@@ -81,7 +81,7 @@ export function WiredAgentFactoryProgress({
           message = `This agent has ${slackBindings} Slack bindings for ${next}, one per Slack identity, and it needs exactly one. Remove the extra identity, then set it here.`;
           hint = "none";
         } else if (slackBindings === 0) {
-          message = `This agent has no Slack binding for ${next}. Add the channel as a surface first, then set it here.`;
+          message = `This agent has no Slack binding for ${next}. Add the channel as a surface first, then set it here. If another agent already holds the default Slack identity on that channel, add it under a free declared identity instead: replace <identity> with that identity's name in the second command.`;
           hint = "add";
         } else {
           message = `This agent needs exactly one Slack binding for ${next ?? "that channel"}, and the bindings this page shows do not explain why it has not. List the agent's current bindings and make sure exactly one Slack binding for ${next ?? "that channel"} remains, then set it here.`;
@@ -187,6 +187,22 @@ export function WiredAgentFactoryProgress({
               <CliHint
                 label="local"
                 command={cliCommand("local.surfaces", { agent: agentId, add: `slack=${error.channel}` })}
+              />
+              <CliHint
+                label="cluster, named identity"
+                command={cliCommand("cluster.surfaces", {
+                  agent: agentId,
+                  add: `slack=${error.channel}`,
+                  adapter: "<identity>",
+                })}
+              />
+              <CliHint
+                label="local, named identity"
+                command={cliCommand("local.surfaces", {
+                  agent: agentId,
+                  add: `slack=${error.channel}`,
+                  adapter: "<identity>",
+                })}
               />
             </div>
           ) : null}

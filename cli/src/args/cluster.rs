@@ -1227,8 +1227,10 @@ pub(crate) enum ClusterAction {
     ///
     /// With neither flag this inspects. The agent must already hold exactly
     /// one Slack binding with an identity for the channel; add it first with
-    /// `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>`, or, when the
-    /// channel is bound under several identities, remove the extra with
+    /// `curie cluster surfaces <agent> --add slack=<CHANNEL_ID>` (when another
+    /// agent already holds the default Slack identity on that channel, add it
+    /// under a free declared identity with `--adapter <identity>`), or, when
+    /// the channel is bound under several identities, remove the extra with
     /// `curie cluster surfaces <agent> --remove slack=<CHANNEL_ID> --adapter
     /// <identity>`. Binding it is a separate decision because it also makes
     /// the agent answer there.
