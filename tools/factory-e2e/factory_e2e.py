@@ -186,6 +186,15 @@ run needs CURIE_FACTORY_MODEL_API_KEY. `--live-chain-attempt N` (1 or 2) records
 which of the at most two attempts this is. Both flags are refused for any
 other scenario.
 
+`one-ticket --forge jira_cloud --answer-file <file> [--issue-file <file>]`
+(one_ticket_live.py, #5793) runs the one-ticket flow on a real Jira Cloud site
+with a real model: the labeller opens and labels the ticket, the factory asks,
+the driver posts the plain answer only once the question ending has settled,
+and the answered run's pull request is merged. It judges each beat against its
+bound, the Jira status id before and after, at most two requests and the
+factory's own usage total, and writes evidence and logs only through its
+anonymizer. `--answer-file` is required and refused for any other scenario.
+
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
 Standard library only, so it runs from a bare source checkout.
@@ -455,6 +464,7 @@ SCENARIOS: dict[str, ScenarioDriver | None] = {
     "repo-runner": None,  # bound at the bottom from repo_runner.py
     "docker": None,  # bound at the bottom from docker_driver.py
     "live-github-chain": None,  # bound at the bottom from live_github_chain.py
+    "one-ticket": None,  # bound at the bottom from one_ticket_live.py
 }
 SCENARIO_NAMES = tuple(SCENARIOS)
 LIVE_CHAIN_SCENARIO = "live-github-chain"
@@ -472,7 +482,13 @@ def resolve_scenario(name: str) -> ScenarioDriver:
 
 
 # The loop scenarios and the forge each one fixes; None means `--forge` names it.
-LOOP_SCENARIOS: dict[str, str | None] = {"forge-loop": None, "github-loop": "github"}
+LOOP_SCENARIOS: dict[str, str | None] = {
+    "forge-loop": None,
+    "github-loop": "github",
+    "one-ticket": "jira_cloud",
+}
+ONE_TICKET_SCENARIO = "one-ticket"
+ONE_TICKET_ISSUE_FILE = Path(__file__).resolve().parent / "fixtures" / "one-ticket-jira-issue.md"
 
 
 # Scenarios that open every ticket they judge themselves.
@@ -1183,6 +1199,33 @@ def parse_issue_file(path: Path) -> tuple[str, str]:
     if not title or not body:
         raise ConfigError(f"the issue file {path} needs a title line followed by a non-empty body")
     return title, body
+
+
+# A mention in plain text: `@name` at a word start, or Jira's `[~accountid:...]` form.
+_ANSWER_MENTION = re.compile(r"(?:^|[^\w.+-])@\w|\[~")
+
+
+def read_answer_file(path: Path | None) -> str:
+    """The one-ticket answer: the labeller's plain text, stripped, with no mention.
+
+    Refused before anything is installed: a missing flag, an unreadable or
+    empty file, or text that mentions anyone (the answer must start the next
+    request as a plain answer, not as a mention).
+    """
+
+    if path is None:
+        raise ConfigError(
+            f"{ONE_TICKET_SCENARIO} needs --answer-file <file>: the labeller's plain answer"
+        )
+    try:
+        text = path.read_text().strip()
+    except OSError as exc:
+        raise ConfigError(f"cannot read the answer file {path}: {exc.strerror}") from None
+    if not text:
+        raise ConfigError(f"the answer file {path} is empty")
+    if _ANSWER_MENTION.search(text):
+        raise ConfigError(f"the answer file {path} mentions someone; the answer must be plain text")
+    return text
 
 
 def validate_namespace(name: str) -> str:
@@ -6266,7 +6309,8 @@ def loop_forge(scenario: str, requested: str | None) -> str | None:
 
     if scenario not in LOOP_SCENARIOS:
         if requested is not None:
-            raise ConfigError(f"--forge applies only to {' and '.join(LOOP_SCENARIOS)}")
+            *rest, last = LOOP_SCENARIOS
+            raise ConfigError(f"--forge applies only to {', '.join(rest)} and {last}")
         return None
     fixed = LOOP_SCENARIOS[scenario]
     if fixed is not None and requested not in (None, fixed):
@@ -6752,8 +6796,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--forge",
         choices=tuple(FORGES),
         help=(
-            "forge-loop (required) and github-loop (github only): the forge entry under "
-            "tools/factory-e2e/forges/ whose driver the loop observes through"
+            "forge-loop (required), github-loop (github only) and one-ticket (jira_cloud "
+            "only): the forge entry under tools/factory-e2e/forges/ whose driver the loop "
+            "observes through"
         ),
     )
     scenario.add_argument(
@@ -6767,9 +6812,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--issue-file",
         type=Path,
         help=(
-            "issue-to-pr, revision (required), cancel-running and quiesce (optional): "
-            "Markdown "
+            "issue-to-pr, revision (required), cancel-running, quiesce, the loops and "
+            "one-ticket (optional; one-ticket defaults to "
+            "tools/factory-e2e/fixtures/one-ticket-jira-issue.md): Markdown "
             "ticket, first line the title, the rest the body"
+        ),
+    )
+    scenario.add_argument(
+        "--answer-file",
+        type=Path,
+        help=(
+            "one-ticket (required): the labeller's plain answer to the factory's question, "
+            "posted on the Jira issue once the question ending has settled; no mention"
         ),
     )
     scenario.add_argument(
@@ -7353,6 +7407,7 @@ def main(argv: list[str] | None = None) -> int:
     revision_text: str | None = None
     forge: str | None = None
     forge_target: str | None = None
+    answer_text: str | None = None
     try:
         if args.mode == "run":
             driver = resolve_scenario(args.scenario)
@@ -7363,6 +7418,8 @@ def main(argv: list[str] | None = None) -> int:
                 ):
                     if value is not None:
                         raise ConfigError(f"{flag} applies only to {LIVE_CHAIN_SCENARIO}")
+            if args.scenario != ONE_TICKET_SCENARIO and args.answer_file is not None:
+                raise ConfigError(f"--answer-file applies only to {ONE_TICKET_SCENARIO}")
             forge = loop_forge(args.scenario, args.forge)
             forge_target = loop_forge_target(forge, args.forge_target)
             if args.scenario == "issue-to-pr":
@@ -7398,6 +7455,9 @@ def main(argv: list[str] | None = None) -> int:
                         raise ConfigError(
                             f"cannot read the revision file {args.revision_file}: {exc.strerror}"
                         ) from None
+            elif args.scenario == ONE_TICKET_SCENARIO:
+                issue_spec = parse_issue_file(args.issue_file or ONE_TICKET_ISSUE_FILE)
+                answer_text = read_answer_file(args.answer_file)
             elif args.scenario in LOOP_SCENARIOS:
                 issue_spec = (
                     parse_issue_file(args.issue_file)
@@ -7516,6 +7576,8 @@ def main(argv: list[str] | None = None) -> int:
         preflight.scenario_options.update(
             stop_after=args.stop_after, attempt=args.live_chain_attempt or 1
         )
+    if answer_text is not None:
+        preflight.scenario_options["answer_text"] = answer_text
 
     def _terminate(signum: int, _frame: Any) -> None:
         raise SystemExit(128 + signum)
@@ -7683,6 +7745,33 @@ SCENARIO_HOOKS[LIVE_CHAIN_SCENARIO] = ScenarioHooks(
     install_values=_live_chain_install_values,
     finish=_live_chain_finish,
     ensure_label=_live_chain_ensure_label,
+    private_binary=True,
+)
+
+
+def load_one_ticket_live() -> Any:
+    """Load the one-ticket live driver once (one_ticket_live.py, #5793)."""
+
+    return _load_by_path("one_ticket_live", Path(__file__).with_name("one_ticket_live.py"))
+
+
+def _drive_one_ticket(p: Preflight) -> dict[str, Any]:
+    # Loaded at call time, like the other scenario modules that import this one.
+    return cast(dict[str, Any], load_one_ticket_live().drive(p))
+
+
+def _one_ticket_before_run(p: Preflight) -> None:
+    load_one_ticket_live().before_run(p)
+
+
+def _one_ticket_finish(p: Preflight, results: list[dict[str, Any]]) -> bool:
+    return bool(load_one_ticket_live().finish(p, results))
+
+
+SCENARIOS[ONE_TICKET_SCENARIO] = _drive_one_ticket
+SCENARIO_HOOKS[ONE_TICKET_SCENARIO] = ScenarioHooks(
+    before_run=_one_ticket_before_run,
+    finish=_one_ticket_finish,
     private_binary=True,
 )
 

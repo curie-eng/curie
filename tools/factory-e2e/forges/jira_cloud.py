@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json
+import math
 import os
 import subprocess
 import time
@@ -176,6 +177,22 @@ def done_transition(transitions: Mapping[str, Any]) -> str | None:
     return None
 
 
+def adf_paragraph(text: str) -> dict[str, Any]:
+    """A one-paragraph ADF document holding ``text``. Pure."""
+
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
+    }
+
+
+def created_since_jql(project_key: str, account_id: str, minutes: int) -> str:
+    """JQL for the issues ``account_id`` created in the project in the last ``minutes``. Pure."""
+
+    return f'project = "{project_key}" AND creator = "{account_id}" AND created >= -{minutes}m'
+
+
 def jira_label_update(*, add: Iterable[str] = (), remove: Iterable[str] = ()) -> dict[str, Any]:
     """An issue edit body adding and removing labels in one update. Pure."""
 
@@ -258,13 +275,7 @@ class JiraCloudDriver:
                     "project": {"key": self.site.project_key},
                     "issuetype": {"name": "Task"},
                     "summary": title,
-                    "description": {
-                        "type": "doc",
-                        "version": 1,
-                        "content": [
-                            {"type": "paragraph", "content": [{"type": "text", "text": body}]}
-                        ],
-                    },
+                    "description": adf_paragraph(body),
                 }
             },
         )
@@ -299,10 +310,26 @@ class JiraCloudDriver:
 
     # -- the ticket --
 
-    def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
+    def open_and_label_ticket(
+        self,
+        title: str,
+        body: str,
+        since: float,
+        *,
+        before_label: Callable[[str, str], None] | None = None,
+    ) -> str:
+        """Open the issue, label it as the labeler and prove one WorkItem.
+
+        ``before_label`` is called with the created issue's ``(id, key)`` after
+        it exists and before the label, so a caller can read the issue as it
+        was before the factory saw it.
+        """
+
         issue_id, key = self._create_issue(title, body)
         self.key = key
         self.p.evidence["jira_issue_key"] = key
+        if before_label is not None:
+            before_label(issue_id, key)
         self._label("labeler", issue_id)
         self.p.step("Jira issue opened and labelled by the labeler", key=key)
 
@@ -359,6 +386,62 @@ class JiraCloudDriver:
     def pin_fixture_base(self) -> None:
         self.github.pin_fixture_base()
 
+    # -- reads and writes the one-ticket scenario adds (one_ticket_live.py) --
+
+    def issue_fields(self, issue_id_or_key: str) -> tuple[int, dict[str, Any] | None]:
+        """The issue's status and labels, read as the labeler: (HTTP status, issue or None)."""
+
+        status, issue = self._jira(
+            "labeler", "GET", f"/issue/{issue_id_or_key}?fields=status,labels"
+        )
+        return status, issue if isinstance(issue, dict) else None
+
+    def bot_comments(self, key: str) -> list[dict[str, Any]] | None:
+        """The bot's comments on ``key`` with their entity properties expanded, or None.
+
+        The raw Jira REST comment objects of ``POST /comment/list?expand=properties``:
+        ``properties`` is a list of ``{"key": ..., "value": ...}``.
+        """
+
+        ids = self._bot_comment_ids(key)
+        if ids is None:
+            return None
+        listed: list[dict[str, Any]] = []
+        for start in range(0, len(ids), COMMENT_LIST_IDS_LIMIT):
+            page = self._comments_with_properties(ids[start : start + COMMENT_LIST_IDS_LIMIT])
+            if page is None:
+                return None
+            listed.extend(page)
+        return listed
+
+    def post_comment(self, issue_id: str, text: str) -> tuple[int, Any]:
+        """Post ``text`` as one plain paragraph comment by the labeler."""
+
+        return self._jira(
+            "labeler", "POST", f"/issue/{issue_id}/comment", {"body": adf_paragraph(text)}
+        )
+
+    def factory_created_issues(self, since_epoch: float) -> int | None:
+        """Issues the factory account created in the project since ``since_epoch``, or None.
+
+        Jira Cloud REST v3 "Search for issues using JQL enhanced search":
+        https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/#api-rest-api-3-search-jql-post
+        JQL's relative ``created`` takes whole minutes, so the window is rounded up.
+        """
+
+        minutes = max(1, math.ceil((time.time() - since_epoch) / 60) + 1)
+        jql = created_since_jql(self.site.project_key, self.site.bot_account_id, minutes)
+        status, found = self._jira(
+            "labeler",
+            "POST",
+            "/search/jql",
+            {"jql": jql, "fields": ["created"], "maxResults": 100},
+        )
+        issues = found.get("issues") if isinstance(found, dict) else None
+        if status != 200 or not isinstance(issues, list):
+            return None
+        return len(issues)
+
     # -- tracker evidence --
 
     def _status_comments(self, key: str) -> int | None:
@@ -371,15 +454,9 @@ class JiraCloudDriver:
         https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/
         """
 
-        ids = self._bot_comment_ids(key)
-        if ids is None:
+        listed = self.bot_comments(key)
+        if listed is None:
             return None
-        listed: list[dict[str, Any]] = []
-        for start in range(0, len(ids), COMMENT_LIST_IDS_LIMIT):
-            page = self._comments_with_properties(ids[start : start + COMMENT_LIST_IDS_LIMIT])
-            if page is None:
-                return None
-            listed.extend(page)
         return bot_comment_count({"comments": listed}, self.site.bot_account_id)
 
     def _bot_comment_ids(self, key: str) -> list[int] | None:
