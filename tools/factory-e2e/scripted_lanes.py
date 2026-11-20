@@ -108,6 +108,24 @@ def observed_revision(request: dict[str, Any]) -> str | None:
     return None
 
 
+def trailing_message(request: dict[str, Any]) -> str:
+    """The role and shortened text of the request's newest message."""
+
+    messages = [m for m in request.get("messages") or [] if isinstance(m, dict)]
+    if not messages:
+        return ""
+    last = messages[-1]
+    content = last.get("content")
+    parts = _texts(content)
+    if isinstance(content, list):
+        parts += [
+            f"[{block.get('type')}]" + "".join(_texts(block.get("content")))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        ]
+    return f"{last.get('role')}: " + " ".join(parts)[:240]
+
+
 def retarget(exchanges: list[dict[str, Any]], source: int, target: int) -> list[dict[str, Any]]:
     """A copy of a recorded issue lane that works issue ``target`` instead of ``source``.
 
@@ -132,6 +150,9 @@ class Lane:
     exchanges: list[dict[str, Any]]
     used: set[int] = field(default_factory=set)
     served: list[int] = field(default_factory=list)
+    # The newest message of each served request, shortened: what the model was
+    # last told before each of its answers.
+    trailing: list[str] = field(default_factory=list)
     revisions: list[str] = field(default_factory=list)
 
     @property
@@ -222,6 +243,7 @@ class LaneRouter:
                 lane.revisions.append(revision)
             lane.used.add(index)
             lane.served.append(exchange["ordinal"])
+            lane.trailing.append(trailing_message(request))
             for hook in self.hooks:
                 hook(lane, exchange["ordinal"])
             return dict(answer)
@@ -234,6 +256,7 @@ class LaneRouter:
                 "agent": lane.agent,
                 "issue": lane.issue,
                 "served_ordinals": list(lane.served),
+                "trailing": list(lane.trailing),
                 "exchange_count": len(lane.exchanges),
                 "complete": lane.complete,
                 "observed_revisions": list(lane.revisions),
