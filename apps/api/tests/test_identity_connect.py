@@ -872,6 +872,86 @@ def test_connect_confirm_page_referrer_policy_is_strict_origin(connect_browser) 
     assert browser_links(tenant_id) == [("UALICE001", principal_id)]
 
 
+def test_connect_refusals_are_pages_for_browsers_and_json_otherwise(connect_browser) -> None:
+    """A browser gets a styled 400/401/403 page; other clients keep the JSON detail."""
+    from curie_api.routers.identity_connect import CSRF_COOKIE, PRIVATE_HEADERS, PROOF_COOKIE
+    from curie_api.routers.identity_connect_pages import STYLE_HASH
+
+    client, raw, tenant_id, principal_id, proof, _ = connect_browser
+    browser = {"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+
+    def assert_page(response, status: int, title: str) -> None:
+        assert response.status_code == status, response.text
+        assert response.headers["content-type"].startswith("text/html")
+        assert f"<title>{title}</title>" in response.text
+        assert response.text.count("<h1>") == 1 and "<style>" in response.text
+        for name, value in PRIVATE_HEADERS.items():
+            assert response.headers[name] == value
+        assert f"style-src '{STYLE_HASH}'" in response.headers["content-security-policy"]
+
+    unknown = f"/identity/connect/{uuid.uuid4()}"
+    assert_page(client.get(unknown, headers=browser), 400, "This link can't be used")
+    answer = client.get(unknown)
+    assert answer.status_code == 400
+    assert answer.json() == {"detail": "invalid or expired account connection"}
+    assert answer.headers["content-security-policy"] == PRIVATE_HEADERS["Content-Security-Policy"]
+
+    path = f"/identity/connect/{raw}"
+    assert client.get(path).status_code == 200
+    csrf = client.cookies.get(CSRF_COOKIE)
+    origin = {"Origin": "https://testserver"}
+
+    unsigned = client.post(f"{path}/confirm", data={"csrf": csrf}, headers={**origin, **browser})
+    assert_page(unsigned, 401, "Sign in required")
+    unsigned = client.post(f"{path}/confirm", data={"csrf": csrf}, headers=origin)
+    assert unsigned.status_code == 401 and unsigned.json() == {"detail": "sign in required"}
+
+    null_origin = {"Origin": "null"}
+    rejected = client.post(
+        f"{path}/confirm", data={"csrf": csrf}, headers={**null_origin, **browser}
+    )
+    assert_page(rejected, 403, "Request not accepted")
+    rejected = client.post(f"{path}/confirm", data={"csrf": csrf}, headers=null_origin)
+    assert rejected.status_code == 403
+    assert rejected.json() == {"detail": "console session origin rejected"}
+
+    malformed = client.post(f"{path}/confirm", data={}, headers={**origin, **browser})
+    assert_page(malformed, 400, "This link can't be used")
+    malformed = client.post(f"{path}/confirm", data={}, headers=origin)
+    assert malformed.status_code == 400
+    assert malformed.json() == {"detail": "invalid account confirmation"}
+    assert browser_links(tenant_id) == []
+
+    client.cookies.set(PROOF_COOKIE, proof)
+    assert client.get(path).status_code == 200
+    csrf = client.cookies.get(CSRF_COOKIE)
+    confirmed = client.post(f"{path}/confirm", data={"csrf": csrf}, headers={**origin, **browser})
+    assert_page(confirmed, 200, "Account connected")
+    assert "<h1>Account connected</h1>" in confirmed.text
+    assert "Return to your chat and send your request again." in confirmed.text
+    assert browser_links(tenant_id) == [("UALICE001", principal_id)]
+    assert_page(client.get(path, headers=browser), 400, "This link can't be used")
+
+
+def test_connect_plan_page_style_matches_its_csp_hash(connect_plan_browser) -> None:
+    import base64
+    import re
+
+    from curie_api.routers.identity_connect import PROOF_COOKIE
+
+    client, raw, _, _, proof, _ = connect_plan_browser
+    client.cookies.set(PROOF_COOKIE, proof)
+    page = client.get(f"/identity/connect/{raw}", headers={"Accept": "text/html"})
+    assert page.status_code == 200
+    styles = re.findall(r"<style>(.*?)</style>", page.text, re.S)
+    assert len(styles) == 1
+    digest = base64.b64encode(hashlib.sha256(styles[0].encode()).digest()).decode()
+    policy = page.headers["content-security-policy"]
+    assert f"style-src 'sha256-{digest}'" in policy
+    assert "unsafe-inline" not in policy and "nonce-" not in policy
+    assert '<p class="warning">Confirm only if this is your own Slack account.' in page.text
+
+
 def test_oidc_callback_returns_to_confirmation_and_preserves_verified_claim(
     connect_browser,
 ) -> None:
