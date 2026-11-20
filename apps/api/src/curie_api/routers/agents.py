@@ -1211,6 +1211,9 @@ async def read_version_connectors(
                     grant_store=grant_store,
                     gated_tools=gated,
                     e2e=e2e_install,
+                    # The operator's ServiceAccount for each of this agent's
+                    # connectors that has one; the bundle cannot name one.
+                    service_accounts=settings.connector_service_accounts_for(agent_name),
                 )
             except ValueError as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc

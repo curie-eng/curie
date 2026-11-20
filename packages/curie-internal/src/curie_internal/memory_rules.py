@@ -196,6 +196,22 @@ def binding_scope_key(kind: str, address: str) -> str:
     return f"{_scope_part(kind, allow_colon=False)}:{_scope_part(address, allow_colon=True)}"
 
 
+def binding_claim_scope_key(binding: object) -> str:
+    """Key the binding scope named by a state credential's ``binding`` claim.
+
+    The worker writes the claim as ``kind:address`` with the raw kind and
+    address (ADR 0188), so it is split at the first colon and keyed through
+    ``binding_scope_key``; a claim that is not such a pair is refused.
+    """
+
+    if type(binding) is not str:
+        raise InvalidRule("invalid_text")
+    kind, colon, address = binding.partition(":")
+    if not colon:
+        raise InvalidRule("invalid_text")
+    return binding_scope_key(kind, address)
+
+
 def _rule_number(value: object) -> int:
     if type(value) is not int or not 1 <= value <= MAX_RULE_NUMBER:
         raise InvalidRule("invalid_text")

@@ -52,6 +52,7 @@ FACTORY_PREFIXES = (
     "apps/api/src/curie_api/routers/forge_credential_health.py",
     "cli/src/forge_expiry.rs",
     "apps/api/tests/forge_fakes/gitlab.py",
+    "apps/api/tests/forge_fakes/jira.py",
     "apps/worker/src/curie_worker/factory",
     "apps/worker/src/curie_worker/workitem_dispatch.py",
     "apps/worker/src/curie_worker/binding.py",
@@ -66,6 +67,7 @@ FACTORY_PREFIXES = (
     "tools/factory-e2e",
     "tools/model-script",
     "tools/github-stub",
+    "tools/jira-stub",
 )
 # The kind approval resume scenario (#4016) covers worker, approval and shared
 # setup paths. Prefixes without a .py suffix match by raw string prefix, so

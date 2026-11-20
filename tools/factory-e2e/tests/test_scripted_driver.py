@@ -7,6 +7,7 @@ kind scenario remains the proof that the product completes an issue.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import fcntl
 import json
 import os
@@ -75,11 +76,11 @@ def test_facts_recording_refuses_before_resource_mutation(
     assert "never records" in capsys.readouterr().err
 
 
-def test_triage_recording_refuses_before_resource_mutation(
+def test_recording_another_scenario_refuses_before_resource_mutation(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
-    args = fe.parse_args(["scripted", "--scenario", "triage-to-pr", "--record"])
+    args = fe.parse_args(["scripted", "--scenario", "jira-one-ticket", "--record"])
     assert sk.main(args) == fe.EXIT_CONFIG
     assert "only the publication scenario supports recording" in capsys.readouterr().err
 
@@ -1696,11 +1697,11 @@ def _image_check_commands(
     return calls, mutating
 
 
-# Triage replay needs the dispatcher image for the channel gateway.
-TRIAGE_IMAGES = (*sk.IMAGES, sk.GATEWAY_IMAGE)
+# The publication replay needs the dispatcher image for the channel gateway.
+GATEWAY_IMAGES = (*sk.IMAGES, sk.GATEWAY_IMAGE)
 
 
-@pytest.mark.parametrize("missing", TRIAGE_IMAGES)
+@pytest.mark.parametrize("missing", GATEWAY_IMAGES)
 def test_missing_local_image_refuses_as_configuration_before_resource_creation(
     missing: str,
     tmp_path: Path,
@@ -1710,7 +1711,7 @@ def test_missing_local_image_refuses_as_configuration_before_resource_creation(
 
     calls, mutating = _image_check_commands(tmp_path, monkeypatch, missing)
 
-    assert sk.main(_replay_args(tmp_path, scenario="triage-to-pr")) == fe.EXIT_CONFIG
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_CONFIG
     assert ("docker", "image", "inspect", missing) in calls
     assert mutating == [], "no cluster, registry or build command may run"
     evidence = _evidence(tmp_path)
@@ -1725,18 +1726,18 @@ def test_present_local_images_pass_the_check_and_reach_resource_creation(
 ) -> None:
     calls, mutating = _image_check_commands(tmp_path, monkeypatch, None)
 
-    assert sk.main(_replay_args(tmp_path, scenario="triage-to-pr")) == fe.EXIT_FAILED
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
     inspected = {
         image for argv in calls if argv[:3] == ("docker", "image", "inspect")
         for image in argv[3:]
     }
-    assert sorted(inspected) == sorted(TRIAGE_IMAGES)
+    assert sorted(inspected) == sorted(GATEWAY_IMAGES)
     assert mutating, "the run must proceed past the image check"
     assert mutating[0][:2] in {("docker", "run"), ("kind", "create")}
     first_mutation = calls.index(mutating[0])
     assert all(
         calls.index(("docker", "image", "inspect", image)) < first_mutation
-        for image in TRIAGE_IMAGES
+        for image in GATEWAY_IMAGES
     )
     assert "stop at first resource command" in _evidence(tmp_path)["error"]
 
@@ -2085,52 +2086,16 @@ def test_runner_layer_disk_budget_follows_the_runner_image(
         assert builds == []
 
 
-# triage-to-pr (#5588): two agents' lanes, the Slack recorder and the scenario
-# assertions, offline. Each capability has a negative control that fails when
-# the capability is removed.
+# Per-agent model lanes and the Slack recorder, offline. Each capability has a
+# negative control that fails when the capability is removed.
 
 import scripted_lanes as lanes  # noqa: E402
-import triage_run  # noqa: E402
-import triage_scenario as ts  # noqa: E402
+import scripted_scenario as sso  # noqa: E402
 
 MODEL_SCRIPT = REPO_ROOT / "tools/model-script/model_script.py"
 RECORDED = REPO_ROOT / "tools/model-script/transcripts/unitconv-issue.json"
 SHA = "0123456789abcdef0123456789abcdef01234567"
-
-
-def test_triage_setup_requests_unattended_publication_before_deploy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    driver = sk.ScriptedRun(_replay_args(tmp_path, scenario="triage-to-pr"))
-    driver.workdir = tmp_path / "work"
-    driver.workdir.mkdir()
-    driver.env.update(CURIE_API_URL="http://api.example.com", CURIE_API_KEY="example-key")
-    driver.stub = type("Stub", (), {"set_permission": lambda *_args, **_kwargs: None})()
-    events: list[tuple[str, Any]] = []
-
-    def http_json(method: str, url: str, **kwargs: Any) -> tuple[int, dict[str, Any]]:
-        if method == "POST" and url.endswith("/agents"):
-            events.append(("create", kwargs["body"]))
-            return 201, {"id": "triage-agent-example"}
-        return 200, {}
-
-    def command(*argv: str, **_kwargs: Any) -> str:
-        if argv[1] == "example":
-            sk.shutil.copytree(triage_run.TRIAGE_BUNDLE, driver.workdir / "triage-bundle")
-        else:
-            events.append(("deploy", argv))
-        return ""
-
-    monkeypatch.setattr(fe, "http_json", http_json)
-    monkeypatch.setattr(driver, "command", command)
-    monkeypatch.setattr(driver, "kubectl", lambda *_args, **_kwargs: "")
-    router = lanes.LaneRouter({"triage": lanes.bundle_system_prompt(triage_run.TRIAGE_BUNDLE)})
-    run = triage_run.TriageToPr(driver, router, None)  # type: ignore[arg-type]
-
-    run.setup()
-
-    assert [event for event, _ in events] == ["create", "deploy"]
-    assert events[0][1].get("publication_policy") == "auto"
+REVIEWER = "Reviewer agent."
 
 
 @pytest.fixture
@@ -2147,8 +2112,10 @@ def _frame(issue: int) -> str:
     )
 
 
-def _request(issue: int, *, triage: bool, turns: list[dict[str, Any]] | None = None) -> bytes:
-    system = lanes.bundle_system_prompt(triage_run.TRIAGE_BUNDLE) if triage else "Dark factory."
+def _request(
+    issue: int, *, reviewer: bool = False, turns: list[dict[str, Any]] | None = None
+) -> bytes:
+    system = REVIEWER if reviewer else "Dark factory."
     messages = [{"role": "user", "content": [{"type": "text", "text": _frame(issue)}]}]
     messages += turns or []
     return json.dumps(
@@ -2166,148 +2133,116 @@ def _tool_turn(output: str) -> list[dict[str, Any]]:
     ]
 
 
-def _tool_names(exchange: dict[str, Any] | None) -> list[str]:
+def _text(exchange: dict[str, Any] | None) -> str:
     assert exchange is not None
-    return [b["name"] for b in exchange["message"]["content"] if b.get("type") == "tool_use"]
+    return json.dumps(exchange["message"])
 
 
-class _FakeStub:
-    def __init__(self) -> None:
-        self.issues: dict[int, dict[str, Any]] = {}
-        self.comments: list[dict[str, Any]] = []
-        self.revoked: list[str] = []
+def _two_agent_router(model_module: Any) -> tuple[Any, lanes.LaneRouter]:
+    """The recorded implementation lane and a reviewer lane that shares its lane key."""
 
-    def _get(self, kind: str, number: int) -> dict[str, Any] | None:
-        assert kind == "issue"
-        return self.issues.get(number)
-
-    def _rows(self, kind: str) -> list[dict[str, Any]]:
-        return self.comments if kind == "comment" else list(self.issues.values())
-
-    def revoke_permission(self, login: str) -> None:
-        self.revoked.append(login)
-
-
-@pytest.fixture
-def routed(model_module: Any) -> tuple[Any, lanes.LaneRouter, _FakeStub]:
     script = model_module.ModelScript(RECORDED)
-    stub = _FakeStub()
-    router = triage_run.build_router(model_module)
-    router.resolvers.append(
-        triage_run.output_resolver(stub, model_module.load_transcript(RECORDED))
-    )
-    router.hooks.append(triage_run.revoke_on_first_turn(stub))
-    router.install(script, model_module)
-    yield script, router, stub
-    script._server.server_close()
-
-
-def test_triage_and_implementation_turns_collapse_without_agent_lanes(model_module: Any) -> None:
-    """Negative control: the scripted model alone gives both agents one lane key."""
-    triage = model_module.request_key(json.loads(_request(ts.SOURCE_TICKET, triage=True)))
-    implementation = model_module.request_key(json.loads(_request(3815, triage=False)))
-    assert triage == implementation
     recorded = model_module.load_transcript(RECORDED)
-    ticket = model_module.load_transcript(triage_run.TICKET_TRANSCRIPT)
-    assert {e["lane_key"] for e in ticket} <= {e["lane_key"] for e in recorded}
-    # So a plain endpoint answers the triage session with the implementation lane.
+    reviewer = [dict(recorded[0], message={"content": [{"type": "text", "text": "review ok"}]})]
+    router = lanes.LaneRouter({"reviewer": REVIEWER})
+    router.add(lanes.Lane("implementation", lanes.IMPLEMENTATION, 3815, recorded))
+    router.add(lanes.Lane("reviewer", "reviewer", 3815, reviewer))
+    router.install(script, model_module)
+    return script, router
+
+
+def test_agents_on_one_issue_collapse_without_lanes(model_module: Any) -> None:
+    """Negative control: the scripted model alone gives both agents one lane key."""
     plain = model_module.ModelScript(RECORDED)
     try:
-        answer = plain._match("POST", "/v1/messages", _request(ts.SOURCE_TICKET, triage=True))
-        assert _tool_names(answer) == ["Skill"]
+        reviewer = plain._match("POST", "/v1/messages", _request(3815, reviewer=True))
+        assert "Skill" in _text(reviewer)
     finally:
         plain._server.server_close()
 
 
-def test_router_answers_each_agent_from_its_own_lane(routed: Any) -> None:
-    script, router, _ = routed
-    triage = script._match("POST", "/v1/messages", _request(ts.SOURCE_TICKET, triage=True))
-    assert _tool_names(triage) == ["Bash"]
-    implementation = script._match("POST", "/v1/messages", _request(3815, triage=False))
-    assert _tool_names(implementation) == ["Skill"]
-    # The refused source has its own triage lane: ordinal 0 again, not ordinal 1.
-    refused = script._match("POST", "/v1/messages", _request(ts.SOURCE_REFUSED, triage=True))
-    assert _tool_names(refused) == ["Bash"]
-    findings = script._match("POST", "/v1/messages", _request(ts.SOURCE_FINDINGS, triage=True))
-    assert "python3 -m unitconv 100 c f" in json.dumps(findings)
-    evidence = router.evidence()
-    assert evidence["triage-ticket"]["served_ordinals"] == [0]
-    assert evidence["triage-refused"]["served_ordinals"] == [0]
-    assert evidence["unrouted"] == []
+def test_router_answers_each_agent_from_its_own_lane(model_module: Any) -> None:
+    script, router = _two_agent_router(model_module)
+    try:
+        reviewer = script._match("POST", "/v1/messages", _request(3815, reviewer=True))
+        assert "review ok" in _text(reviewer)
+        implementation = script._match("POST", "/v1/messages", _request(3815))
+        assert "Skill" in _text(implementation) and "review ok" not in _text(implementation)
+        evidence = router.evidence()
+        assert evidence["reviewer"]["served_ordinals"] == [0]
+        assert evidence["implementation"]["served_ordinals"] == [0]
+        assert evidence["unrouted"] == []
+    finally:
+        script._server.server_close()
 
 
-def test_a_second_triage_session_is_not_answered(routed: Any) -> None:
-    script, router, _ = routed
-    assert script._match("POST", "/v1/messages", _request(ts.SOURCE_TICKET, triage=True))
-    assert script._match("POST", "/v1/messages", _request(ts.SOURCE_TICKET, triage=True)) is None
-    assert router.unrouted and router.unrouted[-1]["lane"] == "triage-ticket"
+def test_a_second_session_of_a_lane_is_not_answered(model_module: Any) -> None:
+    script, router = _two_agent_router(model_module)
+    try:
+        assert script._match("POST", "/v1/messages", _request(3815, reviewer=True))
+        assert script._match("POST", "/v1/messages", _request(3815, reviewer=True)) is None
+        assert router.unrouted and router.unrouted[-1]["lane"] == "reviewer"
+    finally:
+        script._server.server_close()
 
 
-def test_triage_never_borrows_the_implementation_transcript(routed: Any) -> None:
-    script, router, _ = routed
-    assert script._match("POST", "/v1/messages", _request(3999, triage=True)) is None
-    assert router.unrouted == [{"agent": lanes.TRIAGE, "issue": None}]
+def test_a_non_default_agent_never_borrows_the_implementation_transcript(
+    model_module: Any,
+) -> None:
+    script, router = _two_agent_router(model_module)
+    try:
+        assert script._match("POST", "/v1/messages", _request(3999, reviewer=True)) is None
+        assert router.unrouted == [{"agent": "reviewer", "issue": None}]
+    finally:
+        script._server.server_close()
 
 
-def test_submission_carries_the_revision_the_sandbox_printed(routed: Any) -> None:
-    script, router, _ = routed
-    script._match("POST", "/v1/messages", _request(ts.SOURCE_TICKET, triage=True))
-    turn = _tool_turn(f"Exit code 2\n{SHA}\nerror: unknown unit k")
-    answer = script._match("POST", "/v1/messages", _request(ts.SOURCE_TICKET, triage=True,
-                                                             turns=turn))
-    assert answer is not None
-    (submission,) = [b for b in answer["message"]["content"] if b.get("type") == "tool_use"]
-    assert submission["input"]["kind"] == "ticket"
-    assert submission["input"]["reproduction"]["revision"] == SHA
-    assert lanes.REVISION_PLACEHOLDER not in json.dumps(answer)
-    assert router.evidence()["triage-ticket"]["observed_revisions"] == [SHA]
-
-
-def test_submission_without_an_observed_revision_is_refused(routed: Any) -> None:
-    """Negative control: no printed commit, no submission."""
-    script, router, _ = routed
-    script._match("POST", "/v1/messages", _request(ts.SOURCE_TICKET, triage=True))
-    turn = _tool_turn("Exit code 2\nerror: unknown unit k")
-    assert script._match(
-        "POST", "/v1/messages", _request(ts.SOURCE_TICKET, triage=True, turns=turn)
-    ) is None
-    assert router.unrouted[-1] == {"lane": "triage-ticket", "missing": "observed_revision"}
-
-
-def test_output_issue_gets_a_retargeted_implementation_lane(routed: Any) -> None:
-    script, router, stub = routed
-    request_id = "00000000-0000-0000-0000-00000000a001"
-    stub.comments.append(
-        {"issue_number": ts.SOURCE_TICKET, "body": f"<!-- {ts.result_marker(request_id)} -->"}
+def test_an_answer_carries_the_revision_the_sandbox_printed(model_module: Any) -> None:
+    script = model_module.ModelScript(RECORDED)
+    recorded = model_module.load_transcript(RECORDED)
+    second = next(e for e in recorded if e["ordinal"] == 1)
+    placeholder = dict(
+        second, message={"content": [{"type": "text", "text": lanes.REVISION_PLACEHOLDER}]}
     )
-    linked = f"Ticket.\n<!-- {ts.linked_marker(request_id)} -->"
-    stub.issues[3904] = {"number": 3904, "body": linked}
-    answer = script._match("POST", "/v1/messages", _request(3904, triage=False))
-    assert _tool_names(answer) == ["Skill"]
-    assert "issues/3904" in json.dumps(answer) and "3815" not in json.dumps(answer)
-    lane = router.lanes[(lanes.IMPLEMENTATION, 3904)]
-    assert lane.name == "implementation-output" and lane.served == [0]
-    # The recorded issue keeps its own, untouched lane.
-    assert _tool_names(script._match("POST", "/v1/messages", _request(3815, triage=False))) == [
-        "Skill"
-    ]
+    router = lanes.LaneRouter({})
+    router.add(lanes.Lane("implementation", lanes.IMPLEMENTATION, 3815, [recorded[0], placeholder]))
+    router.install(script, model_module)
+    try:
+        assert script._match("POST", "/v1/messages", _request(3815))
+        # No printed commit, no answer: the negative control.
+        bare = _tool_turn("Exit code 2\nerror: unknown unit k")
+        assert script._match("POST", "/v1/messages", _request(3815, turns=bare)) is None
+        assert router.unrouted[-1] == {"lane": "implementation", "missing": "observed_revision"}
+        turn = _tool_turn(f"Exit code 2\n{SHA}\nerror: unknown unit k")
+        answer = script._match("POST", "/v1/messages", _request(3815, turns=turn))
+        assert SHA in _text(answer) and lanes.REVISION_PLACEHOLDER not in _text(answer)
+        assert router.evidence()["implementation"]["observed_revisions"] == [SHA]
+    finally:
+        script._server.server_close()
 
 
-def test_unlinked_issue_gets_no_implementation_lane(model_module: Any) -> None:
-    """Negative control: only the ticket source's linked output is routed."""
-    stub = _FakeStub()
-    stub.issues[3905] = {"number": 3905, "body": "A person's issue."}
-    resolve = triage_run.output_resolver(stub, model_module.load_transcript(RECORDED))
-    assert resolve(lanes.IMPLEMENTATION, 3905) is None
-    assert resolve(lanes.TRIAGE, 3905) is None
-
-
-def test_refused_source_labeller_is_revoked_on_its_first_triage_turn(routed: Any) -> None:
-    script, _, stub = routed
-    script._match("POST", "/v1/messages", _request(ts.SOURCE_TICKET, triage=True))
-    assert stub.revoked == []
-    script._match("POST", "/v1/messages", _request(ts.SOURCE_REFUSED, triage=True))
-    assert stub.revoked == [ts.REFUSED_LABELLER["login"]]
+def test_a_resolver_supplies_the_lane_of_an_issue_the_platform_creates(
+    model_module: Any,
+) -> None:
+    script = model_module.ModelScript(RECORDED)
+    recorded = model_module.load_transcript(RECORDED)
+    router = lanes.LaneRouter({})
+    router.resolvers.append(
+        lambda agent, issue: lanes.Lane(
+            "implementation-created", agent, issue, lanes.retarget(recorded, 3815, issue)
+        )
+        if issue == 3904
+        else None
+    )
+    router.install(script, model_module)
+    try:
+        answer = script._match("POST", "/v1/messages", _request(3904))
+        assert "issues/3904" in _text(answer) and "3815" not in _text(answer)
+        assert router.lanes[(lanes.IMPLEMENTATION, 3904)].served == [0]
+        # Another issue has no resolver: it falls back to the recorded transcript.
+        assert "Skill" in _text(script._match("POST", "/v1/messages", _request(3815)))
+    finally:
+        script._server.server_close()
 
 
 def test_retarget_rewrites_whole_issue_numbers_only() -> None:
@@ -2334,12 +2269,12 @@ def test_slack_recorder_records_posts_and_answers_like_slack() -> None:
     recorder.start()
     try:
         root = _slack_call(recorder, "chat.postMessage",
-                           json.dumps({"channel": ts.SLACK_CHANNEL, "text": "root"}).encode(),
+                           json.dumps({"channel": sso.SLACK_CHANNEL, "text": "root"}).encode(),
                            "application/json")
-        assert root["ok"] and root["channel"] == ts.SLACK_CHANNEL
+        assert root["ok"] and root["channel"] == sso.SLACK_CHANNEL
         reply = _slack_call(
             recorder, "chat.postMessage",
-            f"channel={ts.SLACK_CHANNEL}&text=line&thread_ts={root['ts']}".encode(),
+            f"channel={sso.SLACK_CHANNEL}&text=line&thread_ts={root['ts']}".encode(),
             "application/x-www-form-urlencoded",
         )
         assert reply["ts"] != root["ts"]
@@ -2374,275 +2309,6 @@ def test_scripted_values_route_slack_to_the_recorder_only_when_asked() -> None:
     assert "slackApiBaseUrl" not in plain["worker"]
     assert "slack" not in plain["dispatcher"]
 
-
-def test_observation_sql_takes_issue_numbers_only() -> None:
-    assert "IN ('3901','3904')" in triage_run.observation_sql([3901, 3904])
-    with pytest.raises(ValueError):
-        triage_run.observation_sql(["3901'); DROP TABLE x; --"])  # type: ignore[list-item]
-
-
-# Decision 14 assertions over one coherent happy observation, then one mutation
-# per point that each assertion must refuse.
-
-BOT_LOGIN = "example-app[bot]"
-SOURCE_ID = "00000000-0000-0000-0000-00000000a001"
-IMPL_ID = "00000000-0000-0000-0000-00000000b001"
-REFUSED_ID = "00000000-0000-0000-0000-00000000a002"
-OUTPUT_URL = "https://192.0.2.1:8443/acme-corp/acme-bot/issues/3904"
-REFUSED_URL = "https://192.0.2.1:8443/acme-corp/acme-bot/issues/3905"
-PR_URL = "https://192.0.2.1:8443/acme-corp/acme-bot/pull/2"
-PR_HEAD = "fedcba9876543210fedcba9876543210fedcba98"
-
-
-def _check_run(name: str, conclusion: str | None, head: str = PR_HEAD) -> dict[str, Any]:
-    status = "in_progress" if conclusion is None else "completed"
-    return {"name": name, "head_sha": head, "status": status, "conclusion": conclusion}
-
-
-def _happy() -> dict[str, Any]:
-    output_body = f"Add Kelvin.\n<!-- {ts.linked_marker(SOURCE_ID)} -->"
-    bot = {"login": BOT_LOGIN, "type": "Bot"}
-    source = {"number": 3901, "title": "T", "body": "B", "state": "open",
-              "labels": [{"name": ts.BASE_LABEL}, {"name": ts.TRIAGE_LABEL}]}
-    return {
-        "source_before": json.loads(json.dumps(source)),
-        "source_after": {**source, "labels": source["labels"] + [{"name": ts.TRIAGED_LABEL}]},
-        "issues": [
-            {"number": 3904, "body": output_body, "user": bot, "html_url": OUTPUT_URL,
-             "state": "open", "labels": [{"name": ts.BASE_LABEL},
-                                         {"name": ts.IMPLEMENTATION_LABEL}]},
-            {"number": 3905, "body": f"x <!-- {ts.linked_marker(REFUSED_ID)} -->", "user": bot,
-             "html_url": REFUSED_URL, "state": "open", "labels": [{"name": ts.BASE_LABEL}]},
-        ],
-        "comments": [
-            {"id": 11, "issue_number": 3901, "body": f"<!-- {ts.result_marker(SOURCE_ID)} -->"},
-            {"id": 12, "issue_number": 3902,
-             "body": "Ticket published.\nImplementation not started: authority_revoked."},
-            {"id": 13, "issue_number": 3903, "body": f"<!-- {ts.result_marker('c')} -->"},
-            {"id": 14, "issue_number": 3904, "body": f"Done {PR_URL}"},
-        ],
-        "receipt": {"revision": SHA, "output_body_sha256": ts.body_sha256(output_body),
-                    "output_url": OUTPUT_URL, "result_comment_id": "11"},
-        "lane": {"served_ordinals": [0, 1, 2], "observed_revisions": [SHA]},
-        "source_items": [{"id": "w1"}],
-        "source_requests": [{"id": SOURCE_ID, "completion_contract": "tracker_result",
-                             "model_session_reserved_at": "2026-11-14T01:00:00",
-                             "requester": "octocat",
-                             "created_at": "2026-11-14T01:00:00",
-                             "execution_deadline": "2026-11-14T01:30:00"}],
-        "output_items": [{"id": "w2", "agent_id": "agent-impl",
-                          "trigger_label": ts.IMPLEMENTATION_LABEL}],
-        "output_requests": [{"id": IMPL_ID, "completion_contract": "implementation",
-                             "status": ts.IMPLEMENTATION_SUCCESS_STATUS,
-                             "requester": "octocat", "created_at": "2026-11-14T01:05:00",
-                             "execution_deadline": "2026-11-14T03:05:00"}],
-        "events": [
-            {"event": "labeled", "label": {"name": ts.BASE_LABEL}, "actor": bot},
-            {"event": "labeled", "label": {"name": ts.IMPLEMENTATION_LABEL}, "actor": bot},
-        ],
-        "pulls": [{"head": {"ref": "curie/request-1"}, "body": "Closes #3815",
-                   "html_url": "https://x/pull/1"},
-                  {"head": {"ref": "curie/request-2", "sha": PR_HEAD}, "body": "Closes #3904",
-                   "html_url": PR_URL}],
-        "checks": {PR_HEAD: [_check_run("Python", "success"), _check_run("Docs", "skipped")]},
-        "branches": ["curie/request-1", "curie/request-2", "main"],
-        "posts": [
-            {"method": "chat.postMessage", "channel": ts.SLACK_CHANNEL, "text": "root",
-             "thread_ts": None, "ts": "1.1"},
-            {"method": "chat.postMessage", "channel": ts.SLACK_CHANNEL,
-             "text": f"Triage published a ticket: {OUTPUT_URL}. Implementation admitted.",
-             "thread_ts": "1.1", "ts": "1.2"},
-            {"method": "chat.postMessage", "channel": ts.SLACK_CHANNEL,
-             "text": f"Triage published a ticket: {REFUSED_URL}. "
-                     "Implementation not started: authority_revoked.",
-             "thread_ts": "2.1", "ts": "2.2"},
-        ],
-        "thread": {"channel": ts.SLACK_CHANNEL, "root_ts": "1.1"},
-        "refused_thread": {"channel": ts.SLACK_CHANNEL, "root_ts": "2.1"},
-    }
-
-
-def _check(point: str, o: dict[str, Any]) -> None:
-    if point == "1":
-        ts.assert_one_selection(o["source_items"], o["source_requests"], o["lane"])
-    elif point == "2":
-        ts.assert_reproduction_ran(o["lane"], SHA, o["receipt"])
-    elif point == "3":
-        ts.assert_one_output(o["issues"], o["comments"], 3901, SOURCE_ID, o["receipt"], BOT_LOGIN)
-    elif point == "4":
-        ts.assert_no_triage_publication(o["pulls"], o["branches"], 0, [3901, 3902, 3903])
-    elif point == "5":
-        ts.assert_handoff_admitted(o["output_items"], o["output_requests"], "agent-impl",
-                                   o["source_requests"][0], o["events"])
-    elif point.startswith("6"):
-        final = [c for c in o["comments"] if c["issue_number"] == 3904]
-        ts.assert_implementation_terminus(o["output_requests"][0], o["source_requests"][0],
-                                          o["pulls"], final, 3904, o["checks"])
-    elif point == "7":
-        ts.assert_no_replay_effects({"work_items": 3}, {"work_items": 3},
-                                    [c for c in o["comments"] if c["issue_number"] == 3904])
-    elif point == "8":
-        ts.assert_source_preserved(o["source_before"], o["source_after"])
-    elif point == "9":
-        ts.assert_slack_line(o["posts"], o["thread"], OUTPUT_URL, "Implementation admitted.")
-    elif point == "10":
-        ts.assert_runtime_cleared(0, 0, {"cleanup_verified": True})
-    elif point == "refused":
-        ts.assert_refused_handoff(o["issues"], o["comments"], 3902, REFUSED_ID, [], o["posts"],
-                                  o["refused_thread"], {"served_ordinals": [0, 1]})
-    elif point == "findings":
-        ts.assert_findings_ending(o["issues"], o["comments"], 3903, "c",
-                                  {"result_kind": "findings", "reason": "not_reproduced"}, 0)
-
-
-# Point 6 also refuses a failed implementation request and every way its pull
-# request's checks fall short, each with the final comment still naming the PR.
-POINT_6_BREAKS = ("6-failed-request", "6-failed-checks", "6-pending-checks", "6-no-checks")
-POINTS = [
-    *("1", "2", "3", "4", "5", "6", *POINT_6_BREAKS, "6-checks-on-another-head"),
-    *("7", "8", "9", "10", "refused", "findings"),
-]
-
-
-@pytest.mark.parametrize("point", POINTS)
-def test_decision_14_assertions_accept_the_expected_outcome(point: str) -> None:
-    _check(point, _happy())
-
-
-def _break(point: str, o: dict[str, Any]) -> None:
-    if point == "1":
-        o["lane"]["served_ordinals"] = [0, 1, 0]
-    elif point == "2":
-        o["lane"]["observed_revisions"] = ["f" * 40]
-    elif point == "3":
-        o["issues"][0]["body"] += " edited"
-    elif point == "4":
-        o["branches"].append("curie/triage-3901")
-    elif point == "5":
-        o["events"].append({"event": "labeled", "label": {"name": ts.IMPLEMENTATION_LABEL},
-                            "actor": {"login": "octocat", "type": "User"}})
-    elif point == "6":
-        o["output_requests"][0]["execution_deadline"] = o["source_requests"][0][
-            "execution_deadline"]
-    elif point == "6-failed-request":
-        o["output_requests"][0]["status"] = "failed"
-    elif point == "6-failed-checks":
-        o["checks"][PR_HEAD].append(_check_run("E2E", "failure"))
-    elif point == "6-pending-checks":
-        o["checks"][PR_HEAD].append(_check_run("E2E", None))
-    elif point == "6-no-checks":
-        o["checks"] = {}
-    elif point == "6-checks-on-another-head":
-        o["checks"] = {PR_HEAD: [_check_run("Python", "success", head="0" * 40)]}
-    elif point == "7":
-        o["comments"].append({"id": 15, "issue_number": 3904,
-                              "body": f"<!-- {ts.INTAKE_NOTICE_PREFIX}actor_bot -->"})
-    elif point == "8":
-        o["source_after"]["body"] = "rewritten"
-    elif point == "9":
-        o["posts"].append(dict(o["posts"][1], ts="1.3"))
-    elif point == "10":
-        pass
-    elif point == "refused":
-        o["issues"][1]["labels"].append({"name": ts.IMPLEMENTATION_LABEL})
-    elif point == "findings":
-        o["issues"].append({"number": 3906, "body": f"<!-- {ts.linked_marker('c')} -->"})
-
-
-@pytest.mark.parametrize("point", POINTS)
-def test_decision_14_assertions_refuse_the_violation(point: str) -> None:
-    observed = _happy()
-    _break(point, observed)
-    with pytest.raises(ts.TriageAssertionError):
-        if point == "10":
-            ts.assert_runtime_cleared(1, 0, {"cleanup_verified": True})
-        else:
-            _check(point, observed)
-
-
-def test_runtime_cleared_refuses_an_unverified_teardown() -> None:
-    with pytest.raises(ts.TriageAssertionError, match="teardown"):
-        ts.assert_runtime_cleared(0, 0, {"cleanup_verified": False})
-
-
-@pytest.mark.parametrize("state", ["suspended", "active", "foreign", "delete_failed"])
-def test_runtime_cleanup_deletes_only_owned_suspended_claims(
-    state: str, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Observed controller state: suspend removes the pod and reports
-    # SandboxSuspended. The substrate retains the claim for a later resume.
-    claim = {
-        "metadata": {"name": "curie-thread-example", "namespace": "curie"},
-        "status": {"conditions": [{
-            "type": "Ready", "status": "False", "reason": "SandboxSuspended",
-        }]},
-    }
-    if state == "active":
-        claim["status"]["conditions"][0].update(status="True", reason="SandboxReady")
-    if state == "foreign":
-        claim["metadata"]["namespace"] = "other"
-    claims = [claim]
-    deletes: list[tuple[str, ...]] = []
-
-    def kubectl(*argv: str) -> str:
-        if argv[:2] == ("get", "sandboxclaims"):
-            return json.dumps({"items": claims})
-        if "delete" in argv:
-            deletes.append(argv)
-            if state != "delete_failed":
-                claims.clear()
-            return ""
-        return json.dumps({"items": []})
-
-    driver = type("Driver", (), {"namespace": "curie", "stub": None})()
-    monkeypatch.setattr(driver, "kubectl", kubectl, raising=False)
-    run = triage_run.TriageToPr(driver, lanes.LaneRouter({"triage": "x"}), None)  # type: ignore[arg-type]
-    clock = iter(range(100))
-    monkeypatch.setattr(triage_run.time, "monotonic", lambda: float(next(clock)))
-    monkeypatch.setattr(triage_run.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(triage_run, "RUNTIME_SETTLE_SECONDS", 5)
-    if state == "suspended":
-        run.assert_runtime_drained()
-        assert len(deletes) == 1
-        assert deletes[0][:5] == ("-n", "curie", "delete", "sandboxclaim", "curie-thread-example")
-        assert run.evidence["sandbox_claims"] == 0
-    else:
-        with pytest.raises(ts.TriageAssertionError):
-            run.assert_runtime_drained()
-        if state in {"active", "foreign"}:
-            assert deletes == []
-
-
-class _ClosedRecorder:
-    host = "127.0.0.1"
-
-    def __init__(self) -> None:
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            self.port = sock.getsockname()[1]
-
-
-@pytest.mark.parametrize(
-    ("cleanup", "error", "drained", "passed"),
-    [
-        ({"cleanup_verified": True}, None, True, True),
-        ({"cleanup_verified": False}, None, True, False),
-        ({"cleanup_verified": True}, "first scenario failed", True, False),
-        ({"cleanup_verified": True}, None, False, False),
-    ],
-)
-def test_triage_verdict_follows_the_verified_teardown(
-    cleanup: dict[str, Any], error: str | None, drained: bool, passed: bool
-) -> None:
-    run = triage_run.TriageToPr(
-        type("Driver", (), {"stub": None})(), lanes.LaneRouter({"triage": "x"}),
-        _ClosedRecorder(),  # type: ignore[arg-type]
-    )
-    run.evidence.update(sandbox_claims=0 if drained else 2, publication_resources=0)
-    assert run.finish(cleanup, error) is passed
-    assert run.evidence["result"] == ("passed" if passed else "failed")
-
-
 # The channel gateway runs on the dispatcher image, so a run that enables it
 # builds, inspects and imports that image into its cluster.
 
@@ -2651,7 +2317,7 @@ def test_enabled_gateway_builds_and_imports_the_dispatcher_image_the_chart_names
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    args = _replay_args(tmp_path, scenario="triage-to-pr")
+    args = _replay_args(tmp_path)
     args.build_images = True
     run = sk.ScriptedRun(args)
     assert run.gateway_enabled()
@@ -2705,241 +2371,291 @@ def test_enabled_gateway_builds_and_imports_the_dispatcher_image_the_chart_names
     assert chart_image in imported
 
 
-def test_runs_without_the_gateway_leave_the_dispatcher_image_out(tmp_path: Path) -> None:
-    from c4_admitted_kind import AdmittedKind
+def _gateway_argv(scenario: str, *extra: str) -> Any:
+    return fe.parse_args(["scripted", "--scenario", scenario, *extra])
 
-    recording = fe.parse_args(["scripted", "--scenario", "publication", "--record"])
-    facts = fe.parse_args(["scripted", "--scenario", "facts"])
+
+def test_gateway_runs_only_on_the_publication_install() -> None:
+    publication = sk.ScriptedRun(_gateway_argv("publication"))
+    assert publication.gateway_enabled()
+    assert sk.GATEWAY_IMAGE in publication.image_refs
+
+    class NoSlack(sk.ScriptedRun):
+        SLACK_PROGRESS = False
 
     for run in (
-        sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"])),
-        sk.ScriptedRun(recording),
-        sk.ScriptedRun(facts),
-        AdmittedKind(tmp_path, Path("curie")),
+        sk.ScriptedRun(_gateway_argv("facts")),
+        sk.ScriptedRun(_gateway_argv("jira-one-ticket")),
+        sk.ScriptedRun(_gateway_argv("publication", "--record")),
+        NoSlack(_gateway_argv("publication")),
     ):
         assert not run.gateway_enabled()
         assert sk.GATEWAY_IMAGE not in run.image_refs
 
 
-# Point 7: the internal selection event is replayed on the live API, and the
-# quiet window is measured in observed intake reads.
+def test_every_subclass_that_drives_its_own_scenario_runs_no_gateway(tmp_path: Path) -> None:
+    """A subclass left on the default would start the gateway on its own install."""
+
+    from c4_admitted_kind import AdmittedKind
+    from test_c4_held_cancellation import HeldRun
+
+    assert AdmittedKind(tmp_path, Path("curie")).gateway_enabled() is False
+    held = HeldRun.__new__(HeldRun)
+    held.args = _gateway_argv("publication")
+    assert held.gateway_enabled() is False
 
 
-class _ReplayStub:
-    def __init__(self, *, polls: bool) -> None:
-        self.polls = polls
-        self.log: list[dict[str, str]] = []
-        self.events: list[tuple[int, str]] = []
-        self.unknown_requests: list[str] = []
-        self.comments: list[dict[str, Any]] = []
-        self.event_rows: list[dict[str, Any]] = []
-
-    @property
-    def request_log(self) -> list[dict[str, str]]:
-        # Each look sees one more intake list read once the replay has begun.
-        if self.polls and self.events:
-            self.log.append({"method": "GET", "path": "/api/v3" + triage_run.INTAKE_LIST_PATH})
-        return list(self.log)
-
-    def _rows(self, kind: str) -> list[dict[str, Any]]:
-        return list({"comment": self.comments, "event": self.event_rows}.get(kind, []))
-
-    def _label_event(self, number: int, label: str, _event: str, actor: Any) -> None:
-        self.events.append((number, label))
-        event_id = len(self.events)
-        self.event_rows.append({
-            "id": event_id, "issue_number": number, "event": "labeled",
-            "label": {"name": label}, "actor": actor,
-            "performed_via_github_app": {"id": 51},
-        })
-        if number == ts.SOURCE_TICKET:
-            self.comments.append({
-                "id": 1, "issue_number": number, "user": actor,
-                "performed_via_github_app": {"id": 51},
-                "body": f"Not started.<!-- {ts.INTAKE_NOTICE_PREFIX}{event_id}-"
-                        "0123456789abcdef reason=actor_bot -->",
-            })
+def _post(method: str, text: str | None, *, thread_ts: str | None, ts: str,
+          channel: str = sso.SLACK_CHANNEL) -> lanes.SlackPost:
+    return lanes.SlackPost(method, channel, text, thread_ts, ts)
 
 
-class _ReplayDriver:
-    namespace = "curie"
-    deadline = None
-    tracker_poll_seconds = sk.TRACKER_POLL_SECONDS
-
-    def __init__(self, stub: _ReplayStub, replay: dict[str, Any], grow: bool) -> None:
-        self.stub = stub
-        self.replay = replay
-        self.grow = grow
-        self.model = type("Model", (), {"unexpected": []})()
-        self.calls: list[tuple[str, ...]] = []
-        self.work_items = 3
-
-    def kubectl(self, *argv: str, **_kwargs: Any) -> str:
-        self.calls.append(argv)
-        if "exec" in argv:
-            if self.grow:
-                self.work_items += 1
-            return "log line\n" + json.dumps(self.replay) + "\n"
-        return ""
-
-    def sql(self, _query: str) -> dict[str, Any]:
-        return {"totals": {"work_items": self.work_items, "execution_requests": 4, "receipts": 3}}
+PULL_REQUEST = "https://192.0.2.1:8443/acme-corp/acme-bot/pull/2"
+ROOT_TEXT = sso.SLACK_ROOT_PREFIX + ": started"
 
 
-ADMITTED_REPLAY = {
-    "handoff_id": "h1",
-    "reopened": None,
-    "attempt": None,
-    "outcome_before": "admitted",
-    "outcome_after": "admitted",
-}
+def _slack_run(
+    ready: str | None = "root", ready_channel: str = sso.SLACK_CHANNEL, extra_card: bool = False
+) -> list[lanes.SlackPost]:
+    """Posts as a real SlackRecorder holds them: one root, one card, a ready reply.
+
+    ``ready`` is the thread the ready reply lands in: ``root`` (correct), another
+    thread's ts, or None for no ready reply at all.
+    """
+
+    recorder = lanes.SlackRecorder()
+    recorder.start()
+
+    def call(method: str, body: dict[str, Any], channel: str = sso.SLACK_CHANNEL) -> Any:
+        body = {"channel": channel, **body}
+        return _slack_call(recorder, method, json.dumps(body).encode(), "application/json")
+
+    try:
+        root = call("chat.postMessage", {"text": ROOT_TEXT})
+        card = call("chat.postMessage", {"text": "card", "thread_ts": root["ts"]})
+        call("chat.update", {"ts": card["ts"], "text": "card, finished"})
+        # Another scenario's thread: ignored.
+        call("chat.postMessage", {"text": "Factory run: other", "thread_ts": "9.9"})
+        if extra_card:
+            call("chat.postMessage", {"text": "card again", "thread_ts": root["ts"]})
+        if ready is not None:
+            call("chat.postMessage", {
+                "text": f"Opened {PULL_REQUEST}",
+                "thread_ts": root["ts"] if ready == "root" else ready,
+            }, ready_channel)
+        return recorder.posts()
+    finally:
+        recorder.close()
 
 
-def _replay_run(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    polls: bool = True,
-    replay: dict[str, Any] | None = None,
-    grow: bool = False,
-) -> tuple[triage_run.TriageToPr, _ReplayDriver]:
-    monkeypatch.setattr(triage_run.time, "sleep", lambda _seconds: None)
-    driver = _ReplayDriver(_ReplayStub(polls=polls), replay or ADMITTED_REPLAY, grow)
-    run = triage_run.TriageToPr(
-        driver,
-        lanes.LaneRouter({"triage": "x"}),
-        _ClosedRecorder(),  # type: ignore[arg-type]
-    )
-    run.output = 3904
-    run.evidence["source_request_id"] = SOURCE_ID
-    return run, driver
+def test_slack_progress_accepts_root_card_and_ready() -> None:
+    counts = sso.assert_slack_progress(_slack_run(), sso.SLACK_CHANNEL, PULL_REQUEST)
+    assert counts == {"root": 1, "card": 1, "ready": 1}
 
 
-def test_selection_replay_snippet_compiles_and_calls_both_entry_points() -> None:
-    compile(triage_run.REPLAY_SELECTION_SNIPPET, "replay", "exec")
-    assert "await open_handoff(" in triage_run.REPLAY_SELECTION_SNIPPET
-    assert "await hand_off(" in triage_run.REPLAY_SELECTION_SNIPPET
-    assert "await session.commit()" in triage_run.REPLAY_SELECTION_SNIPPET
+def test_slack_progress_refuses_a_missing_or_misthreaded_ready_post() -> None:
+    for posts in (_slack_run(ready=None), _slack_run(ready="9.9")):
+        with pytest.raises(sso.ScenarioAssertionError, match="ready reply"):
+            sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
 
 
-def test_replay_runs_the_internal_selection_event_in_the_api_pod(
+class _RecordedSlack:
+    """Stands in for the run's recorder with the posts a real SlackRecorder held."""
+
+    def __init__(self, posts: list[lanes.SlackPost]) -> None:
+        self._posts = posts
+
+    def posts(self) -> list[lanes.SlackPost]:
+        return self._posts
+
+
+def _publication_run(posts: list[lanes.SlackPost]) -> sk.ScriptedRun:
+    run = sk.ScriptedRun(_gateway_argv("publication"))
+    run.slack = _RecordedSlack(posts)  # type: ignore[assignment]
+    run.evidence["pull_request"] = {"html_url": PULL_REQUEST}
+    return run
+
+
+def test_the_recorder_stamps_each_post_with_its_receive_time() -> None:
+    before = time.monotonic()
+    posts = _slack_run()
+    after = time.monotonic()
+    assert posts and all(before <= post.received_at <= after for post in posts)
+
+
+def test_the_run_records_the_slack_post_counts_in_its_evidence() -> None:
+    run = _publication_run(_slack_run())
+    run.wait_for_slack_progress()
+    assert run.evidence["slack_posts"] == {"root": 1, "card": 1, "ready": 1}
+
+
+def test_the_run_fails_when_the_ready_reply_lands_outside_the_root_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run, driver = _replay_run(monkeypatch)
-    run.assert_replay(
-        type("GitHub", (), {"BOT": {"id": 51, "login": "app[bot]", "type": "Bot"}})()
-    )
-    execs = [argv for argv in driver.calls if "exec" in argv]
-    assert execs == [
-        (
-            "-n",
-            "curie",
-            "exec",
-            "deployment/curie-api",
-            "--",
-            "python",
-            "-c",
-            triage_run.REPLAY_SELECTION_SNIPPET,
-            SOURCE_ID,
-        )
+    monkeypatch.setattr(sk, "SLACK_PROGRESS_SECONDS", 0)
+    run = _publication_run(_slack_run(ready="9.9"))
+    with pytest.raises(sk.ScriptedScenarioError, match="Slack progress: .*ready reply"):
+        run.wait_for_slack_progress()
+    assert "slack_posts" not in run.evidence
+
+
+def test_a_run_without_the_gateway_does_not_wait_for_slack() -> None:
+    run = sk.ScriptedRun(_gateway_argv("jira-one-ticket"))
+    run.wait_for_slack_progress()
+    assert "slack_posts" not in run.evidence
+
+
+def test_the_run_binds_the_factory_agent_to_the_slack_channel_before_the_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _publication_run([])
+    run.evidence["agent_id"] = "agent-example"
+    run.env.update(CURIE_API_URL="http://api.example.com", CURIE_API_KEY="example-key")
+    calls: list[tuple[str, str, Any]] = []
+
+    def http_json(method: str, url: str, **kwargs: Any) -> tuple[int, dict[str, Any]]:
+        calls.append((method, url, kwargs["body"]))
+        return 200, {}
+
+    monkeypatch.setattr(fe, "http_json", http_json)
+    monkeypatch.setattr(run, "kubectl", lambda *_args, **_kwargs: "")
+    run.bind_slack()
+    assert calls == [
+        ("POST", "http://api.example.com/agents/agent-example/channels",
+         {"kind": "slack", "address": sso.SLACK_CHANNEL}),
+        ("PATCH", "http://api.example.com/agents/agent-example",
+         {"factory_slack_channel": sso.SLACK_CHANNEL}),
     ]
-    restart = driver.calls.index(
-        ("-n", "curie", "rollout", "status", "deployment/curie-api", "--timeout=300s")
+    monkeypatch.setattr(fe, "http_json", lambda *_a, **_k: (409, {}))
+    with pytest.raises(sk.ScriptedScenarioError, match="Slack binding returned HTTP 409"):
+        run.bind_slack()
+
+
+def test_slack_progress_refuses_a_ready_reply_in_another_channel_or_a_second_card() -> None:
+    other = "C0EXAMPLE8"
+    with pytest.raises(sso.ScenarioAssertionError, match="ready reply"):
+        sso.assert_slack_progress(
+            _slack_run(ready_channel=other), sso.SLACK_CHANNEL, PULL_REQUEST
+        )
+    with pytest.raises(sso.ScenarioAssertionError, match="one card"):
+        sso.assert_slack_progress(_slack_run(extra_card=True), sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+def test_slack_progress_ignores_an_update_of_the_card_in_another_channel() -> None:
+    posts = [
+        lanes.SlackPost(p.method, "C0EXAMPLE8" if p.method == "chat.update" else p.channel,
+                        p.text, p.thread_ts, p.ts)
+        for p in _slack_run()
+    ]
+    with pytest.raises(sso.ScenarioAssertionError, match="never updated"):
+        sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+def _received_at(posts: list[lanes.SlackPost], seconds: float) -> list[lanes.SlackPost]:
+    """The same posts as the recorder received them ``seconds`` after the final comment."""
+
+    return [dataclasses.replace(post, received_at=seconds) for post in posts]
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch, now: float) -> None:
+    monkeypatch.setattr(
+        sk, "time", type("Clock", (), {"monotonic": staticmethod(lambda: now),
+                                       "sleep": staticmethod(lambda _s: None)})
     )
-    assert driver.calls.index(execs[0]) > restart
-    assert run.evidence["selection_replay"] == ADMITTED_REPLAY
-    assert len(driver.stub.events) == 2
-    assert run.evidence["replay_counts"]["comments"] == 0
-    assert run.evidence["bot_label_control"]["after"]["comments"] == 1
 
 
-def test_replay_that_creates_a_work_item_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
-    run, _ = _replay_run(monkeypatch, grow=True)
-    with pytest.raises(ts.TriageAssertionError, match="replay changed the outcome"):
-        run.assert_replay(
-            type("GitHub", (), {"BOT": {"id": 51, "login": "app[bot]", "type": "Bot"}})()
-        )
+def test_a_settled_result_after_the_bound_is_late(monkeypatch: pytest.MonkeyPatch) -> None:
+    run = _publication_run(_received_at(_slack_run(), 181.0))
+    run.final_comment_at = 0.0
+    _clock(monkeypatch, 182.0)
+    with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
+        run.wait_for_slack_progress()
+    assert "slack_posts" not in run.evidence
 
 
-@pytest.mark.parametrize("defect", [
-    "new_work", "extra_comment", "missing_notice", "unrelated_comment", "output_notice",
-    "wrong_event", "wrong_reason", "human_author", "other_bot", "other_app",
-])
-def test_source_bot_label_control_rejects_unexpected_effects(defect: str) -> None:
-    bot = {"id": 51, "login": "app[bot]", "type": "Bot"}
-    before = {"work_items": 3, "execution_requests": 4, "comments": 0}
-    after = {**before, "comments": 1}
-    event = {
-        "id": 2, "issue_number": ts.SOURCE_TICKET, "event": "labeled",
-        "label": {"name": ts.TRIAGE_LABEL}, "actor": dict(bot),
-        "performed_via_github_app": {"id": 51},
-    }
-    notice = {
-        "id": 1, "issue_number": ts.SOURCE_TICKET, "user": dict(bot),
-        "performed_via_github_app": {"id": 51},
-        "body": "Not started.<!-- curie-factory-intake-2-0123456789abcdef reason=actor_bot -->",
-    }
-    comments = [notice]
-    if defect == "new_work":
-        after["work_items"] += 1
-    elif defect == "extra_comment":
-        comments.append({**notice, "id": 2})
-        after["comments"] += 1
-    elif defect == "missing_notice":
-        comments.clear()
-    elif defect == "unrelated_comment":
-        notice["body"] = "Another status comment"
-    elif defect == "output_notice":
-        notice["issue_number"] = 3904
-    elif defect == "wrong_event":
-        notice["body"] = notice["body"].replace("intake-2-", "intake-3-")
-    elif defect == "wrong_reason":
-        notice["body"] = notice["body"].replace("actor_bot", "actor_no_permission")
-    elif defect == "human_author":
-        notice["user"]["type"] = "User"
-    elif defect == "other_bot":
-        notice["user"]["id"] = 52
-    elif defect == "other_app":
-        notice["performed_via_github_app"]["id"] = 52
-    with pytest.raises(ts.TriageAssertionError):
-        ts.assert_bot_label_refusal(before, after, [], comments, event, bot)
-
-
-def test_replay_that_changes_the_handoff_outcome_is_refused(
+def test_posts_received_on_time_pass_however_late_the_run_looks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run, _ = _replay_run(monkeypatch, replay={**ADMITTED_REPLAY, "outcome_after": "refused"})
-    with pytest.raises(triage_run.TriageScenarioError, match="expected admitted"):
-        run.assert_replay(
-            type("GitHub", (), {"BOT": {"id": 51, "login": "app[bot]", "type": "Bot"}})()
-        )
+    """The recorder had everything one second after the final comment; the check ran at 181."""
+
+    run = _publication_run(_received_at(_slack_run(), 1.0))
+    run.final_comment_at = 0.0
+    _clock(monkeypatch, 181.0)
+    run.wait_for_slack_progress()
+    assert run.evidence["slack_posts"] == {"root": 1, "card": 1, "ready": 1}
 
 
-def test_replay_quiet_window_needs_observed_intake_reads(monkeypatch: pytest.MonkeyPatch) -> None:
-    run, _ = _replay_run(monkeypatch, polls=False)
-    clock = iter(range(0, 10_000, 7))
-    monkeypatch.setattr(triage_run.time, "monotonic", lambda: float(next(clock)))
-    with pytest.raises(triage_run.TriageScenarioError, match="intake read the tracker 0 times"):
-        run.assert_replay(
-            type("GitHub", (), {"BOT": {"id": 51, "login": "app[bot]", "type": "Bot"}})()
-        )
-
-
-def test_replay_quiet_window_is_bounded_by_the_install_poll_interval(
+def test_identical_posts_are_judged_by_their_receive_time_not_the_check_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run, driver = _replay_run(monkeypatch, polls=False)
-    now = [0.0]
-    monkeypatch.setattr(triage_run.time, "monotonic", lambda: now[0])
+    for received, passes in ((179.0, True), (181.0, False)):
+        run = _publication_run(_received_at(_slack_run(), received))
+        run.final_comment_at = 0.0
+        _clock(monkeypatch, 400.0)
+        if passes:
+            run.wait_for_slack_progress()
+            assert "slack_posts" in run.evidence
+        else:
+            with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
+                run.wait_for_slack_progress()
 
-    def sleep(seconds: float) -> None:
-        assert seconds == driver.tracker_poll_seconds / 5
-        now[0] += seconds
 
-    monkeypatch.setattr(triage_run.time, "sleep", sleep)
-    with pytest.raises(triage_run.TriageScenarioError):
-        run.wait_for_intake_passes(0)
-    expected = 4 * triage_run.REPLAY_POLLS * driver.tracker_poll_seconds
-    assert expected <= now[0] < expected + driver.tracker_poll_seconds
+def test_the_bound_starts_at_the_final_comment_not_at_the_slack_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _publication_run(_received_at(_slack_run(), 190.0))
+    run.final_comment_at = 0.0
+    _clock(monkeypatch, 190.0)
+    with pytest.raises(sk.ScriptedScenarioError, match="settled after 180 seconds"):
+        run.wait_for_slack_progress()
+
+
+def test_a_duplicate_card_that_arrives_after_the_first_check_fails_the_run() -> None:
+    run = _publication_run(_slack_run())
+    run.wait_for_slack_progress()
+    assert run.evidence["slack_posts"] == {"root": 1, "card": 1, "ready": 1}
+    run.slack = _RecordedSlack(_slack_run(extra_card=True))  # type: ignore[assignment]
+    with pytest.raises(sk.ScriptedScenarioError, match="end of the run: .*one card"):
+        run.verify_slack_progress()
+
+
+def test_the_publication_install_fails_without_its_recorder() -> None:
+    run = sk.ScriptedRun(_gateway_argv("publication"))
+    run.evidence["pull_request"] = {"html_url": PULL_REQUEST}
+    with pytest.raises(sk.ScriptedScenarioError, match="recorder did not start"):
+        run.wait_for_slack_progress()
+    with pytest.raises(sk.ScriptedScenarioError, match="recorder did not start"):
+        run.bind_slack()
+
+
+def test_the_publication_binds_slack_then_labels_then_waits_then_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = sk.ScriptedRun(_gateway_argv("publication"))
+    calls: list[str] = []
+    monkeypatch.setattr(run, "bind_slack", lambda: calls.append("bind"))
+    monkeypatch.setattr(run, "label_issue", lambda _github: calls.append("label"))
+    monkeypatch.setattr(run, "wait_for_final", lambda: calls.append("wait"))
+    monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "wait_for_slack_progress", lambda: calls.append("slack"))
+    monkeypatch.setattr(run, "verify_slack_progress", lambda: calls.append("slack-final"))
+    monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
+    run.router = lanes.LaneRouter({})
+    run.run_publication(None)
+    assert calls == ["bind", "label", "wait", "observe", "slack", "one-ticket", "slack-final"]
+
+
+def test_slack_progress_refuses_a_card_that_was_never_updated() -> None:
+    posts = [p for p in _slack_run() if p.method != "chat.update"]
+    with pytest.raises(sso.ScenarioAssertionError, match="never updated"):
+        sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
+
+
+def test_slack_progress_refuses_a_second_root_post() -> None:
+    posts = _slack_run()
+    posts.append(_post("chat.postMessage", ROOT_TEXT, thread_ts=None, ts="7.7"))
+    with pytest.raises(sso.ScenarioAssertionError, match="one Slack root post"):
+        sso.assert_slack_progress(posts, sso.SLACK_CHANNEL, PULL_REQUEST)
 
 
 # one-ticket (#5788): the scenario runs on every replayed install, and its
@@ -3008,7 +2724,6 @@ def test_the_scripted_command_fails_when_the_one_ticket_scenario_did_not_pass(
     ("argv", "required"),
     [
         (["scripted", "--scenario", "publication"], True),
-        (["scripted", "--scenario", "triage-to-pr"], True),
         (["scripted", "--scenario", "publication", "--record"], False),
         (["scripted", "--scenario", "facts"], False),
     ],
@@ -3031,11 +2746,13 @@ def test_the_scenarios_after_the_publication_scenario_call_the_one_ticket_scenar
     run.router = lanes.LaneRouter({})
     calls: list[str] = []
     monkeypatch.setattr(run, "observe", lambda: calls.append("observe"))
+    monkeypatch.setattr(run, "wait_for_slack_progress", lambda: calls.append("slack"))
+    monkeypatch.setattr(run, "verify_slack_progress", lambda: calls.append("slack-final"))
     monkeypatch.setattr(run, "run_one_ticket", lambda _github: calls.append("one-ticket"))
 
     run.run_scenarios(None)
 
-    assert calls == ["observe", "one-ticket"]
+    assert calls == ["observe", "slack", "one-ticket", "slack-final"]
 
 
 def test_a_fixture_that_owns_its_agents_does_not_run_the_one_ticket_scenario(
@@ -3067,9 +2784,9 @@ def test_only_the_scripted_command_runs_the_one_ticket_scenario_on_its_install()
     assert HeldRun.runs_one_ticket is False
 
 
-def test_the_publication_scenario_installs_the_one_ticket_lane_and_no_gateway() -> None:
+def test_the_publication_scenario_installs_the_one_ticket_lane_and_the_gateway() -> None:
     run = sk.ScriptedRun(fe.parse_args(["scripted", "--scenario", "publication"]))
-    assert not run.gateway_enabled()
+    assert run.gateway_enabled()
     assert run.one_ticket is None
     model = sk._module("factory_model_script_one_ticket", MODEL_SCRIPT)
     lane = one_ticket_run.build_lane(model)
@@ -3184,10 +2901,9 @@ def test_the_learned_rules_scenario_owes_no_one_ticket_verdict_and_the_others_st
     assert chain.one_ticket_verdict_error() is None
     assert not chain.gateway_enabled() and sk.GATEWAY_IMAGE not in chain.image_refs
     assert chain.router_fallback() is False
-    for scenario in ("publication", "triage-to-pr"):
-        run = sk.ScriptedRun(_replay_args(tmp_path, scenario=scenario))
-        assert run.one_ticket_required() is True
-        assert run.one_ticket_verdict_error() == "the one-ticket scenario did not run"
+    run = sk.ScriptedRun(_replay_args(tmp_path, scenario="publication"))
+    assert run.one_ticket_required() is True
+    assert run.one_ticket_verdict_error() == "the one-ticket scenario did not run"
     monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "sk-or-example")
     recording = fe.parse_args(["scripted", "--scenario", "publication", "--record"])
     assert sk.ScriptedRun(recording).one_ticket_required() is False

@@ -1798,6 +1798,15 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 conn,
                 dry_run,
             } = target;
+            let rule_scope = if rules.rules || rules.action().is_some() {
+                commands::RuleScopeFilter::resolve(
+                    channel.clone(),
+                    rules.agent_scope,
+                    rules.scope_key.clone(),
+                )?
+            } else {
+                commands::RuleScopeFilter::default()
+            };
             if let Some((verb, rule_id)) = rules.action() {
                 // An action is the person's own: it never resolves the
                 // platform key, so it skips the release connection lookup.
@@ -1813,6 +1822,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         rule_id,
                         expected_version,
                         session_file,
+                        scope: rule_scope,
                         api_url: conn.api_url,
                         namespace: conn.namespace,
                         release: conn.release,
@@ -1826,7 +1836,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     commands::memory_rules_list_session(commands::MemoryRuleListSessionOpts {
                         agent,
                         state: rules.rule_state,
-                        scope_key: rules.scope_key,
+                        scope: rule_scope,
                         session_file,
                         api_url: conn.api_url,
                         namespace: conn.namespace,
@@ -1851,10 +1861,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     dry_run,
                 };
                 if rules.rules {
-                    emit(
-                        commands::memory_rules_list(opts, rules.rule_state, rules.scope_key)
-                            .await?,
-                    )
+                    emit(commands::memory_rules_list(opts, rules.rule_state, rule_scope).await?)
                 } else {
                     match (guidance.action(), add, delete) {
                         (Some(action), _, _) => emit_memory_guidance(opts, action).await,

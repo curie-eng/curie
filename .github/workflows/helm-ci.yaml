@@ -646,6 +646,14 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-caller-key-assertions.sh
 
+      # Prove an operator-named connector ServiceAccount reaches the API alone,
+      # that the schema refuses a name the API would refuse at boot, and that
+      # naming one grants the worker nothing.
+      - name: helm render assertions (connector ServiceAccounts)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/connector-service-accounts-assertions.sh
+
       # Prove the connector reconciler's RBAC (ADR-0090, #1184): absent when the
       # reconciler is off, and when on, exactly {create,list,patch,delete} on
       # exactly the four kinds the client handles. `create` is load-bearing --

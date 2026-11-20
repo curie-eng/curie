@@ -2,10 +2,9 @@
 
 The scripted model keys a lane by the scrubbed first user message. A factory
 run's first user message is the platform's sender frame around the issue URL,
-and the URL scrubs to ``<v>``, so a triage session and an implementation
-session on the same install produce the same lane key. Left alone they
-collapse into one lane, and the first one to ask would take the other's
-answers.
+and the URL scrubs to ``<v>``, so two agents' sessions on the same install
+produce the same lane key. Left alone they collapse into one lane, and the
+first one to ask would take the other's answers.
 
 ``LaneRouter`` keeps one exchange list per ``(agent, issue)`` lane. The agent
 is recognised by its bundle's own ``systemPrompt`` (read from the bundle
@@ -17,7 +16,7 @@ was.
 
 A served answer may carry ``{{observed_revision}}``. It is replaced by the
 last full commit id the request's latest tool result printed, so a scripted
-triage run reports the revision its own reproduction command observed.
+run reports the revision its own command observed.
 
 ``SlackRecorder`` answers the Slack Web API methods the channel gateway calls
 and records every post, so a scenario can count the lines a thread received.
@@ -31,6 +30,7 @@ import copy
 import json
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,7 +40,6 @@ from urllib.parse import parse_qs
 
 REVISION_PLACEHOLDER = "{{observed_revision}}"
 IMPLEMENTATION = "implementation"
-TRIAGE = "triage"
 _ISSUE = re.compile(r"/issues/(\d+)\b")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
@@ -280,6 +279,9 @@ class SlackPost:
     text: str | None
     thread_ts: str | None
     ts: str
+    # time.monotonic() when the recorder received the call, so a scenario judges
+    # a deadline by when Slack was told, not by when the scenario looked.
+    received_at: float = 0.0
 
 
 class SlackRecorder:
@@ -350,6 +352,7 @@ class SlackRecorder:
                     "text": body.get("text"),
                     "thread_ts": body.get("thread_ts"),
                     "ts": body.get("ts") if method == "chat.update" else ts,
+                    "received_at": time.monotonic(),
                 }
             )
         payload: dict[str, Any] = {"ok": True}
@@ -380,6 +383,7 @@ class SlackRecorder:
                 call["text"],
                 call["thread_ts"],
                 str(call["ts"]),
+                float(call["received_at"]),
             )
             for call in calls
             if call["method"] in {"chat.postMessage", "chat.update"}
