@@ -571,6 +571,55 @@ def test_definite_creation_refusal_settles_the_turn(
     asyncio.run(run())
 
 
+def test_a_ticket_refusal_on_the_relay_gets_only_the_relay_settlement(
+    make_harness: Any,
+) -> None:
+    """ADR 0288 decision 3 through the consumer: the relay keeps its own pair.
+
+    A refusal of the prepared ticket on a turn whose replies go to the cluster
+    message relay still settles the relay waiter exactly as
+    HTTP-INVOCATION-EXECUTION-31 requires, and the person-facing notice is
+    never sent there.
+    """
+
+    async def run() -> None:
+        async def handle(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(422, json={"detail": "approval_ticket_invalid_ticket"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+            approvals = ApprovalClient(
+                api_base_url="https://core.example.test",
+                api_key="SyntheticPlatformKey",
+                client=http,
+                read_timeout_s=30,
+                worker_token="SyntheticPrivateWorkerToken",
+            )
+            async with make_harness(
+                binding=Binding(), identity_authority=Core(), approvals=approvals,
+            ) as h:
+                h.runner.default_script = awaiting()
+                event = qevent("synthetic relay refusal", adapter=CLUSTER_MESSAGE_ADAPTER)
+                consumer = Consumer(
+                    redis=h.async_redis,
+                    kernel=h.kernel,
+                    config=h.config,
+                    leases=DeliveryLeaseStore(h.async_redis, h.config),
+                    reminders=refuse_unconfigured_reminder,
+                )
+                entry_id, observed = await pending_entry(h, consumer, {
+                    "payload": raw_payload(event), "curie_identity_context_v1": CAPSULE,
+                })
+                await consumer._handle(entry_id, observed)
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+                names = [sent.event for sent, _, _ in h.sink.events]
+                assert names == ["reply.update", "turn.completed"]
+                (_, _, text), = h.sink.updates
+                assert text.splitlines()[0] == "curie-turn-failure: identity-refused"
+                assert TICKET_RETRY_REPLY not in text
+
+    asyncio.run(run())
+
+
 def test_an_undelivered_ticket_refusal_notice_keeps_the_terminal_outcome(
     make_harness: Any,
 ) -> None:

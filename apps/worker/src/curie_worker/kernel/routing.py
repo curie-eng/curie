@@ -351,7 +351,9 @@ async def _settle_relay_after_refusal(self: Kernel, qevent: QueuedTurn) -> None:
     Only a turn whose replies go to the platform-owned relay adapter gets
     this notice: that adapter posts to the platform's own API, which only an
     operator holding the API key can read, never to Slack or any other
-    surface a person sees. Every other refused turn stays silent.
+    surface a person sees. Every other refused turn stays silent, except the
+    ADR 0288 notice for a refused approval ticket (``_notice_after_refusal``),
+    which the relay never gets.
 
     Called after the done marker, and best effort: a lost notice leaves the
     waiter on its deadline as before and never changes the terminal outcome.

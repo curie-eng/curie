@@ -7,8 +7,8 @@ into the top-level ``approval_ticket`` argument of the gated tool. A ticket is
 part of it (long repeated runs are the usual casualty). The API then refuses the
 approval and nothing tells the requester why.
 
-This module removes the copy from the model's hands without giving the runner
-any authority. It remembers the well-formed tickets a hosted connector returned
+This module mitigates that without giving the runner any authority. It
+remembers the well-formed tickets a hosted connector returned
 in this conversation, reading their claims WITHOUT trusting them. When the
 model calls that connector's gated tool with a damaged copy, it puts back the
 ticket the copy was taken from, identified by evidence in the copy itself: a
@@ -18,11 +18,14 @@ The source must be the one remembered ticket matching the copy this way, must
 name this connector and tool, and must have been issued for exactly the other
 arguments of this call.
 
-Because the source is identified by the copy and checked against the call, a
-ticket the runner never saw, forgot, or saw twice cannot be confused with
-another one: there is simply no unique source, and the call is left alone. A
-copy that still parses as a complete ticket is never replaced, since nothing
-distinguishes a damaged signature of the same length from a different ticket.
+The result is the unique remembered string (identical observations count
+once) that matches one anchored end of the copy and the call's digest. That is
+evidence, not proof, of which string the model copied: a ticket the runner
+never saw is never chosen, two matching strings leave the call alone, and a
+reply the runner could not read whole, or a forgotten ticket, stops restoring
+for the rest of the conversation. A copy that still parses as a complete ticket
+is never replaced, since nothing distinguishes a damaged signature of the same
+length from a different ticket.
 
 The API still verifies the signature, scope, requester, freshness, digest,
 ceiling and nonce of whatever ticket it receives. Fail closed means "leave the

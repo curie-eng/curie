@@ -167,7 +167,8 @@ async def process_event(
                 await self._markers.mark_done(qevent.event_id, marker_value="1")
                 constants._LIFECYCLE_OUTCOME.set("classified_failure")
                 logger.info("HTTP invocation refused before further execution")
-                # @spec HTTP-INVOCATION-EXECUTION-31: only the relay hears of it.
+                # @spec HTTP-INVOCATION-EXECUTION-31: the relay hears of it;
+                # ADR 0288's ticket notice below is the one other exception.
                 await self._settle_relay_after_refusal(qevent)
                 if refusal.notice is not None and _lease_still_held(lease):
                     # ADR 0288 decision 3: a refused approval ticket. The

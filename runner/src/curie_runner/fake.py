@@ -789,22 +789,26 @@ class FakeModelSession:
         """Note scripted tool names, and run the PostToolUse hook over their results.
 
         A result whose call this turn refused or denied never ran, so the real
-        CLI runs no PostToolUse hook for it, and neither does this fake.
+        CLI runs no PostToolUse hook for it, and neither does this fake. Without
+        an injected hook nothing is noted, and each noted name is dropped when
+        its result arrives, so a long session keeps no state for this.
         """
 
+        if self._post_tool_use_hook is None:
+            return
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
                     self._tool_names[block.id] = block.name
             return
-        if self._post_tool_use_hook is None or not isinstance(message, UserMessage):
+        if not isinstance(message, UserMessage):
             return
         if isinstance(message.content, str):
             return
         for block in message.content:
             if not isinstance(block, ToolResultBlock):
                 continue
-            name = self._tool_names.get(block.tool_use_id)
+            name = self._tool_names.pop(block.tool_use_id, None)
             if name is None or block.is_error is True:
                 continue
             if block.tool_use_id in self._refused_ids or block.tool_use_id in self._denied_ids:
