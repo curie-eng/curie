@@ -297,6 +297,30 @@ def test_an_incomplete_acknowledgment_never_changes_an_absent_pin_evidence(
 
     assert _code(bare) == "acknowledgment_mismatch"
     assert _evidence(absent.request_id) == "none"
-    # Liveness: a worker failure reason alone still records a failure.
-    failed = _ack(api, absent, epoch, None, reason="runner_unacknowledged")
-    assert failed.status_code == 200 and failed.json() == {"evidence": "failed"}
+    # Liveness: a worker failure reason alone is still accepted, and it leaves the
+    # absent pin's evidence alone (see the next test).
+    accepted = _ack(api, absent, epoch, None, reason="runner_unacknowledged")
+    assert accepted.status_code == 200 and accepted.json() == {"evidence": "none"}
+
+
+def test_a_delivery_failure_never_rewrites_an_absent_pins_evidence(
+    api: TestClient, world: support.World
+) -> None:
+    refused, refused_epoch = _running(api, world, 579818, rules=False)
+    relayed, relayed_epoch = _running(
+        api, world, 579819, rules=False, agent=_agent_of(refused.work_item_id)
+    )
+    assert _evidence(refused.request_id) == _evidence(relayed.request_id) == "none"
+
+    # The runner refuses an envelope for this very execution and fence, and the
+    # worker reports its own delivery failure for the other request.
+    by_runner = _ack(api, refused, refused_epoch, "failed", reason="wrong_execution")
+    by_worker = _ack(api, relayed, relayed_epoch, None, reason="runner_unacknowledged")
+
+    assert by_runner.status_code == 200 and by_runner.json() == {"evidence": "none"}
+    assert by_worker.status_code == 200 and by_worker.json() == {"evidence": "none"}
+    assert _evidence(refused.request_id) == _evidence(relayed.request_id) == "none"
+    # Liveness: the absent pin still acknowledges none, and a pinned selection still
+    # records a runner refusal as failed (test_a_runner_refusal_or_worker_failure_records_failed).
+    kept = _ack(api, refused, refused_epoch, "none")
+    assert kept.status_code == 200 and kept.json() == {"evidence": "none"}

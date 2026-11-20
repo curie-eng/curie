@@ -195,7 +195,10 @@ async def accept_acknowledgment(
             # An applied pin is never downgraded by a later failure.
             await session.rollback()
             return Refused("evidence_conflict")
-        evidence = "failed"
+        # A failure marks a pinned selection failed. An absent pin carries no rules to
+        # fail, so its evidence stays ``none``: the refusal is the request's terminal
+        # detail (the worker records it), never a rewrite of the evidence.
+        evidence = "failed" if selected else current
     if evidence != current:
         await session.execute(
             update(ExecutionRequest)
