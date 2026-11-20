@@ -1103,6 +1103,7 @@ pub struct MemoryEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MemoryRuleDecider {
     pub principal_id: uuid::Uuid,
+    #[serde(deserialize_with = "present_or_null")]
     pub display_name: Option<String>,
 }
 
@@ -1138,14 +1139,21 @@ pub struct MemoryRule {
     pub state: MemoryRuleState,
     pub text: String,
     pub reason: String,
+    #[serde(deserialize_with = "present_or_null")]
     pub source_url: Option<String>,
     pub proposed_by: String,
     pub proposed_at: String,
+    #[serde(deserialize_with = "present_or_null")]
     pub accepted_by: Option<MemoryRuleDecider>,
+    #[serde(deserialize_with = "present_or_null")]
     pub accepted_at: Option<String>,
+    #[serde(deserialize_with = "present_or_null")]
     pub rejected_by: Option<MemoryRuleDecider>,
+    #[serde(deserialize_with = "present_or_null")]
     pub rejected_at: Option<String>,
+    #[serde(deserialize_with = "present_or_null")]
     pub removed_by: Option<MemoryRuleDecider>,
+    #[serde(deserialize_with = "present_or_null")]
     pub removed_at: Option<String>,
     pub version: i64,
 }
@@ -1196,16 +1204,29 @@ pub fn parse_memory_rule_change(body: serde_json::Value) -> Result<MemoryRuleCha
     )
 }
 
+/// A field the API always sends, `null` when it has no value: `null` decodes
+/// to `None`, and a missing key is refused (serde would otherwise read it as
+/// `None`, since a custom deserializer turns off the implicit default).
+fn present_or_null<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 fn parse_memory_rules_body<T: serde::de::DeserializeOwned>(
     body: serde_json::Value,
     operation: &str,
     resource: &str,
 ) -> Result<T> {
-    serde_json::from_value(body).map_err(|err| {
+    serde_path_to_error::deserialize(body).map_err(|err| {
+        let path = err.path().to_string();
+        let inner = err.into_inner();
         anyhow::Error::from(
             crate::exit::CliError::failure(format!(
-                "{operation} answered with a body that is not {resource} ({err}); \
-                 the platform release may not match this CLI"
+                "{operation} answered with a body that is not {resource} \
+                 (at `{path}`: {inner}); the platform release may not match this CLI"
             ))
             .with_fix("use a CLI matching the release"),
         )

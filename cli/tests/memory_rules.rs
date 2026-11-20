@@ -627,3 +627,104 @@ fn a_rule_list_in_another_shape_exits_1() {
         .to_string();
     assert!(error.contains("not a learned rule list"), "{error}");
 }
+
+/// The API always sends its nullable fields: a missing one is refused by name,
+/// an explicit null is not.
+#[test]
+fn a_missing_nullable_field_is_refused_and_an_explicit_null_is_not() {
+    let mut no_accepted_by = vector("list");
+    no_accepted_by["rules"][0]
+        .as_object_mut()
+        .expect("a rule object")
+        .remove("accepted_by");
+    let err = curie::api::parse_memory_rules(no_accepted_by).expect_err("accepted_by missing");
+    let shown = format!("{err:#}");
+    assert!(shown.contains("missing field `accepted_by`"), "{shown}");
+    assert!(shown.contains("at `rules[0]`"), "{shown}");
+
+    let mut no_accepted_at = vector("accept");
+    no_accepted_at["rule"]
+        .as_object_mut()
+        .expect("a rule object")
+        .remove("accepted_at");
+    let err =
+        curie::api::parse_memory_rule_change(no_accepted_at).expect_err("accepted_at missing");
+    let shown = format!("{err:#}");
+    assert!(shown.contains("missing field `accepted_at`"), "{shown}");
+    assert!(shown.contains("at `rule`"), "{shown}");
+
+    let mut no_display_name = vector("accept");
+    no_display_name["rule"]["accepted_by"]
+        .as_object_mut()
+        .expect("a decider object")
+        .remove("display_name");
+    let err = curie::api::parse_memory_rule_change(no_display_name).expect_err("no display_name");
+    assert!(
+        format!("{err:#}").contains("missing field `display_name`"),
+        "{err:#}"
+    );
+
+    let mut nulls = vector("accept");
+    nulls["rule"]["accepted_by"] = Value::Null;
+    nulls["rule"]["accepted_at"] = Value::Null;
+    nulls["rule"]["source_url"] = Value::Null;
+    let change = curie::api::parse_memory_rule_change(nulls).expect("explicit nulls parse");
+    assert_eq!(change.rule.accepted_by, None);
+    assert_eq!(change.rule.accepted_at, None);
+}
+
+/// A field of the wrong type is named by its path.
+#[test]
+fn a_wrong_type_field_is_named_by_its_path() {
+    let mut text_version = vector("accept");
+    text_version["rule"]["version"] = json!("2");
+    let err = curie::api::parse_memory_rule_change(text_version).expect_err("a string version");
+    let shown = format!("{err:#}");
+    assert!(shown.contains("at `rule.version`"), "{shown}");
+    assert!(shown.contains("invalid type"), "{shown}");
+
+    let mut text_limit = vector("list");
+    text_limit["in_force_limit"] = json!("16");
+    let err = curie::api::parse_memory_rules(text_limit).expect_err("a string limit");
+    assert!(
+        format!("{err:#}").contains("at `in_force_limit`"),
+        "{err:#}"
+    );
+
+    let mut text_count = vector("list");
+    text_count["scopes"][0]["in_force_count"] = json!(true);
+    let err = curie::api::parse_memory_rules(text_count).expect_err("a bool count");
+    assert!(
+        format!("{err:#}").contains("at `scopes[0].in_force_count`"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn an_action_answer_missing_accepted_at_or_with_a_text_version_exits_1_naming_it() {
+    let fixture = Fixture::new();
+    let session = fixture.session(0o600);
+    let mut missing = json!({"rule": rule("accepted", 2), "applies_from": "next_ticket"});
+    missing["rule"]
+        .as_object_mut()
+        .expect("a rule object")
+        .remove("accepted_at");
+    let mut text_version = json!({"rule": rule("accepted", 2), "applies_from": "next_ticket"});
+    text_version["rule"]["version"] = json!("2");
+    for (answer, named) in [
+        (missing, "missing field `accepted_at`"),
+        (text_version, "rule.version"),
+    ] {
+        let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/agents") => agent_list(),
+            ("POST", p) if p == accept_path() => Response::json(200, &answer.to_string()),
+            other => panic!("unexpected request: {other:?}"),
+        });
+        let output = fixture.run(&act_args("--accept", &session, &server.base_url));
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+        let value = object(&output);
+        let error = value["error"].as_str().expect("an error string");
+        assert!(error.contains(named), "{value}");
+        assert!(value.get("rule").is_none(), "{value}");
+    }
+}
