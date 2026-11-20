@@ -2685,6 +2685,13 @@ def _with_account(account: str | None, spec: ConnectorSpec = HOSTED) -> dict[str
 def test_a_named_service_account_lands_on_the_connector_pod() -> None:
     pod = _with_account("acme-bot-grafana")["Deployment"]["spec"]["template"]["spec"]
     assert pod["serviceAccountName"] == "acme-bot-grafana"
+    # The deprecated alias too. Observed on a disposable minikube cluster
+    # (Kubernetes v1.35.1): the API server fills `serviceAccount` from
+    # `serviceAccountName`, and a server-side apply that then omits only
+    # `serviceAccountName` leaves the unowned alias, which restores it, so the
+    # pod never returns to `default`. Declaring both, then omitting both,
+    # left both empty.
+    assert pod["serviceAccount"] == "acme-bot-grafana"
     # Token mounting stays the ServiceAccount's own setting.
     assert "automountServiceAccountToken" not in pod
 
@@ -2697,14 +2704,16 @@ def test_a_named_service_account_moves_nothing_else() -> None:
         if key != "Deployment":
             assert named[key] == baseline[key], key
     deployment = json.loads(json.dumps(named["Deployment"]))
-    assert deployment["spec"]["template"]["spec"].pop("serviceAccountName") == "acme-bot-grafana"
+    pod = deployment["spec"]["template"]["spec"]
+    assert pod.pop("serviceAccountName") == "acme-bot-grafana"
+    assert pod.pop("serviceAccount") == "acme-bot-grafana"
     assert deployment == baseline["Deployment"]
 
 
 def test_an_unnamed_service_account_renders_the_same_bytes() -> None:
-    assert "serviceAccountName" not in _with_account(None)["Deployment"]["spec"]["template"][
-        "spec"
-    ]
+    unnamed = _with_account(None)["Deployment"]["spec"]["template"]["spec"]
+    assert "serviceAccountName" not in unnamed
+    assert "serviceAccount" not in unnamed
     cases = json.loads(_BASELINE.read_text(encoding="utf-8"))["cases"]
     for case in cases:
         objs = r.render(
