@@ -1016,8 +1016,36 @@ def test_a_plain_answer_after_an_older_finish_is_the_one_continuation(
         assert again["status"] == "factory_duplicate", again
     _after_the_roll()
     assert _after_asker(triage) == [(answer, "waiting")]
-    _take_over(triage, answer)
+    run = _take_over(triage, answer)
     assert _request(answer)["status"] == "running"
+    read = intake._run_issue(run)
+    assert read["has_question_history"] is True
+    assert read["admitted_answers"] == [
+        {
+            "comment_id": str(comment["id"]),
+            "author_id": str(intake.WRITER["id"]),
+            "text": intake.ANSWER,
+        }
+    ]
+
+
+def test_a_retained_answer_receipt_remains_context_on_the_new_reader(world: intake.World) -> None:
+    number = 1233
+    asking = intake._outstanding(world, number)
+    comment = intake._admits(world, "webhook", asking, number)
+    answer = intake._answer_id(asking, comment)
+    # The expand migration gives an older writer's receipt a NULL fingerprint.
+    tr._exec(
+        "UPDATE curie.factory_answer_receipts SET answer_fingerprint = NULL "
+        "WHERE request_id = :id",
+        {"id": answer},
+    )
+    read = intake._run_issue(_take_over(asking, answer))
+    assert read["answer_attempt"] is True
+    assert read["has_question_history"] is True
+    assert read["admitted_answers"] == []
+    assert intake.ANSWER in read["thread_context"]
+    assert intake.ANSWER not in read["ticket"]
 
 
 # Guard: every reader and writer of the round state is covered above --------------------
@@ -1092,6 +1120,11 @@ _EXPECTED_USES = {
     "curie_api/routers/work_item_issue.py": {
         "ALREADY_ASKED",
         "ALREADY_PUBLISHED",
+        "ANSWER_RECEIPT_OUTCOMES",
+        "ANSWER_STARTED_OUTCOMES",
+        "COALESCED",
+        "FactoryAnswerReceipt",
+        "FactoryQuestionRoundCount",
         "INVALID_CONTEXT",
         "INVALID_QUESTIONS",
         "NOT_IMPLEMENTATION_CONTRACT",

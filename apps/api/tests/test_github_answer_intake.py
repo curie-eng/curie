@@ -90,7 +90,6 @@ from test_factory_question_ending import (
     _take_over,
 )
 from test_factory_terminus import _reconcile
-from test_publications import _execute
 
 PATHS = ("webhook", "poll")
 TOKEN = "ghs_answer_intake_fixture"
@@ -631,7 +630,7 @@ def test_issue_read_separates_exact_answers_from_thread_context(world: World, pa
     assert exact not in unrelated["thread_context"]
 
 
-@pytest.mark.parametrize("change", ["edit", "missing_author", "legacy_receipt"])
+@pytest.mark.parametrize("change", ["edit", "missing_author"])
 def test_issue_read_withholds_an_unproven_answer(world: World, change: str) -> None:
     number = 6282
     asking = _outstanding(world, number)
@@ -639,14 +638,8 @@ def test_issue_read_withholds_an_unproven_answer(world: World, change: str) -> N
     request = _answer_id(asking, comment)
     if change == "edit":
         world.github.edit_comment(comment["id"], "Use the updated filename.")
-    elif change == "missing_author":
-        comment["user"].pop("id")
     else:
-        _execute(
-            "UPDATE curie.factory_answer_receipts SET answer_fingerprint = NULL "
-            "WHERE request_id = :id",
-            {"id": request},
-        )
+        comment["user"].pop("id")
     read = _run_issue(_take_over(asking, request))
     assert read["answer_attempt"] is True
     assert read["admitted_answers"] == []
