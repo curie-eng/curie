@@ -42,14 +42,6 @@ from .config import Settings, get_settings
 from .factory_notices import ANSWER_PULL_REQUEST_ENDED_SENTENCE, start_failed_sentence
 from .factory_reply_target import reply_columns
 from .factory_retry_policy import RetrySafety
-from .factory_tracker_result_runtime import (
-    CONTRACT_TRACKER_RESULT,
-    IMPLEMENTATION,
-    CompletionContract,
-    CompletionContractName,
-    ContractRefused,
-    select_completion_contract,
-)
 from .forges import surfaces, types
 from .forges.errors import NotFound
 from .forges.registry import forges_registry
@@ -141,10 +133,6 @@ RefusalCode = Literal[
     # whose observation is blank (#5377).
     "stale_version",
     "termination_observation_required",
-    # A revision (a mention or review feedback) on a WorkItem whose run ends
-    # in a tracker result; that contract has no pull request to revise
-    # (ADR 0277, #5586).
-    "tracker_result_no_revision",
     # A gated retry's start did not deliver a strictly larger limit (#5427).
     "resource_gate_unmet",
     # Execution owner admission refusals (#5376).
@@ -210,7 +198,6 @@ class AcquireGrant:
     wait_deadline: datetime
     repository_path: str
     context: FactoryContext
-    completion_contract: CompletionContractName
     # What the request runs, and the retained candidate a publication recovery
     # publishes (#5429), read from the request row.
     execution_kind: ExecutionKindName
@@ -257,7 +244,6 @@ class RunningResult:
     execution_deadline: datetime
     context: FactoryContext | None
     refusal: RefusalCode | None
-    completion_contract: CompletionContractName
 
 
 @dataclass(frozen=True)
@@ -273,7 +259,6 @@ class StartResult:
     execution_deadline: datetime
     remaining_s: float
     heartbeat_interval_s: int
-    completion_contract: CompletionContractName
 
 
 @dataclass(frozen=True)
@@ -369,40 +354,6 @@ def _execution_kind(row: ExecutionRequest) -> ExecutionKindName:
     return cast(ExecutionKindName, kind)
 
 
-def _contract_name(row: ExecutionRequest) -> CompletionContractName:
-    """The request's stored completion contract (the column CHECK admits two)."""
-
-    if row.completion_contract == CONTRACT_TRACKER_RESULT:
-        return "tracker_result"
-    return "implementation"
-
-
-async def _admission_contract(
-    session: AsyncSession, facts: Any
-) -> CompletionContract | DispatchConflict:
-    """The contract a request admitted on ``facts`` runs under (ADR 0277, #5586).
-
-    Selected from the binding agent's in-force deployed version, never from
-    issue text. A refusal (the declared kinds need an operation the issue's
-    tracker cannot perform) is answered as a label no binding serves:
-    ``binding_missing``, nothing written.
-    """
-
-    selected = await select_completion_contract(
-        session,
-        agent_id=facts.agent_id,
-        tracker_kind=facts.issue.kind,
-        tracker_host=facts.issue.host,
-        registry=forges_registry(get_settings()),
-    )
-    if isinstance(selected, ContractRefused):
-        logger.warning(
-            "work item admission for agent %s refused: %s", facts.agent_id, selected.code
-        )
-        return await _refuse(session, "binding_missing")
-    return selected
-
-
 def _snapshot_matches(row: ExecutionRequest, facts: Any) -> bool:
     return all(getattr(row, column) == value for column, value in _snapshot_values(facts).items())
 
@@ -424,14 +375,12 @@ def work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
 
 
 async def _write_snapshot(
-    session: AsyncSession, request_id: uuid.UUID, facts: Any, contract: CompletionContract
+    session: AsyncSession, request_id: uuid.UUID, facts: Any
 ) -> ExecutionRequest | DispatchConflict:
     """Write the admission snapshot that makes a request dispatchable.
 
-    ``claim_due`` skips a request whose objective is NULL, so the completion
-    contract is written in the same statement: no request is ever dispatched
-    under a contract other than the one its admission selected, whichever
-    lifecycle path inserted the row.
+    ``claim_due`` skips a request whose objective is NULL, so a request is
+    dispatched only once this statement has written its snapshot.
     """
 
     await session.execute(
@@ -442,8 +391,6 @@ async def _write_snapshot(
         )
         .values(
             **_snapshot_values(facts),
-            completion_contract=contract.contract,
-            result_policy_digest=contract.result_policy_digest,
             updated_at=func.clock_timestamp(),
         )
     )
@@ -473,10 +420,7 @@ async def _replay_existing(
     if refused is not None:
         return await _refuse(session, refused.code, work_item_id=work_item.id, request_id=locked.id)
     if locked.objective is None:
-        contract = await _admission_contract(session, facts)
-        if isinstance(contract, DispatchConflict):
-            return contract
-        written = await _write_snapshot(session, locked.id, facts, contract)
+        written = await _write_snapshot(session, locked.id, facts)
         if isinstance(written, DispatchConflict):
             return written
         locked = written
@@ -574,16 +518,6 @@ async def admit_revision(
     refused = await existing_work_item_refusal(session, work_item, facts)
     if refused is not None:
         return await _refuse(session, refused.code, work_item_id=work_item.id)
-    # A tracker result run ends without a pull request, so there is nothing a
-    # revision could revise (ADR 0277).
-    latest_contract = await session.scalar(
-        select(ExecutionRequest.completion_contract)
-        .where(ExecutionRequest.work_item_id == work_item.id)
-        .order_by(ExecutionRequest.sequence.desc())
-        .limit(1)
-    )
-    if latest_contract == CONTRACT_TRACKER_RESULT:
-        return await _refuse(session, "tracker_result_no_revision", work_item_id=work_item.id)
     now = await database_now(session)
     requested = await lifecycle.create_revision_request(
         session,
@@ -598,7 +532,7 @@ async def admit_revision(
     assert requested.request is not None
     if requested.request.status == "queued":
         return requested
-    written = await _write_snapshot(session, facts.request_id, facts, IMPLEMENTATION)
+    written = await _write_snapshot(session, facts.request_id, facts)
     if isinstance(written, DispatchConflict):
         return written
     reloaded = await reload_work_item(session, work_item.id)
@@ -647,7 +581,7 @@ async def create_answer_request(
     assert requested.request is not None
     if requested.request.status == "queued":
         return requested
-    written = await _write_snapshot(session, request_id, revision, IMPLEMENTATION)
+    written = await _write_snapshot(session, request_id, revision)
     if isinstance(written, DispatchConflict):
         return written
     reloaded = await reload_work_item(session, work_item.id)
@@ -681,9 +615,6 @@ async def readmit(
     refused = await existing_work_item_refusal(session, work_item, facts)
     if refused is not None:
         return await _refuse(session, refused.code, work_item_id=work_item.id)
-    contract = await _admission_contract(session, facts)
-    if isinstance(contract, DispatchConflict):
-        return contract
     now = await database_now(session)
     readmitted = await lifecycle.readmit(
         session,
@@ -705,7 +636,7 @@ async def readmit(
     assert readmitted.request is not None
     if readmitted.request.id != facts.request_id:
         return readmitted
-    written = await _write_snapshot(session, facts.request_id, facts, contract)
+    written = await _write_snapshot(session, facts.request_id, facts)
     if isinstance(written, DispatchConflict):
         return written
     reloaded = await reload_work_item(session, work_item.id)
@@ -749,10 +680,6 @@ async def _admit_new_transaction(
         return await _refuse(
             session, owner.code, work_item_id=existing.id if existing is not None else None
         )
-    # Selected before any row is written, so a refusal leaves no WorkItem.
-    contract = await _admission_contract(session, facts)
-    if isinstance(contract, DispatchConflict):
-        return contract
     requester = getattr(facts, "requester_principal_id", None)
     if existing is None:
         if owner is not None and owner.is_personal:
@@ -790,8 +717,6 @@ async def _admit_new_transaction(
             if facts.trigger_label
             else None
         ),
-        completion_contract=contract.contract,
-        result_policy_digest=contract.result_policy_digest,
     )
     if isinstance(requested, WorkItemConflict):
         if requested.code == "identity_mismatch":
@@ -802,7 +727,7 @@ async def _admit_new_transaction(
                 return await _replay_existing(session, existing, facts, adapter)
         return requested
     assert requested.request is not None
-    written = await _write_snapshot(session, requested.request.id, facts, contract)
+    written = await _write_snapshot(session, requested.request.id, facts)
     if isinstance(written, DispatchConflict):
         return written
     work_item = await reload_work_item(session, created.work_item.id)
@@ -1440,7 +1365,6 @@ async def acquire(
         wait_deadline=deadline,
         repository_path=work_item.repository_path,
         context=current,
-        completion_contract=_contract_name(request),
         execution_kind=_execution_kind(request),
         recovery_candidate_id=request.recovery_candidate_id,
         resource_gate=gate,
@@ -1837,7 +1761,6 @@ async def start(
         execution_deadline=row.execution_deadline,
         remaining_s=max(0.0, remaining),
         heartbeat_interval_s=settings.work_item_runtime_ttl_seconds // 3,
-        completion_contract=_contract_name(row),
     )
 
 
@@ -2510,7 +2433,6 @@ async def running_for_conversation(
         execution_deadline=running.execution_deadline,
         context=current if isinstance(current, FactoryContext) else None,
         refusal=current if isinstance(current, str) else None,
-        completion_contract=_contract_name(running),
     )
     await session.commit()
     return "running", result
@@ -2733,7 +2655,6 @@ def request_view(row: ExecutionRequest) -> dict[str, Any]:
         "reply_kind": row.reply_kind,
         "reply_address": row.reply_address,
         "reply_conversation_id": row.reply_conversation_id,
-        "completion_contract": _contract_name(row),
     }
 
 

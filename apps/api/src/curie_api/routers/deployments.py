@@ -48,21 +48,15 @@ async def create_deployment(
     # @spec ACTION-EXECUTOR-16: a bundle stored before intake refused a
     # non-SecretRef sealing key declaration is refused here too, before any row.
     # A stored tracker result declaration is read from the stored bytes
-    # (ADR 0277): a malformed one is a validation failure, and a valid one
-    # this agent could not run is refused with the upload route's envelope.
+    # (ADR 0277): a malformed one is a validation failure.
     try:
         declaration = await deploy.check_stored_bundle_intake(store, version)
-        await deploy.check_tracker_result_admissible(session, agent, declaration)
     except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except deploy.BundleInvalid as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             {"detail": "bundle failed validation", "errors": exc.errors},
-        ) from exc
-    except deploy.TrackerResultRefused as exc:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, {"code": exc.code, "message": str(exc)}
         ) from exc
     # The declared/bound approval-route join (#2436): this is the first moment
     # both halves are known for a specific agent, and the moment the version

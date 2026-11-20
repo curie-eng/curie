@@ -26,10 +26,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import factory_run_support as support
 import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config
 from alembic import command
 from curie_api.config import get_settings
+from forge_fakes.github_comments import _rows as _app_rows
+from forge_fakes.github_comments import admitted, comments  # noqa: F401  (fixtures)
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
@@ -1428,3 +1431,67 @@ def test_0167_downgrade_without_state_restores_0162_and_reapplies(
     assert _constraints_0167() == CONSTRAINTS_0167
     (deliveries,) = _batch((f"SELECT origin FROM curie.{DELIVERIES}", {}))
     assert deliveries == [{"origin": "submitted"}]
+
+
+# -- A version deployed with a stored policy, after the API removal (#5803) ------------
+#
+# The columns stay until the schema ticket drops them, so a version deployed
+# before the removal may still carry a policy. The API no longer reads it: a
+# human label on its binding admits one ordinary implementation request.
+
+FINDINGS_POLICY = {"results": ["findings"], "implementation_label": None}
+
+
+def test_a_version_carrying_a_stored_policy_admits_one_implementation_request(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_factory_tracker_result_admission import _agent_id, _deployed
+
+    client, _github, _sink = admitted
+    agent_id = _agent_id()
+    version_id = _deployed(client, agent_id, None)
+    support._exec(
+        "UPDATE curie.agent_versions SET result_policy_schema_version = 1, "
+        "result_policy_digest = :digest, result_policy = CAST(:policy AS jsonb) "
+        "WHERE id = :id",
+        {"digest": HEX64, "policy": json.dumps(FINDINGS_POLICY), "id": uuid.UUID(version_id)},
+    )
+
+    job = support._admit_run(admitted, monkeypatch, 7311)
+    support._begin(job)
+
+    requests = _app_rows(
+        "SELECT r.id, r.execution_kind, r.completion_contract FROM curie.execution_requests r "
+        "JOIN curie.work_items w ON w.id = r.work_item_id WHERE w.tracker_issue_id = '7311'"
+    )
+    assert requests == [
+        {
+            "id": job.request_id,
+            "execution_kind": "implementation",
+            "completion_contract": "implementation",
+        }
+    ]
+    answered = client.post(
+        "/work-items/completion-contract", headers={"X-Curie-Issue-Read": job.capability}
+    )
+    assert answered.status_code == 200, answered.text
+    assert answered.json() == {
+        "completion_contract": "implementation",
+        "execution": {
+            "tenant_id": str(_tenant(job.work_item_id)),
+            "work_item_id": str(job.work_item_id),
+            "execution_request_id": str(job.request_id),
+            "execution_fence": job.epoch,
+        },
+        "rule_proposal": False,
+    }
+
+
+def _tenant(work_item_id: uuid.UUID) -> uuid.UUID:
+    (row,) = _app_rows(
+        "SELECT a.tenant_id FROM curie.work_items w JOIN curie.agents a ON a.id = w.agent_id "
+        "WHERE w.id = :id",
+        {"id": work_item_id},
+    )
+    return uuid.UUID(str(row["tenant_id"]))

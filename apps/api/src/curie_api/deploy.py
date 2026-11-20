@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 import plugin_format
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -23,13 +22,11 @@ from curie_api.schemas.versions import BundleOut
 
 from . import approver_tickets, bundles
 from .config import Settings, get_settings
-from .models import Agent, AgentChannel, AgentVersion
-from .publication_policy import POLICY_AUTO
+from .models import AgentVersion
 from .storage import ObjectStore
 from .tracker_result_declaration import (
     DeclarationInvalid,
     ResultDeclaration,
-    ResultKind,
     read_declaration,
 )
 
@@ -92,42 +89,6 @@ class SealingKeyCustody(Exception):
     """
 
     code = bundles.SEALING_KEY_CODE
-
-
-class TrackerResultRefused(Exception):
-    """A valid tracker result declaration this agent cannot run (ADR 0277, #5586).
-
-    Deploy-time refusals, so no label can reach a binding that cannot finish
-    a tracker result. Raised by ``check_tracker_result_admissible`` at every
-    site that makes a declared version the one that boots: the bundle upload
-    (which then discards the version it was made for), ``POST /deployments``
-    before any deployment row, and git flow's three attach and promote paths.
-    ``code`` lets ``gitflow._rejected`` and the API routes build their
-    envelopes from the exception alone.
-    """
-
-    code = "tracker_result_refused"
-
-
-class TrackerResultUnsupported(TrackerResultRefused):
-    """The declaration allows a ticket and a tracker bound to the agent cannot
-    create a linked issue (GitLab, Jira Cloud)."""
-
-    code = "tracker_result_unsupported"
-
-
-class TrackerResultNeedsUnattendedPublication(TrackerResultRefused):
-    """The agent's publication policy requires an approval; unattended triage
-    cannot finish under it."""
-
-    code = "tracker_result_needs_unattended_publication"
-
-
-class TrackerResultTargetIsSelf(TrackerResultRefused):
-    """The declaration's implementation label is a trigger label of the agent's
-    own tracker surfaces, so a published ticket would start this triage again."""
-
-    code = "tracker_result_target_is_self"
 
 
 class ApprovalRoutesUnbound(Exception):
@@ -240,9 +201,7 @@ def validate_archive(
     exceeds the configured uncompressed-size or compression-ratio cap.
     ``declaration`` is the bundle's valid tracker result declaration
     (``workflow/result.json``), or None when it has none; a malformed
-    declaration is a ``BundleInvalid``. Whether this agent may run a declared
-    version is ``check_tracker_result_admissible``'s question, asked by the
-    caller that knows the agent.
+    declaration is a ``BundleInvalid``.
     """
 
     settings = settings or get_settings()
@@ -386,85 +345,6 @@ def apply_result_policy(version: AgentVersion, declaration: ResultDeclaration | 
     version.result_policy_schema_version = declaration.schema_version
     version.result_policy_digest = declaration.digest
     version.result_policy = result_policy(declaration)
-
-
-async def check_tracker_result_admissible(
-    session: AsyncSession,
-    agent: Agent,
-    declaration: ResultDeclaration | None,
-    settings: Settings | None = None,
-) -> None:
-    """Refuse a declared version this agent's bindings could not finish (ADR 0277).
-
-    A no-op without a declaration. Otherwise raises, in this order:
-
-    1. ``TrackerResultUnsupported``: the declaration allows a ticket and a
-       tracker surface of the agent resolves to a tracker that does not
-       support ``Operation.CREATE_LINKED_ISSUE``.
-    2. ``TrackerResultNeedsUnattendedPublication``: the agent's publication
-       policy is not ``auto``.
-    3. ``TrackerResultTargetIsSelf``: the implementation label is the
-       effective trigger label of one of the agent's tracker surfaces
-       (compared case-insensitively, as trackers compare labels).
-
-    A surface no configured tracker serves starts no work and is skipped, so
-    an agent with no tracker surfaces passes 1 and 3. Reading a tracker's
-    declaration fails closed (unsupported).
-    """
-
-    if declaration is None:
-        return
-    from .factory_tracker_result_runtime import tracker_creates_linked_issues
-    from .forges.registry import forges_registry
-    from .forges.surfaces import (
-        TRACKER_SURFACE_KINDS,
-        SurfaceUnconfigured,
-        effective_trigger_label,
-        resolve_surface,
-    )
-
-    registry = forges_registry(settings or get_settings())
-    surfaces = list(
-        await session.scalars(
-            select(AgentChannel)
-            .where(
-                AgentChannel.agent_id == agent.id,
-                AgentChannel.kind.in_(sorted(TRACKER_SURFACE_KINDS)),
-            )
-            .order_by(AgentChannel.id)
-        )
-    )
-    if ResultKind.TICKET in declaration.results:
-        for surface in surfaces:
-            try:
-                tracker = resolve_surface(registry, surface.kind, surface.address).tracker
-            except SurfaceUnconfigured:
-                continue
-            if tracker is not None and not tracker_creates_linked_issues(
-                registry, tracker.kind, tracker.host
-            ):
-                raise TrackerResultUnsupported(
-                    f"the bundle declares ticket results, and the {surface.kind} surface "
-                    f"{surface.address!r} of this agent is served by tracker "
-                    f"{tracker.name!r}, which cannot create a linked issue; declare "
-                    "findings only or bind the agent to a tracker that can"
-                )
-    if agent.publication_policy != POLICY_AUTO:
-        raise TrackerResultNeedsUnattendedPublication(
-            f"tracker result runs are unattended, and this agent's publication policy is "
-            f"{agent.publication_policy!r}; set it to {POLICY_AUTO!r} before deploying "
-            "a version that declares workflow/result.json"
-        )
-    label = declaration.implementation_label
-    if label is not None:
-        for surface in surfaces:
-            trigger = effective_trigger_label(surface, registry)
-            if trigger is not None and trigger.casefold() == label.casefold():
-                raise TrackerResultTargetIsSelf(
-                    f"the bundle's implementation_label {label!r} is the trigger label of "
-                    f"this agent's {surface.kind} surface {surface.address!r}, so a published "
-                    "ticket would start this triage again; choose another label"
-                )
 
 
 def _declared_route_map(data: bytes, settings: Settings) -> dict[str, str] | None:

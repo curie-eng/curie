@@ -14,11 +14,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-import pytest
 from curie_api import bundles
 from curie_api.config import get_settings
-from curie_api.db import create_sessionmaker
-from curie_api.routers.bundles import _discard_upload_version
 from curie_api.storage import BundleStore
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -131,8 +128,7 @@ def test_a_malformed_result_declaration_is_a_validation_issue(tmp_path: Path) ->
 
 
 def test_a_valid_result_declaration_passes_extraction_validation(tmp_path: Path) -> None:
-    # Intake validation accepts it; whether the agent may run it is judged at
-    # deploy time (`deploy.check_tracker_result_admissible`).
+    # Intake validation accepts it.
     files = _valid_files()
     files["workflow/result.json"] = RESULT_DECLARATION
     _, _, result = bundles.extract_and_validate(_zip(files), tmp_path)
@@ -387,51 +383,6 @@ RESULT_DECLARATION_DIGEST = hashlib.sha256(
 RESULT_POLICY = {"results": ["findings", "ticket"], "implementation_label": "curie-factory"}
 
 
-def test_upload_with_a_result_declaration_is_refused_and_leaves_nothing_behind(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    agent_id, version_id = _create_version(client, auth_headers)
-    url = f"/agents/{agent_id}/versions/{version_id}/bundle"
-    files = _valid_files()
-    files["workflow/result.json"] = RESULT_DECLARATION
-
-    resp = client.put(url, files={"file": ("demo.tar.gz", _tar_gz(files))}, headers=auth_headers)
-
-    # The agent's publication policy is the default `approve` (#5586).
-    assert resp.status_code == 422, resp.text
-    assert resp.json()["detail"]["code"] == "tracker_result_needs_unattended_publication"
-    # The version made for this upload is gone, no object was stored, and
-    # nothing was deployed or queued for the agent.
-    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
-    assert client.get(url, headers=auth_headers).status_code == 404
-    assert _count_rows("deployments", agent_id) == 0
-    assert _count_rows("work_items", agent_id) == 0
-
-
-def test_a_refused_upload_onto_a_deployed_version_keeps_the_version(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    # The documented deploy-then-attach order: a deployment already references
-    # the bundleless version, so the refusal must not delete it.
-    agent_id, version_id = _create_version(client, auth_headers)
-    deployed = _deploy(client, auth_headers, agent_id, version_id)
-    assert deployed.status_code == 201, deployed.text
-    files = _valid_files()
-    files["workflow/result.json"] = RESULT_DECLARATION
-
-    resp = client.put(
-        f"/agents/{agent_id}/versions/{version_id}/bundle",
-        files={"file": ("demo.tar.gz", _tar_gz(files))},
-        headers=auth_headers,
-    )
-
-    assert resp.status_code == 422, resp.text
-    assert resp.json()["detail"]["code"] == "tracker_result_needs_unattended_publication"
-    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
-    assert [(v["id"], v["bundle_ref"]) for v in versions] == [(version_id, None)]
-    assert _count_rows("deployments", agent_id) == 1
-
-
 def test_the_same_bundle_without_the_result_declaration_uploads_and_deploys(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
@@ -470,87 +421,6 @@ def test_upload_with_a_malformed_result_declaration_reports_validation_first(
     detail = resp.json()["detail"]
     assert detail["detail"] == "bundle failed validation"
     assert [e["code"] for e in detail["errors"]] == ["tracker_result.schema_version"]
-    assert "tracker_result_needs_unattended_publication" not in resp.text
-
-
-def test_the_refusal_cleanup_waits_for_a_concurrent_deployment_and_keeps_both(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    """The discard locks the version before it decides (#5585, review C2).
-
-    `deployments.version_id` cascades on delete, so a cleanup that judged "no
-    deployment" before a concurrent deployment INSERT committed would delete
-    that new deployment with the version. Connection A inserts a deployment
-    and holds its transaction open; the cleanup runs as a task and must block
-    on A's foreign key lock (observed through `pg_blocking_pids`, no sleeps);
-    after A commits, both rows must survive. Calls the router's cleanup helper
-    directly because the TestClient cannot interleave with an open transaction.
-    """
-
-    agent_id, version_id = _create_version(client, auth_headers)
-    deployment_id = uuid.uuid4()
-
-    async def run() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        try:
-            async with engine.connect() as holder, engine.connect() as observer:
-                await holder.execute(
-                    text(
-                        "INSERT INTO curie.deployments "
-                        "(id, agent_id, version_id, environment, status) VALUES "
-                        "(:id, :agent, :version, CAST('dev' AS curie.environment), 'active')"
-                    ),
-                    {
-                        "id": deployment_id,
-                        "agent": uuid.UUID(agent_id),
-                        "version": uuid.UUID(version_id),
-                    },
-                )
-                holder_pid = await holder.scalar(text("SELECT pg_backend_pid()"))
-                async with create_sessionmaker(engine)() as session:
-                    cleaner_pid = await session.scalar(text("SELECT pg_backend_pid()"))
-                    task = asyncio.create_task(
-                        _discard_upload_version(session, uuid.UUID(version_id))
-                    )
-                    # Each observation is a database round trip, which yields
-                    # to the task; the bound only stops a broken run.
-                    for _ in range(10_000):
-                        blockers = await observer.scalar(
-                            text("SELECT pg_blocking_pids(:pid)"), {"pid": cleaner_pid}
-                        )
-                        if holder_pid in (blockers or []):
-                            break
-                        assert not task.done(), "the cleanup finished without waiting for A"
-                    else:
-                        pytest.fail("the cleanup never blocked on the open deployment insert")
-                    assert not task.done()
-                    await holder.commit()
-                    await task
-        finally:
-            await engine.dispose()
-
-    asyncio.run(run())
-
-    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
-    assert [v["id"] for v in versions] == [version_id]
-    assert _count_rows("deployments", agent_id) == 1
-
-
-def test_deploying_a_stored_bundle_with_a_result_declaration_is_refused(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
-    agent_id, version_id = _create_version(client, auth_headers)
-    files = _valid_files()
-    files["workflow/result.json"] = RESULT_DECLARATION
-    _store_directly(agent_id, version_id, _tar_gz(files))
-
-    resp = _deploy(client, auth_headers, agent_id, version_id)
-
-    assert resp.status_code == 422, resp.text
-    assert resp.json()["detail"]["code"] == "tracker_result_needs_unattended_publication"
-    assert _count_rows("deployments", agent_id) == 0
-    assert _count_rows("work_items", agent_id) == 0
-    assert _version_policy(version_id)["result_policy_digest"] is None
 
 
 def test_upload_with_a_result_declaration_under_auto_publication_records_its_policy(

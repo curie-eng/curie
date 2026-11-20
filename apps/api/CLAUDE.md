@@ -91,20 +91,16 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   (`Tracker.read_ticket`; a GitHub issue with an App installation token
   freshly minted only for the recorded installation) and returns it as
   markdown with its link. It stores nothing.
-  The same capability authorizes exactly four sibling routes (ADR 0277,
-  #5586; #5785; ADR 0287, #5796), each repeating the issue check before and
-  after any tracker call.
+  The same capability authorizes exactly three sibling routes (ADR 0277,
+  #5586; #5785; ADR 0287, #5796; narrowed by #5803), each repeating the issue
+  check before and after any tracker call.
   `POST /work-items/completion-contract` answers the execution's completion
-  contract; for a `tracker_result` request the first call reads the source
-  issue's title and body, mints the request's one grant
-  (`factory_tracker_result_grants`) and reserves its one model session
-  (`execution_requests.model_session_reserved_at`), and every later call is
-  409 `session_already_started`. `POST /work-items/tracker-result` seals the
-  request's one result under that grant's fences
-  (`factory_tracker_result_delivery`) and attempts its delivery once; it
-  refuses an implementation request (`not_tracker_result`), a second result
-  (`result_already_submitted`) and a source whose title or body changed
-  (`source_fingerprint_changed`), writing nothing.
+  contract (`read_completion_contract`) with exactly `completion_contract`,
+  `execution` and `rule_proposal`, and stores nothing: an implementation
+  request gets its ADR 0278 execution binding, and a publication recovery
+  request `publication_recovery` with no binding. A capability that does not
+  name its WorkItem's issue, a cancelled WorkItem and a request that can no
+  longer run are 409 `invalid_context`.
   `POST /work-items/questions` posts the execution's numbered questions as one
   marked comment on its own ticket (#5785). `POST /work-items/rule-proposal`
   stores the execution's one learned rule candidate (`memory_rule_lifecycle`):

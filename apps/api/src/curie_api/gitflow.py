@@ -412,7 +412,6 @@ def _rejected(
         deploy.ApprovalRoutesUnbound
         | deploy.BundleTooLarge
         | deploy.SealingKeyCustody
-        | deploy.TrackerResultRefused
         | approver_tickets.BundleGateMismatch
     ),
     agent_id: uuid.UUID | None = None,
@@ -429,10 +428,6 @@ def _rejected(
     there first. The message is the exception's own, identical to the one the
     API returns as a 422 detail. `approver_ticket.bundle_gate_mismatch` (ADR
     0271 decision 2) rides on the same three route gates.
-    The three tracker result refusals (`deploy.TrackerResultRefused`, #5586)
-    fire once the target agent is known: on the build path before any version
-    row of this agent exists, judged against the declaration of the object
-    being attached, and on the reuse path against the stored object's own.
     """
 
     return WebhookResult(
@@ -703,13 +698,6 @@ async def process_push(
                 return WebhookResult(status="rejected", agent_id=agent.id, errors=exc.errors)
             except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
                 return _rejected(exc, agent.id)
-        # The tracker result refusals for the object this delivery attaches,
-        # judged against the resolved agent before any row of its own exists
-        # (#5586), so a refused push leaves no version behind.
-        try:
-            await deploy.check_tracker_result_admissible(session, agent, declaration, settings)
-        except deploy.TrackerResultRefused as exc:
-            return _rejected(exc, agent.id)
         if version is None:
             # The row, and only the row, precedes the refusal below: it is the
             # BUNDLE that must not be written yet (#2436). A bundleless row is
@@ -826,20 +814,12 @@ async def process_push(
             # @spec ACTION-EXECUTOR-16: a reused bundle stored before intake
             # refused a non-SecretRef sealing key declaration is refused here,
             # as `POST /deployments` refuses it. Its tracker result
-            # declaration is read from the stored object, judged against the
-            # resolved agent, and recorded on the version with the
-            # deployment's commit (#5586).
+            # declaration is read from the stored object and recorded on the
+            # version with the deployment's commit (#5586).
             stored_declaration = await deploy.check_stored_bundle_intake(store, version, settings)
-            await deploy.check_tracker_result_admissible(
-                session, agent, stored_declaration, settings
-            )
         except deploy.BundleInvalid as exc:
             return WebhookResult(status="rejected", agent_id=agent.id, errors=exc.errors)
-        except (
-            deploy.BundleTooLarge,
-            deploy.SealingKeyCustody,
-            deploy.TrackerResultRefused,
-        ) as exc:
+        except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
             return _rejected(exc, agent.id)
         deploy.apply_result_policy(version, stored_declaration)
 

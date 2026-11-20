@@ -601,7 +601,6 @@ _HTTP_OPERATIONS = [
     "/work-items/issue-read",
     "/work-items/questions",
     "/work-items/rule-proposal",
-    "/work-items/tracker-result",
     "/work-items/{work_item_id}",
     "/work-items/{work_item_id}/usage",
     "/work-items/{work_item_id}/retry",
@@ -724,9 +723,6 @@ _WORK_ITEM_RECONCILER_STEP_ATTRIBUTES = {
         "sync_status_comments",
         "redispatch_lapsed_acquisitions",
         "reconcile_base_transitions",
-        "expire_tracker_results",
-        "deliver_tracker_results",
-        "hand_off_triage_tickets",
         "publish_execute_wakes",
     ],
 }

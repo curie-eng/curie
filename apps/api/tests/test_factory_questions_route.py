@@ -3,7 +3,7 @@
 Each case admits a labelled issue through a signed GitHub issues webhook
 against create_app(), acquires and starts its implementation request as the
 worker does, and calls the route over HTTP with the issue read capability the
-internal mint route issues (the helpers of test_factory_tracker_results). The
+internal mint route issues (the helpers of factory_run_support). The
 tracker is the in-memory adapter keyed to that WorkItem's issue, the GitHub
 comment fake through the production resolver, or the Jira Cloud fake through
 the production Jira adapter.
@@ -35,9 +35,9 @@ from markdown_it import MarkdownIt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import test_factory_tracker_results as tr
+import factory_run_support as tr
 import test_workitems as wi
-from curie_api import factory_questions, factory_tracker_result_runtime
+from curie_api import completion_contract, factory_questions
 from curie_api.config import get_settings
 from curie_api.forges.capabilities import Operation
 from curie_api.forges.errors import Unavailable
@@ -70,20 +70,20 @@ def _frame(round_number: int, summary: str, questions: list[str]) -> str:
     )
 
 
-def _ask(triage: tr._Triage | _JiraCase, summary: Any = SUMMARY, questions: Any = None) -> Any:
-    return triage.client.post(
+def _ask(job: tr._Run | _JiraCase, summary: Any = SUMMARY, questions: Any = None) -> Any:
+    return job.client.post(
         QUESTIONS_URL,
-        headers={"X-Curie-Issue-Read": triage.capability},
+        headers={"X-Curie-Issue-Read": job.capability},
         json={"summary": summary, "questions": QUESTIONS if questions is None else questions},
     )
 
 
-def _running(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Triage:
+def _running(admitted: Any, monkeypatch: pytest.MonkeyPatch, number: int) -> tr._Run:
     """An implementation request, started, on the in-memory tracker."""
 
-    triage = tr._triage(admitted, monkeypatch, number, tracker_result=False)
-    tr._begin(triage)
-    return triage
+    job = tr._admit_run(admitted, monkeypatch, number)
+    tr._begin(job)
+    return job
 
 
 def _round_row(work_item_id: uuid.UUID) -> dict[str, Any] | None:
@@ -102,11 +102,11 @@ def _request(request_id: uuid.UUID) -> dict[str, Any]:
     return row
 
 
-def _marked(triage: tr._Triage) -> list[str]:
-    marker = f"curie-factory-questions:{triage.request_id}"
-    target = ReplyTarget.on_issue(triage.issue)
+def _marked(job: tr._Run) -> list[str]:
+    marker = f"curie-factory-questions:{job.request_id}"
+    target = ReplyTarget.on_issue(job.issue)
     return [
-        body for _author, body in triage.tracker.marked_comments.comments(target) if marker in body
+        body for _author, body in job.tracker.marked_comments.comments(target) if marker in body
     ]
 
 
@@ -120,31 +120,31 @@ def _code(response: Any) -> str:
 def test_two_questions_post_one_marked_comment_and_record_round_one(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 801)
-    response = _ask(triage)
+    job = _running(admitted, monkeypatch, 801)
+    response = _ask(job)
     assert response.status_code == 200, response.text
     assert response.json() == {"round": 1, "rounds_limit": 3}
     expected = _frame(1, SUMMARY, QUESTIONS)
-    (body,) = _marked(triage)
+    (body,) = _marked(job)
     assert body.startswith(expected)
     assert "\n1. Should the trailing empty row be kept?\n2. Which delimiter" in body
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["rounds_used"], row["state"]) == (1, "outstanding")
     assert row["answer_after"] is not None
-    assert row["asking_request_id"] == triage.request_id
+    assert row["asking_request_id"] == job.request_id
     assert row["pending_request_id"] is None
     assert row["comment_id"] is not None
     assert row["body_sha256"] == hashlib.sha256(expected.encode()).hexdigest()
-    assert triage.tracker.ledger.writes == 1
+    assert job.tracker.ledger.writes == 1
 
 
 def test_inputs_at_the_bounds_are_posted(admitted: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    triage = _running(admitted, monkeypatch, 802)
+    job = _running(admitted, monkeypatch, 802)
     questions = ["q" * 1000 for _ in range(9)] + ["first line\nsecond line"]
-    response = _ask(triage, summary="s" * 4000, questions=questions)
+    response = _ask(job, summary="s" * 4000, questions=questions)
     assert response.status_code == 200, response.text
-    (body,) = _marked(triage)
+    (body,) = _marked(job)
     # The continuation line sits at the item's content column, inside item 10.
     assert "\n10. first line\n    second line\n\n" in body
 
@@ -152,10 +152,10 @@ def test_inputs_at_the_bounds_are_posted(admitted: Any, monkeypatch: pytest.Monk
 def test_model_text_cannot_open_an_html_comment(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 803)
-    response = _ask(triage, summary="See <!-- curie-status:final -->", questions=["<!-- x -->?"])
+    job = _running(admitted, monkeypatch, 803)
+    response = _ask(job, summary="See <!-- curie-status:final -->", questions=["<!-- x -->?"])
     assert response.status_code == 200, response.text
-    (body,) = _marked(triage)
+    (body,) = _marked(job)
     head = body.split("\n\n<!-- curie-factory-questions:")[0]
     assert "<!--" not in head
 
@@ -164,14 +164,14 @@ def test_model_text_is_redacted_mention_free_and_cannot_hold_the_frame_in_a_fenc
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     secret = "ghp_" + "A1b2C3d4E5" * 3 + "F6g7H8"
-    triage = _running(admitted, monkeypatch, 804)
+    job = _running(admitted, monkeypatch, 804)
     response = _ask(
-        triage,
+        job,
         summary=f"Ran it with {secret} and saw:\n```\ntraceback, never closed",
         questions=["Should @someone own this?"],
     )
     assert response.status_code == 200, response.text
-    (body,) = _marked(triage)
+    (body,) = _marked(job)
     assert secret not in body
     assert "[REDACTED" in body
     assert "@someone" not in body and "@\u200bsomeone" in body
@@ -187,24 +187,24 @@ def test_model_text_is_redacted_mention_free_and_cannot_hold_the_frame_in_a_fenc
 def test_github_writes_one_comment_through_the_production_resolver(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 811)
+    job = _running(admitted, monkeypatch, 811)
     # Undo the in-memory substitution: the WorkItem's own GitHub tracker writes.
-    monkeypatch.setattr(factory_tracker_result_runtime, "work_item_tracker", _REAL_TRACKER)
+    monkeypatch.setattr(completion_contract, "work_item_tracker", _REAL_TRACKER)
     _client, github, _server = admitted
-    response = _ask(triage)
+    response = _ask(job)
     assert response.status_code == 200, response.text
-    marker = f"curie-factory-questions:{triage.request_id}"
+    marker = f"curie-factory-questions:{job.request_id}"
     # The GitHub fake behind the app's HTTP client keeps each issue's comments.
     written = [c for c in github.issue_comments.get(811, []) if marker in c["body"]]
     assert len(written) == 1
     assert written[0]["body"].startswith(_frame(1, SUMMARY, QUESTIONS))
     assert written[0]["performed_via_github_app"] is not None
-    assert _marked(triage) == []
-    row = _round_row(triage.work_item_id)
+    assert _marked(job) == []
+    row = _round_row(job.work_item_id)
     assert row is not None and row["comment_id"] == str(written[0]["id"])
 
 
-_REAL_TRACKER = factory_tracker_result_runtime.work_item_tracker
+_REAL_TRACKER = completion_contract.work_item_tracker
 
 
 # The Jira Cloud tracker through the production resolver -------------------------
@@ -419,10 +419,10 @@ def test_a_continuation_line_that_opens_a_block_keeps_one_commonmark_list(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The GitHub surface: CommonMark keeps each question inside its item.
-    triage = _running(admitted, monkeypatch, 813)
-    response = _ask(triage, summary=_LISTED_SUMMARY, questions=_BLOCK_QUESTIONS)
+    job = _running(admitted, monkeypatch, 813)
+    response = _ask(job, summary=_LISTED_SUMMARY, questions=_BLOCK_QUESTIONS)
     assert response.status_code == 200, response.text
-    (body,) = _marked(triage)
+    (body,) = _marked(job)
     tokens = MarkdownIt("commonmark").parse(body)
     kinds = [token.type for token in tokens]
     assert kinds.count("ordered_list_open") == 1
@@ -460,15 +460,15 @@ def test_refused_input_that_redaction_grows_past_the_bound_writes_nothing(
     questions = [("token=x " * 125).strip()] * 10
     assert len(summary) <= 4000 and all(len(question) <= 1000 for question in questions)
     assert len(factory_questions.compose_body(1, summary, questions)) > BODY_LIMIT
-    triage = _running(admitted, monkeypatch, 814)
-    refused = _ask(triage, summary=summary, questions=questions)
+    job = _running(admitted, monkeypatch, 814)
+    refused = _ask(job, summary=summary, questions=questions)
     assert refused.status_code == 409
     assert refused.json()["detail"] == {
         "code": "invalid_questions",
         "message": "the questions are outside the tool's bounds",
     }
-    assert triage.tracker.ledger.writes == 0
-    assert _round_row(triage.work_item_id) is None
+    assert job.tracker.ledger.writes == 0
+    assert _round_row(job.work_item_id) is None
 
 
 # Criterion 3: refusals and replay ------------------------------------------------------
@@ -477,22 +477,22 @@ def test_refused_input_that_redaction_grows_past_the_bound_writes_nothing(
 def test_replay_of_the_same_body_returns_the_first_answer_with_one_write(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 821)
-    first = _ask(triage)
-    again = _ask(triage)
+    job = _running(admitted, monkeypatch, 821)
+    first = _ask(job)
+    again = _ask(job)
     assert first.status_code == again.status_code == 200
     assert again.json() == first.json() == {"round": 1, "rounds_limit": 3}
-    assert triage.tracker.ledger.writes == 1
-    assert len(_marked(triage)) == 1
-    row = _round_row(triage.work_item_id)
+    assert job.tracker.ledger.writes == 1
+    assert len(_marked(job)) == 1
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["rounds_used"], row["version"]) == (1, 2)
 
 
 def test_concurrent_replays_of_one_ask_post_one_comment(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 823)
-    marked = triage.tracker.marked_comments
+    job = _running(admitted, monkeypatch, 823)
+    marked = job.tracker.marked_comments
     original_find = marked.find_marked
     lookups: list[str] = []
     second_lookup = asyncio.Event()
@@ -518,38 +518,38 @@ def test_concurrent_replays_of_one_ask_post_one_comment(
     monkeypatch.setattr(factory_questions, "begin_round", counted_begin)
 
     async def both() -> list[httpx.Response]:
-        transport = httpx.ASGITransport(app=triage.client.app)
+        transport = httpx.ASGITransport(app=job.client.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http:
             calls = [
                 http.post(
                     QUESTIONS_URL,
-                    headers={"X-Curie-Issue-Read": triage.capability},
+                    headers={"X-Curie-Issue-Read": job.capability},
                     json={"summary": SUMMARY, "questions": QUESTIONS},
                 )
                 for _ in range(2)
             ]
             return list(await asyncio.gather(*calls))
 
-    first, second = triage.client.portal.call(both)
+    first, second = job.client.portal.call(both)
     assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
     assert first.json() == second.json() == {"round": 1, "rounds_limit": 3}
-    assert entered == [triage.request_id, triage.request_id]
-    assert len(_marked(triage)) == 1
-    assert triage.tracker.ledger.writes == 1
+    assert entered == [job.request_id, job.request_id]
+    assert len(_marked(job)) == 1
+    assert job.tracker.ledger.writes == 1
     assert len(lookups) == 1
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["rounds_used"]) == ("outstanding", 1)
 
 
 def test_refused_a_different_body_from_the_same_request_is_already_asked(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 822)
-    assert _ask(triage).status_code == 200
-    refused = _ask(triage, questions=["A different question?"])
+    job = _running(admitted, monkeypatch, 822)
+    assert _ask(job).status_code == 200
+    refused = _ask(job, questions=["A different question?"])
     assert refused.status_code == 409
     assert _code(refused) == "already_asked"
-    assert triage.tracker.ledger.writes == 1
+    assert job.tracker.ledger.writes == 1
 
 
 @pytest.mark.parametrize(
@@ -571,28 +571,28 @@ def test_refused_a_different_body_from_the_same_request_is_already_asked(
 def test_refused_input_outside_the_bounds_is_invalid_questions(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, summary: Any, questions: Any
 ) -> None:
-    triage = _running(admitted, monkeypatch, 823)
-    refused = _ask(triage, summary=summary, questions=questions)
+    job = _running(admitted, monkeypatch, 823)
+    refused = _ask(job, summary=summary, questions=questions)
     assert refused.status_code == 409
     assert refused.json()["detail"] == {
         "code": "invalid_questions",
         "message": "the questions are outside the tool's bounds",
     }
-    assert triage.tracker.ledger.writes == 0
-    assert _round_row(triage.work_item_id) is None
+    assert job.tracker.ledger.writes == 0
+    assert _round_row(job.work_item_id) is None
 
 
 @pytest.mark.parametrize("body", [{"questions": ["Which branch?"]}, {"summary": "Found it."}, {}])
 def test_refused_a_missing_field_is_invalid_questions_not_a_422(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
 ) -> None:
-    triage = _running(admitted, monkeypatch, 826)
-    refused = triage.client.post(
-        QUESTIONS_URL, headers={"X-Curie-Issue-Read": triage.capability}, json=body
+    job = _running(admitted, monkeypatch, 826)
+    refused = job.client.post(
+        QUESTIONS_URL, headers={"X-Curie-Issue-Read": job.capability}, json=body
     )
     assert refused.status_code == 409
     assert _code(refused) == "invalid_questions"
-    assert triage.tracker.ledger.writes == 0
+    assert job.tracker.ledger.writes == 0
 
 
 _SENT = "sent-value-7c1e-never-echoed"
@@ -642,16 +642,16 @@ def _post_raw(client: Any, capability: str, raw: str) -> Any:
 def test_refused_a_malformed_body_is_invalid_questions_echoing_nothing(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, raw: str
 ) -> None:
-    triage = _running(admitted, monkeypatch, 831)
-    refused = _post_raw(triage.client, triage.capability, raw)
+    job = _running(admitted, monkeypatch, 831)
+    refused = _post_raw(job.client, job.capability, raw)
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"] == {
         "code": "invalid_questions",
         "message": "the questions are outside the tool's bounds",
     }
     assert _SENT not in refused.text and _SENT_NUMBER not in refused.text
-    assert triage.tracker.ledger.writes == 0
-    assert _round_row(triage.work_item_id) is None
+    assert job.tracker.ledger.writes == 0
+    assert _round_row(job.work_item_id) is None
 
 
 @pytest.mark.parametrize("raw", list(_MALFORMED_BODIES.values()), ids=list(_MALFORMED_BODIES))
@@ -682,83 +682,71 @@ _SEPARATED_BLANK_LINES = {
 def test_refused_a_blank_line_of_any_line_break_form(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, question: str
 ) -> None:
-    triage = _running(admitted, monkeypatch, 832)
-    refused = _ask(triage, questions=[question])
+    job = _running(admitted, monkeypatch, 832)
+    refused = _ask(job, questions=[question])
     assert (refused.status_code, _code(refused)) == (409, "invalid_questions")
-    assert triage.tracker.ledger.writes == 0
-    assert _round_row(triage.work_item_id) is None
+    assert job.tracker.ledger.writes == 0
+    assert _round_row(job.work_item_id) is None
 
 
 def test_a_question_with_one_crlf_line_break_is_accepted(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The runner accepts a single CRLF; the route must not read it as a blank line.
-    triage = _running(admitted, monkeypatch, 827)
-    asked = _ask(triage, questions=["first line\r\nsecond line?"])
+    job = _running(admitted, monkeypatch, 827)
+    asked = _ask(job, questions=["first line\r\nsecond line?"])
     assert asked.status_code == 200
     assert asked.json() == {"round": 1, "rounds_limit": 3}
-
-
-def test_refused_a_tracker_result_request_is_not_implementation_contract(
-    admitted: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    triage = tr._triage(admitted, monkeypatch, 824, tracker_result=True)
-    tr._begin(triage)
-    refused = _ask(triage)
-    assert (refused.status_code, _code(refused)) == (409, "not_implementation_contract")
-    assert _round_row(triage.work_item_id) is None
 
 
 def test_refused_a_request_that_is_not_running(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = tr._triage(admitted, monkeypatch, 825, tracker_result=False)
-    refused = _ask(triage)
+    job = tr._admit_run(admitted, monkeypatch, 825)
+    refused = _ask(job)
     assert (refused.status_code, _code(refused)) == (409, "request_not_running")
-    assert _round_row(triage.work_item_id) is None
+    assert _round_row(job.work_item_id) is None
 
 
-def _cancel(triage: tr._Triage) -> None:
-    (row,) = _rows(
-        "SELECT version FROM curie.work_items WHERE id = :id", {"id": triage.work_item_id}
-    )
+def _cancel(job: tr._Run) -> None:
+    (row,) = _rows("SELECT version FROM curie.work_items WHERE id = :id", {"id": job.work_item_id})
 
     async def go() -> Any:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             result = await lifecycle.request_cancellation(
                 session,
-                work_item_id=triage.work_item_id,
+                work_item_id=job.work_item_id,
                 expected_work_item_version=row["version"],
             )
             await session.commit()
             return result
 
-    assert isinstance(triage.client.portal.call(go), lifecycle.WorkItemOutcome)
+    assert isinstance(job.client.portal.call(go), lifecycle.WorkItemOutcome)
 
 
 def test_refused_a_cancelled_work_item(admitted: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    triage = _running(admitted, monkeypatch, 826)
-    _cancel(triage)
-    refused = _ask(triage)
+    job = _running(admitted, monkeypatch, 826)
+    _cancel(job)
+    refused = _ask(job)
     assert (refused.status_code, _code(refused)) == (409, "work_item_cancelled")
-    assert triage.tracker.ledger.writes == 0
+    assert job.tracker.ledger.writes == 0
 
 
-def _with_session(triage: tr._Triage, work: Any) -> Any:
+def _with_session(job: tr._Run, work: Any) -> Any:
     async def go() -> Any:
-        async with triage.client.app.state.sessionmaker() as session:
+        async with job.client.app.state.sessionmaker() as session:
             return await work(session)
 
-    return triage.client.portal.call(go)
+    return job.client.portal.call(go)
 
 
 def test_refused_while_the_work_item_has_an_open_pull_request(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 827)
+    job = _running(admitted, monkeypatch, 827)
     (item,) = _rows(
         "SELECT agent_id, conversation_id FROM curie.work_items WHERE id = :id",
-        {"id": triage.work_item_id},
+        {"id": job.work_item_id},
     )
 
     async def open_lineage(session: Any) -> uuid.UUID:
@@ -768,77 +756,75 @@ def test_refused_while_the_work_item_has_an_open_pull_request(
         await session.commit()
         return lineage
 
-    lineage_id = _with_session(triage, open_lineage)
+    lineage_id = _with_session(job, open_lineage)
     tr._exec(
         "UPDATE curie.work_items SET publication_lineage_id = :lineage WHERE id = :id",
-        {"lineage": lineage_id, "id": triage.work_item_id},
+        {"lineage": lineage_id, "id": job.work_item_id},
     )
-    refused = _ask(triage)
+    refused = _ask(job)
     assert (refused.status_code, _code(refused)) == (409, "pull_request_open")
     # A closed lineage is no open pull request: the same request may ask.
     tr._exec(
         "UPDATE curie.thread_publication_lineages SET status = 'closed' WHERE id = :id",
         {"id": lineage_id},
     )
-    assert _ask(triage).status_code == 200
+    assert _ask(job).status_code == 200
 
 
 def test_refused_after_the_request_published(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 828)
+    job = _running(admitted, monkeypatch, 828)
 
     async def publish(session: Any) -> None:
-        await wi._attach_own_publication(
-            session, triage.work_item_id, triage.request_id, status="failed"
-        )
+        await wi._attach_own_publication(session, job.work_item_id, job.request_id, status="failed")
 
-    _with_session(triage, publish)
-    refused = _ask(triage)
+    _with_session(job, publish)
+    refused = _ask(job)
     assert (refused.status_code, _code(refused)) == (409, "already_published")
-    assert _round_row(triage.work_item_id) is None
+    assert _round_row(job.work_item_id) is None
 
 
 def test_refused_past_three_rounds_marks_the_row_exhausted(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 829)
+    job = _running(admitted, monkeypatch, 829)
     tr._exec(
         "INSERT INTO curie.factory_question_rounds "
         "(work_item_id, rounds_used, state, asking_request_id, body_sha256) "
         "VALUES (:id, 3, 'cleared', :asker, :digest)",
-        {"id": triage.work_item_id, "asker": uuid.uuid4(), "digest": "cd" * 32},
+        {"id": job.work_item_id, "asker": uuid.uuid4(), "digest": "cd" * 32},
     )
     tr._exec(
         "INSERT INTO curie.factory_question_round_counts (work_item_id, rounds_used) "
         "VALUES (:id, 3)",
-        {"id": triage.work_item_id},
+        {"id": job.work_item_id},
     )
-    refused = _ask(triage)
+    refused = _ask(job)
     assert (refused.status_code, _code(refused)) == (409, "question_rounds_exhausted")
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["rounds_used"], row["asking_request_id"]) == (
         "exhausted",
         3,
-        triage.request_id,
+        job.request_id,
     )
-    again = _ask(triage)
+    again = _ask(job)
     assert (again.status_code, _code(again)) == (409, "question_rounds_exhausted")
-    assert triage.tracker.ledger.writes == 0
+    assert job.tracker.ledger.writes == 0
 
 
 def test_refused_a_capability_for_another_issue(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 830)
-    refused = triage.client.post(
+    job = _running(admitted, monkeypatch, 830)
+    refused = job.client.post(
         QUESTIONS_URL,
         headers={"X-Curie-Issue-Read": "wir.not-a-capability"},
         json={"summary": SUMMARY, "questions": QUESTIONS},
     )
     assert refused.status_code == 401
-    assert _round_row(triage.work_item_id) is None
+    assert _round_row(job.work_item_id) is None
 
 
 # Criterion 4: the tracker is unavailable ----------------------------------------------
@@ -847,22 +833,20 @@ def test_refused_a_capability_for_another_issue(
 def test_tracker_unavailable_leaves_the_round_posting_and_the_request_settles_as_today(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 841)
-    triage.tracker.write_faults.abort_before_next(
-        Operation.UPSERT_MARKED, Unavailable("tracker down")
-    )
-    refused = _ask(triage)
+    job = _running(admitted, monkeypatch, 841)
+    job.tracker.write_faults.abort_before_next(Operation.UPSERT_MARKED, Unavailable("tracker down"))
+    refused = _ask(job)
     assert refused.status_code == 503
     assert _code(refused) == "tracker_unavailable"
-    row = _round_row(triage.work_item_id)
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["rounds_used"], row["comment_id"]) == ("posting", 0, None)
-    assert _marked(triage) == []
+    assert _marked(job) == []
 
-    tr._finish(triage, "failed", "no_pull_request")
+    tr._finish(job, "failed", "no_pull_request")
 
-    assert _request(triage.request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
-    row = _round_row(triage.work_item_id)
+    assert _request(job.request_id) == {"status": "failed", "terminal_cause": "no_pull_request"}
+    row = _round_row(job.work_item_id)
     assert row is not None
     assert (row["state"], row["rounds_used"]) == ("cleared", 0)
 
@@ -870,14 +854,14 @@ def test_tracker_unavailable_leaves_the_round_posting_and_the_request_settles_as
 def test_a_retry_after_an_unavailable_tracker_posts_the_round(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    triage = _running(admitted, monkeypatch, 842)
-    triage.tracker.write_faults.lose_next_response(Operation.UPSERT_MARKED)
-    lost = _ask(triage)
+    job = _running(admitted, monkeypatch, 842)
+    job.tracker.write_faults.lose_next_response(Operation.UPSERT_MARKED)
+    lost = _ask(job)
     assert (lost.status_code, _code(lost)) == (503, "tracker_unavailable")
     # The comment landed but its answer was lost; the retry edits it in place.
-    retried = _ask(triage)
+    retried = _ask(job)
     assert retried.status_code == 200, retried.text
     assert retried.json() == {"round": 1, "rounds_limit": 3}
-    assert len(_marked(triage)) == 1
-    row = _round_row(triage.work_item_id)
+    assert len(_marked(job)) == 1
+    row = _round_row(job.work_item_id)
     assert row is not None and (row["state"], row["rounds_used"]) == ("outstanding", 1)
