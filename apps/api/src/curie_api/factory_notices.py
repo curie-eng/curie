@@ -1781,7 +1781,10 @@ async def _render(
             answer = agent_no_change_answer(row.detail)
             if answer is not None:
                 summary += f"**Agent-reported answer:** {answer}\n"
-        result = summary + "\n### Recorded result\n" + result
+        if run_handoff is not None:
+            result = summary + "\n### Recorded result\n" + result
+        else:
+            result = result.rstrip("\n") + "\n\n" + summary
     # A follow-up on an existing pull request cannot ask (pull_request_open),
     # so it carries the continuing line instead of the investigating line.
     admitted = aliased(ExecutionRequest)

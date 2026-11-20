@@ -372,12 +372,15 @@ def _body(sink: _CommentServer, request_id: uuid.UUID) -> str:
 
 
 def _recorded_result(body: str) -> str:
-    """Inspect the original result beneath the issue's attention summary."""
+    """Inspect the original result on either side of the run outcome."""
 
-    assert body.startswith("## Run outcome\n")
-    marker = "### Recorded result\n"
+    if body.startswith("## Run outcome\n"):
+        marker = "### Recorded result\n"
+        assert body.count(marker) == 1
+        return body.split(marker, 1)[1]
+    marker = "\n\n## Run outcome\n"
     assert body.count(marker) == 1
-    return body.split(marker, 1)[1]
+    return body.split(marker, 1)[0]
 
 
 def _terminal(number: int) -> tuple[str, str | None]:

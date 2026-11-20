@@ -35,10 +35,13 @@ USD_HEADLINE = (
 
 
 def _recorded_result(body: str) -> str:
-    assert body.startswith("## Run outcome\n")
-    marker = "### Recorded result\n"
+    if body.startswith("## Run outcome\n"):
+        marker = "### Recorded result\n"
+        assert body.count(marker) == 1
+        return body.split(marker, 1)[1]
+    marker = "\n\n## Run outcome\n"
     assert body.count(marker) == 1
-    return body.split(marker, 1)[1]
+    return body.split(marker, 1)[0]
 
 
 def _finish_body(

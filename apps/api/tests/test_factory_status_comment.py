@@ -1280,8 +1280,8 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
 
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    assert body.startswith("## Run outcome\n")
-    assert "### Recorded result\nCould not complete:" in body
+    assert body.startswith("Could not complete:")
+    assert "\n\n## Run outcome\n" in body
     assert "Details: the tool call kept failing" in body
     assert "Provider message" not in body
     assert "Cause: runner_escalated" in body
@@ -1309,8 +1309,8 @@ def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> N
     assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    assert body.startswith("## Run outcome\n")
-    assert "### Recorded result\nCould not complete: the sandbox terminated" in body
+    assert body.startswith("Could not complete: the sandbox terminated")
+    assert "\n\n## Run outcome\n" in body
     assert f"Details: {detail}" in body
     assert "Provider message:" not in body
     assert "Cause: sandbox_terminated" in body
@@ -1537,8 +1537,8 @@ def test_budget_failure_comment_identifies_the_limit_or_admits_it_is_unknown(
     assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    assert body.startswith("## Run outcome\n")
-    headline = body.split("### Recorded result\n", 1)[1].splitlines()[0]
+    assert "\n\n## Run outcome\n" in body
+    headline = body.splitlines()[0]
     assert headline.startswith("Could not complete:")
     if field is None:
         assert "cannot identify" in headline.lower()
@@ -1648,8 +1648,8 @@ def test_start_failed_comment_names_the_attempts_and_last_reason(
     assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
-    assert body.startswith("## Run outcome\n")
-    assert body.split("### Recorded result\n", 1)[1].splitlines()[0] == START_FAILED_SENTENCE
+    assert body.startswith(START_FAILED_SENTENCE)
+    assert "\n\n## Run outcome\n" in body
     assert "Cause: start_failed" in body
     assert "Provider message:" not in body
     assert "Status: NEEDS HUMAN" in body
@@ -2576,7 +2576,8 @@ def test_merged_lineage_state_refreshes_previously_finalized_comments_idempotent
     assert updated["id"] == comment["id"]
     if terminal == "completed":
         merged_line = f"Pull request merged: https://github.com/{REPO}/pull/77"
-        assert updated["body"].startswith("## Run outcome\n")
+        assert updated["body"].startswith("Completed:")
+        assert "\n\n## Run outcome\n" in updated["body"]
         assert updated["body"].splitlines().count(merged_line) == 1
         assert updated["body"].index(merged_line) < updated["body"].index("Status:")
     else:
