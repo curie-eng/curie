@@ -61,7 +61,15 @@ resolve is a finding (deletion, not a skip).
   missing key, contains `vision_row`; for an unrecognized row, names the row.
 - Grade disagreement: names the seam and both the declared grade and the
   vision-row's grade.
-- Duplicate ADR number prefix: names both (or all) colliding filenames.
+- Duplicate ADR number prefix: names both (or all) colliding filenames. When
+  the remote allocation scan runs (#1957), a cross-train or open-PR collision
+  names each holder as `filename (source)` and includes `next free number is
+  NNNN`.   Collisions this candidate adds or renames into are errors; other
+  remote collisions print as `warning:` and do not fail the exit code. A
+  failed candidate ADR diff, fetch, or open-PR listing fails closed with
+  `cannot verify open PRs to determine a new unique ADR number`, except a
+  fetch/open-PR failure after the candidate ADR diff found no added or
+  renamed ADR files is a warning.
 - Cited ADR number with no file in `docs/adr/`: names the doc, the line, and
   `ADR-NNNN`, and contains `does not exist`.
 - Missing allowlisted root doc (e.g. `ARCHITECTURE.md`) or missing ADR index

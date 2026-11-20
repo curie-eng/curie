@@ -19,14 +19,17 @@ from typing import Any
 import pytest
 import redis
 from aci_protocol import ApprovalRequest, QueuedTurn
+from curie_api import agent_role_policy
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA
 from curie_api.identity.http_transport import HttpIdentityClient
 from curie_internal import identity_context
-from role_policy_support import run
+from principal_adoption_support import ISSUER
+from role_policy_support import change, run
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from apps.api.tests.test_http_invocation_membership import GROUP
 from apps.api.tests.test_http_invocation_membership import synthetic_provider as synthetic_provider
 from apps.api.tests.test_http_turn_authority import delivery_state, queued_invocation
 
@@ -233,6 +236,88 @@ def test_creation_repeats_fresh_provider_membership_instead_of_using_queued_perm
     assert rows(case.request["approval"]["dedupe_key"]) == []
 
 
+def test_selected_creation_refuses_invalid_route_card_and_grant_scope(
+    creation_case: SimpleNamespace,
+) -> None:
+    case = creation_case
+    for changes in (
+        {"route": "synthetic-missing-route"}, {"card_channel": "C0EXAMPLEOTHER"},
+        {"granted_tool": None}, {"granted_arguments": None},
+        {"gate_kind": None, "summary": "Permission required: synthetic_read"},
+    ):
+        request = copy.deepcopy(case.request)
+        request["approval"].update(changes)
+        refused(post(case, request), 409, "unsupported_approval")
+        assert rows(request["approval"]["dedupe_key"]) == []
+    assert accepted(post(case), case.request)["status"] == "pending"
+
+
+def test_creation_discards_authority_captured_before_a_policy_change(
+    creation_case: SimpleNamespace,
+) -> None:
+    case = creation_case
+    committed: list[int] = []
+
+    def write_policy(group: str) -> None:
+        async def write(factory: async_sessionmaker[AsyncSession]) -> None:
+            async with factory() as session, session.begin():
+                policy = await agent_role_policy.apply_role_change(session, change=change(
+                    uuid.UUID(case.scope["tenant"]), uuid.UUID(case.scope["agent"]),
+                    version=case.scope["role_version"], target="invocation",
+                    filter={"entries": [{
+                        "kind": "issuer_group", "group": {"issuer": ISSUER, "id": group},
+                    }]},
+                ))
+                case.scope["role_version"] = policy.version
+                committed.append(policy.version)
+
+        run(write)
+
+    def revoke() -> None:
+        if not committed:
+            write_policy("SyntheticOtherGroup")
+
+    case.provider.during_lookup = revoke
+    try:
+        refused(post(case), 403, "caller_not_allowed")
+    finally:
+        case.provider.during_lookup = None
+    assert len(committed) == 1
+    assert rows(case.request["approval"]["dedupe_key"]) == []
+    write_policy(GROUP)
+    assert accepted(post(case), case.request)["status"] == "pending"
+
+
+def test_public_creation_cannot_hide_selected_scope_or_reuse_its_dedupe_key(
+    creation_case: SimpleNamespace,
+) -> None:
+    case = creation_case
+    approval = case.request["approval"]
+    headers = {"X-API-Key": get_settings().api_key}
+    unbound = {"reply_channel": "C0EXAMPLEUNBOUND", "reply_adapter": "synthetic-unbound"}
+    dedupe = approval["dedupe_key"]
+    before = len(case.provider.requests)
+    for changes in ({"agent_id": None}, unbound):
+        response = case.client.post("/approvals", json={**approval, **changes}, headers=headers)
+        assert response.status_code == 409, response.text
+        assert response.json() == {"detail": "unsupported_approval"}
+        assert rows(dedupe) == []
+    assert len(case.provider.requests) == before
+    accepted(post(case), case.request)
+    saved = rows(dedupe)
+    lookups = len(case.provider.requests)
+    response = case.client.post(
+        "/approvals", json={**approval, **unbound, "agent_id": None}, headers=headers,
+    )
+    assert response.status_code == 409, response.text
+    assert response.json() == {"detail": "unsupported_approval"}
+    conflict = {**case.request, "approval": {**approval, "summary": "A conflicting operation"}}
+    refused(post(case, conflict), 409, "approval_provenance_conflict")
+    assert accepted(post(case), case.request, duplicate=True)["id"] == str(saved[0]["id"])
+    assert rows(dedupe) == saved
+    assert len(case.provider.requests) == lookups
+
+
 def test_creation_external_lookup_holds_no_sql_transaction_or_writer_fence(
     creation_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -352,6 +437,39 @@ def resumed_request(case: SimpleNamespace, token: str, payload: str) -> dict[str
     request["approval"]["summary"] = "Approve the second synthetic bounded operation"
     request["approval"]["granted_tool"] = "synthetic_write"
     return request
+
+
+def test_resuspension_refuses_a_forged_stale_or_foreign_resume(
+    creation_case: SimpleNamespace,
+) -> None:
+    case = creation_case
+    first, resume, payload = resolve_and_resume(case)
+    good = seal_resume(case, resume)
+    foreign_key = identity_context.build_identity_keyring(
+        "context", (("synthetic-context", 1, b"f" * 32),),
+    )
+    foreign = importlib.import_module("curie_internal.identity_approval")
+    other = str(uuid.uuid4())
+    other_event = f"approval-{other}-resolved"
+    other_payload = payload.replace(resume["event_id"], other_event)
+    approved_rows = rows(case.request["approval"]["dedupe_key"])
+    lookups = len(case.provider.requests)
+    for token, carried in (
+        (foreign.seal_resume_context(foreign.ResumeContextV1.model_validate(resume), foreign_key),
+         payload),
+        (seal_resume(case, {**resume, "status": "rejected"}), payload),
+        (seal_resume(case, {**resume, "approval_id": other, "event_id": other_event,
+                            "payload_sha256": digest(other_payload)}), other_payload),
+        (seal_resume(case, {**resume, "original_payload_sha256": digest("synthetic")}), payload),
+        (good, payload + " "),
+    ):
+        request = resumed_request(case, token, carried)
+        refused(post(case, request), 422, "invalid_approval_context")
+        assert rows(request["approval"]["dedupe_key"]) == []
+        assert rows(case.request["approval"]["dedupe_key"]) == approved_rows
+        assert len(case.provider.requests) == lookups
+    request = resumed_request(case, good, payload)
+    assert accepted(post(case, request), request)["id"] != first["id"]
 
 
 def test_resumed_turn_suspends_again_under_its_original_invoker(

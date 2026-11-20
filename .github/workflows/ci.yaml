@@ -734,6 +734,12 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      # ADR number uniqueness across open PRs (#1957): curie_doclint lists
+      # open pull-request file additions via gh so collisions this candidate
+      # claims fail the gate and other remote collisions warn in the log.
+      # contents:read alone is not enough for that listing under the
+      # restricted default token.
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -822,9 +828,13 @@ jobs:
       # each seam's front-matter, fail on drift, resolve every `curie ...`
       # command named in the agent verification contract (docs/agents.md)
       # against cli/command-manifest.json (#1041), then lint every citation
-      # under docs/ (excluding docs/adr/). A cheap, cluster-free gate, so it
-      # runs right after ruff/mypy.
+      # under docs/ (excluding docs/adr/), and verify ADR numbers are unique
+      # across the working tree, origin/main, origin/next, and open PR
+      # additions (#1957). A cheap, cluster-free gate, so it runs right after
+      # ruff/mypy.
       - name: Docs gate (catalog drift + agent contract + citations)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash scripts/check-docs.sh
       # _AciModel tolerant-decode gate (#625, following #492): every direct
       # ClassName.model_validate*(...) call on an _AciModel subclass must thread
