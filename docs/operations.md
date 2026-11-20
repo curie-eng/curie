@@ -2351,16 +2351,21 @@ Each refusal is a `factory_ignored` code (`ordinary_comment`,
 `lineage_unbound`, `lineage_closed`, `installation_mismatch`,
 `sender_permission_refused`, `terminal_pull_request`, `active_request`, and
 others). An accepted mention becomes the work item's next execution request.
-The request stores its reply target when it is admitted: the review thread
-for an inline review comment, the pull request conversation for a PR comment
-or a submitted review, and the tracker issue for every other request. The
+The request stores its reply target when it is admitted: the pull request
+conversation for a PR comment or a submitted review, including every inline
+comment that is part of a submitted review that starts a revision (plain or
+mentioning, in a commented or changes-requested review), and the tracker issue
+for every other request. Only a mentioning inline comment in an approved or
+dismissed review is admitted on its own, and its reply target is its review
+thread. The
 objective still opens with the feedback URL for the agent, but nothing routes
 on it. Upgrading to schema 0102 backfills the stored target of existing
 requests from that first line.
 A revision's status comment lives where its reply lives, on the pull
-request: in the review thread for an inline comment, otherwise as a PR comment
-that links the feedback. If GitHub refuses the thread reply with 422, the
-comment is posted as a linked PR comment. Either way it is edited in place
+request: in the review thread for an inline comment admitted on its own,
+otherwise as a PR comment that links the feedback, and for a submitted review
+that starts a revision it links that review. If GitHub refuses the thread reply
+with 422, the comment is posted as a linked PR comment. Either way it is edited in place
 until the revision ends. PR review feedback reaches the factory only
 when `factory.enabled` is true. A PR no work item owns keeps
 the existing review behavior.

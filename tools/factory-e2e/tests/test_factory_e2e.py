@@ -1867,6 +1867,52 @@ def test_judge_revision_rejects_a_reply_on_a_second_pull_request() -> None:
     assert "2 pull requests were opened, expected exactly one" in failures
 
 
+def _revision_preflight(tmp_path: Path, text: str) -> fe.Preflight:
+    env = {**_env(_app_dir(tmp_path)), "CURIE_FACTORY_MENTION": "acme-bot"}
+    config = fe.load_config(env, context=None, gh_token=_no_gh)
+    return fe.Preflight(
+        config,
+        repo_root=REPO_ROOT,
+        candidate="c" * 40,
+        namespace="test-factory-unit",
+        evidence_path=tmp_path / "evidence" / "e.json",
+        admission_timeout=1,
+        scenario_name="revision",
+        revision_text=text,
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "please @acme-bot add a test",
+        "please @ACME-BOT add a test",
+        "please @example-factory add a test",
+        "@example-factory[bot] add a test",
+    ],
+)
+def test_revision_file_naming_the_mention_or_app_slug_is_refused_before_any_post(
+    tmp_path: Path, text: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    posted: list[str] = []
+    monkeypatch.setattr(
+        fe.Preflight, "post_pr_comment", lambda self, n, body: posted.append(body) or {}
+    )
+    with pytest.raises(fe.ConfigError, match="plain comment"):
+        _revision_preflight(tmp_path, text)
+    assert posted == []
+
+
+def test_revision_file_without_a_mention_is_accepted(tmp_path: Path) -> None:
+    text = "  add a test; mail ops@acme-bot.example, see #12 \n"
+    preflight = _revision_preflight(tmp_path, text)
+    assert preflight.revision_text == text
+    assert (
+        fe.plain_comment_text(text, preflight.config.mention, preflight.config.app_slug)
+        == text.strip()
+    )
+
+
 def test_plain_comment_text_is_not_addressed_to_the_factory() -> None:
     assert fe.plain_comment_text("  add a test \n") == "add a test"
     assert "@" not in fe.plain_comment_text(None)

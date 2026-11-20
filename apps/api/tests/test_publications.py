@@ -8823,15 +8823,52 @@ def test_github_publication_puts_the_ask_line_immediately_before_requester_prefe
     assert created.status_code == 201, created.text
     lines = created.json()["body"].splitlines()
     assert lines[-1] == ANNOTATION
-    assert lines[-3] == github_ask_line("curie")
-    # Any platform annotation may sit between the ask line and the evidence line.
+    # Locate the ask line by content; platform annotations may follow it.
+    ask_at = lines.index(github_ask_line("curie"))
     trailing = assert_single_ask_line(
         created.json()["body"],
-        "\n".join(lines[: lines.index(github_ask_line("curie")) - 1]),
+        "\n".join(lines[: ask_at - 1]),
     )
     assert trailing[-1] == ANNOTATION
+    assert all(
+        line == "" or line.startswith(("Requester preferences:", "Learned rules:"))
+        for line in trailing
+    )
     assert all(line == "" or not line.startswith("Ask the factory:") for line in trailing)
     assert sum(line.startswith("Requester preferences:") for line in lines) == 1
+
+
+def test_github_publication_orders_ask_learned_rules_then_requester_preferences(
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    import test_memory_rule_publication as learned
+    import test_requester_instruction_publication as requester
+
+    client, request_id, payload = _factory_publication_case
+    recorded = _record_factory_verification(client, request_id, outcome="passed")
+    assert recorded.status_code == 201, recorded.text
+    learned._pin(request_id)
+    requester._pin(request_id)
+    first = learned._acknowledge(client, request_id, "applied", sha256=learned.DIGEST)
+    assert first.status_code == 200, first.text
+    second = requester._acknowledge(client, request_id, "applied", sha256=requester.DIGEST)
+    assert second.status_code == 200, second.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = created.json()["body"]
+    lines = body.splitlines()
+    ask = github_ask_line("curie")
+    assert lines.count(ask) == 1
+    assert [line for line in lines if line.startswith("Learned rules:")] == [learned.LINE]
+    assert [line for line in lines if line.startswith("Requester preferences:")] == [
+        requester.ANNOTATION
+    ]
+    ask_at = lines.index(ask)
+    assert lines[ask_at - 1] == ""
+    assert lines[ask_at + 1 :] == ["", learned.LINE, requester.ANNOTATION]
+    assert body.startswith(payload["body"])
 
 
 def test_factory_publication_replaces_the_previous_ask_wording(
