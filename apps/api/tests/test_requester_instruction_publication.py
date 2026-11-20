@@ -39,6 +39,7 @@ from test_publications import (  # noqa: E402, F401
     _factory_publication_case,
     _post_factory_publication,
     _record_factory_verification,
+    assert_single_ask_line,
 )
 
 Case = tuple[TestClient, uuid.UUID, dict[str, Any]]
@@ -296,6 +297,11 @@ def test_an_applied_request_publishes_the_annotation_last(_factory_publication_c
     body = _factory_publication_body(created.json()["id"])
     assert body.splitlines()[-1] == ANNOTATION
     assert sum(line.startswith("Requester preferences:") for line in body.splitlines()) == 1
+    # One current ask line, then only platform annotations, the evidence line last.
+    lines = body.splitlines()
+    ask_at = next(i for i, line in enumerate(lines) if line.startswith("Ask the factory:"))
+    trailing = assert_single_ask_line(body, "\n".join(lines[: ask_at - 1]))
+    assert trailing[-1] == ANNOTATION
     # Nothing but the digest: no text, no principal.
     assert CANARY not in body and str(PRINCIPAL) not in body
     assert CANARY not in created.text

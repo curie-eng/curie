@@ -1565,7 +1565,7 @@ later publication is refused.
 Polling reads each bound repository every `factory.trackers[].pollIntervalSeconds`
 (default 45 seconds). It can admit an open labeled issue immediately, but
 sandbox acquisition waits for the base label settling interval described below.
-It admits a mention and review feedback on a factory pull request, and cancels
+It admits review feedback on a factory pull request (a plain comment on GitHub, a mention elsewhere), and cancels
 a work item whose issue was closed or unlabeled. Those reads do not record a
 webhook delivery. The webhook is optional. In webhook mode the missed-label
 backstop stays: every `FACTORY_RECONCILE_INTERVAL_S` (default 300, 0
@@ -2337,9 +2337,15 @@ execution deadline stays fixed from start and covers that wait.
 
 Review feedback on a factory pull request asks for one more revision of that
 pull request. When a work item owns the PR, an `issue_comment`,
-`pull_request_review_comment` or `pull_request_review` that mentions
-the tracker's `mention` goes to the factory, not to the Slack-bound review
-path. The sender must have write access now, the PR must still be open at the
+`pull_request_review_comment` or `pull_request_review` goes to the factory, not
+to the Slack-bound review path. On GitHub an authorized reviewer's plain
+comment on the factory's open pull request starts a revision with no mention.
+One submitted review is one revision: its body and all its inline comments are
+read together once the review is submitted. An approving review never starts a
+revision unless a comment in it mentions the factory. Each pull request allows
+10 plain-comment revisions; after that the factory posts one notice on the pull
+request and a mention of the tracker's `mention` is required. A mention always
+works and is not counted. GitLab and Bitbucket still require the mention. The sender must have write access now, the PR must still be open at the
 recorded head, and the delivery must come from the work item's installation.
 Each refusal is a `factory_ignored` code (`ordinary_comment`,
 `lineage_unbound`, `lineage_closed`, `installation_mismatch`,
@@ -2552,16 +2558,13 @@ as the OpenRouter key's usage delta (or `unverified`). The key is shared, so
 that delta includes any concurrent use of it.
 
 `run --scenario revision --issue-file <ticket.md> [--revision-file <text.md>]`
-needs the ticket's run to open a pull request. It then posts an ordinary
-comment on that pull request, which must be delivered as `factory_ignored`
-and add no request within 60 s. Next it posts a mention comment (the revision
-file's text, or by default a request for a docstring and a test, prefixed
-with `@<mention>` when absent). It passes when that delivery is
+needs the ticket's run to open a pull request. It then posts one plain
+comment on that pull request (the revision file's text, or by default a request
+for a docstring and a test). It passes when that delivery is
 `factory_admitted`, the revision request belongs to the same WorkItem, the
 WorkItem ends with two requests and the second `completed`, the same single
 pull request gained a commit and a new head, exactly one App reply carries the
-revision's marker and links the mention, no other App comment followed the
-ordinary one, and the default branch is unmoved. Before posting feedback, the
+revision's marker and links the comment, and the default branch is unmoved. Before posting feedback, the
 driver also requires the initial run's one final issue comment to name that
 pull request.
 
