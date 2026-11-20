@@ -1812,3 +1812,51 @@ Teardown deletes Dex and the OIDC Secret, the session files, the code host
 links, the run's unbound label (read back as gone), closes the run's issues,
 moves the default branch back to its head before the merge (read back), and
 deletes the namespace. The verdict fails unless every step is verified.
+
+## Live one-ticket on Jira Cloud (#5793)
+
+`factory_e2e.py run --scenario one-ticket --forge jira_cloud --answer-file
+<file> [--issue-file <file>]` runs the one-ticket flow against a real Jira
+Cloud site with a real model on the preflight's `jira_cloud+github` install.
+The driver is `one_ticket_live.py`; `one-ticket` is a loop scenario fixed to
+the `jira_cloud` forge, so any other `--forge` is refused before anything is
+installed. `--issue-file` defaults to `fixtures/one-ticket-jira-issue.md`, a
+ticket that leaves its rounding mode and default precision open, and
+`fixtures/one-ticket-answer.md` answers it.
+
+### Inputs
+
+1. The usual App, fixture repository, actor token, kube context and layer
+   registry inputs, plus `CURIE_FACTORY_MODEL_API_KEY`.
+2. `CURIE_FACTORY_JIRA_ENV_FILE`, in the format of the docstring of
+   `forges/jira_cloud.py`.
+3. `--answer-file`: the labeller's plain answer. It is required, refused when
+   empty or when it mentions anyone, and refused for every other scenario.
+
+### What the run judges
+
+Each beat against its bound, counted from labelling or from the answer:
+`Investigating this ticket.` within 180 seconds of labelling, a question
+comment within 1800 seconds, the answer posted only after the issue carries
+`curie-factory:questions` with no live request in the same read, the second
+request and `Answer received.` each within 180 seconds of the answer, exactly
+one pull request within 3600 seconds of the answer that names the Jira key and
+has a line starting `Answered on the ticket by `, the merge, and
+`Pull request merged:` within 600 seconds of it. It also requires the Jira
+status id read before labelling to equal the one read after the merged notice
+(an id, not a category), at most two requests, a `Usage:` total of at most
+25 USD (`total cost unknown` and a missing line fail), and no Jira issue
+created by the factory account.
+
+### Evidence and check-clean
+
+Before any lock or cluster call the run loads every identity of its
+environment (fixture repository, actor, operator, App, installation, Jira
+site, cloud, project, labeller and bot accounts, kube context, registry,
+binary paths, home) and writes evidence and log lines only through
+`anonymize`, which replaces each value with its role name. The serializer
+refuses evidence that still names one. The outcome summary for the pull
+request body is logged and stored as `outcome_summary`.
+`python3 tools/factory-e2e/one_ticket_live.py check-clean <file>` reloads the
+same identities and prints `clean`, or exits 1 naming only the roles it found;
+an unreadable input exits 2. It needs only the standard library.
