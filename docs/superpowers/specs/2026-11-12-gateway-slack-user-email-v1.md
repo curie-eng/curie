@@ -84,3 +84,39 @@ operator-supplied Secret whose key holds the identity caller credential. When
 set, the gateway receives it as `CURIE_CHANNEL_GATEWAY_IDENTITY_TOKEN`. When
 unset, nothing changes. The operator gives the same value to the identity
 provider.
+
+## 7. A lookup-only Slack identity
+
+<!-- @spec GATEWAY-USER-EMAIL-7 -->
+An operator may give the lookup its own Slack app instead of adding
+`users:read.email` to an agent's bot app. A declared Slack identity
+(`CURIE_SLACK_IDENTITIES`) needs an app token and Socket Mode, which a
+directory-lookup app has no use for, so the gateway accepts one optional
+lookup-only identity: `CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_IDENTITY` names
+it and `CURIE_CHANNEL_GATEWAY_USER_EMAIL_SLACK_BOT_TOKEN` holds its bot token
+(scopes `users:read` and `users:read.email`). The gateway hands that token to
+the `user_email` read and to nothing else: replies, group membership, file
+fetches, channel and canvas reads, sender identities and account profiles
+never see it, and the dispatcher, API and worker never receive it. A
+`user_email` request naming the lookup identity reads `users.info` with that
+token, under the same answers and refusals as sections 2, 3 and 5; every other
+operation naming it answers as for an unknown identity.
+
+The gateway refuses to start when only one of the two settings is set, when
+the name does not match the Slack identity name pattern of
+`aci_protocol.slack_identities`, or when it equals `default` or any declared
+identity's name. When neither is set, every identity and read behaves as
+before. The `token_custody.refuse_slack_tokens` check refuses the bot token
+setting in any process that consumes gateway ports.
+
+## 8. Chart: lookup-only identity
+
+<!-- @spec GATEWAY-USER-EMAIL-8 -->
+`channelGateway.identityLookup.slackIdentity`,
+`channelGateway.identityLookup.slackBotTokenExistingSecret` and
+`channelGateway.identityLookup.slackBotTokenKey` (default `token`) render the
+section 7 settings into the gateway workload only, reading the bot token from
+the named operator-supplied Secret. Setting the Secret without the identity
+name, or an empty key, fails the render. When the Secret is unset, the
+rendered manifests are unchanged and no other workload receives either
+setting.
