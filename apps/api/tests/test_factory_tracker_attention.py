@@ -11,6 +11,7 @@ from curie_api.factory_card import CardInput, render_card
 from curie_api.factory_notices import public_result_detail, result_section, status_body
 from curie_api.factory_run_handoff import (
     RunHandoff,
+    agent_no_change_answer,
     fallback_summary,
     format_handoff,
     redact_tracker_text,
@@ -76,6 +77,75 @@ def test_live_card_explicitly_says_no_progress_report() -> None:
         cause_text=None,
     )
     assert "No progress note reported" in " ".join(ET.fromstring(render_card(card)).itertext())
+
+
+def test_completed_state_requires_open_pull_request_evidence() -> None:
+    for pr_open, expected in ((False, "Completed"), (True, "PR open")):
+        state, _ = live_lines(
+            status="completed",
+            publishing=False,
+            retrying=False,
+            view=_view(),
+            note=None,
+            note_at=None,
+            pr_open=pr_open,
+        )
+        assert state == expected
+
+
+def test_no_change_answer_is_bounded_and_ignores_following_lines() -> None:
+    answer = agent_no_change_answer(
+        "No changes needed: **already covered**.\nCause: completed\n" + "x" * 500
+    )
+    assert answer == r"\*\*already covered\*\*\."
+    assert agent_no_change_answer("An unrelated final") is None
+
+
+def test_omitted_human_decision_is_not_attributed_to_agent() -> None:
+    handoff = RunHandoff.model_validate(
+        {"next_owner": "agent", "next_action": "Continue", "verification": []}
+    )
+    rendered = format_handoff(handoff, no_pull_request=True)
+    assert "**Human decision now:** none recorded." in rendered
+    assert "none recorded. (agent reported)" not in rendered
+
+
+def test_card_state_leaves_room_for_reviewer_metadata() -> None:
+    view = PhaseView(
+        phases=_view().phases,
+        loops=(),
+        current="plan",
+        stages=(
+            StageSlot(
+                id="plan",
+                label="A very long stage name that would overlap reviewer metadata",
+                phase_ids=("plan",),
+                state="current",
+                round_label=None,
+            ),
+        ),
+        reviewer_model="reviewer-model",
+        staged=True,
+    )
+    card = CardInput(
+        repo="example/repo",
+        issue_number=7,
+        title=None,
+        revision_pr=None,
+        status="running",
+        publishing=False,
+        started_at=None,
+        terminal_at=None,
+        now=datetime(2026, 11, 17, 12, 30, tzinfo=UTC),
+        activity=None,
+        note=None,
+        phase_view=view,
+        cause_text=None,
+    )
+    root = ET.fromstring(render_card(card))
+    state = next(node.text for node in root if node.attrib.get("y") == "82")
+    assert state is not None and len(state) <= 55
+    assert any(node.attrib.get("class") == "review-meta muted" for node in root)
 
 
 def test_platform_wait_does_not_present_an_old_agent_note_as_current_progress() -> None:

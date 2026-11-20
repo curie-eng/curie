@@ -219,6 +219,7 @@ def test_unchanged_issue_usage_stays_outside_the_handoff_quote(
     assert "In response to" not in body
     quoted, outside = _commonmark_content(body)
     assert detail not in body
+    assert "**Agent-reported answer:** the existing tests already cover this request" in body
     (usage,) = [line for line in outside if line.startswith("Usage:")]
     assert usage.startswith(
         "Usage: implementer 1,500,000 tokens ($2.00), reviewers 300,000 tokens ($0.40), "
@@ -436,8 +437,7 @@ def test_completed_unchanged_notice_retains_the_agents_answer(revision: bool) ->
         f"{headline}\n"
         "Agent's last message:\n"
         "> The check rejects malformed records before parsing.\n"
-        "\n"
-        + (f"In response to {feedback_url}\n" if revision else "")
+        "\n" + (f"In response to {feedback_url}\n" if revision else "")
     )
 
 
@@ -819,11 +819,14 @@ def test_quoted_links_are_inert_and_status_card_stays_active(
             record_token(token, depth > 0)
     assert not any(token.type in {"link_open", "image"} for token in quoted_tokens)
     assert {"strong_open", "code_inline"} <= {token.type for token in quoted_tokens}
-    assert "".join(
-        "\n" if token.type in {"softbreak", "hardbreak"} else token.content.rstrip("\n")
-        for token in quoted_tokens
-        if token.type in {"text", "code_inline", "fence", "softbreak", "hardbreak"}
-    ) == "Kept bold and code." + visible
+    assert (
+        "".join(
+            "\n" if token.type in {"softbreak", "hardbreak"} else token.content.rstrip("\n")
+            for token in quoted_tokens
+            if token.type in {"text", "code_inline", "fence", "softbreak", "hardbreak"}
+        )
+        == "Kept bold and code." + visible
+    )
     assert [token.attrGet("src") for token in outside_tokens if token.type == "image"] == [card_url]
     assert [token.attrGet("href") for token in outside_tokens if token.type == "link_open"] == [
         control_url
@@ -842,9 +845,12 @@ def test_quoted_links_are_inert_and_status_card_stays_active(
     quote_marks = [mark for node in quoted_nodes for mark in node.get("marks", [])]
     assert not any(mark["type"] == "link" for mark in quote_marks)
     assert {"strong", "code"} <= {mark["type"] for mark in quote_marks}
-    assert "".join(
-        "\n" if node["type"] == "hardBreak" else node.get("text", "") for node in quoted_nodes
-    ) == "Kept bold and code." + visible
+    assert (
+        "".join(
+            "\n" if node["type"] == "hardBreak" else node.get("text", "") for node in quoted_nodes
+        )
+        == "Kept bold and code." + visible
+    )
     assert [
         mark["attrs"]["href"]
         for node in outside_nodes

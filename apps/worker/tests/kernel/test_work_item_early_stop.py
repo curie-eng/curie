@@ -73,9 +73,11 @@ GITHUB_TOKEN = "gh" + "p_" + "A1b2C3d4" * 5
 
 
 class _Binding:
-
     async def identity_binding(
-        self, kind: str, adapter: str | None, address: str,
+        self,
+        kind: str,
+        adapter: str | None,
+        address: str,
     ) -> HttpIdentityBinding | None:
         """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
         agent_id = AGENT_ID
@@ -83,7 +85,8 @@ class _Binding:
             tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
             agent_id=agent_id,
             binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
-            binding_generation=1, http_identity_required=False,
+            binding_generation=1,
+            http_identity_required=False,
         )
 
     def _deployment(self) -> object:
@@ -271,7 +274,11 @@ class _WorkItems(AbsentRequesterContext):
         return started
 
     async def hold_for_approval(
-        self, request_id: uuid.UUID, *, runtime_epoch: int, **_: object,
+        self,
+        request_id: uuid.UUID,
+        *,
+        runtime_epoch: int,
+        **_: object,
     ) -> None:
         self.calls.append("hold_for_approval")
         assert runtime_epoch == self.starts[request_id].runtime_epoch
@@ -535,6 +542,7 @@ def test_only_context_reads_end_as_early_stop(make_harness) -> None:
         (frozenset({"mcp__github__search_code", "mcp__github__read_file"}), "early_stop"),
         (frozenset({"mcp__curie__request_approval"}), "early_stop"),
         (frozenset({PROGRESS_TOOL}), "no_pull_request"),
+        (frozenset({"Read", RUN_HANDOFF_TOOL}), "early_stop"),
         (frozenset({"Bash"}), "no_pull_request"),
         (frozenset({"Edit"}), "no_pull_request"),
         (frozenset({"Write"}), "no_pull_request"),
@@ -627,8 +635,12 @@ def test_issue_4752_unpublished_revision_uses_the_recorded_pull_request(
 @pytest.mark.parametrize(
     ("tool", "prefixed"),
     [
-        ("Read", True), (PROGRESS_TOOL, True), ("Read", False),
-        (PROGRESS_TOOL, False), ("Bash", False), ("Bash", True),
+        ("Read", True),
+        (PROGRESS_TOOL, True),
+        ("Read", False),
+        (PROGRESS_TOOL, False),
+        ("Bash", False),
+        ("Bash", True),
     ],
 )
 @pytest.mark.parametrize("status", [SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT])
@@ -733,8 +745,13 @@ def test_a_missing_lineage_or_no_change_outcome_still_gets_a_continuation(
 @pytest.mark.parametrize(
     ("tool", "flagged"),
     [
-        ("Edit", False), ("Edit", True), ("Write", False), ("Write", True),
-        ("Bash", False), ("Bash", True), ("Read", True),
+        ("Edit", False),
+        ("Edit", True),
+        ("Write", False),
+        ("Write", True),
+        ("Bash", False),
+        ("Bash", True),
+        ("Read", True),
     ],
 )
 def test_a_no_change_reply_after_a_potential_write_still_gets_a_continuation(
@@ -796,6 +813,7 @@ def test_an_unprefixed_reply_keeps_other_continuation_outcomes(
         assert terminal
 
     asyncio.run(exercise())
+
 
 def _patch_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
     from curie_worker.runner_client import RunnerWorkspaceSnapshot

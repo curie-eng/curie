@@ -18,6 +18,7 @@ def live_lines(
     note: str | None,
     note_at: datetime | None,
     wait_at: datetime | None = None,
+    pr_open: bool = False,
 ) -> tuple[str, str]:
     """Return bounded facts only; neither a forecast nor an inferred owner."""
 
@@ -26,7 +27,7 @@ def live_lines(
         "waiting": "Waiting",
         "running": "Running",
         "cancellation_requested": "Stopping",
-        "completed": "PR open",
+        "completed": "PR open" if pr_open else "Completed",
         "failed": "Failed",
         "expired": "Expired",
         "cancelled": "Stopped",

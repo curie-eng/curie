@@ -215,7 +215,10 @@ def _unpublished_cause(tools_called: frozenset[str]) -> str:
     no work beyond fetching context; otherwise ``no_pull_request``."""
 
     for name in tools_called:
-        if name == constants._APPROVAL_TOOL_NAME or _is_context_tool(name):
+        if name in {
+            constants._APPROVAL_TOOL_NAME,
+            constants._RUN_HANDOFF_TOOL_NAME,
+        } or _is_context_tool(name):
             continue
         return "no_pull_request"
     return "early_stop"

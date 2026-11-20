@@ -192,12 +192,19 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
         )
     ) is not None
     revision_pr: int | None = None
-    if request.sequence > 1 and work_item.publication_lineage_id is not None:
-        revision_pr = await session.scalar(
-            select(ThreadPublicationLineage.pr_number).where(
-                ThreadPublicationLineage.id == work_item.publication_lineage_id
+    pr_open = False
+    if work_item.publication_lineage_id is not None:
+        lineage = (
+            await session.execute(
+                select(ThreadPublicationLineage.pr_number, ThreadPublicationLineage.status).where(
+                    ThreadPublicationLineage.id == work_item.publication_lineage_id
+                )
             )
-        )
+        ).one_or_none()
+        if lineage is not None:
+            if request.sequence > 1:
+                revision_pr = lineage.pr_number
+            pr_open = lineage.pr_number is not None and lineage.status == "open"
     terminal = request.terminal_cause if request.terminal_at is not None else None
     # Any automatic successor, owner loss or ordinary failure (ADR 0269).
     retrying = await retry_successor(session, request) is not None
@@ -228,6 +235,7 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             note_at=latest_note.reported_at if latest_note else None,
             wait_at=latest_wait.reported_at if latest_wait else None,
             no_pull_request=terminal == "no_pull_request",
+            pr_open=pr_open,
             next_owner=run_handoff.next_owner if run_handoff is not None else None,
             phase_view=phase_view(
                 row.declaration or {"phases": [], "loops": []},

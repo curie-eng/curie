@@ -107,6 +107,7 @@ class CardInput:
     note_at: datetime | None = None
     wait_at: datetime | None = None
     no_pull_request: bool = False
+    pr_open: bool = False
     next_owner: str | None = None
 
 
@@ -274,6 +275,7 @@ def render_card(card: CardInput) -> str:
         note=card.note,
         note_at=card.note_at,
         wait_at=card.wait_at,
+        pr_open=card.pr_open,
     )
     if card.no_pull_request:
         state_line = "No pull request published"
@@ -294,7 +296,9 @@ def render_card(card: CardInput) -> str:
         f'<text class="stats muted" x="24" y="61">'
         f"{'  |  '.join(_text(s, 45) for s in stats)}</text>",
     ]
-    parts.append(f'<text class="fg" x="24" y="82">{_text(state_line, 95)}</text>')
+    parts.append(
+        f'<text class="fg" x="24" y="82">{_text(state_line, 55 if review_text else 95)}</text>'
+    )
     if card.status in {"queued", "waiting", "running", "cancellation_requested"}:
         parts.append(f'<text class="note" x="24" y="106">{_text(update_line, 95)}</text>')
     elif card.status in {"completed", "failed", "expired", "cancelled"}:

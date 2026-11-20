@@ -92,7 +92,9 @@ def format_handoff(
 
     lines = ["## Run outcome"]
     decision = (
-        safe_tracker_line(handoff.human_decision) if handoff.human_decision else "None reported"
+        f"{safe_tracker_line(handoff.human_decision)} (agent reported)"
+        if handoff.human_decision
+        else "none recorded."
     )
     if no_pull_request:
         lines.append("**No pull request was published.**")
@@ -100,7 +102,7 @@ def format_handoff(
         [
             f"**Next owner:** {handoff.next_owner} (agent reported)",
             f"**Next action:** {safe_tracker_line(handoff.next_action)} (agent reported)",
-            f"**Human decision now:** {decision} (agent reported)",
+            f"**Human decision now:** {decision}",
             "",
             "### Open findings",
         ]
@@ -224,3 +226,17 @@ def _agent_failure_lines(detail: str | None) -> tuple[str | None, str | None]:
             if match:
                 question = bounded(match.group(1))
     return reason, question
+
+
+def agent_no_change_answer(detail: str | None) -> str | None:
+    """Extract one bounded, inert answer from a declared no-change final."""
+
+    if not detail:
+        return None
+    first = detail.replace("\r\n", "\n").replace("\r", "\n").split("\n", 1)[0].strip()
+    if not first.startswith("No changes needed:"):
+        return None
+    rendered = safe_tracker_line(first.removeprefix("No changes needed:").strip())
+    if not rendered:
+        return None
+    return rendered if len(rendered) <= 240 else rendered[:237].rstrip() + "..."

@@ -68,7 +68,13 @@ from .factory_questions import (
 )
 from .factory_reply_target import stored_reply_target
 from .factory_retry_policy import condition_text
-from .factory_run_handoff import RunHandoff, fallback_summary, format_handoff, safe_tracker_line
+from .factory_run_handoff import (
+    RunHandoff,
+    agent_no_change_answer,
+    fallback_summary,
+    format_handoff,
+    safe_tracker_line,
+)
 from .factory_tracker_attention import live_lines
 from .factory_triage_status import (
     delivered_triage,
@@ -1723,6 +1729,7 @@ async def _render(
             wait_at=(
                 next((r.reported_at for r in reversed(reports) if r.phase == WAIT_CI_PHASE), None)
             ),
+            pr_open=bool(pr_url and pr_state == "open"),
         )
         live_summary = (
             f"**{safe_tracker_line(state_line[:120])}**  \n{safe_tracker_line(update_line[:200])}"
@@ -1774,6 +1781,10 @@ async def _render(
                 agent_detail=row.detail if cause in _AGENT_MESSAGE_CAUSES else None,
             )
         )
+        if target.kind == "issue" and unchanged:
+            answer = agent_no_change_answer(row.detail)
+            if answer is not None:
+                summary += f"**Agent-reported answer:** {answer}\n"
         result = summary + "\n### Recorded result\n" + result
     # A follow-up on an existing pull request cannot ask (pull_request_open),
     # so it carries the continuing line instead of the investigating line.
