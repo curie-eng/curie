@@ -117,8 +117,9 @@ Whether quickstart creates a kind cluster or installs into an existing one, it
 installs with `cluster up --no-expose`, so the Console and Langfuse stay
 `ClusterIP` and nothing is published on the host. A release that already
 matches the target is not reinstalled and keeps the exposure it recorded; run
-`curie cluster up --no-expose` on it to change that. When you want to open them,
-run `curie cluster access --context "$CURIE_CONTEXT"`. It forwards them to
+`curie cluster up --context "$CURIE_CONTEXT" --no-expose` on it to change
+that. When you want to open the Console and Langfuse, run
+`curie cluster access --context "$CURIE_CONTEXT"`. It forwards them to
 `localhost` (loopback only), prints the URLs, and stops them when you press
 Ctrl-C.
 
