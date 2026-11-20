@@ -67,6 +67,14 @@ class ReviewComment:
 
 
 @dataclass(frozen=True)
+class ReviewComments:
+    """A review's unedited comments in id order, and the ids edited since submission."""
+
+    comments: tuple[ReviewComment, ...]
+    edited: frozenset[int]
+
+
+@dataclass(frozen=True)
 class SubmittedReview:
     """A review GitHub reports as submitted; ``state`` is upper case."""
 
@@ -180,6 +188,21 @@ def _comment(
     pull_url: str,
     head_sha: str,
 ) -> ReviewComment:
+    comment, edited = _listed_comment(item, review, pull_url=pull_url, head_sha=head_sha)
+    if edited:
+        raise FeedbackIgnored("edited_feedback")
+    return comment
+
+
+def _listed_comment(
+    item: Any,
+    review: SubmittedReview,
+    *,
+    pull_url: str,
+    head_sha: str,
+) -> tuple[ReviewComment, bool]:
+    """One listed comment, checked, and whether it was edited after submission."""
+
     if not isinstance(item, dict):
         raise FeedbackIgnored("review_unavailable")
     if (
@@ -205,9 +228,8 @@ def _comment(
     updated_at = parse_time(item.get("updated_at"))
     if updated_at is None:
         raise FeedbackIgnored("invalid_feedback_time")
-    if updated_at > review.submitted_at + SUBMISSION_SKEW:
-        raise FeedbackIgnored("edited_feedback")
-    return ReviewComment(comment_id, path, line, body)
+    edited = updated_at > review.submitted_at + SUBMISSION_SKEW
+    return ReviewComment(comment_id, path, line, body), edited
 
 
 async def _review_items(
@@ -246,17 +268,28 @@ async def read_review_comments(
     pr_number: int,
     review: SubmittedReview,
     head_sha: str,
-) -> tuple[ReviewComment, ...]:
-    """Every comment of ``review``, in id order, or a refusal for the whole review.
+) -> ReviewComments:
+    """Every comment of ``review``, or a refusal for the whole review.
 
-    Each comment must belong to this review and pull request, be written by the
-    review's author on ``head_sha``, and be unedited since submission.
+    Each comment must belong to this review and pull request and be written by
+    the review's author on ``head_sha``, or the review is refused. A comment
+    edited since submission is not part of the review's feedback: it is set
+    apart in ``edited``, so editing one comment never loses its siblings.
     """
 
     pull_url = _pull_url(verified, repo_path, pr_number)
     items = await _review_items(client, verified, pull_url=pull_url, review_id=review.id)
-    comments = [_comment(item, review, pull_url=pull_url, head_sha=head_sha) for item in items]
-    return tuple(sorted(comments, key=lambda comment: comment.id))
+    comments: list[ReviewComment] = []
+    edited: set[int] = set()
+    for item in items:
+        comment, was_edited = _listed_comment(item, review, pull_url=pull_url, head_sha=head_sha)
+        if was_edited:
+            edited.add(comment.id)
+        else:
+            comments.append(comment)
+    return ReviewComments(
+        tuple(sorted(comments, key=lambda comment: comment.id)), frozenset(edited)
+    )
 
 
 async def read_review_comment(

@@ -515,6 +515,86 @@ def test_inline_comment_edited_after_submission_is_refused(factory: Factory, pat
 
 
 @pytest.mark.parametrize("path", PATHS)
+def test_an_edited_sibling_never_loses_the_mention_beside_it(factory: Factory, path: str) -> None:
+    """A writer submits a review of two inline comments, one mentioning the
+    factory, then edits only the other 60 s later, before intake. The edited
+    comment is left out of the review's feedback; the untouched mention is
+    still admitted (decision 2.3), on the mention's original signed delivery
+    and on the poll alike, and is not counted as plain feedback."""
+
+    pull = factory.pull()
+    mention = f"@{MENTION} please rename this helper."
+    posted = factory.github.create_review(
+        pull.number,
+        REVIEWER,
+        event="COMMENT",
+        comments=[
+            _comment("src/acme/helper.py", 12, mention),
+            _comment("src/acme/helper.py", 30, "Also tidy this loop."),
+        ],
+    )
+    review_id = posted.item["id"]
+    asked, sibling = factory.github.comments_of_review(review_id)
+    assert asked["body"] == mention
+    factory.github.tick(60)
+    factory.github.edit_comment(sibling["id"], "Also tidy this loop and its guard.")
+    factory.github.drain_deliveries()
+
+    if path == "webhook":
+        (asked_delivery,) = [
+            delivery
+            for delivery in posted.deliveries
+            if delivery.payload.get("comment", {}).get("id") == asked["id"]
+        ]
+        response = factory.post(asked_delivery)
+        assert response.json()["status"] == "factory_admitted", response.text
+        # The edited sibling's own delivery starts nothing more.
+        (sibling_delivery,) = [
+            delivery
+            for delivery in posted.deliveries
+            if delivery.payload.get("comment", {}).get("id") == sibling["id"]
+        ]
+        assert factory.post(sibling_delivery).json()["status"] != "factory_admitted"
+    else:
+        factory.poll()
+
+    rows = _requests(pull.issue)
+    assert len(rows) == 2
+    assert rows[1]["id"] == _review_key(pull.number, review_id)
+    assert _provenance(rows[1]["objective"])["comments"] == [
+        {"path": "src/acme/helper.py", "line": 12, "body": mention}
+    ]
+    assert "tidy this loop" not in rows[1]["objective"]
+    assert _lineage(pull)["plain_feedback_revisions"] == 0
+
+
+@pytest.mark.parametrize("path", PATHS)
+def test_an_edited_inline_comment_is_still_refused_when_it_arrives_itself(
+    factory: Factory, path: str
+) -> None:
+    """The counterpart: the edited comment of a review with no other feedback
+    is refused, whether its own delivery (whose text no longer matches
+    GitHub's copy) or the poll brings it."""
+
+    pull = factory.pull()
+    posted = factory.github.create_review(
+        pull.number,
+        REVIEWER,
+        body="",
+        event="COMMENT",
+        comments=[_comment("src/acme/helper.py", 12, "Rename this helper.")],
+    )
+    (inline,) = factory.github.comments_of_review(posted.item["id"])
+    factory.github.tick(60)
+    factory.github.edit_comment(inline["id"], "Rename this helper and its callers.")
+    comment_only = Posted(
+        posted.item,
+        tuple(d for d in posted.deliveries if d.payload.get("comment", {}).get("id")),
+    )
+    _assert_refused(factory, pull, path, comment_only, ["feedback_changed"])
+
+
+@pytest.mark.parametrize("path", PATHS)
 def test_empty_review_without_inline_comments_is_refused(factory: Factory, path: str) -> None:
     pull = factory.pull()
     posted = factory.github.create_review(pull.number, REVIEWER, body="", event="COMMENT")

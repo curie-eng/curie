@@ -410,7 +410,7 @@ async def admit_parsed_feedback(
         assert review_key is not None
         if review.commit_id != bound.head_sha:
             raise FeedbackIgnored("stale_feedback_head")
-        comments = await read_review_comments(
+        snapshot = await read_review_comments(
             client,
             verified,
             repo_path=repo_path,
@@ -418,20 +418,25 @@ async def admit_parsed_feedback(
             review=review,
             head_sha=bound.head_sha,
         )
-        if feedback.event == "pull_request_review_comment" and feedback.feedback_id not in {
-            comment.id for comment in comments
-        }:
-            raise FeedbackUnavailable("review_comments_unavailable")
+        # An edited comment is left out of the review's feedback; its unedited
+        # siblings, a mention among them, still count. The arriving piece
+        # itself must be one of them.
+        comments = snapshot.comments
+        if feedback.event == "pull_request_review_comment":
+            if feedback.feedback_id in snapshot.edited:
+                raise FeedbackIgnored("edited_feedback")
+            if feedback.feedback_id not in {comment.id for comment in comments}:
+                raise FeedbackUnavailable("review_comments_unavailable")
         if not review.body.strip() and not comments:
-            raise FeedbackIgnored("empty_feedback")
+            raise FeedbackIgnored("edited_feedback" if snapshot.edited else "empty_feedback")
         # A review whose mentioning inline comment was admitted on its own
-        # before #5794 was answered then.
+        # before #5794 was answered then, edited since or not.
         replay = await _review_replay(
             session,
             work_item,
             (
-                event_request_id(feedback.repository_id, "pull_request_review_comment", comment.id)
-                for comment in comments
+                event_request_id(feedback.repository_id, "pull_request_review_comment", comment_id)
+                for comment_id in sorted({comment.id for comment in comments} | snapshot.edited)
             ),
         )
         if replay is not None:
