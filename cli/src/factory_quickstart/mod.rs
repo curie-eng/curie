@@ -2674,6 +2674,8 @@ mod tests {
     use super::*;
 
     const KIND_CONTEXT: &str = "kind-curie-factory";
+    const REMOTE_CONTEXT: &str = "remote-cluster";
+    const ODD_CONTEXT: &str = "prod west; id";
     const TEST_CONTEXT: &str = "scratch-cluster";
 
     fn agent_holding(kind: &str, address: &str, label: Option<&str>) -> crate::api::Agent {
@@ -2959,7 +2961,9 @@ mod tests {
         };
         let hint = added.console_access_hint("curie", "curie").unwrap();
         assert!(
-            hint.contains("`curie cluster access --context remote-cluster`"),
+            hint.contains(&format!(
+                "`curie cluster access --context {REMOTE_CONTEXT}`"
+            )),
             "{hint}"
         );
     }
@@ -2971,9 +2975,11 @@ mod tests {
             hint.contains(&format!("`curie cluster access --context {KIND_CONTEXT}`")),
             "{hint}"
         );
-        let hint = console_access_hint("remote-cluster", "curie", "curie");
+        let hint = console_access_hint(REMOTE_CONTEXT, "curie", "curie");
         assert!(
-            hint.contains("`curie cluster access --context remote-cluster`"),
+            hint.contains(&format!(
+                "`curie cluster access --context {REMOTE_CONTEXT}`"
+            )),
             "{hint}"
         );
         // A namespace or release that is not the default must be in the command,
@@ -2986,9 +2992,10 @@ mod tests {
             "{hint}"
         );
         // A context is any kubeconfig name, so the copy-paste command quotes it.
-        let hint = console_access_hint("prod west; id", "curie", "curie");
+        let hint = console_access_hint(ODD_CONTEXT, "curie", "curie");
+        let quoted = format!("'{ODD_CONTEXT}'");
         assert!(
-            hint.contains("`curie cluster access --context 'prod west; id'`"),
+            hint.contains(&format!("`curie cluster access --context {quoted}`")),
             "{hint}"
         );
     }
