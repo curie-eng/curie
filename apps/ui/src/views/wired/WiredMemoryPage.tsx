@@ -69,13 +69,20 @@ function safeHref(url: string | null): string | null {
 
 // The refusal sentences of the learned rule routes; an unlisted code shows the
 // API's own message (for example write_access_unverifiable).
-export function refusalText(error: unknown, repository: string, limit: number): string {
+export function refusalText(
+  error: unknown,
+  repository: string,
+  limit: number,
+  refreshed: boolean,
+): string {
   if (error instanceof MemoryRuleRefusal) {
     switch (error.code) {
       case "memory_rules.write_access_required":
         return `Only someone who can merge to ${repository} can do this. Link your code host account if you can.`;
       case "memory_rules.stale_version":
-        return "This rule changed. The list was refreshed.";
+        return refreshed
+          ? "This rule changed. The list was refreshed."
+          : "This rule changed. The list could not be refreshed.";
       case "memory_rules.scope_full":
         return `${repository} already has ${error.limit ?? limit} rules in force. Remove one first.`;
       case "memory_rules.code_host_unavailable":
@@ -192,10 +199,13 @@ function MemoryBody({
   const newest = useRef(0);
   // One refusal per rule, shown on its card; a note per section after a Dismiss
   // or a Remove (neither has an undo).
-  const [refusals, setRefusals] = useState<Record<string, string>>({});
+  const [refusals, setRefusals] = useState<Record<string, { text: string; scopeKey: string }>>({});
   const [notes, setNotes] = useState<Record<string, { proposed?: string; inForce?: string }>>({});
 
-  const load = useCallback(async () => {
+  // Resolves true when the list was read. A reload the person did not ask for
+  // (after an action) passes `report: false`: its failure belongs to the action
+  // that caused it, not to the page.
+  const load = useCallback(async (report = true): Promise<boolean> => {
     // Only the newest request's answer is applied: two decisions in a row start
     // two reloads, and the older one may read before the second decision lands.
     const mine = ++newest.current;
@@ -205,8 +215,10 @@ function MemoryBody({
         setData(fresh);
         setError(null);
       }
+      return true;
     } catch (e) {
-      if (mine === newest.current) setError(e instanceof Error ? e.message : String(e));
+      if (report && mine === newest.current) setError(e instanceof Error ? e.message : String(e));
+      return false;
     }
   }, [agentId]);
 
@@ -221,11 +233,13 @@ function MemoryBody({
   );
   const proposed = inScope.filter((r) => r.state === "proposed");
   const inForce = inScope.filter((r) => r.state === "accepted");
-  const repository = scope?.label ?? "";
   // A refusal belongs on its card; when the refreshed list no longer shows that
-  // rule (another person already decided it), it is shown here so it is not lost.
+  // rule (another person already decided it), it is shown here so it is not lost,
+  // but only on the repository the action was made in.
   const shown = new Set([...proposed, ...inForce].map((r) => r.id));
-  const orphanRefusals = Object.entries(refusals).filter(([id]) => !shown.has(id));
+  const orphanRefusals = Object.entries(refusals).filter(
+    ([id, r]) => !shown.has(id) && r.scopeKey === scope?.key,
+  );
 
   const act = async (action: Action, rule: MemoryRule) => {
     setBusy((b) => new Set(b).add(rule.id));
@@ -233,6 +247,7 @@ function MemoryBody({
       const { [rule.id]: _drop, ...rest } = r;
       return rest;
     });
+    let refused: unknown = null;
     try {
       await DECIDE[action](agentId, rule.id, rule.version);
       if (action === "reject") {
@@ -242,17 +257,23 @@ function MemoryBody({
         setNotes((n) => ({ ...n, [rule.scope_key]: { ...n[rule.scope_key], inForce: "Removed" } }));
       }
     } catch (e) {
-      setRefusals((r) => ({ ...r, [rule.id]: refusalText(e, repository, data?.in_force_limit ?? 16) }));
-    } finally {
-      // Every outcome reloads: a stale version, an invalid transition and a
-      // success all leave the list different from what the person saw.
-      await load();
-      setBusy((b) => {
-        const rest = new Set(b);
-        rest.delete(rule.id);
-        return rest;
-      });
+      refused = e;
     }
+    // Every outcome reloads: a stale version, an invalid transition and a
+    // success all leave the list different from what the person saw.
+    const refreshed = await load(false);
+    const text =
+      refused !== null
+        ? refusalText(refused, rule.scope_label, data?.in_force_limit ?? 16, refreshed)
+        : refreshed
+          ? null
+          : "The change was saved, but the list could not be refreshed.";
+    if (text !== null) setRefusals((r) => ({ ...r, [rule.id]: { text, scopeKey: rule.scope_key } }));
+    setBusy((b) => {
+      const rest = new Set(b);
+      rest.delete(rule.id);
+      return rest;
+    });
   };
 
   return (
@@ -325,7 +346,7 @@ function MemoryBody({
               {error}
             </div>
           ) : null}
-          {orphanRefusals.map(([id, text]) => (
+          {orphanRefusals.map(([id, { text }]) => (
             <div key={id} role="alert" data-testid="memory-rule-refusal" style={{ ...meta, color: C.destructive, marginBottom: 12 }}>
               {text}
             </div>
@@ -338,7 +359,7 @@ function MemoryBody({
             <>
               <RuleSection title="Proposed" count={proposed.length} note={notes[scope.key]?.proposed} empty="Nothing waiting for review.">
                 {proposed.map((rule) => (
-                  <RuleCard key={rule.id} rule={rule} refusal={refusals[rule.id]}>
+                  <RuleCard key={rule.id} rule={rule} refusal={refusals[rule.id]?.text}>
                     <div style={{ display: "flex", gap: 18, flexWrap: "wrap", ...meta }}>
                       <span>Scope: this repository</span>
                       <span>Applies to: every factory run here, for everyone</span>
@@ -363,7 +384,7 @@ function MemoryBody({
               </RuleSection>
               <RuleSection title="In force" count={inForce.length} note={notes[scope.key]?.inForce} empty="No rules yet.">
                 {inForce.map((rule) => (
-                  <RuleCard key={rule.id} rule={rule} refusal={refusals[rule.id]}>
+                  <RuleCard key={rule.id} rule={rule} refusal={refusals[rule.id]?.text}>
                     <div style={{ color: C.text2, fontSize: 12.5 }}>
                       <span style={{ color: C.brand }}>✓</span> Accepted by{" "}
                       {rule.accepted_by?.display_name ?? "someone"}, who can merge to this repository,{" "}

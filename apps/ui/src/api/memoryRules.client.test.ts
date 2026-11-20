@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  ApiError,
   acceptMemoryRule,
   listMemoryRules,
   MemoryRuleRefusal,
@@ -112,5 +113,86 @@ describe("accept, reject and remove against the recorded accept answer", () => {
     const error = await acceptMemoryRule(AGENT, RULE, 1).catch((e) => e);
     expect(error).not.toBeInstanceOf(MemoryRuleRefusal);
     expect(error).toMatchObject({ status: 403, message: "forbidden origin" });
+  });
+});
+
+// --- the requests the client sends, replayed by the API tests ------------------------
+
+const REQUESTS = join(process.cwd(), "../../tests/vectors/memory-rules-console-requests.json");
+const RESPONSES = join(process.cwd(), "../../tests/vectors/memory-rules-console-responses.json");
+const REQUESTS_NOTE =
+  "The requests apps/ui/src/api/client.ts sends for the learned rule routes, recorded by " +
+  "apps/ui/src/api/memoryRules.client.test.ts, which fails when they drift, and replayed against the " +
+  "registered routes by apps/api/tests/test_memory_rule_routes.py (console_client). Ids are placeholders. " +
+  "Refresh: CURIE_WRITE_MEMORY_RULES_VECTOR=1 pnpm exec vitest run src/api/memoryRules.client.test.ts";
+
+describe("the requests the client sends", () => {
+  it("match the recorded vector the API tests replay against the routes", async () => {
+    const requests = [];
+    for (const [operation, call] of [
+      ["list", () => listMemoryRules(AGENT)],
+      ["accept", () => acceptMemoryRule(AGENT, RULE, 1)],
+      ["reject", () => rejectMemoryRule(AGENT, RULE, 1)],
+      ["remove", () => removeMemoryRule(AGENT, RULE, 1)],
+    ] as const) {
+      vi.stubGlobal("fetch", answer(200, operation === "list" ? VECTOR.list : VECTOR.accept));
+      await call();
+      const [url, init] = vi.mocked(fetch).mock.calls[0];
+      requests.push({
+        operation,
+        method: init?.method ?? "GET",
+        // The dev proxy and the ingress strip the `/api` prefix before the API sees it.
+        path: String(url).replace(/^\/api/, ""),
+        body: init?.body ? JSON.parse(init.body as string) : null,
+      });
+    }
+    const document = { _comment: REQUESTS_NOTE, agent_id: AGENT, rule_id: RULE, requests };
+    if (process.env.CURIE_WRITE_MEMORY_RULES_VECTOR === "1") {
+      writeFileSync(REQUESTS, JSON.stringify(document, null, 2) + "\n");
+    }
+    expect(JSON.parse(readFileSync(REQUESTS, "utf8"))).toEqual(document);
+  });
+});
+
+// --- the answers of the routes, read back through the client -------------------------
+
+type Recorded = { status: number; body: { rule: { state: string; version: number }; detail: { code?: string; message: string } } };
+const answers = () => JSON.parse(readFileSync(RESPONSES, "utf8")) as Record<string, Recorded>;
+
+describe("the recorded decision answers of each route", () => {
+  it.each([
+    ["accept", acceptMemoryRule, "accepted"],
+    ["reject", rejectMemoryRule, "rejected"],
+    ["remove", removeMemoryRule, "removed"],
+  ] as const)("%s answers a rule in its own state", async (name, fn, state) => {
+    const recorded = answers()[name];
+    vi.stubGlobal("fetch", answer(recorded.status, recorded.body));
+    const change = await fn(AGENT, RULE, 1);
+    expect(change.rule.state).toBe(state);
+    expect(change.rule.version).toBe(recorded.body.rule.version);
+    // The three routes answer three different rules: none reuses another's payload.
+    const others = ["accept", "reject", "remove"].filter((other) => other !== name);
+    for (const other of others) expect(answers()[other].body.rule.state).not.toBe(state);
+  });
+
+  it.each([
+    ["refusal_stale_version", 409, "memory_rules.stale_version"],
+    ["refusal_write_access_required", 403, "memory_rules.write_access_required"],
+    ["refusal_code_host_unavailable", 503, "memory_rules.code_host_unavailable"],
+  ])("%s keeps its status and code", async (name, status, code) => {
+    const recorded = answers()[name];
+    vi.stubGlobal("fetch", answer(recorded.status, recorded.body));
+    const error = await acceptMemoryRule(AGENT, RULE, 1).catch((e) => e);
+    expect(error).toBeInstanceOf(MemoryRuleRefusal);
+    expect(error).toMatchObject({ status, code, message: recorded.body.detail.message });
+  });
+
+  it("a refusal recorded without its code is not a coded refusal", async () => {
+    const { code: _code, ...detail } = answers().refusal_stale_version.body.detail;
+    vi.stubGlobal("fetch", answer(409, { detail }));
+    const error = await acceptMemoryRule(AGENT, RULE, 1).catch((e) => e);
+    expect(error).not.toBeInstanceOf(MemoryRuleRefusal);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.message).toBe(detail.message);
   });
 });

@@ -720,7 +720,12 @@ async function ruleJsonOrThrow<T>(resp: Response, check: (body: unknown) => T): 
       typeof d.limit === "number" ? d.limit : null,
     );
   }
-  throw new ApiError(resp.status, describeError(body) ?? resp.statusText);
+  // An error body that carries a message but no code is still the API's sentence.
+  const said = detail && typeof detail === "object" ? (detail as { message?: unknown }).message : null;
+  throw new ApiError(
+    resp.status,
+    describeError(body) ?? (typeof said === "string" ? said : null) ?? (resp.statusText || `HTTP ${resp.status}`),
+  );
 }
 
 // Every learned rule of an agent in every state; the page picks what to show.

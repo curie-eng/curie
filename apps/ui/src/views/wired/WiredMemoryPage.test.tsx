@@ -378,6 +378,83 @@ describe("WiredMemoryPage actions (#5800)", () => {
     expect(screen.queryByText("Dismissed")).toBeNull();
   });
 
+  describe("a refusal stays with the repository and the action that caused it", () => {
+    const other = () =>
+      rule({ id: "rb", scope_key: "github:github.com:9", scope_label: "acme-corp/other", text: "other repo rule" });
+
+    it("does not show repository A's refusal above repository B's rules", async () => {
+      vi.mocked(listMemoryRules).mockResolvedValue(list(proposed(), other()));
+      vi.mocked(acceptMemoryRule).mockRejectedValue(refusal(403, "memory_rules.write_access_required"));
+      renderPage();
+
+      await userEvent.click(await screen.findByRole("button", { name: "Accept" }));
+      expect(await screen.findByText(/Only someone who can merge to acme-corp\/acme-bot/)).toBeInTheDocument();
+      await userEvent.selectOptions(screen.getByTestId("memory-repository-select"), "github:github.com:9");
+      expect(await screen.findByText("other repo rule")).toBeInTheDocument();
+      expect(screen.queryByTestId("memory-rule-refusal")).toBeNull();
+    });
+
+    it("keeps a refusal whose rule left the list with its own repository only", async () => {
+      vi.mocked(listMemoryRules)
+        .mockResolvedValueOnce(list(proposed(), other()))
+        .mockResolvedValue(list({ ...proposed(), state: "rejected", version: 5 }, other()));
+      vi.mocked(acceptMemoryRule).mockRejectedValue(refusal(409, "memory_rules.stale_version"));
+      renderPage();
+
+      await userEvent.click(await screen.findByRole("button", { name: "Accept" }));
+      expect(await screen.findByTestId("memory-rule-refusal")).toHaveTextContent("This rule changed. The list was refreshed.");
+      await userEvent.selectOptions(screen.getByTestId("memory-repository-select"), "github:github.com:9");
+      await screen.findByText("other repo rule");
+      expect(screen.queryByTestId("memory-rule-refusal")).toBeNull();
+      await userEvent.selectOptions(screen.getByTestId("memory-repository-select"), "github:github.com:4401");
+      expect(await screen.findByTestId("memory-rule-refusal")).toBeInTheDocument();
+    });
+  });
+
+  describe("a reload that fails after an action stays with the action", () => {
+    const unavailable = () => new MemoryRuleRefusal(503, "memory_rules.unavailable", "try again", null);
+
+    it("shows only the card refusal when the decision and the reload both fail with 503", async () => {
+      vi.mocked(listMemoryRules).mockResolvedValueOnce(list(proposed())).mockRejectedValue(unavailable());
+      vi.mocked(acceptMemoryRule).mockRejectedValue(refusal(503, "memory_rules.code_host_unavailable"));
+      renderPage();
+
+      await userEvent.click(await screen.findByRole("button", { name: "Accept" }));
+      expect(await screen.findByText("The code host could not be reached. Nothing changed.")).toBeInTheDocument();
+      expect(screen.queryByTestId("memory-rules-error")).toBeNull();
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
+      expect(screen.getByRole("button", { name: "Accept" })).toBeEnabled();
+    });
+
+    it("does not claim the list was refreshed when the stale version reload fails", async () => {
+      vi.mocked(listMemoryRules).mockResolvedValueOnce(list(proposed())).mockRejectedValue(unavailable());
+      vi.mocked(acceptMemoryRule).mockRejectedValue(refusal(409, "memory_rules.stale_version"));
+      renderPage();
+
+      await userEvent.click(await screen.findByRole("button", { name: "Accept" }));
+      expect(await screen.findByText("This rule changed. The list could not be refreshed.")).toBeInTheDocument();
+      expect(screen.queryByText(/The list was refreshed/)).toBeNull();
+      expect(screen.queryByTestId("memory-rules-error")).toBeNull();
+      expect(screen.getByText("a proposed rule")).toBeInTheDocument();
+    });
+
+    it("says a saved change could not be refreshed, on the card", async () => {
+      vi.mocked(listMemoryRules).mockResolvedValueOnce(list(proposed())).mockRejectedValue(unavailable());
+      vi.mocked(acceptMemoryRule).mockResolvedValue({ rule: accepted(), applies_from: "next_ticket" });
+      renderPage();
+
+      await userEvent.click(await screen.findByRole("button", { name: "Accept" }));
+      expect(await screen.findByText("The change was saved, but the list could not be refreshed.")).toBeInTheDocument();
+      expect(screen.queryByTestId("memory-rules-error")).toBeNull();
+    });
+
+    it("still reports a failure of the first load on the page", async () => {
+      vi.mocked(listMemoryRules).mockRejectedValue(unavailable());
+      renderPage();
+      expect(await screen.findByTestId("memory-rules-error")).toHaveTextContent("try again");
+    });
+  });
+
   it("409 invalid transition reloads without leaving the page in a busy state", async () => {
     vi.mocked(listMemoryRules)
       .mockResolvedValueOnce(list(proposed()))
