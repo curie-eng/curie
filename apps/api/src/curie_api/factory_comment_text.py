@@ -48,7 +48,10 @@ def end_trailing_decisions(body: str) -> str:
     for line in lines[headings[-1] + 1 :]:
         if line.startswith("## ") or line == DECISIONS_SECTION_END:
             return body
-    closed = f"{body.rstrip()}\n\n{DECISIONS_SECTION_END}"
+    # Only newlines come off: trailing spaces on the agent's last line are its own,
+    # and trimming them could turn a malformed `--- ` line into the break.
+    text = body.rstrip("\r\n")
+    closed = f"{text}\n\n{DECISIONS_SECTION_END}"
     return f"{closed}\n" if body.endswith("\n") else closed
 
 
@@ -68,7 +71,7 @@ def append_github_ask_line(body: str, mention: str) -> str:
                 kept.pop()
             continue
         kept.append(part)
-    text = end_trailing_decisions("\n".join(kept).rstrip())
+    text = end_trailing_decisions("\n".join(kept)).rstrip()
     text = f"{text}\n\n{line}" if text else line
     if body.endswith("\n"):
         text += "\n"

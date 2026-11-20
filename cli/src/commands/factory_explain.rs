@@ -1134,15 +1134,32 @@ mod tests {
     /// output byte for byte by `test_factory_decisions_trailer.py`.
     #[test]
     fn factory_published_decisions_vector() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/vectors/factory-decisions-published.json");
-        let raw =
-            std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path:?}: {error}"));
-        let document: Value = serde_json::from_str(&raw).expect("vector json");
-        let cases = document["cases"].as_array().expect("cases");
-        assert!(cases.iter().any(|case| case["valid"] == true));
-        assert!(cases.iter().any(|case| case["valid"] == false));
-        for case in cases {
+        // The first file holds bodies the platform text helpers publish. The second
+        // holds bodies the publications route stored, with the per-run issue number
+        // and marker replaced by fixed text.
+        let mut cases: Vec<Value> = Vec::new();
+        for name in [
+            "factory-decisions-published.json",
+            "factory-decisions-published-route.json",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tests/vectors")
+                .join(name);
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {path:?}: {error}"));
+            let document: Value = serde_json::from_str(&raw).expect("vector json");
+            let file_cases = document["cases"].as_array().expect("cases").clone();
+            assert!(
+                file_cases.iter().any(|case| case["valid"] == true),
+                "{name}"
+            );
+            assert!(
+                file_cases.iter().any(|case| case["valid"] == false),
+                "{name}"
+            );
+            cases.extend(file_cases);
+        }
+        for case in &cases {
             let id = case["id"].as_str().unwrap_or("?");
             let parsed = parse_decisions(case["published_body"].as_str().expect("published body"));
             if case["valid"].as_bool() != Some(true) {
