@@ -113,9 +113,11 @@ user with Developer access or higher in a file outside the repository. It needs
 ## Start the factory
 
 Run **one** of these paths with the repository and cluster variables above.
-On every path, whether quickstart creates a kind cluster or installs into an
-existing one, the Console and Langfuse stay `ClusterIP` (`cluster up
---no-expose`) and nothing is published on the host. When you want to open them,
+Whether quickstart creates a kind cluster or installs into an existing one, it
+installs with `cluster up --no-expose`, so the Console and Langfuse stay
+`ClusterIP` and nothing is published on the host. A release that already
+matches the target is not reinstalled and keeps the exposure it recorded; run
+`curie cluster up --no-expose` on it to change that. When you want to open them,
 run `curie cluster access --context "$CURIE_CONTEXT"`. It forwards them to
 `localhost` (loopback only), prints the URLs, and stops them when you press
 Ctrl-C.

@@ -688,7 +688,9 @@ impl QuickstartOutput {
     /// name, which the result does not carry.
     pub fn console_access_hint(&self, namespace: &str, release: &str) -> Option<String> {
         match self {
-            Self::Ready { context, .. } => Some(console_access_hint(context, namespace, release)),
+            Self::Ready { context, .. } | Self::AgentAdded { context, .. } => {
+                Some(console_access_hint(context, namespace, release))
+            }
             _ => None,
         }
     }
@@ -993,17 +995,21 @@ fn is_kind_context(name: &str) -> bool {
     name.starts_with("kind-")
 }
 
-/// How to reach the Console and Langfuse, whose services quickstart leaves
-/// ClusterIP on every context.
+/// How to reach the Console and Langfuse of the release quickstart installs
+/// or confirms. It makes no claim about the release's service type: a release
+/// that already matched the target is not reinstalled and keeps what it
+/// recorded, and `cluster access` forwards both service types. The values are
+/// shell-quoted because a kubeconfig context is any name, not only `kind-*`.
 fn console_access_hint(context: &str, namespace: &str, release: &str) -> String {
-    let mut command = format!("curie cluster access --context {context}");
+    use crate::ops::shell_quote;
+    let mut command = format!("curie cluster access --context {}", shell_quote(context));
     for (flag, value) in [("--namespace", namespace), ("--release", release)] {
         if value != "curie" {
-            command.push_str(&format!(" {flag} {value}"));
+            command.push_str(&format!(" {flag} {}", shell_quote(value)));
         }
     }
     format!(
-        "The Console and Langfuse are not published on this host. Run `{command}` to open them on localhost while it runs."
+        "To open the Console and Langfuse on localhost, run `{command}`. It forwards them while it runs."
     )
 }
 
@@ -1356,9 +1362,9 @@ pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
         target.chart.to_string(),
     ];
     // Quickstart is also how organisations stand up shared factory clusters, so
-    // the console and Langfuse stay ClusterIP on every path and are reached on
-    // demand with `curie cluster access`, which holds loopback port-forwards
-    // only while it runs.
+    // every install it runs keeps the console and Langfuse ClusterIP, reached
+    // on demand with `curie cluster access`, which holds loopback
+    // port-forwards only while it runs.
     up.push("--no-expose".into());
     if kind_target {
         up.push("--set".into());
@@ -2934,6 +2940,30 @@ mod tests {
         );
     }
 
+    /// The GitLab and Jira installs end in `AgentAdded`, not `Ready`, and they
+    /// run the same `cluster up`, so they close with the access line too.
+    #[test]
+    fn an_agent_added_result_closes_with_the_access_hint() {
+        let added = QuickstartOutput::AgentAdded {
+            context: "remote-cluster".into(),
+            agent: DEFAULT_AGENT.into(),
+            repos: vec!["acme/widgets".into()],
+            trigger_label: None,
+            effective_label: "factory".into(),
+            bundle: "published".into(),
+            runner_image: None,
+            deadline_seconds: DEFAULT_DEADLINE_SECONDS,
+            budget_usd: DEFAULT_BUDGET_USD,
+            output_tokens: DEFAULT_OUTPUT_TOKENS_PER_RUN,
+            credit_remaining_usd: None,
+        };
+        let hint = added.console_access_hint("curie", "curie").unwrap();
+        assert!(
+            hint.contains("`curie cluster access --context remote-cluster`"),
+            "{hint}"
+        );
+    }
+
     #[test]
     fn the_access_hint_names_the_context_on_every_context() {
         let hint = console_access_hint(KIND_CONTEXT, "curie", "curie");
@@ -2953,6 +2983,12 @@ mod tests {
             hint.contains(&format!(
                 "`curie cluster access --context {KIND_CONTEXT} --namespace factory --release acme`"
             )),
+            "{hint}"
+        );
+        // A context is any kubeconfig name, so the copy-paste command quotes it.
+        let hint = console_access_hint("prod west; id", "curie", "curie");
+        assert!(
+            hint.contains("`curie cluster access --context 'prod west; id'`"),
             "{hint}"
         );
     }
