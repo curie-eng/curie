@@ -377,6 +377,11 @@ class Settings(BaseSettings):
     # lineage, to record one merged or closed outside a publication (#3831).
     # Runs with the work item reconciler and factory ingress; 0 disables it.
     factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
+    # How often the API settles learned rule candidates (ADR 0287, #5796) of a
+    # pull request an older replica recorded merged or closed without settling.
+    # It runs whatever the reconciler and factory switches say, so it has no
+    # off value: no setting may strand a candidate.
+    memory_rule_settlement_interval_s: float = Field(default=60, gt=0, allow_inf_nan=False)
     # How often the API publishes optional UI evidence a worker uploaded for a
     # recorded publication, as one marked pull request comment. It reads the
     # code publication and never changes it; 0 disables it.

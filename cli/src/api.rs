@@ -362,6 +362,10 @@ pub struct Agent {
     /// as off, which is what it does.
     #[serde(default)]
     pub memory_writes: bool,
+    /// Whether the agent may propose memory rules for a person to accept
+    /// (#5796). Defaulted so a platform older than the field reads as off.
+    #[serde(default)]
+    pub memory_rule_proposals: bool,
     /// Who resolves publication approval. Missing responses stay on human approval.
     #[serde(default = "default_publication_policy")]
     pub publication_policy: String,

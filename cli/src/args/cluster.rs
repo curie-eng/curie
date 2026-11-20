@@ -1161,6 +1161,12 @@ pub(crate) enum ClusterAction {
         /// channel memory stays readable. Takes effect at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
+        /// Let the agent propose memory rules on or off
+        /// (`memory_rule_proposals`, #5796). Takes effect for the next
+        /// request's completion contract. A person still accepts any proposed
+        /// rule; the agent never activates one itself.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        memory_rule_proposals: Option<String>,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.

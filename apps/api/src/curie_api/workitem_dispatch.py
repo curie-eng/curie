@@ -39,7 +39,7 @@ from curie_api.workitems.lifecycle import (
 )
 
 from .config import Settings, get_settings
-from .factory_notices import start_failed_sentence
+from .factory_notices import ANSWER_PULL_REQUEST_ENDED_SENTENCE, start_failed_sentence
 from .factory_reply_target import reply_columns
 from .factory_retry_policy import RetrySafety
 from .factory_tracker_result_runtime import (
@@ -1544,6 +1544,93 @@ async def defer(
     )
 
 
+async def _answer_on_terminal_lineage(
+    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
+) -> bool:
+    """Whether ``request`` was started by an answer (#5786 decision 5) on a
+    WorkItem whose pull request is merged or closed.
+
+    Such a request can never start: the worker refuses a turn on a terminal
+    pull request before any sandbox starts (one ticket ADR, decision 10).
+    """
+
+    from . import factory_questions
+    from .models import ThreadPublicationLineage
+
+    if work_item.publication_lineage_id is None:
+        return False
+    lineage_status = await session.scalar(
+        select(ThreadPublicationLineage.status).where(
+            ThreadPublicationLineage.id == work_item.publication_lineage_id
+        )
+    )
+    if lineage_status in (None, "open"):
+        return False
+    return await factory_questions.answer_started(session, work_item.id, request.id)
+
+
+async def _end_answer_on_terminal_lineage(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    owner: str,
+    generation: int,
+    reason: str,
+    now: datetime,
+) -> DeferResult | DispatchConflict:
+    """End an answer's request whose pull request merged or closed before it
+    started (#5786) at its first start deferral, instead of retrying a start
+    the worker always refuses until the start limit fails it.
+
+    The request fails ``start_failed`` (the one ending an unstarted waiting
+    request has) with a sentence that says why. Its settlement clears the
+    question round and posts the request's status comment, and the state
+    label that asked for an answer is replaced.
+    """
+
+    changed_id = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.status == "waiting",
+            ExecutionRequest.acquire_owner == owner,
+            ExecutionRequest.acquired_generation == generation,
+        )
+        .values(
+            status="failed",
+            terminal_at=now,
+            terminal_cause="start_failed",
+            dispatch_generation=ExecutionRequest.dispatch_generation + 1,
+            acquired_generation=None,
+            acquire_owner=None,
+            acquire_expires_at=None,
+            last_deferral_reason=reason,
+            last_start_failure_detail=ANSWER_PULL_REQUEST_ENDED_SENTENCE,
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        return await _refuse(session, "not_dispatchable", request_id=request.id)
+    request = await reload_request(session, request.id)
+    await lifecycle.settle_terminal(
+        session, work_item, request, detail=ANSWER_PULL_REQUEST_ENDED_SENTENCE
+    )
+    result = DeferResult(
+        dispatch_generation=request.dispatch_generation,
+        not_before=None,
+        terminal_cause="start_failed",
+    )
+    await session.commit()
+    logger.info(
+        "work item request %s ended start_failed: its pull request is no longer open",
+        request.id,
+    )
+    return result
+
+
 async def _apply_deferral(
     session: AsyncSession,
     work_item: WorkItem | None,
@@ -1557,6 +1644,14 @@ async def _apply_deferral(
     now: datetime,
 ) -> DeferResult | DispatchConflict:
     counts_as_start = not capacity and reason.startswith(START_DEFERRAL_REASON_PREFIX)
+    if (
+        counts_as_start
+        and work_item is not None
+        and await _answer_on_terminal_lineage(session, work_item, request)
+    ):
+        return await _end_answer_on_terminal_lineage(
+            session, work_item, request, owner=owner, generation=generation, reason=reason, now=now
+        )
     settings = get_settings()
     # Failed starts and structural workspace timeout waits retain supplied diagnostics.
     detail = (

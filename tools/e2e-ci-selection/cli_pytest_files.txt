@@ -80,6 +80,7 @@ runner/tests/test_hooks.py
 runner/tests/test_mcp_argv.py
 runner/tests/test_personal_token_cluster.py
 runner/tests/test_preflight_blocked.py
+runner/tests/test_propose_rule_live.py
 runner/tests/test_repository_verification.py
 runner/tests/test_route_callers.py
 runner/tests/test_tool_policy_enforcement.py
@@ -161,6 +162,8 @@ tools/factory-e2e/tests/test_gitlab_driver.py
 tools/factory-e2e/tests/test_jira_driver.py
 tools/factory-e2e/tests/test_kind_images.py
 tools/factory-e2e/tests/test_live_github_chain.py
+tools/factory-e2e/tests/test_live_github_chain_driver.py
+tools/factory-e2e/tests/test_live_github_chain_pending.py
 tools/factory-e2e/tests/test_one_ticket_jira.py
 tools/factory-e2e/tests/test_one_ticket_scenario.py
 tools/factory-e2e/tests/test_personal_owner_enforcement.py

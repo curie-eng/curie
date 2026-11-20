@@ -68,7 +68,7 @@ from .github_factory_events import (
     event_repository,
     parse_factory_event,
 )
-from .github_review_audit import claim_review_delivery, settle_review_delivery
+from .github_review_audit import claim_review_delivery, comment_refusal, settle_review_delivery
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable, label_actor
 from .models import (
     AgentChannel,
@@ -952,6 +952,36 @@ class _AnswerOwner:
     owner: None = None
 
 
+# The answer refusals no later state can lift: they judge who wrote the
+# comment, or the ticket as it stood when the comment was decided.
+_STANDING_REFUSALS = frozenset(
+    {ANSWER_FROM_BOT, ANSWER_NOT_AUTHORIZED, TICKET_CLOSED, TRIGGER_LABEL_ABSENT}
+)
+
+
+async def _closed_round_answer(
+    session: AsyncSession, item: WorkItem, notice: FactoryNotice
+) -> WebhookResult | None:
+    """A comment on an issue whose round has ended: refused again when a
+    webhook delivery of it was refused as an answer, for who wrote it or for
+    a closed or unlabelled ticket, else None.
+
+    That comment was an answer when it was made, so it never becomes a
+    mention revision (#5787 decision 4) when the poll pass first lists it
+    after another answer ended the round, however many rounds later, even
+    if its author has since gained permission or the ticket was reopened or
+    labelled again. The webhook's own recorded verdict decides, not a
+    comparison of GitHub's whole-second creation time with the round's end.
+    """
+
+    if notice.comment_id is None:
+        return None
+    reason = await comment_refusal(session, notice.comment_id, _STANDING_REFUSALS)
+    if reason is None:
+        return None
+    return _refuse_answer(reason, item, notice)
+
+
 async def admit_answer_notice(
     session: AsyncSession,
     settings: Settings,
@@ -1022,8 +1052,10 @@ async def admit_answer_notice(
         .where(FactoryQuestionRound.work_item_id == item.id)
         .execution_options(populate_existing=True)
     )
-    if row is None or row.state not in _ANSWERABLE:
+    if row is None:
         return None
+    if row.state not in _ANSWERABLE:
+        return await _closed_round_answer(session, item, notice)
     if item.cancelled_at is not None:
         return _refuse_answer(factory_questions.WORK_ITEM_CANCELLED, item, notice)
     if (

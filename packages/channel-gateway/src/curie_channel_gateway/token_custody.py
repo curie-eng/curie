@@ -6,6 +6,10 @@ from collections.abc import Mapping
 from aci_protocol.slack_identities import SlackIdentities
 from pydantic import TypeAdapter, ValidationError
 
+#: Every gateway lookup identity's credential env name starts with this
+#: (@spec GATEWAY-USER-EMAIL-10), so it is refused and filtered by prefix.
+LOOKUP_TOKEN_ENV_PREFIX = "CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__"
+
 
 def refuse_slack_tokens(values: object) -> object:
     supplied = values if isinstance(values, Mapping) else {}
@@ -24,6 +28,7 @@ def refuse_slack_tokens(values: object) -> object:
             continue
         if (
             name in token_names
+            or str(name).startswith(LOOKUP_TOKEN_ENV_PREFIX)
             or ("SLACK" in str(name).upper() and "TOKEN" in str(name).upper())
             or value.startswith(("xoxb-", "xoxp-", "xapp-"))
         ):

@@ -5117,6 +5117,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/work-items/rule-proposal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Post Rule Proposal
+         * @description Store this execution's one learned rule candidate (#5796, ADR 0287).
+         *
+         *     The capability's request and WorkItem decide everything but the text: the
+         *     agent, the repository scope, the source request, pull request lineage and
+         *     URL, and the proposer (the request's verified requester). The candidate
+         *     stays hidden until the pull request merges. A capability that does not
+         *     name its WorkItem's issue is 409 ``invalid_context``; a request that is
+         *     not an eligible revision is 403 ``rule_proposal_not_eligible``; a second
+         *     proposal of the request is 409 ``rule_already_proposed``; a body that is
+         *     not one JSON object of exactly ``rule`` and ``reason`` strings is 422
+         *     ``invalid_body``; text outside the bounds is 422 ``invalid_text``,
+         *     ``too_large`` or ``reserved_text``. No refusal and no log line carries the
+         *     submitted text.
+         */
+        post: operations["post_rule_proposal_work_items_rule_proposal_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/work-items/tracker-result": {
         parameters: {
             query?: never;
@@ -5805,6 +5837,11 @@ export interface components {
             /** Memory */
             memory: boolean;
             /**
+             * Memory Rule Proposals
+             * @default false
+             */
+            memory_rule_proposals?: boolean;
+            /**
              * Memory Writes
              * @default false
              */
@@ -5904,6 +5941,8 @@ export interface components {
             } | null;
             /** Memory */
             memory?: boolean | null;
+            /** Memory Rule Proposals */
+            memory_rule_proposals?: boolean | null;
             /** Memory Writes */
             memory_writes?: boolean | null;
             /** Model */
@@ -8182,6 +8221,8 @@ export interface components {
             execution?: components["schemas"]["ExecutionBindingOut"] | null;
             /** Result Kinds */
             result_kinds: string[];
+            /** Rule Proposal */
+            rule_proposal: boolean;
             /** Session Usd Allowance */
             session_usd_allowance: number | null;
         };
@@ -12825,6 +12866,18 @@ export interface components {
             content?: string | null;
             /** Repo Full Name */
             repo_full_name: string;
+        };
+        /**
+         * RuleProposalOut
+         * @description A stored proposal: a hidden candidate, shown to a person only after the
+         *     pull request merges.
+         */
+        RuleProposalOut: {
+            /**
+             * Status
+             * @constant
+             */
+            status: "candidate";
         };
         /**
          * RunnerPods
@@ -25381,6 +25434,52 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["QuestionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_rule_proposal_work_items_rule_proposal_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Issue-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Reason
+                     * @description Why the feedback states a general rule, at most 240 UTF-8 bytes.
+                     */
+                    reason: string;
+                    /**
+                     * Rule
+                     * @description The rule, one sentence of at most 240 UTF-8 bytes.
+                     */
+                    rule: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleProposalOut"];
                 };
             };
             /** @description Validation Error */

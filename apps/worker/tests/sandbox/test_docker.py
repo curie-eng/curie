@@ -1171,6 +1171,30 @@ def test_create_claim_excludes_every_slack_identity_token_from_child_env() -> No
     assert "CURIE_SLACK_IDENTITIES" in child_env_names
 
 
+def test_create_claim_excludes_every_gateway_lookup_token_from_child_env() -> None:
+    """@spec GATEWAY-USER-EMAIL-10: a gateway lookup identity's credential is
+    indexed under `CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__<n>`. The filter drops
+    it by prefix, at any index, and a connector marker cannot readmit one."""
+
+    tokens = {
+        "CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__0": "placeholder",
+        "CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__7": "placeholder",
+    }
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim(
+        "thread-lookup-identities",
+        pool="pool",
+        env={
+            **tokens,
+            "CURIE_CONNECTOR_SECRET_KEYS": "CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__0",
+        },
+        deadline=time.monotonic() + 300,
+    )
+
+    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.runner_argv, "-e")}
+    assert tokens.keys().isdisjoint(child_env_names)
+
+
 def test_create_claim_fetches_and_unwraps_bundle() -> None:
     store = _FakeBundleStore(_plugin_tar_gz(wrapper="deal-desk"))
     client = _RecordingDocker(image="curie-runner", bundle_store=store)

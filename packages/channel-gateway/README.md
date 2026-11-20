@@ -80,6 +80,33 @@ email scope the lookup answers 502 rather than silently unknown. Requests use th
 single-use proof as every gateway caller (`request_replay.request_headers`).
 Nothing on this path logs an email.
 
+### Lookup identities
+
+By default `{identity}` is a declared Slack identity, so that agent's app
+needs `users:read.email`. To keep directory scopes off every agent app, declare
+a lookup identity: a credential the gateway uses for directory reads alone
+(section 7 of the [spec](../../docs/superpowers/specs/2026-11-12-gateway-slack-user-email-v1.md)).
+`CURIE_CHANNEL_GATEWAY_LOOKUP_IDENTITIES` is a JSON list of
+`{"name", "kind", "token_env"}` entries, for example
+`[{"name": "directory", "kind": "slack", "token_env": "CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__0"}]`,
+with the credential in `CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__0`. `slack` is the
+only kind: a bot-token-only app with `users:read` and `users:read.email`, no
+Socket Mode and no events. Point the provider's
+`CURIE_CHANNEL_GATEWAY_SLACK_IDENTITY` at the lookup identity's name. Do not
+declare it in `CURIE_SLACK_IDENTITIES`.
+
+Only the `user_email` read sees a lookup identity's credential. Replies, group
+membership, files, channel and canvas reads, sender identities and account
+profiles never receive it, and every other operation naming it answers as for
+an unknown identity. The gateway refuses to start on a malformed entry, a
+repeated name or `token_env`, a name that is `default`, `curie-cluster-message`
+or a declared identity, an unsupported kind (the error lists the supported
+ones), or an unset or blank credential. Each kind is one adapter in the
+`lookup_registry` of `slack/read_server.py`; adding one leaves the declaration
+unchanged. Processes that consume gateway ports refuse any
+`CURIE_CHANNEL_GATEWAY_LOOKUP_TOKEN__` variable, and the worker drops that
+prefix from agent environments.
+
 A Python provider uses `curie_channel_gateway.user_email_client`:
 
 ```python
